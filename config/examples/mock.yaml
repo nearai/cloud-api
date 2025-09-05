@@ -1,0 +1,16 @@
+# Mock Provider Configuration
+# Use for testing and development without real vLLM servers
+
+use_mock: true
+
+# No providers needed - mock service handles all requests
+providers: []
+
+server:
+  host: "0.0.0.0"
+  port: 3000
+
+# Mock mode doesn't need model discovery
+model_discovery:
+  refresh_interval: 0
+  timeout: 5

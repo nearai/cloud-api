@@ -1,0 +1,18 @@
+use_mock: false
+
+providers:
+  - name: "vllm-prod-1"
+    type: "vllm"
+    url: "http://0.0.0.1:8000"
+    api_key: "my-api-key"
+    enabled: true
+    priority: 1
+
+
+server:
+  host: "0.0.0.0"
+  port: 3000
+
+model_discovery:
+  refresh_interval: 300  # 5 minutes
+  timeout: 30           # 30 seconds

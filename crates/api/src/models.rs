@@ -4,6 +4,38 @@ use serde::{Deserialize, Serialize};
 // Chat Completions Models
 // ============================================================================
 
+// Streaming response models
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StreamChunkResponse {
+    pub id: String,
+    pub object: String,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<StreamChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StreamChoice {
+    pub index: u32,
+    pub delta: Delta,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Delta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+// ============================================================================
+// Chat Completions Models
+// ============================================================================
+
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -111,7 +143,7 @@ pub struct CompletionChoice {
 // Shared Models
 // ============================================================================
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,

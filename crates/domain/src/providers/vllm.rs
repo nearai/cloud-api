@@ -177,36 +177,39 @@ impl CompletionProvider for VLlmProvider {
         
         // Create a stream from the response
         let stream = response.bytes_stream()
-            .filter_map(|result| async move {
+            .map(|result| {
                 match result {
                     Ok(bytes) => {
                         let text = String::from_utf8_lossy(&bytes);
-                        // Parse SSE format
+                        let mut chunks = Vec::new();
+                        
+                        // Parse SSE format - collect all chunks from this batch
                         for line in text.lines() {
                             if line.starts_with("data: ") {
                                 let json_str = &line[6..];
                                 if json_str == "[DONE]" {
-                                    return None;
+                                    continue;
                                 }
                                 
                                 match serde_json::from_str::<StreamChunk>(json_str) {
-                                    Ok(chunk) => return Some(Ok(chunk)),
+                                    Ok(chunk) => chunks.push(Ok(chunk)),
                                     Err(e) => {
                                         error!("Failed to parse SSE chunk: {}", e);
-                                        return Some(Err(CompletionError::InternalError(
+                                        chunks.push(Err(CompletionError::InternalError(
                                             format!("Failed to parse stream chunk: {}", e)
                                         )));
                                     }
                                 }
                             }
                         }
-                        None
+                        chunks
                     }
-                    Err(e) => Some(Err(CompletionError::InternalError(
+                    Err(e) => vec![Err(CompletionError::InternalError(
                         format!("Stream error: {}", e)
-                    )))
+                    ))]
                 }
-            });
+            })
+            .flat_map(futures::stream::iter);
         
         Ok(Box::pin(stream))
     }
@@ -301,36 +304,39 @@ impl CompletionProvider for VLlmProvider {
         
         // Create a stream from the response - text completions use same SSE format
         let stream = response.bytes_stream()
-            .filter_map(|result| async move {
+            .map(|result| {
                 match result {
                     Ok(bytes) => {
                         let text = String::from_utf8_lossy(&bytes);
-                        // Parse SSE format
+                        let mut chunks = Vec::new();
+                        
+                        // Parse SSE format - collect all chunks from this batch
                         for line in text.lines() {
                             if line.starts_with("data: ") {
                                 let json_str = &line[6..];
                                 if json_str == "[DONE]" {
-                                    return None;
+                                    continue;
                                 }
                                 
                                 match serde_json::from_str::<StreamChunk>(json_str) {
-                                    Ok(chunk) => return Some(Ok(chunk)),
+                                    Ok(chunk) => chunks.push(Ok(chunk)),
                                     Err(e) => {
                                         error!("Failed to parse SSE chunk: {}", e);
-                                        return Some(Err(CompletionError::InternalError(
+                                        chunks.push(Err(CompletionError::InternalError(
                                             format!("Failed to parse stream chunk: {}", e)
                                         )));
                                     }
                                 }
                             }
                         }
-                        None
+                        chunks
                     }
-                    Err(e) => Some(Err(CompletionError::InternalError(
+                    Err(e) => vec![Err(CompletionError::InternalError(
                         format!("Stream error: {}", e)
-                    )))
+                    ))]
                 }
-            });
+            })
+            .flat_map(futures::stream::iter);
         
         Ok(Box::pin(stream))
     }
@@ -452,6 +458,9 @@ fn parse_finish_reason(reason: &Option<String>) -> FinishReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use httpmock::prelude::*;
+    use tokio_stream::StreamExt;
+    use std::time::Duration;
 
     #[test]
     fn test_vllm_provider_creation() {
@@ -464,5 +473,442 @@ mod tests {
         assert_eq!(provider.name(), "test-provider");
         assert_eq!(provider.base_url, "http://localhost:8000");
         assert_eq!(provider.api_key, Some("test-api-key".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_chat_completion_stream_success() {
+        // Start a mock server
+        let server = MockServer::start();
+
+        // Define SSE response chunks
+        let sse_response = vec![
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"finish_reason\":null}]}",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}",
+            "data: [DONE]",
+        ];
+
+        // Create mock endpoint
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(sse_response.join("\n\n"));
+        });
+
+        // Create provider with mock server URL
+        let provider = VLlmProvider::new(
+            "test-provider".to_string(),
+            server.url(""),
+            None,
+        );
+
+        // Create chat completion parameters
+        let params = ChatCompletionParams {
+            model_id: "test-model".to_string(),
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "Hello".to_string(),
+                name: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop_sequences: None,
+            stream: Some(true),
+        };
+
+        // Call the streaming method
+        let stream = provider.chat_completion_stream(params).await.unwrap();
+        let mut stream = Box::pin(stream);
+
+        // Collect all chunks
+        let mut chunks = Vec::new();
+        let mut content = String::new();
+        
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(chunk) => {
+                    // Verify chunk structure
+                    assert_eq!(chunk.id, "chat-1");
+                    assert_eq!(chunk.object, "chat.completion.chunk");
+                    assert_eq!(chunk.model, "test-model");
+                    
+                    if let Some(choice) = chunk.choices.first() {
+                        if let Some(text) = &choice.delta.content {
+                            content.push_str(text);
+                        }
+                    }
+                    
+                    chunks.push(chunk);
+                }
+                Err(e) => panic!("Stream error: {:?}", e),
+            }
+        }
+
+        // Verify we received all chunks
+        assert_eq!(chunks.len(), 4, "Should have received 4 chunks (excluding [DONE])");
+        assert_eq!(content, "Hello world!", "Accumulated content should match");
+        
+        // Verify the last chunk has finish_reason
+        let last_chunk = &chunks[3];
+        assert_eq!(last_chunk.choices[0].finish_reason, Some("stop".to_string()));
+
+        // Verify mock was called
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_text_completion_stream_success() {
+        // Start a mock server
+        let server = MockServer::start();
+
+        // Define SSE response chunks for text completion
+        let sse_response = vec![
+            "data: {\"id\":\"cmpl-1\",\"object\":\"text_completion\",\"created\":1234567890,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The quick\"},\"finish_reason\":null}]}",
+            "data: {\"id\":\"cmpl-1\",\"object\":\"text_completion\",\"created\":1234567890,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" brown fox\"},\"finish_reason\":null}]}",
+            "data: {\"id\":\"cmpl-1\",\"object\":\"text_completion\",\"created\":1234567890,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" jumps\"},\"finish_reason\":null}]}",
+            "data: {\"id\":\"cmpl-1\",\"object\":\"text_completion\",\"created\":1234567890,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}",
+            "data: [DONE]",
+        ];
+
+        // Create mock endpoint
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(sse_response.join("\n\n"));
+        });
+
+        // Create provider with mock server URL
+        let provider = VLlmProvider::new(
+            "test-provider".to_string(),
+            server.url(""),
+            None,
+        );
+
+        // Create completion parameters
+        let params = CompletionParams {
+            model_id: "test-model".to_string(),
+            prompt: "Complete this:".to_string(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop_sequences: None,
+            stream: Some(true),
+        };
+
+        // Call the streaming method
+        let stream = provider.text_completion_stream(params).await.unwrap();
+        let mut stream = Box::pin(stream);
+
+        // Collect all chunks
+        let mut chunks = Vec::new();
+        let mut content = String::new();
+        
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(chunk) => {
+                    // Verify chunk structure
+                    assert_eq!(chunk.id, "cmpl-1");
+                    assert_eq!(chunk.object, "text_completion");
+                    assert_eq!(chunk.model, "test-model");
+                    
+                    if let Some(choice) = chunk.choices.first() {
+                        if let Some(text) = &choice.delta.content {
+                            content.push_str(text);
+                        }
+                    }
+                    
+                    chunks.push(chunk);
+                }
+                Err(e) => panic!("Stream error: {:?}", e),
+            }
+        }
+
+        // Verify we received all chunks
+        assert_eq!(chunks.len(), 4, "Should have received 4 chunks (excluding [DONE])");
+        assert_eq!(content, "The quick brown fox jumps", "Accumulated content should match");
+        
+        // Verify the last chunk has finish_reason
+        let last_chunk = &chunks[3];
+        assert_eq!(last_chunk.choices[0].finish_reason, Some("length".to_string()));
+
+        // Verify mock was called
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_stream_with_multiple_lines_in_chunk() {
+        // Test SSE parsing when multiple data lines come in a single chunk
+        let server = MockServer::start();
+
+        // Multiple SSE lines in one response
+        let sse_response = concat!(
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"First\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" Second\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]"
+        );
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(sse_response);
+        });
+
+        let provider = VLlmProvider::new(
+            "test-provider".to_string(),
+            server.url(""),
+            None,
+        );
+
+        let params = ChatCompletionParams {
+            model_id: "test-model".to_string(),
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "Test".to_string(),
+                name: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop_sequences: None,
+            stream: Some(true),
+        };
+
+        let stream = provider.chat_completion_stream(params).await.unwrap();
+        let mut stream = Box::pin(stream);
+
+        let mut content = String::new();
+        while let Some(result) = stream.next().await {
+            if let Ok(chunk) = result {
+                if let Some(choice) = chunk.choices.first() {
+                    if let Some(text) = &choice.delta.content {
+                        content.push_str(text);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(content, "First Second", "Should parse multiple SSE lines correctly");
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_stream_error_response() {
+        let server = MockServer::start();
+
+        // Mock error response
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions");
+            then.status(500)
+                .header("content-type", "text/plain")
+                .body("Internal server error");
+        });
+
+        let provider = VLlmProvider::new(
+            "test-provider".to_string(),
+            server.url(""),
+            None,
+        );
+
+        let params = ChatCompletionParams {
+            model_id: "test-model".to_string(),
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "Test".to_string(),
+                name: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop_sequences: None,
+            stream: Some(true),
+        };
+
+        let result = provider.chat_completion_stream(params).await;
+        
+        assert!(result.is_err(), "Should return error for HTTP 500");
+        if let Err(e) = result {
+            match e {
+                CompletionError::InternalError(msg) => {
+                    assert!(msg.contains("vLLM API error"), "Error message should indicate API error");
+                    assert!(msg.contains("500"), "Error message should contain status code");
+                }
+                _ => panic!("Expected InternalError variant"),
+            }
+        }
+
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_stream_with_api_key() {
+        let server = MockServer::start();
+
+        // Mock endpoint that verifies API key
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .header("Authorization", "Bearer test-api-key");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body("data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Authenticated\"},\"finish_reason\":null}]}\n\ndata: [DONE]");
+        });
+
+        let provider = VLlmProvider::new(
+            "test-provider".to_string(),
+            server.url(""),
+            Some("test-api-key".to_string()),
+        );
+
+        let params = ChatCompletionParams {
+            model_id: "test-model".to_string(),
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "Test".to_string(),
+                name: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop_sequences: None,
+            stream: Some(true),
+        };
+
+        let stream = provider.chat_completion_stream(params).await.unwrap();
+        let mut stream = Box::pin(stream);
+
+        let mut has_chunks = false;
+        while let Some(result) = stream.next().await {
+            if let Ok(_) = result {
+                has_chunks = true;
+            }
+        }
+
+        assert!(has_chunks, "Should receive at least one chunk");
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_stream_malformed_sse() {
+        let server = MockServer::start();
+
+        // Malformed SSE response
+        let sse_response = concat!(
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Valid\"},\"finish_reason\":null}]}\n\n",
+            "data: {malformed json}\n\n",  // This will cause parse error
+            "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" after error\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]"
+        );
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(sse_response);
+        });
+
+        let provider = VLlmProvider::new(
+            "test-provider".to_string(),
+            server.url(""),
+            None,
+        );
+
+        let params = ChatCompletionParams {
+            model_id: "test-model".to_string(),
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "Test".to_string(),
+                name: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop_sequences: None,
+            stream: Some(true),
+        };
+
+        let stream = provider.chat_completion_stream(params).await.unwrap();
+        let mut stream = Box::pin(stream);
+
+        let mut valid_chunks = 0;
+        let mut errors = 0;
+        
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(_) => valid_chunks += 1,
+                Err(e) => {
+                    errors += 1;
+                    match e {
+                        CompletionError::InternalError(msg) => {
+                            assert!(msg.contains("Failed to parse stream chunk"), "Error should indicate parsing failure");
+                        }
+                        _ => panic!("Expected InternalError for parse failure"),
+                    }
+                }
+            }
+        }
+
+        assert_eq!(valid_chunks, 2, "Should have received 2 valid chunks");
+        assert_eq!(errors, 1, "Should have received 1 parsing error");
+        
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_stream_timeout_handling() {
+        let server = MockServer::start();
+
+        // Mock a slow response
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .delay(Duration::from_millis(100))  // Add small delay
+                .body("data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Delayed\"},\"finish_reason\":null}]}\n\ndata: [DONE]");
+        });
+
+        let provider = VLlmProvider::new(
+            "test-provider".to_string(),
+            server.url(""),
+            None,
+        );
+
+        let params = ChatCompletionParams {
+            model_id: "test-model".to_string(),
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "Test".to_string(),
+                name: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop_sequences: None,
+            stream: Some(true),
+        };
+
+        // Should still work with delay
+        let stream = provider.chat_completion_stream(params).await.unwrap();
+        let mut stream = Box::pin(stream);
+
+        let mut chunks = Vec::new();
+        while let Some(result) = stream.next().await {
+            if let Ok(chunk) = result {
+                chunks.push(chunk);
+            }
+        }
+
+        assert!(!chunks.is_empty(), "Should receive chunks even with delay");
+        mock.assert();
     }
 }

@@ -1,9 +1,5 @@
 use crate::models::*;
 
-// ============================================================================
-// HTTP to Domain Conversions
-// ============================================================================
-
 impl From<&crate::models::Message> for domain::ChatMessage {
     fn from(msg: &crate::models::Message) -> Self {
         Self {
@@ -46,10 +42,6 @@ impl From<&CompletionRequest> for domain::CompletionParams {
         }
     }
 }
-
-// ============================================================================
-// Domain to HTTP Conversions
-// ============================================================================
 
 impl From<&domain::ChatMessage> for crate::models::Message {
     fn from(msg: &domain::ChatMessage) -> Self {
@@ -124,10 +116,6 @@ pub fn completion_to_http_response(
     }
 }
 
-// ============================================================================
-// Error Conversions
-// ============================================================================
-
 impl From<domain::CompletionError> for crate::models::ErrorResponse {
     fn from(err: domain::CompletionError) -> Self {
         match err {
@@ -146,10 +134,6 @@ impl From<domain::CompletionError> for crate::models::ErrorResponse {
         }
     }
 }
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
 
 pub fn generate_completion_id() -> String {
     use std::collections::hash_map::DefaultHasher;
@@ -173,6 +157,46 @@ pub fn current_unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+impl From<domain::QuoteResponse> for crate::models::QuoteResponse {
+    fn from(domain_quote: domain::QuoteResponse) -> Self {
+        Self {
+            gateway: domain_quote.gateway.into(),
+            allowlist: domain_quote.allowlist.into_iter().map(|entry| entry.into()).collect(),
+        }
+    }
+}
+
+impl From<domain::GatewayQuote> for crate::models::GatewayQuote {
+    fn from(domain_gateway: domain::GatewayQuote) -> Self {
+        Self {
+            quote: domain_gateway.quote,
+            measurement: domain_gateway.measurement,
+            svn: domain_gateway.svn,
+            build: domain_gateway.build.into(),
+        }
+    }
+}
+
+impl From<domain::ServiceAllowlistEntry> for crate::models::ServiceAllowlistEntry {
+    fn from(domain_entry: domain::ServiceAllowlistEntry) -> Self {
+        Self {
+            service: domain_entry.service,
+            expected_measurements: domain_entry.expected_measurements,
+            min_svn: domain_entry.min_svn,
+            identifier: domain_entry.identifier,
+        }
+    }
+}
+
+impl From<domain::BuildInfo> for crate::models::BuildInfo {
+    fn from(domain_build: domain::BuildInfo) -> Self {
+        Self {
+            image: domain_build.image,
+            sbom: domain_build.sbom,
+        }
+    }
 }
 
 #[cfg(test)]

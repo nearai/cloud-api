@@ -1,10 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-// ============================================================================
-// Core Configuration Structures
-// ============================================================================
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfig {
     pub use_mock: bool,
@@ -13,6 +9,7 @@ pub struct ApiConfig {
     pub model_discovery: ModelDiscoveryConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    pub dstack_client: DstackClientConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,12 +56,18 @@ pub struct ProviderConfig {
     pub priority: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DstackClientConfig {
+    pub url: String,
+}
+
 // Domain-specific configuration types that will be used by domain layer
 #[derive(Debug, Clone)]
 pub struct DomainConfig {
     pub use_mock: bool,
     pub providers: Vec<ProviderConfig>,
     pub model_discovery: ModelDiscoveryConfig,
+    pub dstack_client: DstackClientConfig,
 }
 
 impl From<ApiConfig> for DomainConfig {
@@ -73,6 +76,7 @@ impl From<ApiConfig> for DomainConfig {
             use_mock: api_config.use_mock,
             providers: api_config.providers,
             model_discovery: api_config.model_discovery,
+            dstack_client: api_config.dstack_client,
         }
     }
 }

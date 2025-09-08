@@ -1,6 +1,4 @@
-// ============================================================================
 // Configuration Management
-// ============================================================================
 //
 // This crate handles all configuration loading and management for the platform-api.
 // It provides:

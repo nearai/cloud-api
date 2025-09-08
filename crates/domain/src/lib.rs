@@ -1,6 +1,4 @@
-// ============================================================================
 // Domain Layer - Business Logic and Models
-// ============================================================================
 //
 // This crate contains the core domain logic for AI completions, organized into:
 // - models: Core domain models and data structures
@@ -15,7 +13,14 @@ pub mod providers;
 pub mod services;
 
 // Re-export all public types for convenience
-pub use errors::*;
+pub use errors::CompletionError;
 pub use models::*;
-pub use providers::*;
-pub use services::*;
+pub use providers::{
+    StreamChunk, StreamChoice, Delta, 
+    ModelInfo, ModelsResponse, 
+    vllm::VLlmProvider, 
+    mock::MockProvider
+};
+pub use services::{
+    CompletionHandler, Domain, ProviderRouter, MockCompletionHandler
+};

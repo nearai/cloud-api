@@ -9,10 +9,6 @@ use std::sync::Arc;
 use futures::stream::StreamExt;
 use std::convert::Infallible;
 
-// ============================================================================
-// Error Handling Helpers
-// ============================================================================
-
 fn map_domain_error_to_status(error: &domain::CompletionError) -> StatusCode {
     match error {
         domain::CompletionError::InvalidModel(_) | domain::CompletionError::InvalidParams(_) => StatusCode::BAD_REQUEST,
@@ -247,13 +243,17 @@ pub async fn models(
     }
 }
 
-// Legacy struct for backwards compatibility
-pub struct Routes {
-    pub test: String,
-}
-
-impl Routes {
-    pub fn new() -> Self {
-        Self { test: "test".to_string() }
+pub async fn quote(
+    State(domain): State<AppState>,
+) -> Result<ResponseJson<QuoteResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    match domain.get_quote().await {
+        Ok(quote_response) => {
+            let response: QuoteResponse = quote_response.into();
+            Ok(ResponseJson(response))
+        }
+        Err(domain_error) => {
+            let status_code = map_domain_error_to_status(&domain_error);
+            Err((status_code, ResponseJson(domain_error.into())))
+        }
     }
 }

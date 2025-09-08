@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use dstack_sdk::dstack_client::DstackClient;
 use futures::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -8,23 +9,21 @@ use tracing::{debug, error, info};
 use crate::{
     errors::CompletionError,
     models::*,
-    providers::{CompletionProvider, StreamChunk, vllm::VLlmProvider, ModelInfo},
-    services::CompletionService,
+    providers::{StreamChunk, vllm::VLlmProvider, ModelInfo},
+    services::CompletionHandler,
 };
 use config::DomainConfig;
 
-// ============================================================================
-// Provider-based Completion Service
-// ============================================================================
+use crate::services::TdxHandler;
 
 /// A completion service that routes requests to different providers based on model availability
-pub struct ProviderService {
-    providers: Vec<Arc<dyn CompletionProvider>>,
-    model_mapping: HashMap<String, Arc<dyn CompletionProvider>>,
+pub struct ProviderRouter {
+    providers: Vec<Arc<dyn CompletionHandler>>,
+    model_mapping: HashMap<String, Arc<dyn CompletionHandler>>,
     pub config: DomainConfig,
 }
 
-impl ProviderService {
+impl ProviderRouter {
     pub fn new(config: DomainConfig) -> Self {
         Self {
             providers: Vec::new(),
@@ -59,7 +58,7 @@ impl ProviderService {
                         provider_config.name.clone(),
                         provider_config.url.clone(),
                         provider_config.api_key.clone(),
-                    )) as Arc<dyn CompletionProvider>
+                    )) as Arc<dyn CompletionHandler>
                 }
                 provider_type => {
                     error!("Unsupported provider type: {} for provider {}", provider_type, provider_config.name);
@@ -83,7 +82,7 @@ impl ProviderService {
         self.model_mapping.clear();
         
         for provider in &self.providers {
-            match provider.get_models().await {
+            match provider.get_available_models().await {
                 Ok(models) => {
                     info!("Discovered {} models from provider {}", models.len(), provider.name());
                     
@@ -107,22 +106,9 @@ impl ProviderService {
         Ok(all_models)
     }
     
-    /// Get all available models
-    pub async fn get_available_models(&self) -> Result<Vec<ModelInfo>, CompletionError> {
-        let mut all_models = Vec::new();
-        
-        for provider in &self.providers {
-            match provider.get_models().await {
-                Ok(models) => all_models.extend(models),
-                Err(e) => error!("Failed to get models from {}: {}", provider.name(), e),
-            }
-        }
-        
-        Ok(all_models)
-    }
     
     /// Add a provider to the service
-    pub fn add_provider(&mut self, provider: Arc<dyn CompletionProvider>, models: Vec<String>) {
+    pub fn add_provider(&mut self, provider: Arc<dyn CompletionHandler>, models: Vec<String>) {
         for model in models {
             self.model_mapping.insert(model, provider.clone());
         }
@@ -130,14 +116,21 @@ impl ProviderService {
     }
     
     /// Get the provider for a specific model
-    fn get_provider(&self, model_id: &str) -> Result<&Arc<dyn CompletionProvider>, CompletionError> {
+    fn get_provider(&self, model_id: &str) -> Result<&Arc<dyn CompletionHandler>, CompletionError> {
         self.model_mapping.get(model_id)
             .ok_or_else(|| CompletionError::InvalidModel(format!("Model '{}' not available in any provider", model_id)))
     }
 }
 
 #[async_trait]
-impl CompletionService for ProviderService {
+impl CompletionHandler for ProviderRouter {
+    fn name(&self) -> &str {
+        "provider-router"
+    }
+    
+    fn supports_model(&self, model_id: &str) -> bool {
+        self.model_mapping.contains_key(model_id)
+    }
     async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ChatCompletionResult, CompletionError> {
         let provider = self.get_provider(&params.model_id)?;
         debug!("Routing chat completion for model '{}' to provider '{}'", params.model_id, provider.name());
@@ -168,28 +161,106 @@ impl CompletionService for ProviderService {
         provider.text_completion_stream(params).await
     }
     
+    async fn get_available_models(&self) -> Result<Vec<crate::providers::ModelInfo>, CompletionError> {
+        let mut all_models = Vec::new();
+        
+        for provider in &self.providers {
+            match provider.get_available_models().await {
+                Ok(models) => all_models.extend(models),
+                Err(e) => error!("Failed to get models from {}: {}", provider.name(), e),
+            }
+        }
+        
+        Ok(all_models)
+    }
+    
+    
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 }
 
-// ============================================================================
-// Configuration Helpers
-// ============================================================================
-
-impl ProviderService {
-    /// Load service from configuration file using dependency injection 
-    pub fn from_config_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
-        let api_config = config::ApiConfig::load_from_file(path)?;
-        let domain_config = DomainConfig::from(api_config);
-        Ok(Self::from_domain_config(domain_config))
-    }
-    
+impl ProviderRouter {
     /// Load service from default configuration using dependency injection
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let api_config = config::ApiConfig::load()?;
         let domain_config = DomainConfig::from(api_config);
         Ok(Self::from_domain_config(domain_config))
+    }
+}
+
+
+pub struct TdxHandlerImpl {
+    client: DstackClient,
+    config: DomainConfig,
+}
+
+impl TdxHandlerImpl {
+    pub fn new(config: DomainConfig) -> Self {
+        Self {
+            client: DstackClient::new(Some(&config.dstack_client.url)),
+            config,
+        }
+    }
+}
+
+#[async_trait]
+impl TdxHandler for TdxHandlerImpl {
+    
+    async fn get_quote(&self) -> Result<QuoteResponse, CompletionError> {
+        // Get system info (not currently used but available for future enhancements)
+        let _info = self.client.info().await
+            .map_err(|e| CompletionError::InternalError(format!("Failed to get system info: {}", e)))?;
+        
+        // Generate TDX quote with a standard identifier
+        let quote_data = b"platform-api-gateway-quote";
+        let quote_resp = self.client.get_quote(quote_data.to_vec()).await
+            .map_err(|e| CompletionError::InternalError(format!("Failed to get TDX quote: {}", e)))?;
+        
+        // Parse RTMRs to get measurement
+        let rtmrs = quote_resp.replay_rtmrs()
+            .map_err(|e| CompletionError::InternalError(format!("Failed to replay RTMRs: {}", e)))?;
+        
+        // Extract MRENCLAVE from RTMRs (typically RTMR 0 contains the enclave measurement)
+        let measurement = if let Some(rtmr) = rtmrs.get(&0) {
+            // Convert the first RTMR to a formatted string - will be improved later
+            format!("MRENCLAVE:{:?}", rtmr)
+        } else {
+            "MRENCLAVE:unknown".to_string()
+        };
+        
+        // Build gateway quote response
+        let gateway_quote = GatewayQuote {
+            quote: quote_resp.quote,
+            measurement,
+            svn: 12, // TODO: Extract actual SVN from quote
+            build: BuildInfo {
+                image: "ghcr.io/agenthub/gateway:dev".to_string(), // TODO: Get from build metadata
+                sbom: "sha256:placeholder".to_string(), // TODO: Get actual SBOM hash
+            },
+        };
+        
+        // Build allowlist from current provider configuration
+        let mut allowlist = Vec::new();
+        
+        // Add configured vLLM providers to allowlist
+        for provider in &self.config.providers {
+            if provider.enabled {
+                allowlist.push(ServiceAllowlistEntry {
+                    service: format!("vllm-models/{}", provider.name),
+                    expected_measurements: vec![
+                        "sha256:placeholder-measurement".to_string() // TODO: Get real measurements
+                    ],
+                    min_svn: 10,
+                    identifier: format!("ledger://compose/sha256:{}", provider.name.replace('-', "")),
+                });
+            }
+        }
+        
+        Ok(QuoteResponse {
+            gateway: gateway_quote,
+            allowlist,
+        })
     }
 }
 
@@ -206,8 +277,11 @@ mod tests {
                 refresh_interval: 300,
                 timeout: 30,
             },
+            dstack_client: config::DstackClientConfig {
+                url: "http://localhost:8000".to_string(),
+            },
         };
-        let service = ProviderService::new(config);
+        let service = ProviderRouter::new(config);
         assert_eq!(service.providers.len(), 0);
         assert_eq!(service.model_mapping.len(), 0);
     }
@@ -232,9 +306,12 @@ mod tests {
                 refresh_interval: 300,
                 timeout: 30,
             },
+            dstack_client: config::DstackClientConfig {
+                url: "http://localhost:8000".to_string(),
+            },
         };
         
-        let service = ProviderService::from_domain_config(config);
+        let service = ProviderRouter::from_domain_config(config);
         assert_eq!(service.providers.len(), 1);
         // Note: model_mapping is empty until discover_models() is called
     }

@@ -1,9 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-// ============================================================================
-// Chat Completions Models
-// ============================================================================
-
 // Streaming response models
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StreamChunkResponse {
@@ -31,10 +27,6 @@ pub struct Delta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
 }
-
-// ============================================================================
-// Chat Completions Models
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -78,10 +70,6 @@ pub struct ChatChoice {
     pub finish_reason: Option<String>, // "stop", "length", "content_filter"
 }
 
-// ============================================================================
-// Text Completions Models
-// ============================================================================
-
 #[derive(Debug, Deserialize)]
 pub struct CompletionRequest {
     pub model: String,
@@ -113,10 +101,6 @@ pub struct CompletionResponse {
     pub usage: Usage,
 }
 
-// ============================================================================
-// Models Endpoint
-// ============================================================================
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ModelsResponse {
     pub object: String,
@@ -139,10 +123,6 @@ pub struct CompletionChoice {
     pub finish_reason: Option<String>, // "stop", "length", "content_filter"
 }
 
-// ============================================================================
-// Shared Models
-// ============================================================================
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
@@ -163,10 +143,6 @@ pub struct ErrorDetail {
     pub code: Option<String>,
 }
 
-// ============================================================================
-// Default Values
-// ============================================================================
-
 fn default_max_tokens() -> Option<u32> {
     Some(100)
 }
@@ -182,10 +158,6 @@ fn default_top_p() -> Option<f32> {
 fn default_n() -> Option<u32> {
     Some(1)
 }
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
 
 impl ChatCompletionRequest {
     pub fn validate(&self) -> Result<(), String> {
@@ -280,4 +252,32 @@ impl ErrorResponse {
             },
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+pub struct QuoteResponse {
+    pub gateway: GatewayQuote,
+    pub allowlist: Vec<ServiceAllowlistEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GatewayQuote {
+    pub quote: String,
+    pub measurement: String,
+    pub svn: u32,
+    pub build: BuildInfo,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ServiceAllowlistEntry {
+    pub service: String,
+    pub expected_measurements: Vec<String>,
+    pub min_svn: u32,
+    pub identifier: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BuildInfo {
+    pub image: String,
+    pub sbom: String,
 }

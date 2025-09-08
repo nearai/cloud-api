@@ -8,12 +8,9 @@ use tracing::{debug, error};
 use crate::{
     errors::CompletionError,
     models::*,
-    providers::{CompletionProvider, StreamChunk, ModelInfo},
+    providers::{StreamChunk, ModelInfo},
+    services::CompletionHandler,
 };
-
-// ============================================================================
-// vLLM Provider Implementation
-// ============================================================================
 
 pub struct VLlmProvider {
     client: Client,
@@ -36,12 +33,17 @@ impl VLlmProvider {
 }
 
 #[async_trait]
-impl CompletionProvider for VLlmProvider {
+impl CompletionHandler for VLlmProvider {
     fn name(&self) -> &str {
         &self.name
     }
     
-    async fn get_models(&self) -> Result<Vec<ModelInfo>, CompletionError> {
+    fn supports_model(&self, model_id: &str) -> bool {
+        let models = self.supported_models.read().unwrap();
+        models.iter().any(|m| m == model_id)
+    }
+    
+    async fn get_available_models(&self) -> Result<Vec<ModelInfo>, CompletionError> {
         let url = format!("{}/v1/models", self.base_url);
         
         let mut request = self.client.get(&url);
@@ -81,10 +83,6 @@ impl CompletionProvider for VLlmProvider {
         }).collect();
         
         Ok(models_with_provider)
-    }
-    
-    fn supports_model(&self, model_id: &str) -> bool {
-        self.supported_models.read().unwrap().iter().any(|m| m == model_id)
     }
     
     async fn chat_completion(
@@ -340,11 +338,11 @@ impl CompletionProvider for VLlmProvider {
         
         Ok(Box::pin(stream))
     }
+    
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
-
-// ============================================================================
-// vLLM API Models
-// ============================================================================
 
 #[derive(Debug, Serialize)]
 struct VLlmChatRequest {
@@ -421,14 +419,6 @@ struct VLlmCompletionChoice {
     text: String,
     finish_reason: Option<String>,
 }
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-// ============================================================================
-// vLLM Models Response (different from our internal ModelsResponse)
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 struct VLlmModelsResponse {

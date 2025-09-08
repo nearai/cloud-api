@@ -1,9 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-// ============================================================================
-// Domain Models - Business Logic Focused
-// ============================================================================
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: MessageRole,
@@ -79,6 +75,34 @@ impl TokenUsage {
             total_tokens: prompt_tokens + completion_tokens,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuoteResponse {
+    pub gateway: GatewayQuote,
+    pub allowlist: Vec<ServiceAllowlistEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayQuote {
+    pub quote: String,  // base64 encoded
+    pub measurement: String,  // MRENCLAVE:...
+    pub svn: u32,
+    pub build: BuildInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceAllowlistEntry {
+    pub service: String,
+    pub expected_measurements: Vec<String>,
+    pub min_svn: u32,
+    pub identifier: String,  // e.g., ledger://compose/sha256:abcd...
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildInfo {
+    pub image: String,
+    pub sbom: String,  // sha256:...
 }
 
 #[cfg(test)]

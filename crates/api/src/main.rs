@@ -2,7 +2,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use api::routes::{chat_completions, completions, models};
+use api::routes::{chat_completions, completions, models, quote};
 use domain::Domain;
 use config::{ApiConfig, LoggingConfig};
 use std::sync::Arc;
@@ -37,6 +37,8 @@ async fn main() {
         .route("/v1/completions", post(completions))
         // Models endpoint
         .route("/v1/models", get(models))
+        // TDX attestation endpoint
+        .route("/v1/quote", get(quote))
         // Share the domain service as application state
         .with_state(domain);
 
@@ -47,6 +49,7 @@ async fn main() {
     tracing::info!("  - POST /v1/chat/completions (Chat Completions)");
     tracing::info!("  - POST /v1/completions (Text Completions)");
     tracing::info!("  - GET /v1/models (Available Models)");
+    tracing::info!("  - GET /v1/quote (TDX Quote & Attestation)");
     axum::serve(listener, app).await.unwrap();
 }
 

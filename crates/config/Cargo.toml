@@ -1,0 +1,15 @@
+[package]
+name = "config"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Configuration management for platform-api"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3.0"

@@ -7,8 +7,9 @@ use std::sync::Arc;
 use crate::{
     errors::CompletionError,
     models::*,
-    providers::{StreamChunk, ServerConfig},
+    providers::{StreamChunk},
 };
+use config::ServerConfig;
 
 pub use provider_service::ProviderService;
 
@@ -171,8 +172,11 @@ impl Domain {
     
     /// Create a domain from YAML configuration
     pub async fn from_config() -> Result<Self, Box<dyn std::error::Error>> {
+        // Load the full API config to get server config
+        let api_config = config::ApiConfig::load()?;
+        let server_config = api_config.server.clone();
+        
         let mut service = ProviderService::load()?;
-        let server_config = service.config.server.clone();
         
         if service.config.use_mock {
             tracing::info!("Using mock provider (real providers disabled in config)");
@@ -217,8 +221,11 @@ impl Domain {
     
     /// Create a domain from a specific config file
     pub async fn from_config_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
+        // Load the full API config to get server config
+        let api_config = config::ApiConfig::load_from_file(path.as_ref())?;
+        let server_config = api_config.server.clone();
+        
         let mut service = ProviderService::from_config_file(path)?;
-        let server_config = service.config.server.clone();
         
         if service.config.use_mock {
             tracing::info!("Using mock provider (real providers disabled in config)");

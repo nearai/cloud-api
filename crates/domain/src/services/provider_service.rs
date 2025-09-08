@@ -8,9 +8,10 @@ use tracing::{debug, error, info};
 use crate::{
     errors::CompletionError,
     models::*,
-    providers::{CompletionProvider, StreamChunk, vllm::VLlmProvider, ModelInfo, ApiConfig},
+    providers::{CompletionProvider, StreamChunk, vllm::VLlmProvider, ModelInfo},
     services::CompletionService,
 };
+use config::DomainConfig;
 
 // ============================================================================
 // Provider-based Completion Service
@@ -20,13 +21,11 @@ use crate::{
 pub struct ProviderService {
     providers: Vec<Arc<dyn CompletionProvider>>,
     model_mapping: HashMap<String, Arc<dyn CompletionProvider>>,
-    pub config: ApiConfig,
+    pub config: DomainConfig,
 }
 
 impl ProviderService {
-    pub fn new() -> Self {
-        let config = ApiConfig::load().expect("Failed to load configuration. Application cannot continue without a valid config file.");
-        
+    pub fn new(config: DomainConfig) -> Self {
         Self {
             providers: Vec::new(),
             model_mapping: HashMap::new(),
@@ -34,8 +33,8 @@ impl ProviderService {
         }
     }
     
-    /// Create a service from API configuration
-    pub fn from_api_config(config: ApiConfig) -> Self {
+    /// Create a service from domain configuration
+    pub fn from_domain_config(config: DomainConfig) -> Self {
         let mut service = Self {
             providers: Vec::new(),
             model_mapping: HashMap::new(),
@@ -179,16 +178,18 @@ impl CompletionService for ProviderService {
 // ============================================================================
 
 impl ProviderService {
-    /// Load service from configuration file  
+    /// Load service from configuration file using dependency injection 
     pub fn from_config_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
-        let config = ApiConfig::load_from_file(path)?;
-        Ok(Self::from_api_config(config))
+        let api_config = config::ApiConfig::load_from_file(path)?;
+        let domain_config = DomainConfig::from(api_config);
+        Ok(Self::from_domain_config(domain_config))
     }
     
-    /// Load service from default configuration
+    /// Load service from default configuration using dependency injection
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
-        let config = ApiConfig::load()?;
-        Ok(Self::from_api_config(config))
+        let api_config = config::ApiConfig::load()?;
+        let domain_config = DomainConfig::from(api_config);
+        Ok(Self::from_domain_config(domain_config))
     }
 }
 
@@ -198,16 +199,24 @@ mod tests {
 
     #[test]
     fn test_provider_service_creation() {
-        let service = ProviderService::new();
+        let config = DomainConfig {
+            use_mock: true,
+            providers: vec![],
+            model_discovery: config::ModelDiscoveryConfig {
+                refresh_interval: 300,
+                timeout: 30,
+            },
+        };
+        let service = ProviderService::new(config);
         assert_eq!(service.providers.len(), 0);
         assert_eq!(service.model_mapping.len(), 0);
     }
     
     #[test]
-    fn test_provider_service_from_api_config() {
-        use crate::providers::{ServerConfig, ModelDiscoveryConfig};
+    fn test_provider_service_from_domain_config() {
+        use config::{ProviderConfig, ModelDiscoveryConfig};
         
-        let config = ApiConfig {
+        let config = DomainConfig {
             use_mock: false,
             providers: vec![
                 ProviderConfig {
@@ -219,18 +228,13 @@ mod tests {
                     priority: 1,
                 },
             ],
-            server: ServerConfig {
-                host: "0.0.0.0".to_string(),
-                port: 3000,
-            },
             model_discovery: ModelDiscoveryConfig {
                 refresh_interval: 300,
                 timeout: 30,
             },
-            logging: crate::providers::LoggingConfig::default(),
         };
         
-        let service = ProviderService::from_api_config(config);
+        let service = ProviderService::from_domain_config(config);
         assert_eq!(service.providers.len(), 1);
         // Note: model_mapping is empty until discover_models() is called
     }

@@ -39,6 +39,7 @@ dependencies = [
  "anyhow",
  "axum",
  "axum-extra",
+ "config",
  "domain",
  "futures",
  "serde",
@@ -491,6 +492,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "config"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.16",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -585,12 +596,12 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "config",
  "futures",
  "httpmock",
  "reqwest",
  "serde",
  "serde_json",
- "serde_yaml",
  "thiserror 2.0.16",
  "tokio",
  "tokio-stream",

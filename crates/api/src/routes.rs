@@ -9,6 +9,18 @@ use std::sync::Arc;
 use futures::stream::StreamExt;
 use std::convert::Infallible;
 
+// ============================================================================
+// Error Handling Helpers
+// ============================================================================
+
+fn map_domain_error_to_status(error: &domain::CompletionError) -> StatusCode {
+    match error {
+        domain::CompletionError::InvalidModel(_) | domain::CompletionError::InvalidParams(_) => StatusCode::BAD_REQUEST,
+        domain::CompletionError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+        domain::CompletionError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 // Application state containing the domain service
 pub type AppState = Arc<Domain>;
 
@@ -88,11 +100,7 @@ pub async fn chat_completions(
                     .into_response()
             }
             Err(domain_error) => {
-                let status_code = match domain_error {
-                    domain::CompletionError::InvalidModel(_) | domain::CompletionError::InvalidParams(_) => StatusCode::BAD_REQUEST,
-                    domain::CompletionError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
-                    domain::CompletionError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
-                };
+                let status_code = map_domain_error_to_status(&domain_error);
                 (status_code, ResponseJson::<ErrorResponse>(domain_error.into())).into_response()
             }
         }
@@ -109,11 +117,7 @@ pub async fn chat_completions(
                 (StatusCode::OK, ResponseJson(response)).into_response()
             }
             Err(domain_error) => {
-                let status_code = match domain_error {
-                    domain::CompletionError::InvalidModel(_) | domain::CompletionError::InvalidParams(_) => StatusCode::BAD_REQUEST,
-                    domain::CompletionError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
-                    domain::CompletionError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
-                };
+                let status_code = map_domain_error_to_status(&domain_error);
                 (status_code, ResponseJson::<ErrorResponse>(domain_error.into())).into_response()
             }
         }
@@ -194,11 +198,7 @@ pub async fn completions(
                     .into_response()
             }
             Err(domain_error) => {
-                let status_code = match domain_error {
-                    domain::CompletionError::InvalidModel(_) | domain::CompletionError::InvalidParams(_) => StatusCode::BAD_REQUEST,
-                    domain::CompletionError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
-                    domain::CompletionError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
-                };
+                let status_code = map_domain_error_to_status(&domain_error);
                 (status_code, ResponseJson::<ErrorResponse>(domain_error.into())).into_response()
             }
         }
@@ -215,11 +215,7 @@ pub async fn completions(
                 (StatusCode::OK, ResponseJson(response)).into_response()
             }
             Err(domain_error) => {
-                let status_code = match domain_error {
-                    domain::CompletionError::InvalidModel(_) | domain::CompletionError::InvalidParams(_) => StatusCode::BAD_REQUEST,
-                    domain::CompletionError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
-                    domain::CompletionError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
-                };
+                let status_code = map_domain_error_to_status(&domain_error);
                 (status_code, ResponseJson::<ErrorResponse>(domain_error.into())).into_response()
             }
         }

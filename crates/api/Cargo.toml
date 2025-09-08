@@ -17,4 +17,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
+config = { path = "../config" }
 domain = { path = "../domain" }

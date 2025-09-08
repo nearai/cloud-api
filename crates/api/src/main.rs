@@ -1,17 +1,16 @@
 use axum::{
     routing::{get, post},
-    http::StatusCode,
-    Json, Router,
+    Router,
 };
-use serde::{Deserialize, Serialize};
 use api::routes::{chat_completions, completions, models};
 use domain::Domain;
+use config::{ApiConfig, LoggingConfig};
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
     // Load configuration first to get logging settings
-    let config = domain::providers::ApiConfig::load().unwrap_or_else(|e| {
+    let config = ApiConfig::load().unwrap_or_else(|e| {
         eprintln!("Failed to load configuration: {}", e);
         eprintln!("Application cannot start without a valid configuration file.");
         std::process::exit(1);
@@ -31,12 +30,8 @@ async fn main() {
     let server_config = domain.server_config().clone();
     let bind_address = format!("{}:{}", server_config.host, server_config.port);
 
-    // build our application with a route
+    // build our application with routes
     let app = Router::new()
-        // `GET /` goes to `root`
-        .route("/", get(root))
-        // `POST /users` goes to `create_user`
-        .route("/users", post(create_user))
         // AI completion endpoints
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
@@ -55,7 +50,7 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-fn init_tracing(logging_config: &domain::providers::LoggingConfig) {
+fn init_tracing(logging_config: &LoggingConfig) {
     // Build the filter string from the logging configuration
     let mut filter = logging_config.level.clone();
     
@@ -84,38 +79,4 @@ fn init_tracing(logging_config: &domain::providers::LoggingConfig) {
                 .init();
         },
     }
-}
-
-// basic handler that responds with a static string
-async fn root() -> &'static str {
-    "Hello, World!"
-}
-
-async fn create_user(
-    // this argument tells axum to parse the request body
-    // as JSON into a `CreateUser` type
-    Json(payload): Json<CreateUser>,
-) -> (StatusCode, Json<User>) {
-    // insert your application logic here
-    let user = User {
-        id: 1337,
-        username: payload.username,
-    };
-
-    // this will be converted into a JSON response
-    // with a status code of `201 Created`
-    (StatusCode::CREATED, Json(user))
-}
-
-// the input to our `create_user` handler
-#[derive(Deserialize)]
-struct CreateUser {
-    username: String,
-}
-
-// the output to our `create_user` handler
-#[derive(Serialize)]
-struct User {
-    id: u64,
-    username: String,
 }

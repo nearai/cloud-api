@@ -107,6 +107,8 @@ pub struct ApiConfig {
     pub providers: Vec<ProviderConfig>,
     pub server: ServerConfig,
     pub model_discovery: ModelDiscoveryConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +121,27 @@ pub struct ServerConfig {
 pub struct ModelDiscoveryConfig {
     pub refresh_interval: u64,  // seconds
     pub timeout: u64,          // seconds
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    pub level: String,
+    pub format: String,
+    pub modules: std::collections::HashMap<String, String>,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        let mut modules = std::collections::HashMap::new();
+        modules.insert("api".to_string(), "debug".to_string());
+        modules.insert("domain".to_string(), "debug".to_string());
+        
+        Self {
+            level: "info".to_string(),
+            format: "pretty".to_string(),
+            modules,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,18 +194,10 @@ impl ApiConfig {
             }
         }
         
-        // If no config file found, return default mock configuration
-        Ok(ApiConfig {
-            use_mock: true,
-            providers: vec![],
-            server: ServerConfig {
-                host: "0.0.0.0".to_string(),
-                port: 3000,
-            },
-            model_discovery: ModelDiscoveryConfig {
-                refresh_interval: 300,
-                timeout: 30,
-            },
-        })
+        // If no config file found, fail with descriptive error
+        Err(format!(
+            "Configuration file not found. Tried paths: {}. Please provide a valid config file.",
+            config_paths.join(", ")
+        ).into())
     }
 }

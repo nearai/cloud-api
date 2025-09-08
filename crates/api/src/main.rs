@@ -10,14 +10,21 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
-    // initialize tracing
-    tracing_subscriber::fmt::init();
+    // Load configuration first to get logging settings
+    let config = domain::providers::ApiConfig::load().unwrap_or_else(|e| {
+        eprintln!("Failed to load configuration: {}", e);
+        eprintln!("Application cannot start without a valid configuration file.");
+        std::process::exit(1);
+    });
+
+    // Initialize tracing with configuration from config.yaml
+    init_tracing(&config.logging);
 
     // Create the domain service from YAML configuration
     let domain = Arc::new(Domain::from_config().await.unwrap_or_else(|e| {
-        eprintln!("Failed to load configuration: {}", e);
-        eprintln!("Falling back to mock mode");
-        Domain::new()
+        tracing::error!(error = %e, "Failed to load domain configuration");
+        tracing::error!("Application cannot start without a valid configuration. Exiting.");
+        std::process::exit(1);
     }));
 
     // Get server config before moving domain into router state
@@ -40,11 +47,43 @@ async fn main() {
 
     // run our app with hyper, using configuration from domain
     let listener = tokio::net::TcpListener::bind(&bind_address).await.unwrap();
-    println!("🚀 Server listening on http://{}", bind_address);
-    println!("📡 Chat Completions: POST /v1/chat/completions");
-    println!("📝 Text Completions: POST /v1/completions");
-    println!("📋 Available Models: GET /v1/models");
+    tracing::info!(address = %bind_address, "Server started successfully");
+    tracing::info!("Available endpoints:");
+    tracing::info!("  - POST /v1/chat/completions (Chat Completions)");
+    tracing::info!("  - POST /v1/completions (Text Completions)");
+    tracing::info!("  - GET /v1/models (Available Models)");
     axum::serve(listener, app).await.unwrap();
+}
+
+fn init_tracing(logging_config: &domain::providers::LoggingConfig) {
+    // Build the filter string from the logging configuration
+    let mut filter = logging_config.level.clone();
+    
+    for (module, level) in &logging_config.modules {
+        filter.push_str(&format!(",{}={}", module, level));
+    }
+    
+    // Initialize tracing based on the format specified in config
+    match logging_config.format.as_str() {
+        "json" => {
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .init();
+        },
+        "compact" => {
+            tracing_subscriber::fmt()
+                .compact()
+                .with_env_filter(filter)
+                .init();
+        },
+        "pretty" | _ => {
+            tracing_subscriber::fmt()
+                .pretty()
+                .with_env_filter(filter)
+                .init();
+        },
+    }
 }
 
 // basic handler that responds with a static string

@@ -16,3 +16,13 @@ server:
 model_discovery:
   refresh_interval: 300  # 5 minutes
   timeout: 30           # 30 seconds
+
+logging:
+  level: "info"
+  format: "json"
+  modules:
+    api: "info"
+    domain: "info"
+    reqwest: "warn"
+    hyper: "warn"
+    tokio: "warn"

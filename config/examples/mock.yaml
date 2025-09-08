@@ -14,3 +14,10 @@ server:
 model_discovery:
   refresh_interval: 0
   timeout: 5
+
+logging:
+  level: "debug"
+  format: "pretty"
+  modules:
+    api: "trace"
+    domain: "debug"

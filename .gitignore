@@ -1,3 +1,4 @@
 target/
 config/config.yaml
 config/examples/production.yaml
+.cursor

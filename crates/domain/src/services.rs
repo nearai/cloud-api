@@ -175,7 +175,7 @@ impl Domain {
         let server_config = service.config.server.clone();
         
         if service.config.use_mock {
-            println!("🎭 Using mock provider (real providers disabled in config)");
+            tracing::info!("Using mock provider (real providers disabled in config)");
             return Ok(Self {
                 completion_service: Arc::new(MockCompletionService),
                 server_config,
@@ -188,20 +188,20 @@ impl Domain {
         match models {
             Ok(discovered_models) => {
                 if discovered_models.is_empty() {
-                    println!("⚠️  No models discovered, falling back to mock mode");
+                    tracing::warn!("No models discovered, falling back to mock mode");
                     return Ok(Self {
                         completion_service: Arc::new(MockCompletionService),
                         server_config,
                     });
                 }
                 
-                println!("📋 Discovered {} models:", discovered_models.len());
+                tracing::info!(count = discovered_models.len(), "Models discovered successfully");
                 for model in &discovered_models {
-                    println!("   - {} ({})", model.id, model.provider);
+                    tracing::info!(model_id = %model.id, provider = %model.provider, "Available model");
                 }
             }
             Err(e) => {
-                println!("⚠️  Model discovery failed: {}, falling back to mock mode", e);
+                tracing::warn!(error = %e, "Model discovery failed, falling back to mock mode");
                 return Ok(Self {
                     completion_service: Arc::new(MockCompletionService),
                     server_config,
@@ -221,7 +221,7 @@ impl Domain {
         let server_config = service.config.server.clone();
         
         if service.config.use_mock {
-            println!("🎭 Using mock provider (real providers disabled in config)");
+            tracing::info!("Using mock provider (real providers disabled in config)");
             return Ok(Self {
                 completion_service: Arc::new(MockCompletionService),
                 server_config,
@@ -234,20 +234,20 @@ impl Domain {
         match models {
             Ok(discovered_models) => {
                 if discovered_models.is_empty() {
-                    println!("⚠️  No models discovered, falling back to mock mode");
+                    tracing::warn!("No models discovered, falling back to mock mode");
                     return Ok(Self {
                         completion_service: Arc::new(MockCompletionService),
                         server_config,
                     });
                 }
                 
-                println!("📋 Discovered {} models:", discovered_models.len());
+                tracing::info!(count = discovered_models.len(), "Models discovered successfully");
                 for model in &discovered_models {
-                    println!("   - {} ({})", model.id, model.provider);
+                    tracing::info!(model_id = %model.id, provider = %model.provider, "Available model");
                 }
             }
             Err(e) => {
-                println!("⚠️  Model discovery failed: {}, falling back to mock mode", e);
+                tracing::warn!(error = %e, "Model discovery failed, falling back to mock mode");
                 return Ok(Self {
                     completion_service: Arc::new(MockCompletionService),
                     server_config,

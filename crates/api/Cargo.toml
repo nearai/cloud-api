@@ -14,7 +14,7 @@ serde_json = "1.0"
 futures = "0.3"
 tokio-stream = "0.1"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
 domain = { path = "../domain" }

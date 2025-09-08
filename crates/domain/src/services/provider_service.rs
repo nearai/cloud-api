@@ -8,7 +8,7 @@ use tracing::{debug, error, info};
 use crate::{
     errors::CompletionError,
     models::*,
-    providers::{CompletionProvider, StreamChunk, vllm::VLlmProvider, ModelInfo, ApiConfig, ProviderConfig},
+    providers::{CompletionProvider, StreamChunk, vllm::VLlmProvider, ModelInfo, ApiConfig},
     services::CompletionService,
 };
 
@@ -25,21 +25,7 @@ pub struct ProviderService {
 
 impl ProviderService {
     pub fn new() -> Self {
-        let config = ApiConfig::load().unwrap_or_else(|e| {
-            error!("Failed to load config: {}, using defaults", e);
-            ApiConfig {
-                use_mock: true,
-                providers: vec![],
-                server: crate::providers::ServerConfig {
-                    host: "0.0.0.0".to_string(),
-                    port: 3000,
-                },
-                model_discovery: crate::providers::ModelDiscoveryConfig {
-                    refresh_interval: 300,
-                    timeout: 30,
-                },
-            }
-        });
+        let config = ApiConfig::load().expect("Failed to load configuration. Application cannot continue without a valid config file.");
         
         Self {
             providers: Vec::new(),
@@ -241,6 +227,7 @@ mod tests {
                 refresh_interval: 300,
                 timeout: 30,
             },
+            logging: crate::providers::LoggingConfig::default(),
         };
         
         let service = ProviderService::from_api_config(config);

@@ -19,3 +19,8 @@ tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
 config = { path = "../config" }
 domain = { path = "../domain" }
+# Authentication dependencies
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.5", features = ["cors"] }
+uuid = { version = "1.5", features = ["v4"] }
+url = "2.5"

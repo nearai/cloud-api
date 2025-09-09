@@ -1,5 +1,6 @@
 # Mock Provider Configuration
 # Use for testing and development without real vLLM servers
+# No authentication required in this mode
 
 use_mock: true
 
@@ -21,3 +22,10 @@ logging:
   modules:
     api: "trace"
     domain: "debug"
+
+dstack_client:
+  url: "http://localhost:8000"
+
+# Authentication disabled for development
+auth:
+  enabled: false

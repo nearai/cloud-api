@@ -7,6 +7,7 @@
 //
 // The domain layer is technology-agnostic and focuses purely on business logic.
 
+pub mod auth;
 pub mod errors;
 pub mod models;
 pub mod providers;
@@ -24,3 +25,4 @@ pub use providers::{
 pub use services::{
     CompletionHandler, Domain, ProviderRouter, MockCompletionHandler
 };
+pub use auth::*;

@@ -1,13 +1,16 @@
+pub mod auth;
+
 use axum::{
-    extract::{Json, State},
+    extract::{Json, State, Extension},
     http::StatusCode,
     response::{Json as ResponseJson, sse::{Event, Sse}, IntoResponse},
 };
-use crate::{models::*, conversions::*};
+use crate::{models::*, conversions::*, middleware::AuthenticatedUser};
 use domain::{Domain, ChatCompletionParams, CompletionParams};
 use std::sync::Arc;
 use futures::stream::StreamExt;
 use std::convert::Infallible;
+use tracing::debug;
 
 fn map_domain_error_to_status(error: &domain::CompletionError) -> StatusCode {
     match error {
@@ -22,8 +25,12 @@ pub type AppState = Arc<Domain>;
 
 pub async fn chat_completions(
     State(domain): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
+    debug!("Chat completions request from user: {}", user.0.id);
+    debug!("Request model: {}, stream: {:?}, messages: {}", 
+        request.model, request.stream, request.messages.len());
     // Validate the request
     if let Err(error) = request.validate() {
         return (
@@ -122,8 +129,12 @@ pub async fn chat_completions(
 
 pub async fn completions(
     State(domain): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Json(request): Json<CompletionRequest>,
 ) -> axum::response::Response {
+    debug!("Text completions request from user: {}", user.0.id);
+    debug!("Request model: {}, stream: {:?}, prompt length: {} chars", 
+        request.model, request.stream, request.prompt.len());
     // Validate the request
     if let Err(error) = request.validate() {
         return (
@@ -220,7 +231,9 @@ pub async fn completions(
 
 pub async fn models(
     State(domain): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<ResponseJson<ModelsResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    debug!("Models list request from user: {}", user.0.id);
     match domain.get_available_models().await {
         Ok(models) => {
             let response = ModelsResponse {
@@ -245,7 +258,10 @@ pub async fn models(
 
 pub async fn quote(
     State(domain): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<ResponseJson<QuoteResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    debug!("TDX quote request from user: {}", user.0.id);
+    debug!("Admin endpoint accessed successfully");
     match domain.get_quote().await {
         Ok(quote_response) => {
             let response: QuoteResponse = quote_response.into();

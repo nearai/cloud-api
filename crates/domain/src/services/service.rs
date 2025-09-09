@@ -280,6 +280,7 @@ mod tests {
             dstack_client: config::DstackClientConfig {
                 url: "http://localhost:8000".to_string(),
             },
+            auth: config::AuthConfig::default(),
         };
         let service = ProviderRouter::new(config);
         assert_eq!(service.providers.len(), 0);
@@ -309,6 +310,7 @@ mod tests {
             dstack_client: config::DstackClientConfig {
                 url: "http://localhost:8000".to_string(),
             },
+            auth: config::AuthConfig::default(),
         };
         
         let service = ProviderRouter::from_domain_config(config);

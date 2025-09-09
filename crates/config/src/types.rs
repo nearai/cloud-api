@@ -10,6 +10,8 @@ pub struct ApiConfig {
     #[serde(default)]
     pub logging: LoggingConfig,
     pub dstack_client: DstackClientConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +70,41 @@ pub struct DomainConfig {
     pub providers: Vec<ProviderConfig>,
     pub model_discovery: ModelDiscoveryConfig,
     pub dstack_client: DstackClientConfig,
+    pub auth: AuthConfig,
+}
+
+// Simplified Authentication Configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub github: Option<GitHubOAuthConfig>,
+    #[serde(default)]
+    pub google: Option<GoogleOAuthConfig>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            github: None,
+            google: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubOAuthConfig {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoogleOAuthConfig {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_url: String,
 }
 
 impl From<ApiConfig> for DomainConfig {
@@ -77,6 +114,7 @@ impl From<ApiConfig> for DomainConfig {
             providers: api_config.providers,
             model_discovery: api_config.model_discovery,
             dstack_client: api_config.dstack_client,
+            auth: api_config.auth,
         }
     }
 }

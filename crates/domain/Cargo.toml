@@ -12,6 +12,7 @@ async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 config = { path = "../config" }
+database = { path = "../database" }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures = "0.3"
@@ -24,6 +25,8 @@ hex = "0.4"
 oauth2 = { version = "4.4", features = ["reqwest"] }
 url = "2.5"
 uuid = { version = "1.5", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0"
 
 [dev-dependencies]
 # HTTP mocking library for testing streaming responses

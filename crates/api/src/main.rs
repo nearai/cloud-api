@@ -4,8 +4,9 @@ use axum::{
     Router,
 };
 use api::{
-    middleware::auth_middleware,
+    middleware::{auth_middleware, AuthState},
     routes::{
+        api::build_api_router,
         chat_completions, completions, models, quote,
         auth::{github_login, google_login, oauth_callback, current_user, logout, auth_success, login_page, StateStore},
     },
@@ -42,13 +43,24 @@ async fn main() {
     let oauth_manager = if config.auth.enabled {
         tracing::info!("Authentication enabled, setting up OAuth providers");
         
-        let manager = OAuthManager::new(
-            config.auth.github.clone(),
-            config.auth.google.clone(),
+        let github_config = config.auth.github.clone()
+            .map(|c| config::OAuthProviderConfig::from(c));
+        let google_config = config.auth.google.clone()
+            .map(|c| config::OAuthProviderConfig::from(c));
+        
+        let mut manager = OAuthManager::new(
+            github_config,
+            google_config,
         ).unwrap_or_else(|e| {
             tracing::error!("Failed to create OAuth manager: {}", e);
             std::process::exit(1);
         });
+        
+        // Set database if available
+        if let Some(ref db) = domain.database {
+            manager = manager.with_database(db.clone());
+            tracing::info!("OAuth manager configured with database support");
+        }
         
         if config.auth.github.is_some() {
             tracing::info!("GitHub OAuth configured");
@@ -64,8 +76,14 @@ async fn main() {
         Arc::new(OAuthManager::new(None, None).unwrap())
     };
 
-    let sessions = oauth_manager.sessions.clone();
+    let _sessions = oauth_manager.sessions.clone();
     let state_store: StateStore = Arc::new(RwLock::new(HashMap::new()));
+    
+    // Create AuthState for middleware
+    let auth_state_middleware = AuthState::new(
+        oauth_manager.clone(),
+        domain.database.clone(),
+    );
 
     // Build authentication routes with combined state
     let auth_state = (oauth_manager.clone(), state_store.clone());
@@ -74,19 +92,19 @@ async fn main() {
         .route("/github", get(github_login))
         .route("/google", get(google_login))
         .route("/callback", get(oauth_callback))
-        .route("/user", get(current_user).layer(from_fn_with_state(sessions.clone(), auth_middleware)))
+        .route("/user", get(current_user).layer(from_fn_with_state(auth_state_middleware.clone(), auth_middleware)))
         .route("/logout", post(logout))
         .route("/success", get(auth_success))
         .with_state(auth_state);
 
-    // Build API routes with authentication
-    let v1_routes = if config.auth.enabled {
+    // Build API routes for completions
+    let completion_routes = if config.auth.enabled {
         Router::new()
             .route("/chat/completions", post(chat_completions))
             .route("/completions", post(completions))
             .route("/models", get(models))
             .route("/quote", get(quote))
-            .layer(from_fn_with_state(sessions.clone(), auth_middleware))
+            .layer(from_fn_with_state(auth_state_middleware.clone(), auth_middleware))
     } else {
         // No auth middleware when disabled
         Router::new()
@@ -96,10 +114,26 @@ async fn main() {
             .route("/quote", get(quote))
     };
     
+    // Build management API routes (orgs, teams, users)
+    let management_routes = if let Some(ref db) = domain.database {
+        Some(build_api_router(
+            db.clone(),
+            auth_state_middleware.clone(),
+            config.auth.enabled,
+        ))
+    } else {
+        None
+    };
+    
     // Build the final application
-    let app = Router::new()
+    let mut app = Router::new()
         .nest("/auth", auth_routes)
-        .nest("/v1", v1_routes.with_state(domain));
+        .nest("/v1", completion_routes.with_state(domain.clone()));
+    
+    // Add management routes if database is available
+    if let Some(mgmt_routes) = management_routes {
+        app = app.nest("/api/v1", mgmt_routes);
+    }
 
     // Start periodic session cleanup
     if config.auth.enabled {
@@ -139,6 +173,25 @@ async fn main() {
     tracing::info!("  - POST /v1/completions (Text Completions)");
     tracing::info!("  - GET /v1/models (Available Models)");
     tracing::info!("  - GET /v1/quote (TDX Quote & Attestation)");
+    
+    if domain.database.is_some() {
+        tracing::info!("");
+        tracing::info!("Management API Endpoints:");
+        tracing::info!("  Organizations:");
+        tracing::info!("    - GET/POST /api/v1/organizations");
+        tracing::info!("    - GET/PUT/DELETE /api/v1/organizations/:id");
+        tracing::info!("    - GET/POST /api/v1/organizations/:id/members");
+        tracing::info!("    - GET/POST /api/v1/organizations/:id/teams");
+        tracing::info!("    - GET/POST /api/v1/organizations/:id/api-keys");
+        tracing::info!("  Teams:");
+        tracing::info!("    - GET/PUT/DELETE /api/v1/teams/:id");
+        tracing::info!("    - GET/POST /api/v1/teams/:id/members");
+        tracing::info!("  Users:");
+        tracing::info!("    - GET /api/v1/users/me (Current user)");
+        tracing::info!("    - GET /api/v1/users/me/personal-org");
+        tracing::info!("    - GET /api/v1/users/me/organizations");
+        tracing::info!("    - GET /api/v1/users/:id/teams");
+    }
     
     axum::serve(listener, app).await.unwrap();
 }

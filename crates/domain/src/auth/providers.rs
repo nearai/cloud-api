@@ -210,7 +210,7 @@ impl OAuthManager {
         let session = AuthSession {
             session_id: session_id.clone(),
             user: User {
-                id: user_info.id,
+                id: user_info.sub.clone(),
                 email: user_info.email,
                 provider: "google".to_string(),
             },
@@ -334,9 +334,15 @@ impl OAuthManager {
 }
 
 #[derive(Deserialize)]
-struct GitHubUser {
-    id: u64,
-    email: Option<String>,
+pub struct GitHubUser {
+    pub id: u64,
+    pub email: Option<String>,
+    #[serde(default)]
+    pub login: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -346,14 +352,83 @@ struct GitHubEmail {
 }
 
 #[derive(Debug, Deserialize)]
-struct GoogleUser {
+pub struct GoogleUser {
     #[serde(alias = "sub", alias = "id")]
-    id: String,
-    email: String,
+    pub sub: String,
+    pub email: String,
     #[serde(default)]
-    verified_email: Option<bool>,
+    pub verified_email: Option<bool>,
     #[serde(default)]
-    name: Option<String>,
+    pub name: Option<String>,
     #[serde(default)]
-    picture: Option<String>,
+    pub picture: Option<String>,
+}
+
+/// Helper function to fetch GitHub user information
+pub async fn fetch_github_user(access_token: &str) -> Result<GitHubUser, AuthError> {
+    let client = Client::new();
+    let response = client
+        .get("https://api.github.com/user")
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("User-Agent", "platform-api")
+        .send()
+        .await
+        .map_err(|e| AuthError::NetworkError(format!("Failed to fetch GitHub user: {}", e)))?;
+
+    if !response.status().is_success() {
+        return Err(AuthError::AuthFailed(format!(
+            "GitHub API returned status: {}",
+            response.status()
+        )));
+    }
+
+    let mut user: GitHubUser = response.json().await
+        .map_err(|e| AuthError::AuthFailed(format!("Failed to parse GitHub user: {}", e)))?;
+
+    // If no public email, fetch from emails endpoint
+    if user.email.is_none() {
+        let emails_response = client
+            .get("https://api.github.com/user/emails")
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("User-Agent", "platform-api")
+            .send()
+            .await
+            .map_err(|e| AuthError::NetworkError(format!("Failed to fetch GitHub emails: {}", e)))?;
+
+        if emails_response.status().is_success() {
+            let emails: Vec<GitHubEmail> = emails_response.json().await
+                .map_err(|e| AuthError::AuthFailed(format!("Failed to parse GitHub emails: {}", e)))?;
+            
+            // Get primary email
+            if let Some(primary) = emails.iter().find(|e| e.primary) {
+                user.email = Some(primary.email.clone());
+            } else if let Some(first) = emails.first() {
+                user.email = Some(first.email.clone());
+            }
+        }
+    }
+
+    Ok(user)
+}
+
+/// Helper function to fetch Google user information
+pub async fn fetch_google_user(access_token: &str) -> Result<GoogleUser, AuthError> {
+    let client = Client::new();
+    let response = client
+        .get("https://www.googleapis.com/oauth2/v2/userinfo")
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await
+        .map_err(|e| AuthError::NetworkError(format!("Failed to fetch Google user: {}", e)))?;
+
+    if !response.status().is_success() {
+        let error_text = response.text().await.unwrap_or_default();
+        return Err(AuthError::AuthFailed(format!(
+            "Google API returned error: {}",
+            error_text
+        )));
+    }
+
+    response.json().await
+        .map_err(|e| AuthError::AuthFailed(format!("Failed to parse Google user: {}", e)))
 }

@@ -1,5 +1,6 @@
 pub mod service;
 pub mod mock;
+pub mod user_service;
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -11,9 +12,11 @@ use crate::{
     providers::StreamChunk,
 };
 use config::ServerConfig;
+use database::Database;
 
 pub use service::ProviderRouter;
 pub use mock::{MockCompletionHandler, MockTdxHandler};
+pub use user_service::UserService;
 
 #[async_trait]
 pub trait CompletionHandler: Send + Sync {
@@ -52,6 +55,7 @@ pub struct Domain {
     completion_handler: Arc<dyn CompletionHandler>,
     tdx_handler: Arc<dyn TdxHandler>,
     server_config: ServerConfig,
+    pub database: Option<Arc<Database>>,
 }
 
 impl Domain {
@@ -63,6 +67,7 @@ impl Domain {
                 host: "0.0.0.0".to_string(),
                 port: 3000,
             },
+            database: None,
         }
     }
     
@@ -82,6 +87,25 @@ impl Domain {
         let api_config = config::ApiConfig::load()?;
         let server_config = api_config.server.clone();
         
+        // Initialize database if configured
+        let database = {
+            let db_config = database::DatabaseConfig::default();
+            match Database::from_config(&db_config).await {
+                Ok(db) => {
+                    // Run migrations
+                    if let Err(e) = db.run_migrations().await {
+                        tracing::warn!("Failed to run database migrations: {}", e);
+                    }
+                    tracing::info!("Database initialized successfully");
+                    Some(Arc::new(db))
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to initialize database: {}. Running without database support.", e);
+                    None
+                }
+            }
+        };
+        
         let mut service = ProviderRouter::load()?;
         let _tdx_handler = MockTdxHandler;
         
@@ -91,6 +115,7 @@ impl Domain {
                 completion_handler: Arc::new(MockCompletionHandler),
                 tdx_handler: Arc::new(MockTdxHandler),
                 server_config,
+                database,
             });
         }
         
@@ -105,6 +130,7 @@ impl Domain {
                         completion_handler: Arc::new(MockCompletionHandler),
                         tdx_handler: Arc::new(MockTdxHandler),
                         server_config,
+                        database,
                     });
                 }
                 
@@ -119,6 +145,7 @@ impl Domain {
                     completion_handler: Arc::new(MockCompletionHandler),
                     tdx_handler: Arc::new(MockTdxHandler),
                     server_config,
+                    database,
                 });
             }
         }
@@ -127,6 +154,7 @@ impl Domain {
             completion_handler: Arc::new(service),
             tdx_handler: Arc::new(MockTdxHandler),
             server_config,
+            database,
         })
     }
     
@@ -138,6 +166,7 @@ impl Domain {
                 host: "0.0.0.0".to_string(),
                 port: 3000,
             },
+            database: None,
         }
     }
 

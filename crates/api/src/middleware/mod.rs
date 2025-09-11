@@ -8,6 +8,6 @@ pub mod auth;
 // Re-export commonly used items
 pub use auth::{
     auth_middleware, 
-    optional_auth_middleware, 
     AuthenticatedUser,
+    AuthState,
 };

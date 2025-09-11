@@ -156,7 +156,7 @@ pub async fn current_user(
     Json(AuthResponse {
         message: "Authenticated".to_string(),
         email: user.0.email.clone(),
-        provider: user.0.provider.clone(),
+        provider: user.0.auth_provider.clone(),
     })
 }
 

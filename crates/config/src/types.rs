@@ -107,6 +107,34 @@ pub struct GoogleOAuthConfig {
     pub redirect_url: String,
 }
 
+// Generic OAuth provider config for unified handling
+#[derive(Debug, Clone)]
+pub struct OAuthProviderConfig {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+}
+
+impl From<GitHubOAuthConfig> for OAuthProviderConfig {
+    fn from(config: GitHubOAuthConfig) -> Self {
+        Self {
+            client_id: config.client_id,
+            client_secret: config.client_secret,
+            redirect_uri: config.redirect_url,
+        }
+    }
+}
+
+impl From<GoogleOAuthConfig> for OAuthProviderConfig {
+    fn from(config: GoogleOAuthConfig) -> Self {
+        Self {
+            client_id: config.client_id,
+            client_secret: config.client_secret,
+            redirect_uri: config.redirect_url,
+        }
+    }
+}
+
 impl From<ApiConfig> for DomainConfig {
     fn from(api_config: ApiConfig) -> Self {
         Self {

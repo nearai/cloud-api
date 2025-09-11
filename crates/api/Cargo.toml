@@ -21,10 +21,10 @@ config = { path = "../config" }
 domain = { path = "../domain" }
 database = { path = "../database" }
 # Authentication dependencies
-tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.5", features = ["cors"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1.5", features = ["v4"] }
 url = "2.5"
 chrono = { version = "0.4", features = ["serde"] }
 # For TypedHeader support
-headers = "0.3"
+headers = "0.4"

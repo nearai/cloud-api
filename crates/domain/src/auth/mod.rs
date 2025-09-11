@@ -8,6 +8,9 @@ use oauth2::{
     basic::BasicClient, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
     PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenUrl, TokenResponse,
 };
+
+// Type alias for a fully configured OAuth client
+type ConfiguredClient = oauth2::Client<oauth2::basic::BasicErrorResponse, oauth2::basic::BasicTokenResponse, oauth2::basic::BasicTokenIntrospectionResponse, oauth2::StandardRevocableToken, oauth2::basic::BasicRevocationErrorResponse, oauth2::EndpointSet, oauth2::EndpointNotSet, oauth2::EndpointNotSet, oauth2::EndpointNotSet, oauth2::EndpointSet>;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -16,8 +19,8 @@ use uuid::Uuid;
 
 /// OAuth Manager handles authentication flows
 pub struct OAuthManager {
-    github_client: Option<BasicClient>,
-    google_client: Option<BasicClient>,
+    github_client: Option<ConfiguredClient>,
+    google_client: Option<ConfiguredClient>,
     pub sessions: Arc<RwLock<HashMap<String, types::AuthSession>>>,
     database: Option<Arc<Database>>,
 }
@@ -51,41 +54,39 @@ impl OAuthManager {
     }
 
     /// Create GitHub OAuth client
-    fn create_github_client(config: OAuthProviderConfig) -> Result<BasicClient, AuthError> {
-        let client = BasicClient::new(
-            ClientId::new(config.client_id),
-            Some(ClientSecret::new(config.client_secret)),
-            AuthUrl::new("https://github.com/login/oauth/authorize".to_string())
-                .map_err(|e| AuthError::ConfigError(e.to_string()))?,
-            Some(
-                TokenUrl::new("https://github.com/login/oauth/access_token".to_string())
+    fn create_github_client(config: OAuthProviderConfig) -> Result<ConfiguredClient, AuthError> {
+        let auth_url = AuthUrl::new("https://github.com/login/oauth/authorize".to_string())
+            .map_err(|e| AuthError::ConfigError(e.to_string()))?;
+        let token_url = TokenUrl::new("https://github.com/login/oauth/access_token".to_string())
+            .map_err(|e| AuthError::ConfigError(e.to_string()))?;
+        
+        let client = BasicClient::new(ClientId::new(config.client_id))
+            .set_client_secret(ClientSecret::new(config.client_secret))
+            .set_auth_uri(auth_url)
+            .set_token_uri(token_url)
+            .set_redirect_uri(
+                RedirectUrl::new(config.redirect_uri)
                     .map_err(|e| AuthError::ConfigError(e.to_string()))?,
-            ),
-        )
-        .set_redirect_uri(
-            RedirectUrl::new(config.redirect_uri)
-                .map_err(|e| AuthError::ConfigError(e.to_string()))?,
-        );
+            );
 
         Ok(client)
     }
 
     /// Create Google OAuth client
-    fn create_google_client(config: OAuthProviderConfig) -> Result<BasicClient, AuthError> {
-        let client = BasicClient::new(
-            ClientId::new(config.client_id),
-            Some(ClientSecret::new(config.client_secret)),
-            AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string())
-                .map_err(|e| AuthError::ConfigError(e.to_string()))?,
-            Some(
-                TokenUrl::new("https://oauth2.googleapis.com/token".to_string())
+    fn create_google_client(config: OAuthProviderConfig) -> Result<ConfiguredClient, AuthError> {
+        let auth_url = AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string())
+            .map_err(|e| AuthError::ConfigError(e.to_string()))?;
+        let token_url = TokenUrl::new("https://oauth2.googleapis.com/token".to_string())
+            .map_err(|e| AuthError::ConfigError(e.to_string()))?;
+        
+        let client = BasicClient::new(ClientId::new(config.client_id))
+            .set_client_secret(ClientSecret::new(config.client_secret))
+            .set_auth_uri(auth_url)
+            .set_token_uri(token_url)
+            .set_redirect_uri(
+                RedirectUrl::new(config.redirect_uri)
                     .map_err(|e| AuthError::ConfigError(e.to_string()))?,
-            ),
-        )
-        .set_redirect_uri(
-            RedirectUrl::new(config.redirect_uri)
-                .map_err(|e| AuthError::ConfigError(e.to_string()))?,
-        );
+            );
 
         Ok(client)
     }
@@ -145,7 +146,7 @@ impl OAuthManager {
         // Exchange code for token
         let token_result = client
             .exchange_code(AuthorizationCode::new(code))
-            .request_async(oauth2::reqwest::async_http_client)
+            .request_async(&reqwest::Client::new())
             .await
             .map_err(|e| AuthError::OAuthError(e.to_string()))?;
 
@@ -227,7 +228,7 @@ impl OAuthManager {
         let token_result = client
             .exchange_code(AuthorizationCode::new(code))
             .set_pkce_verifier(PkceCodeVerifier::new(pkce_verifier))
-            .request_async(oauth2::reqwest::async_http_client)
+            .request_async(&reqwest::Client::new())
             .await
             .map_err(|e| AuthError::OAuthError(e.to_string()))?;
 

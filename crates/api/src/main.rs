@@ -125,15 +125,17 @@ async fn main() {
         None
     };
     
-    // Build the final application
-    let mut app = Router::new()
-        .nest("/auth", auth_routes)
-        .nest("/v1", completion_routes.with_state(domain.clone()));
-    
-    // Add management routes if database is available
-    if let Some(mgmt_routes) = management_routes {
-        app = app.nest("/api/v1", mgmt_routes);
-    }
+    // Build the final application with consistent /v1/* routing
+    let app = Router::new()
+        .nest("/v1", Router::new()
+            .nest("/auth", auth_routes)
+            .merge(completion_routes.with_state(domain.clone()))
+            .merge(if let Some(mgmt_routes) = management_routes {
+                mgmt_routes
+            } else {
+                Router::new()
+            })
+        );
 
     // Start periodic session cleanup
     if config.auth.enabled {
@@ -156,16 +158,16 @@ async fn main() {
     
     if config.auth.enabled {
         tracing::info!("OAuth Endpoints:");
-        tracing::info!("  - GET /auth/login (Login page)");
+        tracing::info!("  - GET /v1/auth/login (Login page)");
         if config.auth.github.is_some() {
-            tracing::info!("  - GET /auth/github (Redirect to GitHub OAuth)");
+            tracing::info!("  - GET /v1/auth/github (Redirect to GitHub OAuth)");
         }
         if config.auth.google.is_some() {
-            tracing::info!("  - GET /auth/google (Redirect to Google OAuth)");
+            tracing::info!("  - GET /v1/auth/google (Redirect to Google OAuth)");
         }
-        tracing::info!("  - GET /auth/callback (OAuth callback)");
-        tracing::info!("  - GET /auth/user (Current user info)");
-        tracing::info!("  - POST /auth/logout (Logout)");
+        tracing::info!("  - GET /v1/auth/callback (OAuth callback)");
+        tracing::info!("  - GET /v1/auth/user (Current user info)");
+        tracing::info!("  - POST /v1/auth/logout (Logout)");
     }
     
     tracing::info!("API Endpoints:");
@@ -178,19 +180,19 @@ async fn main() {
         tracing::info!("");
         tracing::info!("Management API Endpoints:");
         tracing::info!("  Organizations:");
-        tracing::info!("    - GET/POST /api/v1/organizations");
-        tracing::info!("    - GET/PUT/DELETE /api/v1/organizations/:id");
-        tracing::info!("    - GET/POST /api/v1/organizations/:id/members");
-        tracing::info!("    - GET/POST /api/v1/organizations/:id/teams");
-        tracing::info!("    - GET/POST /api/v1/organizations/:id/api-keys");
+        tracing::info!("    - GET/POST /v1/organizations");
+        tracing::info!("    - GET/PUT/DELETE /v1/organizations/:id");
+        tracing::info!("    - GET/POST /v1/organizations/:id/members");
+        tracing::info!("    - GET/POST /v1/organizations/:id/teams");
+        tracing::info!("    - GET/POST /v1/organizations/:id/api-keys");
         tracing::info!("  Teams:");
-        tracing::info!("    - GET/PUT/DELETE /api/v1/teams/:id");
-        tracing::info!("    - GET/POST /api/v1/teams/:id/members");
+        tracing::info!("    - GET/PUT/DELETE /v1/teams/:id");
+        tracing::info!("    - GET/POST /v1/teams/:id/members");
         tracing::info!("  Users:");
-        tracing::info!("    - GET /api/v1/users/me (Current user)");
-        tracing::info!("    - GET /api/v1/users/me/personal-org");
-        tracing::info!("    - GET /api/v1/users/me/organizations");
-        tracing::info!("    - GET /api/v1/users/:id/teams");
+        tracing::info!("    - GET /v1/users/me (Current user)");
+        tracing::info!("    - GET /v1/users/me/personal-org");
+        tracing::info!("    - GET /v1/users/me/organizations");
+        tracing::info!("    - GET /v1/users/:id/teams");
     }
     
     axum::serve(listener, app).await.unwrap();

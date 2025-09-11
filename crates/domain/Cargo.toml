@@ -22,7 +22,7 @@ bytes = "1.5"
 dstack-sdk = "0.1"
 hex = "0.4"
 # OAuth2 authentication
-oauth2 = { version = "4.4", features = ["reqwest"] }
+oauth2 = { version = "5", features = ["reqwest"] }
 url = "2.5"
 uuid = { version = "1.5", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }

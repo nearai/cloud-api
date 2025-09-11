@@ -1,9 +1,3 @@
-pub mod api;
-pub mod auth;
-pub mod organizations;
-pub mod organization_members;
-pub mod users;
-
 use axum::{
     extract::{Json, State, Extension},
     http::StatusCode,

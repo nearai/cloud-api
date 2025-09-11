@@ -6,11 +6,13 @@
 use super::types::{AuthError, User, AuthSession};
 use config::{GitHubOAuthConfig, GoogleOAuthConfig};
 use oauth2::basic::BasicClient;
-use oauth2::reqwest::async_http_client;
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, 
     PkceCodeChallenge, RedirectUrl, Scope, TokenResponse, TokenUrl,
 };
+
+// Type alias for a fully configured OAuth client
+type ConfiguredClient = oauth2::Client<oauth2::basic::BasicErrorResponse, oauth2::basic::BasicTokenResponse, oauth2::basic::BasicTokenIntrospectionResponse, oauth2::StandardRevocableToken, oauth2::basic::BasicRevocationErrorResponse, oauth2::EndpointSet, oauth2::EndpointNotSet, oauth2::EndpointNotSet, oauth2::EndpointNotSet, oauth2::EndpointSet>;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -25,8 +27,8 @@ pub type SessionStore = Arc<RwLock<HashMap<String, AuthSession>>>;
 
 /// OAuth2 authentication manager
 pub struct OAuthManager {
-    github_client: Option<BasicClient>,
-    google_client: Option<BasicClient>,
+    github_client: Option<ConfiguredClient>,
+    google_client: Option<ConfiguredClient>,
     pub sessions: SessionStore,
     http_client: Client,
 }
@@ -56,44 +58,40 @@ impl OAuthManager {
         })
     }
 
-    fn create_github_client(config: GitHubOAuthConfig) -> Result<BasicClient, AuthError> {
+    fn create_github_client(config: GitHubOAuthConfig) -> Result<ConfiguredClient, AuthError> {
         let auth_url = AuthUrl::new("https://github.com/login/oauth/authorize".to_string())
             .map_err(|e| AuthError::ConfigError(format!("Invalid GitHub auth URL: {}", e)))?;
         
         let token_url = TokenUrl::new("https://github.com/login/oauth/access_token".to_string())
             .map_err(|e| AuthError::ConfigError(format!("Invalid GitHub token URL: {}", e)))?;
 
-        let client = BasicClient::new(
-            ClientId::new(config.client_id),
-            Some(ClientSecret::new(config.client_secret)),
-            auth_url,
-            Some(token_url),
-        )
-        .set_redirect_uri(
-            RedirectUrl::new(config.redirect_url)
-                .map_err(|e| AuthError::ConfigError(format!("Invalid redirect URL: {}", e)))?,
-        );
+        let client = BasicClient::new(ClientId::new(config.client_id))
+            .set_client_secret(ClientSecret::new(config.client_secret))
+            .set_auth_uri(auth_url)
+            .set_token_uri(token_url)
+            .set_redirect_uri(
+                RedirectUrl::new(config.redirect_url)
+                    .map_err(|e| AuthError::ConfigError(format!("Invalid redirect URL: {}", e)))?,
+            );
 
         Ok(client)
     }
 
-    fn create_google_client(config: GoogleOAuthConfig) -> Result<BasicClient, AuthError> {
+    fn create_google_client(config: GoogleOAuthConfig) -> Result<ConfiguredClient, AuthError> {
         let auth_url = AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string())
             .map_err(|e| AuthError::ConfigError(format!("Invalid Google auth URL: {}", e)))?;
         
         let token_url = TokenUrl::new("https://www.googleapis.com/oauth2/v3/token".to_string())
             .map_err(|e| AuthError::ConfigError(format!("Invalid Google token URL: {}", e)))?;
 
-        let client = BasicClient::new(
-            ClientId::new(config.client_id),
-            Some(ClientSecret::new(config.client_secret)),
-            auth_url,
-            Some(token_url),
-        )
-        .set_redirect_uri(
-            RedirectUrl::new(config.redirect_url)
-                .map_err(|e| AuthError::ConfigError(format!("Invalid redirect URL: {}", e)))?,
-        );
+        let client = BasicClient::new(ClientId::new(config.client_id))
+            .set_client_secret(ClientSecret::new(config.client_secret))
+            .set_auth_uri(auth_url)
+            .set_token_uri(token_url)
+            .set_redirect_uri(
+                RedirectUrl::new(config.redirect_url)
+                    .map_err(|e| AuthError::ConfigError(format!("Invalid redirect URL: {}", e)))?,
+            );
 
         Ok(client)
     }
@@ -142,7 +140,7 @@ impl OAuthManager {
         // Exchange code for token
         let token = client
             .exchange_code(AuthorizationCode::new(code))
-            .request_async(async_http_client)
+            .request_async(&self.http_client)
             .await
             .map_err(|e| AuthError::OAuthError(format!("Token exchange failed: {}", e)))?;
 
@@ -196,7 +194,7 @@ impl OAuthManager {
         let token = client
             .exchange_code(AuthorizationCode::new(code))
             .set_pkce_verifier(pkce_verifier)
-            .request_async(async_http_client)
+            .request_async(&self.http_client)
             .await
             .map_err(|e| AuthError::OAuthError(format!("Token exchange failed: {}", e)))?;
 

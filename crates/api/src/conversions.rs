@@ -7,10 +7,13 @@ impl From<&crate::models::Message> for domain::ChatMessage {
                 "system" => domain::MessageRole::System,
                 "user" => domain::MessageRole::User,
                 "assistant" => domain::MessageRole::Assistant,
+                "tool" => domain::MessageRole::Tool,
                 _ => domain::MessageRole::User, // Default to user for unknown roles
             },
-            content: msg.content.clone(),
+            content: Some(msg.content.clone()),
             name: msg.name.clone(),
+            tool_call_id: None,
+            tool_calls: None,
         }
     }
 }
@@ -25,6 +28,7 @@ impl From<&ChatCompletionRequest> for domain::ChatCompletionParams {
             top_p: req.top_p,
             stop_sequences: req.stop.clone(),
             stream: req.stream,
+            tools: None, // TODO: Add tools support to API request
         }
     }
 }
@@ -50,8 +54,9 @@ impl From<&domain::ChatMessage> for crate::models::Message {
                 domain::MessageRole::System => "system".to_string(),
                 domain::MessageRole::User => "user".to_string(),
                 domain::MessageRole::Assistant => "assistant".to_string(),
+                domain::MessageRole::Tool => "tool".to_string(),
             },
-            content: msg.content.clone(),
+            content: msg.content.clone().unwrap_or_default(),
             name: msg.name.clone(),
         }
     }
@@ -213,7 +218,7 @@ mod tests {
         
         let domain_msg: domain::ChatMessage = (&http_msg).into();
         assert!(matches!(domain_msg.role, domain::MessageRole::User));
-        assert_eq!(domain_msg.content, "Hello");
+        assert_eq!(domain_msg.content, Some("Hello".to_string()));
         
         let back_to_http: crate::models::Message = (&domain_msg).into();
         assert_eq!(back_to_http.role, "user");

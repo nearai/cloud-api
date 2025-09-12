@@ -6,7 +6,7 @@ use axum::{
 use api::{
     middleware::{auth_middleware, AuthState},
     routes::{
-        api::build_api_router,
+        api::{build_api_router, AppState},
         chat_completions, completions, models, quote,
         auth::{github_login, google_login, oauth_callback, current_user, logout, auth_success, login_page, StateStore},
     },
@@ -114,10 +114,18 @@ async fn main() {
             .route("/quote", get(quote))
     };
     
-    // Build management API routes (orgs, teams, users)
+    // Build management API routes (orgs, teams, users)  
     let management_routes = if let Some(ref db) = domain.database {
+        // Create shared MCP client manager
+        let mcp_manager = Arc::new(domain::mcp::McpClientManager::new());
+        
+        let app_state = AppState {
+            db: db.clone(),
+            mcp_manager,
+        };
+        
         Some(build_api_router(
-            db.clone(),
+            app_state,
             auth_state_middleware.clone(),
             config.auth.enabled,
         ))

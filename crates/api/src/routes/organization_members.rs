@@ -3,14 +3,13 @@ use axum::{
     http::StatusCode,
 };
 use database::{
-    Database, OrganizationMember, OrganizationRole,
+    OrganizationMember, OrganizationRole,
     AddOrganizationMemberRequest, UpdateOrganizationMemberRequest,
 };
 use serde::Serialize;
-use std::sync::Arc;
 use uuid::Uuid;
 use tracing::{debug, error};
-use crate::middleware::AuthenticatedUser;
+use crate::{middleware::AuthenticatedUser, routes::api::AppState};
 
 #[derive(Debug, Serialize)]
 pub struct OrganizationMemberWithUser {
@@ -21,7 +20,7 @@ pub struct OrganizationMemberWithUser {
 
 /// Add a member to an organization
 pub async fn add_organization_member(
-    State(db): State<Arc<Database>>,
+    State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
     Json(request): Json<AddOrganizationMemberRequest>,
@@ -29,7 +28,7 @@ pub async fn add_organization_member(
     debug!("Adding member to organization: {} by user: {}", org_id, user.0.id);
     
     // Check if user has permission to add members (must be owner or admin)
-    match db.organizations.get_member(org_id, user.0.id).await {
+    match app_state.db.organizations.get_member(org_id, user.0.id).await {
         Ok(Some(member)) => {
             if !member.role.can_manage_members() {
                 return Err(StatusCode::FORBIDDEN);
@@ -43,11 +42,11 @@ pub async fn add_organization_member(
     }
     
     // Verify the user to be added exists
-    if let Ok(None) = db.users.get_by_id(request.user_id).await {
+    if let Ok(None) = app_state.db.users.get_by_id(request.user_id).await {
         return Err(StatusCode::NOT_FOUND);
     }
     
-    match db.organizations.add_member(org_id, request, user.0.id).await {
+    match app_state.db.organizations.add_member(org_id, request, user.0.id).await {
         Ok(member) => Ok(Json(member)),
         Err(e) => {
             if e.to_string().contains("already a member") {
@@ -62,7 +61,7 @@ pub async fn add_organization_member(
 
 /// Update an organization member's role
 pub async fn update_organization_member(
-    State(db): State<Arc<Database>>,
+    State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path((org_id, user_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<UpdateOrganizationMemberRequest>,
@@ -70,7 +69,7 @@ pub async fn update_organization_member(
     debug!("Updating member {} in organization: {} by user: {}", user_id, org_id, user.0.id);
     
     // Check if user has permission to update members
-    match db.organizations.get_member(org_id, user.0.id).await {
+    match app_state.db.organizations.get_member(org_id, user.0.id).await {
         Ok(Some(member)) => {
             if !member.role.can_manage_members() {
                 return Err(StatusCode::FORBIDDEN);
@@ -88,7 +87,7 @@ pub async fn update_organization_member(
         }
     }
     
-    match db.organizations.update_member(org_id, user_id, request).await {
+    match app_state.db.organizations.update_member(org_id, user_id, request).await {
         Ok(member) => Ok(Json(member)),
         Err(e) => {
             error!("Failed to update organization member: {}", e);
@@ -99,14 +98,14 @@ pub async fn update_organization_member(
 
 /// Remove a member from an organization
 pub async fn remove_organization_member(
-    State(db): State<Arc<Database>>,
+    State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path((org_id, user_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
     debug!("Removing member {} from organization: {} by user: {}", user_id, org_id, user.0.id);
     
     // Check if user has permission to remove members
-    match db.organizations.get_member(org_id, user.0.id).await {
+    match app_state.db.organizations.get_member(org_id, user.0.id).await {
         Ok(Some(member)) => {
             if !member.role.can_manage_members() {
                 // Allow members to remove themselves (leave organization)
@@ -123,7 +122,7 @@ pub async fn remove_organization_member(
     }
     
     // Prevent removing the last owner
-    if let Ok(members) = db.organizations.list_members(org_id).await {
+    if let Ok(members) = app_state.db.organizations.list_members(org_id).await {
         let owner_count = members.iter()
             .filter(|m| matches!(m.role, OrganizationRole::Owner))
             .count();
@@ -139,7 +138,7 @@ pub async fn remove_organization_member(
     }
     
     
-    match db.organizations.remove_member(org_id, user_id).await {
+    match app_state.db.organizations.remove_member(org_id, user_id).await {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
@@ -151,14 +150,14 @@ pub async fn remove_organization_member(
 
 /// List organization members
 pub async fn list_organization_members(
-    State(db): State<Arc<Database>>,
+    State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
 ) -> Result<Json<Vec<OrganizationMemberWithUser>>, StatusCode> {
     debug!("Listing members for organization: {} for user: {}", org_id, user.0.id);
     
     // Check if user has access to this organization
-    match db.organizations.get_member(org_id, user.0.id).await {
+    match app_state.db.organizations.get_member(org_id, user.0.id).await {
         Ok(Some(_)) => {
             // User is a member, allow access
         }
@@ -170,7 +169,7 @@ pub async fn list_organization_members(
     }
     
     // Get organization members
-    let members = match db.organizations.list_members(org_id).await {
+    let members = match app_state.db.organizations.list_members(org_id).await {
         Ok(members) => members,
         Err(e) => {
             error!("Failed to list organization members: {}", e);
@@ -181,7 +180,7 @@ pub async fn list_organization_members(
     // Get user details for each member
     let mut members_with_users = Vec::new();
     for member in members {
-        if let Ok(Some(user_data)) = db.users.get_by_id(member.user_id).await {
+        if let Ok(Some(user_data)) = app_state.db.users.get_by_id(member.user_id).await {
             members_with_users.push(OrganizationMemberWithUser {
                 member,
                 user: user_data,
@@ -194,13 +193,13 @@ pub async fn list_organization_members(
 
 /// Get current user's role in an organization
 pub async fn get_my_organization_role(
-    State(db): State<Arc<Database>>,
+    State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
 ) -> Result<Json<OrganizationMember>, StatusCode> {
     debug!("Getting role for user: {} in organization: {}", user.0.id, org_id);
     
-    match db.organizations.get_member(org_id, user.0.id).await {
+    match app_state.db.organizations.get_member(org_id, user.0.id).await {
         Ok(Some(member)) => Ok(Json(member)),
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(e) => {

@@ -152,4 +152,97 @@ impl OrganizationRole {
     pub fn can_delete_organization(&self) -> bool {
         matches!(self, OrganizationRole::Owner)
     }
+    
+    pub fn can_manage_mcp_connectors(&self) -> bool {
+        matches!(self, OrganizationRole::Owner | OrganizationRole::Admin)
+    }
+}
+
+/// MCP Connector Authentication Type
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpAuthType {
+    None,
+    Bearer,
+}
+
+impl std::fmt::Display for McpAuthType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            McpAuthType::None => write!(f, "none"),
+            McpAuthType::Bearer => write!(f, "bearer"),
+        }
+    }
+}
+
+/// MCP Connector Status
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpConnectionStatus {
+    Pending,
+    Connected,
+    Failed,
+}
+
+/// MCP Connector model - external MCP server configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpConnector {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub mcp_server_url: String,
+    pub auth_type: McpAuthType,
+    pub auth_config: Option<serde_json::Value>,
+    pub is_active: bool,
+    pub created_by: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub last_connected_at: Option<DateTime<Utc>>,
+    pub connection_status: McpConnectionStatus,
+    pub error_message: Option<String>,
+    pub capabilities: Option<serde_json::Value>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Bearer token configuration for MCP connectors
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpBearerConfig {
+    pub token: String,
+}
+
+/// Create MCP Connector Request
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateMcpConnectorRequest {
+    pub name: String,
+    pub description: Option<String>,
+    pub mcp_server_url: String,
+    pub auth_type: McpAuthType,
+    pub bearer_token: Option<String>, // Required if auth_type is Bearer
+}
+
+/// Update MCP Connector Request
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateMcpConnectorRequest {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub mcp_server_url: Option<String>,
+    pub auth_type: Option<McpAuthType>,
+    pub bearer_token: Option<String>,
+    pub is_active: Option<bool>,
+}
+
+/// MCP Connector Usage Log
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpConnectorUsage {
+    pub id: Uuid,
+    pub connector_id: Uuid,
+    pub user_id: Uuid,
+    pub method: String,
+    pub request_payload: Option<serde_json::Value>,
+    pub response_payload: Option<serde_json::Value>,
+    pub status_code: Option<i32>,
+    pub error_message: Option<String>,
+    pub duration_ms: Option<i32>,
+    pub created_at: DateTime<Utc>,
 }

@@ -1,5 +1,6 @@
 pub mod service;
 pub mod mock;
+pub mod mcp_handler;
 pub mod user_service;
 
 use async_trait::async_trait;
@@ -16,6 +17,7 @@ use database::Database;
 
 pub use service::ProviderRouter;
 pub use mock::{MockCompletionHandler, MockTdxHandler};
+pub use mcp_handler::McpCompletionHandler;
 pub use user_service::UserService;
 
 #[async_trait]
@@ -111,8 +113,15 @@ impl Domain {
         
         if service.config.use_mock {
             tracing::info!("Using mock provider (real providers disabled in config)");
+            let handler: Arc<dyn CompletionHandler> = Arc::new(MockCompletionHandler);
+            // Wrap with MCP handler if database is available
+            let completion_handler = if database.is_some() {
+                Arc::new(McpCompletionHandler::new(handler, database.clone()))
+            } else {
+                handler
+            };
             return Ok(Self {
-                completion_handler: Arc::new(MockCompletionHandler),
+                completion_handler,
                 tdx_handler: Arc::new(MockTdxHandler),
                 server_config,
                 database,
@@ -126,8 +135,15 @@ impl Domain {
             Ok(discovered_models) => {
                 if discovered_models.is_empty() {
                     tracing::warn!("No models discovered, falling back to mock mode");
+                    let handler: Arc<dyn CompletionHandler> = Arc::new(MockCompletionHandler);
+                    // Wrap with MCP handler if database is available
+                    let completion_handler = if database.is_some() {
+                        Arc::new(McpCompletionHandler::new(handler, database.clone()))
+                    } else {
+                        handler
+                    };
                     return Ok(Self {
-                        completion_handler: Arc::new(MockCompletionHandler),
+                        completion_handler,
                         tdx_handler: Arc::new(MockTdxHandler),
                         server_config,
                         database,
@@ -141,8 +157,15 @@ impl Domain {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Model discovery failed, falling back to mock mode");
+                let handler: Arc<dyn CompletionHandler> = Arc::new(MockCompletionHandler);
+                // Wrap with MCP handler if database is available
+                let completion_handler = if database.is_some() {
+                    Arc::new(McpCompletionHandler::new(handler, database.clone()))
+                } else {
+                    handler
+                };
                 return Ok(Self {
-                    completion_handler: Arc::new(MockCompletionHandler),
+                    completion_handler,
                     tdx_handler: Arc::new(MockTdxHandler),
                     server_config,
                     database,
@@ -150,8 +173,16 @@ impl Domain {
             }
         }
         
+        let handler: Arc<dyn CompletionHandler> = Arc::new(service);
+        // Wrap with MCP handler if database is available
+        let completion_handler = if database.is_some() {
+            Arc::new(McpCompletionHandler::new(handler, database.clone()))
+        } else {
+            handler
+        };
+        
         Ok(Self {
-            completion_handler: Arc::new(service),
+            completion_handler,
             tdx_handler: Arc::new(MockTdxHandler),
             server_config,
             database,
@@ -209,14 +240,17 @@ mod tests {
             model_id: "gpt-3.5-turbo".to_string(),
             messages: vec![ChatMessage {
                 role: MessageRole::User,
-                content: "Hello there!".to_string(),
+                content: Some("Hello there!".to_string()),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             }],
             max_tokens: Some(100),
             temperature: Some(0.7),
             top_p: Some(1.0),
             stop_sequences: None,
             stream: None,
+            tools: None,
         };
 
         let result = domain.chat_completion(params).await;
@@ -224,7 +258,7 @@ mod tests {
         
         let completion = result.unwrap();
         assert!(matches!(completion.message.role, MessageRole::Assistant));
-        assert!(!completion.message.content.is_empty());
+        assert!(completion.message.content.is_some());
         assert!(completion.usage.total_tokens > 0);
     }
 
@@ -256,14 +290,17 @@ mod tests {
             model_id: "".to_string(),
             messages: vec![ChatMessage {
                 role: MessageRole::User,
-                content: "Hello".to_string(),
+                content: Some("Hello".to_string()),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             }],
             max_tokens: Some(100),
             temperature: Some(0.7),
             top_p: Some(1.0),
             stop_sequences: None,
             stream: None,
+            tools: None,
         };
 
         let result = domain.chat_completion(params).await;
@@ -286,35 +323,41 @@ mod tests {
             model_id: "test".to_string(),
             messages: vec![ChatMessage {
                 role: MessageRole::User,
-                content: "Hello".to_string(),
+                content: Some("Hello".to_string()),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             }],
             max_tokens: None,
             temperature: None,
             top_p: None,
             stop_sequences: None,
             stream: None,
+            tools: None,
         };
         
         let result = service.chat_completion(params).await.unwrap();
-        assert!(result.message.content.contains("Hello! How can I assist"));
+        assert!(result.message.content.as_ref().unwrap().contains("Hello! How can I assist"));
         
         // Test weather response
         let params = ChatCompletionParams {
             model_id: "test".to_string(),
             messages: vec![ChatMessage {
                 role: MessageRole::User,
-                content: "What's the weather?".to_string(),
+                content: Some("What's the weather?".to_string()),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             }],
             max_tokens: None,
             temperature: None,
             top_p: None,
             stop_sequences: None,
             stream: None,
+            tools: None,
         };
         
         let result = service.chat_completion(params).await.unwrap();
-        assert!(result.message.content.contains("weather data"));
+        assert!(result.message.content.as_ref().unwrap().contains("weather data"));
     }
 }

@@ -1,6 +1,7 @@
 pub mod api;
 pub mod auth;
 pub mod completions;
+pub mod mcp_connectors;
 pub mod organizations;
 pub mod organization_members;
 pub mod users;

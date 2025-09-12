@@ -97,6 +97,25 @@ impl OrganizationRepository {
         }
     }
 
+    /// Get organization member by user ID
+    pub async fn get_member(&self, organization_id: Uuid, user_id: Uuid) -> Result<Option<OrganizationMember>> {
+        let client = self.pool.get().await
+            .context("Failed to get database connection")?;
+        
+        let row = client.query_opt(
+            r#"
+            SELECT * FROM organization_members 
+            WHERE organization_id = $1 AND user_id = $2
+            "#,
+            &[&organization_id, &user_id],
+        ).await.context("Failed to query organization member")?;
+        
+        match row {
+            Some(row) => Ok(Some(self.row_to_org_member(row)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Update an organization
     pub async fn update(&self, id: Uuid, request: UpdateOrganizationRequest) -> Result<Organization> {
         let client = self.pool.get().await
@@ -239,22 +258,6 @@ impl OrganizationRepository {
         ).await.context("Failed to count organization members")?;
         
         Ok(row.get("count"))
-    }
-
-    /// Get organization member by user ID
-    pub async fn get_member(&self, org_id: Uuid, user_id: Uuid) -> Result<Option<OrganizationMember>> {
-        let client = self.pool.get().await
-            .context("Failed to get database connection")?;
-        
-        let row = client.query_opt(
-            "SELECT * FROM organization_members WHERE organization_id = $1 AND user_id = $2",
-            &[&org_id, &user_id],
-        ).await.context("Failed to query organization member")?;
-        
-        match row {
-            Some(row) => Ok(Some(self.row_to_org_member(row)?)),
-            None => Ok(None),
-        }
     }
 
     // Helper function to convert database row to Organization

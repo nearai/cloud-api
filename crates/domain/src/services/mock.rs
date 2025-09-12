@@ -33,24 +33,29 @@ impl CompletionHandler for MockCompletionHandler {
 
         // Get the last user message to respond to
         let last_message = params.messages.last().unwrap();
-        let response_content = match &last_message.content.to_lowercase() {
+        let message_content = last_message.content.as_ref()
+            .map(|s| s.as_str())
+            .unwrap_or("empty");
+        let response_content = match &message_content.to_lowercase() {
             content if content.contains("hello") => "Hello! How can I assist you today?".to_string(),
             content if content.contains("weather") => "I don't have access to real-time weather data, but I'd be happy to help with other questions!".to_string(),
             content if content.contains("help") => "I'm here to help! Please let me know what you need assistance with.".to_string(),
-            _ => format!("I understand you're asking about: '{}'. This is a mock response from the completion service.", last_message.content),
+            _ => format!("I understand you're asking about: '{}'. This is a mock response from the completion service.", message_content),
         };
 
         // Mock token calculation (simple heuristic)
         let prompt_tokens = params.messages.iter()
-            .map(|m| m.content.split_whitespace().count() as u32)
+            .map(|m| m.content.as_ref().map_or(0, |c| c.split_whitespace().count()) as u32)
             .sum::<u32>() + 10; // +10 for system overhead
         let completion_tokens = response_content.split_whitespace().count() as u32;
 
         Ok(ChatCompletionResult {
             message: ChatMessage {
                 role: MessageRole::Assistant,
-                content: response_content,
+                content: Some(response_content),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             },
             finish_reason: FinishReason::Stop,
             usage: TokenUsage {

@@ -1,0 +1,1565 @@
+{
+	"info": {
+		"_postman_id": "mcp-platform-api-collection",
+		"name": "MCP Platform API",
+		"description": "Complete API collection for testing the MCP (Model Context Protocol) Platform. This collection includes all endpoints for authentication, completions, organizations, users, and MCP connector management.\n\n## Setup Instructions\n1. Import this collection into Postman\n2. Set the collection variables (baseUrl, authToken, orgId, etc.)\n3. Start with 'Health Check' to verify API connectivity\n4. Use 'Auth > Get User Info' to verify authentication\n5. Get your organization ID from 'Users > Get User Organizations'\n\n## Key Features\n- Complete endpoint coverage\n- Environment variables for easy configuration\n- Real-world examples and workflows\n- Error testing scenarios\n- MCP integration examples",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "Health & Models",
+			"item": [
+				{
+					"name": "Health Check / List Models",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/models",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"models"
+							]
+						},
+						"description": "Check API health and list available models"
+					}
+				},
+				{
+					"name": "Get Quote (TDX)",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/quote",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"quote"
+							]
+						},
+						"description": "Get TDX quote and attestation information"
+					}
+				}
+			],
+			"description": "Basic health checks and model information"
+		},
+		{
+			"name": "Authentication",
+			"item": [
+				{
+					"name": "Get User Info",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/auth/user",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"auth",
+								"user"
+							]
+						},
+						"description": "Get current authenticated user information"
+					}
+				},
+				{
+					"name": "Login Page",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/auth/login",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"auth",
+								"login"
+							]
+						},
+						"description": "Get login page (redirect to OAuth provider)"
+					}
+				},
+				{
+					"name": "GitHub OAuth Login",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/auth/github",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"auth",
+								"github"
+							]
+						},
+						"description": "Initiate GitHub OAuth login flow"
+					}
+				},
+				{
+					"name": "Google OAuth Login",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/auth/google",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"auth",
+								"google"
+							]
+						},
+						"description": "Initiate Google OAuth login flow"
+					}
+				},
+				{
+					"name": "Logout",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/auth/logout",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"auth",
+								"logout"
+							]
+						},
+						"description": "Logout current user session"
+					}
+				}
+			],
+			"description": "Authentication and user session management"
+		},
+		{
+			"name": "Completions",
+			"item": [
+				{
+					"name": "Chat Completion - Basic",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"{{model}}\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Hello, how are you?\"\n    }\n  ],\n  \"max_tokens\": 150,\n  \"temperature\": 0.7\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/chat/completions",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"chat",
+								"completions"
+							]
+						},
+						"description": "Basic chat completion request"
+					}
+				},
+				{
+					"name": "Chat Completion - With System Message",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"{{model}}\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a helpful AI assistant specializing in weather information.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"What's the weather like in San Francisco?\"\n    }\n  ],\n  \"max_tokens\": 200,\n  \"temperature\": 0.5\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/chat/completions",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"chat",
+								"completions"
+							]
+						},
+						"description": "Chat completion with system message"
+					}
+				},
+				{
+					"name": "Chat Completion - Streaming",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Accept",
+								"value": "text/event-stream",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"{{model}}\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Tell me a short story about AI and weather.\"\n    }\n  ],\n  \"stream\": true,\n  \"max_tokens\": 300\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/chat/completions",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"chat",
+								"completions"
+							]
+						},
+						"description": "Streaming chat completion"
+					}
+				},
+				{
+					"name": "Chat Completion - MCP Tool Request",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"{{model}}\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Please check the current weather in New York City. Use any available weather tools if possible.\"\n    }\n  ],\n  \"max_tokens\": 250,\n  \"temperature\": 0.3\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/chat/completions",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"chat",
+								"completions"
+							]
+						},
+						"description": "Chat completion that may trigger MCP tool usage"
+					}
+				},
+				{
+					"name": "Text Completion - Basic",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"{{model}}\",\n  \"prompt\": \"The future of artificial intelligence is\",\n  \"max_tokens\": 100,\n  \"temperature\": 0.8\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/completions",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"completions"
+							]
+						},
+						"description": "Basic text completion"
+					}
+				},
+				{
+					"name": "Text Completion - Streaming",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Accept",
+								"value": "text/event-stream",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"{{model}}\",\n  \"prompt\": \"Once upon a time, in a world where weather could be controlled,\",\n  \"stream\": true,\n  \"max_tokens\": 200,\n  \"temperature\": 0.9\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/completions",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"completions"
+							]
+						},
+						"description": "Streaming text completion"
+					}
+				}
+			],
+			"description": "Chat and text completion endpoints"
+		},
+		{
+			"name": "Organizations",
+			"item": [
+				{
+					"name": "List Organizations",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/organizations",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations"
+							]
+						},
+						"description": "List all organizations user has access to"
+					}
+				},
+				{
+					"name": "Get Organization",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}"
+							]
+						},
+						"description": "Get specific organization details"
+					}
+				},
+				{
+					"name": "Create Organization",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"name\": \"my-test-org\",\n  \"display_name\": \"My Test Organization\",\n  \"description\": \"A test organization for MCP platform testing\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/organizations",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations"
+							]
+						},
+						"description": "Create a new organization"
+					}
+				},
+				{
+					"name": "Update Organization",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"display_name\": \"Updated Organization Name\",\n  \"description\": \"Updated description\",\n  \"rate_limit\": 1000\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}"
+							]
+						},
+						"description": "Update organization details"
+					}
+				},
+				{
+					"name": "List Organization Members",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/members",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"members"
+							]
+						},
+						"description": "List all members of an organization"
+					}
+				},
+				{
+					"name": "List Organization API Keys",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/api-keys",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"api-keys"
+							]
+						},
+						"description": "List organization API keys"
+					}
+				},
+				{
+					"name": "Create Organization API Key",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"name\": \"Test API Key\",\n  \"expires_in_days\": 90\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/api-keys",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"api-keys"
+							]
+						},
+						"description": "Create a new API key for the organization"
+					}
+				}
+			],
+			"description": "Organization management endpoints"
+		},
+		{
+			"name": "Users",
+			"item": [
+				{
+					"name": "Get Current User",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/users/me",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"users",
+								"me"
+							]
+						},
+						"description": "Get current user profile"
+					}
+				},
+				{
+					"name": "Get User Organizations",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/users/me/organizations",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"users",
+								"me",
+								"organizations"
+							]
+						},
+						"description": "Get current user's organizations - use this to get orgId"
+					}
+				},
+				{
+					"name": "Update User Profile",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"display_name\": \"Updated Display Name\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/users/me/profile",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"users",
+								"me",
+								"profile"
+							]
+						},
+						"description": "Update current user profile"
+					}
+				},
+				{
+					"name": "Search Users",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/users/search?q=john@example.com",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"users",
+								"search"
+							],
+							"query": [
+								{
+									"key": "q",
+									"value": "john@example.com"
+								}
+							]
+						},
+						"description": "Search users (admin only)"
+					}
+				}
+			],
+			"description": "User management endpoints"
+		},
+		{
+			"name": "MCP Connectors",
+			"item": [
+				{
+					"name": "List MCP Connectors",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/mcp-connectors",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"mcp-connectors"
+							]
+						},
+						"description": "List all MCP connectors for the organization"
+					}
+				},
+				{
+					"name": "Get MCP Connector",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/mcp-connectors/{{connectorId}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"mcp-connectors",
+								"{{connectorId}}"
+							]
+						},
+						"description": "Get specific MCP connector details"
+					}
+				},
+				{
+					"name": "Create MCP Connector - With Bearer Token",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"name\": \"Weather Service\",\n  \"description\": \"OpenWeather API integration for real-time weather data\",\n  \"mcp_server_url\": \"https://api.openweathermap.org/mcp\",\n  \"auth_type\": \"bearer\",\n  \"bearer_token\": \"your_openweather_api_key_here\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/mcp-connectors",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"mcp-connectors"
+							]
+						},
+						"description": "Create MCP connector with bearer token authentication"
+					}
+				},
+				{
+					"name": "Create MCP Connector - No Auth",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"name\": \"Public Data Service\",\n  \"description\": \"Free public API for testing\",\n  \"mcp_server_url\": \"https://httpbin.org/json\",\n  \"auth_type\": \"none\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/mcp-connectors",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"mcp-connectors"
+							]
+						},
+						"description": "Create MCP connector without authentication"
+					}
+				},
+				{
+					"name": "Create MCP Connector - Mock Testing",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"name\": \"Mock Weather Testing\",\n  \"description\": \"Mock service for testing MCP integration\",\n  \"mcp_server_url\": \"https://api.github.com\",\n  \"auth_type\": \"bearer\",\n  \"bearer_token\": \"github_token_for_testing\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/mcp-connectors",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"mcp-connectors"
+							]
+						},
+						"description": "Create mock MCP connector for testing purposes"
+					}
+				},
+				{
+					"name": "Update MCP Connector",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"description\": \"Updated description for the connector\",\n  \"is_active\": true,\n  \"bearer_token\": \"new_updated_token_here\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/mcp-connectors/{{connectorId}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"mcp-connectors",
+								"{{connectorId}}"
+							]
+						},
+						"description": "Update MCP connector settings"
+					}
+				},
+				{
+					"name": "Delete MCP Connector",
+					"request": {
+						"method": "DELETE",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/mcp-connectors/{{connectorId}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"mcp-connectors",
+								"{{connectorId}}"
+							]
+						},
+						"description": "Delete MCP connector"
+					}
+				}
+			],
+			"description": "MCP connector management (create, read, update, delete)"
+		},
+		{
+			"name": "MCP Tools & Testing",
+			"item": [
+				{
+					"name": "Test MCP Connector Connection",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/mcp-connectors/{{connectorId}}/test",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"mcp-connectors",
+								"{{connectorId}}",
+								"test"
+							]
+						},
+						"description": "Test connectivity and capabilities of MCP connector"
+					}
+				},
+				{
+					"name": "List Available Tools",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/mcp-connectors/{{connectorId}}/tools",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"mcp-connectors",
+								"{{connectorId}}",
+								"tools"
+							]
+						},
+						"description": "List all tools available from this MCP connector"
+					}
+				},
+				{
+					"name": "Call Tool - Weather Example",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"tool_name\": \"get_current_weather\",\n  \"arguments\": {\n    \"location\": \"San Francisco, CA\",\n    \"units\": \"celsius\"\n  }\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/mcp-connectors/{{connectorId}}/tools/call",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"mcp-connectors",
+								"{{connectorId}}",
+								"tools",
+								"call"
+							]
+						},
+						"description": "Call a weather tool directly"
+					}
+				},
+				{
+					"name": "Call Tool - Generic Data Fetch",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"tool_name\": \"fetch_data\",\n  \"arguments\": {\n    \"endpoint\": \"/api/data\",\n    \"format\": \"json\"\n  }\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/mcp-connectors/{{connectorId}}/tools/call",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"mcp-connectors",
+								"{{connectorId}}",
+								"tools",
+								"call"
+							]
+						},
+						"description": "Call a generic data fetch tool"
+					}
+				},
+				{
+					"name": "Call Tool - Complex Arguments",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"tool_name\": \"search_locations\",\n  \"arguments\": {\n    \"query\": \"weather stations\",\n    \"filters\": {\n      \"country\": \"US\",\n      \"state\": \"CA\",\n      \"active\": true\n    },\n    \"limit\": 10,\n    \"coordinates\": {\n      \"lat\": 37.7749,\n      \"lon\": -122.4194\n    }\n  }\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/mcp-connectors/{{connectorId}}/tools/call",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"mcp-connectors",
+								"{{connectorId}}",
+								"tools",
+								"call"
+							]
+						},
+						"description": "Call tool with complex nested arguments"
+					}
+				},
+				{
+					"name": "Get Usage Logs",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/mcp-connectors/{{connectorId}}/usage?limit=10",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"mcp-connectors",
+								"{{connectorId}}",
+								"usage"
+							],
+							"query": [
+								{
+									"key": "limit",
+									"value": "10"
+								}
+							]
+						},
+						"description": "Get usage logs for this connector"
+					}
+				}
+			],
+			"description": "Test MCP connector functionality and view usage logs"
+		},
+		{
+			"name": "Integration Examples",
+			"item": [
+				{
+					"name": "Weather Integration Chat",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"{{model}}\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a helpful weather assistant. Use available weather tools to provide accurate, real-time weather information.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"What's the weather like in Tokyo and London right now? Compare the temperatures.\"\n    }\n  ],\n  \"max_tokens\": 300,\n  \"temperature\": 0.3\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/chat/completions",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"chat",
+								"completions"
+							]
+						},
+						"description": "Chat that automatically uses weather MCP tools"
+					}
+				},
+				{
+					"name": "Multi-Tool Planning Chat",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"{{model}}\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"I'm planning a trip to San Francisco next week. Can you check the weather forecast and also look up any local events or attractions I should know about?\"\n    }\n  ],\n  \"max_tokens\": 400,\n  \"temperature\": 0.5\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/chat/completions",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"chat",
+								"completions"
+							]
+						},
+						"description": "Chat that might use multiple MCP connectors"
+					}
+				},
+				{
+					"name": "Customer Service Chat",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"{{model}}\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a customer service assistant. Use available customer database tools to look up account information when helping customers.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Hi, I'm John Smith and I need help with my account. My email is john.smith@example.com\"\n    }\n  ],\n  \"max_tokens\": 400\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/chat/completions",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"chat",
+								"completions"
+							]
+						},
+						"description": "Customer service chat with database lookup tools"
+					}
+				},
+				{
+					"name": "Business Assistant Chat",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"{{model}}\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a comprehensive business assistant with access to weather, calendar, and database tools. Provide helpful, accurate responses using available tools when appropriate.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"I have a client meeting in Chicago tomorrow. Can you check the weather, see if there are any scheduling conflicts, and look up the client's recent order history?\"\n    }\n  ],\n  \"max_tokens\": 500,\n  \"temperature\": 0.2\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/chat/completions",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"chat",
+								"completions"
+							]
+						},
+						"description": "Multi-modal business assistant using multiple tools"
+					}
+				},
+				{
+					"name": "Create GitHub Integration",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"name\": \"GitHub Code Analysis\",\n  \"description\": \"Analyze code repositories and pull requests\",\n  \"mcp_server_url\": \"https://api.github.com/mcp\",\n  \"auth_type\": \"bearer\",\n  \"bearer_token\": \"{{githubToken}}\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/mcp-connectors",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"mcp-connectors"
+							]
+						},
+						"description": "Create GitHub MCP connector for code analysis"
+					}
+				}
+			],
+			"description": "Real-world integration examples and workflows"
+		},
+		{
+			"name": "Error Testing",
+			"item": [
+				{
+					"name": "Invalid Auth Token",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer invalid_token_here",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/organizations",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations"
+							]
+						},
+						"description": "Test with invalid authentication token"
+					}
+				},
+				{
+					"name": "Missing Auth Header",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/organizations",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations"
+							]
+						},
+						"description": "Test without authentication header"
+					}
+				},
+				{
+					"name": "Non-existent Organization",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/organizations/00000000-0000-0000-0000-000000000000/mcp-connectors",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"00000000-0000-0000-0000-000000000000",
+								"mcp-connectors"
+							]
+						},
+						"description": "Test with non-existent organization ID"
+					}
+				},
+				{
+					"name": "Invalid UUID Format",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/organizations/not-a-uuid/mcp-connectors",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"not-a-uuid",
+								"mcp-connectors"
+							]
+						},
+						"description": "Test with malformed UUID"
+					}
+				},
+				{
+					"name": "Create Connector - Missing Fields",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"description\": \"Missing name and URL\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/mcp-connectors",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"mcp-connectors"
+							]
+						},
+						"description": "Test connector creation with missing required fields"
+					}
+				},
+				{
+					"name": "Create Connector - Invalid Auth Type",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"name\": \"Invalid Auth Test\",\n  \"mcp_server_url\": \"https://example.com\",\n  \"auth_type\": \"invalid_auth_type\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/mcp-connectors",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"mcp-connectors"
+							]
+						},
+						"description": "Test with invalid authentication type"
+					}
+				},
+				{
+					"name": "Call Non-existent Tool",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"tool_name\": \"nonexistent_tool\",\n  \"arguments\": {\n    \"test\": \"value\"\n  }\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/organizations/{{orgId}}/mcp-connectors/{{connectorId}}/tools/call",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"organizations",
+								"{{orgId}}",
+								"mcp-connectors",
+								"{{connectorId}}",
+								"tools",
+								"call"
+							]
+						},
+						"description": "Test calling a tool that doesn't exist"
+					}
+				},
+				{
+					"name": "Invalid Model Name",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"nonexistent-model\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Test message\"\n    }\n  ]\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/chat/completions",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"chat",
+								"completions"
+							]
+						},
+						"description": "Test with non-existent model name"
+					}
+				}
+			],
+			"description": "Error conditions and edge case testing"
+		}
+	],
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:3000/v1",
+			"type": "string"
+		},
+		{
+			"key": "authToken",
+			"value": "sess_03ce637cae3e4bc5869ef37140a2e23e",
+			"type": "string"
+		},
+		{
+			"key": "model",
+			"value": "deepseek-ai/DeepSeek-V3.1",
+			"type": "string"
+		},
+		{
+			"key": "orgId",
+			"value": "your_org_id_here",
+			"type": "string"
+		},
+		{
+			"key": "connectorId",
+			"value": "your_connector_id_here",
+			"type": "string"
+		},
+		{
+			"key": "githubToken",
+			"value": "your_github_token_here",
+			"type": "string"
+		}
+	]
+}

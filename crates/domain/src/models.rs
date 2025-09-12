@@ -3,9 +3,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: MessageRole,
-    pub content: String,
+    pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +18,39 @@ pub enum MessageRole {
     System,
     User,
     Assistant,
+    Tool,
+}
+
+/// Tool call in a message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub function: FunctionCall,
+}
+
+/// Function call details
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: Option<String>,
+}
+
+/// Tool definition for available tools
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub function: FunctionDefinition,
+}
+
+/// Function definition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionDefinition {
+    pub name: String,
+    pub description: Option<String>,
+    pub parameters: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +62,8 @@ pub struct ChatCompletionParams {
     pub top_p: Option<f32>,
     pub stop_sequences: Option<Vec<String>>,
     pub stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolDefinition>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,12 +160,14 @@ mod tests {
     fn test_message_creation() {
         let message = ChatMessage {
             role: MessageRole::User,
-            content: "Hello, world!".to_string(),
+            content: Some("Hello, world!".to_string()),
             name: Some("test_user".to_string()),
+            tool_call_id: None,
+            tool_calls: None,
         };
         
         assert!(matches!(message.role, MessageRole::User));
-        assert_eq!(message.content, "Hello, world!");
+        assert_eq!(message.content, Some("Hello, world!".to_string()));
         assert_eq!(message.name, Some("test_user".to_string()));
     }
 
@@ -137,13 +178,17 @@ mod tests {
             messages: vec![
                 ChatMessage {
                     role: MessageRole::System,
-                    content: "You are a helpful assistant".to_string(),
+                    content: Some("You are a helpful assistant".to_string()),
                     name: None,
+                    tool_call_id: None,
+                    tool_calls: None,
                 },
                 ChatMessage {
                     role: MessageRole::User,
-                    content: "Hello!".to_string(),
+                    content: Some("Hello!".to_string()),
                     name: None,
+                    tool_call_id: None,
+                    tool_calls: None,
                 }
             ],
             max_tokens: Some(100),
@@ -151,6 +196,7 @@ mod tests {
             top_p: Some(1.0),
             stop_sequences: Some(vec!["\n".to_string()]),
             stream: None,
+            tools: None,
         };
         
         assert_eq!(params.model_id, "gpt-3.5-turbo");

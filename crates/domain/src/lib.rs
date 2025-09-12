@@ -9,6 +9,7 @@
 
 pub mod auth;
 pub mod errors;
+pub mod mcp;
 pub mod models;
 pub mod providers;
 pub mod services;

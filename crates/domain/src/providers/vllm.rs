@@ -8,7 +8,7 @@ use tracing::{debug, error};
 use crate::{
     errors::CompletionError,
     models::*,
-    providers::{StreamChunk, ModelInfo},
+    providers::{StreamChunk, StreamChoice, Delta, ModelInfo},
     services::CompletionHandler,
 };
 
@@ -189,10 +189,42 @@ impl CompletionHandler for VLlmProvider {
                                     continue;
                                 }
                                 
-                                match serde_json::from_str::<StreamChunk>(json_str) {
-                                    Ok(chunk) => chunks.push(Ok(chunk)),
+                                // Parse vLLM stream chunk and convert to our format
+                                match serde_json::from_str::<VLlmStreamChunk>(json_str) {
+                                    Ok(vllm_chunk) => {
+                                        // Convert vLLM format to our internal StreamChunk format
+                                        let chunk = StreamChunk {
+                                            id: vllm_chunk.id,
+                                            object: vllm_chunk.object,
+                                            created: vllm_chunk.created,
+                                            model: vllm_chunk.model,
+                                            choices: vllm_chunk.choices.into_iter().map(|c| {
+                                                // For chat completions, use delta field; for text completions, use text field
+                                                let (role, content) = if let Some(delta) = c.delta {
+                                                    (delta.role, delta.content)
+                                                } else if let Some(text) = c.text {
+                                                    // Text completion format
+                                                    (None, Some(text))
+                                                } else {
+                                                    (None, None)
+                                                };
+                                                
+                                                StreamChoice {
+                                                    index: c.index,
+                                                    delta: Delta { role, content },
+                                                    finish_reason: c.finish_reason,
+                                                }
+                                            }).collect(),
+                                            usage: vllm_chunk.usage,
+                                        };
+                                        chunks.push(Ok(chunk));
+                                    }
                                     Err(e) => {
-                                        error!("Failed to parse SSE chunk: {}", e);
+                                        error!("Failed to parse SSE chunk: {}. Raw data: {}", e, json_str);
+                                        // Try to parse as a generic JSON value to see the structure
+                                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                            error!("Actual JSON structure: {}", serde_json::to_string_pretty(&value).unwrap_or_default());
+                                        }
                                         chunks.push(Err(CompletionError::InternalError(
                                             format!("Failed to parse stream chunk: {}", e)
                                         )));
@@ -316,10 +348,42 @@ impl CompletionHandler for VLlmProvider {
                                     continue;
                                 }
                                 
-                                match serde_json::from_str::<StreamChunk>(json_str) {
-                                    Ok(chunk) => chunks.push(Ok(chunk)),
+                                // Parse vLLM stream chunk and convert to our format
+                                match serde_json::from_str::<VLlmStreamChunk>(json_str) {
+                                    Ok(vllm_chunk) => {
+                                        // Convert vLLM format to our internal StreamChunk format
+                                        let chunk = StreamChunk {
+                                            id: vllm_chunk.id,
+                                            object: vllm_chunk.object,
+                                            created: vllm_chunk.created,
+                                            model: vllm_chunk.model,
+                                            choices: vllm_chunk.choices.into_iter().map(|c| {
+                                                // For chat completions, use delta field; for text completions, use text field
+                                                let (role, content) = if let Some(delta) = c.delta {
+                                                    (delta.role, delta.content)
+                                                } else if let Some(text) = c.text {
+                                                    // Text completion format
+                                                    (None, Some(text))
+                                                } else {
+                                                    (None, None)
+                                                };
+                                                
+                                                StreamChoice {
+                                                    index: c.index,
+                                                    delta: Delta { role, content },
+                                                    finish_reason: c.finish_reason,
+                                                }
+                                            }).collect(),
+                                            usage: vllm_chunk.usage,
+                                        };
+                                        chunks.push(Ok(chunk));
+                                    }
                                     Err(e) => {
-                                        error!("Failed to parse SSE chunk: {}", e);
+                                        error!("Failed to parse SSE chunk: {}. Raw data: {}", e, json_str);
+                                        // Try to parse as a generic JSON value to see the structure
+                                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                            error!("Actual JSON structure: {}", serde_json::to_string_pretty(&value).unwrap_or_default());
+                                        }
                                         chunks.push(Err(CompletionError::InternalError(
                                             format!("Failed to parse stream chunk: {}", e)
                                         )));
@@ -436,6 +500,40 @@ struct VLlmModelInfo {
     // vLLM may have additional fields we don't need
 }
 
+// Streaming response structures for vLLM - these match the actual vLLM/OpenAI format
+#[derive(Debug, Deserialize)]
+struct VLlmStreamChunk {
+    id: String,
+    object: String,
+    created: u64,
+    model: String,
+    choices: Vec<VLlmStreamChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<TokenUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VLlmStreamChoice {
+    index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delta: Option<VLlmDelta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,  // For text completions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finish_reason: Option<String>,
+    #[allow(dead_code)]  // vLLM sends this field but we don't use it yet
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<serde_json::Value>, // Might have logprobs, ignore for now
+}
+
+#[derive(Debug, Deserialize)]
+struct VLlmDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+}
+
 fn parse_finish_reason(reason: &Option<String>) -> FinishReason {
     match reason.as_deref() {
         Some("stop") => FinishReason::Stop,
@@ -500,14 +598,17 @@ mod tests {
             model_id: "test-model".to_string(),
             messages: vec![ChatMessage {
                 role: MessageRole::User,
-                content: "Hello".to_string(),
+                content: Some("Hello".to_string()),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             }],
             max_tokens: None,
             temperature: None,
             top_p: None,
             stop_sequences: None,
             stream: Some(true),
+            tools: None,
         };
 
         // Call the streaming method
@@ -661,14 +762,17 @@ mod tests {
             model_id: "test-model".to_string(),
             messages: vec![ChatMessage {
                 role: MessageRole::User,
-                content: "Test".to_string(),
+                content: Some("Test".to_string()),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             }],
             max_tokens: None,
             temperature: None,
             top_p: None,
             stop_sequences: None,
             stream: Some(true),
+            tools: None,
         };
 
         let stream = provider.chat_completion_stream(params).await.unwrap();
@@ -712,14 +816,17 @@ mod tests {
             model_id: "test-model".to_string(),
             messages: vec![ChatMessage {
                 role: MessageRole::User,
-                content: "Test".to_string(),
+                content: Some("Test".to_string()),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             }],
             max_tokens: None,
             temperature: None,
             top_p: None,
             stop_sequences: None,
             stream: Some(true),
+            tools: None,
         };
 
         let result = provider.chat_completion_stream(params).await;
@@ -762,14 +869,17 @@ mod tests {
             model_id: "test-model".to_string(),
             messages: vec![ChatMessage {
                 role: MessageRole::User,
-                content: "Test".to_string(),
+                content: Some("Test".to_string()),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             }],
             max_tokens: None,
             temperature: None,
             top_p: None,
             stop_sequences: None,
             stream: Some(true),
+            tools: None,
         };
 
         let stream = provider.chat_completion_stream(params).await.unwrap();
@@ -816,14 +926,17 @@ mod tests {
             model_id: "test-model".to_string(),
             messages: vec![ChatMessage {
                 role: MessageRole::User,
-                content: "Test".to_string(),
+                content: Some("Test".to_string()),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             }],
             max_tokens: None,
             temperature: None,
             top_p: None,
             stop_sequences: None,
             stream: Some(true),
+            tools: None,
         };
 
         let stream = provider.chat_completion_stream(params).await.unwrap();
@@ -877,14 +990,17 @@ mod tests {
             model_id: "test-model".to_string(),
             messages: vec![ChatMessage {
                 role: MessageRole::User,
-                content: "Test".to_string(),
+                content: Some("Test".to_string()),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             }],
             max_tokens: None,
             temperature: None,
             top_p: None,
             stop_sequences: None,
             stream: Some(true),
+            tools: None,
         };
 
         // Should still work with delay

@@ -58,13 +58,16 @@ impl CompletionHandler for MockProvider {
         let last_message = params.messages.last()
             .ok_or_else(|| CompletionError::InvalidParams("No messages provided".to_string()))?;
         
-        let response_content = format!("Mock response to: {}", last_message.content);
+        let response_content = format!("Mock response to: {}", 
+            last_message.content.as_ref().unwrap_or(&"empty".to_string()));
         
         Ok(ChatCompletionResult {
             message: ChatMessage {
                 role: MessageRole::Assistant,
-                content: response_content,
+                content: Some(response_content),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             },
             finish_reason: FinishReason::Stop,
             usage: TokenUsage::new(10, 5),

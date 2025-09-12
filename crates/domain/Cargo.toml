@@ -27,6 +27,14 @@ url = "2.5"
 uuid = { version = "1.5", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
+# MCP protocol implementation
+# Documentation: https://docs.rs/rmcp/latest/rmcp/
+# Crate: https://crates.io/crates/rmcp
+rmcp = { version = "0.6", features = [
+    "client",                                    # Core client functionality
+    "transport-streamable-http-client-reqwest", # HTTP streaming transport
+    "transport-sse-client-reqwest",             # Server-Sent Events transport
+] }
 
 [dev-dependencies]
 # HTTP mocking library for testing streaming responses

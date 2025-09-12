@@ -2,12 +2,11 @@ use axum::{
     extract::{Json, Path, Query, State, Extension},
     http::StatusCode,
 };
-use database::{Database, User, Session};
+use database::{User, Session};
 use serde::Deserialize;
-use std::sync::Arc;
 use uuid::Uuid;
 use tracing::{debug, error};
-use crate::middleware::AuthenticatedUser;
+use crate::{middleware::AuthenticatedUser, routes::api::AppState};
 
 /// Query parameters for searching users
 #[derive(Debug, Deserialize)]
@@ -37,12 +36,12 @@ pub struct UpdateUserProfileRequest {
 
 /// Get current user
 pub async fn get_current_user(
-    State(db): State<Arc<Database>>,
+    State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<Json<User>, StatusCode> {
     debug!("Getting current user: {}", user.0.id);
     
-    match db.users.get_by_id(user.0.id).await {
+    match app_state.db.users.get_by_id(user.0.id).await {
         Ok(Some(user)) => Ok(Json(user)),
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
@@ -54,7 +53,7 @@ pub async fn get_current_user(
 
 /// Get a user by ID
 pub async fn get_user(
-    State(db): State<Arc<Database>>,
+    State(app_state): State<AppState>,
     Extension(current_user): Extension<AuthenticatedUser>,
     Path(user_id): Path<Uuid>,
 ) -> Result<Json<User>, StatusCode> {
@@ -70,7 +69,7 @@ pub async fn get_user(
             WHERE om1.user_id = $1 AND om2.user_id = $2
         ";
         
-        let client = db.pool().get().await.map_err(|e| {
+        let client = app_state.db.pool().get().await.map_err(|e| {
             error!("Failed to get database connection: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
@@ -87,7 +86,7 @@ pub async fn get_user(
         }
     }
     
-    match db.users.get_by_id(user_id).await {
+    match app_state.db.users.get_by_id(user_id).await {
         Ok(Some(user)) => Ok(Json(user)),
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
@@ -99,13 +98,13 @@ pub async fn get_user(
 
 /// Update current user's profile
 pub async fn update_current_user_profile(
-    State(db): State<Arc<Database>>,
+    State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Json(request): Json<UpdateUserProfileRequest>,
 ) -> Result<Json<User>, StatusCode> {
     debug!("Updating profile for user: {}", user.0.id);
     
-    match db.users.update_profile(
+    match app_state.db.users.update_profile(
         user.0.id,
         request.display_name,
         request.avatar_url,
@@ -120,7 +119,7 @@ pub async fn update_current_user_profile(
 
 /// List all users (shows users in same organizations)
 pub async fn list_users(
-    State(db): State<Arc<Database>>,
+    State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<User>>, StatusCode> {
@@ -140,7 +139,7 @@ pub async fn list_users(
         LIMIT $2 OFFSET $3
     ";
     
-    let client = db.pool().get().await.map_err(|e| {
+    let client = app_state.db.pool().get().await.map_err(|e| {
         error!("Failed to get database connection: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -153,7 +152,7 @@ pub async fn list_users(
     
     let mut users = Vec::new();
     for row in rows {
-        if let Ok(Some(user)) = db.users.get_by_id(row.get("id")).await {
+        if let Ok(Some(user)) = app_state.db.users.get_by_id(row.get("id")).await {
             users.push(user);
         }
     }
@@ -163,7 +162,7 @@ pub async fn list_users(
 
 /// Search users
 pub async fn search_users(
-    State(db): State<Arc<Database>>,
+    State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<Vec<User>>, StatusCode> {
@@ -183,7 +182,7 @@ pub async fn search_users(
         LIMIT $3
     ";
     
-    let client = db.pool().get().await.map_err(|e| {
+    let client = app_state.db.pool().get().await.map_err(|e| {
         error!("Failed to get database connection: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -197,7 +196,7 @@ pub async fn search_users(
     
     let mut users = Vec::new();
     for row in rows {
-        if let Ok(Some(user)) = db.users.get_by_id(row.get("id")).await {
+        if let Ok(Some(user)) = app_state.db.users.get_by_id(row.get("id")).await {
             users.push(user);
         }
     }
@@ -207,13 +206,13 @@ pub async fn search_users(
 
 /// Get user's organizations (current user)
 pub async fn get_user_organizations(
-    State(db): State<Arc<Database>>,
+    State(app_state): State<AppState>,
     Extension(current_user): Extension<AuthenticatedUser>,
 ) -> Result<Json<Vec<database::Organization>>, StatusCode> {
     debug!("Getting organizations for current user: {}", current_user.0.id);
     
     get_user_organizations_by_id(
-        State(db),
+        State(app_state),
         Extension(current_user.clone()),
         Path(current_user.0.id)
     ).await
@@ -221,7 +220,7 @@ pub async fn get_user_organizations(
 
 /// Get user's organizations by ID
 pub async fn get_user_organizations_by_id(
-    State(db): State<Arc<Database>>,
+    State(app_state): State<AppState>,
     Extension(current_user): Extension<AuthenticatedUser>,
     Path(user_id): Path<Uuid>,
 ) -> Result<Json<Vec<database::Organization>>, StatusCode> {
@@ -241,7 +240,7 @@ pub async fn get_user_organizations_by_id(
         ORDER BY o.created_at DESC
     ";
     
-    let client = db.pool().get().await.map_err(|e| {
+    let client = app_state.db.pool().get().await.map_err(|e| {
         error!("Failed to get database connection: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -253,7 +252,7 @@ pub async fn get_user_organizations_by_id(
     
     let mut organizations = Vec::new();
     for row in rows {
-        if let Ok(Some(org)) = db.organizations.get_by_id(row.get("id")).await {
+        if let Ok(Some(org)) = app_state.db.organizations.get_by_id(row.get("id")).await {
             organizations.push(org);
         }
     }
@@ -263,7 +262,7 @@ pub async fn get_user_organizations_by_id(
 
 /// Get user's sessions
 pub async fn get_user_sessions(
-    State(db): State<Arc<Database>>,
+    State(app_state): State<AppState>,
     Extension(current_user): Extension<AuthenticatedUser>,
     Path(user_id): Path<Uuid>,
 ) -> Result<Json<Vec<Session>>, StatusCode> {
@@ -274,7 +273,7 @@ pub async fn get_user_sessions(
         return Err(StatusCode::FORBIDDEN);
     }
     
-    match db.sessions.list_by_user(user_id).await {
+    match app_state.db.sessions.list_by_user(user_id).await {
         Ok(sessions) => Ok(Json(sessions)),
         Err(e) => {
             error!("Failed to get user sessions: {}", e);
@@ -285,7 +284,7 @@ pub async fn get_user_sessions(
 
 /// Revoke a user session
 pub async fn revoke_user_session(
-    State(db): State<Arc<Database>>,
+    State(app_state): State<AppState>,
     Extension(current_user): Extension<AuthenticatedUser>,
     Path((user_id, session_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, StatusCode> {
@@ -297,7 +296,7 @@ pub async fn revoke_user_session(
     }
     
     // Verify the session belongs to the user
-    match db.sessions.get_by_id(session_id).await {
+    match app_state.db.sessions.get_by_id(session_id).await {
         Ok(Some(session)) => {
             if session.user_id != user_id {
                 return Err(StatusCode::NOT_FOUND);
@@ -310,7 +309,7 @@ pub async fn revoke_user_session(
         }
     }
     
-    match db.sessions.revoke(session_id).await {
+    match app_state.db.sessions.revoke(session_id).await {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
@@ -322,7 +321,7 @@ pub async fn revoke_user_session(
 
 /// Revoke all sessions for a user
 pub async fn revoke_all_user_sessions(
-    State(db): State<Arc<Database>>,
+    State(app_state): State<AppState>,
     Extension(current_user): Extension<AuthenticatedUser>,
     Path(user_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -333,7 +332,7 @@ pub async fn revoke_all_user_sessions(
         return Err(StatusCode::FORBIDDEN);
     }
     
-    match db.sessions.revoke_all_for_user(user_id).await {
+    match app_state.db.sessions.revoke_all_for_user(user_id).await {
         Ok(count) => Ok(Json(serde_json::json!({
             "message": format!("Revoked {} sessions", count),
             "count": count

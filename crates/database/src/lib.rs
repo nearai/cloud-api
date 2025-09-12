@@ -10,6 +10,7 @@ pub use repositories::{
     UserRepository,
     ApiKeyRepository,
     SessionRepository,
+    McpConnectorRepository,
 };
 
 use anyhow::Result;
@@ -20,6 +21,7 @@ pub struct Database {
     pub users: UserRepository,
     pub api_keys: ApiKeyRepository,
     pub sessions: SessionRepository,
+    pub mcp_connectors: McpConnectorRepository,
     pool: DbPool,
 }
 
@@ -31,6 +33,7 @@ impl Database {
             users: UserRepository::new(pool.clone()),
             api_keys: ApiKeyRepository::new(pool.clone()),
             sessions: SessionRepository::new(pool.clone()),
+            mcp_connectors: McpConnectorRepository::new(pool.clone()),
             pool,
         }
     }

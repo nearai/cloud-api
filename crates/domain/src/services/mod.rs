@@ -221,6 +221,11 @@ impl Domain {
     pub async fn get_quote(&self) -> Result<QuoteResponse, CompletionError> {
         self.tdx_handler.get_quote().await
     }
+
+    /// Get a reference to the completion handler
+    pub fn completion_handler(&self) -> Arc<dyn CompletionHandler> {
+        self.completion_handler.clone()
+    }
 }
 
 impl Default for Domain {

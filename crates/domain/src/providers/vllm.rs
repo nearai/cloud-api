@@ -173,16 +173,23 @@ impl CompletionHandler for VLlmProvider {
             ));
         }
         
-        // Create a stream from the response
+        // Create a stream from the response with proper SSE buffering
         let stream = response.bytes_stream()
-            .map(|result| {
+            .scan(String::new(), |buffer, result| {
+                futures::future::ready(Some(
                 match result {
                     Ok(bytes) => {
                         let text = String::from_utf8_lossy(&bytes);
-                        let mut chunks = Vec::new();
+                        buffer.push_str(&text);
                         
-                        // Parse SSE format - collect all chunks from this batch
-                        for line in text.lines() {
+                        let mut chunks = Vec::new();
+                        let mut processed_until = 0;
+                        
+                        // Parse complete SSE lines from buffer
+                        while let Some(line_end) = buffer[processed_until..].find('\n') {
+                            let line = &buffer[processed_until..processed_until + line_end];
+                            processed_until += line_end + 1;
+                            
                             if line.starts_with("data: ") {
                                 let json_str = &line[6..];
                                 if json_str == "[DONE]" {
@@ -232,12 +239,17 @@ impl CompletionHandler for VLlmProvider {
                                 }
                             }
                         }
+                        
+                        // Remove processed data from buffer
+                        *buffer = buffer[processed_until..].to_string();
+                        
                         chunks
                     }
                     Err(e) => vec![Err(CompletionError::InternalError(
                         format!("Stream error: {}", e)
                     ))]
                 }
+                ))
             })
             .flat_map(futures::stream::iter);
         
@@ -334,14 +346,21 @@ impl CompletionHandler for VLlmProvider {
         
         // Create a stream from the response - text completions use same SSE format
         let stream = response.bytes_stream()
-            .map(|result| {
+            .scan(String::new(), |buffer, result| {
+                futures::future::ready(Some(
                 match result {
                     Ok(bytes) => {
                         let text = String::from_utf8_lossy(&bytes);
-                        let mut chunks = Vec::new();
+                        buffer.push_str(&text);
                         
-                        // Parse SSE format - collect all chunks from this batch
-                        for line in text.lines() {
+                        let mut chunks = Vec::new();
+                        let mut processed_until = 0;
+                        
+                        // Parse complete SSE lines from buffer
+                        while let Some(line_end) = buffer[processed_until..].find('\n') {
+                            let line = &buffer[processed_until..processed_until + line_end];
+                            processed_until += line_end + 1;
+                            
                             if line.starts_with("data: ") {
                                 let json_str = &line[6..];
                                 if json_str == "[DONE]" {
@@ -391,12 +410,17 @@ impl CompletionHandler for VLlmProvider {
                                 }
                             }
                         }
+                        
+                        // Remove processed data from buffer
+                        *buffer = buffer[processed_until..].to_string();
+                        
                         chunks
                     }
                     Err(e) => vec![Err(CompletionError::InternalError(
                         format!("Stream error: {}", e)
                     ))]
                 }
+                ))
             })
             .flat_map(futures::stream::iter);
         

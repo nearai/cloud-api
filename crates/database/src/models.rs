@@ -246,3 +246,56 @@ pub struct McpConnectorUsage {
     pub duration_ms: Option<i32>,
     pub created_at: DateTime<Utc>,
 }
+
+// ============================================
+// Response and Conversation Models
+// ============================================
+
+/// Response model - stores AI response data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Response {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub model: String,
+    pub input_messages: serde_json::Value, // JSONB storing input messages
+    pub output_message: Option<String>,
+    pub status: ResponseStatus,
+    pub instructions: Option<String>,
+    pub conversation_id: Option<Uuid>,
+    pub previous_response_id: Option<Uuid>,
+    pub usage: Option<serde_json::Value>, // JSONB storing token usage
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Response status enum
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseStatus {
+    InProgress,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl std::fmt::Display for ResponseStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResponseStatus::InProgress => write!(f, "in_progress"),
+            ResponseStatus::Completed => write!(f, "completed"),
+            ResponseStatus::Failed => write!(f, "failed"),
+            ResponseStatus::Cancelled => write!(f, "cancelled"),
+        }
+    }
+}
+
+/// Conversation model - stores conversation metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Conversation {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub metadata: serde_json::Value, // JSONB storing conversation metadata
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}

@@ -69,8 +69,14 @@ pub async fn chat_completions(
                                         finish_reason: choice.finish_reason,
                                     }).collect(),
                                     usage: chunk.usage.map(|u| Usage {
-                                        prompt_tokens: u.prompt_tokens,
-                                        completion_tokens: u.completion_tokens,
+                                        input_tokens: u.prompt_tokens,
+                                        input_tokens_details: Some(InputTokensDetails {
+                                            cached_tokens: 0,
+                                        }),
+                                        output_tokens: u.completion_tokens,
+                                        output_tokens_details: Some(OutputTokensDetails {
+                                            reasoning_tokens: 0,
+                                        }),
                                         total_tokens: u.total_tokens,
                                     }),
                                 };
@@ -173,8 +179,14 @@ pub async fn completions(
                                         finish_reason: choice.finish_reason,
                                     }).collect(),
                                     usage: chunk.usage.map(|u| Usage {
-                                        prompt_tokens: u.prompt_tokens,
-                                        completion_tokens: u.completion_tokens,
+                                        input_tokens: u.prompt_tokens,
+                                        input_tokens_details: Some(InputTokensDetails {
+                                            cached_tokens: 0,
+                                        }),
+                                        output_tokens: u.completion_tokens,
+                                        output_tokens_details: Some(OutputTokensDetails {
+                                            reasoning_tokens: 0,
+                                        }),
                                         total_tokens: u.total_tokens,
                                     }),
                                 };

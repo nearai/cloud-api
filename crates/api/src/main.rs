@@ -7,7 +7,9 @@ use api::{
     middleware::{auth_middleware, AuthState},
     routes::{
         api::{build_api_router, AppState},
-        chat_completions, completions, models, quote,
+        completions::{chat_completions, completions, models, quote},
+        responses,
+        conversations,
         auth::{github_login, google_login, oauth_callback, current_user, logout, auth_success, login_page, StateStore},
     },
 };
@@ -113,6 +115,54 @@ async fn main() {
             .route("/models", get(models))
             .route("/quote", get(quote))
     };
+
+    // Build Response and Conversation API routes with domain services
+    let conversation_service = Arc::new(domain::ConversationService::new(domain.database.clone()));
+    let response_service = Arc::new(domain::ResponseService::new(
+        domain.completion_handler(),
+        domain.database.clone(),
+        conversation_service.clone(),
+    ));
+    
+    let response_routes = if config.auth.enabled {
+        Router::new()
+            .route("/responses", post(responses::create_response))
+            .route("/responses/{response_id}", get(responses::get_response))
+            .route("/responses/{response_id}", axum::routing::delete(responses::delete_response))
+            .route("/responses/{response_id}/cancel", post(responses::cancel_response))
+            .route("/responses/{response_id}/input_items", get(responses::list_input_items))
+            .with_state(response_service)
+            .layer(from_fn_with_state(auth_state_middleware.clone(), auth_middleware))
+    } else {
+        Router::new()
+            .route("/responses", post(responses::create_response))
+            .route("/responses/{response_id}", get(responses::get_response))
+            .route("/responses/{response_id}", axum::routing::delete(responses::delete_response))
+            .route("/responses/{response_id}/cancel", post(responses::cancel_response))
+            .route("/responses/{response_id}/input_items", get(responses::list_input_items))
+            .with_state(response_service)
+    };
+
+    let conversation_routes = if config.auth.enabled {
+        Router::new()
+            .route("/conversations", get(conversations::list_conversations))
+            .route("/conversations", post(conversations::create_conversation))
+            .route("/conversations/{conversation_id}", get(conversations::get_conversation))
+            .route("/conversations/{conversation_id}", post(conversations::update_conversation))
+            .route("/conversations/{conversation_id}", axum::routing::delete(conversations::delete_conversation))
+            .route("/conversations/{conversation_id}/items", get(conversations::list_conversation_items))
+            .with_state(conversation_service)
+            .layer(from_fn_with_state(auth_state_middleware.clone(), auth_middleware))
+    } else {
+        Router::new()
+            .route("/conversations", get(conversations::list_conversations))
+            .route("/conversations", post(conversations::create_conversation))
+            .route("/conversations/{conversation_id}", get(conversations::get_conversation))
+            .route("/conversations/{conversation_id}", post(conversations::update_conversation))
+            .route("/conversations/{conversation_id}", axum::routing::delete(conversations::delete_conversation))
+            .route("/conversations/{conversation_id}/items", get(conversations::list_conversation_items))
+            .with_state(conversation_service)
+    };
     
     // Build management API routes (orgs, teams, users)  
     let management_routes = if let Some(ref db) = domain.database {
@@ -138,6 +188,8 @@ async fn main() {
         .nest("/v1", Router::new()
             .nest("/auth", auth_routes)
             .merge(completion_routes.with_state(domain.clone()))
+            .merge(response_routes)
+            .merge(conversation_routes)
             .merge(if let Some(mgmt_routes) = management_routes {
                 mgmt_routes
             } else {
@@ -183,6 +235,21 @@ async fn main() {
     tracing::info!("  - POST /v1/completions (Text Completions)");
     tracing::info!("  - GET /v1/models (Available Models)");
     tracing::info!("  - GET /v1/quote (TDX Quote & Attestation)");
+    tracing::info!("");
+    tracing::info!("Response API Endpoints:");
+    tracing::info!("  - POST /v1/responses (Create Response)");
+    tracing::info!("  - GET /v1/responses/:id (Get Response)");
+    tracing::info!("  - DELETE /v1/responses/:id (Delete Response)");
+    tracing::info!("  - POST /v1/responses/:id/cancel (Cancel Response)");
+    tracing::info!("  - GET /v1/responses/:id/input_items (List Input Items)");
+    tracing::info!("");
+    tracing::info!("Conversation API Endpoints:");
+    tracing::info!("  - GET /v1/conversations (List Conversations)");
+    tracing::info!("  - POST /v1/conversations (Create Conversation)");
+    tracing::info!("  - GET /v1/conversations/:id (Get Conversation)");
+    tracing::info!("  - POST /v1/conversations/:id (Update Conversation)");
+    tracing::info!("  - DELETE /v1/conversations/:id (Delete Conversation)");
+    tracing::info!("  - GET /v1/conversations/:id/items (List Items - extracted from responses)");
     
     if domain.database.is_some() {
         tracing::info!("");

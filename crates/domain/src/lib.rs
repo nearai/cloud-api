@@ -8,13 +8,18 @@
 // The domain layer is technology-agnostic and focuses purely on business logic.
 
 pub mod auth;
+pub mod conversations;
 pub mod errors;
 pub mod mcp;
 pub mod models;
 pub mod providers;
+pub mod responses;
 pub mod services;
 
 // Re-export all public types for convenience
+pub use conversations::{
+    Conversation, ConversationMessage, ConversationRequest, ConversationService,
+};
 pub use errors::CompletionError;
 pub use models::*;
 pub use providers::{
@@ -22,6 +27,9 @@ pub use providers::{
     ModelInfo, ModelsResponse, 
     vllm::VLlmProvider, 
     mock::MockProvider
+};
+pub use responses::{
+    Response, ResponseInput, ResponseMessage, ResponseRequest, ResponseService, ResponseStatus,
 };
 pub use services::{
     CompletionHandler, Domain, ProviderRouter, MockCompletionHandler

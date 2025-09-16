@@ -123,19 +123,33 @@ pub struct CompletionChoice {
     pub finish_reason: Option<String>, // "stop", "length", "content_filter"
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Usage {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
+    pub input_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens_details: Option<InputTokensDetails>,
+    pub output_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens_details: Option<OutputTokensDetails>,
     pub total_tokens: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputTokensDetails {
+    pub cached_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputTokensDetails {
+    pub reasoning_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: ErrorDetail,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorDetail {
     pub message: String,
     pub r#type: String,
@@ -221,11 +235,17 @@ impl CompletionRequest {
 }
 
 impl Usage {
-    pub fn new(prompt_tokens: u32, completion_tokens: u32) -> Self {
+    pub fn new(input_tokens: u32, output_tokens: u32) -> Self {
         Self {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
+            input_tokens,
+            input_tokens_details: Some(InputTokensDetails {
+                cached_tokens: 0,
+            }),
+            output_tokens,
+            output_tokens_details: Some(OutputTokensDetails {
+                reasoning_tokens: 0,
+            }),
+            total_tokens: input_tokens + output_tokens,
         }
     }
 }
@@ -281,3 +301,543 @@ pub struct BuildInfo {
     pub image: String,
     pub sbom: String,
 }
+
+// ============================================
+// Response API Models
+// ============================================
+
+/// Request to create a response
+#[derive(Debug, Deserialize)]
+pub struct CreateResponseRequest {
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<ResponseInput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<ConversationReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ResponseTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ResponseToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<ResponseTextConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ResponseReasoningConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_identifier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+}
+
+/// Input for a response - can be text, array of items, or single item
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ResponseInput {
+    Text(String),
+    Items(Vec<ResponseInputItem>),
+}
+
+/// Single input item
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ResponseInputItem {
+    #[serde(rename = "message")]
+    Message {
+        role: String,
+        content: ResponseContent,
+    },
+}
+
+/// Content can be text or array of content parts
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResponseContent {
+    Text(String),
+    Parts(Vec<ResponseContentPart>),
+}
+
+/// Content part (text, image, etc.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ResponseContentPart {
+    #[serde(rename = "input_text")]
+    InputText { text: String },
+    #[serde(rename = "input_image")]
+    InputImage { 
+        image_url: ResponseImageUrl,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    #[serde(rename = "input_file")]
+    InputFile {
+        file_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseImageUrl {
+    pub url: String,
+}
+
+/// Conversation reference
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ConversationReference {
+    Id(String),
+    Object {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+    },
+}
+
+/// Tool configuration for responses
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ResponseTool {
+    #[serde(rename = "function")]
+    Function {
+        function: ResponseFunction,
+    },
+    #[serde(rename = "web_search")]
+    WebSearch {},
+    #[serde(rename = "file_search")]
+    FileSearch {},
+    #[serde(rename = "code_interpreter")]
+    CodeInterpreter {},
+    #[serde(rename = "computer")]
+    Computer {},
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseFunction {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+}
+
+/// Tool choice configuration
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ResponseToolChoice {
+    Auto(String), // "auto", "none", "required"
+    Specific {
+        #[serde(rename = "type")]
+        type_: String,
+        function: ResponseToolChoiceFunction,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseToolChoiceFunction {
+    pub name: String,
+}
+
+/// Text format configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseTextConfig {
+    pub format: ResponseTextFormat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ResponseTextFormat {
+    #[serde(rename = "text")]
+    Text,
+    #[serde(rename = "json_object")]
+    JsonObject,
+    #[serde(rename = "json_schema")]
+    JsonSchema { 
+        json_schema: serde_json::Value,
+    },
+}
+
+/// Reasoning configuration
+#[derive(Debug, Deserialize)]
+pub struct ResponseReasoningConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// Complete response object
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseObject {
+    pub id: String,
+    pub object: String, // "response"
+    pub created_at: u64,
+    pub status: ResponseStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ResponseError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_details: Option<ResponseIncompleteDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<u32>,
+    pub model: String,
+    pub output: Vec<ResponseOutputItem>,
+    pub parallel_tool_calls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ResponseReasoningOutput>,
+    pub store: bool,
+    pub temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<ResponseTextConfig>,
+    pub tool_choice: ResponseToolChoiceOutput,
+    pub tools: Vec<ResponseTool>,
+    pub top_p: f32,
+    pub truncation: String,
+    pub usage: Usage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResponseStatus {
+    Completed,
+    Failed,
+    InProgress,
+    Cancelled,
+    Queued,
+    Incomplete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseError {
+    pub message: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseIncompleteDetails {
+    pub reason: String, // "length", "content_filter", "max_tool_calls"
+}
+
+/// Output item from response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ResponseOutputItem {
+    #[serde(rename = "message")]
+    Message {
+        id: String,
+        status: ResponseItemStatus,
+        role: String,
+        content: Vec<ResponseOutputContent>,
+    },
+    #[serde(rename = "tool_call")]
+    ToolCall {
+        id: String,
+        status: ResponseItemStatus,
+        tool_type: String,
+        function: ResponseOutputFunction,
+    },
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        id: String,
+        status: ResponseItemStatus,
+        summary: String,
+        content: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResponseItemStatus {
+    Completed,
+    Failed,
+    InProgress,
+    Cancelled,
+}
+
+/// Output content part
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ResponseOutputContent {
+    #[serde(rename = "output_text")]
+    OutputText {
+        text: String,
+        annotations: Vec<serde_json::Value>,
+    },
+    #[serde(rename = "tool_calls")]
+    ToolCalls {
+        tool_calls: Vec<ResponseOutputToolCall>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseOutputFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseOutputToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub function: ResponseOutputFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseReasoningOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResponseToolChoiceOutput {
+    Auto(String),
+    Object {
+        #[serde(rename = "type")]
+        type_: String,
+        function: ResponseToolChoiceFunction,
+    },
+}
+
+/// Response deletion result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseDeleteResult {
+    pub id: String,
+    pub object: String, // "response"
+    pub deleted: bool,
+}
+
+// ============================================
+// Response Streaming Event Types
+// ============================================
+
+/// Response streaming event wrapper
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseStreamEvent {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<ResponseObject>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item: Option<ResponseOutputItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub part: Option<ResponseOutputContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// Input item list for responses
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseInputItemList {
+    pub object: String, // "list"
+    pub data: Vec<ResponseInputItem>,
+    pub first_id: String,
+    pub last_id: String,
+    pub has_more: bool,
+}
+
+// ============================================
+// Conversation API Models
+// ============================================
+
+/// Request to create a conversation
+#[derive(Debug, Deserialize)]
+pub struct CreateConversationRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Request to update a conversation
+#[derive(Debug, Deserialize)]
+pub struct UpdateConversationRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Conversation object
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationObject {
+    pub id: String,
+    pub object: String, // "conversation"
+    pub created_at: u64,
+    pub metadata: serde_json::Value,
+}
+
+/// List of conversations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationList {
+    pub object: String, // "list"
+    pub data: Vec<ConversationObject>,
+    pub first_id: String,
+    pub last_id: String,
+    pub has_more: bool,
+}
+
+/// Deleted conversation result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationDeleteResult {
+    pub id: String,
+    pub object: String, // "conversation.deleted"
+    pub deleted: bool,
+}
+
+/// Input item for conversations
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+pub enum ConversationInputItem {
+    #[serde(rename = "message")]
+    Message {
+        role: String,
+        content: ConversationContent,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+    },
+}
+
+/// Content for conversation items
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ConversationContent {
+    Text(String),
+    Parts(Vec<ConversationContentPart>),
+}
+
+/// Content part for conversations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ConversationContentPart {
+    #[serde(rename = "input_text")]
+    InputText { text: String },
+    #[serde(rename = "input_image")]
+    InputImage { 
+        image_url: ResponseImageUrl,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    #[serde(rename = "output_text")]
+    OutputText { 
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        annotations: Option<Vec<serde_json::Value>>,
+    },
+}
+
+/// Conversation item (for responses)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ConversationItem {
+    #[serde(rename = "message")]
+    Message {
+        id: String,
+        status: ResponseItemStatus,
+        role: String,
+        content: Vec<ConversationContentPart>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+    },
+}
+
+/// List of conversation items
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationItemList {
+    pub object: String, // "list"
+    pub data: Vec<ConversationItem>,
+    pub first_id: String,
+    pub last_id: String,
+    pub has_more: bool,
+}
+
+
+// ============================================
+// Validation implementations
+// ============================================
+
+impl CreateResponseRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.model.trim().is_empty() {
+            return Err("Model cannot be empty".to_string());
+        }
+
+        if let Some(max_tokens) = self.max_output_tokens {
+            if max_tokens == 0 {
+                return Err("max_output_tokens must be greater than 0".to_string());
+            }
+        }
+
+        if let Some(max_calls) = self.max_tool_calls {
+            if max_calls == 0 {
+                return Err("max_tool_calls must be greater than 0".to_string());
+            }
+        }
+
+        if let Some(temp) = self.temperature {
+            if temp < 0.0 || temp > 2.0 {
+                return Err("temperature must be between 0.0 and 2.0".to_string());
+            }
+        }
+
+        if let Some(top_p) = self.top_p {
+            if top_p <= 0.0 || top_p > 1.0 {
+                return Err("top_p must be between 0.0 and 1.0".to_string());
+            }
+        }
+
+        // Validate mutual exclusivity
+        if self.conversation.is_some() && self.previous_response_id.is_some() {
+            return Err("Cannot specify both conversation and previous_response_id".to_string());
+        }
+
+        Ok(())
+    }
+}
+
+impl CreateConversationRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        // Basic validation - can be extended if needed
+        Ok(())
+    }
+}
+

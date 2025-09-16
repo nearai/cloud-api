@@ -66,8 +66,99 @@ impl CompletionHandler for MockCompletionHandler {
         })
     }
 
-    async fn chat_completion_stream(&self, _params: ChatCompletionParams) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, CompletionError>> + Send>>, CompletionError> {
-        Err(CompletionError::InternalError("Streaming not supported in mock service".to_string()))
+    async fn chat_completion_stream(&self, params: ChatCompletionParams) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, CompletionError>> + Send>>, CompletionError> {
+        use futures::stream;
+        use crate::providers::{StreamChunk, StreamChoice, Delta};
+        
+        // Validate model
+        if params.model_id.is_empty() {
+            return Err(CompletionError::InvalidModel("Model ID cannot be empty".to_string()));
+        }
+        
+        // Create mock streaming response
+        let chunks = vec![
+            StreamChunk {
+                id: "chatcmpl-mock".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1234567890,
+                model: params.model_id.clone(),
+                choices: vec![StreamChoice {
+                    index: 0,
+                    delta: Delta {
+                        role: Some("assistant".to_string()),
+                        content: None,
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            },
+            StreamChunk {
+                id: "chatcmpl-mock".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1234567890,
+                model: params.model_id.clone(),
+                choices: vec![StreamChoice {
+                    index: 0,
+                    delta: Delta {
+                        role: None,
+                        content: Some("Hello!".to_string()),
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            },
+            StreamChunk {
+                id: "chatcmpl-mock".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1234567890,
+                model: params.model_id.clone(),
+                choices: vec![StreamChoice {
+                    index: 0,
+                    delta: Delta {
+                        role: None,
+                        content: Some(" This is".to_string()),
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            },
+            StreamChunk {
+                id: "chatcmpl-mock".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1234567890,
+                model: params.model_id.clone(),
+                choices: vec![StreamChoice {
+                    index: 0,
+                    delta: Delta {
+                        role: None,
+                        content: Some(" a mock response.".to_string()),
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            },
+            StreamChunk {
+                id: "chatcmpl-mock".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1234567890,
+                model: params.model_id,
+                choices: vec![StreamChoice {
+                    index: 0,
+                    delta: Delta {
+                        role: None,
+                        content: None,
+                    },
+                    finish_reason: Some("stop".to_string()),
+                }],
+                usage: Some(TokenUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 20,
+                    total_tokens: 30,
+                }),
+            },
+        ];
+        
+        Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
     }
 
     async fn text_completion(&self, params: CompletionParams) -> Result<CompletionResult, CompletionError> {

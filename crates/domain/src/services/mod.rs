@@ -108,7 +108,7 @@ impl Domain {
             }
         };
         
-        let mut service = ProviderRouter::load()?;
+        let service = ProviderRouter::load()?;
         let _tdx_handler = MockTdxHandler;
         
         if service.config.use_mock {
@@ -128,52 +128,11 @@ impl Domain {
             });
         }
         
-        // Discover models from all providers
-        let models = service.discover_models().await;
-        
-        match models {
-            Ok(discovered_models) => {
-                if discovered_models.is_empty() {
-                    tracing::warn!("No models discovered, falling back to mock mode");
-                    let handler: Arc<dyn CompletionHandler> = Arc::new(MockCompletionHandler);
-                    // Wrap with MCP handler if database is available
-                    let completion_handler = if database.is_some() {
-                        Arc::new(McpCompletionHandler::new(handler, database.clone()))
-                    } else {
-                        handler
-                    };
-                    return Ok(Self {
-                        completion_handler,
-                        tdx_handler: Arc::new(MockTdxHandler),
-                        server_config,
-                        database,
-                    });
-                }
-                
-                tracing::info!(count = discovered_models.len(), "Models discovered successfully");
-                for model in &discovered_models {
-                    tracing::info!(model_id = %model.id, provider = %model.provider, "Available model");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Model discovery failed, falling back to mock mode");
-                let handler: Arc<dyn CompletionHandler> = Arc::new(MockCompletionHandler);
-                // Wrap with MCP handler if database is available
-                let completion_handler = if database.is_some() {
-                    Arc::new(McpCompletionHandler::new(handler, database.clone()))
-                } else {
-                    handler
-                };
-                return Ok(Self {
-                    completion_handler,
-                    tdx_handler: Arc::new(MockTdxHandler),
-                    server_config,
-                    database,
-                });
-            }
-        }
-        
-        let handler: Arc<dyn CompletionHandler> = Arc::new(service);
+        // Create the service first, then spawn model discovery in background
+        let service = Arc::new(service);
+        service.clone().start_periodic_refresh();
+        let handler: Arc<dyn CompletionHandler> = service;
+
         // Wrap with MCP handler if database is available
         let completion_handler = if database.is_some() {
             Arc::new(McpCompletionHandler::new(handler, database.clone()))

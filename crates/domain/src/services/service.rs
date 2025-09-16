@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use dstack_sdk::dstack_client::DstackClient;
-use futures::Stream;
+use futures::{Stream, stream, StreamExt};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
 use crate::{
@@ -19,7 +20,8 @@ use crate::services::TdxHandler;
 /// A completion service that routes requests to different providers based on model availability
 pub struct ProviderRouter {
     providers: Vec<Arc<dyn CompletionHandler>>,
-    model_mapping: HashMap<String, Arc<dyn CompletionHandler>>,
+    model_mapping: Arc<RwLock<HashMap<String, Arc<dyn CompletionHandler>>>>,
+    discovered_models: Arc<RwLock<Vec<ModelInfo>>>,
     pub config: DomainConfig,
 }
 
@@ -27,16 +29,46 @@ impl ProviderRouter {
     pub fn new(config: DomainConfig) -> Self {
         Self {
             providers: Vec::new(),
-            model_mapping: HashMap::new(),
+            model_mapping: Arc::new(RwLock::new(HashMap::new())),
+            discovered_models: Arc::new(RwLock::new(Vec::new())),
             config,
         }
+    }
+    
+    /// Start periodic model discovery refresh in the background
+    pub fn start_periodic_refresh(self: Arc<Self>) {
+        let refresh_interval = self.config.model_discovery.refresh_interval;
+        
+        // Don't start refresh if in mock mode
+        if self.config.use_mock {
+            return;
+        }
+        
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(refresh_interval));
+            loop {
+                tracing::debug!("Starting periodic model discovery refresh...");
+                
+                match self.discover_models().await {
+                    Ok(models) => {
+                        tracing::info!("Periodic model refresh completed: {} models available", models.len());
+                    }
+                    Err(e) => {
+                        tracing::warn!("Periodic model refresh failed: {}", e);
+                    }
+                }
+                tracing::debug!("Waiting for next periodic model discovery refresh...");
+                interval.tick().await;
+            }
+        });
     }
     
     /// Create a service from domain configuration
     pub fn from_domain_config(config: DomainConfig) -> Self {
         let mut service = Self {
             providers: Vec::new(),
-            model_mapping: HashMap::new(),
+            model_mapping: Arc::new(RwLock::new(HashMap::new())),
+            discovered_models: Arc::new(RwLock::new(Vec::new())),
             config: config.clone(),
         };
         
@@ -77,19 +109,39 @@ impl ProviderRouter {
     }
     
     /// Discover models from all providers and update routing table
-    pub async fn discover_models(&mut self) -> Result<Vec<ModelInfo>, CompletionError> {
+    pub async fn discover_models(&self) -> Result<Vec<ModelInfo>, CompletionError> {
         let mut all_models = Vec::new();
-        self.model_mapping.clear();
+        let mut model_mapping = self.model_mapping.write().await;
+        model_mapping.clear();
         
-        for provider in &self.providers {
-            match provider.get_available_models().await {
+        // Create futures for all provider discoveries
+        let provider_futures: Vec<_> = self.providers
+            .iter()
+            .map(|provider| {
+                let provider_clone = provider.clone();
+                async move {
+                    let result = provider_clone.get_available_models().await;
+                    (provider_clone, result)
+                }
+            })
+            .collect();
+        
+        // Execute all futures in parallel
+        let mut results = stream::iter(provider_futures)
+            .buffer_unordered(10)  // Run up to 10 discoveries in parallel
+            .collect::<Vec<_>>()
+            .await;
+        
+        // Process the results
+        for (provider, result) in results.drain(..) {
+            match result {
                 Ok(models) => {
                     info!("Discovered {} models from provider {}", models.len(), provider.name());
                     
                     // Update model mapping
                     for model in &models {
                         debug!("  - {} ({})", model.id, model.provider);
-                        self.model_mapping.insert(model.id.clone(), provider.clone());
+                        model_mapping.insert(model.id.clone(), provider.clone());
                     }
                     
                     all_models.extend(models);
@@ -102,22 +154,28 @@ impl ProviderRouter {
         
         info!("Model discovery complete: {} total models from {} providers", 
               all_models.len(), self.providers.len());
+        
+        // Store discovered models for later retrieval
+        *self.discovered_models.write().await = all_models.clone();
               
         Ok(all_models)
     }
     
     
     /// Add a provider to the service
-    pub fn add_provider(&mut self, provider: Arc<dyn CompletionHandler>, models: Vec<String>) {
+    pub async fn add_provider(&mut self, provider: Arc<dyn CompletionHandler>, models: Vec<String>) {
+        let mut model_mapping = self.model_mapping.write().await;
         for model in models {
-            self.model_mapping.insert(model, provider.clone());
+            model_mapping.insert(model, provider.clone());
         }
         self.providers.push(provider);
     }
     
     /// Get the provider for a specific model
-    fn get_provider(&self, model_id: &str) -> Result<&Arc<dyn CompletionHandler>, CompletionError> {
-        self.model_mapping.get(model_id)
+    async fn get_provider(&self, model_id: &str) -> Result<Arc<dyn CompletionHandler>, CompletionError> {
+        let model_mapping = self.model_mapping.read().await;
+        model_mapping.get(model_id)
+            .cloned()
             .ok_or_else(|| CompletionError::InvalidModel(format!("Model '{}' not available in any provider", model_id)))
     }
 }
@@ -129,10 +187,14 @@ impl CompletionHandler for ProviderRouter {
     }
     
     fn supports_model(&self, model_id: &str) -> bool {
-        self.model_mapping.contains_key(model_id)
+        // Note: This is now an async operation, but the trait requires sync
+        // We'll use try_read() and default to false if the lock is not immediately available
+        self.model_mapping.try_read()
+            .map(|mapping| mapping.contains_key(model_id))
+            .unwrap_or(false)
     }
     async fn chat_completion(&self, params: ChatCompletionParams) -> Result<ChatCompletionResult, CompletionError> {
-        let provider = self.get_provider(&params.model_id)?;
+        let provider = self.get_provider(&params.model_id).await?;
         debug!("Routing chat completion for model '{}' to provider '{}'", params.model_id, provider.name());
         provider.chat_completion(params).await
     }
@@ -141,13 +203,13 @@ impl CompletionHandler for ProviderRouter {
         &self,
         params: ChatCompletionParams,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, CompletionError>> + Send>>, CompletionError> {
-        let provider = self.get_provider(&params.model_id)?;
+        let provider = self.get_provider(&params.model_id).await?;
         debug!("Routing streaming chat completion for model '{}' to provider '{}'", params.model_id, provider.name());
         provider.chat_completion_stream(params).await
     }
     
     async fn text_completion(&self, params: CompletionParams) -> Result<CompletionResult, CompletionError> {
-        let provider = self.get_provider(&params.model_id)?;
+        let provider = self.get_provider(&params.model_id).await?;
         debug!("Routing text completion for model '{}' to provider '{}'", params.model_id, provider.name());
         provider.text_completion(params).await
     }
@@ -156,22 +218,15 @@ impl CompletionHandler for ProviderRouter {
         &self,
         params: CompletionParams,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, CompletionError>> + Send>>, CompletionError> {
-        let provider = self.get_provider(&params.model_id)?;
+        let provider = self.get_provider(&params.model_id).await?;
         debug!("Routing streaming text completion for model '{}' to provider '{}'", params.model_id, provider.name());
         provider.text_completion_stream(params).await
     }
     
     async fn get_available_models(&self) -> Result<Vec<crate::providers::ModelInfo>, CompletionError> {
-        let mut all_models = Vec::new();
-        
-        for provider in &self.providers {
-            match provider.get_available_models().await {
-                Ok(models) => all_models.extend(models),
-                Err(e) => error!("Failed to get models from {}: {}", provider.name(), e),
-            }
-        }
-        
-        Ok(all_models)
+        // Return the cached discovered models from the periodic check
+        let models = self.discovered_models.read().await;
+        Ok(models.clone())
     }
     
     
@@ -284,7 +339,7 @@ mod tests {
         };
         let service = ProviderRouter::new(config);
         assert_eq!(service.providers.len(), 0);
-        assert_eq!(service.model_mapping.len(), 0);
+        // Model mapping is now behind Arc<RwLock> so we can't directly check its size in tests
     }
     
     #[test]

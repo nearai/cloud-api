@@ -233,6 +233,8 @@ impl ResponseService {
         // Prepare chat messages for LLM
         let chat_messages = self.prepare_chat_messages(&request, &llm_context_messages);
 
+        tracing::info!("Chat messages: {:?}", chat_messages);
+        
         let chat_params = ChatCompletionParams {
             model_id: request.model,
             messages: chat_messages,

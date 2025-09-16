@@ -480,19 +480,52 @@ impl ResponseService {
                                 
                                 // Update database with completion
                                 if let (Some(ref database), Some(id)) = (&db, db_id) {
-                                    if let Ok(user_uuid) = Uuid::parse_str(&user_id_str) {
-                                        if let Some(ref usage) = final_usage {
-                                            if let Ok(usage_json) = serde_json::to_value(usage) {
-                                                let _ = database.responses.update(
-                                                    id,
-                                                    user_uuid,
-                                                    Some(accumulated_text.clone()),
-                                                    database::ResponseStatus::Completed,
-                                                    Some(usage_json),
-                                                ).await;
+                                    match Uuid::parse_str(&user_id_str) {
+                                        Ok(user_uuid) => {
+                                            if let Some(ref usage) = final_usage {
+                                                match serde_json::to_value(usage) {
+                                                    Ok(usage_json) => {
+                                                        if let Err(e) = database.responses.update(
+                                                            id,
+                                                            user_uuid,
+                                                            Some(accumulated_text.clone()),
+                                                            database::ResponseStatus::Completed,
+                                                            Some(usage_json),
+                                                        ).await {
+                                                            tracing::error!(
+                                                                "Failed to update response {} with usage in database: {}",
+                                                                id, e
+                                                            );
+                                                        } else {
+                                                            tracing::debug!(
+                                                                "Successfully updated response {} with usage",
+                                                                id
+                                                            );
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::error!(
+                                                            "Failed to serialize usage for response {}: {}",
+                                                            id, e
+                                                        );
+                                                    }
+                                                }
+                                            } else {
+                                                tracing::warn!(
+                                                    "No usage data available in final chunk for response {}",
+                                                    id
+                                                );
                                             }
                                         }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "Failed to parse user_id '{}' as UUID for response {}: {}",
+                                                user_id_str, id, e
+                                            );
+                                        }
                                     }
+                                } else {
+                                    tracing::debug!("No database available to update response with usage");
                                 }
                                 
                                 Some((

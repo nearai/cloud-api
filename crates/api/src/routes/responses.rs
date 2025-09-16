@@ -597,19 +597,31 @@ mod tests {
         let body = response.into_body();
         let mut stream = body.into_data_stream();
         let mut events_received = 0;
+        let mut has_usage = false;
+        let mut has_completed = false;
         
         while let Some(Ok(chunk)) = stream.next().await {
             let text = String::from_utf8_lossy(&chunk);
+            
+            // Check for completion event with usage
+            if text.contains("event: response.completed") {
+                has_completed = true;
+                // The next data line should contain usage information
+                if text.contains("\"usage\"") {
+                    has_usage = true;
+                }
+            }
+            
             if text.contains("event:") {
                 events_received += 1;
             }
-            // Stop after receiving a few events
-            if events_received > 3 {
-                break;
-            }
+            
+            // Don't stop early - consume the entire stream to ensure we get the final event
         }
         
         // We should have received at least some streaming events
         assert!(events_received > 0, "Should receive streaming events");
+        assert!(has_completed, "Should receive response.completed event");
+        assert!(has_usage, "Completed event should contain usage information");
     }
 }

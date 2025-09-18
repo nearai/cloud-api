@@ -11,5 +11,5 @@ pub use user::UserRepository;
 pub use api_key::ApiKeyRepository;
 pub use session::SessionRepository;
 pub use mcp_connector::McpConnectorRepository;
-pub use conversation::ConversationRepository;
-pub use response::ResponseRepository;
+pub use conversation::PgConversationRepository;
+pub use response::PgResponseRepository;

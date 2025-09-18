@@ -18,8 +18,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
 config = { path = "../config" }
-domain = { path = "../domain" }
 database = { path = "../database" }
+services = { path = "../services" }
 # Authentication dependencies
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }

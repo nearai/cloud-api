@@ -143,9 +143,20 @@ pub async fn create_response(
 
     // Check if streaming is requested
     if request.stream.unwrap_or(false) {
+        tracing::info!(
+            user_id = %user.0.id,
+            model = %request.model,
+            "Processing streaming response request"
+        );
+
         // Create streaming response
         match service.create_response_stream(domain_request).await {
             Ok(stream) => {
+                tracing::info!(
+                    user_id = %user.0.id,
+                    "Successfully created streaming response, returning SSE stream"
+                );
+
                 let sse_stream = stream.map(|event| {
                     Ok::<_, Infallible>(
                         Event::default()
@@ -160,14 +171,31 @@ pub async fn create_response(
                     .into_response()
             }
             Err(error) => {
+                tracing::error!(
+                    user_id = %user.0.id,
+                    model = %request.model,
+                    error = %error,
+                    "Failed to create streaming response"
+                );
                 let status_code = map_response_error_to_status(&error);
                 (status_code, ResponseJson::<ErrorResponse>(error.into())).into_response()
             }
         }
     } else {
+        tracing::info!(
+            user_id = %user.0.id,
+            model = %request.model,
+            "Processing non-streaming response request"
+        );
+
         // Service only supports streaming - collect stream for non-streaming response
         match service.create_response_stream(domain_request).await {
             Ok(stream) => {
+                tracing::info!(
+                    user_id = %user.0.id,
+                    "Successfully created stream, collecting events for non-streaming response"
+                );
+
                 // Collect stream events to build complete response
                 let mut response_id = None;
                 let mut content = String::new();
@@ -246,6 +274,12 @@ pub async fn create_response(
                 (StatusCode::OK, ResponseJson(response)).into_response()
             }
             Err(error) => {
+                tracing::error!(
+                    user_id = %user.0.id,
+                    model = %request.model,
+                    error = %error,
+                    "Failed to create non-streaming response"
+                );
                 let status_code = map_response_error_to_status(&error);
                 (status_code, ResponseJson::<ErrorResponse>(error.into())).into_response()
             }

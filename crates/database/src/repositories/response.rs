@@ -85,14 +85,14 @@ impl ResponseRepository for PgResponseRepository {
             "#,
                 &[
                     &id,
-                    &user_id.to_string(),
+                    &user_id.0, // Store UUID directly
                     &model,
                     &input_messages,
                     &None::<String>,
                     &status.to_string(),
                     &instructions,
-                    &conversation_id.map(|id| id.to_string()),
-                    &previous_response_id.map(|id| id.to_string()),
+                    &conversation_id.map(|id| id.0), // Store UUID directly
+                    &previous_response_id.map(|id| id.0), // Store UUID directly
                     &None::<serde_json::Value>,
                     &metadata,
                     &now,
@@ -132,8 +132,8 @@ impl ResponseRepository for PgResponseRepository {
             RETURNING *
             "#,
                 &[
-                    &id.to_string(),
-                    &user_id.to_string(),
+                    &id.0,      // Store UUID directly
+                    &user_id.0, // Store UUID directly
                     &output_message,
                     &status.to_string(),
                     &usage,
@@ -163,7 +163,7 @@ impl ResponseRepository for PgResponseRepository {
         let row = client
             .query_opt(
                 "SELECT * FROM responses WHERE id = $1 AND user_id = $2",
-                &[&id.to_string(), &user_id.to_string()],
+                &[&id.0, &user_id.0],
             )
             .await
             .context("Failed to query response")?;
@@ -185,7 +185,7 @@ impl ResponseRepository for PgResponseRepository {
         let result = client
             .execute(
                 "DELETE FROM responses WHERE id = $1 AND user_id = $2",
-                &[&id.to_string(), &user_id.to_string()],
+                &[&id.0, &user_id.0],
             )
             .await
             .context("Failed to delete response")?;
@@ -225,7 +225,7 @@ impl ResponseRepository for PgResponseRepository {
             ORDER BY created_at DESC
             LIMIT $2 OFFSET $3
             "#,
-                &[&user_id.to_string(), &limit, &offset],
+                &[&user_id.0, &limit, &offset],
             )
             .await
             .context("Failed to list responses")?;
@@ -256,7 +256,7 @@ impl ResponseRepository for PgResponseRepository {
             ORDER BY created_at DESC
             LIMIT $3
             "#,
-                &[&conversation_id.to_string(), &user_id.to_string(), &limit],
+                &[&conversation_id.0, &user_id.0, &limit],
             )
             .await
             .context("Failed to list responses by conversation")?;
@@ -282,7 +282,7 @@ impl ResponseRepository for PgResponseRepository {
         let current = client
             .query_opt(
                 "SELECT previous_response_id FROM responses WHERE id = $1 AND user_id = $2",
-                &[&response_id.to_string(), &user_id.to_string()],
+                &[&response_id.0, &user_id.0],
             )
             .await
             .context("Failed to query current response")?;

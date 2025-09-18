@@ -161,22 +161,48 @@ impl ResponseService {
         &self,
         request: ResponseRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = ResponseStreamEvent> + Send>>, ResponseError> {
+        tracing::info!(
+            user_id = %request.user_id,
+            model = %request.model,
+            "Starting response stream creation"
+        );
+
         // Prepare messages
-        let (input_messages, llm_context_messages) = self.prepare_messages(&request).await?;
+        tracing::debug!("Preparing messages for response");
+        let (input_messages, llm_context_messages) =
+            self.prepare_messages(&request).await.map_err(|e| {
+                tracing::error!("Failed to prepare messages: {}", e);
+                e
+            })?;
+        tracing::debug!(
+            "Successfully prepared {} input messages",
+            input_messages.len()
+        );
 
         // Create response in database
+        tracing::debug!("Creating response record in database");
         let response_id = self
             .create_database_response(&request, &input_messages)
-            .await?;
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to create database response: {}", e);
+                e
+            })?;
+        tracing::info!(
+            response_id = %response_id,
+            "Successfully created response record in database"
+        );
 
         // Prepare chat messages for LLM
+        tracing::debug!("Preparing chat messages for LLM");
         let chat_messages = self.prepare_chat_messages(&request, &llm_context_messages);
+        tracing::debug!("Prepared {} chat messages for LLM", chat_messages.len());
 
         tracing::info!("Starting streaming response for {}", response_id);
 
         let chat_params = ChatCompletionParams {
             model: request.model.clone(),
-            messages: chat_messages,
+            messages: chat_messages.clone(),
             max_tokens: request.max_output_tokens,
             temperature: request.temperature,
             top_p: request.top_p,
@@ -200,21 +226,44 @@ impl ResponseService {
             stream_options: None,
         };
 
+        tracing::debug!(
+            model = %chat_params.model,
+            message_count = chat_messages.len(),
+            max_tokens = ?chat_params.max_tokens,
+            temperature = ?chat_params.temperature,
+            "Calling inference provider with chat completion params"
+        );
+
         // Get the LLM stream
         let llm_stream = self
             .inference_provider_pool
             .chat_completion_stream(chat_params)
             .await
             .map_err(|e| {
+                tracing::error!(
+                    model = %request.model,
+                    error = %e,
+                    "Failed to create LLM stream from inference provider"
+                );
                 ResponseError::InternalError(format!("Failed to create LLM stream: {}", e))
             })?;
+
+        tracing::info!(
+            response_id = %response_id,
+            "Successfully created LLM stream, creating event stream"
+        );
 
         // Create the response event stream
         let event_stream = Self::create_event_stream(
             llm_stream,
-            response_id,
+            response_id.clone(),
             self.response_repository.clone(),
             request.user_id.clone(),
+        );
+
+        tracing::info!(
+            response_id = %response_id,
+            "Successfully created response event stream"
         );
 
         Ok(Box::pin(event_stream))

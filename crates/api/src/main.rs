@@ -168,6 +168,12 @@ async fn main() {
     let inference_provider_pool =
         Arc::new(services::inference_provider_pool::InferenceProviderPool::new(providers));
 
+    // Initialize model discovery during startup
+    if let Err(e) = inference_provider_pool.initialize().await {
+        tracing::warn!("Failed to initialize model discovery during startup: {}", e);
+        tracing::info!("Models will be discovered on first request");
+    }
+
     let models_service = Arc::new(services::models::ModelsServiceImpl::new(
         inference_provider_pool.clone(),
     ));

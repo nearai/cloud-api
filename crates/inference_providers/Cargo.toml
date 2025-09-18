@@ -16,6 +16,7 @@ tokio = { version = "1.0", features = ["full"] }
 thiserror = "2.0"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures-util = "0.3"
+tracing = "0.1"
 
 # Dev dependencies for testing and examples
 [dev-dependencies]

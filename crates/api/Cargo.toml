@@ -20,6 +20,7 @@ anyhow = "1.0"
 config = { path = "../config" }
 database = { path = "../database" }
 services = { path = "../services" }
+inference_providers = { path = "../inference_providers" }
 # Authentication dependencies
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }

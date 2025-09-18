@@ -4,6 +4,7 @@ use anyhow::{Result, Context};
 use uuid::Uuid;
 use chrono::Utc;
 use tracing::debug;
+use async_trait::async_trait;
 
 pub struct UserRepository {
     pool: DbPool,
@@ -210,5 +211,109 @@ impl UserRepository {
             auth_provider: row.get("auth_provider"),
             provider_user_id: row.get("provider_user_id"),
         })
+    }
+}
+
+// Convert database User to service User
+fn db_user_to_service_user(db_user: User) -> services::auth::User {
+    services::auth::User {
+        id: services::auth::UserId(db_user.id),
+        email: db_user.email,
+        username: db_user.username,
+        display_name: db_user.display_name,
+        avatar_url: db_user.avatar_url,
+        organization_id: None, // TODO: Map from db_user if organization support is added
+        role: services::auth::UserRole::User, // TODO: Map from db_user if roles are added
+        is_active: db_user.is_active,
+        last_login: db_user.last_login_at,
+        created_at: db_user.created_at,
+        updated_at: db_user.updated_at,
+    }
+}
+
+// Implement the service trait
+#[async_trait]
+impl services::auth::UserRepository for UserRepository {
+    async fn create(
+        &self,
+        email: String,
+        username: String,
+        display_name: Option<String>,
+        avatar_url: Option<String>,
+    ) -> anyhow::Result<services::auth::User> {
+        // For now, we'll use create_from_oauth with "manual" as the provider
+        let db_user = self.create_from_oauth(
+            email,
+            username,
+            display_name,
+            avatar_url,
+            "manual".to_string(),
+            Uuid::new_v4().to_string(),
+        ).await?;
+        
+        Ok(db_user_to_service_user(db_user))
+    }
+
+    async fn create_from_oauth(
+        &self,
+        email: String,
+        username: String,
+        display_name: Option<String>,
+        avatar_url: Option<String>,
+        auth_provider: String,
+        provider_user_id: String,
+    ) -> anyhow::Result<services::auth::User> {
+        let db_user = self.create_from_oauth(
+            email,
+            username,
+            display_name,
+            avatar_url,
+            auth_provider,
+            provider_user_id,
+        ).await?;
+        
+        Ok(db_user_to_service_user(db_user))
+    }
+
+    async fn get_by_id(&self, id: services::auth::UserId) -> anyhow::Result<Option<services::auth::User>> {
+        let maybe_user = self.get_by_id(id.0).await?;
+        Ok(maybe_user.map(db_user_to_service_user))
+    }
+
+    async fn get_by_email(&self, email: &str) -> anyhow::Result<Option<services::auth::User>> {
+        let maybe_user = self.get_by_email(email).await?;
+        Ok(maybe_user.map(db_user_to_service_user))
+    }
+
+    async fn update(
+        &self,
+        id: services::auth::UserId,
+        display_name: Option<String>,
+        avatar_url: Option<String>,
+    ) -> anyhow::Result<Option<services::auth::User>> {
+        match self.update_profile(id.0, display_name, avatar_url).await {
+            Ok(user) => Ok(Some(db_user_to_service_user(user))),
+            Err(e) => {
+                // Check if error is because user wasn't found
+                if e.to_string().contains("no rows") {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    async fn update_last_login(&self, id: services::auth::UserId) -> anyhow::Result<()> {
+        self.update_last_login(id.0).await
+    }
+
+    async fn delete(&self, id: services::auth::UserId) -> anyhow::Result<bool> {
+        self.deactivate(id.0).await
+    }
+
+    async fn list(&self, limit: i64, offset: i64) -> anyhow::Result<Vec<services::auth::User>> {
+        let db_users = self.list(limit, offset).await?;
+        Ok(db_users.into_iter().map(db_user_to_service_user).collect())
     }
 }

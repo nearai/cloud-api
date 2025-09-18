@@ -1,7 +1,10 @@
-use std::{collections::HashMap, sync::Arc};
-use inference_providers::{models::{CompletionError, ListModelsError, ModelsResponse}, ChatCompletionParams, CompletionParams, InferenceProvider, StreamingResult};
-use tokio::sync::RwLock;
 use async_trait::async_trait;
+use inference_providers::{
+    models::{CompletionError, ListModelsError, ModelsResponse},
+    ChatCompletionParams, CompletionParams, InferenceProvider, StreamingResult,
+};
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::RwLock;
 
 pub struct InferenceProviderPool {
     providers: Vec<Arc<dyn InferenceProvider + Send + Sync>>,
@@ -10,7 +13,10 @@ pub struct InferenceProviderPool {
 
 impl InferenceProviderPool {
     pub fn new(providers: Vec<Arc<dyn InferenceProvider + Send + Sync>>) -> Self {
-        Self { providers, model_mapping: Arc::new(RwLock::new(HashMap::new())) }
+        Self {
+            providers,
+            model_mapping: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
 
     async fn discover_models(&self) -> Result<ModelsResponse, ListModelsError> {
@@ -18,7 +24,7 @@ impl InferenceProviderPool {
         let mut all_models = Vec::new();
         let mut model_mapping = self.model_mapping.write().await;
         model_mapping.clear();
-        
+
         for provider in &self.providers {
             match provider.models().await {
                 Ok(models_response) => {
@@ -34,7 +40,7 @@ impl InferenceProviderPool {
                 }
             }
         }
-        
+
         Ok(ModelsResponse {
             object: "list".to_string(),
             data: all_models,
@@ -47,37 +53,36 @@ impl InferenceProvider for InferenceProviderPool {
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
         self.discover_models().await
     }
-    
-    async fn chat_completion_stream(&self, params: ChatCompletionParams) -> Result<StreamingResult, CompletionError> {
+
+    async fn chat_completion_stream(
+        &self,
+        params: ChatCompletionParams,
+    ) -> Result<StreamingResult, CompletionError> {
         let model_id = &params.model;
         let model_mapping = self.model_mapping.read().await;
-        
+
         match model_mapping.get(model_id) {
-            Some(provider) => {
-                provider.chat_completion_stream(params).await
-            }
-            None => {
-                Err(CompletionError::CompletionError(format!(
-                    "Model '{}' not found in any configured provider", model_id
-                )))
-            }
+            Some(provider) => provider.chat_completion_stream(params).await,
+            None => Err(CompletionError::CompletionError(format!(
+                "Model '{}' not found in any configured provider",
+                model_id
+            ))),
         }
     }
-    
-    async fn text_completion_stream(&self, params: CompletionParams) -> Result<StreamingResult, CompletionError> {
+
+    async fn text_completion_stream(
+        &self,
+        params: CompletionParams,
+    ) -> Result<StreamingResult, CompletionError> {
         let model_id = &params.model;
         let model_mapping = self.model_mapping.read().await;
-        
+
         match model_mapping.get(model_id) {
-            Some(provider) => {
-                provider.text_completion_stream(params).await
-            }
-            None => {
-                Err(CompletionError::CompletionError(format!(
-                    "Model '{}' not found in any configured provider", model_id
-                )))
-            }
+            Some(provider) => provider.text_completion_stream(params).await,
+            None => Err(CompletionError::CompletionError(format!(
+                "Model '{}' not found in any configured provider",
+                model_id
+            ))),
         }
     }
 }
-

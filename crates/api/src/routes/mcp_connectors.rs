@@ -1,22 +1,63 @@
+use crate::{middleware::AuthenticatedUser, routes::api::AppState};
 use axum::{
-    extract::{Path, State, Query},
-    response::Json,
+    extract::{Path, Query, State},
     http::StatusCode,
+    response::Json,
     Extension,
 };
 use database::{
-    Database,
     models::{
-        McpConnector, CreateMcpConnectorRequest, UpdateMcpConnectorRequest,
-        McpConnectionStatus, McpConnectorUsage,
+        CreateMcpConnectorRequest, McpConnectionStatus, McpConnector, McpConnectorUsage,
+        UpdateMcpConnectorRequest,
     },
+    Database,
 };
-use domain::mcp::{McpClientManager, manager::McpError};
-use crate::{middleware::AuthenticatedUser, routes::api::AppState};
 use serde::{Deserialize, Serialize};
+use services::{McpClientManager, McpError, organization::ports::OrganizationRepository};
 use std::sync::Arc;
-use uuid::Uuid;
 use tracing::{error, info};
+use uuid::Uuid;
+
+/// Convert database McpConnector to services McpConnector
+fn convert_db_to_service_connector(
+    db_connector: &database::McpConnector,
+) -> services::mcp::ports::McpConnector {
+    let auth = match &db_connector.auth_type {
+        database::McpAuthType::None => services::mcp::ports::McpAuthConfig::None,
+        database::McpAuthType::Bearer => {
+            let token = db_connector
+                .auth_config
+                .as_ref()
+                .and_then(|c| c.get("token"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            services::mcp::ports::McpAuthConfig::Bearer(services::mcp::ports::McpBearerConfig {
+                token,
+                header_name: None,
+            })
+        }
+    };
+
+    services::mcp::ports::McpConnector {
+        id: services::mcp::ports::McpConnectorId::from(db_connector.id),
+        organization_id: services::organization::ports::OrganizationId::from(
+            db_connector.organization_id,
+        ),
+        name: db_connector.name.clone(),
+        description: db_connector.description.clone(),
+        server_url: db_connector.mcp_server_url.clone(),
+        auth,
+        is_active: db_connector.is_active,
+        settings: db_connector
+            .auth_config
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({})),
+        created_at: db_connector.created_at,
+        updated_at: db_connector.updated_at,
+    }
+}
 
 /// List all MCP connectors for an organization
 pub async fn list_mcp_connectors(
@@ -25,24 +66,30 @@ pub async fn list_mcp_connectors(
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<Json<Vec<McpConnector>>, StatusCode> {
     // Check if user has access to the organization
-    let member = app_state.db.organizations.get_member(org_id, user.0.id)
+    let member = app_state
+        .db
+        .organizations
+        .get_member(org_id, user.0.id)
         .await
         .map_err(|e| {
             error!("Failed to check organization membership: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    
+
     if member.is_none() {
         return Err(StatusCode::FORBIDDEN);
     }
-    
-    let connectors = app_state.db.mcp_connectors.list_by_organization(org_id)
+
+    let connectors = app_state
+        .db
+        .mcp_connectors
+        .list_by_organization(org_id)
         .await
         .map_err(|e| {
             error!("Failed to list MCP connectors: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    
+
     Ok(Json(connectors))
 }
 
@@ -53,30 +100,36 @@ pub async fn get_mcp_connector(
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<Json<McpConnector>, StatusCode> {
     // Check if user has access to the organization
-    let member = app_state.db.organizations.get_member(org_id, user.0.id)
+    let member = app_state
+        .db
+        .organizations
+        .get_member(org_id, user.0.id)
         .await
         .map_err(|e| {
             error!("Failed to check organization membership: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    
+
     if member.is_none() {
         return Err(StatusCode::FORBIDDEN);
     }
-    
-    let connector = app_state.db.mcp_connectors.get_by_id(connector_id)
+
+    let connector = app_state
+        .db
+        .mcp_connectors
+        .get_by_id(connector_id)
         .await
         .map_err(|e| {
             error!("Failed to get MCP connector: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
-    
+
     // Verify the connector belongs to the organization
     if connector.organization_id != org_id {
         return Err(StatusCode::NOT_FOUND);
     }
-    
+
     Ok(Json(connector))
 }
 
@@ -88,43 +141,67 @@ pub async fn create_mcp_connector(
     Json(request): Json<CreateMcpConnectorRequest>,
 ) -> Result<(StatusCode, Json<McpConnector>), StatusCode> {
     // Check if user has permission to manage connectors
-    let member = app_state.db.organizations.get_member(org_id, user.0.id)
+    let member = app_state
+        .db
+        .organizations
+        .get_member(org_id, user.0.id)
         .await
         .map_err(|e| {
             error!("Failed to check organization membership: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::FORBIDDEN)?;
-    
+
     if !member.role.can_manage_mcp_connectors() {
         return Err(StatusCode::FORBIDDEN);
     }
-    
-    let connector = app_state.db.mcp_connectors.create(org_id, user.0.id, request)
+
+    let connector = app_state
+        .db
+        .mcp_connectors
+        .create(org_id, user.0.id, request)
         .await
         .map_err(|e| {
             error!("Failed to create MCP connector: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    
-    info!("Created MCP connector {} for organization {}", connector.id, org_id);
-    
+
+    info!(
+        "Created MCP connector {} for organization {}",
+        connector.id, org_id
+    );
+
     // Optionally test the connection in the background
     let app_state_clone = app_state.clone();
     let connector_clone = connector.clone();
     tokio::spawn(async move {
-        info!("Starting background MCP connection test for connector {}", connector_clone.id);
-        match test_mcp_connection(app_state_clone.db.clone(), app_state_clone.mcp_manager, connector_clone.clone()).await {
+        info!(
+            "Starting background MCP connection test for connector {}",
+            connector_clone.id
+        );
+        match test_mcp_connection(
+            app_state_clone.db.clone(),
+            app_state_clone.mcp_manager,
+            connector_clone.clone(),
+        )
+        .await
+        {
             Ok(capabilities) => {
-                info!("MCP connection test successful for connector {}: {:?}", connector_clone.id, capabilities);
+                info!(
+                    "MCP connection test successful for connector {}: {:?}",
+                    connector_clone.id, capabilities
+                );
             }
             Err(e) => {
-                error!("Failed to test MCP connection for connector {}: {:?}", connector_clone.id, e);
+                error!(
+                    "Failed to test MCP connection for connector {}: {:?}",
+                    connector_clone.id, e
+                );
                 error!("Error chain: {:#}", e);
             }
         }
     });
-    
+
     Ok((StatusCode::CREATED, Json(connector)))
 }
 
@@ -136,49 +213,67 @@ pub async fn update_mcp_connector(
     Json(request): Json<UpdateMcpConnectorRequest>,
 ) -> Result<Json<McpConnector>, StatusCode> {
     // Check if user has permission to manage connectors
-    let member = app_state.db.organizations.get_member(org_id, user.0.id)
+    let member = app_state
+        .db
+        .organizations
+        .get_member(org_id, user.0.id)
         .await
         .map_err(|e| {
             error!("Failed to check organization membership: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::FORBIDDEN)?;
-    
+
     if !member.role.can_manage_mcp_connectors() {
         return Err(StatusCode::FORBIDDEN);
     }
-    
+
     // Verify the connector belongs to the organization
-    let existing = app_state.db.mcp_connectors.get_by_id(connector_id)
+    let existing = app_state
+        .db
+        .mcp_connectors
+        .get_by_id(connector_id)
         .await
         .map_err(|e| {
             error!("Failed to get MCP connector: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
-    
+
     if existing.organization_id != org_id {
         return Err(StatusCode::NOT_FOUND);
     }
-    
-    let connector = app_state.db.mcp_connectors.update(connector_id, request)
+
+    let connector = app_state
+        .db
+        .mcp_connectors
+        .update(connector_id, request)
         .await
         .map_err(|e| {
             error!("Failed to update MCP connector: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    
-    info!("Updated MCP connector {} for organization {}", connector_id, org_id);
-    
+
+    info!(
+        "Updated MCP connector {} for organization {}",
+        connector_id, org_id
+    );
+
     // Test the connection if URL or auth changed
     let app_state_clone = app_state.clone();
     let connector_clone = connector.clone();
     tokio::spawn(async move {
-        if let Err(e) = test_mcp_connection(app_state_clone.db.clone(), app_state_clone.mcp_manager, connector_clone).await {
+        if let Err(e) = test_mcp_connection(
+            app_state_clone.db.clone(),
+            app_state_clone.mcp_manager,
+            connector_clone,
+        )
+        .await
+        {
             error!("Failed to test MCP connection: {}", e);
         }
     });
-    
+
     Ok(Json(connector))
 }
 
@@ -189,40 +284,52 @@ pub async fn delete_mcp_connector(
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<StatusCode, StatusCode> {
     // Check if user has permission to manage connectors
-    let member = app_state.db.organizations.get_member(org_id, user.0.id)
+    let member = app_state
+        .db
+        .organizations
+        .get_member(org_id, user.0.id)
         .await
         .map_err(|e| {
             error!("Failed to check organization membership: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::FORBIDDEN)?;
-    
+
     if !member.role.can_manage_mcp_connectors() {
         return Err(StatusCode::FORBIDDEN);
     }
-    
+
     // Verify the connector belongs to the organization
-    let existing = app_state.db.mcp_connectors.get_by_id(connector_id)
+    let existing = app_state
+        .db
+        .mcp_connectors
+        .get_by_id(connector_id)
         .await
         .map_err(|e| {
             error!("Failed to get MCP connector: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
-    
+
     if existing.organization_id != org_id {
         return Err(StatusCode::NOT_FOUND);
     }
-    
-    app_state.db.mcp_connectors.delete(connector_id)
+
+    app_state
+        .db
+        .mcp_connectors
+        .delete(connector_id)
         .await
         .map_err(|e| {
             error!("Failed to delete MCP connector: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    
-    info!("Deleted MCP connector {} for organization {}", connector_id, org_id);
-    
+
+    info!(
+        "Deleted MCP connector {} for organization {}",
+        connector_id, org_id
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -233,47 +340,54 @@ pub async fn test_mcp_connector(
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<Json<TestConnectionResponse>, StatusCode> {
     // Check if user has access to the organization
-    let _member = app_state.db.organizations.get_member(org_id, user.0.id)
+    let _member = app_state
+        .db
+        .organizations
+        .get_member(org_id, user.0.id)
         .await
         .map_err(|e| {
             error!("Failed to check organization membership: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::FORBIDDEN)?;
-    
-    let connector = app_state.db.mcp_connectors.get_by_id(connector_id)
+
+    let connector = app_state
+        .db
+        .mcp_connectors
+        .get_by_id(connector_id)
         .await
         .map_err(|e| {
             error!("Failed to get MCP connector: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
-    
+
     // Verify the connector belongs to the organization
     if connector.organization_id != org_id {
         return Err(StatusCode::NOT_FOUND);
     }
-    
+
     // Test the connection
-    let result = test_mcp_connection(app_state.db.clone(), app_state.mcp_manager.clone(), connector).await;
-    
+    let result = test_mcp_connection(
+        app_state.db.clone(),
+        app_state.mcp_manager.clone(),
+        connector,
+    )
+    .await;
+
     match result {
-        Ok(capabilities) => {
-            Ok(Json(TestConnectionResponse {
-                success: true,
-                message: Some("Connection successful".to_string()),
-                capabilities: Some(capabilities),
-                error: None,
-            }))
-        }
-        Err(e) => {
-            Ok(Json(TestConnectionResponse {
-                success: false,
-                message: Some("Connection failed".to_string()),
-                capabilities: None,
-                error: Some(e.to_string()),
-            }))
-        }
+        Ok(capabilities) => Ok(Json(TestConnectionResponse {
+            success: true,
+            message: Some("Connection successful".to_string()),
+            capabilities: Some(capabilities),
+            error: None,
+        })),
+        Err(e) => Ok(Json(TestConnectionResponse {
+            success: false,
+            message: Some("Connection failed".to_string()),
+            capabilities: None,
+            error: Some(e.to_string()),
+        })),
     }
 }
 
@@ -293,35 +407,43 @@ pub async fn list_mcp_tools(
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // Check if user has access to the organization
-    let _member = app_state.db.organizations.get_member(org_id, user.0.id)
+    let _member = app_state
+        .db
+        .organizations
+        .get_member(org_id, user.0.id)
         .await
         .map_err(|e| {
             error!("Failed to check organization membership: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::FORBIDDEN)?;
-    
-    let connector = app_state.db.mcp_connectors.get_by_id(connector_id)
+
+    let connector = app_state
+        .db
+        .mcp_connectors
+        .get_by_id(connector_id)
         .await
         .map_err(|e| {
             error!("Failed to get MCP connector: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
-    
+
     // Verify the connector belongs to the organization
     if connector.organization_id != org_id {
         return Err(StatusCode::NOT_FOUND);
     }
-    
-    // Use shared MCP manager to list tools  
-    let tools = app_state.mcp_manager.list_tools(&connector)
+
+    // Use shared MCP manager to list tools
+    let tools = app_state
+        .mcp_manager
+        .get_tools(&services::mcp::ports::McpConnectorId::from(connector.id))
         .await
         .map_err(|e| {
             error!("Failed to list MCP tools: {}", e);
             StatusCode::BAD_GATEWAY
         })?;
-    
+
     Ok(Json(serde_json::json!({ "tools": tools })))
 }
 
@@ -339,49 +461,70 @@ pub async fn call_mcp_tool(
     Json(request): Json<CallToolRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // Check if user has access to the organization
-    let _member = app_state.db.organizations.get_member(org_id, user.0.id)
+    let _member = app_state
+        .db
+        .organizations
+        .get_member(org_id, user.0.id)
         .await
         .map_err(|e| {
             error!("Failed to check organization membership: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::FORBIDDEN)?;
-    
-    let connector = app_state.db.mcp_connectors.get_by_id(connector_id)
+
+    let connector = app_state
+        .db
+        .mcp_connectors
+        .get_by_id(connector_id)
         .await
         .map_err(|e| {
             error!("Failed to get MCP connector: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
-    
+
     // Verify the connector belongs to the organization
     if connector.organization_id != org_id {
         return Err(StatusCode::NOT_FOUND);
     }
-    
+
     // Use shared MCP manager to call tool
     let start = std::time::Instant::now();
-    let result = app_state.mcp_manager.call_tool(&connector, request.tool_name.clone(), request.arguments.clone()).await;
+    let result = app_state
+        .mcp_manager
+        .call_tool(
+            &services::mcp::ports::McpConnectorId::from(connector.id),
+            request.tool_name.clone(),
+            request.arguments.clone(),
+        )
+        .await;
     let duration_ms = start.elapsed().as_millis() as i32;
-    
+
     // Log the usage
     let (response_payload, status_code, error_message) = match &result {
-        Ok(res) => (Some(serde_json::to_value(res).unwrap_or(serde_json::json!({}))), Some(200), None),
+        Ok(res) => (
+            Some(serde_json::to_value(res).unwrap_or(serde_json::json!({}))),
+            Some(200),
+            None,
+        ),
         Err(e) => (None, Some(500), Some(e.to_string())),
     };
-    
-    let _ = app_state.db.mcp_connectors.log_usage(
-        connector_id,
-        user.0.id,
-        format!("tools/call:{}", request.tool_name),
-        request.arguments,
-        response_payload,
-        status_code,
-        error_message.clone(),
-        Some(duration_ms),
-    ).await;
-    
+
+    let _ = app_state
+        .db
+        .mcp_connectors
+        .log_usage(
+            connector_id,
+            user.0.id,
+            format!("tools/call:{}", request.tool_name),
+            request.arguments,
+            response_payload,
+            status_code,
+            error_message.clone(),
+            Some(duration_ms),
+        )
+        .await;
+
     result
         .map(|r| Json(serde_json::to_value(r).unwrap_or(serde_json::json!({}))))
         .map_err(|e| {
@@ -403,40 +546,49 @@ pub async fn get_mcp_usage_logs(
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<Json<Vec<McpConnectorUsage>>, StatusCode> {
     // Check if user has permission to view logs
-    let member = app_state.db.organizations.get_member(org_id, user.0.id)
+    let member = app_state
+        .db
+        .organizations
+        .get_member(org_id, user.0.id)
         .await
         .map_err(|e| {
             error!("Failed to check organization membership: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::FORBIDDEN)?;
-    
+
     if !member.role.can_manage_mcp_connectors() {
         return Err(StatusCode::FORBIDDEN);
     }
-    
+
     // Verify the connector belongs to the organization
-    let connector = app_state.db.mcp_connectors.get_by_id(connector_id)
+    let connector = app_state
+        .db
+        .mcp_connectors
+        .get_by_id(connector_id)
         .await
         .map_err(|e| {
             error!("Failed to get MCP connector: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
-    
+
     if connector.organization_id != org_id {
         return Err(StatusCode::NOT_FOUND);
     }
-    
+
     let limit = query.limit.unwrap_or(100).min(1000);
-    
-    let logs = app_state.db.mcp_connectors.get_usage_logs(connector_id, limit)
+
+    let logs = app_state
+        .db
+        .mcp_connectors
+        .get_usage_logs(connector_id, limit)
         .await
         .map_err(|e| {
             error!("Failed to get usage logs: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    
+
     Ok(Json(logs))
 }
 
@@ -447,19 +599,29 @@ async fn test_mcp_connection(
     connector: McpConnector,
 ) -> Result<serde_json::Value, McpError> {
     let connector_id = connector.id;
-    
-    info!("Testing MCP connection for connector {} ({})", connector_id, connector.name);
+
+    info!(
+        "Testing MCP connection for connector {} ({})",
+        connector_id, connector.name
+    );
     info!("MCP Server URL: {}", connector.mcp_server_url);
     info!("Auth Type: {:?}", connector.auth_type);
-    
+
     // Try to test the connection and get server info + tools in one call
     info!("Attempting to test connection to MCP server...");
-    match manager.test_connection(&connector).await {
+    let service_connector = convert_db_to_service_connector(&connector);
+    match manager.test_connection(&service_connector).await {
         Ok((server_info, tools)) => {
-            info!("Connection test passed for connector {}, server: {} v{}", 
-                  connector_id, server_info.name, server_info.version);
-            info!("Successfully listed {} tools from connector {}", tools.len(), connector_id);
-            
+            info!(
+                "Connection test passed for connector {}, server: {} v{}",
+                connector_id, server_info.name, server_info.version
+            );
+            info!(
+                "Successfully listed {} tools from connector {}",
+                tools.len(),
+                connector_id
+            );
+
             // Create a combined capabilities response
             let capabilities = serde_json::json!({
                 "server": {
@@ -468,47 +630,79 @@ async fn test_mcp_connection(
                 },
                 "tools_available": tools.len(),
             });
-            
+
             // Update connection status to connected
-            info!("Updating connection status to Connected for connector {}", connector_id);
-            match db.mcp_connectors.update_connection_status(
-                connector_id,
-                McpConnectionStatus::Connected,
-                None,
-                Some(capabilities.clone()),
-            ).await {
+            info!(
+                "Updating connection status to Connected for connector {}",
+                connector_id
+            );
+            match db
+                .mcp_connectors
+                .update_connection_status(
+                    connector_id,
+                    McpConnectionStatus::Connected,
+                    None,
+                    Some(capabilities.clone()),
+                )
+                .await
+            {
                 Ok(_) => {
-                    info!("Successfully updated connection status to Connected for connector {}", connector_id);
+                    info!(
+                        "Successfully updated connection status to Connected for connector {}",
+                        connector_id
+                    );
                     Ok(capabilities)
                 }
-                    Err(e) => {
-                        error!("Failed to update connection status for connector {}: {:?}", connector_id, e);
-                        error!("Error details: {:#}", e);
-                        Err(McpError::ServerError(format!("Failed to update connection status: {}", e)))
-                    }
+                Err(e) => {
+                    error!(
+                        "Failed to update connection status for connector {}: {:?}",
+                        connector_id, e
+                    );
+                    error!("Error details: {:#}", e);
+                    Err(McpError::InternalError(format!(
+                        "Failed to update connection status: {}",
+                        e
+                    )))
+                }
             }
         }
         Err(e) => {
-            error!("Connection test failed for connector {}: {:?}", connector_id, e);
+            error!(
+                "Connection test failed for connector {}: {:?}",
+                connector_id, e
+            );
             error!("Error chain: {:#}", e);
-            
+
             // Update connection status to failed
-            info!("Updating connection status to Failed for connector {}", connector_id);
-            match db.mcp_connectors.update_connection_status(
-                connector_id,
-                McpConnectionStatus::Failed,
-                Some(e.to_string()),
-                None,
-            ).await {
+            info!(
+                "Updating connection status to Failed for connector {}",
+                connector_id
+            );
+            match db
+                .mcp_connectors
+                .update_connection_status(
+                    connector_id,
+                    McpConnectionStatus::Failed,
+                    Some(e.to_string()),
+                    None,
+                )
+                .await
+            {
                 Ok(_) => {
-                    info!("Successfully updated connection status to Failed for connector {}", connector_id);
+                    info!(
+                        "Successfully updated connection status to Failed for connector {}",
+                        connector_id
+                    );
                 }
                 Err(update_err) => {
-                    error!("Failed to update connection status for connector {}: {:?}", connector_id, update_err);
+                    error!(
+                        "Failed to update connection status for connector {}: {:?}",
+                        connector_id, update_err
+                    );
                     error!("Update error details: {:#}", update_err);
                 }
             }
-            
+
             Err(e)
         }
     }

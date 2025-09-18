@@ -255,3 +255,6 @@ impl ConversationService {
         Ok(messages)
     }
 }
+
+// Re-export the service and types
+pub use ports::*;

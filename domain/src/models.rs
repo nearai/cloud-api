@@ -1,4 +1,69 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+// Domain ID Types
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ResponseId(pub Uuid);
+
+impl std::fmt::Display for ResponseId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<Uuid> for ResponseId {
+    fn from(uuid: Uuid) -> Self {
+        ResponseId(uuid)
+    }
+}
+
+impl From<ResponseId> for Uuid {
+    fn from(id: ResponseId) -> Self {
+        id.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct UserId(pub Uuid);
+
+impl std::fmt::Display for UserId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<Uuid> for UserId {
+    fn from(uuid: Uuid) -> Self {
+        UserId(uuid)
+    }
+}
+
+impl From<UserId> for Uuid {
+    fn from(id: UserId) -> Self {
+        id.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ConversationId(pub Uuid);
+
+impl std::fmt::Display for ConversationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<Uuid> for ConversationId {
+    fn from(uuid: Uuid) -> Self {
+        ConversationId(uuid)
+    }
+}
+
+impl From<ConversationId> for Uuid {
+    fn from(id: ConversationId) -> Self {
+        id.0
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {

@@ -11,8 +11,8 @@ pub use repositories::{
     ApiKeyRepository,
     SessionRepository,
     McpConnectorRepository,
-    ConversationRepository,
-    ResponseRepository,
+    PgConversationRepository,
+    PgResponseRepository,
 };
 
 use anyhow::Result;
@@ -24,8 +24,8 @@ pub struct Database {
     pub api_keys: ApiKeyRepository,
     pub sessions: SessionRepository,
     pub mcp_connectors: McpConnectorRepository,
-    pub conversations: ConversationRepository,
-    pub responses: ResponseRepository,
+    pub conversations: PgConversationRepository,
+    pub responses: PgResponseRepository,
     pool: DbPool,
 }
 
@@ -38,8 +38,8 @@ impl Database {
             api_keys: ApiKeyRepository::new(pool.clone()),
             sessions: SessionRepository::new(pool.clone()),
             mcp_connectors: McpConnectorRepository::new(pool.clone()),
-            conversations: ConversationRepository::new(pool.clone()),
-            responses: ResponseRepository::new(pool.clone()),
+            conversations: PgConversationRepository::new(pool.clone()),
+            responses: PgResponseRepository::new(pool.clone()),
             pool,
         }
     }

@@ -1,0 +1,107 @@
+use async_trait::async_trait;
+use futures::Stream;
+use serde::{Deserialize, Serialize};
+use std::pin::Pin;
+use uuid::Uuid;
+
+// Domain types defined directly here (following dependency inversion)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionId(Uuid);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserId(Uuid);
+
+impl From<Uuid> for CompletionId {
+    fn from(uuid: Uuid) -> Self {
+        CompletionId(uuid)
+    }
+}
+
+impl From<Uuid> for UserId {
+    fn from(uuid: Uuid) -> Self {
+        UserId(uuid)
+    }
+}
+
+impl std::fmt::Display for CompletionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "comp_{}", self.0)
+    }
+}
+
+impl std::fmt::Display for UserId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+// Error types
+#[derive(Debug, thiserror::Error)]
+pub enum CompletionError {
+    #[error("Invalid model: {0}")]
+    InvalidModel(String),
+
+    #[error("Rate limit exceeded")]
+    RateLimitExceeded,
+
+    #[error("Invalid parameters: {0}")]
+    InvalidParams(String),
+
+    #[error("Provider error: {0}")]
+    ProviderError(String),
+
+    #[error("Internal error: {0}")]
+    InternalError(String),
+}
+
+// Request/Response models
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionRequest {
+    pub model: String,
+    pub messages: Vec<CompletionMessage>,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub stop: Option<Vec<String>>,
+    pub stream: Option<bool>,
+    pub user_id: UserId,
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String,
+    pub provider: String,
+    pub capabilities: ModelCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelCapabilities {
+    pub chat: bool,
+    pub completion: bool,
+    pub embeddings: bool,
+}
+
+// Streaming event for completion API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionStreamEvent {
+    pub event_name: String,
+    pub data: serde_json::Value,
+}
+
+// Port/Trait definitions (no implementations!)
+#[async_trait]
+pub trait CompletionService: Send + Sync {
+    /// Create a streaming completion
+    async fn create_completion_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = CompletionStreamEvent> + Send>>, CompletionError>;
+}

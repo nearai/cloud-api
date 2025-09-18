@@ -2,15 +2,15 @@
 //
 // Handles GitHub and Google OAuth2 login flows
 
+use crate::middleware::AuthenticatedUser;
 use axum::{
     extract::{Query, State},
     http::{header::SET_COOKIE, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     Extension, Json,
 };
-use crate::middleware::AuthenticatedUser;
-use domain::auth::OAuthManager;
 use serde::{Deserialize, Serialize};
+use services::auth::{AuthService, OAuthManager};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -23,7 +23,7 @@ pub type StateStore = Arc<RwLock<HashMap<String, OAuthState>>>;
 #[derive(Clone)]
 pub struct OAuthState {
     provider: String,
-    pkce_verifier: Option<String>,  // Store verifier as string
+    pkce_verifier: Option<String>, // Store verifier as string
 }
 
 #[derive(Deserialize)]
@@ -41,46 +41,50 @@ pub struct AuthResponse {
 
 /// Initiate GitHub OAuth flow - redirects to GitHub
 pub async fn github_login(
-    State((oauth, state_store)): State<(Arc<OAuthManager>, StateStore)>,
+    State((oauth, state_store, _auth_service)): State<(Arc<OAuthManager>, StateStore, Arc<AuthService>)>,
 ) -> Result<Redirect, StatusCode> {
     debug!("Initiating GitHub OAuth flow");
-    
-    let (auth_url, state) = oauth.github_auth_url()
-        .map_err(|e| {
-            error!("Failed to generate GitHub auth URL: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    
+
+    let (auth_url, state) = oauth.github_auth_url().map_err(|e| {
+        error!("Failed to generate GitHub auth URL: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     // Store state for verification
     let mut store = state_store.write().await;
-    store.insert(state.clone(), OAuthState {
-        provider: "github".to_string(),
-        pkce_verifier: None,
-    });
-    
+    store.insert(
+        state.clone(),
+        OAuthState {
+            provider: "github".to_string(),
+            pkce_verifier: None,
+        },
+    );
+
     info!("Redirecting to GitHub with state: {}", state);
     Ok(Redirect::to(&auth_url))
 }
 
 /// Initiate Google OAuth flow - redirects to Google
 pub async fn google_login(
-    State((oauth, state_store)): State<(Arc<OAuthManager>, StateStore)>,
+    State((oauth, state_store, _auth_service)): State<(Arc<OAuthManager>, StateStore, Arc<AuthService>)>,
 ) -> Result<Redirect, StatusCode> {
     debug!("Initiating Google OAuth flow");
-    
-    let (auth_url, state, pkce_verifier) = oauth.google_auth_url()
-        .map_err(|e| {
-            error!("Failed to generate Google auth URL: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    
+
+    let (auth_url, state, pkce_verifier) = oauth.google_auth_url().map_err(|e| {
+        error!("Failed to generate Google auth URL: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     // Store state and PKCE verifier for verification
     let mut store = state_store.write().await;
-    store.insert(state.clone(), OAuthState {
-        provider: "google".to_string(),
-        pkce_verifier: Some(pkce_verifier),
-    });
-    
+    store.insert(
+        state.clone(),
+        OAuthState {
+            provider: "google".to_string(),
+            pkce_verifier: Some(pkce_verifier),
+        },
+    );
+
     info!("Redirecting to Google with state: {}", state);
     Ok(Redirect::to(&auth_url))
 }
@@ -88,16 +92,16 @@ pub async fn google_login(
 /// Handle OAuth callback from both providers
 pub async fn oauth_callback(
     Query(params): Query<OAuthCallback>,
-    State((oauth, state_store)): State<(Arc<OAuthManager>, StateStore)>,
+    State((oauth, state_store, auth_service)): State<(Arc<OAuthManager>, StateStore, Arc<AuthService>)>,
 ) -> Response {
     debug!("OAuth callback received with state: {}", params.state);
-    
+
     // Retrieve and verify state
     let oauth_state = {
         let mut store = state_store.write().await;
         store.remove(&params.state)
     };
-    
+
     let oauth_state = match oauth_state {
         Some(state) => state,
         None => {
@@ -105,54 +109,88 @@ pub async fn oauth_callback(
             return (StatusCode::BAD_REQUEST, "Invalid state parameter").into_response();
         }
     };
-    
+
     info!("Processing {} OAuth callback", oauth_state.provider);
-    
-    // Handle provider-specific callback
-    let session_id = match oauth_state.provider.as_str() {
+
+    // Handle provider-specific callback to get OAuth user info
+    let oauth_result = match oauth_state.provider.as_str() {
         "github" => {
-            oauth.handle_github_callback(params.code, params.state).await
+            oauth
+                .handle_github_callback(params.code, params.state)
+                .await
         }
         "google" => {
             let verifier = oauth_state.pkce_verifier.unwrap();
-            oauth.handle_google_callback(params.code, params.state, verifier).await
+            oauth
+                .handle_google_callback(params.code, params.state, verifier)
+                .await
         }
         _ => {
             error!("Unknown provider: {}", oauth_state.provider);
             return (StatusCode::INTERNAL_SERVER_ERROR, "Unknown provider").into_response();
         }
     };
-    
-    match session_id {
-        Ok(session_id) => {
-            info!("OAuth authentication successful, session: {}", session_id);
-            
+
+    let (oauth_user_info, _access_token) = match oauth_result {
+        Ok(result) => result,
+        Err(e) => {
+            error!("OAuth authentication failed: {}", e);
+            return (
+                StatusCode::UNAUTHORIZED,
+                format!("Authentication failed: {}", e),
+            )
+                .into_response();
+        }
+    };
+
+    // Get or create user from OAuth info
+    let user = match auth_service.get_or_create_oauth_user(oauth_user_info).await {
+        Ok(user) => user,
+        Err(e) => {
+            error!("Failed to get or create user: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("User creation failed: {}", e),
+            )
+                .into_response();
+        }
+    };
+
+    // Create session for the user (24 hours)
+    let session_result = auth_service
+        .create_session(user.id, None, None, 24)
+        .await;
+
+    match session_result {
+        Ok((_session, session_token)) => {
+            info!("Session created successfully for user: {}", user.email);
+
             // Set session cookie and redirect to success page
             let cookie = format!(
                 "session_id={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400",
-                session_id
+                session_token
             );
-            
+
             (
                 StatusCode::SEE_OTHER,
                 [(SET_COOKIE, cookie)],
                 Redirect::to("/v1/auth/success"),
-            ).into_response()
+            )
+                .into_response()
         }
         Err(e) => {
-            error!("OAuth authentication failed: {}", e);
+            error!("Failed to create session: {}", e);
             (
-                StatusCode::UNAUTHORIZED,
-                format!("Authentication failed: {}", e),
-            ).into_response()
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Session creation failed: {}", e),
+            )
+                .into_response()
         }
     }
 }
 
 /// Get current user information
-pub async fn current_user(
-    Extension(user): Extension<AuthenticatedUser>,
-) -> Json<AuthResponse> {
+pub async fn current_user(Extension(user): Extension<AuthenticatedUser>) -> Json<AuthResponse> {
     Json(AuthResponse {
         message: "Authenticated".to_string(),
         email: user.0.email.clone(),
@@ -161,27 +199,27 @@ pub async fn current_user(
 }
 
 /// Logout endpoint
-pub async fn logout(
-    Extension(user): Extension<AuthenticatedUser>,
-) -> Response {
+pub async fn logout(Extension(user): Extension<AuthenticatedUser>) -> Response {
     debug!("Logging out user: {}", user.0.email);
-    
+
     // This would need the session_id from cookie in real implementation
     // For now, just clear the cookie
     let cookie = "session_id=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0";
-    
+
     (
         StatusCode::OK,
         [(SET_COOKIE, cookie)],
         Json(serde_json::json!({
             "message": "Logged out successfully"
         })),
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// Success page after authentication
 pub async fn auth_success() -> Html<&'static str> {
-    Html(r#"<!DOCTYPE html>
+    Html(
+        r#"<!DOCTYPE html>
 <html>
 <head>
     <title>Authentication Successful</title>
@@ -214,12 +252,14 @@ pub async fn auth_success() -> Html<&'static str> {
         <p>You can close this window and return to your application.</p>
     </div>
 </body>
-</html>"#)
+</html>"#,
+    )
 }
 
 /// Login page with OAuth provider options
 pub async fn login_page() -> Html<&'static str> {
-    Html(r##"<!DOCTYPE html>
+    Html(
+        r##"<!DOCTYPE html>
 <html>
 <head>
     <title>Login - Platform API</title>
@@ -315,5 +355,6 @@ pub async fn login_page() -> Html<&'static str> {
         <div class="divider">Secure OAuth 2.0 Authentication</div>
     </div>
 </body>
-</html>"##)
+</html>"##,
+    )
 }

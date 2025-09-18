@@ -1,25 +1,20 @@
+pub mod migrations;
 pub mod models;
 pub mod pool;
 pub mod repositories;
-pub mod migrations;
 
 pub use models::*;
-pub use pool::{DatabaseConfig, DbPool, create_pool};
+pub use pool::{create_pool, DatabaseConfig, DbPool};
 pub use repositories::{
-    OrganizationRepository,
-    UserRepository,
-    ApiKeyRepository,
-    SessionRepository,
-    McpConnectorRepository,
-    PgConversationRepository,
-    PgResponseRepository,
+    ApiKeyRepository, McpConnectorRepository, PgConversationRepository, PgOrganizationRepository,
+    PgResponseRepository, SessionRepository, UserRepository,
 };
 
 use anyhow::Result;
 
 /// Database service combining all repositories
 pub struct Database {
-    pub organizations: OrganizationRepository,
+    pub organizations: PgOrganizationRepository,
     pub users: UserRepository,
     pub api_keys: ApiKeyRepository,
     pub sessions: SessionRepository,
@@ -33,7 +28,7 @@ impl Database {
     /// Create a new database service from a connection pool
     pub fn new(pool: DbPool) -> Self {
         Self {
-            organizations: OrganizationRepository::new(pool.clone()),
+            organizations: PgOrganizationRepository::new(pool.clone()),
             users: UserRepository::new(pool.clone()),
             api_keys: ApiKeyRepository::new(pool.clone()),
             sessions: SessionRepository::new(pool.clone()),

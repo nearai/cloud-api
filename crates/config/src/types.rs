@@ -22,7 +22,7 @@ pub struct ServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDiscoveryConfig {
-    pub refresh_interval: u64,  // seconds
+    pub refresh_interval: u64, // seconds
     pub timeout: u64,          // seconds
 }
 
@@ -38,7 +38,7 @@ impl Default for LoggingConfig {
         let mut modules = HashMap::new();
         modules.insert("api".to_string(), "debug".to_string());
         modules.insert("domain".to_string(), "debug".to_string());
-        
+
         Self {
             level: "info".to_string(),
             format: "pretty".to_string(),
@@ -51,7 +51,7 @@ impl Default for LoggingConfig {
 pub struct ProviderConfig {
     pub name: String,
     #[serde(rename = "type")]
-    pub provider_type: String,  // "vllm", "openai", "anthropic", etc.
+    pub provider_type: String, // "vllm", "redpill"
     pub url: String,
     pub api_key: Option<String>,
     pub enabled: bool,

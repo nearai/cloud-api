@@ -19,6 +19,21 @@ inference_providers = { path = "../inference_providers" }
 futures = "0.3"
 futures-util = "0.3"
 thiserror = "2.0"
+config = { path = "../config" }
+# OAuth2 authentication
+oauth2 = { version = "5", features = ["reqwest"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+url = "2.5"
+bytes = "1.5"
+tokio-stream = "0.1"
+# MCP protocol
+rmcp = { version = "0.6", features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+    "transport-sse-client-reqwest",
+] }
+hex = "0.4"
+dstack-sdk = "0.1"
 
 [dev-dependencies]
 tokio-test = "0.4"

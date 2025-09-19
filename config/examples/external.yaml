@@ -1,5 +1,3 @@
-use_mock: false
-
 providers:
   - name: "vllm-prod-1"
     type: "vllm"

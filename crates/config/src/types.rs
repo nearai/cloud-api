@@ -1,9 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::{collections::HashMap, env};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfig {
-    pub use_mock: bool,
     pub providers: Vec<ProviderConfig>,
     pub server: ServerConfig,
     pub model_discovery: ModelDiscoveryConfig,
@@ -12,6 +11,79 @@ pub struct ApiConfig {
     pub dstack_client: DstackClientConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    pub database: DatabaseConfig,
+}
+
+/// Database configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseConfig {
+    pub host: String,
+    pub port: u16,
+    pub database: String,
+    pub username: String,
+    pub password: String,
+    pub max_connections: usize,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            host: env::var("DB_HOST").unwrap_or_else(|_| "localhost".to_string()),
+            port: env::var("DB_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5432),
+            database: env::var("DB_NAME").unwrap_or_else(|_| "platform_api".to_string()),
+            username: env::var("DB_USER").unwrap_or_else(|_| "postgres".to_string()),
+            password: env::var("DB_PASSWORD").unwrap_or_else(|_| "postgres".to_string()),
+            max_connections: env::var("DB_MAX_CONNECTIONS")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(20),
+        }
+    }
+}
+
+impl DatabaseConfig {
+    /// Create a new database configuration
+    pub fn new(
+        host: String,
+        port: u16,
+        database: String,
+        username: String,
+        password: String,
+        max_connections: usize,
+    ) -> Self {
+        Self {
+            host,
+            port,
+            database,
+            username,
+            password,
+            max_connections,
+        }
+    }
+
+    /// Create from environment variables with custom prefix
+    pub fn from_env_with_prefix(prefix: &str) -> Self {
+        Self {
+            host: env::var(format!("{}_HOST", prefix)).unwrap_or_else(|_| "localhost".to_string()),
+            port: env::var(format!("{}_PORT", prefix))
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5432),
+            database: env::var(format!("{}_DATABASE", prefix))
+                .unwrap_or_else(|_| "platform_api".to_string()),
+            username: env::var(format!("{}_USERNAME", prefix))
+                .unwrap_or_else(|_| "postgres".to_string()),
+            password: env::var(format!("{}_PASSWORD", prefix))
+                .unwrap_or_else(|_| "postgres".to_string()),
+            max_connections: env::var(format!("{}_MAX_CONNECTIONS", prefix))
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(20),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +138,6 @@ pub struct DstackClientConfig {
 // Domain-specific configuration types that will be used by domain layer
 #[derive(Debug, Clone)]
 pub struct DomainConfig {
-    pub use_mock: bool,
     pub providers: Vec<ProviderConfig>,
     pub model_discovery: ModelDiscoveryConfig,
     pub dstack_client: DstackClientConfig,
@@ -138,7 +209,6 @@ impl From<GoogleOAuthConfig> for OAuthProviderConfig {
 impl From<ApiConfig> for DomainConfig {
     fn from(api_config: ApiConfig) -> Self {
         Self {
-            use_mock: api_config.use_mock,
             providers: api_config.providers,
             model_discovery: api_config.model_discovery,
             dstack_client: api_config.dstack_client,

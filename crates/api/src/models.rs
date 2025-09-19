@@ -178,11 +178,11 @@ impl ChatCompletionRequest {
         if self.model.is_empty() {
             return Err("model is required".to_string());
         }
-        
+
         if self.messages.is_empty() {
             return Err("messages cannot be empty".to_string());
         }
-        
+
         for message in &self.messages {
             if message.role.is_empty() {
                 return Err("message role is required".to_string());
@@ -191,19 +191,19 @@ impl ChatCompletionRequest {
                 return Err(format!("invalid message role: {}", message.role));
             }
         }
-        
+
         if let Some(temp) = self.temperature {
             if !(0.0..=2.0).contains(&temp) {
                 return Err("temperature must be between 0 and 2".to_string());
             }
         }
-        
+
         if let Some(top_p) = self.top_p {
             if !(0.0..=1.0).contains(&top_p) {
                 return Err("top_p must be between 0 and 1".to_string());
             }
         }
-        
+
         Ok(())
     }
 }
@@ -213,23 +213,23 @@ impl CompletionRequest {
         if self.model.is_empty() {
             return Err("model is required".to_string());
         }
-        
+
         if self.prompt.is_empty() {
             return Err("prompt is required".to_string());
         }
-        
+
         if let Some(temp) = self.temperature {
             if !(0.0..=2.0).contains(&temp) {
                 return Err("temperature must be between 0 and 2".to_string());
             }
         }
-        
+
         if let Some(top_p) = self.top_p {
             if !(0.0..=1.0).contains(&top_p) {
                 return Err("top_p must be between 0 and 1".to_string());
             }
         }
-        
+
         Ok(())
     }
 }
@@ -238,9 +238,7 @@ impl Usage {
     pub fn new(input_tokens: u32, output_tokens: u32) -> Self {
         Self {
             input_tokens,
-            input_tokens_details: Some(InputTokensDetails {
-                cached_tokens: 0,
-            }),
+            input_tokens_details: Some(InputTokensDetails { cached_tokens: 0 }),
             output_tokens,
             output_tokens_details: Some(OutputTokensDetails {
                 reasoning_tokens: 0,
@@ -261,7 +259,7 @@ impl ErrorResponse {
             },
         }
     }
-    
+
     pub fn with_param(message: String, error_type: String, param: String) -> Self {
         Self {
             error: ErrorDetail {
@@ -386,7 +384,7 @@ pub enum ResponseContentPart {
     #[serde(rename = "input_text")]
     InputText { text: String },
     #[serde(rename = "input_image")]
-    InputImage { 
+    InputImage {
         image_url: ResponseImageUrl,
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
@@ -421,9 +419,7 @@ pub enum ConversationReference {
 #[serde(tag = "type")]
 pub enum ResponseTool {
     #[serde(rename = "function")]
-    Function {
-        function: ResponseFunction,
-    },
+    Function { function: ResponseFunction },
     #[serde(rename = "web_search")]
     WebSearch {},
     #[serde(rename = "file_search")]
@@ -474,9 +470,7 @@ pub enum ResponseTextFormat {
     #[serde(rename = "json_object")]
     JsonObject,
     #[serde(rename = "json_schema")]
-    JsonSchema { 
-        json_schema: serde_json::Value,
-    },
+    JsonSchema { json_schema: serde_json::Value },
 }
 
 /// Reasoning configuration
@@ -525,7 +519,7 @@ pub struct ResponseObject {
     pub metadata: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ResponseStatus {
     Completed,
@@ -752,13 +746,13 @@ pub enum ConversationContentPart {
     #[serde(rename = "input_text")]
     InputText { text: String },
     #[serde(rename = "input_image")]
-    InputImage { 
+    InputImage {
         image_url: ResponseImageUrl,
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
     #[serde(rename = "output_text")]
-    OutputText { 
+    OutputText {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<Vec<serde_json::Value>>,
@@ -789,7 +783,6 @@ pub struct ConversationItemList {
     pub last_id: String,
     pub has_more: bool,
 }
-
 
 // ============================================
 // Validation implementations
@@ -840,4 +833,3 @@ impl CreateConversationRequest {
         Ok(())
     }
 }
-

@@ -31,6 +31,7 @@ chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 anyhow = "1.0"
 services = { path = "../services" }
+config = { path = "../config" }
 
 # For database migrations
 refinery = { version = "0.8", features = ["tokio-postgres"] }

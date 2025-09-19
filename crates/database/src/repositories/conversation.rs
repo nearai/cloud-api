@@ -51,7 +51,7 @@ impl ConversationRepository for PgConversationRepository {
             VALUES ($1, $2, $3, $4, $5)
             RETURNING *
             "#,
-                &[&id, &user_id.to_string(), &metadata, &now, &now],
+                &[&id, &user_id.0, &metadata, &now, &now],
             )
             .await
             .context("Failed to create conversation")?;
@@ -71,7 +71,7 @@ impl ConversationRepository for PgConversationRepository {
         let row = client
             .query_opt(
                 "SELECT * FROM conversations WHERE id = $1 AND user_id = $2",
-                &[&id.to_string(), &user_id.to_string()],
+                &[&id.0, &user_id.0],
             )
             .await
             .context("Failed to query conversation")?;
@@ -105,7 +105,7 @@ impl ConversationRepository for PgConversationRepository {
             WHERE id = $1 AND user_id = $2
             RETURNING *
             "#,
-                &[&id.to_string(), &user_id.to_string(), &metadata, &now],
+                &[&id.0, &user_id.0, &metadata, &now],
             )
             .await
             .context("Failed to update conversation")?;
@@ -130,7 +130,7 @@ impl ConversationRepository for PgConversationRepository {
         let result = client
             .execute(
                 "DELETE FROM conversations WHERE id = $1 AND user_id = $2",
-                &[&id.to_string(), &user_id.to_string()],
+                &[&id.0, &user_id.0],
             )
             .await
             .context("Failed to delete conversation")?;
@@ -164,7 +164,7 @@ impl ConversationRepository for PgConversationRepository {
             ORDER BY updated_at DESC
             LIMIT $2 OFFSET $3
             "#,
-                &[&user_id.to_string(), &limit, &offset],
+                &[&user_id.0, &limit, &offset],
             )
             .await
             .context("Failed to list conversations")?;
@@ -185,7 +185,7 @@ impl ConversationRepository for PgConversationRepository {
         let row = client
             .query_one(
                 "SELECT COUNT(*) FROM conversations WHERE user_id = $1",
-                &[&user_id.to_string()],
+                &[&user_id.0],
             )
             .await
             .context("Failed to count conversations")?;

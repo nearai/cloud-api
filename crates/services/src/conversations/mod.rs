@@ -50,6 +50,8 @@ impl ConversationService {
     ) -> Result<Conversation, ConversationError> {
         let metadata = request.metadata.unwrap_or_else(|| serde_json::json!({}));
 
+        tracing::info!("Creating conversation for user: {}", request.user_id.0);
+
         let db_conversation = self
             .conv_repo
             .create(request.user_id, metadata)
@@ -57,6 +59,8 @@ impl ConversationService {
             .map_err(|e| {
                 ConversationError::InternalError(format!("Failed to create conversation: {}", e))
             })?;
+
+        tracing::info!("Created conversation: {}", db_conversation.id);
 
         let conversation = Conversation {
             id: db_conversation.id,
@@ -140,6 +144,8 @@ impl ConversationService {
         let limit = limit.unwrap_or(20).min(100) as i64;
         let offset = offset.unwrap_or(0) as i64;
 
+        tracing::info!("Listing conversations for user: {}", user_id.0);
+
         let db_conversations = self
             .conv_repo
             .list_by_user(user_id.clone(), limit, offset)
@@ -148,17 +154,9 @@ impl ConversationService {
                 ConversationError::InternalError(format!("Failed to list conversations: {}", e))
             })?;
 
-        // Convert to domain format
-        Ok(db_conversations
-            .into_iter()
-            .map(|c| Conversation {
-                id: c.id,
-                user_id: c.user_id,
-                metadata: c.metadata,
-                created_at: c.created_at,
-                updated_at: c.updated_at,
-            })
-            .collect())
+        tracing::info!("Found {} conversations", db_conversations.len());
+
+        Ok(db_conversations)
     }
 
     /// Get conversation messages by extracting from responses

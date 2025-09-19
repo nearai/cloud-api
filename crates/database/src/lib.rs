@@ -4,7 +4,7 @@ pub mod pool;
 pub mod repositories;
 
 pub use models::*;
-pub use pool::{create_pool, DatabaseConfig, DbPool};
+pub use pool::{create_pool, DbPool};
 pub use repositories::{
     ApiKeyRepository, McpConnectorRepository, PgConversationRepository, PgOrganizationRepository,
     PgResponseRepository, SessionRepository, UserRepository,
@@ -40,7 +40,7 @@ impl Database {
     }
 
     /// Create a new database service from configuration
-    pub async fn from_config(config: &DatabaseConfig) -> Result<Self> {
+    pub async fn from_config(config: &config::DatabaseConfig) -> Result<Self> {
         let pool = create_pool(config).await?;
         Ok(Self::new(pool))
     }

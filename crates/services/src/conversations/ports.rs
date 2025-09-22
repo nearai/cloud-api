@@ -1,4 +1,7 @@
-use crate::responses::ports::{ConversationId, ResponseId, ResponseRepository, UserId};
+use crate::{
+    responses::ports::{ConversationId, ResponseId, ResponseRepository},
+    UserId,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

@@ -5,7 +5,10 @@ use axum::{
     response::Response,
 };
 use database::User as DbUser;
-use services::auth::{AuthError, AuthService, OAuthManager};
+use services::{
+    auth::{AuthError, AuthService, OAuthManager},
+    organization::OrganizationId,
+};
 use std::sync::Arc;
 use tracing::{debug, error};
 use uuid::Uuid;
@@ -116,7 +119,7 @@ async fn authenticate_api_key(state: &AuthState, api_key: &str) -> Result<DbUser
         .as_ref()
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    match auth_service.validate_api_key(api_key).await {
+    match auth_service.validate_api_key(api_key.to_string()).await {
         Ok(user) => {
             debug!("Authenticated via API key for user: {}", user.email);
             Ok(convert_user_to_db_user(user))

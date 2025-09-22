@@ -217,6 +217,7 @@ pub fn build_app(
         mcp_manager: domain_services.mcp_manager.clone(),
         completion_service: domain_services.completion_service.clone(),
         models_service: domain_services.models_service.clone(),
+        auth_service: auth_components.auth_service.clone(),
     };
 
     // Build individual route groups

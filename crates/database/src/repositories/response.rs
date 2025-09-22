@@ -2,7 +2,7 @@ use crate::pool::DbPool;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use services::responses::ports::*;
+use services::{responses::ports::*, UserId};
 use tracing::debug;
 use uuid::Uuid;
 

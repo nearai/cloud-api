@@ -147,7 +147,7 @@ impl AuthService {
     }
 
     /// Validate an API key and return the associated user
-    pub async fn validate_api_key(&self, api_key: &str) -> Result<User, AuthError> {
+    pub async fn validate_api_key(&self, api_key: String) -> Result<User, AuthError> {
         // Validate the API key
         let api_key_info = self
             .api_key_repository
@@ -174,5 +174,79 @@ impl AuthService {
             .await
             .map_err(|e| AuthError::InternalError(format!("Failed to get user: {}", e)))?
             .ok_or(AuthError::UserNotFound)
+    }
+
+    /// Create an API key for an organization with proper permission checking
+    pub async fn create_organization_api_key(
+        &self,
+        organization_id: crate::organization::OrganizationId,
+        requester_id: UserId,
+        mut request: CreateApiKeyRequest,
+    ) -> Result<ApiKey, AuthError> {
+        // Check if requester has permission to create API keys for this organization
+        let member = self
+            .organization_repository
+            .get_member(organization_id.0, requester_id.0)
+            .await
+            .map_err(|e| {
+                AuthError::InternalError(format!("Failed to check organization membership: {}", e))
+            })?
+            .ok_or(AuthError::Unauthorized)?;
+
+        // Check if the user has permission to manage API keys
+        if !member.role.can_manage_api_keys() {
+            return Err(AuthError::Unauthorized);
+        }
+
+        // Ensure the request has the correct organization_id and created_by_user_id
+        request.organization_id = organization_id;
+        request.created_by_user_id = requester_id;
+
+        // Create the API key
+        self.api_key_repository
+            .create(request)
+            .await
+            .map_err(|e| AuthError::InternalError(format!("Failed to create API key: {}", e)))
+    }
+
+    /// Check if a user can manage API keys for an organization
+    pub async fn can_manage_organization_api_keys(
+        &self,
+        organization_id: crate::organization::OrganizationId,
+        user_id: UserId,
+    ) -> Result<bool, AuthError> {
+        // Check if user has permission to create API keys for this organization
+        let member = self
+            .organization_repository
+            .get_member(organization_id.0, user_id.0)
+            .await
+            .map_err(|e| {
+                AuthError::InternalError(format!("Failed to check organization membership: {}", e))
+            })?;
+
+        Ok(member.map_or(false, |m| m.role.can_manage_api_keys()))
+    }
+
+    /// List API keys for an organization with proper permission checking
+    pub async fn list_organization_api_keys(
+        &self,
+        organization_id: crate::organization::OrganizationId,
+        requester_id: UserId,
+    ) -> Result<Vec<ApiKey>, AuthError> {
+        // Check if requester is a member of the organization
+        let _member = self
+            .organization_repository
+            .get_member(organization_id.0, requester_id.0)
+            .await
+            .map_err(|e| {
+                AuthError::InternalError(format!("Failed to check organization membership: {}", e))
+            })?
+            .ok_or(AuthError::Unauthorized)?;
+
+        // List API keys for the organization
+        self.api_key_repository
+            .list_by_organization(organization_id)
+            .await
+            .map_err(|e| AuthError::InternalError(format!("Failed to list API keys: {}", e)))
     }
 }

@@ -1,9 +1,12 @@
-use crate::models::{ApiKey, ApiKeyResponse, CreateApiKeyRequest};
+use crate::models::{ApiKey, ApiKeyResponse};
 use crate::pool::DbPool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{Duration, Utc};
-use services::organization::ports::OrganizationId;
+use chrono::Utc;
+use services::{
+    auth::ports::{AccountType, CreateApiKeyRequest},
+    organization::ports::OrganizationId,
+};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 use uuid::Uuid;
@@ -30,12 +33,7 @@ impl ApiKeyRepository {
     }
 
     /// Create a new API key
-    pub async fn create(
-        &self,
-        org_id: Uuid,
-        user_id: Uuid,
-        request: CreateApiKeyRequest,
-    ) -> Result<ApiKeyResponse> {
+    pub async fn create(&self, request: CreateApiKeyRequest) -> Result<ApiKey> {
         let client = self
             .pool
             .get()
@@ -47,28 +45,28 @@ impl ApiKeyRepository {
         let key_hash = Self::hash_api_key(&key);
         let now = Utc::now();
 
-        let expires_at = request
-            .expires_in_days
-            .map(|days| now + Duration::days(days as i64));
+        // Use name as Option<String>
+        let name = request.name.clone().unwrap_or_default();
 
         let _row = client
             .query_one(
                 r#"
-            INSERT INTO api_keys (
-                id, key_hash, name, organization_id, created_by_user_id,
-                created_at, expires_at, is_active
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, true)
-            RETURNING *
-            "#,
+                INSERT INTO api_keys (
+                    id, key_hash, name, organization_id, created_by_user_id,
+                    account_type, created_at, expires_at, last_used_at, is_active
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true)
+                RETURNING *
+                "#,
                 &[
                     &id,
                     &key_hash,
-                    &request.name,
-                    &org_id,
-                    &user_id,
+                    &name,
+                    &request.organization_id.0,
+                    &request.created_by_user_id.0,
+                    &request.account_type.to_string(),
                     &now,
-                    &expires_at,
+                    &request.expires_at,
                 ],
             )
             .await
@@ -76,15 +74,77 @@ impl ApiKeyRepository {
 
         debug!(
             "Created API key: {} for org: {} by user: {}",
-            id, org_id, user_id
+            id, request.organization_id.0, request.created_by_user_id.0
         );
 
-        Ok(ApiKeyResponse {
+        Ok(ApiKey {
             id,
-            key: key.clone(), // Only return the unhashed key on creation
-            name: request.name.clone(),
+            key_hash,
+            name,
             created_at: now,
-            expires_at,
+            expires_at: request.expires_at,
+            last_used_at: None,
+            is_active: true,
+            account_type: request.account_type,
+            created_by_user_id: request.created_by_user_id.0,
+            organization_id: request.organization_id.0,
+        })
+    }
+
+    /// Create a new API key and return it with the raw key for API response
+    pub async fn create_with_key(
+        &self,
+        request: CreateApiKeyRequest,
+    ) -> Result<crate::models::ApiKeyResponse> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let id = Uuid::new_v4();
+        let key = Self::generate_api_key();
+        let key_hash = Self::hash_api_key(&key);
+        let now = Utc::now();
+
+        // Use name as Option<String>
+        let name = request.name.clone().unwrap_or_default();
+
+        let _row = client
+            .query_one(
+                r#"
+                INSERT INTO api_keys (
+                    id, key_hash, name, organization_id, created_by_user_id,
+                    account_type, created_at, expires_at, last_used_at, is_active
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true)
+                RETURNING *
+                "#,
+                &[
+                    &id,
+                    &key_hash,
+                    &name,
+                    &request.organization_id.0,
+                    &request.created_by_user_id.0,
+                    &request.account_type.to_string(),
+                    &now,
+                    &request.expires_at,
+                ],
+            )
+            .await
+            .context("Failed to create API key")?;
+
+        debug!(
+            "Created API key: {} for org: {} by user: {}",
+            id, request.organization_id.0, request.created_by_user_id.0
+        );
+
+        Ok(crate::models::ApiKeyResponse {
+            id,
+            key, // Return the raw key for the API response
+            name,
+            created_at: now,
+            expires_at: request.expires_at,
         })
     }
 
@@ -132,7 +192,8 @@ impl ApiKeyRepository {
         }
     }
 
-    /// Validate an API key and return it if valid
+    /// Validate an API key globally and return it if valid
+    /// API keys are globally unique across all organizations
     pub async fn validate(&self, key: &str) -> Result<Option<ApiKey>> {
         let key_hash = Self::hash_api_key(key);
 
@@ -268,6 +329,7 @@ impl ApiKeyRepository {
             expires_at: row.get("expires_at"),
             last_used_at: row.get("last_used_at"),
             is_active: row.get("is_active"),
+            account_type: row.get::<_, String>("account_type").into(),
         })
     }
 }
@@ -279,6 +341,7 @@ fn db_apikey_to_service_apikey(db_api_key: ApiKey) -> services::auth::ApiKey {
         name: db_api_key.name,
         organization_id: OrganizationId(db_api_key.organization_id),
         created_by_user_id: services::auth::UserId(db_api_key.created_by_user_id),
+        account_type: db_api_key.account_type,
         created_at: db_api_key.created_at,
         expires_at: db_api_key.expires_at,
         last_used_at: db_api_key.last_used_at,
@@ -289,8 +352,32 @@ fn db_apikey_to_service_apikey(db_api_key: ApiKey) -> services::auth::ApiKey {
 // Implement the service trait
 #[async_trait]
 impl services::auth::ApiKeyRepository for ApiKeyRepository {
-    async fn validate(&self, api_key: &str) -> anyhow::Result<Option<services::auth::ApiKey>> {
-        let maybe_api_key = self.validate(api_key).await?;
+    async fn validate(&self, api_key: String) -> anyhow::Result<Option<services::auth::ApiKey>> {
+        let maybe_api_key = self.validate(&api_key).await?;
         Ok(maybe_api_key.map(db_apikey_to_service_apikey))
+    }
+
+    async fn create(&self, request: CreateApiKeyRequest) -> anyhow::Result<services::auth::ApiKey> {
+        let db_api_key = self.create(request).await?;
+        Ok(db_apikey_to_service_apikey(db_api_key))
+    }
+
+    async fn list_by_organization(
+        &self,
+        organization_id: OrganizationId,
+    ) -> anyhow::Result<Vec<services::auth::ApiKey>> {
+        let api_keys = self.list_by_organization(organization_id.0).await?;
+        Ok(api_keys
+            .into_iter()
+            .map(db_apikey_to_service_apikey)
+            .collect())
+    }
+
+    async fn delete(&self, id: services::auth::ApiKeyId) -> anyhow::Result<bool> {
+        self.revoke(Uuid::parse_str(&id.0)?).await
+    }
+
+    async fn update_last_used(&self, id: services::auth::ApiKeyId) -> anyhow::Result<()> {
+        self.update_last_used(Uuid::parse_str(&id.0)?).await
     }
 }

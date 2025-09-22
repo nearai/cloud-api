@@ -3,11 +3,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResponseId(pub Uuid);
+use crate::UserId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserId(pub Uuid);
+pub struct ResponseId(pub Uuid);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationId(pub Uuid);
@@ -15,12 +14,6 @@ pub struct ConversationId(pub Uuid);
 impl From<Uuid> for ResponseId {
     fn from(uuid: Uuid) -> Self {
         ResponseId(uuid)
-    }
-}
-
-impl From<Uuid> for UserId {
-    fn from(uuid: Uuid) -> Self {
-        UserId(uuid)
     }
 }
 
@@ -33,12 +26,6 @@ impl From<Uuid> for ConversationId {
 impl std::fmt::Display for ResponseId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "resp_{}", self.0)
-    }
-}
-
-impl std::fmt::Display for UserId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
     }
 }
 

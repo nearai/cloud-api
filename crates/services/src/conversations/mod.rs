@@ -2,7 +2,8 @@ pub mod ports;
 
 use crate::{
     conversations::ports::*,
-    responses::ports::{ConversationId, ResponseRepository, UserId},
+    responses::ports::{ConversationId, ResponseRepository},
+    UserId,
 };
 use ports::ConversationError;
 use std::sync::Arc;

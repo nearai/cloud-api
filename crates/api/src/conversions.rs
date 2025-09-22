@@ -1,4 +1,6 @@
-use crate::models::*;
+use services::{organization::OrganizationId, UserId};
+
+use crate::{middleware::AuthenticatedUser, models::*};
 
 impl From<&crate::models::Message> for services::ChatMessage {
     fn from(msg: &crate::models::Message) -> Self {
@@ -167,7 +169,9 @@ pub fn current_unix_timestamp() -> u64 {
 
 // Organization-related conversions helper functions
 
-pub fn services_org_to_db_org(org: services::organization::ports::Organization) -> database::Organization {
+pub fn services_org_to_db_org(
+    org: services::organization::ports::Organization,
+) -> database::Organization {
     database::Organization {
         id: org.id.0,
         name: org.name.clone(),
@@ -181,7 +185,9 @@ pub fn services_org_to_db_org(org: services::organization::ports::Organization) 
     }
 }
 
-pub fn db_create_org_req_to_services(req: database::CreateOrganizationRequest) -> services::organization::ports::CreateOrganizationRequest {
+pub fn db_create_org_req_to_services(
+    req: database::CreateOrganizationRequest,
+) -> services::organization::ports::CreateOrganizationRequest {
     services::organization::ports::CreateOrganizationRequest {
         name: req.name,
         display_name: Some(req.display_name),
@@ -189,7 +195,9 @@ pub fn db_create_org_req_to_services(req: database::CreateOrganizationRequest) -
     }
 }
 
-pub fn db_update_org_req_to_services(req: database::UpdateOrganizationRequest) -> services::organization::ports::UpdateOrganizationRequest {
+pub fn db_update_org_req_to_services(
+    req: database::UpdateOrganizationRequest,
+) -> services::organization::ports::UpdateOrganizationRequest {
     services::organization::ports::UpdateOrganizationRequest {
         display_name: req.display_name,
         description: req.description,
@@ -198,7 +206,9 @@ pub fn db_update_org_req_to_services(req: database::UpdateOrganizationRequest) -
     }
 }
 
-pub fn db_role_to_member_role(role: database::OrganizationRole) -> services::organization::ports::MemberRole {
+pub fn db_role_to_member_role(
+    role: database::OrganizationRole,
+) -> services::organization::ports::MemberRole {
     match role {
         database::OrganizationRole::Owner => services::organization::ports::MemberRole::Owner,
         database::OrganizationRole::Admin => services::organization::ports::MemberRole::Admin,
@@ -206,7 +216,9 @@ pub fn db_role_to_member_role(role: database::OrganizationRole) -> services::org
     }
 }
 
-pub fn member_role_to_db_role(role: services::organization::ports::MemberRole) -> database::OrganizationRole {
+pub fn member_role_to_db_role(
+    role: services::organization::ports::MemberRole,
+) -> database::OrganizationRole {
     match role {
         services::organization::ports::MemberRole::Owner => database::OrganizationRole::Owner,
         services::organization::ports::MemberRole::Admin => database::OrganizationRole::Admin,
@@ -214,20 +226,26 @@ pub fn member_role_to_db_role(role: services::organization::ports::MemberRole) -
     }
 }
 
-pub fn db_add_member_req_to_services(req: database::AddOrganizationMemberRequest) -> services::organization::ports::AddOrganizationMemberRequest {
+pub fn db_add_member_req_to_services(
+    req: database::AddOrganizationMemberRequest,
+) -> services::organization::ports::AddOrganizationMemberRequest {
     services::organization::ports::AddOrganizationMemberRequest {
         user_id: req.user_id,
         role: db_role_to_member_role(req.role),
     }
 }
 
-pub fn db_update_member_req_to_services(req: database::UpdateOrganizationMemberRequest) -> services::organization::ports::UpdateOrganizationMemberRequest {
+pub fn db_update_member_req_to_services(
+    req: database::UpdateOrganizationMemberRequest,
+) -> services::organization::ports::UpdateOrganizationMemberRequest {
     services::organization::ports::UpdateOrganizationMemberRequest {
         role: db_role_to_member_role(req.role),
     }
 }
 
-pub fn services_member_to_db_member(member: services::organization::ports::OrganizationMember) -> database::OrganizationMember {
+pub fn services_member_to_db_member(
+    member: services::organization::ports::OrganizationMember,
+) -> database::OrganizationMember {
     database::OrganizationMember {
         id: uuid::Uuid::new_v4(), // Generate new ID for database
         organization_id: member.organization_id.0,
@@ -238,8 +256,23 @@ pub fn services_member_to_db_member(member: services::organization::ports::Organ
     }
 }
 
-// Note: Quote-related types (QuoteResponse, GatewayQuote, ServiceAllowlistEntry, BuildInfo)
-// no longer exist in services. Quote functionality moved elsewhere or removed.
+pub fn api_key_req_to_services(
+    req: CreateApiKeyRequest,
+    organization_id: OrganizationId,
+    created_by_user_id: UserId,
+) -> services::auth::CreateApiKeyRequest {
+    services::auth::CreateApiKeyRequest {
+        name: req.name,
+        account_type: req.account_type,
+        expires_at: req.expires_at,
+        organization_id: organization_id,
+        created_by_user_id: created_by_user_id,
+    }
+}
+
+pub fn authenticated_user_to_user_id(user: AuthenticatedUser) -> UserId {
+    UserId(user.0.id)
+}
 
 #[cfg(test)]
 mod tests {

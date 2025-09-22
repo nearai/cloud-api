@@ -1,4 +1,4 @@
-use crate::{middleware::AuthenticatedUser, models::*};
+use crate::{conversions::authenticated_user_to_user_id, middleware::AuthenticatedUser, models::*};
 use axum::{
     extract::{Extension, Json, Path, Query, State},
     http::StatusCode,
@@ -24,10 +24,6 @@ fn parse_conversation_id(id_str: &str) -> Result<ConversationId, ConversationErr
     })?;
 
     Ok(ConversationId::from(uuid))
-}
-
-fn user_uuid_to_user_id(uuid: Uuid) -> UserId {
-    UserId::from(uuid)
 }
 
 // Add a function to handle error mapping for ConversationError
@@ -59,16 +55,16 @@ pub async fn create_conversation(
     }
 
     let domain_request = ConversationRequest {
-        user_id: user_uuid_to_user_id(user.0.id),
+        user_id: authenticated_user_to_user_id(user),
         metadata: request.metadata,
     };
 
-    match service.create_conversation(domain_request).await {
+    match service.create_conversation(domain_request.clone()).await {
         Ok(domain_conversation) => {
             let http_conversation = convert_domain_conversation_to_http(domain_conversation);
             info!(
                 "Created conversation {} for user {}",
-                http_conversation.id, user.0.id
+                http_conversation.id, domain_request.user_id
             );
             Ok((StatusCode::CREATED, ResponseJson(http_conversation)))
         }
@@ -100,7 +96,7 @@ pub async fn get_conversation(
         }
     };
 
-    let user_id = user_uuid_to_user_id(user.0.id);
+    let user_id = authenticated_user_to_user_id(user);
 
     match service
         .get_conversation(&parsed_conversation_id, &user_id)
@@ -146,7 +142,7 @@ pub async fn update_conversation(
         }
     };
 
-    let user_id = user_uuid_to_user_id(user.0.id);
+    let user_id = authenticated_user_to_user_id(user);
     let metadata = request.metadata.unwrap_or_else(|| serde_json::json!({}));
 
     match service
@@ -157,7 +153,7 @@ pub async fn update_conversation(
             let http_conversation = convert_domain_conversation_to_http(domain_conversation);
             info!(
                 "Updated conversation {} for user {}",
-                conversation_id, user.0.id
+                conversation_id, user_id
             );
             Ok(ResponseJson(http_conversation))
         }
@@ -196,7 +192,7 @@ pub async fn delete_conversation(
         }
     };
 
-    let user_id = user_uuid_to_user_id(user.0.id);
+    let user_id = authenticated_user_to_user_id(user);
 
     match service
         .delete_conversation(&parsed_conversation_id, &user_id)
@@ -205,7 +201,7 @@ pub async fn delete_conversation(
         Ok(true) => {
             info!(
                 "Deleted conversation {} for user {}",
-                conversation_id, user.0.id
+                conversation_id, user_id
             );
             Ok(ResponseJson(ConversationDeleteResult {
                 id: conversation_id,
@@ -238,7 +234,7 @@ pub async fn list_conversations(
         user.0.id, params.limit, params.offset
     );
 
-    let user_id = user_uuid_to_user_id(user.0.id);
+    let user_id = authenticated_user_to_user_id(user);
 
     match service
         .list_conversations(&user_id, params.limit, params.offset)
@@ -301,7 +297,7 @@ pub async fn list_conversation_items(
         }
     };
 
-    let user_id = user_uuid_to_user_id(user.0.id);
+    let user_id = authenticated_user_to_user_id(user);
 
     match service
         .get_conversation_messages(&parsed_conversation_id, &user_id, params.limit)

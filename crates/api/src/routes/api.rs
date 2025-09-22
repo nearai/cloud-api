@@ -6,15 +6,18 @@ use axum::{
 };
 use database::Database;
 use services::{
-    completions::CompletionService, mcp::McpClientManager, models::ModelsService,
-    organization::ports::OrganizationRepository,
+    completions::CompletionService,
+    mcp::McpClientManager,
+    models::ModelsService,
+    organization::{ports::OrganizationRepository, OrganizationService},
 };
 use std::sync::Arc;
 
 /// Application state shared across all route handlers
 #[derive(Clone)]
 pub struct AppState {
-    pub db: Arc<Database>,
+    pub db: Arc<Database>, // Still need DB for now, other routes depend on it
+    pub organization_service: Arc<OrganizationService>, // New clean service layer
     pub mcp_manager: Arc<McpClientManager>,
     pub completion_service: Arc<dyn CompletionService>,
     pub models_service: Arc<dyn ModelsService>,

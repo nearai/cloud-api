@@ -211,9 +211,18 @@ pub fn build_app(
     domain_services: DomainServices,
     auth_enabled: bool,
 ) -> Router {
+    // Create organization service using the database's organization repository
+    let organization_repo = Arc::new(database::PgOrganizationRepository::new(
+        database.pool().clone(),
+    ));
+    let organization_service = Arc::new(services::organization::OrganizationService::new(
+        organization_repo,
+    ));
+
     // Create app state for completions and management routes
     let app_state = AppState {
         db: database.clone(),
+        organization_service,
         mcp_manager: domain_services.mcp_manager.clone(),
         completion_service: domain_services.completion_service.clone(),
         models_service: domain_services.models_service.clone(),

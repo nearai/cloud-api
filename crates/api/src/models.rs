@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use services::auth::{AccountType, CreateApiKeyRequest as ServicesCreateApiKeyRequest};
+use services::auth::AccountType;
 
 // Streaming response models
 #[derive(Debug, Serialize, Deserialize)]
@@ -840,5 +840,96 @@ impl CreateConversationRequest {
 pub struct CreateApiKeyRequest {
     pub name: Option<String>,
     pub account_type: AccountType,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+// ============================================
+// Organization API Models
+// ============================================
+
+/// Request to create a new organization
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateOrganizationRequest {
+    pub name: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Request to update an organization
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateOrganizationRequest {
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub rate_limit: Option<i32>,
+    pub settings: Option<serde_json::Value>,
+}
+
+/// Organization response model
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrganizationResponse {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub owner_id: String,
+    pub settings: serde_json::Value,
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Organization member response model
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrganizationMemberResponse {
+    pub organization_id: String,
+    pub user_id: String,
+    pub role: MemberRole,
+    pub joined_at: DateTime<Utc>,
+}
+
+/// Member role enum for API
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum MemberRole {
+    Owner,
+    Admin,
+    Member,
+}
+
+/// Request to add an organization member
+#[derive(Debug, Deserialize)]
+pub struct AddOrganizationMemberRequest {
+    pub user_id: String,
+    pub role: MemberRole,
+}
+
+/// Request to update an organization member
+#[derive(Debug, Deserialize)]
+pub struct UpdateOrganizationMemberRequest {
+    pub role: MemberRole,
+}
+
+/// User response model
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserResponse {
+    pub id: String,
+    pub email: String,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_login_at: Option<DateTime<Utc>>,
+}
+
+/// API Key response model
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyResponse {
+    pub id: String,
+    pub name: Option<String>,
+    pub key_prefix: String,
+    pub organization_id: String,
+    pub created_by_user_id: String,
+    pub account_type: AccountType,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
 }

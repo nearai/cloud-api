@@ -71,7 +71,7 @@ fn db_config_for_tests() -> config::DatabaseConfig {
 }
 
 fn get_session_id() -> String {
-    "2829502f-1d81-4f1c-9857-c047b8420ef6".to_string()
+    "402af343-70ba-4a8a-b926-012f71e86769".to_string()
 }
 
 #[tokio::test]

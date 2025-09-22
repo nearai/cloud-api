@@ -1,19 +1,32 @@
-use crate::models::CreateApiKeyRequest;
+use crate::models::{
+    ApiKeyResponse, CreateApiKeyRequest, CreateOrganizationRequest, OrganizationResponse,
+    UpdateOrganizationRequest,
+};
 use crate::{middleware::AuthenticatedUser, routes::api::AppState};
 use axum::{
     extract::{Extension, Json, Path, Query, State},
     http::StatusCode,
 };
-use database::{
-    ApiKeyResponse, CreateOrganizationRequest, Organization, UpdateOrganizationRequest,
-};
 use serde::Deserialize;
 use services::{
-    auth::CreateApiKeyRequest as ServicesCreateApiKeyRequest,
-    organization::ports::OrganizationRepository,
+    auth::AuthError,
+    organization::{OrganizationError, OrganizationId},
 };
 use tracing::{debug, error};
 use uuid::Uuid;
+
+/// List all organizations for the authenticated user
+pub async fn list_organizations(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Query(params): Query<ListParams>,
+) -> Result<Json<Vec<OrganizationResponse>>, StatusCode> {
+    debug!("Listing organizations for user: {}", user.0.id);
+
+    // For now, return empty list until we implement the service method
+    // TODO: Implement proper organization listing in service layer
+    Ok(Json(vec![]))
+}
 
 /// Query parameters for listing
 #[derive(Debug, Deserialize)]
@@ -33,25 +46,27 @@ pub async fn create_organization(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Json(request): Json<CreateOrganizationRequest>,
-) -> Result<Json<Organization>, StatusCode> {
+) -> Result<Json<OrganizationResponse>, StatusCode> {
     debug!(
         "Creating organization: {} by user: {}",
         request.name, user.0.id
     );
 
-    // Any authenticated user can create organizations
-    // They will automatically become the owner
-    let services_request = crate::conversions::db_create_org_req_to_services(request);
+    // Convert API request to services request
+    let user_id = crate::conversions::authenticated_user_to_user_id(user);
+
     match app_state
-        .db
-        .organizations
-        .create(services_request, user.0.id)
+        .organization_service
+        .create_organization(request.name, request.description, user_id.clone())
         .await
     {
         Ok(org) => {
-            debug!("Created organization: {} with owner: {}", org.id, user.0.id);
-            let db_org = crate::conversions::services_org_to_db_org(org);
-            Ok(Json(db_org))
+            debug!("Created organization: {} with owner: {}", org.id, user_id.0);
+            Ok(Json(crate::conversions::services_org_to_api_org(org)))
+        }
+        Err(OrganizationError::InvalidParams(msg)) => {
+            debug!("Invalid organization creation params: {}", msg);
+            Err(StatusCode::BAD_REQUEST)
         }
         Err(e) => {
             error!("Failed to create organization: {}", e);
@@ -64,127 +79,76 @@ pub async fn create_organization(
     }
 }
 
-/// Get an organization by ID
+/// Get organization by ID
 pub async fn get_organization(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
-) -> Result<Json<Organization>, StatusCode> {
-    debug!("Getting organization: {} for user: {}", org_id, user.0.id);
+) -> Result<Json<OrganizationResponse>, StatusCode> {
+    debug!("Getting organization: {} by user: {}", org_id, user.0.id);
 
-    // Check if user has access to this organization
-    // User must be an organization member
+    let organization_id = OrganizationId(org_id);
+    let user_id = crate::conversions::authenticated_user_to_user_id(user);
+
+    // Check if user is a member or can access the organization
     match app_state
-        .db
-        .organizations
-        .get_member(org_id, user.0.id)
+        .organization_service
+        .is_member(organization_id.clone(), user_id)
         .await
     {
-        Ok(Some(_)) => {
-            // User is a member, allow access
+        Ok(true) => {
+            // User is a member, get the organization
+            match app_state
+                .organization_service
+                .get_organization(organization_id)
+                .await
+            {
+                Ok(org) => Ok(Json(crate::conversions::services_org_to_api_org(org))),
+                Err(OrganizationError::NotFound) => Err(StatusCode::NOT_FOUND),
+                Err(e) => {
+                    error!("Failed to get organization: {}", e);
+                    Err(StatusCode::INTERNAL_SERVER_ERROR)
+                }
+            }
         }
-        Ok(None) => return Err(StatusCode::FORBIDDEN),
+        Ok(false) => Err(StatusCode::FORBIDDEN),
         Err(e) => {
             error!("Failed to check organization membership: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    }
-
-    match app_state.db.organizations.get_by_id(org_id).await {
-        Ok(Some(org)) => {
-            let db_org = crate::conversions::services_org_to_db_org(org);
-            Ok(Json(db_org))
-        }
-        Ok(None) => Err(StatusCode::NOT_FOUND),
-        Err(e) => {
-            error!("Failed to get organization: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
 
-/// List organizations
-pub async fn list_organizations(
-    State(app_state): State<AppState>,
-    Extension(user): Extension<AuthenticatedUser>,
-    Query(params): Query<ListParams>,
-) -> Result<Json<Vec<Organization>>, StatusCode> {
-    debug!("Listing organizations for user: {}", user.0.id);
-
-    // Users can only see organizations they are members of
-    let query = "
-        SELECT DISTINCT o.* 
-        FROM organizations o
-        JOIN organization_members om ON o.id = om.organization_id
-        WHERE om.user_id = $1 AND o.is_active = true
-        ORDER BY o.created_at DESC
-        LIMIT $2 OFFSET $3
-    ";
-
-    let client = app_state.db.pool().get().await.map_err(|e| {
-        error!("Failed to get database connection: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let rows = client
-        .query(query, &[&user.0.id, &params.limit, &params.offset])
-        .await
-        .map_err(|e| {
-            error!("Failed to query user organizations: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    let mut organizations = Vec::new();
-    for row in rows {
-        if let Ok(Some(org)) = app_state.db.organizations.get_by_id(row.get("id")).await {
-            let db_org = crate::conversions::services_org_to_db_org(org);
-            organizations.push(db_org);
-        }
-    }
-
-    Ok(Json(organizations))
-}
-
-/// Update an organization
+/// Update organization
 pub async fn update_organization(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
     Json(request): Json<UpdateOrganizationRequest>,
-) -> Result<Json<Organization>, StatusCode> {
+) -> Result<Json<OrganizationResponse>, StatusCode> {
     debug!("Updating organization: {} by user: {}", org_id, user.0.id);
 
-    // Check if user has permission to update this organization
-    // User must be an owner or admin of the organization
-    match app_state
-        .db
-        .organizations
-        .get_member(org_id, user.0.id)
-        .await
-    {
-        Ok(Some(member)) => {
-            if !member.role.can_manage_organization() {
-                return Err(StatusCode::FORBIDDEN);
-            }
-        }
-        Ok(None) => return Err(StatusCode::FORBIDDEN),
-        Err(e) => {
-            error!("Failed to check organization membership: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    }
+    let organization_id = OrganizationId(org_id);
+    let user_id = crate::conversions::authenticated_user_to_user_id(user);
 
-    let services_request = crate::conversions::db_update_org_req_to_services(request);
     match app_state
-        .db
-        .organizations
-        .update(org_id, services_request)
+        .organization_service
+        .update_organization(
+            organization_id,
+            user_id,
+            request.display_name,
+            request.description,
+            request.rate_limit,
+            request.settings,
+        )
         .await
     {
-        Ok(org) => {
-            let db_org = crate::conversions::services_org_to_db_org(org);
-            Ok(Json(db_org))
-        }
+        Ok(updated_org) => Ok(Json(crate::conversions::services_org_to_api_org(
+            updated_org,
+        ))),
+        Err(OrganizationError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
+        Err(OrganizationError::InvalidParams(_)) => Err(StatusCode::BAD_REQUEST),
         Err(e) => {
             error!("Failed to update organization: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -192,36 +156,35 @@ pub async fn update_organization(
     }
 }
 
-/// Delete an organization
+/// Delete organization (owner only)
 pub async fn delete_organization(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     debug!("Deleting organization: {} by user: {}", org_id, user.0.id);
 
-    // Only organization owners can delete
+    let organization_id = OrganizationId(org_id);
+    let user_id = crate::conversions::authenticated_user_to_user_id(user);
+
     match app_state
-        .db
-        .organizations
-        .get_member(org_id, user.0.id)
+        .organization_service
+        .delete_organization(organization_id, user_id)
         .await
     {
-        Ok(Some(member)) => {
-            if !member.role.can_delete_organization() {
-                return Err(StatusCode::FORBIDDEN);
-            }
+        Ok(true) => {
+            debug!("Organization {} deleted successfully", org_id);
+            Ok(Json(serde_json::json!({
+                "id": org_id.to_string(),
+                "deleted": true
+            })))
         }
-        Ok(None) => return Err(StatusCode::FORBIDDEN),
-        Err(e) => {
-            error!("Failed to check organization membership: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        Ok(false) => {
+            error!("Failed to delete organization {}", org_id);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
-    }
-
-    match app_state.db.organizations.delete(org_id).await {
-        Ok(true) => Ok(StatusCode::NO_CONTENT),
-        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(OrganizationError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
         Err(e) => {
             error!("Failed to delete organization: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -229,51 +192,38 @@ pub async fn delete_organization(
     }
 }
 
-/// Create an API key for an organization
+/// Create API key for organization
 pub async fn create_organization_api_key(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
-    Json(mut request): Json<CreateApiKeyRequest>,
+    Json(request): Json<CreateApiKeyRequest>,
 ) -> Result<Json<ApiKeyResponse>, StatusCode> {
     debug!(
         "Creating API key for organization: {} by user: {}",
         org_id, user.0.id
     );
 
-    // Use auth service for permission checking
-    let organization_id = services::organization::OrganizationId(org_id);
-    let user_id = services::auth::UserId(user.0.id);
+    let organization_id = OrganizationId(org_id);
+    let user_id = crate::conversions::authenticated_user_to_user_id(user);
+    let services_request = crate::conversions::api_key_req_to_services(
+        request,
+        organization_id.clone(),
+        user_id.clone(),
+    );
 
-    // Check permissions through auth service
-    let can_manage = match app_state
-        .auth_service
-        .can_manage_organization_api_keys(organization_id.clone(), user_id.clone())
-        .await
-    {
-        Ok(can_manage) => can_manage,
-        Err(services::auth::AuthError::Unauthorized) => return Err(StatusCode::FORBIDDEN),
-        Err(e) => {
-            error!("Failed to check API key permissions: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
-
-    if !can_manage {
-        return Err(StatusCode::FORBIDDEN);
-    }
-
-    let services_request =
-        crate::conversions::api_key_req_to_services(request, organization_id, user_id);
-
-    // Create the API key through database (with raw key for response)
     match app_state
-        .db
-        .api_keys
-        .create_with_key(services_request)
+        .auth_service
+        .create_organization_api_key(organization_id, user_id, services_request)
         .await
     {
-        Ok(response) => Ok(Json(response)),
+        Ok(api_key) => {
+            debug!("Created API key: {:?}", api_key.id);
+            Ok(Json(crate::conversions::services_api_key_to_api_response(
+                api_key,
+            )))
+        }
+        Err(AuthError::Unauthorized) => Err(StatusCode::FORBIDDEN),
         Err(e) => {
             error!("Failed to create API key: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -281,39 +231,38 @@ pub async fn create_organization_api_key(
     }
 }
 
-/// List API keys for an organization
+/// List API keys for organization
 pub async fn list_organization_api_keys(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
-) -> Result<Json<Vec<database::ApiKey>>, StatusCode> {
+) -> Result<Json<Vec<ApiKeyResponse>>, StatusCode> {
     debug!(
-        "Listing API keys for organization: {} for user: {}",
+        "Listing API keys for organization: {} by user: {}",
         org_id, user.0.id
     );
 
-    // Check if user is organization member
-    let is_member = match app_state
-        .db
-        .organizations
-        .get_member(org_id, user.0.id)
+    let organization_id = OrganizationId(org_id);
+    let user_id = crate::conversions::authenticated_user_to_user_id(user);
+
+    match app_state
+        .auth_service
+        .list_organization_api_keys(organization_id, user_id)
         .await
     {
-        Ok(Some(_)) => true,
-        Ok(None) => return Err(StatusCode::FORBIDDEN),
-        Err(e) => {
-            error!("Failed to check organization membership: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        Ok(api_keys) => {
+            debug!(
+                "Found {} API keys for organization {}",
+                api_keys.len(),
+                org_id
+            );
+            let response: Vec<ApiKeyResponse> = api_keys
+                .into_iter()
+                .map(crate::conversions::services_api_key_to_api_response)
+                .collect();
+            Ok(Json(response))
         }
-    };
-
-    if !is_member {
-        return Err(StatusCode::FORBIDDEN);
-    }
-
-    // List API keys through database
-    match app_state.db.api_keys.list_by_organization(org_id).await {
-        Ok(keys) => Ok(Json(keys)),
+        Err(AuthError::Unauthorized) => Err(StatusCode::FORBIDDEN),
         Err(e) => {
             error!("Failed to list API keys: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)

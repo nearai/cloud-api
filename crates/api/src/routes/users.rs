@@ -221,7 +221,7 @@ pub async fn search_users(
 pub async fn get_user_organizations(
     State(app_state): State<AppState>,
     Extension(current_user): Extension<AuthenticatedUser>,
-) -> Result<Json<Vec<database::Organization>>, StatusCode> {
+) -> Result<Json<Vec<crate::models::OrganizationResponse>>, StatusCode> {
     debug!(
         "Getting organizations for current user: {}",
         current_user.0.id
@@ -240,7 +240,7 @@ pub async fn get_user_organizations_by_id(
     State(app_state): State<AppState>,
     Extension(current_user): Extension<AuthenticatedUser>,
     Path(user_id): Path<Uuid>,
-) -> Result<Json<Vec<database::Organization>>, StatusCode> {
+) -> Result<Json<Vec<crate::models::OrganizationResponse>>, StatusCode> {
     debug!(
         "Getting organizations for user: {} requested by: {}",
         user_id, current_user.0.id
@@ -273,7 +273,7 @@ pub async fn get_user_organizations_by_id(
     let mut organizations = Vec::new();
     for row in rows {
         if let Ok(Some(org)) = app_state.db.organizations.get_by_id(row.get("id")).await {
-            let db_org = crate::conversions::services_org_to_db_org(org);
+            let db_org = crate::conversions::services_org_to_api_org(org);
             organizations.push(db_org);
         }
     }

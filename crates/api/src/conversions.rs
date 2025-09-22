@@ -1,4 +1,4 @@
-use services::{organization::OrganizationId, UserId};
+use services::UserId;
 
 use crate::{middleware::AuthenticatedUser, models::*};
 
@@ -169,22 +169,46 @@ pub fn current_unix_timestamp() -> u64 {
 
 // Organization-related conversions helper functions
 
-pub fn services_org_to_db_org(
+/// Convert services Organization to API OrganizationResponse
+pub fn services_org_to_api_org(
     org: services::organization::ports::Organization,
-) -> database::Organization {
-    database::Organization {
-        id: org.id.0,
-        name: org.name.clone(),
-        display_name: org.name, // Use name as display name
+) -> crate::models::OrganizationResponse {
+    crate::models::OrganizationResponse {
+        id: org.id.0.to_string(),
+        name: org.name,
         description: org.description,
+        owner_id: org.owner_id.0.to_string(),
+        settings: org.settings,
+        is_active: org.is_active,
         created_at: org.created_at,
         updated_at: org.updated_at,
-        is_active: org.is_active,
-        rate_limit: None, // Not directly mapped in ports
-        settings: Some(org.settings),
     }
 }
 
+/// Convert API CreateOrganizationRequest to services request
+pub fn api_create_org_req_to_services(
+    req: crate::models::CreateOrganizationRequest,
+) -> services::organization::ports::CreateOrganizationRequest {
+    services::organization::ports::CreateOrganizationRequest {
+        name: req.name,
+        display_name: req.display_name,
+        description: req.description,
+    }
+}
+
+/// Convert API UpdateOrganizationRequest to services request
+pub fn api_update_org_req_to_services(
+    req: crate::models::UpdateOrganizationRequest,
+) -> services::organization::ports::UpdateOrganizationRequest {
+    services::organization::ports::UpdateOrganizationRequest {
+        display_name: req.display_name,
+        description: req.description,
+        rate_limit: req.rate_limit,
+        settings: req.settings,
+    }
+}
+
+// Legacy DB conversion functions - TODO: Remove once all routes migrated
 pub fn db_create_org_req_to_services(
     req: database::CreateOrganizationRequest,
 ) -> services::organization::ports::CreateOrganizationRequest {
@@ -206,6 +230,29 @@ pub fn db_update_org_req_to_services(
     }
 }
 
+/// Convert API MemberRole to services MemberRole
+pub fn api_role_to_services_role(
+    role: crate::models::MemberRole,
+) -> services::organization::ports::MemberRole {
+    match role {
+        crate::models::MemberRole::Owner => services::organization::ports::MemberRole::Owner,
+        crate::models::MemberRole::Admin => services::organization::ports::MemberRole::Admin,
+        crate::models::MemberRole::Member => services::organization::ports::MemberRole::Member,
+    }
+}
+
+/// Convert services MemberRole to API MemberRole
+pub fn services_role_to_api_role(
+    role: services::organization::ports::MemberRole,
+) -> crate::models::MemberRole {
+    match role {
+        services::organization::ports::MemberRole::Owner => crate::models::MemberRole::Owner,
+        services::organization::ports::MemberRole::Admin => crate::models::MemberRole::Admin,
+        services::organization::ports::MemberRole::Member => crate::models::MemberRole::Member,
+    }
+}
+
+// Legacy DB role conversion functions - TODO: Remove once all routes migrated
 pub fn db_role_to_member_role(
     role: database::OrganizationRole,
 ) -> services::organization::ports::MemberRole {
@@ -226,6 +273,27 @@ pub fn member_role_to_db_role(
     }
 }
 
+/// Convert API AddOrganizationMemberRequest to services request
+pub fn api_add_member_req_to_services(
+    req: crate::models::AddOrganizationMemberRequest,
+    user_id: uuid::Uuid,
+) -> services::organization::ports::AddOrganizationMemberRequest {
+    services::organization::ports::AddOrganizationMemberRequest {
+        user_id,
+        role: api_role_to_services_role(req.role),
+    }
+}
+
+/// Convert API UpdateOrganizationMemberRequest to services request
+pub fn api_update_member_req_to_services(
+    req: crate::models::UpdateOrganizationMemberRequest,
+) -> services::organization::ports::UpdateOrganizationMemberRequest {
+    services::organization::ports::UpdateOrganizationMemberRequest {
+        role: api_role_to_services_role(req.role),
+    }
+}
+
+// Legacy DB member conversion functions - TODO: Remove once all routes migrated
 pub fn db_add_member_req_to_services(
     req: database::AddOrganizationMemberRequest,
 ) -> services::organization::ports::AddOrganizationMemberRequest {
@@ -243,6 +311,19 @@ pub fn db_update_member_req_to_services(
     }
 }
 
+/// Convert services OrganizationMember to API response
+pub fn services_member_to_api_member(
+    member: services::organization::ports::OrganizationMember,
+) -> crate::models::OrganizationMemberResponse {
+    crate::models::OrganizationMemberResponse {
+        organization_id: member.organization_id.0.to_string(),
+        user_id: member.user_id.0.to_string(),
+        role: services_role_to_api_role(member.role),
+        joined_at: member.joined_at,
+    }
+}
+
+// Legacy DB member conversion function - TODO: Remove once all routes migrated
 pub fn services_member_to_db_member(
     member: services::organization::ports::OrganizationMember,
 ) -> database::OrganizationMember {
@@ -256,10 +337,11 @@ pub fn services_member_to_db_member(
     }
 }
 
+/// Convert API CreateApiKeyRequest to services request
 pub fn api_key_req_to_services(
-    req: CreateApiKeyRequest,
-    organization_id: OrganizationId,
-    created_by_user_id: UserId,
+    req: crate::models::CreateApiKeyRequest,
+    organization_id: services::organization::OrganizationId,
+    created_by_user_id: services::UserId,
 ) -> services::auth::CreateApiKeyRequest {
     services::auth::CreateApiKeyRequest {
         name: req.name,
@@ -270,8 +352,39 @@ pub fn api_key_req_to_services(
     }
 }
 
-pub fn authenticated_user_to_user_id(user: AuthenticatedUser) -> UserId {
-    UserId(user.0.id)
+/// Convert services ApiKey to API response
+pub fn services_api_key_to_api_response(
+    api_key: services::auth::ApiKey,
+) -> crate::models::ApiKeyResponse {
+    crate::models::ApiKeyResponse {
+        id: api_key.id.0,                 // ApiKeyId contains a String
+        name: Some(api_key.name.clone()), // Convert String to Option<String>
+        key_prefix: format!("{}...", &api_key.name[..4.min(api_key.name.len())]), // Create key prefix from name
+        organization_id: api_key.organization_id.0.to_string(),
+        created_by_user_id: api_key.created_by_user_id.0.to_string(),
+        account_type: api_key.account_type,
+        created_at: api_key.created_at,
+        last_used_at: api_key.last_used_at,
+        expires_at: api_key.expires_at,
+    }
+}
+
+/// Convert AuthenticatedUser to services UserId
+pub fn authenticated_user_to_user_id(user: AuthenticatedUser) -> services::UserId {
+    services::UserId(user.0.id)
+}
+
+/// Convert services User to API UserResponse
+pub fn services_user_to_api_response(user: services::auth::User) -> crate::models::UserResponse {
+    crate::models::UserResponse {
+        id: user.id.0.to_string(), // UserId contains a Uuid
+        email: user.email,
+        username: Some(user.username), // Convert String to Option<String>
+        display_name: user.display_name,
+        avatar_url: user.avatar_url,
+        created_at: user.created_at,
+        last_login_at: user.last_login, // Field is called last_login, not last_login_at
+    }
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use services::auth::AccountType;
+use uuid::Uuid;
 
 /// Organization model - top level entity
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +75,7 @@ pub struct ApiKey {
     pub name: String,
     pub organization_id: Uuid,
     pub created_by_user_id: Uuid,
+    pub account_type: AccountType,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
@@ -121,12 +123,6 @@ pub struct UpdateOrganizationRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CreateApiKeyRequest {
-    pub name: String,
-    pub expires_in_days: Option<i32>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct ApiKeyResponse {
     pub id: Uuid,
     pub key: String, // Only returned on creation
@@ -139,20 +135,20 @@ impl OrganizationRole {
     pub fn can_manage_organization(&self) -> bool {
         matches!(self, OrganizationRole::Owner | OrganizationRole::Admin)
     }
-    
+
     pub fn can_manage_members(&self) -> bool {
         matches!(self, OrganizationRole::Owner | OrganizationRole::Admin)
     }
-    
+
     pub fn can_manage_api_keys(&self) -> bool {
         // All members can create and manage their own API keys
         true
     }
-    
+
     pub fn can_delete_organization(&self) -> bool {
         matches!(self, OrganizationRole::Owner)
     }
-    
+
     pub fn can_manage_mcp_connectors(&self) -> bool {
         matches!(self, OrganizationRole::Owner | OrganizationRole::Admin)
     }

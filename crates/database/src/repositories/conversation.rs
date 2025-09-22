@@ -3,7 +3,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use services::conversations::ports::{Conversation, ConversationRepository};
-use services::responses::ports::{ConversationId, UserId};
+use services::responses::ports::ConversationId;
+use services::UserId;
 use tracing::debug;
 use uuid::Uuid;
 

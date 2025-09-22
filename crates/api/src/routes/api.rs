@@ -18,6 +18,7 @@ pub struct AppState {
     pub mcp_manager: Arc<McpClientManager>,
     pub completion_service: Arc<dyn CompletionService>,
     pub models_service: Arc<dyn ModelsService>,
+    pub auth_service: Arc<services::auth::AuthService>,
 }
 
 // Import route handlers

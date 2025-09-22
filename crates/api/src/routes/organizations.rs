@@ -1,14 +1,17 @@
+use crate::models::CreateApiKeyRequest;
 use crate::{middleware::AuthenticatedUser, routes::api::AppState};
 use axum::{
     extract::{Extension, Json, Path, Query, State},
     http::StatusCode,
 };
 use database::{
-    ApiKeyResponse, CreateApiKeyRequest, CreateOrganizationRequest, Organization,
-    UpdateOrganizationRequest,
+    ApiKeyResponse, CreateOrganizationRequest, Organization, UpdateOrganizationRequest,
 };
 use serde::Deserialize;
-use services::organization::ports::OrganizationRepository;
+use services::{
+    auth::CreateApiKeyRequest as ServicesCreateApiKeyRequest,
+    organization::ports::OrganizationRepository,
+};
 use tracing::{debug, error};
 use uuid::Uuid;
 
@@ -231,39 +234,46 @@ pub async fn create_organization_api_key(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
-    Json(request): Json<CreateApiKeyRequest>,
+    Json(mut request): Json<CreateApiKeyRequest>,
 ) -> Result<Json<ApiKeyResponse>, StatusCode> {
     debug!(
         "Creating API key for organization: {} by user: {}",
         org_id, user.0.id
     );
 
-    // Check if user has permission to create API keys for this organization
-    match app_state
-        .db
-        .organizations
-        .get_member(org_id, user.0.id)
+    // Use auth service for permission checking
+    let organization_id = services::organization::OrganizationId(org_id);
+    let user_id = services::auth::UserId(user.0.id);
+
+    // Check permissions through auth service
+    let can_manage = match app_state
+        .auth_service
+        .can_manage_organization_api_keys(organization_id.clone(), user_id.clone())
         .await
     {
-        Ok(Some(member)) => {
-            if !member.role.can_manage_api_keys() {
-                return Err(StatusCode::FORBIDDEN);
-            }
-        }
-        Ok(None) => return Err(StatusCode::FORBIDDEN),
+        Ok(can_manage) => can_manage,
+        Err(services::auth::AuthError::Unauthorized) => return Err(StatusCode::FORBIDDEN),
         Err(e) => {
-            error!("Failed to check organization membership: {}", e);
+            error!("Failed to check API key permissions: {}", e);
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
+    };
+
+    if !can_manage {
+        return Err(StatusCode::FORBIDDEN);
     }
 
+    let services_request =
+        crate::conversions::api_key_req_to_services(request, organization_id, user_id);
+
+    // Create the API key through database (with raw key for response)
     match app_state
         .db
         .api_keys
-        .create(org_id, user.0.id, request)
+        .create_with_key(services_request)
         .await
     {
-        Ok(api_key) => Ok(Json(api_key)),
+        Ok(response) => Ok(Json(response)),
         Err(e) => {
             error!("Failed to create API key: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -282,23 +292,26 @@ pub async fn list_organization_api_keys(
         org_id, user.0.id
     );
 
-    // Check if user has access to this organization
-    match app_state
+    // Check if user is organization member
+    let is_member = match app_state
         .db
         .organizations
         .get_member(org_id, user.0.id)
         .await
     {
-        Ok(Some(_)) => {
-            // User is a member, allow access
-        }
+        Ok(Some(_)) => true,
         Ok(None) => return Err(StatusCode::FORBIDDEN),
         Err(e) => {
             error!("Failed to check organization membership: {}", e);
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
+    };
+
+    if !is_member {
+        return Err(StatusCode::FORBIDDEN);
     }
 
+    // List API keys through database
     match app_state.db.api_keys.list_by_organization(org_id).await {
         Ok(keys) => Ok(Json(keys)),
         Err(e) => {

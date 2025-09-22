@@ -78,18 +78,6 @@ pub struct OAuthUserInfo {
     pub avatar_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiKey {
-    pub id: ApiKeyId,
-    pub name: String,
-    pub organization_id: OrganizationId,
-    pub created_by_user_id: UserId,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: Option<DateTime<Utc>>,
-    pub last_used_at: Option<DateTime<Utc>>,
-    pub is_active: bool,
-}
-
 // Error types
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -197,9 +185,70 @@ pub trait SessionRepository: Send + Sync {
     async fn cleanup_expired(&self) -> anyhow::Result<usize>;
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKey {
+    pub id: ApiKeyId,
+    pub name: String,
+    pub organization_id: OrganizationId,
+    pub created_by_user_id: UserId,
+    pub account_type: AccountType,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateApiKeyRequest {
+    pub name: Option<String>,
+    pub organization_id: OrganizationId,
+    pub account_type: AccountType,
+    pub created_by_user_id: UserId,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AccountType {
+    User,
+    ServiceAccount,
+}
+
+impl std::fmt::Display for AccountType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                AccountType::User => "User",
+                AccountType::ServiceAccount => "ServiceAccount",
+            }
+        )
+    }
+}
+
+impl From<String> for AccountType {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "User" => AccountType::User,
+            "ServiceAccount" => AccountType::ServiceAccount,
+            _ => panic!("Invalid account_type: {}", s),
+        }
+    }
+}
+
 #[async_trait]
 pub trait ApiKeyRepository: Send + Sync {
-    async fn validate(&self, api_key: &str) -> anyhow::Result<Option<ApiKey>>;
+    async fn validate(&self, api_key: String) -> anyhow::Result<Option<ApiKey>>;
+
+    async fn create(&self, request: CreateApiKeyRequest) -> anyhow::Result<ApiKey>;
+
+    async fn list_by_organization(
+        &self,
+        organization_id: OrganizationId,
+    ) -> anyhow::Result<Vec<ApiKey>>;
+
+    async fn delete(&self, id: ApiKeyId) -> anyhow::Result<bool>;
+    async fn update_last_used(&self, id: ApiKeyId) -> anyhow::Result<()>;
 }
 
 // Service interfaces

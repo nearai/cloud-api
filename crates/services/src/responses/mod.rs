@@ -2,9 +2,11 @@ pub mod ports;
 
 use crate::conversations::ports::ConversationService;
 use crate::responses::ports::{
-    ResponseId, ResponseInput, ResponseMessage, ResponseRequest, ResponseStreamEvent, UserId,
+    ResponseId, ResponseInput, ResponseMessage, ResponseRequest, ResponseStreamEvent,
 };
-use crate::{inference_provider_pool::InferenceProviderPool, responses::ports::ResponseError};
+use crate::{
+    inference_provider_pool::InferenceProviderPool, responses::ports::ResponseError, UserId,
+};
 use futures::Stream;
 use inference_providers::{
     ChatCompletionParams, ChatMessage, InferenceProvider, MessageRole, StreamChunk,

@@ -1,4 +1,6 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use services::auth::{AccountType, CreateApiKeyRequest as ServicesCreateApiKeyRequest};
 
 // Streaming response models
 #[derive(Debug, Serialize, Deserialize)]
@@ -832,4 +834,11 @@ impl CreateConversationRequest {
         // Basic validation - can be extended if needed
         Ok(())
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateApiKeyRequest {
+    pub name: Option<String>,
+    pub account_type: AccountType,
+    pub expires_at: Option<DateTime<Utc>>,
 }

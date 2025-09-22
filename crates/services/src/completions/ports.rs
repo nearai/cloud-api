@@ -4,12 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use uuid::Uuid;
 
+use crate::UserId;
+
 // Domain types defined directly here (following dependency inversion)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionId(Uuid);
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserId(Uuid);
 
 impl From<Uuid> for CompletionId {
     fn from(uuid: Uuid) -> Self {
@@ -17,21 +16,9 @@ impl From<Uuid> for CompletionId {
     }
 }
 
-impl From<Uuid> for UserId {
-    fn from(uuid: Uuid) -> Self {
-        UserId(uuid)
-    }
-}
-
 impl std::fmt::Display for CompletionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "comp_{}", self.0)
-    }
-}
-
-impl std::fmt::Display for UserId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
     }
 }
 

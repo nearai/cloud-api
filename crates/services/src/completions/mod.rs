@@ -2,7 +2,7 @@ pub mod ports;
 
 use crate::completions::ports::{
     CompletionError, CompletionMessage, CompletionRequest, CompletionStreamEvent,
-    ModelCapabilities, ModelInfo, UserId,
+    ModelCapabilities, ModelInfo,
 };
 use crate::inference_provider_pool::InferenceProviderPool;
 use futures::Stream;

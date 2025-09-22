@@ -21,10 +21,12 @@ pub use inference_providers::{
 pub use responses::{
     ports::{
         ConversationId, Response, ResponseError, ResponseId, ResponseInput, ResponseMessage,
-        ResponseRequest, ResponseStatus, ResponseStreamEvent, UserId,
+        ResponseRequest, ResponseStatus, ResponseStreamEvent,
     },
     ResponseService,
 };
+
+pub use auth::UserId;
 
 pub use conversations::{
     ports::{Conversation, ConversationError},

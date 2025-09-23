@@ -177,24 +177,20 @@ async fn test_responses_api() {
     )
     .await;
     println!("Response: {:?}", response);
-    assert_eq!(
-        response
-            .output
-            .iter()
-            .any(|o| if let ResponseOutputItem::Message { content, .. } = o {
-                content.iter().any(|c| {
-                    if let ResponseOutputContent::OutputText { text, .. } = c {
-                        println!("Text: {}", text);
-                        text.len() > max_tokens as usize
-                    } else {
-                        false
-                    }
-                })
-            } else {
-                false
-            }),
-        true
-    );
+    assert!(response.output.iter().any(|o| {
+        if let ResponseOutputItem::Message { content, .. } = o {
+            content.iter().any(|c| {
+                if let ResponseOutputContent::OutputText { text, .. } = c {
+                    println!("Text: {}", text);
+                    text.len() > max_tokens as usize
+                } else {
+                    false
+                }
+            })
+        } else {
+            false
+        }
+    }));
 
     let conversation_items = list_conversation_items(&server, conversation.id).await;
     assert_eq!(conversation_items.data.len(), 2);
@@ -220,6 +216,7 @@ async fn create_conversation(server: &axum_test::TestServer) -> api::models::Con
     response.json::<api::models::ConversationObject>()
 }
 
+#[allow(dead_code)]
 async fn get_conversation(
     server: &axum_test::TestServer,
     conversation_id: String,
@@ -446,23 +443,20 @@ async fn test_streaming_responses_api() {
     );
 
     // Verify the final response has content
-    assert_eq!(
-        streaming_response.output.iter().any(|o| {
-            if let ResponseOutputItem::Message { content, .. } = o {
-                content.iter().any(|c| {
-                    if let ResponseOutputContent::OutputText { text, .. } = c {
-                        println!("Final Response Text: {}", text);
-                        !text.is_empty()
-                    } else {
-                        false
-                    }
-                })
-            } else {
-                false
-            }
-        }),
-        true
-    );
+    assert!(streaming_response.output.iter().any(|o| {
+        if let ResponseOutputItem::Message { content, .. } = o {
+            content.iter().any(|c| {
+                if let ResponseOutputContent::OutputText { text, .. } = c {
+                    println!("Final Response Text: {}", text);
+                    !text.is_empty()
+                } else {
+                    false
+                }
+            })
+        } else {
+            false
+        }
+    }));
 
     // Verify streamed content matches final response content
     let final_text = streaming_response

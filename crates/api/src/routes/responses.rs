@@ -44,8 +44,8 @@ impl From<ResponseError> for ErrorResponse {
 
 // Helper functions for ID conversion
 fn parse_response_id(id_str: &str) -> Result<ResponseId, ResponseError> {
-    let uuid = if id_str.starts_with("resp_") {
-        Uuid::parse_str(&id_str[5..])
+    let uuid = if let Some(stripped) = id_str.strip_prefix("resp_") {
+        Uuid::parse_str(stripped)
     } else {
         Uuid::parse_str(id_str)
     }
@@ -55,8 +55,8 @@ fn parse_response_id(id_str: &str) -> Result<ResponseId, ResponseError> {
 }
 
 fn parse_conversation_id_from_string(id_str: &str) -> Result<ConversationId, ResponseError> {
-    let uuid = if id_str.starts_with("conv_") {
-        Uuid::parse_str(&id_str[5..])
+    let uuid = if let Some(stripped) = id_str.strip_prefix("conv_") {
+        Uuid::parse_str(stripped)
     } else {
         Uuid::parse_str(id_str)
     }
@@ -93,6 +93,7 @@ pub async fn create_response(
     let domain_input = request.input.clone().map(|input| match input {
         ResponseInput::Text(text) => DomainResponseInput::Text(text),
         ResponseInput::Items(items) => {
+            #[allow(clippy::unnecessary_filter_map)]
             let messages = items
                 .into_iter()
                 .filter_map(|item| match item {
@@ -419,11 +420,9 @@ fn convert_domain_response_to_http_with_request(
         }),
         store: request.store.unwrap_or(true),
         temperature: request.temperature.unwrap_or(1.0),
-        text: request.text.clone().or_else(|| {
-            Some(ResponseTextConfig {
-                format: ResponseTextFormat::Text,
-            })
-        }),
+        text: request.text.clone().or(Some(ResponseTextConfig {
+            format: ResponseTextFormat::Text,
+        })),
         tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
         tools: request.tools.clone().unwrap_or_default(),
         top_p: request.top_p.unwrap_or(1.0),

@@ -73,7 +73,13 @@ fn init_tracing(logging_config: &LoggingConfig) {
                 .with_env_filter(filter)
                 .init();
         }
-        "pretty" | _ => {
+        "pretty" => {
+            tracing_subscriber::fmt()
+                .pretty()
+                .with_env_filter(filter)
+                .init();
+        }
+        _ => {
             tracing_subscriber::fmt()
                 .pretty()
                 .with_env_filter(filter)

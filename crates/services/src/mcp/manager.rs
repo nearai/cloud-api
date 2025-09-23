@@ -427,9 +427,7 @@ impl McpClientManager {
     ) -> Result<ReadResourceResult, McpError> {
         let client_arc = self.get_or_create_client_arc(connector_id).await?;
 
-        let request_params = ReadResourceRequestParam {
-            uri: uri.clone().into(),
-        };
+        let request_params = ReadResourceRequestParam { uri: uri.clone() };
 
         let result = {
             let client = client_arc.lock().await;
@@ -486,7 +484,7 @@ impl McpClientManager {
         let args = arguments.and_then(|v| v.as_object().cloned());
 
         let request_params = GetPromptRequestParam {
-            name: name.clone().into(),
+            name: name.clone(),
             arguments: args,
         };
 

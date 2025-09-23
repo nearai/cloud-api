@@ -202,7 +202,7 @@ impl ConversationService {
         for response in responses {
             // Parse input_messages JSONB to extract individual messages
             if let Some(input_array) = response.input_messages.as_array() {
-                for (_index, msg_value) in input_array.iter().enumerate() {
+                for msg_value in input_array.iter() {
                     if let Some(msg_obj) = msg_value.as_object() {
                         let role = msg_obj
                             .get("role")

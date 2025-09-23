@@ -239,7 +239,7 @@ impl ports::CompletionService for CompletionServiceImpl {
             })?;
 
         // Create the completion event stream
-        let event_stream = Self::create_event_stream(llm_stream, completion_id.into());
+        let event_stream = Self::create_event_stream(llm_stream, completion_id);
 
         Ok(Box::pin(event_stream))
     }

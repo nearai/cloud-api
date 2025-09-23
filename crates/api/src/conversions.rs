@@ -346,8 +346,8 @@ pub fn api_key_req_to_services(
         name: req.name,
         account_type: req.account_type,
         expires_at: req.expires_at,
-        organization_id: organization_id,
-        created_by_user_id: created_by_user_id,
+        organization_id,
+        created_by_user_id,
     }
 }
 

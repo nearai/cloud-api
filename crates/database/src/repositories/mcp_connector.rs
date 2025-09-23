@@ -338,6 +338,7 @@ impl McpConnectorRepository {
     }
 
     /// Log MCP connector usage
+    #[allow(clippy::too_many_arguments)]
     pub async fn log_usage(
         &self,
         connector_id: Uuid,

@@ -14,8 +14,8 @@ use uuid::Uuid;
 // Helper functions for ID conversion
 fn parse_conversation_id(id_str: &str) -> Result<ConversationId, ConversationError> {
     // Handle both prefixed (conv_*) and raw UUID formats
-    let uuid = if id_str.starts_with("conv_") {
-        Uuid::parse_str(&id_str[5..])
+    let uuid = if let Some(stripped) = id_str.strip_prefix("conv_") {
+        Uuid::parse_str(stripped)
     } else {
         Uuid::parse_str(id_str)
     }
@@ -258,7 +258,7 @@ pub async fn list_conversations(
             // Determine if there are more conversations
             let has_more = params
                 .limit
-                .map_or(false, |limit| http_conversations.len() >= limit as usize);
+                .is_some_and(|limit| http_conversations.len() >= limit as usize);
 
             Ok(ResponseJson(ConversationList {
                 object: "list".to_string(),

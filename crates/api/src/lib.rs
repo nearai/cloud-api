@@ -26,13 +26,13 @@ use database::{
     Database,
 };
 use inference_providers::{InferenceProvider, VLlmConfig, VLlmProvider};
-use services::auth::{AuthService, OAuthManager};
+use services::auth::{AuthService, AuthServiceTrait, MockAuthService, OAuthManager};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
 /// Service initialization components
 pub struct AuthComponents {
-    pub auth_service: Arc<AuthService>,
+    pub auth_service: Arc<dyn AuthServiceTrait>,
     pub oauth_manager: Arc<OAuthManager>,
     pub state_store: StateStore,
     pub auth_state_middleware: AuthState,
@@ -67,23 +67,30 @@ pub async fn init_database_with_config(db_config: &config::DatabaseConfig) -> Ar
 
 /// Initialize authentication services and middleware
 pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthComponents {
-    // Create repository instances
-    let user_repository = Arc::new(UserRepository::new(database.pool().clone()))
-        as Arc<dyn services::auth::UserRepository>;
-    let session_repository = Arc::new(SessionRepository::new(database.pool().clone()))
-        as Arc<dyn services::auth::SessionRepository>;
-    let api_key_repository = Arc::new(ApiKeyRepository::new(database.pool().clone()))
-        as Arc<dyn services::auth::ApiKeyRepository>;
-    let organization_repository = Arc::new(PgOrganizationRepository::new(database.pool().clone()))
-        as Arc<dyn services::organization::ports::OrganizationRepository>;
+    // Choose auth service implementation based on config
+    let auth_service: Arc<dyn AuthServiceTrait> = if config.auth.mock {
+        // Use MockAuthService when mock auth is enabled
+        Arc::new(MockAuthService)
+    } else {
+        // Create repository instances
+        let user_repository = Arc::new(UserRepository::new(database.pool().clone()))
+            as Arc<dyn services::auth::UserRepository>;
+        let session_repository = Arc::new(SessionRepository::new(database.pool().clone()))
+            as Arc<dyn services::auth::SessionRepository>;
+        let api_key_repository = Arc::new(ApiKeyRepository::new(database.pool().clone()))
+            as Arc<dyn services::auth::ApiKeyRepository>;
+        let organization_repository =
+            Arc::new(PgOrganizationRepository::new(database.pool().clone()))
+                as Arc<dyn services::organization::ports::OrganizationRepository>;
 
-    // Create AuthService
-    let auth_service = Arc::new(AuthService::new(
-        user_repository,
-        session_repository,
-        api_key_repository,
-        organization_repository,
-    ));
+        // Create AuthService
+        Arc::new(AuthService::new(
+            user_repository,
+            session_repository,
+            api_key_repository,
+            organization_repository,
+        ))
+    };
 
     // Create OAuth manager
     tracing::info!("Setting up OAuth providers");
@@ -92,8 +99,7 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
 
     // Create AuthState for middleware
     let oauth_manager_arc = Arc::new(oauth_manager);
-    let auth_state_middleware =
-        AuthState::new(oauth_manager_arc.clone(), Some(auth_service.clone()));
+    let auth_state_middleware = AuthState::new(oauth_manager_arc.clone(), auth_service.clone());
 
     AuthComponents {
         auth_service,
@@ -209,7 +215,6 @@ pub fn build_app(
     database: Arc<Database>,
     auth_components: AuthComponents,
     domain_services: DomainServices,
-    auth_enabled: bool,
 ) -> Router {
     // Create organization service using the database's organization repository
     let organization_repo = Arc::new(database::PgOrganizationRepository::new(
@@ -237,29 +242,21 @@ pub fn build_app(
         &auth_components.auth_state_middleware,
     );
 
-    let completion_routes = build_completion_routes(
-        app_state.clone(),
-        &auth_components.auth_state_middleware,
-        auth_enabled,
-    );
+    let completion_routes =
+        build_completion_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
     let response_routes = build_response_routes(
         domain_services.response_service,
         &auth_components.auth_state_middleware,
-        auth_enabled,
     );
 
     let conversation_routes = build_conversation_routes(
         domain_services.conversation_service,
         &auth_components.auth_state_middleware,
-        auth_enabled,
     );
 
-    let management_routes = build_management_router(
-        app_state,
-        auth_components.auth_state_middleware,
-        auth_enabled,
-    );
+    let management_routes =
+        build_management_router(app_state, auth_components.auth_state_middleware);
 
     // Combine all routes under /v1
     Router::new().nest(
@@ -277,7 +274,7 @@ pub fn build_app(
 pub fn build_auth_routes(
     oauth_manager: Arc<OAuthManager>,
     state_store: StateStore,
-    auth_service: Arc<AuthService>,
+    auth_service: Arc<dyn AuthServiceTrait>,
     auth_state_middleware: &AuthState,
 ) -> Router {
     let auth_state = (oauth_manager, state_store, auth_service);
@@ -299,29 +296,26 @@ pub fn build_auth_routes(
         .with_state(auth_state)
 }
 
-/// Build completion routes with optional auth
-pub fn build_completion_routes(
-    app_state: AppState,
-    auth_state_middleware: &AuthState,
-    auth_enabled: bool,
-) -> Router {
-    let routes = Router::new()
+/// Build completion routes with auth
+pub fn build_completion_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
+    Router::new()
         .route("/chat/completions", post(chat_completions))
         .route("/completions", post(completions))
         .route("/models", get(models))
         .route("/quote", get(quote))
-        .with_state(app_state);
-
-    apply_auth_middleware(routes, auth_state_middleware, auth_enabled)
+        .with_state(app_state)
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            auth_middleware,
+        ))
 }
 
-/// Build response routes with optional auth
+/// Build response routes with auth
 pub fn build_response_routes(
     response_service: Arc<services::ResponseService>,
     auth_state_middleware: &AuthState,
-    auth_enabled: bool,
 ) -> Router {
-    let routes = Router::new()
+    Router::new()
         .route("/responses", post(responses::create_response))
         .route("/responses/{response_id}", get(responses::get_response))
         .route(
@@ -336,18 +330,19 @@ pub fn build_response_routes(
             "/responses/{response_id}/input_items",
             get(responses::list_input_items),
         )
-        .with_state(response_service);
-
-    apply_auth_middleware(routes, auth_state_middleware, auth_enabled)
+        .with_state(response_service)
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            auth_middleware,
+        ))
 }
 
-/// Build conversation routes with optional auth
+/// Build conversation routes with auth
 pub fn build_conversation_routes(
     conversation_service: Arc<services::ConversationService>,
     auth_state_middleware: &AuthState,
-    auth_enabled: bool,
 ) -> Router {
-    let routes = Router::new()
+    Router::new()
         .route("/conversations", get(conversations::list_conversations))
         .route("/conversations", post(conversations::create_conversation))
         .route(
@@ -366,25 +361,11 @@ pub fn build_conversation_routes(
             "/conversations/{conversation_id}/items",
             get(conversations::list_conversation_items),
         )
-        .with_state(conversation_service);
-
-    apply_auth_middleware(routes, auth_state_middleware, auth_enabled)
-}
-
-/// Apply authentication middleware conditionally
-pub fn apply_auth_middleware(
-    routes: Router,
-    auth_state_middleware: &AuthState,
-    auth_enabled: bool,
-) -> Router {
-    if auth_enabled {
-        routes.layer(from_fn_with_state(
+        .with_state(conversation_service)
+        .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware,
         ))
-    } else {
-        routes
-    }
 }
 
 #[cfg(test)]
@@ -415,7 +396,7 @@ mod tests {
                 url: "http://localhost:8000".to_string(),
             },
             auth: config::AuthConfig {
-                enabled: false,
+                mock: true,
                 github: None,
                 google: None,
             },
@@ -435,12 +416,7 @@ mod tests {
         let domain_services = init_domain_services(database.clone(), &config).await;
 
         // Build the application
-        let _app = build_app(
-            database,
-            auth_components,
-            domain_services,
-            config.auth.enabled,
-        );
+        let _app = build_app(database, auth_components, domain_services);
 
         // You can now use `app` with a test server like:
         // let server = axum_test::TestServer::new(app).unwrap();
@@ -485,7 +461,7 @@ mod tests {
                 url: "http://localhost:8000".to_string(),
             },
             auth: config::AuthConfig {
-                enabled: false,
+                mock: true,
                 github: None,
                 google: None,
             },
@@ -502,12 +478,7 @@ mod tests {
         let auth_components = init_auth_services(database.clone(), &config);
         let domain_services = init_domain_services(database.clone(), &config).await;
 
-        let _app = build_app(
-            database,
-            auth_components,
-            domain_services,
-            false, // auth disabled for testing
-        );
+        let _app = build_app(database, auth_components, domain_services);
 
         // Test the app...
     }

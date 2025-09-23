@@ -5,7 +5,7 @@ use axum::{
     response::Response,
 };
 use database::User as DbUser;
-use services::auth::{AuthError, AuthService, OAuthManager};
+use services::auth::{AuthError, AuthServiceTrait, OAuthManager};
 use std::sync::Arc;
 use tracing::{debug, error};
 use uuid::Uuid;
@@ -20,6 +20,7 @@ pub async fn auth_middleware(
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    tracing::debug!("Auth middleware");
     // Try to extract authentication from various sources
     let auth_header = request
         .headers()
@@ -27,17 +28,28 @@ pub async fn auth_middleware(
         .and_then(|h| h.to_str().ok());
 
     let auth_result = if let Some(auth_value) = auth_header {
+        debug!("Found Authorization header: {}", auth_value);
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
+            debug!("Extracted Bearer token: {}", token);
             // Check if it's an API key (starts with "sk_")
             if token.starts_with("sk_") {
+                debug!("Token looks like API key");
                 authenticate_api_key(&state, token).await
             } else {
+                debug!("Token looks like session token, parsing as UUID");
                 match Uuid::parse_str(token) {
-                    Ok(uuid) => authenticate_session(&state, uuid).await,
-                    Err(_) => Err(StatusCode::UNAUTHORIZED),
+                    Ok(uuid) => {
+                        debug!("Successfully parsed UUID: {}", uuid);
+                        authenticate_session(&state, uuid).await
+                    }
+                    Err(e) => {
+                        debug!("Failed to parse token as UUID: {}", e);
+                        Err(StatusCode::UNAUTHORIZED)
+                    }
                 }
             }
         } else {
+            debug!("Authorization header does not start with 'Bearer '");
             Err(StatusCode::UNAUTHORIZED)
         }
     } else if let Some(cookie_str) = request
@@ -84,8 +96,9 @@ pub async fn auth_middleware(
 /// Authenticate using session token
 async fn authenticate_session(state: &AuthState, token: Uuid) -> Result<DbUser, StatusCode> {
     debug!("Authenticating session token: {}", token);
-    // Use auth service if available
-    if let Some(ref auth_service) = state.auth_service {
+    // Use auth service
+    {
+        let auth_service = &state.auth_service;
         debug!("Validating session via auth service with token");
         match auth_service.validate_session(token).await {
             Ok(user) => {
@@ -110,11 +123,7 @@ async fn authenticate_session(state: &AuthState, token: Uuid) -> Result<DbUser, 
 
 /// Authenticate using API key
 async fn authenticate_api_key(state: &AuthState, api_key: &str) -> Result<DbUser, StatusCode> {
-    // API keys only work with auth service
-    let auth_service = state
-        .auth_service
-        .as_ref()
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let auth_service = &state.auth_service;
 
     match auth_service.validate_api_key(api_key.to_string()).await {
         Ok(user) => {
@@ -140,11 +149,11 @@ async fn authenticate_api_key(state: &AuthState, api_key: &str) -> Result<DbUser
 #[derive(Clone)]
 pub struct AuthState {
     pub oauth_manager: Arc<OAuthManager>,
-    pub auth_service: Option<Arc<AuthService>>,
+    pub auth_service: Arc<dyn AuthServiceTrait>,
 }
 
 impl AuthState {
-    pub fn new(oauth_manager: Arc<OAuthManager>, auth_service: Option<Arc<AuthService>>) -> Self {
+    pub fn new(oauth_manager: Arc<OAuthManager>, auth_service: Arc<dyn AuthServiceTrait>) -> Self {
         Self {
             oauth_manager,
             auth_service,

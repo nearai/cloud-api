@@ -14,12 +14,7 @@ async fn main() {
     let domain_services = init_domain_services(database.clone(), &config).await;
 
     // Build application router
-    let app = build_app(
-        database,
-        auth_components,
-        domain_services,
-        config.auth.enabled,
-    );
+    let app = build_app(database, auth_components, domain_services);
 
     // Start server
     start_server(app, &config).await;
@@ -44,10 +39,10 @@ async fn start_server(app: axum::Router, config: &ApiConfig) {
     tracing::info!(address = %bind_address, "Server started successfully");
     tracing::info!(
         "Authentication: {}",
-        if config.auth.enabled {
-            "ENABLED"
+        if config.auth.mock {
+            "MOCK MODE"
         } else {
-            "DISABLED"
+            "PRODUCTION MODE"
         }
     );
 

@@ -14,9 +14,17 @@
 
 use api::{
     build_app, init_auth_services, init_database_with_config, init_domain_services,
-    models::{ConversationContentPart, ConversationItem},
+    models::{
+        ConversationContentPart, ConversationItem, ResponseOutputContent, ResponseOutputItem,
+    },
 };
 use config::ApiConfig;
+use database::Database;
+use std::sync::Arc;
+use tracing::level_filters::LevelFilter;
+
+// Constants for mock test data
+const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
 
 /// Helper function to create a test configuration
 fn test_config() -> ApiConfig {
@@ -46,7 +54,7 @@ fn test_config() -> ApiConfig {
             url: "http://localhost:8000".to_string(),
         },
         auth: config::AuthConfig {
-            enabled: true,
+            mock: true,
             github: None,
             google: None,
         },
@@ -74,20 +82,47 @@ fn get_session_id() -> String {
     "402af343-70ba-4a8a-b926-012f71e86769".to_string()
 }
 
+/// Create the mock user in the database to satisfy foreign key constraints
+async fn assert_mock_user_in_db(database: &Arc<Database>) {
+    let pool = database.pool();
+    let client = pool.get().await.expect("Failed to get database connection");
+
+    // Insert mock user if it doesn't exist
+    let _ = client.execute(
+        "INSERT INTO users (id, email, username, display_name, avatar_url, auth_provider, provider_user_id, created_at, updated_at) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+         ON CONFLICT (id) DO NOTHING",
+        &[
+            &uuid::Uuid::parse_str(MOCK_USER_ID).unwrap(),
+            &"test@example.com",
+            &"testuser", 
+            &Some("Test User".to_string()),
+            &Some("https://example.com/avatar.jpg".to_string()),
+            &"mock",
+            &"mock_123",
+        ],
+    ).await.expect("Failed to create mock user");
+
+    tracing::debug!("Mock user created/exists in database: {}", MOCK_USER_ID);
+}
+
 #[tokio::test]
 async fn test_models_api() {
     // Setup
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
     let config = test_config();
     let database = init_database_with_config(&config.database).await;
+
+    // Create mock user in database for foreign key constraints
+    assert_mock_user_in_db(&database).await;
+
     let auth_components = init_auth_services(database.clone(), &config);
     let domain_services = init_domain_services(database.clone(), &config).await;
 
-    let app = build_app(
-        database,
-        auth_components,
-        domain_services,
-        config.auth.enabled,
-    );
+    let app = build_app(database, auth_components, domain_services);
 
     let server = axum_test::TestServer::new(app).unwrap();
     let response = server
@@ -102,17 +137,21 @@ async fn test_models_api() {
 
 #[tokio::test]
 async fn test_responses_api() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
     let config = test_config();
     let database = init_database_with_config(&config.database).await;
+
+    // Create mock user in database for foreign key constraints
+    assert_mock_user_in_db(&database).await;
+
     let auth_components = init_auth_services(database.clone(), &config);
     let domain_services = init_domain_services(database.clone(), &config).await;
 
-    let app = build_app(
-        database,
-        auth_components,
-        domain_services,
-        config.auth.enabled,
-    );
+    let app = build_app(database, auth_components, domain_services);
 
     let server = axum_test::TestServer::new(app).unwrap();
 
@@ -127,7 +166,7 @@ async fn test_responses_api() {
     let conversation = create_conversation(&server).await;
     println!("Conversation: {:?}", conversation);
 
-    let message = "Hello".to_string();
+    let message = "Hello, how are you?".to_string();
     let response = create_response(
         &server,
         conversation.id.clone(),
@@ -136,6 +175,24 @@ async fn test_responses_api() {
     )
     .await;
     println!("Response: {:?}", response);
+    assert_eq!(
+        response
+            .output
+            .iter()
+            .any(|o| if let ResponseOutputItem::Message { content, .. } = o {
+                content.iter().any(|c| {
+                    if let ResponseOutputContent::OutputText { text, .. } = c {
+                        println!("Text: {}", text);
+                        text.len() > 0
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                false
+            }),
+        true
+    );
 
     let conversation_items = list_conversation_items(&server, conversation.id).await;
     assert_eq!(conversation_items.data.len(), 2);
@@ -199,7 +256,7 @@ async fn create_response(
                 "id": conversation_id,
             },
             "input": message,
-            "temperature": 0.5,
+            "temperature": 0.7,
             "max_output_tokens": 10,
             "stream": false,
             "model": model
@@ -214,15 +271,14 @@ async fn test_conversations_api() {
     // Setup
     let config = test_config();
     let database = init_database_with_config(&config.database).await;
+
+    // Create mock user in database for foreign key constraints
+    assert_mock_user_in_db(&database).await;
+
     let auth_components = init_auth_services(database.clone(), &config);
     let domain_services = init_domain_services(database.clone(), &config).await;
 
-    let app = build_app(
-        database,
-        auth_components,
-        domain_services,
-        config.auth.enabled,
-    );
+    let app = build_app(database, auth_components, domain_services);
 
     let server = axum_test::TestServer::new(app).unwrap();
 

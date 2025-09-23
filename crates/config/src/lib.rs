@@ -20,13 +20,13 @@ pub use types::*;
 pub enum ConfigError {
     #[error("Configuration file not found. Tried paths: {paths}")]
     FileNotFound { paths: String },
-    
+
     #[error("Failed to read configuration file: {source}")]
     IoError {
         #[from]
         source: std::io::Error,
     },
-    
+
     #[error("Failed to parse configuration: {source}")]
     ParseError {
         #[from]
@@ -42,22 +42,18 @@ impl ApiConfig {
         let config: ApiConfig = serde_yaml::from_str(&content)?;
         Ok(config)
     }
-    
+
     /// Load configuration from default locations
     pub fn load() -> Result<Self, ConfigError> {
         // Try different config locations in order
-        let config_paths = [
-            "config/config.yaml",
-            "config.yaml",
-            "config/default.yaml",
-        ];
-        
+        let config_paths = ["config/config.yaml", "config.yaml", "config/default.yaml"];
+
         for path in &config_paths {
             if std::path::Path::new(path).exists() {
                 return Self::load_from_file(path);
             }
         }
-        
+
         // If no config file found, fail with descriptive error
         Err(ConfigError::FileNotFound {
             paths: config_paths.join(", "),

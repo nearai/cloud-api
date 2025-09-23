@@ -1,23 +1,22 @@
 pub mod ports;
 
 use crate::{
-    conversations::ports::*,
     responses::ports::{ConversationId, ResponseRepository},
     UserId,
 };
-use ports::ConversationError;
+// ConversationError will be re-exported via pub use ports::* at the end of the file
 use std::sync::Arc;
 use uuid::Uuid;
 
 // Helper functions for ID parsing
-pub fn parse_uuid(id: &str) -> Result<Uuid, ConversationError> {
+pub fn parse_uuid(id: &str) -> Result<Uuid, ports::ConversationError> {
     Uuid::parse_str(id)
-        .map_err(|_| ConversationError::InvalidParams(format!("Invalid UUID: {}", id)))
+        .map_err(|_| ports::ConversationError::InvalidParams(format!("Invalid UUID: {}", id)))
 }
 
-pub fn parse_uuid_from_prefixed(id: &str, prefix: &str) -> Result<Uuid, ConversationError> {
+pub fn parse_uuid_from_prefixed(id: &str, prefix: &str) -> Result<Uuid, ports::ConversationError> {
     let uuid_str = id.strip_prefix(prefix).ok_or_else(|| {
-        ConversationError::InvalidParams(format!(
+        ports::ConversationError::InvalidParams(format!(
             "Invalid {} ID format: {}",
             prefix.trim_end_matches('_'),
             id
@@ -25,7 +24,7 @@ pub fn parse_uuid_from_prefixed(id: &str, prefix: &str) -> Result<Uuid, Conversa
     })?;
 
     Uuid::parse_str(uuid_str).map_err(|_| {
-        ConversationError::InvalidParams(format!(
+        ports::ConversationError::InvalidParams(format!(
             "Invalid {} UUID: {}",
             prefix.trim_end_matches('_'),
             id
@@ -47,8 +46,8 @@ impl ConversationService {
     /// Create a new conversation
     pub async fn create_conversation(
         &self,
-        request: ConversationRequest,
-    ) -> Result<Conversation, ConversationError> {
+        request: ports::ConversationRequest,
+    ) -> Result<ports::Conversation, ConversationError> {
         let metadata = request.metadata.unwrap_or_else(|| serde_json::json!({}));
 
         tracing::info!("Creating conversation for user: {}", request.user_id.0);
@@ -58,12 +57,15 @@ impl ConversationService {
             .create(request.user_id, metadata)
             .await
             .map_err(|e| {
-                ConversationError::InternalError(format!("Failed to create conversation: {}", e))
+                ports::ConversationError::InternalError(format!(
+                    "Failed to create conversation: {}",
+                    e
+                ))
             })?;
 
         tracing::info!("Created conversation: {}", db_conversation.id);
 
-        let conversation = Conversation {
+        let conversation = ports::Conversation {
             id: db_conversation.id,
             user_id: db_conversation.user_id,
             metadata: db_conversation.metadata,
@@ -79,16 +81,19 @@ impl ConversationService {
         &self,
         conversation_id: &ConversationId,
         user_id: &UserId,
-    ) -> Result<Option<Conversation>, ConversationError> {
+    ) -> Result<Option<ports::Conversation>, ConversationError> {
         let db_conversation = self
             .conv_repo
             .get_by_id(conversation_id.clone(), user_id.clone())
             .await
             .map_err(|e| {
-                ConversationError::InternalError(format!("Failed to get conversation: {}", e))
+                ports::ConversationError::InternalError(format!(
+                    "Failed to get conversation: {}",
+                    e
+                ))
             })?;
 
-        Ok(db_conversation.map(|c| Conversation {
+        Ok(db_conversation.map(|c| ports::Conversation {
             id: c.id,
             user_id: c.user_id,
             metadata: c.metadata,
@@ -103,16 +108,19 @@ impl ConversationService {
         conversation_id: &ConversationId,
         user_id: &UserId,
         metadata: serde_json::Value,
-    ) -> Result<Option<Conversation>, ConversationError> {
+    ) -> Result<Option<ports::Conversation>, ConversationError> {
         let db_conversation = self
             .conv_repo
             .update(conversation_id.clone(), user_id.clone(), metadata)
             .await
             .map_err(|e| {
-                ConversationError::InternalError(format!("Failed to update conversation: {}", e))
+                ports::ConversationError::InternalError(format!(
+                    "Failed to update conversation: {}",
+                    e
+                ))
             })?;
 
-        Ok(db_conversation.map(|c| Conversation {
+        Ok(db_conversation.map(|c| ports::Conversation {
             id: c.id,
             user_id: c.user_id,
             metadata: c.metadata,
@@ -126,12 +134,15 @@ impl ConversationService {
         &self,
         conversation_id: &ConversationId,
         user_id: &UserId,
-    ) -> Result<bool, ConversationError> {
+    ) -> Result<bool, ports::ConversationError> {
         self.conv_repo
             .delete(conversation_id.clone(), user_id.clone())
             .await
             .map_err(|e| {
-                ConversationError::InternalError(format!("Failed to delete conversation: {}", e))
+                ports::ConversationError::InternalError(format!(
+                    "Failed to delete conversation: {}",
+                    e
+                ))
             })
     }
 
@@ -141,7 +152,7 @@ impl ConversationService {
         user_id: &UserId,
         limit: Option<i32>,
         offset: Option<i32>,
-    ) -> Result<Vec<Conversation>, ConversationError> {
+    ) -> Result<Vec<ports::Conversation>, ports::ConversationError> {
         let limit = limit.unwrap_or(20).min(100) as i64;
         let offset = offset.unwrap_or(0) as i64;
 
@@ -152,7 +163,10 @@ impl ConversationService {
             .list_by_user(user_id.clone(), limit, offset)
             .await
             .map_err(|e| {
-                ConversationError::InternalError(format!("Failed to list conversations: {}", e))
+                ports::ConversationError::InternalError(format!(
+                    "Failed to list conversations: {}",
+                    e
+                ))
             })?;
 
         tracing::info!("Found {} conversations", db_conversations.len());
@@ -166,7 +180,7 @@ impl ConversationService {
         conversation_id: &ConversationId,
         user_id: &UserId,
         limit: Option<i32>,
-    ) -> Result<Vec<ConversationMessage>, ConversationError> {
+    ) -> Result<Vec<ports::ConversationMessage>, ports::ConversationError> {
         let limit = limit.unwrap_or(50).min(100) as i64;
 
         // Get responses for this conversation
@@ -175,7 +189,7 @@ impl ConversationService {
             .list_by_conversation(conversation_id.clone(), user_id.clone(), limit)
             .await
             .map_err(|e| {
-                ConversationError::InternalError(format!(
+                ports::ConversationError::InternalError(format!(
                     "Failed to get conversation messages: {}",
                     e
                 ))
@@ -188,7 +202,7 @@ impl ConversationService {
         for response in responses {
             // Parse input_messages JSONB to extract individual messages
             if let Some(input_array) = response.input_messages.as_array() {
-                for (index, msg_value) in input_array.iter().enumerate() {
+                for (_index, msg_value) in input_array.iter().enumerate() {
                     if let Some(msg_obj) = msg_value.as_object() {
                         let role = msg_obj
                             .get("role")
@@ -215,7 +229,7 @@ impl ConversationService {
                         // Only add if we haven't seen this content recently
                         if !seen_content.contains(&dedup_key) {
                             seen_content.insert(dedup_key);
-                            messages.push(ConversationMessage {
+                            messages.push(ports::ConversationMessage {
                                 id: response.id.clone(),
                                 role,
                                 content,
@@ -237,7 +251,7 @@ impl ConversationService {
 
                 if !seen_content.contains(&dedup_key) {
                     seen_content.insert(dedup_key);
-                    messages.push(ConversationMessage {
+                    messages.push(ports::ConversationMessage {
                         id: response.id.clone(),
                         role: "assistant".to_string(),
                         content: output,

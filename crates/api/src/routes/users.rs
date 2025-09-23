@@ -168,55 +168,6 @@ pub async fn list_users(
     Ok(Json(users))
 }
 
-/// Search users
-pub async fn search_users(
-    State(app_state): State<AppState>,
-    Extension(user): Extension<AuthenticatedUser>,
-    Query(params): Query<SearchParams>,
-) -> Result<Json<Vec<User>>, StatusCode> {
-    debug!(
-        "Searching users with query: {} for user: {}",
-        params.q, user.0.id
-    );
-
-    // Search for users in the same organizations as the current user
-    let query = "
-        SELECT DISTINCT u.*
-        FROM users u
-        JOIN organization_members om ON u.id = om.user_id
-        WHERE om.organization_id IN (
-            SELECT organization_id 
-            FROM organization_members 
-            WHERE user_id = $1
-        )
-        AND (u.username ILIKE $2 OR u.email ILIKE $2)
-        LIMIT $3
-    ";
-
-    let client = app_state.db.pool().get().await.map_err(|e| {
-        error!("Failed to get database connection: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let search_pattern = format!("%{}%", params.q);
-    let rows = client
-        .query(query, &[&user.0.id, &search_pattern, &params.limit])
-        .await
-        .map_err(|e| {
-            error!("Failed to search users: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    let mut users = Vec::new();
-    for row in rows {
-        if let Ok(Some(user)) = app_state.db.users.get_by_id(row.get("id")).await {
-            users.push(user);
-        }
-    }
-
-    Ok(Json(users))
-}
-
 /// Get user's organizations (current user)
 pub async fn get_user_organizations(
     State(app_state): State<AppState>,

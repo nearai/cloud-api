@@ -1,9 +1,5 @@
 pub mod ports;
 
-use crate::completions::ports::{
-    CompletionError, CompletionMessage, CompletionRequest, CompletionStreamEvent,
-    ModelCapabilities, ModelInfo,
-};
 use crate::inference_provider_pool::InferenceProviderPool;
 use futures::Stream;
 use inference_providers::{ChatMessage, InferenceProvider, MessageRole, StreamChunk};
@@ -22,7 +18,7 @@ impl CompletionServiceImpl {
     }
 
     /// Convert completion messages to chat messages for inference providers
-    fn prepare_chat_messages(messages: &[CompletionMessage]) -> Vec<ChatMessage> {
+    fn prepare_chat_messages(messages: &[ports::CompletionMessage]) -> Vec<ChatMessage> {
         messages
             .iter()
             .map(|msg| ChatMessage {
@@ -49,7 +45,7 @@ impl CompletionServiceImpl {
             >,
         >,
         completion_id: CompletionId,
-    ) -> impl Stream<Item = CompletionStreamEvent> + Send {
+    ) -> impl Stream<Item = ports::CompletionStreamEvent> + Send {
         use futures::stream::{self, StreamExt};
 
         // State to track accumulated content
@@ -122,8 +118,8 @@ impl CompletionServiceImpl {
         initial_events.chain(content_stream)
     }
 
-    fn create_start_event(completion_id: &CompletionId) -> CompletionStreamEvent {
-        CompletionStreamEvent {
+    fn create_start_event(completion_id: &CompletionId) -> ports::CompletionStreamEvent {
+        ports::CompletionStreamEvent {
             event_name: "completion.started".to_string(),
             data: serde_json::json!({
                 "completion_id": completion_id,
@@ -132,8 +128,8 @@ impl CompletionServiceImpl {
         }
     }
 
-    fn create_progress_event(completion_id: &CompletionId) -> CompletionStreamEvent {
-        CompletionStreamEvent {
+    fn create_progress_event(completion_id: &CompletionId) -> ports::CompletionStreamEvent {
+        ports::CompletionStreamEvent {
             event_name: "completion.progress".to_string(),
             data: serde_json::json!({
                 "completion_id": completion_id,
@@ -142,8 +138,11 @@ impl CompletionServiceImpl {
         }
     }
 
-    fn create_delta_event(completion_id: &CompletionId, delta: &str) -> CompletionStreamEvent {
-        CompletionStreamEvent {
+    fn create_delta_event(
+        completion_id: &CompletionId,
+        delta: &str,
+    ) -> ports::CompletionStreamEvent {
+        ports::CompletionStreamEvent {
             event_name: "completion.delta".to_string(),
             data: serde_json::json!({
                 "completion_id": completion_id,
@@ -156,8 +155,8 @@ impl CompletionServiceImpl {
         completion_id: &CompletionId,
         content: &str,
         usage: &inference_providers::TokenUsage,
-    ) -> CompletionStreamEvent {
-        CompletionStreamEvent {
+    ) -> ports::CompletionStreamEvent {
+        ports::CompletionStreamEvent {
             event_name: "completion.completed".to_string(),
             data: serde_json::json!({
                 "completion_id": completion_id,
@@ -172,8 +171,11 @@ impl CompletionServiceImpl {
         }
     }
 
-    fn create_error_event(completion_id: &CompletionId, error: &str) -> CompletionStreamEvent {
-        CompletionStreamEvent {
+    fn create_error_event(
+        completion_id: &CompletionId,
+        error: &str,
+    ) -> ports::CompletionStreamEvent {
+        ports::CompletionStreamEvent {
             event_name: "completion.error".to_string(),
             data: serde_json::json!({
                 "completion_id": completion_id,
@@ -188,8 +190,11 @@ impl CompletionServiceImpl {
 impl ports::CompletionService for CompletionServiceImpl {
     async fn create_completion_stream(
         &self,
-        request: CompletionRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = CompletionStreamEvent> + Send>>, CompletionError> {
+        request: ports::CompletionRequest,
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = ports::CompletionStreamEvent> + Send>>,
+        ports::CompletionError,
+    > {
         // Generate a completion ID
         let completion_id = CompletionId::from(Uuid::new_v4());
 
@@ -230,7 +235,7 @@ impl ports::CompletionService for CompletionServiceImpl {
             .chat_completion_stream(chat_params)
             .await
             .map_err(|e| {
-                CompletionError::ProviderError(format!("Failed to create LLM stream: {}", e))
+                ports::CompletionError::ProviderError(format!("Failed to create LLM stream: {}", e))
             })?;
 
         // Create the completion event stream

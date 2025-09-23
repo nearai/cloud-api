@@ -17,9 +17,9 @@ use uuid::Uuid;
 
 /// List all organizations for the authenticated user
 pub async fn list_organizations(
-    State(app_state): State<AppState>,
+    State(_app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
-    Query(params): Query<ListParams>,
+    Query(_params): Query<ListParams>,
 ) -> Result<Json<Vec<OrganizationResponse>>, StatusCode> {
     debug!("Listing organizations for user: {}", user.0.id);
 

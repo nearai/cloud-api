@@ -1,5 +1,3 @@
-use services::UserId;
-
 use crate::{middleware::AuthenticatedUser, models::*};
 
 impl From<&crate::models::Message> for services::ChatMessage {
@@ -90,6 +88,7 @@ impl From<&services::ChatMessage> for crate::models::Message {
     }
 }
 
+#[allow(dead_code)]
 fn finish_reason_to_string(reason: &services::FinishReason) -> String {
     match reason {
         services::FinishReason::Stop => "stop".to_string(),

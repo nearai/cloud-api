@@ -1,7 +1,6 @@
 use crate::models::Session;
 use crate::pool::DbPool;
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use sha2::{Digest, Sha256};
 use tracing::debug;

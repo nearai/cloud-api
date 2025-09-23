@@ -160,8 +160,8 @@ pub async fn create_response(
                 let sse_stream = stream.map(|event| {
                     Ok::<_, Infallible>(
                         Event::default()
-                            .event(event.event_name)
-                            .data(serde_json::to_string(&event.data).unwrap_or_default()),
+                            .event(event.event_type.clone())
+                            .data(serde_json::to_string(&event).unwrap_or_default()),
                     )
                 });
 
@@ -200,25 +200,35 @@ pub async fn create_response(
                 let mut response_id = None;
                 let mut content = String::new();
                 let mut status = DomainResponseStatus::InProgress;
+                let mut final_response: Option<ResponseObject> = None;
 
                 let mut stream = Box::pin(stream);
                 while let Some(event) = stream.next().await {
-                    match event.event_name.as_str() {
+                    match event.event_type.as_str() {
                         "response.created" => {
-                            // Extract response ID from event data
-                            if let Some(id) = event.data.get("response_id").and_then(|v| v.as_str())
-                            {
-                                response_id = Some(id.to_string());
+                            // Extract response ID from JSON response object
+                            if let Some(response) = &event.response {
+                                if let Some(id) = response.get("id").and_then(|v| v.as_str()) {
+                                    response_id = Some(id.to_string());
+                                }
                             }
                         }
-                        "response.output.delta" => {
+                        "response.output_text.delta" => {
                             // Accumulate content deltas
-                            if let Some(text) = event.data.get("delta").and_then(|v| v.as_str()) {
-                                content.push_str(text);
+                            if let Some(delta) = &event.delta {
+                                content.push_str(delta);
                             }
                         }
                         "response.completed" => {
                             status = DomainResponseStatus::Completed;
+                            // Convert the JSON response to a ResponseObject
+                            if let Some(response_json) = event.response {
+                                if let Ok(response_obj) =
+                                    serde_json::from_value::<ResponseObject>(response_json)
+                                {
+                                    final_response = Some(response_obj);
+                                }
+                            }
                         }
                         "response.failed" => {
                             status = DomainResponseStatus::Failed;
@@ -229,45 +239,51 @@ pub async fn create_response(
                     }
                 }
 
-                // Build complete response
-                let response = ResponseObject {
-                    id: response_id.unwrap_or_else(|| format!("resp_{}", Uuid::new_v4())),
-                    object: "response".to_string(),
-                    created_at: chrono::Utc::now().timestamp() as u64,
-                    status: match status {
-                        DomainResponseStatus::InProgress => ResponseStatus::InProgress,
-                        DomainResponseStatus::Completed => ResponseStatus::Completed,
-                        DomainResponseStatus::Failed => ResponseStatus::Failed,
-                        DomainResponseStatus::Cancelled => ResponseStatus::Cancelled,
-                    },
-                    error: None,
-                    incomplete_details: None,
-                    instructions: request.instructions.clone(),
-                    max_output_tokens: request.max_output_tokens,
-                    max_tool_calls: request.max_tool_calls,
-                    model: request.model.clone(),
-                    output: vec![ResponseOutputItem::Message {
-                        id: format!("msg_{}", Uuid::new_v4()),
-                        status: ResponseItemStatus::Completed,
-                        role: "assistant".to_string(),
-                        content: vec![ResponseOutputContent::OutputText {
-                            text: content,
-                            annotations: vec![],
+                // Use final response from completed event or build fallback response
+                let response = if let Some(final_resp) = final_response {
+                    // Use the complete response object from the response.completed event
+                    final_resp
+                } else {
+                    // Fallback: Build response from collected data (for compatibility)
+                    ResponseObject {
+                        id: response_id.unwrap_or_else(|| format!("resp_{}", Uuid::new_v4())),
+                        object: "response".to_string(),
+                        created_at: chrono::Utc::now().timestamp() as u64,
+                        status: match status {
+                            DomainResponseStatus::InProgress => ResponseStatus::InProgress,
+                            DomainResponseStatus::Completed => ResponseStatus::Completed,
+                            DomainResponseStatus::Failed => ResponseStatus::Failed,
+                            DomainResponseStatus::Cancelled => ResponseStatus::Cancelled,
+                        },
+                        error: None,
+                        incomplete_details: None,
+                        instructions: request.instructions.clone(),
+                        max_output_tokens: request.max_output_tokens,
+                        max_tool_calls: request.max_tool_calls,
+                        model: request.model.clone(),
+                        output: vec![ResponseOutputItem::Message {
+                            id: format!("msg_{}", Uuid::new_v4()),
+                            status: ResponseItemStatus::Completed,
+                            role: "assistant".to_string(),
+                            content: vec![ResponseOutputContent::OutputText {
+                                text: content,
+                                annotations: vec![],
+                            }],
                         }],
-                    }],
-                    parallel_tool_calls: request.parallel_tool_calls.unwrap_or(false),
-                    previous_response_id: request.previous_response_id.clone(),
-                    reasoning: None,
-                    store: request.store.unwrap_or(false),
-                    temperature: request.temperature.unwrap_or(0.7),
-                    text: request.text.clone(),
-                    tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
-                    tools: request.tools.clone().unwrap_or_default(),
-                    top_p: request.top_p.unwrap_or(1.0),
-                    truncation: "stop".to_string(),
-                    usage: Usage::new(0, 0), // TODO: Get actual usage from stream
-                    user: None,
-                    metadata: request.metadata.clone(),
+                        parallel_tool_calls: request.parallel_tool_calls.unwrap_or(false),
+                        previous_response_id: request.previous_response_id.clone(),
+                        reasoning: None,
+                        store: request.store.unwrap_or(false),
+                        temperature: request.temperature.unwrap_or(0.7),
+                        text: request.text.clone(),
+                        tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
+                        tools: request.tools.clone().unwrap_or_default(),
+                        top_p: request.top_p.unwrap_or(1.0),
+                        truncation: "stop".to_string(),
+                        usage: Usage::new(0, 0), // TODO: Get actual usage from stream
+                        user: None,
+                        metadata: request.metadata.clone(),
+                    }
                 };
 
                 info!("Created response {} for user {}", response.id, user.0.id);

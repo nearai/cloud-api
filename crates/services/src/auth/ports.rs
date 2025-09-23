@@ -252,6 +252,61 @@ pub trait ApiKeyRepository: Send + Sync {
 }
 
 // Service interfaces
+#[async_trait]
+pub trait AuthServiceTrait: Send + Sync {
+    /// Create a new session for a user
+    async fn create_session(
+        &self,
+        user_id: UserId,
+        ip_address: Option<String>,
+        user_agent: Option<String>,
+        expires_in_hours: i64,
+    ) -> Result<(Session, String), AuthError>;
+
+    /// Validate a session token and return the session
+    async fn validate_session_token(
+        &self,
+        session_token: uuid::Uuid,
+    ) -> Result<Option<Session>, AuthError>;
+
+    /// Validate a session token and return the associated user
+    async fn validate_session(&self, session_token: uuid::Uuid) -> Result<User, AuthError>;
+
+    /// Logout (revoke session)
+    async fn logout(&self, session_id: SessionId) -> Result<bool, AuthError>;
+
+    /// Get or create user from OAuth data
+    async fn get_or_create_oauth_user(&self, oauth_info: OAuthUserInfo) -> Result<User, AuthError>;
+
+    /// Clean up expired sessions
+    async fn cleanup_expired_sessions(&self) -> Result<usize, AuthError>;
+
+    /// Validate an API key and return the associated user
+    async fn validate_api_key(&self, api_key: String) -> Result<User, AuthError>;
+
+    /// Create an API key for an organization with proper permission checking
+    async fn create_organization_api_key(
+        &self,
+        organization_id: crate::organization::OrganizationId,
+        requester_id: UserId,
+        request: CreateApiKeyRequest,
+    ) -> Result<ApiKey, AuthError>;
+
+    /// Check if a user can manage API keys for an organization
+    async fn can_manage_organization_api_keys(
+        &self,
+        organization_id: crate::organization::OrganizationId,
+        user_id: UserId,
+    ) -> Result<bool, AuthError>;
+
+    /// List API keys for an organization with proper permission checking
+    async fn list_organization_api_keys(
+        &self,
+        organization_id: crate::organization::OrganizationId,
+        requester_id: UserId,
+    ) -> Result<Vec<ApiKey>, AuthError>;
+}
+
 pub struct AuthService {
     pub user_repository: Arc<dyn UserRepository>,
     pub session_repository: Arc<dyn SessionRepository>,
@@ -261,4 +316,141 @@ pub struct AuthService {
 
 pub struct UserService {
     pub user_repository: Arc<dyn UserRepository>,
+}
+
+// Mock constants for testing
+const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+/// Mock auth service that returns fake data for testing/development
+/// Used when mock auth is enabled
+pub struct MockAuthService;
+
+impl MockAuthService {
+    fn create_mock_user() -> User {
+        User {
+            id: UserId(uuid::Uuid::parse_str(MOCK_USER_ID).expect("Invalid mock user ID")),
+            email: "test@example.com".to_string(),
+            username: "testuser".to_string(),
+            display_name: Some("Test User".to_string()),
+            avatar_url: Some("https://example.com/avatar.jpg".to_string()),
+            organization_id: None,
+            role: UserRole::User,
+            is_active: true,
+            last_login: Some(chrono::Utc::now()),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn create_mock_session(&self, user_id: UserId) -> (Session, String) {
+        let session_id = SessionId(uuid::Uuid::new_v4().to_string());
+        let session_token = uuid::Uuid::new_v4();
+        let expires_at = chrono::Utc::now() + chrono::Duration::hours(24);
+
+        let session = Session {
+            id: session_id,
+            user_id,
+            token_hash: "mock_token_hash".to_string(),
+            created_at: chrono::Utc::now(),
+            expires_at,
+            ip_address: Some("127.0.0.1".to_string()),
+            user_agent: Some("Mock User Agent".to_string()),
+        };
+
+        (session, session_token.to_string())
+    }
+
+    fn create_mock_api_key(
+        &self,
+        organization_id: crate::organization::OrganizationId,
+        requester_id: UserId,
+    ) -> ApiKey {
+        ApiKey {
+            id: ApiKeyId(uuid::Uuid::new_v4().to_string()),
+            name: "Mock API Key".to_string(),
+            organization_id,
+            created_by_user_id: requester_id,
+            account_type: AccountType::User,
+            created_at: chrono::Utc::now(),
+            expires_at: None,
+            last_used_at: None,
+            is_active: true,
+        }
+    }
+}
+
+#[async_trait]
+impl AuthServiceTrait for MockAuthService {
+    async fn create_session(
+        &self,
+        user_id: UserId,
+        _ip_address: Option<String>,
+        _user_agent: Option<String>,
+        _expires_in_hours: i64,
+    ) -> Result<(Session, String), AuthError> {
+        Ok(self.create_mock_session(user_id))
+    }
+
+    async fn validate_session_token(
+        &self,
+        _session_token: uuid::Uuid,
+    ) -> Result<Option<Session>, AuthError> {
+        let mock_user = Self::create_mock_user();
+        let (session, _) = self.create_mock_session(mock_user.id);
+        Ok(Some(session))
+    }
+
+    async fn validate_session(&self, session_token: uuid::Uuid) -> Result<User, AuthError> {
+        tracing::debug!(
+            "MockAuthService::validate_session called with token: {}",
+            session_token
+        );
+        let user = Self::create_mock_user();
+        tracing::debug!("MockAuthService returning mock user: {}", user.email);
+        Ok(user)
+    }
+
+    async fn logout(&self, _session_id: SessionId) -> Result<bool, AuthError> {
+        Ok(true) // Mock logout always succeeds
+    }
+
+    async fn get_or_create_oauth_user(
+        &self,
+        _oauth_info: OAuthUserInfo,
+    ) -> Result<User, AuthError> {
+        Ok(Self::create_mock_user())
+    }
+
+    async fn cleanup_expired_sessions(&self) -> Result<usize, AuthError> {
+        Ok(0) // No sessions to clean up in mock
+    }
+
+    async fn validate_api_key(&self, _api_key: String) -> Result<User, AuthError> {
+        Ok(Self::create_mock_user())
+    }
+
+    async fn create_organization_api_key(
+        &self,
+        organization_id: crate::organization::OrganizationId,
+        requester_id: UserId,
+        _request: CreateApiKeyRequest,
+    ) -> Result<ApiKey, AuthError> {
+        Ok(self.create_mock_api_key(organization_id, requester_id))
+    }
+
+    async fn can_manage_organization_api_keys(
+        &self,
+        _organization_id: crate::organization::OrganizationId,
+        _user_id: UserId,
+    ) -> Result<bool, AuthError> {
+        Ok(true) // Mock user can always manage API keys
+    }
+
+    async fn list_organization_api_keys(
+        &self,
+        organization_id: crate::organization::OrganizationId,
+        requester_id: UserId,
+    ) -> Result<Vec<ApiKey>, AuthError> {
+        Ok(vec![self.create_mock_api_key(organization_id, requester_id)])
+    }
 }

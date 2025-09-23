@@ -54,7 +54,7 @@ impl ApiConfig {
         
         for path in &config_paths {
             if std::path::Path::new(path).exists() {
-                return Self::load_from_file(path).map_err(ConfigError::from);
+                return Self::load_from_file(path);
             }
         }
         

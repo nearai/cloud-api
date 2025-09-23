@@ -45,44 +45,12 @@ impl Default for DatabaseConfig {
 }
 
 impl DatabaseConfig {
-    /// Create a new database configuration
-    pub fn new(
-        host: String,
-        port: u16,
-        database: String,
-        username: String,
-        password: String,
-        max_connections: usize,
-    ) -> Self {
-        Self {
-            host,
-            port,
-            database,
-            username,
-            password,
-            max_connections,
-        }
-    }
-
-    /// Create from environment variables with custom prefix
-    pub fn from_env_with_prefix(prefix: &str) -> Self {
-        Self {
-            host: env::var(format!("{}_HOST", prefix)).unwrap_or_else(|_| "localhost".to_string()),
-            port: env::var(format!("{}_PORT", prefix))
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(5432),
-            database: env::var(format!("{}_DATABASE", prefix))
-                .unwrap_or_else(|_| "platform_api".to_string()),
-            username: env::var(format!("{}_USERNAME", prefix))
-                .unwrap_or_else(|_| "postgres".to_string()),
-            password: env::var(format!("{}_PASSWORD", prefix))
-                .unwrap_or_else(|_| "postgres".to_string()),
-            max_connections: env::var(format!("{}_MAX_CONNECTIONS", prefix))
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(20),
-        }
+    /// Create a connection URL for this database configuration
+    pub fn connection_url(&self) -> String {
+        format!(
+            "postgres://{}:{}@{}:{}/{}",
+            self.username, self.password, self.host, self.port, self.database
+        )
     }
 }
 
@@ -98,6 +66,22 @@ pub struct ModelDiscoveryConfig {
     pub timeout: u64,          // seconds
 }
 
+impl Default for ModelDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            refresh_interval: env::var("MODEL_DISCOVERY_REFRESH_INTERVAL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300), // 5 minutes
+            timeout: env::var("MODEL_DISCOVERY_TIMEOUT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30), // 30 seconds
+        }
+    }
+}
+
+/// Logging Configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
     pub level: String,
@@ -145,23 +129,13 @@ pub struct DomainConfig {
 }
 
 // Simplified Authentication Configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AuthConfig {
-    pub enabled: bool,
+    pub mock: bool,
     #[serde(default)]
     pub github: Option<GitHubOAuthConfig>,
     #[serde(default)]
     pub google: Option<GoogleOAuthConfig>,
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            github: None,
-            google: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

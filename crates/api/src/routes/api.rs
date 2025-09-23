@@ -6,6 +6,7 @@ use axum::{
 };
 use database::Database;
 use services::{
+    auth::AuthServiceTrait,
     completions::CompletionService,
     mcp::McpClientManager,
     models::ModelsService,
@@ -21,18 +22,14 @@ pub struct AppState {
     pub mcp_manager: Arc<McpClientManager>,
     pub completion_service: Arc<dyn CompletionService>,
     pub models_service: Arc<dyn ModelsService>,
-    pub auth_service: Arc<services::auth::AuthService>,
+    pub auth_service: Arc<dyn AuthServiceTrait>,
 }
 
 // Import route handlers
 use crate::routes::{mcp_connectors::*, organization_members::*, organizations::*, users::*};
 
 /// Build the complete API router with all management endpoints
-pub fn build_management_router(
-    app_state: AppState,
-    auth_state: AuthState,
-    auth_enabled: bool,
-) -> Router {
+pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Router {
     // Organization routes
     let org_routes = Router::new()
         .route("/", get(list_organizations).post(create_organization))
@@ -98,18 +95,12 @@ pub fn build_management_router(
         )
         .route("/{id}/sessions/{session_id}", delete(revoke_user_session));
 
-    // Combine all routes
-    let mut api_router = Router::new()
+    // Combine all routes with auth middleware
+    Router::new()
         .nest("/organizations", org_routes)
         .nest("/users", user_routes)
-        .with_state(app_state);
-
-    // Apply authentication middleware if enabled
-    if auth_enabled {
-        api_router = api_router.layer(from_fn_with_state(auth_state, auth_middleware));
-    }
-
-    api_router
+        .with_state(app_state)
+        .layer(from_fn_with_state(auth_state, auth_middleware))
 }
 
 // Revoke an API key

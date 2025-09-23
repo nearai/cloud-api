@@ -34,13 +34,9 @@ impl OAuthManager {
         github_config: Option<OAuthProviderConfig>,
         google_config: Option<OAuthProviderConfig>,
     ) -> Result<Self, AuthError> {
-        let github_client = github_config
-            .map(Self::create_github_client)
-            .transpose()?;
+        let github_client = github_config.map(Self::create_github_client).transpose()?;
 
-        let google_client = google_config
-            .map(Self::create_google_client)
-            .transpose()?;
+        let google_client = google_config.map(Self::create_google_client).transpose()?;
 
         Ok(Self {
             github_client,

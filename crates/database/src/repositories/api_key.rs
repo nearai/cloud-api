@@ -3,10 +3,7 @@ use crate::pool::DbPool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use services::{
-    auth::ports::CreateApiKeyRequest,
-    organization::ports::OrganizationId,
-};
+use services::{auth::ports::CreateApiKeyRequest, organization::ports::OrganizationId};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 use uuid::Uuid;

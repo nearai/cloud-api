@@ -111,11 +111,27 @@ pub struct ResponseMessage {
     pub content: String,
 }
 
-/// Streaming event for response API
+/// API Spec-compliant streaming event for response API
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseStreamEvent {
-    pub event_name: String,
-    pub data: serde_json::Value,
+    #[serde(rename = "type")]
+    pub event_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<serde_json::Value>, // Full response object
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item: Option<serde_json::Value>, // ResponseOutputItem
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub part: Option<serde_json::Value>, // ResponseOutputContent
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 #[async_trait]

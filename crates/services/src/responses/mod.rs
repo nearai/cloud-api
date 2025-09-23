@@ -285,13 +285,17 @@ impl ResponseService {
     ) -> impl Stream<Item = ResponseStreamEvent> + Send {
         use futures::stream::{self, StreamExt};
 
-        // State to track accumulated content
+        // State to track accumulated content and message IDs
         let accumulated_content = Arc::new(std::sync::Mutex::new(String::new()));
+        let message_id = format!("msg_{}", uuid::Uuid::new_v4());
+        let message_id_clone = message_id.clone();
 
-        // Initial events
+        // Initial events with full response objects
         let initial_events = stream::iter(vec![
-            Self::create_start_event(&response_id),
-            Self::create_progress_event(&response_id),
+            Self::create_response_created_event(&response_id),
+            Self::create_response_in_progress_event(&response_id),
+            Self::create_output_item_added_event(&response_id, &message_id, 0),
+            Self::create_content_part_added_event(&response_id, &message_id, 0, 0),
         ]);
 
         // Transform LLM chunks to response events
@@ -300,6 +304,7 @@ impl ResponseService {
             let response_repository = response_repository.clone();
             let user_id = user_id.clone();
             let accumulated_content = accumulated_content.clone();
+            let message_id = message_id_clone.clone();
 
             async move {
                 match chunk_result {
@@ -315,8 +320,11 @@ impl ResponseService {
                                                 if let Ok(mut acc) = accumulated_content.lock() {
                                                     acc.push_str(delta_content);
                                                 }
-                                                return Some(Self::create_delta_event(
+                                                return Some(Self::create_output_text_delta_event(
                                                     &response_id,
+                                                    &message_id,
+                                                    0,
+                                                    0,
                                                     delta_content,
                                                 ));
                                             }
@@ -359,8 +367,11 @@ impl ResponseService {
                                         }
                                     });
 
-                                    return Some(Self::create_completion_event(
+                                    // Create completion events sequence - for now just return the response.completed event
+                                    // TODO: We should emit the full sequence (text.done, content_part.done, output_item.done, response.completed)
+                                    return Some(Self::create_response_completed_event(
                                         &response_id,
+                                        &final_content,
                                         &usage,
                                     ));
                                 }
@@ -407,62 +418,225 @@ impl ResponseService {
         initial_events.chain(content_stream)
     }
 
-    fn create_start_event(response_id: &ResponseId) -> ResponseStreamEvent {
+    // API Spec-compliant event creation methods
+
+    fn create_response_created_event(response_id: &ResponseId) -> ResponseStreamEvent {
         ResponseStreamEvent {
-            event_name: "response.started".to_string(),
-            data: serde_json::json!({
-                "response_id": response_id.to_string(),
-                "status": "started"
-            }),
+            event_type: "response.created".to_string(),
+            response: Some(Self::create_base_response_json(response_id, "in_progress")),
+            output_index: None,
+            content_index: None,
+            item: None,
+            item_id: None,
+            part: None,
+            delta: None,
+            text: None,
         }
     }
 
-    fn create_progress_event(response_id: &ResponseId) -> ResponseStreamEvent {
+    fn create_response_in_progress_event(response_id: &ResponseId) -> ResponseStreamEvent {
         ResponseStreamEvent {
-            event_name: "response.progress".to_string(),
-            data: serde_json::json!({
-                "response_id": response_id.to_string(),
-                "status": "in_progress"
-            }),
+            event_type: "response.in_progress".to_string(),
+            response: Some(Self::create_base_response_json(response_id, "in_progress")),
+            output_index: None,
+            content_index: None,
+            item: None,
+            item_id: None,
+            part: None,
+            delta: None,
+            text: None,
         }
     }
 
-    fn create_delta_event(response_id: &ResponseId, delta: &str) -> ResponseStreamEvent {
+    fn create_output_item_added_event(
+        _response_id: &ResponseId,
+        message_id: &str,
+        output_index: usize,
+    ) -> ResponseStreamEvent {
+        let message_item = serde_json::json!({
+            "id": message_id,
+            "type": "message",
+            "status": "in_progress",
+            "role": "assistant",
+            "content": []
+        });
+
         ResponseStreamEvent {
-            event_name: "response.delta".to_string(),
-            data: serde_json::json!({
-                "response_id": response_id.to_string(),
-                "delta": delta
-            }),
+            event_type: "response.output_item.added".to_string(),
+            response: None,
+            output_index: Some(output_index),
+            content_index: None,
+            item: Some(message_item),
+            item_id: None,
+            part: None,
+            delta: None,
+            text: None,
         }
     }
 
-    fn create_completion_event(
-        response_id: &ResponseId,
-        usage: &inference_providers::TokenUsage,
+    fn create_content_part_added_event(
+        _response_id: &ResponseId,
+        item_id: &str,
+        output_index: usize,
+        content_index: usize,
+    ) -> ResponseStreamEvent {
+        let text_part = serde_json::json!({
+            "type": "output_text",
+            "text": "",
+            "annotations": []
+        });
+
+        ResponseStreamEvent {
+            event_type: "response.content_part.added".to_string(),
+            response: None,
+            output_index: Some(output_index),
+            content_index: Some(content_index),
+            item: None,
+            item_id: Some(item_id.to_string()),
+            part: Some(text_part),
+            delta: None,
+            text: None,
+        }
+    }
+
+    fn create_output_text_delta_event(
+        _response_id: &ResponseId,
+        item_id: &str,
+        output_index: usize,
+        content_index: usize,
+        delta: &str,
     ) -> ResponseStreamEvent {
         ResponseStreamEvent {
-            event_name: "response.completed".to_string(),
-            data: serde_json::json!({
-                "response_id": response_id.to_string(),
-                "status": "completed",
-                "usage": {
-                    "prompt_tokens": usage.prompt_tokens,
-                    "completion_tokens": usage.completion_tokens,
+            event_type: "response.output_text.delta".to_string(),
+            response: None,
+            output_index: Some(output_index),
+            content_index: Some(content_index),
+            item: None,
+            item_id: Some(item_id.to_string()),
+            part: None,
+            delta: Some(delta.to_string()),
+            text: None,
+        }
+    }
+
+    fn create_response_completed_event(
+        response_id: &ResponseId,
+        final_content: &str,
+        usage: &inference_providers::TokenUsage,
+    ) -> ResponseStreamEvent {
+        let message_item = serde_json::json!({
+            "id": format!("msg_{}", uuid::Uuid::new_v4()),
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": final_content,
+                "annotations": []
+            }]
+        });
+
+        let mut response_obj = Self::create_base_response_json(response_id, "completed");
+        if let Some(response_map) = response_obj.as_object_mut() {
+            response_map.insert("output".to_string(), serde_json::json!([message_item]));
+            response_map.insert(
+                "usage".to_string(),
+                serde_json::json!({
+                    "input_tokens": usage.prompt_tokens,
+                    "input_tokens_details": {
+                        "cached_tokens": 0
+                    },
+                    "output_tokens": usage.completion_tokens,
+                    "output_tokens_details": {
+                        "reasoning_tokens": 0
+                    },
                     "total_tokens": usage.total_tokens
-                }
-            }),
+                }),
+            );
+        }
+
+        ResponseStreamEvent {
+            event_type: "response.completed".to_string(),
+            response: Some(response_obj),
+            output_index: None,
+            content_index: None,
+            item: None,
+            item_id: None,
+            part: None,
+            delta: None,
+            text: None,
         }
     }
 
     fn create_error_event(response_id: &ResponseId, error: &str) -> ResponseStreamEvent {
-        ResponseStreamEvent {
-            event_name: "response.error".to_string(),
-            data: serde_json::json!({
-                "response_id": response_id.to_string(),
-                "status": "failed",
-                "error": error
-            }),
+        let mut response_obj = Self::create_base_response_json(response_id, "failed");
+        if let Some(response_map) = response_obj.as_object_mut() {
+            response_map.insert(
+                "error".to_string(),
+                serde_json::json!({
+                    "message": error,
+                    "type": "internal_error"
+                }),
+            );
         }
+
+        ResponseStreamEvent {
+            event_type: "response.failed".to_string(),
+            response: Some(response_obj),
+            output_index: None,
+            content_index: None,
+            item: None,
+            item_id: None,
+            part: None,
+            delta: None,
+            text: None,
+        }
+    }
+
+    // Helper to create base response JSON object
+    fn create_base_response_json(response_id: &ResponseId, status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": response_id.to_string(),
+            "object": "response",
+            "created_at": chrono::Utc::now().timestamp(),
+            "status": status,
+            "error": null,
+            "incomplete_details": null,
+            "instructions": "You are a helpful assistant.",
+            "max_output_tokens": null,
+            "max_tool_calls": null,
+            "model": "gpt-4", // TODO: Get from request context
+            "output": [],
+            "parallel_tool_calls": true,
+            "previous_response_id": null,
+            "reasoning": {
+                "effort": null,
+                "summary": null
+            },
+            "store": true,
+            "temperature": 1.0,
+            "text": {
+                "format": {
+                    "type": "text"
+                }
+            },
+            "tool_choice": "auto",
+            "tools": [],
+            "top_p": 1.0,
+            "truncation": "disabled",
+            "usage": {
+                "input_tokens": 0,
+                "input_tokens_details": {
+                    "cached_tokens": 0
+                },
+                "output_tokens": 0,
+                "output_tokens_details": {
+                    "reasoning_tokens": 0
+                },
+                "total_tokens": 0
+            },
+            "user": null,
+            "metadata": {}
+        })
     }
 }

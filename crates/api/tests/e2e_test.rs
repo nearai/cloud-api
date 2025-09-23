@@ -167,11 +167,13 @@ async fn test_responses_api() {
     println!("Conversation: {:?}", conversation);
 
     let message = "Hello, how are you?".to_string();
+    let max_tokens = 10;
     let response = create_response(
         &server,
         conversation.id.clone(),
         models.data[0].id.clone(),
         message.clone(),
+        max_tokens,
     )
     .await;
     println!("Response: {:?}", response);
@@ -183,7 +185,7 @@ async fn test_responses_api() {
                 content.iter().any(|c| {
                     if let ResponseOutputContent::OutputText { text, .. } = c {
                         println!("Text: {}", text);
-                        text.len() > 0
+                        text.len() > max_tokens as usize
                     } else {
                         false
                     }
@@ -247,6 +249,7 @@ async fn create_response(
     conversation_id: String,
     model: String,
     message: String,
+    max_tokens: u32,
 ) -> api::models::ResponseObject {
     let response = server
         .post("/v1/responses")
@@ -257,13 +260,101 @@ async fn create_response(
             },
             "input": message,
             "temperature": 0.7,
-            "max_output_tokens": 10,
+            "max_output_tokens": max_tokens,
             "stream": false,
             "model": model
         }))
         .await;
     assert_eq!(response.status_code(), 200);
     response.json::<api::models::ResponseObject>()
+}
+
+async fn create_response_stream(
+    server: &axum_test::TestServer,
+    conversation_id: String,
+    model: String,
+    message: String,
+    max_tokens: u32,
+) -> (String, api::models::ResponseObject) {
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&serde_json::json!({
+            "conversation": {
+                "id": conversation_id,
+            },
+            "input": message,
+            "temperature": 0.7,
+            "max_output_tokens": max_tokens,
+            "stream": true,
+            "model": model
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    // For streaming responses, we get SSE events as text
+    let response_text = response.text();
+
+    let mut content = String::new();
+    let mut final_response: Option<api::models::ResponseObject> = None;
+
+    // Parse SSE format: "event: <type>\ndata: <json>\n\n"
+    for line_chunk in response_text.split("\n\n") {
+        if line_chunk.trim().is_empty() {
+            continue;
+        }
+
+        let mut event_type = "";
+        let mut event_data = "";
+
+        for line in line_chunk.lines() {
+            if let Some(event_name) = line.strip_prefix("event: ") {
+                event_type = event_name;
+            } else if let Some(data) = line.strip_prefix("data: ") {
+                event_data = data;
+            }
+        }
+
+        if !event_data.is_empty() {
+            if let Ok(event_json) = serde_json::from_str::<serde_json::Value>(event_data) {
+                match event_type {
+                    "response.output_text.delta" => {
+                        // Accumulate content deltas as they arrive
+                        if let Some(delta) = event_json.get("delta").and_then(|v| v.as_str()) {
+                            content.push_str(delta);
+                            println!("Delta: {}", delta);
+                        }
+                    }
+                    "response.completed" => {
+                        // Extract final response from completed event
+                        if let Some(response_obj) = event_json.get("response") {
+                            final_response = Some(
+                                serde_json::from_value::<api::models::ResponseObject>(
+                                    response_obj.clone(),
+                                )
+                                .expect("Failed to parse response.completed event"),
+                            );
+                            println!("Stream completed");
+                        }
+                    }
+                    "response.created" => {
+                        println!("Response created");
+                    }
+                    "response.in_progress" => {
+                        println!("Response in progress");
+                    }
+                    _ => {
+                        println!("Event: {}", event_type);
+                    }
+                }
+            }
+        }
+    }
+
+    let final_resp =
+        final_response.expect("Expected to receive response.completed event from stream");
+    (content, final_resp)
 }
 
 #[tokio::test]
@@ -299,4 +390,102 @@ async fn test_conversations_api() {
         }))
         .await;
     assert_eq!(create_response.status_code(), 201);
+}
+
+#[tokio::test]
+async fn test_streaming_responses_api() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock user in database for foreign key constraints
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database, auth_components, domain_services);
+
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Get available models
+    let response = server
+        .get("/v1/models")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    let models = response.json::<api::models::ModelsResponse>();
+    assert!(!models.data.is_empty());
+
+    // Create a conversation
+    let conversation = create_conversation(&server).await;
+    println!("Conversation: {:?}", conversation);
+
+    // Test streaming response
+    let message = "Hello, how are you?".to_string();
+    let (streamed_content, streaming_response) = create_response_stream(
+        &server,
+        conversation.id.clone(),
+        models.data[0].id.clone(),
+        message.clone(),
+        50,
+    )
+    .await;
+
+    println!("Streamed Content: {}", streamed_content);
+    println!("Final Response: {:?}", streaming_response);
+
+    // Verify we got content from the stream
+    assert!(
+        !streamed_content.is_empty(),
+        "Expected non-empty streamed content"
+    );
+
+    // Verify the final response has content
+    assert_eq!(
+        streaming_response.output.iter().any(|o| {
+            if let ResponseOutputItem::Message { content, .. } = o {
+                content.iter().any(|c| {
+                    if let ResponseOutputContent::OutputText { text, .. } = c {
+                        println!("Final Response Text: {}", text);
+                        !text.is_empty()
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                false
+            }
+        }),
+        true
+    );
+
+    // Verify streamed content matches final response content
+    let final_text = streaming_response
+        .output
+        .iter()
+        .filter_map(|o| {
+            if let ResponseOutputItem::Message { content, .. } = o {
+                content.iter().find_map(|c| {
+                    if let ResponseOutputContent::OutputText { text, .. } = c {
+                        Some(text.clone())
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            }
+        })
+        .next()
+        .unwrap_or_default();
+
+    assert_eq!(
+        streamed_content, final_text,
+        "Streamed content should match final response text"
+    );
 }

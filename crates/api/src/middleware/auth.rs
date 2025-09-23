@@ -5,10 +5,7 @@ use axum::{
     response::Response,
 };
 use database::User as DbUser;
-use services::{
-    auth::{AuthError, AuthService, OAuthManager},
-    organization::OrganizationId,
-};
+use services::auth::{AuthError, AuthService, OAuthManager};
 use std::sync::Arc;
 use tracing::{debug, error};
 use uuid::Uuid;

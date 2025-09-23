@@ -1,10 +1,10 @@
-use crate::models::{ApiKey, ApiKeyResponse};
+use crate::models::ApiKey;
 use crate::pool::DbPool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use services::{
-    auth::ports::{AccountType, CreateApiKeyRequest},
+    auth::ports::CreateApiKeyRequest,
     organization::ports::OrganizationId,
 };
 use sha2::{Digest, Sha256};

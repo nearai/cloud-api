@@ -1,5 +1,4 @@
 use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime};
-use std::env;
 use tokio_postgres::NoTls;
 use tracing::info;
 

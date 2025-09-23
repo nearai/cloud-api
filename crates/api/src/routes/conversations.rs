@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::Deserialize;
 use services::conversations::ports::ConversationRequest;
-use services::{ConversationError, ConversationId, UserId};
+use services::{ConversationError, ConversationId};
 use std::sync::Arc;
 use tracing::{debug, info};
 use uuid::Uuid;

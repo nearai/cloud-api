@@ -355,6 +355,7 @@ pub async fn list_input_items(
 
 // Helper functions
 
+#[allow(dead_code)]
 fn convert_domain_response_to_http_with_request(
     domain_response: services::Response,
     request: &CreateResponseRequest,
@@ -434,6 +435,7 @@ fn convert_domain_response_to_http_with_request(
 }
 
 // Simple conversion function for endpoints that don't have request context
+#[allow(dead_code)]
 fn convert_domain_response_to_http_simple(domain_response: services::Response) -> ResponseObject {
     let status = match domain_response.status {
         DomainResponseStatus::InProgress => ResponseStatus::InProgress,

@@ -70,6 +70,24 @@ fn user_uuid_to_user_id(uuid: Uuid) -> UserId {
 }
 
 /// Create a new response
+///
+/// Creates a new response for a conversation.
+#[utoipa::path(
+    post,
+    path = "/responses",
+    tag = "Responses",
+    request_body = CreateResponseRequest,
+    responses(
+        (status = 200, description = "Response created successfully", body = ResponseObject),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn create_response(
     State(service): State<Arc<ResponseService>>,
     Extension(user): Extension<AuthenticatedUser>,

@@ -20,12 +20,13 @@ pub async fn auth_middleware(
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    tracing::debug!("Auth middleware");
     // Try to extract authentication from various sources
     let auth_header = request
         .headers()
         .get("authorization")
         .and_then(|h| h.to_str().ok());
+
+    tracing::debug!("Auth middleware: {:?}", auth_header);
 
     let auth_result = if let Some(auth_value) = auth_header {
         debug!("Found Authorization header: {}", auth_value);

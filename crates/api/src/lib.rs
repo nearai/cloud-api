@@ -1,10 +1,12 @@
 pub mod conversions;
 pub mod middleware;
 pub mod models;
+pub mod openapi;
 pub mod routes;
 
 use crate::{
     middleware::{auth_middleware, AuthState},
+    openapi::ApiDoc,
     routes::{
         api::{build_management_router, AppState},
         auth::{
@@ -17,6 +19,7 @@ use crate::{
 };
 use axum::{
     middleware::from_fn_with_state,
+    response::Html,
     routing::{get, post},
     Router,
 };
@@ -29,6 +32,7 @@ use inference_providers::{InferenceProvider, VLlmConfig, VLlmProvider};
 use services::auth::{AuthService, AuthServiceTrait, MockAuthService, OAuthManager};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
+use utoipa::OpenApi;
 
 /// Service initialization components
 pub struct AuthComponents {
@@ -216,6 +220,16 @@ pub fn build_app(
     auth_components: AuthComponents,
     domain_services: DomainServices,
 ) -> Router {
+    build_app_with_config(database, auth_components, domain_services, None)
+}
+
+/// Build the complete application router with config
+pub fn build_app_with_config(
+    database: Arc<Database>,
+    auth_components: AuthComponents,
+    domain_services: DomainServices,
+    _config: Option<&ApiConfig>,
+) -> Router {
     // Create organization service using the database's organization repository
     let organization_repo = Arc::new(database::PgOrganizationRepository::new(
         database.pool().clone(),
@@ -258,16 +272,21 @@ pub fn build_app(
     let management_routes =
         build_management_router(app_state, auth_components.auth_state_middleware);
 
+    // Build OpenAPI and documentation routes
+    let openapi_routes = build_openapi_routes();
+
     // Combine all routes under /v1
-    Router::new().nest(
-        "/v1",
-        Router::new()
-            .nest("/auth", auth_routes)
-            .merge(completion_routes)
-            .merge(response_routes)
-            .merge(conversation_routes)
-            .merge(management_routes),
-    )
+    Router::new()
+        .nest(
+            "/v1",
+            Router::new()
+                .nest("/auth", auth_routes)
+                .merge(completion_routes)
+                .merge(response_routes)
+                .merge(conversation_routes)
+                .merge(management_routes),
+        )
+        .merge(openapi_routes)
 }
 
 /// Build authentication routes
@@ -368,9 +387,183 @@ pub fn build_conversation_routes(
         ))
 }
 
+/// Build OpenAPI documentation routes  
+pub fn build_openapi_routes() -> Router {
+    Router::new().route("/docs", get(swagger_ui_handler)).route(
+        "/api-docs/openapi.json",
+        get(|| async { axum::Json(ApiDoc::openapi()) }),
+    )
+}
+
+/// Serve Swagger UI HTML page
+async fn swagger_ui_handler() -> Html<String> {
+    Html(format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Platform API Documentation</title>
+    <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui.css" />
+    <style>
+        html {{
+            box-sizing: border-box;
+            overflow: -moz-scrollbars-vertical;
+            overflow-y: scroll;
+        }}
+        *, *:before, *:after {{
+            box-sizing: inherit;
+        }}
+        body {{
+            margin:0;
+            background: #fafafa;
+        }}
+    </style>
+</head>
+<body>
+    <div id="swagger-ui"></div>
+    <script src="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui-bundle.js"></script>
+    <script src="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui-standalone-preset.js"></script>
+    <script>
+    window.onload = function() {{
+        // Dynamically determine the server URL based on current location
+        const protocol = window.location.protocol;
+        const host = window.location.host;
+        const baseUrl = `${{protocol}}//${{host}}/v1`;
+        
+        // Fetch the OpenAPI spec and modify it to include the dynamic server
+        fetch('/api-docs/openapi.json')
+            .then(response => response.json())
+            .then(spec => {{
+                // Add the current server to the spec
+                spec.servers = [{{ 
+                    url: baseUrl,
+                    description: 'Current Server'
+                }}];
+                
+                SwaggerUIBundle({{
+                    spec: spec,
+                    dom_id: '#swagger-ui',
+                    deepLinking: true,
+                    presets: [
+                        SwaggerUIBundle.presets.apis,
+                        SwaggerUIStandalonePreset
+                    ],
+                    plugins: [
+                        SwaggerUIBundle.plugins.DownloadUrl
+                    ],
+                    layout: "StandaloneLayout",
+                    // Make authorization more prominent
+                    persistAuthorization: true,
+                    // Show auth section by default
+                    docExpansion: 'list',
+                    // Configure request interceptor for debugging
+                    requestInterceptor: function(req) {{
+                        console.log('Swagger UI Request:', req);
+                        return req;
+                    }}
+                }});
+            }})
+            .catch(error => {{
+                console.error('Failed to load OpenAPI spec:', error);
+                // Fallback to URL-based loading if fetch fails
+                SwaggerUIBundle({{
+                    url: '/api-docs/openapi.json',
+                    dom_id: '#swagger-ui',
+                    deepLinking: true,
+                    presets: [
+                        SwaggerUIBundle.presets.apis,
+                        SwaggerUIStandalonePreset
+                    ],
+                    plugins: [
+                        SwaggerUIBundle.plugins.DownloadUrl
+                    ],
+                    layout: "StandaloneLayout",
+                    // Make authorization more prominent
+                    persistAuthorization: true,
+                    // Show auth section by default
+                    docExpansion: 'list',
+                    // Configure request interceptor for debugging
+                    requestInterceptor: function(req) {{
+                        console.log('Swagger UI Request:', req);
+                        return req;
+                    }}
+                }});
+            }});
+    }};
+    </script>
+</body>
+</html>"#
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openapi::ApiDoc;
+
+    #[test]
+    fn test_openapi_spec_generation() {
+        // Test that we can generate the OpenAPI spec without errors
+        let spec = ApiDoc::openapi();
+
+        // Basic validation
+        assert_eq!(spec.info.title, "Platform API");
+        assert_eq!(spec.info.version, "1.0.0");
+
+        // Ensure we have components defined
+        assert!(spec.components.is_some());
+        let components = spec.components.as_ref().unwrap();
+
+        // Check that some of our schemas are present
+        assert!(components.schemas.contains_key("ChatCompletionRequest"));
+        assert!(components.schemas.contains_key("ChatCompletionResponse"));
+        assert!(components.schemas.contains_key("Message"));
+        assert!(components.schemas.contains_key("ModelsResponse"));
+        assert!(components.schemas.contains_key("ErrorResponse"));
+
+        // Check that security schemes are configured
+        assert!(components.security_schemes.contains_key("bearer"));
+        assert!(components.security_schemes.contains_key("api_key"));
+
+        // Verify servers are not hardcoded (will be set dynamically on client)
+        assert!(spec.servers.is_none() || spec.servers.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_swagger_ui_html_contains_required_elements() {
+        // Test that the Swagger UI HTML contains the necessary elements
+        use axum::response::Html;
+
+        // Get the HTML response
+        let html = tokio_test::block_on(swagger_ui_handler());
+        let Html(html_content) = html;
+
+        // Verify essential Swagger UI elements are present
+        assert!(
+            html_content.contains("swagger-ui"),
+            "HTML should contain swagger-ui div"
+        );
+        assert!(
+            html_content.contains("swagger-ui-bundle.js"),
+            "HTML should include Swagger UI bundle"
+        );
+        assert!(
+            html_content.contains("swagger-ui-standalone-preset.js"),
+            "HTML should include standalone preset"
+        );
+        assert!(
+            html_content.contains("/api-docs/openapi.json"),
+            "HTML should reference our OpenAPI spec URL"
+        );
+        assert!(
+            html_content.contains("Platform API Documentation"),
+            "HTML should have the correct title"
+        );
+        assert!(
+            html_content.contains("SwaggerUIBundle"),
+            "HTML should initialize SwaggerUIBundle"
+        );
+    }
 
     /// Example of how to set up the application for E2E testing
     #[tokio::test]

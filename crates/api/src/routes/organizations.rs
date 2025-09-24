@@ -1,6 +1,6 @@
 use crate::models::{
-    ApiKeyResponse, CreateApiKeyRequest, CreateOrganizationRequest, OrganizationResponse,
-    UpdateOrganizationRequest,
+    ApiKeyResponse, CreateApiKeyRequest, CreateOrganizationRequest, ErrorResponse,
+    OrganizationResponse, UpdateOrganizationRequest,
 };
 use crate::{middleware::AuthenticatedUser, routes::api::AppState};
 use axum::{
@@ -13,9 +13,26 @@ use services::{
     organization::{OrganizationError, OrganizationId},
 };
 use tracing::{debug, error};
+use utoipa;
 use uuid::Uuid;
 
-/// List all organizations for the authenticated user
+/// List organizations
+///
+/// Lists all organizations accessible to the authenticated user.
+#[utoipa::path(
+    get,
+    path = "/organizations",
+    tag = "Organizations",
+    responses(
+        (status = 200, description = "List of organizations", body = Vec<OrganizationResponse>),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn list_organizations(
     State(_app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -42,6 +59,25 @@ fn default_limit() -> i64 {
 }
 
 /// Create a new organization
+///
+/// Creates a new organization with the authenticated user as owner.
+#[utoipa::path(
+    post,
+    path = "/organizations",
+    tag = "Organizations",
+    request_body = CreateOrganizationRequest,
+    responses(
+        (status = 200, description = "Organization created successfully", body = OrganizationResponse),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 409, description = "Organization already exists", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn create_organization(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -80,6 +116,27 @@ pub async fn create_organization(
 }
 
 /// Get organization by ID
+///
+/// Returns organization details for a specific organization ID.
+#[utoipa::path(
+    get,
+    path = "/organizations/{org_id}",
+    tag = "Organizations",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID")
+    ),
+    responses(
+        (status = 200, description = "Organization details", body = OrganizationResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn get_organization(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -120,6 +177,29 @@ pub async fn get_organization(
 }
 
 /// Update organization
+///
+/// Updates organization details for a specific organization ID.
+#[utoipa::path(
+    put,
+    path = "/organizations/{org_id}",
+    tag = "Organizations",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID")
+    ),
+    request_body = UpdateOrganizationRequest,
+    responses(
+        (status = 200, description = "Updated organization", body = OrganizationResponse),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn update_organization(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -157,6 +237,27 @@ pub async fn update_organization(
 }
 
 /// Delete organization (owner only)
+///
+/// Deletes an organization. Only the organization owner can perform this action.
+#[utoipa::path(
+    delete,
+    path = "/organizations/{org_id}",
+    tag = "Organizations",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID")
+    ),
+    responses(
+        (status = 200, description = "Organization deleted successfully"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn delete_organization(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -193,6 +294,29 @@ pub async fn delete_organization(
 }
 
 /// Create API key for organization
+///
+/// Creates a new API key for an organization.
+#[utoipa::path(
+    post,
+    path = "/organizations/{org_id}/api-keys",
+    tag = "Organizations",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID")
+    ),
+    request_body = CreateApiKeyRequest,
+    responses(
+        (status = 201, description = "API key created successfully", body = ApiKeyResponse),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn create_organization_api_key(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -232,6 +356,26 @@ pub async fn create_organization_api_key(
 }
 
 /// List API keys for organization
+///
+/// Returns a list of all API keys for an organization.
+#[utoipa::path(
+    get,
+    path = "/organizations/{org_id}/api-keys",
+    tag = "Organizations",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID")
+    ),
+    responses(
+        (status = 200, description = "List of organization API keys", body = Vec<ApiKeyResponse>),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn list_organization_api_keys(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,

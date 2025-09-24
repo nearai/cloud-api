@@ -18,6 +18,7 @@ use services::completions::ports::{
 };
 use std::convert::Infallible;
 use tracing::debug;
+use utoipa;
 use uuid::Uuid;
 
 // Convert HTTP ChatCompletionRequest to service CompletionRequest
@@ -66,6 +67,25 @@ fn convert_text_request_to_service(
     }
 }
 
+/// Create a chat completion
+///
+/// Creates a completion for a given chat conversation.
+#[utoipa::path(
+    post,
+    path = "/chat/completions",
+    tag = "Chat",
+    request_body = ChatCompletionRequest,
+    responses(
+        (status = 200, description = "Successful completion", body = ChatCompletionResponse),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn chat_completions(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -324,6 +344,25 @@ pub async fn chat_completions(
     }
 }
 
+/// Create a text completion
+///
+/// Creates a completion for a given text prompt.
+#[utoipa::path(
+    post,
+    path = "/completions",
+    tag = "Chat",
+    request_body = CompletionRequest,
+    responses(
+        (status = 200, description = "Successful completion", body = ChatCompletionResponse),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn completions(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -579,6 +618,23 @@ pub async fn completions(
     }
 }
 
+/// List available models
+///
+/// Lists all available AI models that can be used for completions.
+#[utoipa::path(
+    get,
+    path = "/models",
+    tag = "Models",
+    responses(
+        (status = 200, description = "List of available models", body = ModelsResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn models(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -610,6 +666,23 @@ pub async fn models(
     Ok(ResponseJson(response))
 }
 
+/// Get TDX quote
+///
+/// Returns a TDX quote for testing purposes.
+#[utoipa::path(
+    get,
+    path = "/quote", 
+    tag = "Chat",
+    responses(
+        (status = 200, description = "TDX quote", body = QuoteResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 501, description = "Not implemented", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn quote(
     State(_app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,

@@ -1,4 +1,4 @@
-use api::{build_app, init_auth_services, init_database, init_domain_services};
+use api::{build_app_with_config, init_auth_services, init_database, init_domain_services};
 use config::{ApiConfig, LoggingConfig};
 
 #[tokio::main]
@@ -13,8 +13,8 @@ async fn main() {
     let auth_components = init_auth_services(database.clone(), &config);
     let domain_services = init_domain_services(database.clone(), &config).await;
 
-    // Build application router
-    let app = build_app(database, auth_components, domain_services);
+    // Build application router with config
+    let app = build_app_with_config(database, auth_components, domain_services, Some(&config));
 
     // Start server
     start_server(app, &config).await;

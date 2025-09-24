@@ -35,6 +35,24 @@ fn map_conversation_error_to_status(error: &ConversationError) -> StatusCode {
 }
 
 /// Create a new conversation
+///
+/// Creates a new conversation for the authenticated user.
+#[utoipa::path(
+    post,
+    path = "/conversations",
+    tag = "Conversations",
+    request_body = CreateConversationRequest,
+    responses(
+        (status = 201, description = "Conversation created successfully", body = ConversationObject),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn create_conversation(
     State(service): State<Arc<services::ConversationService>>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -76,6 +94,27 @@ pub async fn create_conversation(
 }
 
 /// Get a conversation by ID
+///
+/// Returns details for a specific conversation.
+#[utoipa::path(
+    get,
+    path = "/conversations/{conversation_id}",
+    tag = "Conversations",
+    params(
+        ("conversation_id" = String, Path, description = "Conversation ID")
+    ),
+    responses(
+        (status = 200, description = "Conversation details", body = ConversationObject),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Conversation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn get_conversation(
     Path(conversation_id): Path<String>,
     State(service): State<Arc<services::ConversationService>>,
@@ -121,6 +160,28 @@ pub async fn get_conversation(
 }
 
 /// Update a conversation
+///
+/// Updates a conversation's metadata.
+#[utoipa::path(
+    post,
+    path = "/conversations/{conversation_id}",
+    tag = "Conversations",
+    params(
+        ("conversation_id" = String, Path, description = "Conversation ID")
+    ),
+    request_body = UpdateConversationRequest,
+    responses(
+        (status = 200, description = "Conversation updated successfully", body = ConversationObject),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Conversation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn update_conversation(
     Path(conversation_id): Path<String>,
     State(service): State<Arc<services::ConversationService>>,
@@ -172,6 +233,27 @@ pub async fn update_conversation(
 }
 
 /// Delete a conversation
+///
+/// Deletes a conversation permanently.
+#[utoipa::path(
+    delete,
+    path = "/conversations/{conversation_id}",
+    tag = "Conversations",
+    params(
+        ("conversation_id" = String, Path, description = "Conversation ID")
+    ),
+    responses(
+        (status = 200, description = "Conversation deleted successfully", body = ConversationDeleteResult),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Conversation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn delete_conversation(
     Path(conversation_id): Path<String>,
     State(service): State<Arc<services::ConversationService>>,
@@ -224,6 +306,26 @@ pub async fn delete_conversation(
 }
 
 /// List conversations
+///
+/// Returns a list of conversations for the authenticated user.
+#[utoipa::path(
+    get,
+    path = "/conversations",
+    tag = "Conversations",
+    params(
+        ("limit" = Option<i32>, Query, description = "Maximum number of conversations to return"),
+        ("offset" = Option<i32>, Query, description = "Number of conversations to skip")
+    ),
+    responses(
+        (status = 200, description = "List of conversations", body = ConversationList),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn list_conversations(
     Query(params): Query<ListConversationsQuery>,
     State(service): State<Arc<services::ConversationService>>,
@@ -276,6 +378,29 @@ pub async fn list_conversations(
 }
 
 /// List items in a conversation (extracts from responses)
+///
+/// Returns items (messages, responses, etc.) within a specific conversation.
+#[utoipa::path(
+    get,
+    path = "/conversations/{conversation_id}/items",
+    tag = "Conversations",
+    params(
+        ("conversation_id" = String, Path, description = "Conversation ID"),
+        ("limit" = Option<i32>, Query, description = "Maximum number of items to return"),
+        ("offset" = Option<i32>, Query, description = "Number of items to skip")
+    ),
+    responses(
+        (status = 200, description = "List of conversation items", body = ConversationItemList),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Conversation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn list_conversation_items(
     Path(conversation_id): Path<String>,
     Query(params): Query<ListItemsQuery>,

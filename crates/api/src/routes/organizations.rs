@@ -34,15 +34,32 @@ use uuid::Uuid;
     )
 )]
 pub async fn list_organizations(
-    State(_app_state): State<AppState>,
+    State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
-    Query(_params): Query<ListParams>,
+    Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<OrganizationResponse>>, StatusCode> {
     debug!("Listing organizations for user: {}", user.0.id);
 
-    // For now, return empty list until we implement the service method
-    // TODO: Implement proper organization listing in service layer
-    Ok(Json(vec![]))
+    let user_id = crate::conversions::authenticated_user_to_user_id(user);
+
+    match app_state
+        .organization_service
+        .list_organizations_for_user(user_id, params.limit, params.offset)
+        .await
+    {
+        Ok(organizations) => {
+            debug!("Found {} organizations for user", organizations.len());
+            let response: Vec<OrganizationResponse> = organizations
+                .into_iter()
+                .map(crate::conversions::services_org_to_api_org)
+                .collect();
+            Ok(Json(response))
+        }
+        Err(e) => {
+            error!("Failed to list organizations for user: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// Query parameters for listing

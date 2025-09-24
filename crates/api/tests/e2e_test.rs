@@ -91,7 +91,7 @@ async fn assert_mock_user_in_db(database: &Arc<Database>) {
     let _ = client.execute(
         "INSERT INTO users (id, email, username, display_name, avatar_url, auth_provider, provider_user_id, created_at, updated_at) 
          VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-         ON CONFLICT (id) DO NOTHING",
+         ON CONFLICT DO NOTHING",
         &[
             &uuid::Uuid::parse_str(MOCK_USER_ID).unwrap(),
             &"test@example.com",

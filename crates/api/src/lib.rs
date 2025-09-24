@@ -50,23 +50,41 @@ pub struct DomainServices {
     pub mcp_manager: Arc<services::mcp::McpClientManager>,
 }
 
-/// Initialize database connection
+/// Initialize database connection and run migrations
 pub async fn init_database() -> Arc<Database> {
     let db_config = config::DatabaseConfig::default();
-    Arc::new(
+    let database = Arc::new(
         Database::from_config(&db_config)
             .await
             .expect("Failed to connect to database"),
-    )
+    );
+
+    // Run database migrations
+    tracing::info!("Starting database migrations...");
+    database
+        .run_migrations()
+        .await
+        .expect("Failed to run database migrations");
+    tracing::info!("Database migrations completed.");
+
+    database
 }
 
 /// Initialize database with custom config for testing
 pub async fn init_database_with_config(db_config: &config::DatabaseConfig) -> Arc<Database> {
-    Arc::new(
+    let database = Arc::new(
         Database::from_config(db_config)
             .await
             .expect("Failed to connect to database"),
-    )
+    );
+
+    // Run database migrations
+    database
+        .run_migrations()
+        .await
+        .expect("Failed to run database migrations");
+
+    database
 }
 
 /// Initialize authentication services and middleware

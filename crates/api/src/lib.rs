@@ -397,26 +397,25 @@ pub fn build_openapi_routes() -> Router {
 
 /// Serve Swagger UI HTML page
 async fn swagger_ui_handler() -> Html<String> {
-    Html(format!(
-        r#"<!DOCTYPE html>
+    Html(r#"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <title>Platform API Documentation</title>
     <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui.css" />
     <style>
-        html {{
+        html {
             box-sizing: border-box;
             overflow: -moz-scrollbars-vertical;
             overflow-y: scroll;
-        }}
-        *, *:before, *:after {{
+        }
+        *, *:before, *:after {
             box-sizing: inherit;
-        }}
-        body {{
+        }
+        body {
             margin:0;
             background: #fafafa;
-        }}
+        }
     </style>
 </head>
 <body>
@@ -424,23 +423,23 @@ async fn swagger_ui_handler() -> Html<String> {
     <script src="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui-bundle.js"></script>
     <script src="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui-standalone-preset.js"></script>
     <script>
-    window.onload = function() {{
+    window.onload = function() {
         // Dynamically determine the server URL based on current location
         const protocol = window.location.protocol;
         const host = window.location.host;
-        const baseUrl = `${{protocol}}//${{host}}/v1`;
+        const baseUrl = `${protocol}//${host}/v1`;
         
         // Fetch the OpenAPI spec and modify it to include the dynamic server
         fetch('/api-docs/openapi.json')
             .then(response => response.json())
-            .then(spec => {{
+            .then(spec => {
                 // Add the current server to the spec
-                spec.servers = [{{ 
+                spec.servers = [{ 
                     url: baseUrl,
                     description: 'Current Server'
-                }}];
+                }];
                 
-                SwaggerUIBundle({{
+                SwaggerUIBundle({
                     spec: spec,
                     dom_id: '#swagger-ui',
                     deepLinking: true,
@@ -457,16 +456,16 @@ async fn swagger_ui_handler() -> Html<String> {
                     // Show auth section by default
                     docExpansion: 'list',
                     // Configure request interceptor for debugging
-                    requestInterceptor: function(req) {{
+                    requestInterceptor: function(req) {
                         console.log('Swagger UI Request:', req);
                         return req;
-                    }}
-                }});
-            }})
-            .catch(error => {{
+                    }
+                });
+            })
+            .catch(error => {
                 console.error('Failed to load OpenAPI spec:', error);
                 // Fallback to URL-based loading if fetch fails
-                SwaggerUIBundle({{
+                SwaggerUIBundle({
                     url: '/api-docs/openapi.json',
                     dom_id: '#swagger-ui',
                     deepLinking: true,
@@ -483,17 +482,16 @@ async fn swagger_ui_handler() -> Html<String> {
                     // Show auth section by default
                     docExpansion: 'list',
                     // Configure request interceptor for debugging
-                    requestInterceptor: function(req) {{
+                    requestInterceptor: function(req) {
                         console.log('Swagger UI Request:', req);
                         return req;
-                    }}
-                }});
-            }});
-    }};
+                    }
+                });
+            });
+    };
     </script>
 </body>
-</html>"#
-    ))
+</html>"#.to_string())
 }
 
 #[cfg(test)]

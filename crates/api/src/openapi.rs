@@ -1,6 +1,6 @@
 use crate::models::*;
-use utoipa::{OpenApi, Modify};
-use utoipa::openapi::security::{SecurityScheme, ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder};
+use utoipa::openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::{Modify, OpenApi};
 
 /// OpenAPI documentation configuration
 #[derive(OpenApi)]
@@ -23,7 +23,6 @@ use utoipa::openapi::security::{SecurityScheme, ApiKey, ApiKeyValue, HttpAuthSch
         crate::routes::completions::completions,
         crate::routes::completions::models,
         crate::routes::completions::quote,
-        
         // Organization endpoints  
         crate::routes::organizations::list_organizations,
         crate::routes::organizations::create_organization,
@@ -32,7 +31,6 @@ use utoipa::openapi::security::{SecurityScheme, ApiKey, ApiKeyValue, HttpAuthSch
         crate::routes::organizations::delete_organization,
         crate::routes::organizations::create_organization_api_key,
         crate::routes::organizations::list_organization_api_keys,
-        
         // Conversation endpoints
         crate::routes::conversations::create_conversation,
         crate::routes::conversations::get_conversation,
@@ -40,25 +38,21 @@ use utoipa::openapi::security::{SecurityScheme, ApiKey, ApiKeyValue, HttpAuthSch
         crate::routes::conversations::delete_conversation,
         crate::routes::conversations::list_conversations,
         crate::routes::conversations::list_conversation_items,
-        
         // Response endpoints
         crate::routes::responses::create_response,
     ),
     components(
         schemas(
-            // Core API models  
+            // Core API models
             ChatCompletionRequest, ChatCompletionResponse, Message,
             CompletionRequest, QuoteResponse, GatewayQuote, ServiceAllowlistEntry, BuildInfo,
             ModelsResponse, ModelInfo, ErrorResponse,
-            
             // Organization models
             CreateOrganizationRequest, OrganizationResponse,
             UpdateOrganizationRequest, CreateApiKeyRequest, ApiKeyResponse,
-            
             // Conversation models
             CreateConversationRequest, ConversationObject, ConversationList,
             UpdateConversationRequest, ConversationDeleteResult, ConversationItemList,
-            
             // Response models
             CreateResponseRequest, ResponseObject,
         ),
@@ -81,16 +75,16 @@ impl Modify for SecurityAddon {
                     HttpBuilder::new()
                         .scheme(HttpAuthScheme::Bearer)
                         .bearer_format("JWT")
-                        .build()
-                )
+                        .build(),
+                ),
             );
-            // API Key authentication  
+            // API Key authentication
             components.add_security_scheme(
-                "api_key", 
-                SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("X-API-Key")))
+                "api_key",
+                SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("X-API-Key"))),
             );
         }
-        
+
         // Set global security requirement - endpoints need at least one of these
         openapi.security = Some(vec![
             // Allow Bearer token

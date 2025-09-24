@@ -122,22 +122,22 @@ impl OrganizationService {
         })
     }
 
-    /// List organizations owned by a user
-    pub async fn list_owned_organizations(
+    /// List organizations accessible to a user (where they are a member)
+    pub async fn list_organizations_for_user(
         &self,
-        _owner_id: UserId,
+        user_id: UserId,
+        limit: i64,
+        offset: i64,
     ) -> Result<Vec<Organization>, OrganizationError> {
-        // This method is not available in the repository trait
-        unimplemented!("list_owned_organizations not implemented in repository")
-    }
-
-    /// List organizations where user is a member
-    pub async fn list_member_organizations(
-        &self,
-        _user_id: UserId,
-    ) -> Result<Vec<Organization>, OrganizationError> {
-        // This method is not available in the repository trait
-        unimplemented!("list_member_organizations not implemented in repository")
+        self.repository
+            .list_organizations_by_user(user_id.0, limit, offset)
+            .await
+            .map_err(|e| {
+                OrganizationError::InternalError(format!(
+                    "Failed to list organizations for user: {}",
+                    e
+                ))
+            })
     }
 
     /// Add a member to an organization

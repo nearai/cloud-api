@@ -191,7 +191,6 @@ pub struct ApiKey {
     pub name: String,
     pub organization_id: OrganizationId,
     pub created_by_user_id: UserId,
-    pub account_type: AccountType,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
@@ -202,38 +201,8 @@ pub struct ApiKey {
 pub struct CreateApiKeyRequest {
     pub name: Option<String>,
     pub organization_id: OrganizationId,
-    pub account_type: AccountType,
     pub created_by_user_id: UserId,
     pub expires_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum AccountType {
-    User,
-    ServiceAccount,
-}
-
-impl std::fmt::Display for AccountType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                AccountType::User => "User",
-                AccountType::ServiceAccount => "ServiceAccount",
-            }
-        )
-    }
-}
-
-impl From<String> for AccountType {
-    fn from(s: String) -> Self {
-        match s.as_str() {
-            "User" => AccountType::User,
-            "ServiceAccount" => AccountType::ServiceAccount,
-            _ => panic!("Invalid account_type: {}", s),
-        }
-    }
 }
 
 #[async_trait]
@@ -282,7 +251,7 @@ pub trait AuthServiceTrait: Send + Sync {
     async fn cleanup_expired_sessions(&self) -> Result<usize, AuthError>;
 
     /// Validate an API key and return the associated user
-    async fn validate_api_key(&self, api_key: String) -> Result<User, AuthError>;
+    async fn validate_api_key(&self, api_key: String) -> Result<ApiKey, AuthError>;
 
     /// Create an API key for an organization with proper permission checking
     async fn create_organization_api_key(
@@ -370,7 +339,6 @@ impl MockAuthService {
             name: "Mock API Key".to_string(),
             organization_id,
             created_by_user_id: requester_id,
-            account_type: AccountType::User,
             created_at: chrono::Utc::now(),
             expires_at: None,
             last_used_at: None,
@@ -425,8 +393,10 @@ impl AuthServiceTrait for MockAuthService {
         Ok(0) // No sessions to clean up in mock
     }
 
-    async fn validate_api_key(&self, _api_key: String) -> Result<User, AuthError> {
-        Ok(Self::create_mock_user())
+    async fn validate_api_key(&self, _api_key: String) -> Result<ApiKey, AuthError> {
+        let mock_user = Self::create_mock_user();
+        let mock_org_id = crate::organization::OrganizationId(uuid::Uuid::new_v4());
+        Ok(self.create_mock_api_key(mock_org_id, mock_user.id))
     }
 
     async fn create_organization_api_key(

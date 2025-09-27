@@ -125,33 +125,12 @@ impl AuthServiceTrait for AuthService {
             .map_err(|e| AuthError::InternalError(format!("Failed to cleanup sessions: {}", e)))
     }
 
-    async fn validate_api_key(&self, api_key: String) -> Result<User, AuthError> {
-        // Validate the API key
-        let api_key_info = self
-            .api_key_repository
+    async fn validate_api_key(&self, api_key: String) -> Result<ApiKey, AuthError> {
+        self.api_key_repository
             .validate(api_key)
             .await
             .map_err(|e| AuthError::InternalError(format!("Failed to validate API key: {}", e)))?
-            .ok_or(AuthError::Unauthorized)?;
-
-        // Check if the organization is active
-        let organization = self
-            .organization_repository
-            .get_by_id(api_key_info.organization_id.0)
-            .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to get organization: {}", e)))?
-            .ok_or(AuthError::Unauthorized)?;
-
-        if !organization.is_active {
-            return Err(AuthError::Unauthorized);
-        }
-
-        // Get the user who created the API key
-        self.user_repository
-            .get_by_id(api_key_info.created_by_user_id)
-            .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to get user: {}", e)))?
-            .ok_or(AuthError::UserNotFound)
+            .ok_or(AuthError::Unauthorized)
     }
 
     async fn create_organization_api_key(

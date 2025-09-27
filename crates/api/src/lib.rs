@@ -5,7 +5,7 @@ pub mod openapi;
 pub mod routes;
 
 use crate::{
-    middleware::{auth_middleware, AuthState},
+    middleware::{auth::auth_middleware_with_api_key, auth_middleware, AuthState},
     openapi::ApiDoc,
     routes::{
         api::{build_management_router, AppState},
@@ -365,7 +365,7 @@ pub fn build_completion_routes(app_state: AppState, auth_state_middleware: &Auth
         .with_state(app_state)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
-            auth_middleware,
+            auth_middleware_with_api_key,
         ))
 }
 

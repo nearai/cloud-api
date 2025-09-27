@@ -2,32 +2,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-/// Account type for API keys
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum AccountType {
-    User,
-    ServiceAccount,
-}
-
-impl From<services::auth::AccountType> for AccountType {
-    fn from(account_type: services::auth::AccountType) -> Self {
-        match account_type {
-            services::auth::AccountType::User => AccountType::User,
-            services::auth::AccountType::ServiceAccount => AccountType::ServiceAccount,
-        }
-    }
-}
-
-impl From<AccountType> for services::auth::AccountType {
-    fn from(account_type: AccountType) -> Self {
-        match account_type {
-            AccountType::User => services::auth::AccountType::User,
-            AccountType::ServiceAccount => services::auth::AccountType::ServiceAccount,
-        }
-    }
-}
-
 // Streaming response models
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StreamChunkResponse {
@@ -865,7 +839,6 @@ impl CreateConversationRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateApiKeyRequest {
     pub name: Option<String>,
-    pub account_type: AccountType,
     pub expires_at: Option<DateTime<Utc>>,
 }
 
@@ -954,7 +927,6 @@ pub struct ApiKeyResponse {
     pub key_prefix: String,
     pub organization_id: String,
     pub created_by_user_id: String,
-    pub account_type: AccountType,
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,

@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use services::auth::AccountType;
 use uuid::Uuid;
 
 /// Organization model - top level entity
@@ -75,7 +74,6 @@ pub struct ApiKey {
     pub name: String,
     pub organization_id: Uuid,
     pub created_by_user_id: Uuid,
-    pub account_type: AccountType,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,

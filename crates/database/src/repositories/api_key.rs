@@ -50,7 +50,7 @@ impl ApiKeyRepository {
                 r#"
                 INSERT INTO api_keys (
                     id, key_hash, name, organization_id, created_by_user_id,
-                    account_type, created_at, expires_at, last_used_at, is_active
+                    created_at, expires_at, last_used_at, is_active
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true)
                 RETURNING *
@@ -61,7 +61,6 @@ impl ApiKeyRepository {
                     &name,
                     &request.organization_id.0,
                     &request.created_by_user_id.0,
-                    &request.account_type.to_string(),
                     &now,
                     &request.expires_at,
                 ],
@@ -82,7 +81,6 @@ impl ApiKeyRepository {
             expires_at: request.expires_at,
             last_used_at: None,
             is_active: true,
-            account_type: request.account_type,
             created_by_user_id: request.created_by_user_id.0,
             organization_id: request.organization_id.0,
         })
@@ -112,7 +110,7 @@ impl ApiKeyRepository {
                 r#"
                 INSERT INTO api_keys (
                     id, key_hash, name, organization_id, created_by_user_id,
-                    account_type, created_at, expires_at, last_used_at, is_active
+                    created_at, expires_at, last_used_at, is_active
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true)
                 RETURNING *
@@ -123,7 +121,6 @@ impl ApiKeyRepository {
                     &name,
                     &request.organization_id.0,
                     &request.created_by_user_id.0,
-                    &request.account_type.to_string(),
                     &now,
                     &request.expires_at,
                 ],
@@ -326,7 +323,6 @@ impl ApiKeyRepository {
             expires_at: row.get("expires_at"),
             last_used_at: row.get("last_used_at"),
             is_active: row.get("is_active"),
-            account_type: row.get::<_, String>("account_type").into(),
         })
     }
 }
@@ -338,7 +334,6 @@ fn db_apikey_to_service_apikey(db_api_key: ApiKey) -> services::auth::ApiKey {
         name: db_api_key.name,
         organization_id: OrganizationId(db_api_key.organization_id),
         created_by_user_id: services::auth::UserId(db_api_key.created_by_user_id),
-        account_type: db_api_key.account_type,
         created_at: db_api_key.created_at,
         expires_at: db_api_key.expires_at,
         last_used_at: db_api_key.last_used_at,

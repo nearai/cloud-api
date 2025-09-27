@@ -344,7 +344,6 @@ pub fn api_key_req_to_services(
 ) -> services::auth::CreateApiKeyRequest {
     services::auth::CreateApiKeyRequest {
         name: req.name,
-        account_type: req.account_type.into(),
         expires_at: req.expires_at,
         organization_id,
         created_by_user_id,
@@ -361,7 +360,6 @@ pub fn services_api_key_to_api_response(
         key_prefix: format!("{}...", &api_key.name[..4.min(api_key.name.len())]), // Create key prefix from name
         organization_id: api_key.organization_id.0.to_string(),
         created_by_user_id: api_key.created_by_user_id.0.to_string(),
-        account_type: api_key.account_type.into(),
         created_at: api_key.created_at,
         last_used_at: api_key.last_used_at,
         expires_at: api_key.expires_at,

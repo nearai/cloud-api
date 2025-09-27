@@ -14,6 +14,43 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct AuthenticatedUser(pub DbUser);
 
+pub async fn auth_middleware_with_api_key(
+    State(state): State<AuthState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|h| h.to_str().ok());
+
+    tracing::debug!("Auth API KEY middleware: {:?}", auth_header);
+
+    let auth_result = if let Some(auth_value) = auth_header {
+        debug!("Found Authorization header: {}", auth_value);
+        if let Some(token) = auth_value.strip_prefix("Bearer ") {
+            debug!("Extracted Bearer token: {}", token);
+            authenticate_api_key(&state, token).await
+        } else {
+            debug!("Authorization header does not start with 'Bearer '");
+            Err(StatusCode::UNAUTHORIZED)
+        }
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    };
+
+    match auth_result {
+        Ok(api_key) => {
+            // Clone request to add extension
+            debug!("Adding API key to request: {:?}", api_key);
+            let mut request = request;
+            request.extensions_mut().insert(api_key);
+            Ok(next.run(request).await)
+        }
+        Err(status) => Err(status),
+    }
+}
+
 /// Authentication middleware that validates session tokens or API keys
 pub async fn auth_middleware(
     State(state): State<AuthState>,
@@ -32,51 +69,18 @@ pub async fn auth_middleware(
         debug!("Found Authorization header: {}", auth_value);
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
             debug!("Extracted Bearer token: {}", token);
-            // Check if it's an API key (starts with "sk_")
-            if token.starts_with("sk_") {
-                debug!("Token looks like API key");
-                authenticate_api_key(&state, token).await
-            } else {
-                debug!("Token looks like session token, parsing as UUID");
-                match Uuid::parse_str(token) {
-                    Ok(uuid) => {
-                        debug!("Successfully parsed UUID: {}", uuid);
-                        authenticate_session(&state, uuid).await
-                    }
-                    Err(e) => {
-                        debug!("Failed to parse token as UUID: {}", e);
-                        Err(StatusCode::UNAUTHORIZED)
-                    }
+            match Uuid::parse_str(token) {
+                Ok(uuid) => {
+                    debug!("Successfully parsed UUID: {}", uuid);
+                    authenticate_session(&state, uuid).await
+                }
+                Err(e) => {
+                    debug!("Failed to parse token as UUID: {}", e);
+                    Err(StatusCode::UNAUTHORIZED)
                 }
             }
         } else {
             debug!("Authorization header does not start with 'Bearer '");
-            Err(StatusCode::UNAUTHORIZED)
-        }
-    } else if let Some(cookie_str) = request
-        .headers()
-        .get("cookie")
-        .and_then(|h| h.to_str().ok())
-    {
-        // Parse cookies manually
-        let session_id = cookie_str
-            .split(';')
-            .filter_map(|c| {
-                let parts: Vec<&str> = c.trim().splitn(2, '=').collect();
-                if parts.len() == 2 && parts[0] == "session_id" {
-                    Some(parts[1])
-                } else {
-                    None
-                }
-            })
-            .next();
-
-        if let Some(sid) = session_id {
-            match Uuid::parse_str(sid) {
-                Ok(uuid) => authenticate_session(&state, uuid).await,
-                Err(_) => Err(StatusCode::UNAUTHORIZED),
-            }
-        } else {
             Err(StatusCode::UNAUTHORIZED)
         }
     } else {
@@ -123,13 +127,16 @@ async fn authenticate_session(state: &AuthState, token: Uuid) -> Result<DbUser, 
 }
 
 /// Authenticate using API key
-async fn authenticate_api_key(state: &AuthState, api_key: &str) -> Result<DbUser, StatusCode> {
+async fn authenticate_api_key(
+    state: &AuthState,
+    api_key: &str,
+) -> Result<services::auth::ApiKey, StatusCode> {
     let auth_service = &state.auth_service;
 
     match auth_service.validate_api_key(api_key.to_string()).await {
-        Ok(user) => {
-            debug!("Authenticated via API key for user: {}", user.email);
-            Ok(convert_user_to_db_user(user))
+        Ok(api_key) => {
+            debug!("Authenticated via API key: {:?}", api_key);
+            Ok(api_key)
         }
         Err(AuthError::Unauthorized) => {
             debug!("Invalid or expired API key");

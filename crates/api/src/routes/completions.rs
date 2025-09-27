@@ -83,16 +83,15 @@ fn convert_text_request_to_service(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
         ("api_key" = [])
     )
 )]
 pub async fn chat_completions(
     State(app_state): State<AppState>,
-    Extension(user): Extension<AuthenticatedUser>,
+    Extension(api_key): Extension<services::auth::ApiKey>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
-    debug!("Chat completions request from user: {}", user.0.id);
+    debug!("Chat completions request from api key: {:?}", api_key);
     debug!(
         "Request model: {}, stream: {:?}, messages: {}",
         request.model,
@@ -112,7 +111,7 @@ pub async fn chat_completions(
     }
 
     // Convert HTTP request to service parameters
-    let service_request = convert_chat_request_to_service(&request, user.0.id);
+    let service_request = convert_chat_request_to_service(&request, api_key.created_by_user_id.0);
 
     // Call the completion service - it only supports streaming
     match app_state

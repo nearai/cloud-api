@@ -13,6 +13,7 @@ use axum::{
     },
 };
 use futures::stream::StreamExt;
+use inference_providers::{FinishReason, StreamChunk};
 use services::completions::ports::{
     CompletionMessage, CompletionRequest as ServiceCompletionRequest,
 };
@@ -122,117 +123,20 @@ pub async fn chat_completions(
         Ok(stream) => {
             // Check if streaming is requested
             if request.stream == Some(true) {
-                // Handle streaming response - convert CompletionStreamEvent to SSE
-                let model = request.model.clone();
-                let id = format!("chatcmpl-{}", generate_completion_id());
-                let created = current_unix_timestamp();
-
-                // Convert CompletionStreamEvent to SSE events
                 let sse_stream = stream
-                    .map(move |event| {
-                        // Convert CompletionStreamEvent to OpenAI-compatible SSE format
-                        match event.event_name.as_str() {
-                            "completion.delta" => {
-                                // Extract delta from event data
-                                if let Some(delta_text) =
-                                    event.data.get("delta").and_then(|d| d.as_str())
-                                {
-                                    let sse_chunk = StreamChunkResponse {
-                                        id: id.clone(),
-                                        object: "chat.completion.chunk".to_string(),
-                                        created,
-                                        model: model.clone(),
-                                        choices: vec![StreamChoice {
-                                            index: 0,
-                                            delta: Delta {
-                                                role: None,
-                                                content: Some(delta_text.to_string()),
-                                            },
-                                            finish_reason: None,
-                                        }],
-                                        usage: None,
-                                    };
-
-                                    let json =
-                                        serde_json::to_string(&sse_chunk).unwrap_or_default();
-                                    Some(Ok::<_, Infallible>(Event::default().data(json)))
-                                } else {
-                                    None
-                                }
-                            }
-                            "completion.completed" => {
-                                // Final chunk with usage information
-                                if let Some(usage_data) = event.data.get("usage") {
-                                    let usage = if let Ok(usage_obj) =
-                                        serde_json::from_value::<serde_json::Value>(
-                                            usage_data.clone(),
-                                        ) {
-                                        Some(Usage {
-                                            input_tokens: usage_obj
-                                                .get("prompt_tokens")
-                                                .and_then(|v| v.as_u64())
-                                                .unwrap_or(0)
-                                                as u32,
-                                            input_tokens_details: Some(InputTokensDetails {
-                                                cached_tokens: 0,
-                                            }),
-                                            output_tokens: usage_obj
-                                                .get("completion_tokens")
-                                                .and_then(|v| v.as_u64())
-                                                .unwrap_or(0)
-                                                as u32,
-                                            output_tokens_details: Some(OutputTokensDetails {
-                                                reasoning_tokens: 0,
-                                            }),
-                                            total_tokens: usage_obj
-                                                .get("total_tokens")
-                                                .and_then(|v| v.as_u64())
-                                                .unwrap_or(0)
-                                                as u32,
-                                        })
-                                    } else {
-                                        None
-                                    };
-
-                                    let sse_chunk = StreamChunkResponse {
-                                        id: id.clone(),
-                                        object: "chat.completion.chunk".to_string(),
-                                        created,
-                                        model: model.clone(),
-                                        choices: vec![StreamChoice {
-                                            index: 0,
-                                            delta: Delta {
-                                                role: None,
-                                                content: None,
-                                            },
-                                            finish_reason: Some("stop".to_string()),
-                                        }],
-                                        usage,
-                                    };
-
-                                    let json =
-                                        serde_json::to_string(&sse_chunk).unwrap_or_default();
-                                    Some(Ok::<_, Infallible>(Event::default().data(json)))
-                                } else {
-                                    None
-                                }
-                            }
-                            "completion.error" => {
-                                // Log error and skip
-                                if let Some(error_msg) =
-                                    event.data.get("error").and_then(|e| e.as_str())
-                                {
-                                    tracing::error!("Completion stream error: {}", error_msg);
-                                }
-                                None
-                            }
-                            _ => {
-                                // Skip other event types (started, progress, etc.)
-                                None
-                            }
+                    .map(|chunk| match chunk {
+                        Ok(chunk) => Ok::<_, Infallible>(
+                            Event::default()
+                                .data(serde_json::to_string(&chunk).unwrap_or_default()),
+                        ),
+                        Err(e) => {
+                            tracing::error!("Completion stream error: {}", e);
+                            Ok::<_, Infallible>(
+                                Event::default()
+                                    .data(serde_json::to_string(&e).unwrap_or_default()),
+                            )
                         }
                     })
-                    .filter_map(|result| async move { result })
                     .chain(futures::stream::once(async move {
                         Ok::<_, Infallible>(Event::default().data("[DONE]"))
                     }));
@@ -250,64 +154,47 @@ pub async fn chat_completions(
                 let mut content = String::new();
                 let mut usage: Option<Usage> = None;
 
-                // Collect all events from the stream
-                let mut stream = Box::pin(stream);
-                while let Some(event) = stream.next().await {
-                    match event.event_name.as_str() {
-                        "completion.delta" => {
-                            if let Some(delta_text) =
-                                event.data.get("delta").and_then(|d| d.as_str())
-                            {
-                                content.push_str(delta_text);
-                            }
-                        }
-                        "completion.completed" => {
-                            if let Some(usage_data) = event.data.get("usage") {
-                                if let Ok(usage_obj) =
-                                    serde_json::from_value::<serde_json::Value>(usage_data.clone())
-                                {
-                                    usage = Some(Usage {
-                                        input_tokens: usage_obj
-                                            .get("prompt_tokens")
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(0)
-                                            as u32,
-                                        input_tokens_details: Some(InputTokensDetails {
-                                            cached_tokens: 0,
-                                        }),
-                                        output_tokens: usage_obj
-                                            .get("completion_tokens")
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(0)
-                                            as u32,
-                                        output_tokens_details: Some(OutputTokensDetails {
-                                            reasoning_tokens: 0,
-                                        }),
-                                        total_tokens: usage_obj
-                                            .get("total_tokens")
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(0)
-                                            as u32,
-                                    });
+                // Pin the stream for iteration
+                let mut stream_pin = stream;
+                while let Some(chunk_result) = stream_pin.next().await {
+                    match chunk_result {
+                        Ok(StreamChunk::Chat(chunk)) => {
+                            // Extract content from delta
+                            if let Some(choice) = chunk.choices.first() {
+                                if let Some(delta) = &choice.delta {
+                                    if let Some(delta_content) = &delta.content {
+                                        content.push_str(delta_content);
+                                    }
                                 }
                             }
-                        }
-                        "completion.error" => {
-                            if let Some(error_msg) =
-                                event.data.get("error").and_then(|e| e.as_str())
-                            {
-                                return (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    ResponseJson(ErrorResponse::new(
-                                        error_msg.to_string(),
-                                        "completion_error".to_string(),
-                                    )),
-                                )
-                                    .into_response();
+
+                            // Extract usage from final chunk
+                            if let Some(chunk_usage) = chunk.usage {
+                                usage = Some(Usage {
+                                    input_tokens: chunk_usage.prompt_tokens,
+                                    input_tokens_details: Some(InputTokensDetails {
+                                        cached_tokens: 0,
+                                    }),
+                                    output_tokens: chunk_usage.completion_tokens,
+                                    output_tokens_details: Some(OutputTokensDetails {
+                                        reasoning_tokens: 0,
+                                    }),
+                                    total_tokens: chunk_usage.total_tokens,
+                                });
                             }
                         }
-                        _ => {
-                            // Skip other events
+                        Ok(StreamChunk::Text(_)) => {
+                            // Handle text completion if needed
+                        }
+                        Err(e) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                ResponseJson(ErrorResponse::new(
+                                    e.to_string(),
+                                    "completion_error".to_string(),
+                                )),
+                            )
+                                .into_response();
                         }
                     }
                 }
@@ -399,112 +286,56 @@ pub async fn completions(
         Ok(stream) => {
             // Check if streaming is requested
             if request.stream == Some(true) {
-                // Handle streaming response - convert CompletionStreamEvent to SSE
-                let model = request.model.clone();
-                let id = format!("cmpl-{}", generate_completion_id());
-                let created = current_unix_timestamp();
-
-                // Convert CompletionStreamEvent to SSE events (same logic as chat completions)
+                // Convert raw StreamChunk to SSE events
                 let sse_stream = stream
-                    .map(move |event| {
-                        // Convert CompletionStreamEvent to OpenAI-compatible SSE format for text completion
-                        match event.event_name.as_str() {
-                            "completion.delta" => {
-                                // Extract delta from event data
-                                if let Some(delta_text) =
-                                    event.data.get("delta").and_then(|d| d.as_str())
-                                {
-                                    let sse_chunk = StreamChunkResponse {
-                                        id: id.clone(),
+                    .map(move |chunk_result| {
+                        match chunk_result {
+                            Ok(StreamChunk::Text(chunk)) => {
+                                // Convert to OpenAI-compatible SSE format
+                                if let Some(choice) = chunk.choices.first() {
+                                    let response = StreamChunkResponse {
+                                        id: format!("cmpl-{}", generate_completion_id()),
                                         object: "text_completion".to_string(),
-                                        created,
-                                        model: model.clone(),
+                                        created: current_unix_timestamp(),
+                                        model: request.model.clone(),
                                         choices: vec![StreamChoice {
                                             index: 0,
                                             delta: Delta {
                                                 role: None,
-                                                content: Some(delta_text.to_string()),
+                                                content: Some(choice.text.clone()),
                                             },
-                                            finish_reason: None,
+                                            finish_reason: choice.finish_reason.as_ref().map(|f| {
+                                                match f {
+                                                    FinishReason::Stop => "stop".to_string(),
+                                                    FinishReason::Length => "length".to_string(),
+                                                    FinishReason::ContentFilter => {
+                                                        "content_filter".to_string()
+                                                    }
+                                                }
+                                            }),
                                         }],
                                         usage: None,
                                     };
 
-                                    let json =
-                                        serde_json::to_string(&sse_chunk).unwrap_or_default();
-                                    Some(Ok::<_, Infallible>(Event::default().data(json)))
+                                    match serde_json::to_string(&response) {
+                                        Ok(json) => {
+                                            Some(Ok::<_, Infallible>(Event::default().data(json)))
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("JSON serialization error: {}", e);
+                                            None
+                                        }
+                                    }
                                 } else {
                                     None
                                 }
                             }
-                            "completion.completed" => {
-                                // Final chunk with usage information
-                                if let Some(usage_data) = event.data.get("usage") {
-                                    let usage = if let Ok(usage_obj) =
-                                        serde_json::from_value::<serde_json::Value>(
-                                            usage_data.clone(),
-                                        ) {
-                                        Some(Usage {
-                                            input_tokens: usage_obj
-                                                .get("prompt_tokens")
-                                                .and_then(|v| v.as_u64())
-                                                .unwrap_or(0)
-                                                as u32,
-                                            input_tokens_details: Some(InputTokensDetails {
-                                                cached_tokens: 0,
-                                            }),
-                                            output_tokens: usage_obj
-                                                .get("completion_tokens")
-                                                .and_then(|v| v.as_u64())
-                                                .unwrap_or(0)
-                                                as u32,
-                                            output_tokens_details: Some(OutputTokensDetails {
-                                                reasoning_tokens: 0,
-                                            }),
-                                            total_tokens: usage_obj
-                                                .get("total_tokens")
-                                                .and_then(|v| v.as_u64())
-                                                .unwrap_or(0)
-                                                as u32,
-                                        })
-                                    } else {
-                                        None
-                                    };
-
-                                    let sse_chunk = StreamChunkResponse {
-                                        id: id.clone(),
-                                        object: "text_completion".to_string(),
-                                        created,
-                                        model: model.clone(),
-                                        choices: vec![StreamChoice {
-                                            index: 0,
-                                            delta: Delta {
-                                                role: None,
-                                                content: None,
-                                            },
-                                            finish_reason: Some("stop".to_string()),
-                                        }],
-                                        usage,
-                                    };
-
-                                    let json =
-                                        serde_json::to_string(&sse_chunk).unwrap_or_default();
-                                    Some(Ok::<_, Infallible>(Event::default().data(json)))
-                                } else {
-                                    None
-                                }
-                            }
-                            "completion.error" => {
-                                // Log error and skip
-                                if let Some(error_msg) =
-                                    event.data.get("error").and_then(|e| e.as_str())
-                                {
-                                    tracing::error!("Completion stream error: {}", error_msg);
-                                }
+                            Ok(StreamChunk::Chat(_)) => {
+                                tracing::warn!("Received chat chunk in text completion endpoint");
                                 None
                             }
-                            _ => {
-                                // Skip other event types (started, progress, etc.)
+                            Err(e) => {
+                                tracing::error!("Completion stream error: {}", e);
                                 None
                             }
                         }
@@ -527,64 +358,46 @@ pub async fn completions(
                 let mut content = String::new();
                 let mut usage: Option<Usage> = None;
 
-                // Collect all events from the stream
-                let mut stream = Box::pin(stream);
-                while let Some(event) = stream.next().await {
-                    match event.event_name.as_str() {
-                        "completion.delta" => {
-                            if let Some(delta_text) =
-                                event.data.get("delta").and_then(|d| d.as_str())
-                            {
-                                content.push_str(delta_text);
-                            }
-                        }
-                        "completion.completed" => {
-                            if let Some(usage_data) = event.data.get("usage") {
-                                if let Ok(usage_obj) =
-                                    serde_json::from_value::<serde_json::Value>(usage_data.clone())
-                                {
-                                    usage = Some(Usage {
-                                        input_tokens: usage_obj
-                                            .get("prompt_tokens")
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(0)
-                                            as u32,
-                                        input_tokens_details: Some(InputTokensDetails {
-                                            cached_tokens: 0,
-                                        }),
-                                        output_tokens: usage_obj
-                                            .get("completion_tokens")
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(0)
-                                            as u32,
-                                        output_tokens_details: Some(OutputTokensDetails {
-                                            reasoning_tokens: 0,
-                                        }),
-                                        total_tokens: usage_obj
-                                            .get("total_tokens")
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(0)
-                                            as u32,
-                                    });
+                let mut stream_pin = stream;
+                while let Some(chunk_result) = stream_pin.next().await {
+                    match chunk_result {
+                        Ok(StreamChunk::Chat(chunk)) => {
+                            // Extract content from delta
+                            if let Some(choice) = chunk.choices.first() {
+                                if let Some(delta) = &choice.delta {
+                                    if let Some(delta_content) = &delta.content {
+                                        content.push_str(delta_content);
+                                    }
                                 }
                             }
-                        }
-                        "completion.error" => {
-                            if let Some(error_msg) =
-                                event.data.get("error").and_then(|e| e.as_str())
-                            {
-                                return (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    ResponseJson(ErrorResponse::new(
-                                        error_msg.to_string(),
-                                        "completion_error".to_string(),
-                                    )),
-                                )
-                                    .into_response();
+
+                            // Extract usage from final chunk
+                            if let Some(chunk_usage) = chunk.usage {
+                                usage = Some(Usage {
+                                    input_tokens: chunk_usage.prompt_tokens,
+                                    input_tokens_details: Some(InputTokensDetails {
+                                        cached_tokens: 0,
+                                    }),
+                                    output_tokens: chunk_usage.completion_tokens,
+                                    output_tokens_details: Some(OutputTokensDetails {
+                                        reasoning_tokens: 0,
+                                    }),
+                                    total_tokens: chunk_usage.total_tokens,
+                                });
                             }
                         }
-                        _ => {
-                            // Skip other events
+                        Ok(StreamChunk::Text(_)) => {
+                            // Handle text completion if needed
+                        }
+                        Err(e) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                ResponseJson(ErrorResponse::new(
+                                    e.to_string(),
+                                    "completion_error".to_string(),
+                                )),
+                            )
+                                .into_response();
                         }
                     }
                 }

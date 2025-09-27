@@ -1,19 +1,68 @@
 pub mod ports;
 
+use crate::attestation::ports::AttestationService;
 use crate::inference_provider_pool::InferenceProviderPool;
-use futures::Stream;
-use inference_providers::{ChatMessage, InferenceProvider, MessageRole, StreamChunk};
-use std::{pin::Pin, sync::Arc};
-use uuid::Uuid;
+use inference_providers::{
+    ChatMessage, InferenceProvider, MessageRole, StreamChunk, StreamingResult,
+};
+use std::sync::Arc;
+
+// Create a new stream that intercepts messages, but passes the original ones through
+use futures_util::Stream;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+struct InterceptStream<S>
+where
+    S: Stream<Item = Result<StreamChunk, inference_providers::CompletionError>> + Unpin,
+{
+    inner: S,
+    attestation_service: Arc<dyn AttestationService>,
+}
+
+impl<S> Stream for InterceptStream<S>
+where
+    S: Stream<Item = Result<StreamChunk, inference_providers::CompletionError>> + Unpin,
+{
+    type Item = Result<StreamChunk, inference_providers::CompletionError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(ref chunk))) => {
+                tracing::debug!("Intercepted chunk: {:?}", chunk);
+
+                if let StreamChunk::Chat(ref chat_chunk) = chunk {
+                    if let Some(_usage) = &chat_chunk.usage {
+                        let attestation_service = self.attestation_service.clone();
+                        let chat_chunk_clone = chat_chunk.clone();
+                        tokio::spawn(async move {
+                            attestation_service
+                                .get_chat_signature(chat_chunk_clone.id.as_str())
+                                .await
+                                .unwrap();
+                        });
+                    }
+                }
+                Poll::Ready(Some(Ok(chunk.clone())))
+            }
+            other => other,
+        }
+    }
+}
 
 pub struct CompletionServiceImpl {
     pub inference_provider_pool: Arc<InferenceProviderPool>,
+    pub attestation_service: Arc<dyn AttestationService>,
 }
 
 impl CompletionServiceImpl {
-    pub fn new(inference_provider_pool: Arc<InferenceProviderPool>) -> Self {
+    pub fn new(
+        inference_provider_pool: Arc<InferenceProviderPool>,
+        attestation_service: Arc<dyn AttestationService>,
+    ) -> Self {
         Self {
             inference_provider_pool,
+            attestation_service,
         }
     }
 
@@ -36,153 +85,12 @@ impl CompletionServiceImpl {
             .collect()
     }
 
-    /// Create the completion stream events from LLM stream
-    fn create_event_stream(
-        llm_stream: Pin<
-            Box<
-                dyn Stream<Item = Result<StreamChunk, inference_providers::models::CompletionError>>
-                    + Send,
-            >,
-        >,
-        completion_id: CompletionId,
-    ) -> impl Stream<Item = ports::CompletionStreamEvent> + Send {
-        use futures::stream::{self, StreamExt};
-
-        // State to track accumulated content
-        let accumulated_content = Arc::new(std::sync::Mutex::new(String::new()));
-
-        // Initial events
-        let initial_events = stream::iter(vec![
-            Self::create_start_event(&completion_id),
-            Self::create_progress_event(&completion_id),
-        ]);
-
-        // Transform LLM chunks to completion events
-        let content_stream = llm_stream.filter_map(move |chunk_result| {
-            let completion_id = completion_id.clone();
-            let accumulated_content = accumulated_content.clone();
-
-            async move {
-                match chunk_result {
-                    Ok(stream_chunk) => {
-                        match stream_chunk {
-                            StreamChunk::Chat(chunk) => {
-                                // Extract delta content
-                                if let Some(choice) = chunk.choices.first() {
-                                    if let Some(delta) = &choice.delta {
-                                        if let Some(delta_content) = &delta.content {
-                                            if !delta_content.is_empty() {
-                                                // Accumulate content
-                                                if let Ok(mut acc) = accumulated_content.lock() {
-                                                    acc.push_str(delta_content);
-                                                }
-                                                return Some(Self::create_delta_event(
-                                                    &completion_id,
-                                                    delta_content,
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Check for usage (final chunk)
-                                if let Some(usage) = chunk.usage {
-                                    let final_content = accumulated_content
-                                        .lock()
-                                        .map(|acc| acc.clone())
-                                        .unwrap_or_default();
-
-                                    return Some(Self::create_completion_event(
-                                        &completion_id,
-                                        &final_content,
-                                        &usage,
-                                    ));
-                                }
-                            }
-                            StreamChunk::Text(_chunk) => {
-                                // Handle text completion if needed
-                                tracing::debug!("Received text chunk in chat completion stream");
-                            }
-                        }
-                        None
-                    }
-                    Err(e) => {
-                        let error_msg = format!("LLM stream error: {}", e);
-                        Some(Self::create_error_event(&completion_id, &error_msg))
-                    }
-                }
-            }
-        });
-
-        // Chain initial events with content stream
-        initial_events.chain(content_stream)
-    }
-
-    fn create_start_event(completion_id: &CompletionId) -> ports::CompletionStreamEvent {
-        ports::CompletionStreamEvent {
-            event_name: "completion.started".to_string(),
-            data: serde_json::json!({
-                "completion_id": completion_id,
-                "status": "started"
-            }),
-        }
-    }
-
-    fn create_progress_event(completion_id: &CompletionId) -> ports::CompletionStreamEvent {
-        ports::CompletionStreamEvent {
-            event_name: "completion.progress".to_string(),
-            data: serde_json::json!({
-                "completion_id": completion_id,
-                "status": "in_progress"
-            }),
-        }
-    }
-
-    fn create_delta_event(
-        completion_id: &CompletionId,
-        delta: &str,
-    ) -> ports::CompletionStreamEvent {
-        ports::CompletionStreamEvent {
-            event_name: "completion.delta".to_string(),
-            data: serde_json::json!({
-                "completion_id": completion_id,
-                "delta": delta
-            }),
-        }
-    }
-
-    fn create_completion_event(
-        completion_id: &CompletionId,
-        content: &str,
-        usage: &inference_providers::TokenUsage,
-    ) -> ports::CompletionStreamEvent {
-        ports::CompletionStreamEvent {
-            event_name: "completion.completed".to_string(),
-            data: serde_json::json!({
-                "completion_id": completion_id,
-                "status": "completed",
-                "content": content,
-                "usage": {
-                    "prompt_tokens": usage.prompt_tokens,
-                    "completion_tokens": usage.completion_tokens,
-                    "total_tokens": usage.total_tokens
-                }
-            }),
-        }
-    }
-
-    fn create_error_event(
-        completion_id: &CompletionId,
-        error: &str,
-    ) -> ports::CompletionStreamEvent {
-        ports::CompletionStreamEvent {
-            event_name: "completion.error".to_string(),
-            data: serde_json::json!({
-                "completion_id": completion_id,
-                "status": "failed",
-                "error": error
-            }),
-        }
+    async fn handle_stream(&self, llm_stream: StreamingResult) -> StreamingResult {
+        let intercepted_stream = InterceptStream {
+            inner: llm_stream,
+            attestation_service: self.attestation_service.clone(),
+        };
+        Box::pin(intercepted_stream)
     }
 }
 
@@ -191,17 +99,8 @@ impl ports::CompletionService for CompletionServiceImpl {
     async fn create_completion_stream(
         &self,
         request: ports::CompletionRequest,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = ports::CompletionStreamEvent> + Send>>,
-        ports::CompletionError,
-    > {
-        // Generate a completion ID
-        let completion_id = CompletionId::from(Uuid::new_v4());
-
-        // Convert messages to chat format for LLM
+    ) -> Result<StreamingResult, ports::CompletionError> {
         let chat_messages = Self::prepare_chat_messages(&request.messages);
-
-        tracing::info!("Starting streaming completion for {}", completion_id);
 
         let chat_params = inference_providers::ChatCompletionParams {
             model: request.model.clone(),
@@ -239,9 +138,9 @@ impl ports::CompletionService for CompletionServiceImpl {
             })?;
 
         // Create the completion event stream
-        let event_stream = Self::create_event_stream(llm_stream, completion_id);
+        let event_stream = self.handle_stream(llm_stream).await;
 
-        Ok(Box::pin(event_stream))
+        Ok(event_stream)
     }
 }
 

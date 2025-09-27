@@ -62,6 +62,15 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use futures_core::Stream;
 use models::*;
+use tokio_stream::StreamExt;
+
+// Re-export commonly used types for convenience
+pub use models::{
+    AttestationData, AttestationReport, AttestationReportParams, ChatCompletionParams, ChatDelta,
+    ChatMessage, ChatSignature, CompletionError, CompletionParams, FinishReason, MessageRole,
+    ModelInfo, NvidiaPayload, StreamChunk, StreamOptions, TokenUsage,
+};
+pub use vllm::{VLlmConfig, VLlmProvider};
 
 /// Type alias for streaming completion results
 ///
@@ -69,6 +78,21 @@ use models::*;
 /// - `Ok(StreamChunk)` - A successful chunk with partial content
 /// - `Err(CompletionError)` - An error that occurred during streaming
 pub type StreamingResult = Pin<Box<dyn Stream<Item = Result<StreamChunk, CompletionError>> + Send>>;
+
+/// Type alias for peekable streaming completion results
+pub type PeekableStreamingResult = tokio_stream::adapters::Peekable<StreamingResult>;
+
+/// Extension trait to add peekable functionality to StreamingResult
+pub trait StreamingResultExt {
+    /// Convert this streaming result into a peekable stream
+    fn peekable(self) -> PeekableStreamingResult;
+}
+
+impl StreamingResultExt for StreamingResult {
+    fn peekable(self) -> PeekableStreamingResult {
+        StreamExt::peekable(self)
+    }
+}
 
 #[async_trait]
 pub trait InferenceProvider {
@@ -96,11 +120,11 @@ pub trait InferenceProvider {
         &self,
         params: CompletionParams,
     ) -> Result<StreamingResult, CompletionError>;
-}
 
-// Re-export commonly used types for convenience
-pub use models::{
-    ChatCompletionParams, ChatDelta, ChatMessage, CompletionParams, FinishReason, MessageRole,
-    ModelInfo, StreamChunk, StreamOptions, TokenUsage,
-};
-pub use vllm::{VLlmConfig, VLlmProvider};
+    async fn get_signature(&self, chat_id: &str) -> Result<ChatSignature, CompletionError>;
+
+    async fn get_attestation_report(
+        &self,
+        signing_algo: Option<&str>,
+    ) -> Result<AttestationReport, CompletionError>;
+}

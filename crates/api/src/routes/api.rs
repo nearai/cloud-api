@@ -6,6 +6,7 @@ use axum::{
 };
 use database::Database;
 use services::{
+    attestation::ports::AttestationService,
     auth::AuthServiceTrait,
     completions::CompletionService,
     mcp::McpClientManager,
@@ -23,6 +24,7 @@ pub struct AppState {
     pub completion_service: Arc<dyn CompletionService>,
     pub models_service: Arc<dyn ModelsService>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
+    pub attestation_service: Arc<dyn AttestationService>,
 }
 
 // Import route handlers

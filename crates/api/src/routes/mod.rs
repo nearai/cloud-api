@@ -1,4 +1,5 @@
 pub mod api;
+pub mod attestation;
 pub mod auth;
 pub mod common;
 pub mod completions;

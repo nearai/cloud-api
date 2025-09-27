@@ -1,10 +1,8 @@
-use async_trait::async_trait;
-use futures::Stream;
-use serde::{Deserialize, Serialize};
-use std::pin::Pin;
-use uuid::Uuid;
-
 use crate::UserId;
+use async_trait::async_trait;
+use inference_providers::StreamingResult;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 // Domain types defined directly here (following dependency inversion)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,13 +74,6 @@ pub struct ModelCapabilities {
     pub embeddings: bool,
 }
 
-// Streaming event for completion API
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompletionStreamEvent {
-    pub event_name: String,
-    pub data: serde_json::Value,
-}
-
 // Port/Trait definitions (no implementations!)
 #[async_trait]
 pub trait CompletionService: Send + Sync {
@@ -90,5 +81,5 @@ pub trait CompletionService: Send + Sync {
     async fn create_completion_stream(
         &self,
         request: CompletionRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = CompletionStreamEvent> + Send>>, CompletionError>;
+    ) -> Result<StreamingResult, CompletionError>;
 }

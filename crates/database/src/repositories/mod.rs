@@ -1,4 +1,5 @@
 pub mod api_key;
+pub mod attestation;
 pub mod conversation;
 pub mod mcp_connector;
 pub mod organization;
@@ -7,6 +8,7 @@ pub mod session;
 pub mod user;
 
 pub use api_key::ApiKeyRepository;
+pub use attestation::PgAttestationRepository;
 pub use conversation::PgConversationRepository;
 pub use mcp_connector::McpConnectorRepository;
 pub use organization::PgOrganizationRepository;

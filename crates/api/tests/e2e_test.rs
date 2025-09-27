@@ -15,12 +15,12 @@
 use api::{
     build_app, init_auth_services, init_database_with_config, init_domain_services,
     models::{
-        ConversationContentPart, ConversationItem,
-        ResponseOutputContent, ResponseOutputItem,
+        ConversationContentPart, ConversationItem, ResponseOutputContent, ResponseOutputItem,
     },
 };
 use config::ApiConfig;
 use database::Database;
+use inference_providers::{models::ChatCompletionChunk, StreamChunk};
 use std::sync::Arc;
 use tracing::level_filters::LevelFilter;
 
@@ -178,53 +178,55 @@ async fn test_chat_completions_api() {
     let response_text = response.text();
 
     let mut content = String::new();
-    let mut final_response: Option<serde_json::Value> = None;
+    let mut final_response: Option<ChatCompletionChunk> = None;
 
-    // Parse SSE format: "event: <type>\ndata: <json>\n\n"
-    for line_chunk in response_text.split("\n\n") {
-        if line_chunk.trim().is_empty() {
-            continue;
-        }
+    // Parse standard OpenAI streaming format: "data: <json>"
+    for line in response_text.lines() {
+        println!("Line: {}", line);
 
-        let mut event_type = "";
-        let mut event_data = "";
-
-        for line in line_chunk.lines() {
-            if let Some(event_name) = line.strip_prefix("event: ") {
-                event_type = event_name;
-            } else if let Some(data) = line.strip_prefix("data: ") {
-                event_data = data;
+        if let Some(data) = line.strip_prefix("data: ") {
+            // Handle the [DONE] marker
+            if data.trim() == "[DONE]" {
+                println!("Stream completed with [DONE]");
+                break;
             }
-        }
 
-        if !event_data.is_empty() {
-            if let Ok(event_json) = serde_json::from_str::<serde_json::Value>(event_data) {
-                match event_type {
-                    "completion.chunk" => {
-                        // Accumulate content deltas for chat completions
-                        if let Some(choices) = event_json.get("choices").and_then(|v| v.as_array())
-                        {
-                            if let Some(choice) = choices.first() {
-                                if let Some(delta) = choice.get("delta") {
-                                    if let Some(delta_content) =
-                                        delta.get("content").and_then(|v| v.as_str())
-                                    {
-                                        content.push_str(delta_content);
-                                        println!("Delta: {}", delta_content);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    "completion.done" => {
-                        // Final completion event
-                        final_response = Some(event_json.clone());
-                        println!("Stream completed");
+            // Parse JSON data
+            if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
+                println!(
+                    "Parsed JSON: {}",
+                    serde_json::to_string_pretty(&chunk).unwrap_or_default()
+                );
+
+                let chat_chunk = match chunk {
+                    StreamChunk::Chat(chat_chunk) => {
+                        println!("Chat chunk: {:?}", chat_chunk);
+                        Some(chat_chunk)
                     }
                     _ => {
-                        println!("Event: {}", event_type);
+                        println!("Unknown chunk: {:?}", chunk);
+                        None
                     }
                 }
+                .unwrap();
+
+                // Extract content from choices[0].delta.content
+                if let Some(choice) = chat_chunk.choices.first() {
+                    if let Some(delta) = &choice.delta {
+                        if let Some(delta_content) = &delta.content {
+                            content.push_str(delta_content.as_str());
+                            println!("Delta content: '{}'", delta_content);
+                        }
+
+                        // Check if this is the final chunk (has usage or finish_reason)
+                        if choice.finish_reason.is_some() || chat_chunk.usage.is_some() {
+                            final_response = Some(chat_chunk.clone());
+                            println!("Final chunk detected");
+                        }
+                    }
+                }
+            } else {
+                println!("Failed to parse JSON: {}", data);
             }
         }
     }
@@ -234,13 +236,28 @@ async fn test_chat_completions_api() {
 
     println!("Streamed Content: {}", content);
 
+    // Verify we got a meaningful response
+    assert!(
+        content.len() > 10,
+        "Expected substantial content from stream, got: '{}'",
+        content
+    );
+
     // If we have a final response, verify its structure
     if let Some(final_resp) = final_response {
         println!("Final Response: {:?}", final_resp);
-        assert!(final_resp.get("choices").is_some());
-        if let Some(choices) = final_resp.get("choices").and_then(|v| v.as_array()) {
-            assert!(!choices.is_empty());
+        assert!(
+            !final_resp.choices.is_empty(),
+            "Final response should have choices"
+        );
+        if let Some(choice) = final_resp.choices.first() {
+            assert!(
+                choice.delta.is_some(),
+                "Final response choices should not be empty"
+            );
         }
+    } else {
+        println!("No final response detected - this is okay for some streaming implementations");
     }
 }
 

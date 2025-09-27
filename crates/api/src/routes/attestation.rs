@@ -95,12 +95,6 @@ impl From<inference_providers::AttestationReport> for Attestation {
     }
 }
 
-/// Get signature for a specific chat completion
-///
-/// # Example
-/// ```
-/// GET /v1/signature/chatcmpl-62a2fbf23537426999516e6941571050?model=gpt-oss-120b&signing_algo=ecdsa
-/// ```
 #[utoipa::path(
     get,
     path = "/v1/signature/{chat_id}",
@@ -119,7 +113,7 @@ impl From<inference_providers::AttestationReport> for Attestation {
 )]
 pub async fn get_signature(
     Path(chat_id): Path<String>,
-    Query(params): Query<SignatureQuery>,
+    Query(_params): Query<SignatureQuery>,
     State(app_state): State<AppState>,
 ) -> Result<Json<SignatureResponse>, (StatusCode, Json<serde_json::Value>)> {
     let signature = app_state
@@ -137,15 +131,9 @@ pub async fn get_signature(
     Ok(Json(signature))
 }
 
-/// Get attestation report for the signing keys
-///
-/// # Example
-/// ```
-/// GET /api/attestation/report?model=gpt-oss-120b
-/// ```
 #[utoipa::path(
     get,
-    path = "/api/attestation/report",
+    path = "/v1/attestation/report",
     params(
         AttestationQuery
     ),
@@ -178,19 +166,6 @@ pub async fn get_attestation_report(
     Ok(Json(response))
 }
 
-/// Verify attestation for a chat completion
-///
-/// This endpoint allows clients to verify the attestation of a chat completion
-/// by providing the chat ID and optionally the expected request hash.
-///
-/// # Example
-/// ```
-/// POST /v1/verify/{chat_id}
-/// Content-Type: application/json
-/// {
-///     "request_hash": "optional_request_hash_to_verify"
-/// }
-/// ```
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct VerifyRequest {
     pub request_hash: Option<String>,
@@ -220,9 +195,9 @@ pub struct VerifyResponse {
     )
 )]
 pub async fn verify_attestation(
-    Path(chat_id): Path<String>,
-    State(app_state): State<AppState>,
-    Json(req): Json<VerifyRequest>,
+    Path(_chat_id): Path<String>,
+    State(_app_state): State<AppState>,
+    Json(_req): Json<VerifyRequest>,
 ) -> Result<Json<VerifyResponse>, (StatusCode, Json<serde_json::Value>)> {
     unimplemented!()
 }

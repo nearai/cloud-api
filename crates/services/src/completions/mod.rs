@@ -29,8 +29,6 @@ where
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(ref chunk))) => {
-                tracing::debug!("Intercepted chunk: {:?}", chunk);
-
                 if let StreamChunk::Chat(ref chat_chunk) = chunk {
                     if let Some(_usage) = &chat_chunk.usage {
                         let attestation_service = self.attestation_service.clone();

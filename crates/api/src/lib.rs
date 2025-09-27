@@ -9,6 +9,7 @@ use crate::{
     openapi::ApiDoc,
     routes::{
         api::{build_management_router, AppState},
+        attestation::{get_attestation_report, get_signature, verify_attestation},
         auth::{
             auth_success, current_user, github_login, google_login, login_page, logout,
             oauth_callback, StateStore,
@@ -42,12 +43,15 @@ pub struct AuthComponents {
     pub auth_state_middleware: AuthState,
 }
 
+#[derive(Clone)]
 pub struct DomainServices {
     pub conversation_service: Arc<services::ConversationService>,
     pub response_service: Arc<services::ResponseService>,
     pub completion_service: Arc<services::CompletionServiceImpl>,
     pub models_service: Arc<services::models::ModelsServiceImpl>,
     pub mcp_manager: Arc<services::mcp::McpClientManager>,
+    pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+    pub attestation_service: Arc<services::attestation::AttestationService>,
 }
 
 /// Initialize database connection and run migrations
@@ -166,6 +170,9 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
         database.pool().clone(),
     ));
     let response_repo = Arc::new(database::PgResponseRepository::new(database.pool().clone()));
+    let attestation_repo = Arc::new(database::PgAttestationRepository::new(
+        database.pool().clone(),
+    ));
 
     // Create conversation service
     let conversation_service = Arc::new(services::ConversationService::new(
@@ -176,6 +183,12 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
     // Create inference provider pool
     let inference_provider_pool = init_inference_providers(config).await;
 
+    // Create attestation service
+    let attestation_service = Arc::new(services::attestation::AttestationService::new(
+        attestation_repo,
+        inference_provider_pool.clone(),
+    ));
+
     // Create models service
     let models_service = Arc::new(services::models::ModelsServiceImpl::new(
         inference_provider_pool.clone(),
@@ -184,12 +197,13 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
     // Create completion service
     let completion_service = Arc::new(services::CompletionServiceImpl::new(
         inference_provider_pool.clone(),
+        attestation_service.clone(),
     ));
 
     // Create response service
     let response_service = Arc::new(services::ResponseService::new(
         response_repo,
-        inference_provider_pool,
+        inference_provider_pool.clone(),
         conversation_service.clone(),
     ));
 
@@ -202,6 +216,8 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
         completion_service,
         models_service,
         mcp_manager,
+        inference_provider_pool,
+        attestation_service,
     }
 }
 
@@ -264,6 +280,7 @@ pub fn build_app_with_config(
         completion_service: domain_services.completion_service.clone(),
         models_service: domain_services.models_service.clone(),
         auth_service: auth_components.auth_service.clone(),
+        attestation_service: domain_services.attestation_service.clone(),
     };
 
     // Build individual route groups
@@ -287,13 +304,17 @@ pub fn build_app_with_config(
         &auth_components.auth_state_middleware,
     );
 
-    let management_routes =
-        build_management_router(app_state, auth_components.auth_state_middleware);
+    let management_routes = build_management_router(
+        app_state.clone(),
+        auth_components.auth_state_middleware.clone(),
+    );
+
+    let attestation_routes =
+        build_attestation_routes(app_state, &auth_components.auth_state_middleware);
 
     // Build OpenAPI and documentation routes
     let openapi_routes = build_openapi_routes();
 
-    // Combine all routes under /v1
     Router::new()
         .nest(
             "/v1",
@@ -302,7 +323,8 @@ pub fn build_app_with_config(
                 .merge(completion_routes)
                 .merge(response_routes)
                 .merge(conversation_routes)
-                .merge(management_routes),
+                .merge(management_routes)
+                .merge(attestation_routes.clone()),
         )
         .merge(openapi_routes)
 }
@@ -399,6 +421,21 @@ pub fn build_conversation_routes(
             get(conversations::list_conversation_items),
         )
         .with_state(conversation_service)
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            auth_middleware,
+        ))
+}
+
+/// Build attestation routes with auth
+pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
+    Router::new()
+        // v1 routes (signature endpoint)
+        .route("/signature/{chat_id}", get(get_signature))
+        .route("/verify/{chat_id}", post(verify_attestation))
+        // api routes (attestation report)
+        .route("/attestation/report", get(get_attestation_report))
+        .with_state(app_state)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware,

@@ -1,14 +1,17 @@
 use async_trait::async_trait;
 use inference_providers::{
-    models::{CompletionError, ListModelsError, ModelsResponse},
-    ChatCompletionParams, CompletionParams, InferenceProvider, StreamingResult,
+    models::{CompletionError, ListModelsError, ModelsResponse, StreamChunk},
+    AttestationReport, ChatCompletionParams, ChatSignature, CompletionParams, InferenceProvider,
+    StreamingResult, StreamingResultExt,
 };
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
+#[derive(Clone)]
 pub struct InferenceProviderPool {
     providers: Vec<Arc<dyn InferenceProvider + Send + Sync>>,
     model_mapping: Arc<RwLock<HashMap<String, Arc<dyn InferenceProvider + Send + Sync>>>>,
+    chat_id_mapping: Arc<RwLock<HashMap<String, Arc<dyn InferenceProvider + Send + Sync>>>>,
 }
 
 impl InferenceProviderPool {
@@ -16,6 +19,7 @@ impl InferenceProviderPool {
         Self {
             providers,
             model_mapping: Arc::new(RwLock::new(HashMap::new())),
+            chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -115,10 +119,73 @@ impl InferenceProviderPool {
             data: all_models,
         })
     }
+
+    /// Store a mapping of chat_id to provider
+    async fn store_chat_id_mapping(
+        &self,
+        chat_id: String,
+        provider: Arc<dyn InferenceProvider + Send + Sync>,
+    ) {
+        let mut mapping = self.chat_id_mapping.write().await;
+        mapping.insert(chat_id.clone(), provider);
+        tracing::debug!("Stored chat_id mapping: {}", chat_id);
+    }
+
+    /// Lookup provider by chat_id
+    pub async fn get_provider_by_chat_id(
+        &self,
+        chat_id: &str,
+    ) -> Option<Arc<dyn InferenceProvider + Send + Sync>> {
+        let mapping = self.chat_id_mapping.read().await;
+        mapping.get(chat_id).cloned()
+    }
 }
 
 #[async_trait]
 impl InferenceProvider for InferenceProviderPool {
+    async fn get_signature(&self, chat_id: &str) -> Result<ChatSignature, CompletionError> {
+        // First try to get the specific provider for this chat_id
+        if let Some(provider) = self.get_provider_by_chat_id(chat_id).await {
+            tracing::info!(
+                chat_id = %chat_id,
+                "Found mapped provider for chat_id, calling get_signature"
+            );
+            return provider.get_signature(chat_id).await;
+        }
+
+        // Fallback to trying all providers if chat_id mapping not found
+        tracing::warn!(
+            chat_id = %chat_id,
+            "No provider mapping found for chat_id, trying all providers"
+        );
+        for provider in &self.providers {
+            match provider.get_signature(chat_id).await {
+                Ok(signature) => return Ok(signature),
+                Err(_) => continue, // Try next provider
+            }
+        }
+        Err(CompletionError::CompletionError(format!(
+            "No provider found with signature for chat_id: {}",
+            chat_id
+        )))
+    }
+
+    async fn get_attestation_report(
+        &self,
+        signing_algo: Option<&str>,
+    ) -> Result<AttestationReport, CompletionError> {
+        // Delegate to the first provider that supports attestation reports
+        for provider in &self.providers {
+            match provider.get_attestation_report(signing_algo).await {
+                Ok(report) => return Ok(report),
+                Err(_) => continue, // Try next provider
+            }
+        }
+        Err(CompletionError::CompletionError(
+            "No provider found that supports attestation reports".to_string(),
+        ))
+    }
+
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
         self.discover_models().await
     }
@@ -153,15 +220,21 @@ impl InferenceProvider for InferenceProviderPool {
                     model_id = %model_id,
                     "Found provider for model, calling chat_completion_stream"
                 );
-
-                provider.chat_completion_stream(params).await.map_err(|e| {
-                    tracing::error!(
-                        model_id = %model_id,
-                        error = %e,
-                        "Provider failed to create chat completion stream"
-                    );
-                    e
-                })
+                let stream = provider.chat_completion_stream(params).await?;
+                let mut peekable = StreamingResultExt::peekable(stream);
+                if let Some(Ok(StreamChunk::Chat(chat_chunk))) = peekable.peek().await {
+                    let chat_id = chat_chunk.id.clone();
+                    let pool = self.clone();
+                    let provider = provider.clone();
+                    tokio::spawn(async move {
+                        tracing::info!(
+                            chat_id = %chat_id,
+                            "Storing chat_id mapping"
+                        );
+                        pool.store_chat_id_mapping(chat_id, provider).await;
+                    });
+                }
+                Ok(Box::pin(peekable))
             }
             None => {
                 tracing::error!(

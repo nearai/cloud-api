@@ -15,7 +15,8 @@
 use api::{
     build_app, init_auth_services, init_database_with_config, init_domain_services,
     models::{
-        ConversationContentPart, ConversationItem, ResponseOutputContent, ResponseOutputItem,
+        ConversationContentPart, ConversationItem,
+        ResponseOutputContent, ResponseOutputItem,
     },
 };
 use config::ApiConfig;
@@ -133,6 +134,114 @@ async fn test_models_api() {
     assert_eq!(response.status_code(), 200);
     let models = response.json::<api::models::ModelsResponse>();
     assert!(!models.data.is_empty());
+}
+
+#[tokio::test]
+async fn test_chat_completions_api() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock user in database for foreign key constraints
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database, auth_components, domain_services);
+
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Hello, how are you?"
+                }
+            ],
+            "stream": true,
+            "max_tokens": 50
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    // For streaming responses, we get SSE events as text
+    let response_text = response.text();
+
+    let mut content = String::new();
+    let mut final_response: Option<serde_json::Value> = None;
+
+    // Parse SSE format: "event: <type>\ndata: <json>\n\n"
+    for line_chunk in response_text.split("\n\n") {
+        if line_chunk.trim().is_empty() {
+            continue;
+        }
+
+        let mut event_type = "";
+        let mut event_data = "";
+
+        for line in line_chunk.lines() {
+            if let Some(event_name) = line.strip_prefix("event: ") {
+                event_type = event_name;
+            } else if let Some(data) = line.strip_prefix("data: ") {
+                event_data = data;
+            }
+        }
+
+        if !event_data.is_empty() {
+            if let Ok(event_json) = serde_json::from_str::<serde_json::Value>(event_data) {
+                match event_type {
+                    "completion.chunk" => {
+                        // Accumulate content deltas for chat completions
+                        if let Some(choices) = event_json.get("choices").and_then(|v| v.as_array())
+                        {
+                            if let Some(choice) = choices.first() {
+                                if let Some(delta) = choice.get("delta") {
+                                    if let Some(delta_content) =
+                                        delta.get("content").and_then(|v| v.as_str())
+                                    {
+                                        content.push_str(delta_content);
+                                        println!("Delta: {}", delta_content);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "completion.done" => {
+                        // Final completion event
+                        final_response = Some(event_json.clone());
+                        println!("Stream completed");
+                    }
+                    _ => {
+                        println!("Event: {}", event_type);
+                    }
+                }
+            }
+        }
+    }
+
+    // Verify we got content from the stream
+    assert!(!content.is_empty(), "Expected non-empty streamed content");
+
+    println!("Streamed Content: {}", content);
+
+    // If we have a final response, verify its structure
+    if let Some(final_resp) = final_response {
+        println!("Final Response: {:?}", final_resp);
+        assert!(final_resp.get("choices").is_some());
+        if let Some(choices) = final_resp.get("choices").and_then(|v| v.as_array()) {
+            assert!(!choices.is_empty());
+        }
+    }
 }
 
 #[tokio::test]

@@ -40,6 +40,10 @@ use utoipa::{Modify, OpenApi};
         crate::routes::conversations::list_conversation_items,
         // Response endpoints
         crate::routes::responses::create_response,
+        // Attestation endpoints  
+        crate::routes::attestation::get_signature,
+        crate::routes::attestation::get_attestation_report,
+        crate::routes::attestation::verify_attestation,
     ),
     components(
         schemas(
@@ -55,6 +59,14 @@ use utoipa::{Modify, OpenApi};
             UpdateConversationRequest, ConversationDeleteResult, ConversationItemList,
             // Response models
             CreateResponseRequest, ResponseObject,
+            // Attestation models
+            crate::routes::attestation::SignatureResponse,
+            crate::routes::attestation::AttestationResponse,
+            crate::routes::attestation::VerifyRequest,
+            crate::routes::attestation::VerifyResponse,
+            crate::routes::attestation::Evidence,
+            crate::routes::attestation::NvidiaPayload,
+            crate::routes::attestation::Attestation,
         ),
     ),
     modifiers(&SecurityAddon)

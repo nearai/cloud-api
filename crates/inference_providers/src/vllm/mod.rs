@@ -71,6 +71,41 @@ impl VLlmProvider {
 
 #[async_trait]
 impl InferenceProvider for VLlmProvider {
+    async fn get_signature(&self, chat_id: &str) -> Result<ChatSignature, CompletionError> {
+        let url = format!("{}/v1/signature/{}", self.config.base_url, chat_id);
+        let response = self
+            .client
+            .get(&url)
+            .headers(self.build_headers())
+            .send()
+            .await
+            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        let signature = response
+            .json()
+            .await
+            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        Ok(signature)
+    }
+
+    async fn get_attestation_report(
+        &self,
+        _signing_algo: Option<&str>,
+    ) -> Result<AttestationReport, CompletionError> {
+        let url = format!("{}/v1/attestation/report", self.config.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .headers(self.build_headers())
+            .send()
+            .await
+            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        let attestation_report = response
+            .json()
+            .await
+            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        Ok(attestation_report)
+    }
+
     /// Lists all available models from the vLLM server
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
         let url = format!("{}/v1/models", self.config.base_url);

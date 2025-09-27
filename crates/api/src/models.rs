@@ -56,7 +56,7 @@ pub struct Delta {
     pub content: Option<String>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<Message>,
@@ -81,7 +81,7 @@ pub struct Message {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema, Deserialize)]
 pub struct ChatCompletionResponse {
     pub id: String,
     pub object: String, // "chat.completion"
@@ -91,7 +91,7 @@ pub struct ChatCompletionResponse {
     pub usage: Usage,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema, Deserialize)]
 pub struct ChatChoice {
     pub index: u32,
     pub message: Message,

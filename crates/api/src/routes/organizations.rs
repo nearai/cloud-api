@@ -118,7 +118,7 @@ pub async fn create_organization(
             );
             let default_workspace_request = database::CreateWorkspaceRequest {
                 name: "default".to_string(),
-                display_name: format!("Default Workspace"),
+                display_name: "Default Workspace".to_string(),
                 description: Some(format!("Default workspace for {}", request.name)),
             };
 

@@ -109,7 +109,7 @@ async fn create_org(server: &axum_test::TestServer) -> api::models::Organization
     response.json::<api::models::OrganizationResponse>()
 }
 
-async fn create_workspace(
+async fn _create_workspace(
     server: &axum_test::TestServer,
 ) -> api::routes::workspaces::WorkspaceResponse {
     let request = api::routes::workspaces::CreateWorkspaceRequest {

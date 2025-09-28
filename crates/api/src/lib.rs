@@ -52,6 +52,7 @@ pub struct DomainServices {
     pub mcp_manager: Arc<services::mcp::McpClientManager>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub attestation_service: Arc<services::attestation::AttestationService>,
+    pub organization_service: Arc<services::organization::OrganizationService>,
 }
 
 /// Initialize database connection and run migrations
@@ -93,10 +94,12 @@ pub async fn init_database_with_config(db_config: &config::DatabaseConfig) -> Ar
 
 /// Initialize authentication services and middleware
 pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthComponents {
-    // Choose auth service implementation based on config
     let auth_service: Arc<dyn AuthServiceTrait> = if config.auth.mock {
-        // Use MockAuthService when mock auth is enabled
-        Arc::new(MockAuthService)
+        // TODO: fix this, it should not use the database pool
+        println!("config: {:?}", config);
+        Arc::new(MockAuthService {
+            apikey_repository: Arc::new(ApiKeyRepository::new(database.pool().clone())),
+        })
     } else {
         // Create repository instances
         let user_repository = Arc::new(UserRepository::new(database.pool().clone()))
@@ -170,6 +173,9 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
         database.pool().clone(),
     ));
     let response_repo = Arc::new(database::PgResponseRepository::new(database.pool().clone()));
+    let organization_repo = Arc::new(database::PgOrganizationRepository::new(
+        database.pool().clone(),
+    ));
     let attestation_repo = Arc::new(database::PgAttestationRepository::new(
         database.pool().clone(),
     ));
@@ -210,6 +216,10 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
     // Create MCP client manager
     let mcp_manager = Arc::new(services::mcp::McpClientManager::new());
 
+    let organization_service = Arc::new(services::organization::OrganizationService::new(
+        organization_repo,
+    ));
+
     DomainServices {
         conversation_service,
         response_service,
@@ -218,6 +228,7 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
         mcp_manager,
         inference_provider_pool,
         attestation_service,
+        organization_service,
     }
 }
 
@@ -392,7 +403,7 @@ pub fn build_response_routes(
         .with_state(response_service)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
-            auth_middleware,
+            auth_middleware_with_api_key,
         ))
 }
 
@@ -423,22 +434,20 @@ pub fn build_conversation_routes(
         .with_state(conversation_service)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
-            auth_middleware,
+            auth_middleware_with_api_key,
         ))
 }
 
 /// Build attestation routes with auth
 pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
     Router::new()
-        // v1 routes (signature endpoint)
         .route("/signature/{chat_id}", get(get_signature))
         .route("/verify/{chat_id}", post(verify_attestation))
-        // api routes (attestation report)
         .route("/attestation/report", get(get_attestation_report))
         .with_state(app_state)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
-            auth_middleware,
+            auth_middleware_with_api_key,
         ))
 }
 

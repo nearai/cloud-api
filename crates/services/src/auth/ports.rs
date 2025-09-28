@@ -188,6 +188,8 @@ pub trait SessionRepository: Send + Sync {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKey {
     pub id: ApiKeyId,
+    // Returned only on creation
+    pub key: Option<String>,
     pub name: String,
     pub organization_id: OrganizationId,
     pub created_by_user_id: UserId,
@@ -197,7 +199,7 @@ pub struct ApiKey {
     pub is_active: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CreateApiKeyRequest {
     pub name: Option<String>,
     pub organization_id: OrganizationId,
@@ -256,8 +258,6 @@ pub trait AuthServiceTrait: Send + Sync {
     /// Create an API key for an organization with proper permission checking
     async fn create_organization_api_key(
         &self,
-        organization_id: crate::organization::OrganizationId,
-        requester_id: UserId,
         request: CreateApiKeyRequest,
     ) -> Result<ApiKey, AuthError>;
 
@@ -292,7 +292,9 @@ const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
 
 /// Mock auth service that returns fake data for testing/development
 /// Used when mock auth is enabled
-pub struct MockAuthService;
+pub struct MockAuthService {
+    pub apikey_repository: Arc<dyn ApiKeyRepository>,
+}
 
 impl MockAuthService {
     fn create_mock_user() -> User {
@@ -327,23 +329,6 @@ impl MockAuthService {
         };
 
         (session, session_token.to_string())
-    }
-
-    fn create_mock_api_key(
-        &self,
-        organization_id: crate::organization::OrganizationId,
-        requester_id: UserId,
-    ) -> ApiKey {
-        ApiKey {
-            id: ApiKeyId(uuid::Uuid::new_v4().to_string()),
-            name: "Mock API Key".to_string(),
-            organization_id,
-            created_by_user_id: requester_id,
-            created_at: chrono::Utc::now(),
-            expires_at: None,
-            last_used_at: None,
-            is_active: true,
-        }
     }
 }
 
@@ -393,19 +378,19 @@ impl AuthServiceTrait for MockAuthService {
         Ok(0) // No sessions to clean up in mock
     }
 
-    async fn validate_api_key(&self, _api_key: String) -> Result<ApiKey, AuthError> {
-        let mock_user = Self::create_mock_user();
-        let mock_org_id = crate::organization::OrganizationId(uuid::Uuid::new_v4());
-        Ok(self.create_mock_api_key(mock_org_id, mock_user.id))
+    async fn validate_api_key(&self, api_key: String) -> Result<ApiKey, AuthError> {
+        self.apikey_repository
+            .validate(api_key)
+            .await
+            .unwrap()
+            .ok_or(AuthError::Unauthorized)
     }
 
     async fn create_organization_api_key(
         &self,
-        organization_id: crate::organization::OrganizationId,
-        requester_id: UserId,
-        _request: CreateApiKeyRequest,
+        request: CreateApiKeyRequest,
     ) -> Result<ApiKey, AuthError> {
-        Ok(self.create_mock_api_key(organization_id, requester_id))
+        Ok(self.apikey_repository.create(request).await.unwrap())
     }
 
     async fn can_manage_organization_api_keys(
@@ -419,8 +404,12 @@ impl AuthServiceTrait for MockAuthService {
     async fn list_organization_api_keys(
         &self,
         organization_id: crate::organization::OrganizationId,
-        requester_id: UserId,
+        _requester_id: UserId,
     ) -> Result<Vec<ApiKey>, AuthError> {
-        Ok(vec![self.create_mock_api_key(organization_id, requester_id)])
+        Ok(self
+            .apikey_repository
+            .list_by_organization(organization_id)
+            .await
+            .unwrap())
     }
 }

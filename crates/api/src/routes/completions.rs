@@ -1,6 +1,5 @@
 use crate::{
     conversions::{current_unix_timestamp, generate_completion_id},
-    middleware::AuthenticatedUser,
     models::*,
     routes::{api::AppState, common::map_domain_error_to_status},
 };
@@ -251,10 +250,10 @@ pub async fn chat_completions(
 )]
 pub async fn completions(
     State(app_state): State<AppState>,
-    Extension(user): Extension<AuthenticatedUser>,
+    Extension(api_key): Extension<services::auth::ApiKey>,
     Json(request): Json<CompletionRequest>,
 ) -> axum::response::Response {
-    debug!("Text completions request from user: {}", user.0.id);
+    debug!("Text completions request from key: {:?}", api_key);
     debug!(
         "Request model: {}, stream: {:?}, prompt length: {} chars",
         request.model,
@@ -274,7 +273,7 @@ pub async fn completions(
     }
 
     // Convert HTTP request to service parameters
-    let service_request = convert_text_request_to_service(&request, user.0.id);
+    let service_request = convert_text_request_to_service(&request, api_key.created_by_user_id.0);
 
     // Call the completion service - it only supports streaming
     match app_state
@@ -443,15 +442,14 @@ pub async fn completions(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
         ("api_key" = [])
     )
 )]
 pub async fn models(
     State(app_state): State<AppState>,
-    Extension(user): Extension<AuthenticatedUser>,
+    Extension(api_key): Extension<services::auth::ApiKey>,
 ) -> Result<ResponseJson<ModelsResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    debug!("Models list request from user: {}", user.0.id);
+    debug!("Models list request from key: {:?}", api_key);
 
     let models = app_state.models_service.get_models().await.map_err(|e| {
         (
@@ -497,17 +495,7 @@ pub async fn models(
 )]
 pub async fn quote(
     State(_app_state): State<AppState>,
-    Extension(user): Extension<AuthenticatedUser>,
+    Extension(_api_key): Extension<services::auth::ApiKey>,
 ) -> Result<ResponseJson<QuoteResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    debug!("TDX quote request from user: {}", user.0.id);
-    debug!("Admin endpoint accessed successfully");
-    // TODO: Move quote endpoint to appropriate service (this doesn't belong in completions)
-    // For now, return a not implemented error
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        ResponseJson(ErrorResponse::new(
-            "Quote endpoint not implemented in completions service".to_string(),
-            "not_implemented".to_string(),
-        )),
-    ))
+    unimplemented!()
 }

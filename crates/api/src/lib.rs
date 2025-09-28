@@ -26,7 +26,10 @@ use axum::{
 };
 use config::ApiConfig;
 use database::{
-    repositories::{ApiKeyRepository, PgOrganizationRepository, SessionRepository, UserRepository},
+    repositories::{
+        ApiKeyRepository, PgOrganizationRepository, SessionRepository, UserRepository,
+        WorkspaceRepository,
+    },
     Database,
 };
 use inference_providers::{InferenceProvider, VLlmConfig, VLlmProvider};
@@ -112,14 +115,23 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
             Arc::new(PgOrganizationRepository::new(database.pool().clone()))
                 as Arc<dyn services::organization::ports::OrganizationRepository>;
 
-        // Create AuthService
+        // Create AuthService with workspace repository
+        let workspace_repository_for_auth =
+            Arc::new(WorkspaceRepository::new(database.pool().clone()))
+                as Arc<dyn services::auth::ports::WorkspaceRepository>;
+
         Arc::new(AuthService::new(
             user_repository,
             session_repository,
             api_key_repository,
             organization_repository,
+            workspace_repository_for_auth,
         ))
     };
+
+    // Create workspace repository
+    let workspace_repository = Arc::new(WorkspaceRepository::new(database.pool().clone()))
+        as Arc<dyn services::auth::ports::WorkspaceRepository>;
 
     // Create OAuth manager
     tracing::info!("Setting up OAuth providers");
@@ -128,7 +140,11 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
 
     // Create AuthState for middleware
     let oauth_manager_arc = Arc::new(oauth_manager);
-    let auth_state_middleware = AuthState::new(oauth_manager_arc.clone(), auth_service.clone());
+    let auth_state_middleware = AuthState::new(
+        oauth_manager_arc.clone(),
+        auth_service.clone(),
+        workspace_repository.clone(),
+    );
 
     AuthComponents {
         auth_service,
@@ -320,6 +336,11 @@ pub fn build_app_with_config(
         auth_components.auth_state_middleware.clone(),
     );
 
+    let workspace_routes = build_workspace_routes(
+        app_state.clone(),
+        &auth_components.auth_state_middleware,
+    );
+
     let attestation_routes =
         build_attestation_routes(app_state, &auth_components.auth_state_middleware);
 
@@ -335,6 +356,7 @@ pub fn build_app_with_config(
                 .merge(response_routes)
                 .merge(conversation_routes)
                 .merge(management_routes)
+                .merge(workspace_routes)
                 .merge(attestation_routes.clone()),
         )
         .merge(openapi_routes)
@@ -448,6 +470,38 @@ pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &Aut
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware_with_api_key,
+        ))
+}
+
+/// Build workspace routes with auth
+pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
+    use crate::routes::workspaces::*;
+    
+    Router::new()
+        // Workspace management routes
+        .route(
+            "/organizations/{org_id}/workspaces",
+            get(list_organization_workspaces).post(create_workspace),
+        )
+        .route(
+            "/workspaces/{workspace_id}",
+            get(get_workspace)
+                .put(update_workspace)
+                .delete(delete_workspace),
+        )
+        // Workspace API key management
+        .route(
+            "/workspaces/{workspace_id}/api-keys",
+            get(list_workspace_api_keys).post(create_workspace_api_key),
+        )
+        .route(
+            "/workspaces/{workspace_id}/api-keys/{key_id}",
+            axum::routing::delete(revoke_workspace_api_key),
+        )
+        .with_state(app_state)
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            auth_middleware,
         ))
 }
 

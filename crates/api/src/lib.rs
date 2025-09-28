@@ -336,10 +336,8 @@ pub fn build_app_with_config(
         auth_components.auth_state_middleware.clone(),
     );
 
-    let workspace_routes = build_workspace_routes(
-        app_state.clone(),
-        &auth_components.auth_state_middleware,
-    );
+    let workspace_routes =
+        build_workspace_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
     let attestation_routes =
         build_attestation_routes(app_state, &auth_components.auth_state_middleware);
@@ -476,7 +474,7 @@ pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &Aut
 /// Build workspace routes with auth
 pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
     use crate::routes::workspaces::*;
-    
+
     Router::new()
         // Workspace management routes
         .route(

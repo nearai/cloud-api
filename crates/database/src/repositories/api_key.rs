@@ -3,7 +3,7 @@ use crate::pool::DbPool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use services::{auth::ports::{CreateApiKeyRequest, WorkspaceId}};
+use services::auth::ports::{CreateApiKeyRequest, WorkspaceId};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 use uuid::Uuid;
@@ -315,7 +315,10 @@ impl ApiKeyRepository {
     }
 
     /// Get workspace info for an API key - used for auth resolution
-    pub async fn get_workspace_for_api_key(&self, api_key: &ApiKey) -> Result<Option<crate::models::Workspace>> {
+    pub async fn get_workspace_for_api_key(
+        &self,
+        api_key: &ApiKey,
+    ) -> Result<Option<crate::models::Workspace>> {
         let client = self
             .pool
             .get()

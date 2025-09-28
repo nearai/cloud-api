@@ -134,16 +134,25 @@ impl AuthServiceTrait for AuthService {
             .ok_or(AuthError::Unauthorized)
     }
 
-    async fn create_organization_api_key(
+    async fn create_workspace_api_key(
         &self,
         request: CreateApiKeyRequest,
     ) -> Result<ApiKey, AuthError> {
-        let organization_id = request.clone().organization_id;
+        let workspace_id = request.clone().workspace_id;
         let requester_id = request.clone().created_by_user_id;
-        // Check if requester has permission to create API keys for this organization
+
+        // Get workspace with organization info to check permissions
+        let (workspace, _organization) = self
+            .workspace_repository
+            .get_workspace_with_organization(workspace_id)
+            .await
+            .map_err(|e| AuthError::InternalError(format!("Failed to get workspace info: {}", e)))?
+            .ok_or(AuthError::Unauthorized)?;
+
+        // Check if requester has permission to create API keys for this workspace's organization
         let member = self
             .organization_repository
-            .get_member(organization_id.0, requester_id.0)
+            .get_member(workspace.organization_id.0, requester_id.0)
             .await
             .map_err(|e| {
                 AuthError::InternalError(format!("Failed to check organization membership: {}", e))
@@ -162,15 +171,23 @@ impl AuthServiceTrait for AuthService {
             .map_err(|e| AuthError::InternalError(format!("Failed to create API key: {}", e)))
     }
 
-    async fn can_manage_organization_api_keys(
+    async fn can_manage_workspace_api_keys(
         &self,
-        organization_id: crate::organization::OrganizationId,
+        workspace_id: WorkspaceId,
         user_id: UserId,
     ) -> Result<bool, AuthError> {
-        // Check if user has permission to create API keys for this organization
+        // Get workspace to find the parent organization
+        let workspace = self
+            .workspace_repository
+            .get_by_id(workspace_id)
+            .await
+            .map_err(|e| AuthError::InternalError(format!("Failed to get workspace: {}", e)))?
+            .ok_or(AuthError::Unauthorized)?;
+
+        // Check if user has permission to create API keys for this workspace's organization
         let member = self
             .organization_repository
-            .get_member(organization_id.0, user_id.0)
+            .get_member(workspace.organization_id.0, user_id.0)
             .await
             .map_err(|e| {
                 AuthError::InternalError(format!("Failed to check organization membership: {}", e))
@@ -179,24 +196,35 @@ impl AuthServiceTrait for AuthService {
         Ok(member.is_some_and(|m| m.role.can_manage_api_keys()))
     }
 
-    async fn list_organization_api_keys(
+    async fn list_workspace_api_keys(
         &self,
-        organization_id: crate::organization::OrganizationId,
+        workspace_id: WorkspaceId,
         requester_id: UserId,
     ) -> Result<Vec<ApiKey>, AuthError> {
-        // Check if requester is a member of the organization
+        // Clone workspace_id since we need to use it twice
+        let workspace_id_for_list = workspace_id.clone();
+
+        // Get workspace to find the parent organization
+        let workspace = self
+            .workspace_repository
+            .get_by_id(workspace_id)
+            .await
+            .map_err(|e| AuthError::InternalError(format!("Failed to get workspace: {}", e)))?
+            .ok_or(AuthError::Unauthorized)?;
+
+        // Check if requester is a member of the workspace's organization
         let _member = self
             .organization_repository
-            .get_member(organization_id.0, requester_id.0)
+            .get_member(workspace.organization_id.0, requester_id.0)
             .await
             .map_err(|e| {
                 AuthError::InternalError(format!("Failed to check organization membership: {}", e))
             })?
             .ok_or(AuthError::Unauthorized)?;
 
-        // List API keys for the organization
+        // List API keys for the workspace
         self.api_key_repository
-            .list_by_organization(organization_id)
+            .list_by_workspace(workspace_id_for_list)
             .await
             .map_err(|e| AuthError::InternalError(format!("Failed to list API keys: {}", e)))
     }
@@ -208,12 +236,14 @@ impl AuthService {
         session_repository: Arc<dyn SessionRepository>,
         api_key_repository: Arc<dyn ApiKeyRepository>,
         organization_repository: Arc<dyn OrganizationRepository>,
+        workspace_repository: Arc<dyn ports::WorkspaceRepository>,
     ) -> Self {
         Self {
             user_repository,
             session_repository,
             api_key_repository,
             organization_repository,
+            workspace_repository,
         }
     }
 

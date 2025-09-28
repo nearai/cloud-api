@@ -66,13 +66,28 @@ impl std::fmt::Display for OrganizationRole {
     }
 }
 
-/// API Key for authentication
+/// Workspace model - belongs to an organization, owns API keys
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Workspace {
+    pub id: Uuid,
+    pub name: String,
+    pub display_name: String,
+    pub description: Option<String>,
+    pub organization_id: Uuid,
+    pub created_by_user_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub is_active: bool,
+    pub settings: Option<serde_json::Value>,
+}
+
+/// API Key for authentication - now workspace-owned
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKey {
     pub id: Uuid,
     pub key_hash: String, // Store hashed API key
     pub name: String,
-    pub organization_id: Uuid,
+    pub workspace_id: Uuid, // Changed from organization_id to workspace_id
     pub created_by_user_id: Uuid,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
@@ -127,6 +142,20 @@ pub struct ApiKeyResponse {
     pub name: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateWorkspaceRequest {
+    pub name: String,
+    pub display_name: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateWorkspaceRequest {
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub settings: Option<serde_json::Value>,
 }
 
 impl OrganizationRole {

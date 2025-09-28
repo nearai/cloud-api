@@ -94,7 +94,7 @@ async fn assert_mock_user_in_db(database: &Arc<Database>) {
     tracing::debug!("Mock user created/exists in database: {}", MOCK_USER_ID);
 }
 
-async fn assert_mock_org(server: &axum_test::TestServer) -> api::models::OrganizationResponse {
+async fn create_org(server: &axum_test::TestServer) -> api::models::OrganizationResponse {
     let request = api::models::CreateOrganizationRequest {
         name: uuid::Uuid::new_v4().to_string(),
         description: Some("A test organization".to_string()),
@@ -109,29 +109,63 @@ async fn assert_mock_org(server: &axum_test::TestServer) -> api::models::Organiz
     response.json::<api::models::OrganizationResponse>()
 }
 
-async fn create_api_key_in_org(
+async fn create_workspace(
     server: &axum_test::TestServer,
-    org_id: String,
+) -> api::routes::workspaces::WorkspaceResponse {
+    let request = api::routes::workspaces::CreateWorkspaceRequest {
+        name: uuid::Uuid::new_v4().to_string(),
+        description: Some("A test workspace".to_string()),
+        display_name: Some("Test Workspace".to_string()),
+    };
+    let response = server
+        .post("/v1/workspaces")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&serde_json::json!(request))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    response.json::<api::routes::workspaces::WorkspaceResponse>()
+}
+
+async fn create_api_key_in_workspace(
+    server: &axum_test::TestServer,
+    workspace_id: String,
 ) -> api::models::ApiKeyResponse {
     let request = api::models::CreateApiKeyRequest {
         name: Some("Test API Key".to_string()),
         expires_at: Some(Utc::now() + chrono::Duration::days(90)),
     };
     let response = server
-        .post(format!("/v1/organizations/{}/api-keys", org_id).as_str())
+        .post(format!("/v1/workspaces/{}/api-keys", workspace_id).as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .json(&serde_json::json!(request))
         .await;
-    assert_eq!(response.status_code(), 200);
+    assert_eq!(response.status_code(), 201);
     response.json::<api::models::ApiKeyResponse>()
+}
+
+async fn list_workspaces(
+    server: &axum_test::TestServer,
+    org_id: String,
+) -> Vec<api::routes::workspaces::WorkspaceResponse> {
+    let response = server
+        .get(format!("/v1/organizations/{}/workspaces", org_id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    response.json::<Vec<api::routes::workspaces::WorkspaceResponse>>()
 }
 
 async fn create_org_and_api_key(
     server: &axum_test::TestServer,
 ) -> (String, api::models::ApiKeyResponse) {
-    let org = assert_mock_org(server).await;
+    let org = create_org(server).await;
     println!("org: {:?}", org);
-    let api_key_resp = create_api_key_in_org(server, org.id.clone()).await;
+
+    let workspaces = list_workspaces(server, org.id.clone()).await;
+    let workspace = workspaces.first().unwrap();
+    println!("workspace: {:?}", workspace);
+    // Fix: Use workspace.id instead of org.id
+    let api_key_resp = create_api_key_in_workspace(server, workspace.id.clone()).await;
     println!("api_key_resp: {:?}", api_key_resp);
     (api_key_resp.key.clone().unwrap(), api_key_resp)
 }

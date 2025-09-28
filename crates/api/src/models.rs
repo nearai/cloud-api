@@ -926,7 +926,7 @@ pub struct ApiKeyResponse {
     pub name: Option<String>,
     pub key: Option<String>,
     pub key_prefix: String,
-    pub organization_id: String,
+    pub workspace_id: String,
     pub created_by_user_id: String,
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,

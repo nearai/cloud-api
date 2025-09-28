@@ -336,16 +336,16 @@ pub fn services_member_to_db_member(
     }
 }
 
-/// Convert API CreateApiKeyRequest to services request
-pub fn api_key_req_to_services(
+/// Convert API CreateApiKeyRequest to services request (workspace-based)
+pub fn api_key_req_to_services_workspace(
     req: crate::models::CreateApiKeyRequest,
-    organization_id: services::organization::OrganizationId,
+    workspace_id: services::auth::ports::WorkspaceId,
     created_by_user_id: services::UserId,
 ) -> services::auth::CreateApiKeyRequest {
     services::auth::CreateApiKeyRequest {
         name: req.name,
         expires_at: req.expires_at,
-        organization_id,
+        workspace_id,
         created_by_user_id,
     }
 }
@@ -359,7 +359,7 @@ pub fn services_api_key_to_api_response(
         name: Some(api_key.name.clone()), // Convert String to Option<String>
         key: api_key.key,                 // Returned only on creation
         key_prefix: format!("{}...", &api_key.name[..4.min(api_key.name.len())]), // Create key prefix from name
-        organization_id: api_key.organization_id.0.to_string(),
+        workspace_id: api_key.workspace_id.0.to_string(),
         created_by_user_id: api_key.created_by_user_id.0.to_string(),
         created_at: api_key.created_at,
         last_used_at: api_key.last_used_at,

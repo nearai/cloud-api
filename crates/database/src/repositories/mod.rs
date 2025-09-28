@@ -6,6 +6,7 @@ pub mod organization;
 pub mod response;
 pub mod session;
 pub mod user;
+pub mod workspace;
 
 pub use api_key::ApiKeyRepository;
 pub use attestation::PgAttestationRepository;
@@ -15,3 +16,4 @@ pub use organization::PgOrganizationRepository;
 pub use response::PgResponseRepository;
 pub use session::SessionRepository;
 pub use user::UserRepository;
+pub use workspace::WorkspaceRepository;

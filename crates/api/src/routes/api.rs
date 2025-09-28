@@ -37,10 +37,6 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
                 .put(update_organization)
                 .delete(delete_organization),
         )
-        .route(
-            "/{id}/api-keys",
-            get(list_organization_api_keys).post(create_organization_api_key),
-        )
         .route("/{id}/api-keys/{key_id}", delete(revoke_api_key))
         // Organization member management
         .route(

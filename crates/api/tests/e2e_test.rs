@@ -1,23 +1,10 @@
-//! End-to-end integration tests for the API
-//!
-//! These tests demonstrate how to use the exported functions from lib.rs
-//! to set up and test the application.
-//!
-//! To run these tests, you need a PostgreSQL database running:
-//! ```bash
-//! # Using Docker:
-//! docker run --name test-postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=platform_api_test -p 5432:5432 -d postgres:15
-//!
-//! # Then run tests:
-//! TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/platform_api_test cargo test --package api --test e2e_test
-//! ```
-
 use api::{
     build_app, init_auth_services, init_database_with_config, init_domain_services,
     models::{
         ConversationContentPart, ConversationItem, ResponseOutputContent, ResponseOutputItem,
     },
 };
+use chrono::Utc;
 use config::ApiConfig;
 use database::Database;
 use inference_providers::{models::ChatCompletionChunk, StreamChunk};
@@ -107,6 +94,60 @@ async fn assert_mock_user_in_db(database: &Arc<Database>) {
     tracing::debug!("Mock user created/exists in database: {}", MOCK_USER_ID);
 }
 
+async fn assert_mock_org(server: &axum_test::TestServer) -> api::models::OrganizationResponse {
+    let request = api::models::CreateOrganizationRequest {
+        name: uuid::Uuid::new_v4().to_string(),
+        description: Some("A test organization".to_string()),
+        display_name: Some("Test Organization 2".to_string()),
+    };
+    let response = server
+        .post("/v1/organizations")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&serde_json::json!(request))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    response.json::<api::models::OrganizationResponse>()
+}
+
+async fn create_api_key_in_org(
+    server: &axum_test::TestServer,
+    org_id: String,
+) -> api::models::ApiKeyResponse {
+    let request = api::models::CreateApiKeyRequest {
+        name: Some("Test API Key".to_string()),
+        expires_at: Some(Utc::now() + chrono::Duration::days(90)),
+    };
+    let response = server
+        .post(format!("/v1/organizations/{}/api-keys", org_id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&serde_json::json!(request))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    response.json::<api::models::ApiKeyResponse>()
+}
+
+async fn create_org_and_api_key(
+    server: &axum_test::TestServer,
+) -> (String, api::models::ApiKeyResponse) {
+    let org = assert_mock_org(server).await;
+    println!("org: {:?}", org);
+    let api_key_resp = create_api_key_in_org(server, org.id.clone()).await;
+    println!("api_key_resp: {:?}", api_key_resp);
+    (api_key_resp.key.clone().unwrap(), api_key_resp)
+}
+
+async fn list_models(
+    server: &axum_test::TestServer,
+    api_key: String,
+) -> api::models::ModelsResponse {
+    let response = server
+        .get("/v1/models")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    response.json::<api::models::ModelsResponse>()
+}
+
 #[tokio::test]
 async fn test_models_api() {
     // Setup
@@ -126,14 +167,11 @@ async fn test_models_api() {
     let app = build_app(database, auth_components, domain_services);
 
     let server = axum_test::TestServer::new(app).unwrap();
-    let response = server
-        .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .await;
 
-    assert_eq!(response.status_code(), 200);
-    let models = response.json::<api::models::ModelsResponse>();
-    assert!(!models.data.is_empty());
+    let (api_key, _) = create_org_and_api_key(&server).await;
+    let response = list_models(&server, api_key).await;
+
+    assert!(!response.data.is_empty());
 }
 
 #[tokio::test]
@@ -156,9 +194,11 @@ async fn test_chat_completions_api() {
 
     let server = axum_test::TestServer::new(app).unwrap();
 
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
     let response = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", api_key))
         .json(&serde_json::json!({
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "messages": [
@@ -280,16 +320,17 @@ async fn test_responses_api() {
     let app = build_app(database, auth_components, domain_services);
 
     let server = axum_test::TestServer::new(app).unwrap();
+    let (api_key, _) = create_org_and_api_key(&server).await;
 
     let response = server
         .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", api_key))
         .await;
 
     let models = response.json::<api::models::ModelsResponse>();
     assert!(!models.data.is_empty());
 
-    let conversation = create_conversation(&server).await;
+    let conversation = create_conversation(&server, api_key.clone()).await;
     println!("Conversation: {:?}", conversation);
 
     let message = "Hello, how are you?".to_string();
@@ -300,6 +341,7 @@ async fn test_responses_api() {
         models.data[0].id.clone(),
         message.clone(),
         max_tokens,
+        api_key.clone(),
     )
     .await;
     println!("Response: {:?}", response);
@@ -318,7 +360,8 @@ async fn test_responses_api() {
         }
     }));
 
-    let conversation_items = list_conversation_items(&server, conversation.id).await;
+    let conversation_items =
+        list_conversation_items(&server, conversation.id, api_key.clone()).await;
     assert_eq!(conversation_items.data.len(), 2);
     match &conversation_items.data[0] {
         ConversationItem::Message { content, .. } => {
@@ -329,10 +372,13 @@ async fn test_responses_api() {
     }
 }
 
-async fn create_conversation(server: &axum_test::TestServer) -> api::models::ConversationObject {
+async fn create_conversation(
+    server: &axum_test::TestServer,
+    api_key: String,
+) -> api::models::ConversationObject {
     let response = server
         .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", api_key))
         .json(&serde_json::json!({
             "name": "Test Conversation",
             "description": "A test conversation"
@@ -346,10 +392,11 @@ async fn create_conversation(server: &axum_test::TestServer) -> api::models::Con
 async fn get_conversation(
     server: &axum_test::TestServer,
     conversation_id: String,
+    api_key: String,
 ) -> api::models::ConversationObject {
     let response = server
         .get(format!("/v1/conversations/{conversation_id}").as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", api_key))
         .await;
     assert_eq!(response.status_code(), 200);
     response.json::<api::models::ConversationObject>()
@@ -358,10 +405,11 @@ async fn get_conversation(
 async fn list_conversation_items(
     server: &axum_test::TestServer,
     conversation_id: String,
+    api_key: String,
 ) -> api::models::ConversationItemList {
     let response = server
         .get(format!("/v1/conversations/{conversation_id}/items").as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", api_key))
         .await;
     assert_eq!(response.status_code(), 200);
     response.json::<api::models::ConversationItemList>()
@@ -373,10 +421,11 @@ async fn create_response(
     model: String,
     message: String,
     max_tokens: u32,
+    api_key: String,
 ) -> api::models::ResponseObject {
     let response = server
         .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", api_key))
         .json(&serde_json::json!({
             "conversation": {
                 "id": conversation_id,
@@ -398,10 +447,11 @@ async fn create_response_stream(
     model: String,
     message: String,
     max_tokens: u32,
+    api_key: String,
 ) -> (String, api::models::ResponseObject) {
     let response = server
         .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", api_key))
         .json(&serde_json::json!({
             "conversation": {
                 "id": conversation_id,
@@ -496,17 +546,19 @@ async fn test_conversations_api() {
 
     let server = axum_test::TestServer::new(app).unwrap();
 
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
     // Test that we can list conversations (should return empty array initially)
     let response = server
         .get("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", api_key))
         .await;
     assert_eq!(response.status_code(), 200);
 
     // Test creating a conversation
     let create_response = server
         .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", api_key))
         .json(&serde_json::json!({
             "name": "Test Conversation",
             "description": "A test conversation"
@@ -534,18 +586,19 @@ async fn test_streaming_responses_api() {
     let app = build_app(database, auth_components, domain_services);
 
     let server = axum_test::TestServer::new(app).unwrap();
+    let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Get available models
     let response = server
         .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", api_key))
         .await;
 
     let models = response.json::<api::models::ModelsResponse>();
     assert!(!models.data.is_empty());
 
     // Create a conversation
-    let conversation = create_conversation(&server).await;
+    let conversation = create_conversation(&server, api_key.clone()).await;
     println!("Conversation: {:?}", conversation);
 
     // Test streaming response
@@ -556,6 +609,7 @@ async fn test_streaming_responses_api() {
         models.data[0].id.clone(),
         message.clone(),
         50,
+        api_key.clone(),
     )
     .await;
 

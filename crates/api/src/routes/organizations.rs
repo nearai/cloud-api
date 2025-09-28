@@ -92,7 +92,6 @@ fn default_limit() -> i64 {
     ),
     security(
         ("bearer" = []),
-        ("api_key" = [])
     )
 )]
 pub async fn create_organization(
@@ -331,7 +330,6 @@ pub async fn delete_organization(
     ),
     security(
         ("bearer" = []),
-        ("api_key" = [])
     )
 )]
 pub async fn create_organization_api_key(
@@ -355,7 +353,7 @@ pub async fn create_organization_api_key(
 
     match app_state
         .auth_service
-        .create_organization_api_key(organization_id, user_id, services_request)
+        .create_organization_api_key(services_request)
         .await
     {
         Ok(api_key) => {

@@ -29,7 +29,6 @@ pub async fn auth_middleware_with_api_key(
     let auth_result = if let Some(auth_value) = auth_header {
         debug!("Found Authorization header: {}", auth_value);
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
-            debug!("Extracted Bearer token: {}", token);
             authenticate_api_key(&state, token).await
         } else {
             debug!("Authorization header does not start with 'Bearer '");
@@ -132,6 +131,7 @@ async fn authenticate_api_key(
     api_key: &str,
 ) -> Result<services::auth::ApiKey, StatusCode> {
     let auth_service = &state.auth_service;
+    debug!("Calling auth service to validate API key: {}", api_key);
 
     match auth_service.validate_api_key(api_key.to_string()).await {
         Ok(api_key) => {

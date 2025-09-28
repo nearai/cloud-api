@@ -357,6 +357,7 @@ pub fn services_api_key_to_api_response(
     crate::models::ApiKeyResponse {
         id: api_key.id.0,                 // ApiKeyId contains a String
         name: Some(api_key.name.clone()), // Convert String to Option<String>
+        key: api_key.key,                 // Returned only on creation
         key_prefix: format!("{}...", &api_key.name[..4.min(api_key.name.len())]), // Create key prefix from name
         organization_id: api_key.organization_id.0.to_string(),
         created_by_user_id: api_key.created_by_user_id.0.to_string(),

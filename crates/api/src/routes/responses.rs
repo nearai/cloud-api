@@ -84,16 +84,15 @@ fn user_uuid_to_user_id(uuid: Uuid) -> UserId {
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
         ("api_key" = [])
     )
 )]
 pub async fn create_response(
     State(service): State<Arc<ResponseService>>,
-    Extension(user): Extension<AuthenticatedUser>,
+    Extension(api_key): Extension<services::auth::ApiKey>,
     Json(request): Json<CreateResponseRequest>,
 ) -> axum::response::Response {
-    debug!("Create response request from user: {}", user.0.id);
+    debug!("Create response request from key: {:?}", api_key);
 
     // Validate the request
     if let Err(error) = request.validate() {
@@ -156,14 +155,14 @@ pub async fn create_response(
         max_output_tokens: request.max_output_tokens,
         temperature: request.temperature,
         top_p: request.top_p,
-        user_id: user_uuid_to_user_id(user.0.id),
+        user_id: user_uuid_to_user_id(api_key.created_by_user_id.0),
         metadata: request.metadata.clone(),
     };
 
     // Check if streaming is requested
     if request.stream.unwrap_or(false) {
         tracing::info!(
-            user_id = %user.0.id,
+            user_id = %api_key.created_by_user_id.0,
             model = %request.model,
             "Processing streaming response request"
         );
@@ -172,7 +171,7 @@ pub async fn create_response(
         match service.create_response_stream(domain_request).await {
             Ok(stream) => {
                 tracing::info!(
-                    user_id = %user.0.id,
+                    user_id = %api_key.created_by_user_id.0,
                     "Successfully created streaming response, returning SSE stream"
                 );
 
@@ -191,7 +190,7 @@ pub async fn create_response(
             }
             Err(error) => {
                 tracing::error!(
-                    user_id = %user.0.id,
+                    user_id = %api_key.created_by_user_id.0,
                     model = %request.model,
                     error = %error,
                     "Failed to create streaming response"
@@ -202,7 +201,7 @@ pub async fn create_response(
         }
     } else {
         tracing::info!(
-            user_id = %user.0.id,
+            user_id = %api_key.created_by_user_id.0,
             model = %request.model,
             "Processing non-streaming response request"
         );
@@ -211,7 +210,7 @@ pub async fn create_response(
         match service.create_response_stream(domain_request).await {
             Ok(stream) => {
                 tracing::info!(
-                    user_id = %user.0.id,
+                    user_id = %api_key.created_by_user_id.0,
                     "Successfully created stream, collecting events for non-streaming response"
                 );
 
@@ -305,12 +304,15 @@ pub async fn create_response(
                     }
                 };
 
-                info!("Created response {} for user {}", response.id, user.0.id);
+                info!(
+                    "Created response {} for key {}",
+                    response.id, api_key.created_by_user_id.0
+                );
                 (StatusCode::OK, ResponseJson(response)).into_response()
             }
             Err(error) => {
                 tracing::error!(
-                    user_id = %user.0.id,
+                    user_id = %api_key.created_by_user_id.0,
                     model = %request.model,
                     error = %error,
                     "Failed to create non-streaming response"

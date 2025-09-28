@@ -18,7 +18,7 @@ impl ApiKeyRepository {
     }
 
     /// Generate a new API key
-    fn generate_api_key() -> String {
+    pub fn generate_api_key() -> String {
         format!("sk_{}", Uuid::new_v4().to_string().replace("-", ""))
     }
 
@@ -30,7 +30,7 @@ impl ApiKeyRepository {
     }
 
     /// Create a new API key
-    pub async fn create(&self, request: CreateApiKeyRequest) -> Result<ApiKey> {
+    pub async fn create(&self, request: CreateApiKeyRequest) -> Result<(String, ApiKey)> {
         let client = self
             .pool
             .get()
@@ -52,7 +52,7 @@ impl ApiKeyRepository {
                     id, key_hash, name, organization_id, created_by_user_id,
                     created_at, expires_at, last_used_at, is_active
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, true)
                 RETURNING *
                 "#,
                 &[
@@ -73,17 +73,20 @@ impl ApiKeyRepository {
             id, request.organization_id.0, request.created_by_user_id.0
         );
 
-        Ok(ApiKey {
-            id,
-            key_hash,
-            name,
-            created_at: now,
-            expires_at: request.expires_at,
-            last_used_at: None,
-            is_active: true,
-            created_by_user_id: request.created_by_user_id.0,
-            organization_id: request.organization_id.0,
-        })
+        Ok((
+            key,
+            ApiKey {
+                id,
+                key_hash,
+                name,
+                created_at: now,
+                expires_at: request.expires_at,
+                last_used_at: None,
+                is_active: true,
+                created_by_user_id: request.created_by_user_id.0,
+                organization_id: request.organization_id.0,
+            },
+        ))
     }
 
     /// Create a new API key and return it with the raw key for API response
@@ -112,7 +115,7 @@ impl ApiKeyRepository {
                     id, key_hash, name, organization_id, created_by_user_id,
                     created_at, expires_at, last_used_at, is_active
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, true)
                 RETURNING *
                 "#,
                 &[
@@ -328,9 +331,13 @@ impl ApiKeyRepository {
 }
 
 // Convert database ApiKey to service ApiKey
-fn db_apikey_to_service_apikey(db_api_key: ApiKey) -> services::auth::ApiKey {
+fn db_apikey_to_service_apikey(
+    api_key: Option<String>,
+    db_api_key: ApiKey,
+) -> services::auth::ApiKey {
     services::auth::ApiKey {
         id: services::auth::ApiKeyId(db_api_key.id.to_string()),
+        key: api_key,
         name: db_api_key.name,
         organization_id: OrganizationId(db_api_key.organization_id),
         created_by_user_id: services::auth::UserId(db_api_key.created_by_user_id),
@@ -346,12 +353,12 @@ fn db_apikey_to_service_apikey(db_api_key: ApiKey) -> services::auth::ApiKey {
 impl services::auth::ApiKeyRepository for ApiKeyRepository {
     async fn validate(&self, api_key: String) -> anyhow::Result<Option<services::auth::ApiKey>> {
         let maybe_api_key = self.validate(&api_key).await?;
-        Ok(maybe_api_key.map(db_apikey_to_service_apikey))
+        Ok(maybe_api_key.map(|db_api_key| db_apikey_to_service_apikey(None, db_api_key)))
     }
 
     async fn create(&self, request: CreateApiKeyRequest) -> anyhow::Result<services::auth::ApiKey> {
-        let db_api_key = self.create(request).await?;
-        Ok(db_apikey_to_service_apikey(db_api_key))
+        let (key, db_api_key) = self.create(request).await?;
+        Ok(db_apikey_to_service_apikey(Some(key), db_api_key))
     }
 
     async fn list_by_organization(
@@ -361,7 +368,7 @@ impl services::auth::ApiKeyRepository for ApiKeyRepository {
         let api_keys = self.list_by_organization(organization_id.0).await?;
         Ok(api_keys
             .into_iter()
-            .map(db_apikey_to_service_apikey)
+            .map(|db_api_key| db_apikey_to_service_apikey(None, db_api_key))
             .collect())
     }
 

@@ -924,6 +924,7 @@ pub struct UserResponse {
 pub struct ApiKeyResponse {
     pub id: String,
     pub name: Option<String>,
+    pub key: Option<String>,
     pub key_prefix: String,
     pub organization_id: String,
     pub created_by_user_id: String,

@@ -172,14 +172,12 @@ impl InferenceProvider for InferenceProviderPool {
 
     async fn get_attestation_report(
         &self,
-        signing_algo: Option<&str>,
+        model: String,
+        signing_algo: Option<String>,
     ) -> Result<AttestationReport, CompletionError> {
-        // Delegate to the first provider that supports attestation reports
-        for provider in &self.providers {
-            match provider.get_attestation_report(signing_algo).await {
-                Ok(report) => return Ok(report),
-                Err(_) => continue, // Try next provider
-            }
+        let providers = self.model_mapping.read().await.get(&model).cloned();
+        if let Some(provider) = providers {
+            return provider.get_attestation_report(model, signing_algo).await;
         }
         Err(CompletionError::CompletionError(
             "No provider found that supports attestation reports".to_string(),

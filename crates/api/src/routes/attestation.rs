@@ -18,6 +18,7 @@ pub struct SignatureQuery {
 #[derive(Debug, Serialize, Deserialize, ToSchema, IntoParams)]
 pub struct AttestationQuery {
     pub model: Option<String>,
+    pub signing_algo: Option<String>,
 }
 
 /// Response for signature endpoint
@@ -149,11 +150,16 @@ pub async fn get_attestation_report(
     Query(params): Query<AttestationQuery>,
     State(app_state): State<AppState>,
 ) -> Result<Json<AttestationResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let signing_algo = params.model.as_deref(); // Using model param as signing_algo for compatibility
+    if let None = params.model {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "model is required" })),
+        ));
+    }
 
     let report = app_state
         .attestation_service
-        .get_attestation_report(signing_algo)
+        .get_attestation_report(params.model.unwrap(), params.signing_algo)
         .await
         .map_err(|e| {
             (

@@ -164,7 +164,7 @@ async fn create_org_and_api_key(
     let workspaces = list_workspaces(server, org.id.clone()).await;
     let workspace = workspaces.first().unwrap();
     println!("workspace: {:?}", workspace);
-    // Fix: Use workspace.id instead of org.id
+
     let api_key_resp = create_api_key_in_workspace(server, workspace.id.clone()).await;
     println!("api_key_resp: {:?}", api_key_resp);
     (api_key_resp.key.clone().unwrap(), api_key_resp)

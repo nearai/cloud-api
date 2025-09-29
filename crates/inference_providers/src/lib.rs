@@ -125,6 +125,7 @@ pub trait InferenceProvider {
 
     async fn get_attestation_report(
         &self,
-        signing_algo: Option<&str>,
+        model: String,
+        signing_algo: Option<String>,
     ) -> Result<AttestationReport, CompletionError>;
 }

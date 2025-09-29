@@ -61,10 +61,11 @@ impl ports::AttestationService for AttestationService {
 
     async fn get_attestation_report(
         &self,
-        signing_algo: Option<&str>,
+        model: String,
+        signing_algo: Option<String>,
     ) -> Result<AttestationReport, CompletionError> {
         self.inference_provider_pool
-            .get_attestation_report(signing_algo)
+            .get_attestation_report(model, signing_algo)
             .await
             .map_err(|e| CompletionError::ProviderError(e.to_string()))
     }

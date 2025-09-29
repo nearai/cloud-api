@@ -6,11 +6,8 @@ use axum::{
 };
 use database::Database;
 use services::{
-    auth::AuthServiceTrait,
-    completions::CompletionService,
-    mcp::McpClientManager,
-    models::ModelsService,
-    organization::{ports::OrganizationRepository, OrganizationService},
+    attestation::ports::AttestationService, auth::AuthServiceTrait, completions::CompletionService,
+    mcp::McpClientManager, models::ModelsService, organization::OrganizationService,
 };
 use std::sync::Arc;
 
@@ -18,11 +15,12 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Database>, // Still need DB for now, other routes depend on it
-    pub organization_service: Arc<OrganizationService>, // New clean service layer
+    pub organization_service: Arc<OrganizationService>,
     pub mcp_manager: Arc<McpClientManager>,
     pub completion_service: Arc<dyn CompletionService>,
     pub models_service: Arc<dyn ModelsService>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
+    pub attestation_service: Arc<dyn AttestationService>,
 }
 
 // Import route handlers
@@ -38,10 +36,6 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
             get(get_organization)
                 .put(update_organization)
                 .delete(delete_organization),
-        )
-        .route(
-            "/{id}/api-keys",
-            get(list_organization_api_keys).post(create_organization_api_key),
         )
         .route("/{id}/api-keys/{key_id}", delete(revoke_api_key))
         // Organization member management
@@ -104,63 +98,21 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
 }
 
 // Revoke an API key
+// DEPRECATED: This organization-based route is deprecated in favor of workspace-based revocation
+// Kept for backward compatibility but returns HTTP 410 Gone
 pub async fn revoke_api_key(
-    state: axum::extract::State<AppState>,
-    user: axum::extract::Extension<crate::middleware::AuthenticatedUser>,
+    _state: axum::extract::State<AppState>,
+    _user: axum::extract::Extension<crate::middleware::AuthenticatedUser>,
     axum::extract::Path((org_id, api_key_id)): axum::extract::Path<(uuid::Uuid, uuid::Uuid)>,
 ) -> Result<axum::http::StatusCode, axum::http::StatusCode> {
-    use tracing::{debug, error};
+    use tracing::error;
 
-    debug!(
-        "Revoking API key: {} in organization: {} by user: {}",
-        api_key_id, org_id, user.0 .0.id
+    error!(
+        "Attempted to use deprecated organization-based API key revocation for key: {} in org: {}",
+        api_key_id, org_id
     );
 
-    // Get the API key to check ownership and validate it belongs to the specified organization
-    match state.db.api_keys.get_by_id(api_key_id).await {
-        Ok(Some(api_key)) => {
-            // Validate that the API key belongs to the specified organization
-            if api_key.organization_id != org_id {
-                return Err(axum::http::StatusCode::NOT_FOUND);
-            }
-
-            // Check if user has permission to revoke this key
-            // Must be the creator, org owner/admin
-            if api_key.created_by_user_id != user.0 .0.id {
-                // Check org membership
-                match state
-                    .db
-                    .organizations
-                    .get_member(org_id, user.0 .0.id)
-                    .await
-                {
-                    Ok(Some(member)) => {
-                        if !member.role.can_manage_api_keys() {
-                            return Err(axum::http::StatusCode::FORBIDDEN);
-                        }
-                    }
-                    Ok(None) => return Err(axum::http::StatusCode::FORBIDDEN),
-                    Err(e) => {
-                        error!("Failed to check organization membership: {}", e);
-                        return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-                    }
-                }
-            }
-
-            // Revoke the key
-            match state.db.api_keys.revoke(api_key_id).await {
-                Ok(true) => Ok(axum::http::StatusCode::NO_CONTENT),
-                Ok(false) => Err(axum::http::StatusCode::NOT_FOUND),
-                Err(e) => {
-                    error!("Failed to revoke API key: {}", e);
-                    Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
-                }
-            }
-        }
-        Ok(None) => Err(axum::http::StatusCode::NOT_FOUND),
-        Err(e) => {
-            error!("Failed to get API key: {}", e);
-            Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
+    // Return HTTP 410 Gone to indicate this endpoint is deprecated
+    // Clients should use /workspaces/{workspace_id}/api-keys/{key_id} instead
+    Err(axum::http::StatusCode::GONE)
 }

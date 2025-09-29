@@ -44,8 +44,8 @@ impl From<ResponseError> for ErrorResponse {
 
 // Helper functions for ID conversion
 fn parse_response_id(id_str: &str) -> Result<ResponseId, ResponseError> {
-    let uuid = if id_str.starts_with("resp_") {
-        Uuid::parse_str(&id_str[5..])
+    let uuid = if let Some(stripped) = id_str.strip_prefix("resp_") {
+        Uuid::parse_str(stripped)
     } else {
         Uuid::parse_str(id_str)
     }
@@ -55,8 +55,8 @@ fn parse_response_id(id_str: &str) -> Result<ResponseId, ResponseError> {
 }
 
 fn parse_conversation_id_from_string(id_str: &str) -> Result<ConversationId, ResponseError> {
-    let uuid = if id_str.starts_with("conv_") {
-        Uuid::parse_str(&id_str[5..])
+    let uuid = if let Some(stripped) = id_str.strip_prefix("conv_") {
+        Uuid::parse_str(stripped)
     } else {
         Uuid::parse_str(id_str)
     }
@@ -70,12 +70,29 @@ fn user_uuid_to_user_id(uuid: Uuid) -> UserId {
 }
 
 /// Create a new response
+///
+/// Creates a new response for a conversation.
+#[utoipa::path(
+    post,
+    path = "/responses",
+    tag = "Responses",
+    request_body = CreateResponseRequest,
+    responses(
+        (status = 200, description = "Response created successfully", body = ResponseObject),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
 pub async fn create_response(
     State(service): State<Arc<ResponseService>>,
-    Extension(user): Extension<AuthenticatedUser>,
+    Extension(api_key): Extension<services::auth::ApiKey>,
     Json(request): Json<CreateResponseRequest>,
 ) -> axum::response::Response {
-    debug!("Create response request from user: {}", user.0.id);
+    debug!("Create response request from key: {:?}", api_key);
 
     // Validate the request
     if let Err(error) = request.validate() {
@@ -93,6 +110,7 @@ pub async fn create_response(
     let domain_input = request.input.clone().map(|input| match input {
         ResponseInput::Text(text) => DomainResponseInput::Text(text),
         ResponseInput::Items(items) => {
+            #[allow(clippy::unnecessary_filter_map)]
             let messages = items
                 .into_iter()
                 .filter_map(|item| match item {
@@ -137,14 +155,14 @@ pub async fn create_response(
         max_output_tokens: request.max_output_tokens,
         temperature: request.temperature,
         top_p: request.top_p,
-        user_id: user_uuid_to_user_id(user.0.id),
+        user_id: user_uuid_to_user_id(api_key.created_by_user_id.0),
         metadata: request.metadata.clone(),
     };
 
     // Check if streaming is requested
     if request.stream.unwrap_or(false) {
         tracing::info!(
-            user_id = %user.0.id,
+            user_id = %api_key.created_by_user_id.0,
             model = %request.model,
             "Processing streaming response request"
         );
@@ -153,7 +171,7 @@ pub async fn create_response(
         match service.create_response_stream(domain_request).await {
             Ok(stream) => {
                 tracing::info!(
-                    user_id = %user.0.id,
+                    user_id = %api_key.created_by_user_id.0,
                     "Successfully created streaming response, returning SSE stream"
                 );
 
@@ -172,7 +190,7 @@ pub async fn create_response(
             }
             Err(error) => {
                 tracing::error!(
-                    user_id = %user.0.id,
+                    user_id = %api_key.created_by_user_id.0,
                     model = %request.model,
                     error = %error,
                     "Failed to create streaming response"
@@ -183,7 +201,7 @@ pub async fn create_response(
         }
     } else {
         tracing::info!(
-            user_id = %user.0.id,
+            user_id = %api_key.created_by_user_id.0,
             model = %request.model,
             "Processing non-streaming response request"
         );
@@ -192,7 +210,7 @@ pub async fn create_response(
         match service.create_response_stream(domain_request).await {
             Ok(stream) => {
                 tracing::info!(
-                    user_id = %user.0.id,
+                    user_id = %api_key.created_by_user_id.0,
                     "Successfully created stream, collecting events for non-streaming response"
                 );
 
@@ -286,12 +304,15 @@ pub async fn create_response(
                     }
                 };
 
-                info!("Created response {} for user {}", response.id, user.0.id);
+                info!(
+                    "Created response {} for key {}",
+                    response.id, api_key.created_by_user_id.0
+                );
                 (StatusCode::OK, ResponseJson(response)).into_response()
             }
             Err(error) => {
                 tracing::error!(
-                    user_id = %user.0.id,
+                    user_id = %api_key.created_by_user_id.0,
                     model = %request.model,
                     error = %error,
                     "Failed to create non-streaming response"
@@ -419,11 +440,9 @@ fn convert_domain_response_to_http_with_request(
         }),
         store: request.store.unwrap_or(true),
         temperature: request.temperature.unwrap_or(1.0),
-        text: request.text.clone().or_else(|| {
-            Some(ResponseTextConfig {
-                format: ResponseTextFormat::Text,
-            })
-        }),
+        text: request.text.clone().or(Some(ResponseTextConfig {
+            format: ResponseTextFormat::Text,
+        })),
         tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
         tools: request.tools.clone().unwrap_or_default(),
         top_p: request.top_p.unwrap_or(1.0),

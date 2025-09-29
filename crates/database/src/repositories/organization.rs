@@ -609,4 +609,40 @@ impl OrganizationRepository for PgOrganizationRepository {
 
         Ok(row.get("count"))
     }
+
+    async fn list_organizations_by_user(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Organization>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let rows = client
+            .query(
+                r#"
+            SELECT DISTINCT o.* FROM organizations o
+            INNER JOIN organization_members om ON o.id = om.organization_id
+            WHERE om.user_id = $1 AND o.is_active = true
+            ORDER BY o.created_at DESC
+            LIMIT $2 OFFSET $3
+            "#,
+                &[&user_id, &limit, &offset],
+            )
+            .await
+            .context("Failed to list organizations by user")?;
+
+        let mut organizations = Vec::new();
+        for row in rows {
+            let db_org = self.row_to_db_organization(row)?;
+            let domain_org = self.db_to_domain_organization(db_org).await?;
+            organizations.push(domain_org);
+        }
+
+        Ok(organizations)
+    }
 }

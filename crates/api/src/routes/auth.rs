@@ -41,7 +41,11 @@ pub struct AuthResponse {
 
 /// Initiate GitHub OAuth flow - redirects to GitHub
 pub async fn github_login(
-    State((oauth, state_store, _auth_service)): State<(Arc<OAuthManager>, StateStore, Arc<dyn AuthServiceTrait>)>,
+    State((oauth, state_store, _auth_service)): State<(
+        Arc<OAuthManager>,
+        StateStore,
+        Arc<dyn AuthServiceTrait>,
+    )>,
 ) -> Result<Redirect, StatusCode> {
     debug!("Initiating GitHub OAuth flow");
 
@@ -66,7 +70,11 @@ pub async fn github_login(
 
 /// Initiate Google OAuth flow - redirects to Google
 pub async fn google_login(
-    State((oauth, state_store, _auth_service)): State<(Arc<OAuthManager>, StateStore, Arc<dyn AuthServiceTrait>)>,
+    State((oauth, state_store, _auth_service)): State<(
+        Arc<OAuthManager>,
+        StateStore,
+        Arc<dyn AuthServiceTrait>,
+    )>,
 ) -> Result<Redirect, StatusCode> {
     debug!("Initiating Google OAuth flow");
 
@@ -92,7 +100,11 @@ pub async fn google_login(
 /// Handle OAuth callback from both providers
 pub async fn oauth_callback(
     Query(params): Query<OAuthCallback>,
-    State((oauth, state_store, auth_service)): State<(Arc<OAuthManager>, StateStore, Arc<dyn AuthServiceTrait>)>,
+    State((oauth, state_store, auth_service)): State<(
+        Arc<OAuthManager>,
+        StateStore,
+        Arc<dyn AuthServiceTrait>,
+    )>,
 ) -> Response {
     debug!("OAuth callback received with state: {}", params.state);
 
@@ -157,9 +169,7 @@ pub async fn oauth_callback(
     };
 
     // Create session for the user (24 hours)
-    let session_result = auth_service
-        .create_session(user.id, None, None, 24)
-        .await;
+    let session_result = auth_service.create_session(user.id, None, None, 24).await;
 
     match session_result {
         Ok((_session, session_token)) => {

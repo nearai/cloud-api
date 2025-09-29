@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use services::auth::AccountType;
+use utoipa::ToSchema;
 
 // Streaming response models
 #[derive(Debug, Serialize, Deserialize)]
@@ -30,7 +30,7 @@ pub struct Delta {
     pub content: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<Message>,
@@ -48,14 +48,14 @@ pub struct ChatCompletionRequest {
     pub frequency_penalty: Option<f32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Message {
     pub role: String, // "system", "user", "assistant"
     pub content: String,
     pub name: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema, Deserialize)]
 pub struct ChatCompletionResponse {
     pub id: String,
     pub object: String, // "chat.completion"
@@ -65,14 +65,14 @@ pub struct ChatCompletionResponse {
     pub usage: Usage,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema, Deserialize)]
 pub struct ChatChoice {
     pub index: u32,
     pub message: Message,
     pub finish_reason: Option<String>, // "stop", "length", "content_filter"
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CompletionRequest {
     pub model: String,
     pub prompt: String,
@@ -103,13 +103,13 @@ pub struct CompletionResponse {
     pub usage: Usage,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelsResponse {
     pub object: String,
     pub data: Vec<ModelInfo>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelInfo {
     pub id: String,
     pub object: String,
@@ -125,7 +125,7 @@ pub struct CompletionChoice {
     pub finish_reason: Option<String>, // "stop", "length", "content_filter"
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Usage {
     pub input_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,22 +136,22 @@ pub struct Usage {
     pub total_tokens: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct InputTokensDetails {
     pub cached_tokens: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OutputTokensDetails {
     pub reasoning_tokens: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorResponse {
     pub error: ErrorDetail,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorDetail {
     pub message: String,
     pub r#type: String,
@@ -274,13 +274,13 @@ impl ErrorResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct QuoteResponse {
     pub gateway: GatewayQuote,
     pub allowlist: Vec<ServiceAllowlistEntry>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct GatewayQuote {
     pub quote: String,
     pub measurement: String,
@@ -288,7 +288,7 @@ pub struct GatewayQuote {
     pub build: BuildInfo,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ServiceAllowlistEntry {
     pub service: String,
     pub expected_measurements: Vec<String>,
@@ -296,7 +296,7 @@ pub struct ServiceAllowlistEntry {
     pub identifier: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct BuildInfo {
     pub image: String,
     pub sbom: String,
@@ -307,7 +307,7 @@ pub struct BuildInfo {
 // ============================================
 
 /// Request to create a response
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateResponseRequest {
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -353,7 +353,7 @@ pub struct CreateResponseRequest {
 }
 
 /// Input for a response - can be text, array of items, or single item
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum ResponseInput {
     Text(String),
@@ -361,7 +361,7 @@ pub enum ResponseInput {
 }
 
 /// Single input item
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
 pub enum ResponseInputItem {
     #[serde(rename = "message")]
@@ -372,7 +372,7 @@ pub enum ResponseInputItem {
 }
 
 /// Content can be text or array of content parts
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum ResponseContent {
     Text(String),
@@ -380,7 +380,7 @@ pub enum ResponseContent {
 }
 
 /// Content part (text, image, etc.)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
 pub enum ResponseContentPart {
     #[serde(rename = "input_text")]
@@ -399,13 +399,13 @@ pub enum ResponseContentPart {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResponseImageUrl {
     pub url: String,
 }
 
 /// Conversation reference
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum ConversationReference {
     Id(String),
@@ -417,7 +417,7 @@ pub enum ConversationReference {
 }
 
 /// Tool configuration for responses
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
 pub enum ResponseTool {
     #[serde(rename = "function")]
@@ -432,7 +432,7 @@ pub enum ResponseTool {
     Computer {},
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResponseFunction {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -442,7 +442,7 @@ pub struct ResponseFunction {
 }
 
 /// Tool choice configuration
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum ResponseToolChoice {
     Auto(String), // "auto", "none", "required"
@@ -453,18 +453,18 @@ pub enum ResponseToolChoice {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResponseToolChoiceFunction {
     pub name: String,
 }
 
 /// Text format configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResponseTextConfig {
     pub format: ResponseTextFormat,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
 pub enum ResponseTextFormat {
     #[serde(rename = "text")]
@@ -476,14 +476,14 @@ pub enum ResponseTextFormat {
 }
 
 /// Reasoning configuration
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ResponseReasoningConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
 }
 
 /// Complete response object
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResponseObject {
     pub id: String,
     pub object: String, // "response"
@@ -521,7 +521,7 @@ pub struct ResponseObject {
     pub metadata: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ResponseStatus {
     Completed,
@@ -532,7 +532,7 @@ pub enum ResponseStatus {
     Incomplete,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResponseError {
     pub message: String,
     #[serde(rename = "type")]
@@ -541,13 +541,13 @@ pub struct ResponseError {
     pub code: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResponseIncompleteDetails {
     pub reason: String, // "length", "content_filter", "max_tool_calls"
 }
 
 /// Output item from response
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
 pub enum ResponseOutputItem {
     #[serde(rename = "message")]
@@ -573,7 +573,7 @@ pub enum ResponseOutputItem {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ResponseItemStatus {
     Completed,
@@ -583,7 +583,7 @@ pub enum ResponseItemStatus {
 }
 
 /// Output content part
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
 pub enum ResponseOutputContent {
     #[serde(rename = "output_text")]
@@ -597,13 +597,13 @@ pub enum ResponseOutputContent {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResponseOutputFunction {
     pub name: String,
     pub arguments: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResponseOutputToolCall {
     pub id: String,
     #[serde(rename = "type")]
@@ -611,7 +611,7 @@ pub struct ResponseOutputToolCall {
     pub function: ResponseOutputFunction,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResponseReasoningOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
@@ -619,7 +619,7 @@ pub struct ResponseReasoningOutput {
     pub summary: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum ResponseToolChoiceOutput {
     Auto(String),
@@ -631,7 +631,7 @@ pub enum ResponseToolChoiceOutput {
 }
 
 /// Response deletion result
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResponseDeleteResult {
     pub id: String,
     pub object: String, // "response"
@@ -643,7 +643,7 @@ pub struct ResponseDeleteResult {
 // ============================================
 
 /// Response streaming event wrapper
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResponseStreamEvent {
     #[serde(rename = "type")]
     pub event_type: String,
@@ -666,7 +666,7 @@ pub struct ResponseStreamEvent {
 }
 
 /// Input item list for responses
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResponseInputItemList {
     pub object: String, // "list"
     pub data: Vec<ResponseInputItem>,
@@ -680,21 +680,21 @@ pub struct ResponseInputItemList {
 // ============================================
 
 /// Request to create a conversation
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateConversationRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 }
 
 /// Request to update a conversation
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateConversationRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 }
 
 /// Conversation object
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ConversationObject {
     pub id: String,
     pub object: String, // "conversation"
@@ -703,7 +703,7 @@ pub struct ConversationObject {
 }
 
 /// List of conversations
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ConversationList {
     pub object: String, // "list"
     pub data: Vec<ConversationObject>,
@@ -713,7 +713,7 @@ pub struct ConversationList {
 }
 
 /// Deleted conversation result
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ConversationDeleteResult {
     pub id: String,
     pub object: String, // "conversation.deleted"
@@ -721,7 +721,7 @@ pub struct ConversationDeleteResult {
 }
 
 /// Input item for conversations
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(tag = "type")]
 pub enum ConversationInputItem {
     #[serde(rename = "message")]
@@ -734,7 +734,7 @@ pub enum ConversationInputItem {
 }
 
 /// Content for conversation items
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum ConversationContent {
     Text(String),
@@ -742,7 +742,7 @@ pub enum ConversationContent {
 }
 
 /// Content part for conversations
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
 pub enum ConversationContentPart {
     #[serde(rename = "input_text")]
@@ -762,7 +762,7 @@ pub enum ConversationContentPart {
 }
 
 /// Conversation item (for responses)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
 pub enum ConversationItem {
     #[serde(rename = "message")]
@@ -777,7 +777,7 @@ pub enum ConversationItem {
 }
 
 /// List of conversation items
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ConversationItemList {
     pub object: String, // "list"
     pub data: Vec<ConversationItem>,
@@ -809,7 +809,7 @@ impl CreateResponseRequest {
         }
 
         if let Some(temp) = self.temperature {
-            if temp < 0.0 || temp > 2.0 {
+            if !(0.0..=2.0).contains(&temp) {
                 return Err("temperature must be between 0.0 and 2.0".to_string());
             }
         }
@@ -836,10 +836,9 @@ impl CreateConversationRequest {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateApiKeyRequest {
     pub name: Option<String>,
-    pub account_type: AccountType,
     pub expires_at: Option<DateTime<Utc>>,
 }
 
@@ -848,7 +847,7 @@ pub struct CreateApiKeyRequest {
 // ============================================
 
 /// Request to create a new organization
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateOrganizationRequest {
     pub name: String,
     pub display_name: Option<String>,
@@ -856,7 +855,7 @@ pub struct CreateOrganizationRequest {
 }
 
 /// Request to update an organization
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateOrganizationRequest {
     pub display_name: Option<String>,
     pub description: Option<String>,
@@ -865,7 +864,7 @@ pub struct UpdateOrganizationRequest {
 }
 
 /// Organization response model
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationResponse {
     pub id: String,
     pub name: String,
@@ -878,7 +877,7 @@ pub struct OrganizationResponse {
 }
 
 /// Organization member response model
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationMemberResponse {
     pub organization_id: String,
     pub user_id: String,
@@ -887,7 +886,7 @@ pub struct OrganizationMemberResponse {
 }
 
 /// Member role enum for API
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum MemberRole {
     Owner,
@@ -896,20 +895,20 @@ pub enum MemberRole {
 }
 
 /// Request to add an organization member
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct AddOrganizationMemberRequest {
     pub user_id: String,
     pub role: MemberRole,
 }
 
 /// Request to update an organization member
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateOrganizationMemberRequest {
     pub role: MemberRole,
 }
 
 /// User response model
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UserResponse {
     pub id: String,
     pub email: String,
@@ -921,14 +920,14 @@ pub struct UserResponse {
 }
 
 /// API Key response model
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiKeyResponse {
     pub id: String,
     pub name: Option<String>,
+    pub key: Option<String>,
     pub key_prefix: String,
-    pub organization_id: String,
+    pub workspace_id: String,
     pub created_by_user_id: String,
-    pub account_type: AccountType,
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,

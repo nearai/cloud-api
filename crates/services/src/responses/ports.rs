@@ -136,6 +136,7 @@ pub struct ResponseStreamEvent {
 
 #[async_trait]
 pub trait ResponseRepository: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     async fn create(
         &self,
         user_id: UserId,

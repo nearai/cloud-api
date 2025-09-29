@@ -3,10 +3,7 @@ use crate::pool::DbPool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use services::{
-    auth::ports::CreateApiKeyRequest,
-    organization::ports::OrganizationId,
-};
+use services::auth::ports::{CreateApiKeyRequest, WorkspaceId};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 use uuid::Uuid;
@@ -21,7 +18,7 @@ impl ApiKeyRepository {
     }
 
     /// Generate a new API key
-    fn generate_api_key() -> String {
+    pub fn generate_api_key() -> String {
         format!("sk_{}", Uuid::new_v4().to_string().replace("-", ""))
     }
 
@@ -33,7 +30,7 @@ impl ApiKeyRepository {
     }
 
     /// Create a new API key
-    pub async fn create(&self, request: CreateApiKeyRequest) -> Result<ApiKey> {
+    pub async fn create(&self, request: CreateApiKeyRequest) -> Result<(String, ApiKey)> {
         let client = self
             .pool
             .get()
@@ -52,19 +49,18 @@ impl ApiKeyRepository {
             .query_one(
                 r#"
                 INSERT INTO api_keys (
-                    id, key_hash, name, organization_id, created_by_user_id,
-                    account_type, created_at, expires_at, last_used_at, is_active
+                    id, key_hash, name, workspace_id, created_by_user_id,
+                    created_at, expires_at, last_used_at, is_active
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, true)
                 RETURNING *
                 "#,
                 &[
                     &id,
                     &key_hash,
                     &name,
-                    &request.organization_id.0,
+                    &request.workspace_id.0,
                     &request.created_by_user_id.0,
-                    &request.account_type.to_string(),
                     &now,
                     &request.expires_at,
                 ],
@@ -73,22 +69,24 @@ impl ApiKeyRepository {
             .context("Failed to create API key")?;
 
         debug!(
-            "Created API key: {} for org: {} by user: {}",
-            id, request.organization_id.0, request.created_by_user_id.0
+            "Created API key: {} for workspace: {} by user: {}",
+            id, request.workspace_id.0, request.created_by_user_id.0
         );
 
-        Ok(ApiKey {
-            id,
-            key_hash,
-            name,
-            created_at: now,
-            expires_at: request.expires_at,
-            last_used_at: None,
-            is_active: true,
-            account_type: request.account_type,
-            created_by_user_id: request.created_by_user_id.0,
-            organization_id: request.organization_id.0,
-        })
+        Ok((
+            key,
+            ApiKey {
+                id,
+                key_hash,
+                name,
+                created_at: now,
+                expires_at: request.expires_at,
+                last_used_at: None,
+                is_active: true,
+                created_by_user_id: request.created_by_user_id.0,
+                workspace_id: request.workspace_id.0,
+            },
+        ))
     }
 
     /// Create a new API key and return it with the raw key for API response
@@ -114,19 +112,18 @@ impl ApiKeyRepository {
             .query_one(
                 r#"
                 INSERT INTO api_keys (
-                    id, key_hash, name, organization_id, created_by_user_id,
-                    account_type, created_at, expires_at, last_used_at, is_active
+                    id, key_hash, name, workspace_id, created_by_user_id,
+                    created_at, expires_at, last_used_at, is_active
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, true)
                 RETURNING *
                 "#,
                 &[
                     &id,
                     &key_hash,
                     &name,
-                    &request.organization_id.0,
+                    &request.workspace_id.0,
                     &request.created_by_user_id.0,
-                    &request.account_type.to_string(),
                     &now,
                     &request.expires_at,
                 ],
@@ -135,8 +132,8 @@ impl ApiKeyRepository {
             .context("Failed to create API key")?;
 
         debug!(
-            "Created API key: {} for org: {} by user: {}",
-            id, request.organization_id.0, request.created_by_user_id.0
+            "Created API key: {} for workspace: {} by user: {}",
+            id, request.workspace_id.0, request.created_by_user_id.0
         );
 
         Ok(crate::models::ApiKeyResponse {
@@ -193,7 +190,7 @@ impl ApiKeyRepository {
     }
 
     /// Validate an API key globally and return it if valid
-    /// API keys are globally unique across all organizations
+    /// API keys are globally unique across all workspaces
     pub async fn validate(&self, key: &str) -> Result<Option<ApiKey>> {
         let key_hash = Self::hash_api_key(key);
 
@@ -246,8 +243,8 @@ impl ApiKeyRepository {
         Ok(())
     }
 
-    /// List API keys for an organization
-    pub async fn list_by_organization(&self, org_id: Uuid) -> Result<Vec<ApiKey>> {
+    /// List API keys for a workspace
+    pub async fn list_by_workspace(&self, workspace_id: Uuid) -> Result<Vec<ApiKey>> {
         let client = self
             .pool
             .get()
@@ -255,8 +252,8 @@ impl ApiKeyRepository {
             .context("Failed to get database connection")?;
 
         let rows = client.query(
-            "SELECT * FROM api_keys WHERE organization_id = $1 AND is_active = true ORDER BY created_at DESC",
-            &[&org_id],
+            "SELECT * FROM api_keys WHERE workspace_id = $1 AND is_active = true ORDER BY created_at DESC",
+            &[&workspace_id],
         ).await.context("Failed to list API keys")?;
 
         rows.into_iter()
@@ -317,31 +314,69 @@ impl ApiKeyRepository {
         Ok(rows_affected)
     }
 
+    /// Get workspace info for an API key - used for auth resolution
+    pub async fn get_workspace_for_api_key(
+        &self,
+        api_key: &ApiKey,
+    ) -> Result<Option<crate::models::Workspace>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let row = client
+            .query_opt(
+                "SELECT * FROM workspaces WHERE id = $1 AND is_active = true",
+                &[&api_key.workspace_id],
+            )
+            .await
+            .context("Failed to query workspace for API key")?;
+
+        match row {
+            Some(row) => Ok(Some(crate::models::Workspace {
+                id: row.get("id"),
+                name: row.get("name"),
+                display_name: row.get("display_name"),
+                description: row.get("description"),
+                organization_id: row.get("organization_id"),
+                created_by_user_id: row.get("created_by_user_id"),
+                created_at: row.get("created_at"),
+                updated_at: row.get("updated_at"),
+                is_active: row.get("is_active"),
+                settings: row.get("settings"),
+            })),
+            None => Ok(None),
+        }
+    }
+
     // Helper function to convert database row to ApiKey
     fn row_to_api_key(&self, row: tokio_postgres::Row) -> Result<ApiKey> {
         Ok(ApiKey {
             id: row.get("id"),
             key_hash: row.get("key_hash"),
             name: row.get("name"),
-            organization_id: row.get("organization_id"),
+            workspace_id: row.get("workspace_id"),
             created_by_user_id: row.get("created_by_user_id"),
             created_at: row.get("created_at"),
             expires_at: row.get("expires_at"),
             last_used_at: row.get("last_used_at"),
             is_active: row.get("is_active"),
-            account_type: row.get::<_, String>("account_type").into(),
         })
     }
 }
 
 // Convert database ApiKey to service ApiKey
-fn db_apikey_to_service_apikey(db_api_key: ApiKey) -> services::auth::ApiKey {
+fn db_apikey_to_service_apikey(
+    api_key: Option<String>,
+    db_api_key: ApiKey,
+) -> services::auth::ApiKey {
     services::auth::ApiKey {
-        id: services::auth::ApiKeyId(db_api_key.id.to_string()),
+        id: services::auth::ports::ApiKeyId(db_api_key.id.to_string()),
+        key: api_key,
         name: db_api_key.name,
-        organization_id: OrganizationId(db_api_key.organization_id),
-        created_by_user_id: services::auth::UserId(db_api_key.created_by_user_id),
-        account_type: db_api_key.account_type,
+        workspace_id: WorkspaceId(db_api_key.workspace_id),
+        created_by_user_id: services::auth::ports::UserId(db_api_key.created_by_user_id),
         created_at: db_api_key.created_at,
         expires_at: db_api_key.expires_at,
         last_used_at: db_api_key.last_used_at,
@@ -351,33 +386,33 @@ fn db_apikey_to_service_apikey(db_api_key: ApiKey) -> services::auth::ApiKey {
 
 // Implement the service trait
 #[async_trait]
-impl services::auth::ApiKeyRepository for ApiKeyRepository {
+impl services::auth::ports::ApiKeyRepository for ApiKeyRepository {
     async fn validate(&self, api_key: String) -> anyhow::Result<Option<services::auth::ApiKey>> {
         let maybe_api_key = self.validate(&api_key).await?;
-        Ok(maybe_api_key.map(db_apikey_to_service_apikey))
+        Ok(maybe_api_key.map(|db_api_key| db_apikey_to_service_apikey(None, db_api_key)))
     }
 
     async fn create(&self, request: CreateApiKeyRequest) -> anyhow::Result<services::auth::ApiKey> {
-        let db_api_key = self.create(request).await?;
-        Ok(db_apikey_to_service_apikey(db_api_key))
+        let (key, db_api_key) = self.create(request).await?;
+        Ok(db_apikey_to_service_apikey(Some(key), db_api_key))
     }
 
-    async fn list_by_organization(
+    async fn list_by_workspace(
         &self,
-        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
     ) -> anyhow::Result<Vec<services::auth::ApiKey>> {
-        let api_keys = self.list_by_organization(organization_id.0).await?;
+        let api_keys = self.list_by_workspace(workspace_id.0).await?;
         Ok(api_keys
             .into_iter()
-            .map(db_apikey_to_service_apikey)
+            .map(|db_api_key| db_apikey_to_service_apikey(None, db_api_key))
             .collect())
     }
 
-    async fn delete(&self, id: services::auth::ApiKeyId) -> anyhow::Result<bool> {
+    async fn delete(&self, id: services::auth::ports::ApiKeyId) -> anyhow::Result<bool> {
         self.revoke(Uuid::parse_str(&id.0)?).await
     }
 
-    async fn update_last_used(&self, id: services::auth::ApiKeyId) -> anyhow::Result<()> {
+    async fn update_last_used(&self, id: services::auth::ports::ApiKeyId) -> anyhow::Result<()> {
         self.update_last_used(Uuid::parse_str(&id.0)?).await
     }
 }

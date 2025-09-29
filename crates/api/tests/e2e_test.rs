@@ -1,25 +1,13 @@
-//! End-to-end integration tests for the API
-//!
-//! These tests demonstrate how to use the exported functions from lib.rs
-//! to set up and test the application.
-//!
-//! To run these tests, you need a PostgreSQL database running:
-//! ```bash
-//! # Using Docker:
-//! docker run --name test-postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=platform_api_test -p 5432:5432 -d postgres:15
-//!
-//! # Then run tests:
-//! TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/platform_api_test cargo test --package api --test e2e_test
-//! ```
-
 use api::{
     build_app, init_auth_services, init_database_with_config, init_domain_services,
     models::{
         ConversationContentPart, ConversationItem, ResponseOutputContent, ResponseOutputItem,
     },
 };
+use chrono::Utc;
 use config::ApiConfig;
 use database::Database;
+use inference_providers::{models::ChatCompletionChunk, StreamChunk};
 use std::sync::Arc;
 use tracing::level_filters::LevelFilter;
 
@@ -91,7 +79,7 @@ async fn assert_mock_user_in_db(database: &Arc<Database>) {
     let _ = client.execute(
         "INSERT INTO users (id, email, username, display_name, avatar_url, auth_provider, provider_user_id, created_at, updated_at) 
          VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-         ON CONFLICT (id) DO NOTHING",
+         ON CONFLICT DO NOTHING",
         &[
             &uuid::Uuid::parse_str(MOCK_USER_ID).unwrap(),
             &"test@example.com",
@@ -104,6 +92,94 @@ async fn assert_mock_user_in_db(database: &Arc<Database>) {
     ).await.expect("Failed to create mock user");
 
     tracing::debug!("Mock user created/exists in database: {}", MOCK_USER_ID);
+}
+
+async fn create_org(server: &axum_test::TestServer) -> api::models::OrganizationResponse {
+    let request = api::models::CreateOrganizationRequest {
+        name: uuid::Uuid::new_v4().to_string(),
+        description: Some("A test organization".to_string()),
+        display_name: Some("Test Organization 2".to_string()),
+    };
+    let response = server
+        .post("/v1/organizations")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&serde_json::json!(request))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    response.json::<api::models::OrganizationResponse>()
+}
+
+async fn _create_workspace(
+    server: &axum_test::TestServer,
+) -> api::routes::workspaces::WorkspaceResponse {
+    let request = api::routes::workspaces::CreateWorkspaceRequest {
+        name: uuid::Uuid::new_v4().to_string(),
+        description: Some("A test workspace".to_string()),
+        display_name: Some("Test Workspace".to_string()),
+    };
+    let response = server
+        .post("/v1/workspaces")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&serde_json::json!(request))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    response.json::<api::routes::workspaces::WorkspaceResponse>()
+}
+
+async fn create_api_key_in_workspace(
+    server: &axum_test::TestServer,
+    workspace_id: String,
+) -> api::models::ApiKeyResponse {
+    let request = api::models::CreateApiKeyRequest {
+        name: Some("Test API Key".to_string()),
+        expires_at: Some(Utc::now() + chrono::Duration::days(90)),
+    };
+    let response = server
+        .post(format!("/v1/workspaces/{}/api-keys", workspace_id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&serde_json::json!(request))
+        .await;
+    assert_eq!(response.status_code(), 201);
+    response.json::<api::models::ApiKeyResponse>()
+}
+
+async fn list_workspaces(
+    server: &axum_test::TestServer,
+    org_id: String,
+) -> Vec<api::routes::workspaces::WorkspaceResponse> {
+    let response = server
+        .get(format!("/v1/organizations/{}/workspaces", org_id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    response.json::<Vec<api::routes::workspaces::WorkspaceResponse>>()
+}
+
+async fn create_org_and_api_key(
+    server: &axum_test::TestServer,
+) -> (String, api::models::ApiKeyResponse) {
+    let org = create_org(server).await;
+    println!("org: {:?}", org);
+
+    let workspaces = list_workspaces(server, org.id.clone()).await;
+    let workspace = workspaces.first().unwrap();
+    println!("workspace: {:?}", workspace);
+    // Fix: Use workspace.id instead of org.id
+    let api_key_resp = create_api_key_in_workspace(server, workspace.id.clone()).await;
+    println!("api_key_resp: {:?}", api_key_resp);
+    (api_key_resp.key.clone().unwrap(), api_key_resp)
+}
+
+async fn list_models(
+    server: &axum_test::TestServer,
+    api_key: String,
+) -> api::models::ModelsResponse {
+    let response = server
+        .get("/v1/models")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    response.json::<api::models::ModelsResponse>()
 }
 
 #[tokio::test]
@@ -125,14 +201,138 @@ async fn test_models_api() {
     let app = build_app(database, auth_components, domain_services);
 
     let server = axum_test::TestServer::new(app).unwrap();
+
+    let (api_key, _) = create_org_and_api_key(&server).await;
+    let response = list_models(&server, api_key).await;
+
+    assert!(!response.data.is_empty());
+}
+
+#[tokio::test]
+async fn test_chat_completions_api() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock user in database for foreign key constraints
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database, auth_components, domain_services);
+
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
     let response = server
-        .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Hello, how are you?"
+                }
+            ],
+            "stream": true,
+            "max_tokens": 50
+        }))
         .await;
 
     assert_eq!(response.status_code(), 200);
-    let models = response.json::<api::models::ModelsResponse>();
-    assert!(!models.data.is_empty());
+
+    // For streaming responses, we get SSE events as text
+    let response_text = response.text();
+
+    let mut content = String::new();
+    let mut final_response: Option<ChatCompletionChunk> = None;
+
+    // Parse standard OpenAI streaming format: "data: <json>"
+    for line in response_text.lines() {
+        println!("Line: {}", line);
+
+        if let Some(data) = line.strip_prefix("data: ") {
+            // Handle the [DONE] marker
+            if data.trim() == "[DONE]" {
+                println!("Stream completed with [DONE]");
+                break;
+            }
+
+            // Parse JSON data
+            if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
+                println!(
+                    "Parsed JSON: {}",
+                    serde_json::to_string_pretty(&chunk).unwrap_or_default()
+                );
+
+                let chat_chunk = match chunk {
+                    StreamChunk::Chat(chat_chunk) => {
+                        println!("Chat chunk: {:?}", chat_chunk);
+                        Some(chat_chunk)
+                    }
+                    _ => {
+                        println!("Unknown chunk: {:?}", chunk);
+                        None
+                    }
+                }
+                .unwrap();
+
+                // Extract content from choices[0].delta.content
+                if let Some(choice) = chat_chunk.choices.first() {
+                    if let Some(delta) = &choice.delta {
+                        if let Some(delta_content) = &delta.content {
+                            content.push_str(delta_content.as_str());
+                            println!("Delta content: '{}'", delta_content);
+                        }
+
+                        // Check if this is the final chunk (has usage or finish_reason)
+                        if choice.finish_reason.is_some() || chat_chunk.usage.is_some() {
+                            final_response = Some(chat_chunk.clone());
+                            println!("Final chunk detected");
+                        }
+                    }
+                }
+            } else {
+                println!("Failed to parse JSON: {}", data);
+            }
+        }
+    }
+
+    // Verify we got content from the stream
+    assert!(!content.is_empty(), "Expected non-empty streamed content");
+
+    println!("Streamed Content: {}", content);
+
+    // Verify we got a meaningful response
+    assert!(
+        content.len() > 10,
+        "Expected substantial content from stream, got: '{}'",
+        content
+    );
+
+    // If we have a final response, verify its structure
+    if let Some(final_resp) = final_response {
+        println!("Final Response: {:?}", final_resp);
+        assert!(
+            !final_resp.choices.is_empty(),
+            "Final response should have choices"
+        );
+        if let Some(choice) = final_resp.choices.first() {
+            assert!(
+                choice.delta.is_some(),
+                "Final response choices should not be empty"
+            );
+        }
+    } else {
+        println!("No final response detected - this is okay for some streaming implementations");
+    }
 }
 
 #[tokio::test]
@@ -154,16 +354,17 @@ async fn test_responses_api() {
     let app = build_app(database, auth_components, domain_services);
 
     let server = axum_test::TestServer::new(app).unwrap();
+    let (api_key, _) = create_org_and_api_key(&server).await;
 
     let response = server
         .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", api_key))
         .await;
 
     let models = response.json::<api::models::ModelsResponse>();
     assert!(!models.data.is_empty());
 
-    let conversation = create_conversation(&server).await;
+    let conversation = create_conversation(&server, api_key.clone()).await;
     println!("Conversation: {:?}", conversation);
 
     let message = "Hello, how are you?".to_string();
@@ -174,29 +375,27 @@ async fn test_responses_api() {
         models.data[0].id.clone(),
         message.clone(),
         max_tokens,
+        api_key.clone(),
     )
     .await;
     println!("Response: {:?}", response);
-    assert_eq!(
-        response
-            .output
-            .iter()
-            .any(|o| if let ResponseOutputItem::Message { content, .. } = o {
-                content.iter().any(|c| {
-                    if let ResponseOutputContent::OutputText { text, .. } = c {
-                        println!("Text: {}", text);
-                        text.len() > max_tokens as usize
-                    } else {
-                        false
-                    }
-                })
-            } else {
-                false
-            }),
-        true
-    );
+    assert!(response.output.iter().any(|o| {
+        if let ResponseOutputItem::Message { content, .. } = o {
+            content.iter().any(|c| {
+                if let ResponseOutputContent::OutputText { text, .. } = c {
+                    println!("Text: {}", text);
+                    text.len() > max_tokens as usize
+                } else {
+                    false
+                }
+            })
+        } else {
+            false
+        }
+    }));
 
-    let conversation_items = list_conversation_items(&server, conversation.id).await;
+    let conversation_items =
+        list_conversation_items(&server, conversation.id, api_key.clone()).await;
     assert_eq!(conversation_items.data.len(), 2);
     match &conversation_items.data[0] {
         ConversationItem::Message { content, .. } => {
@@ -207,10 +406,13 @@ async fn test_responses_api() {
     }
 }
 
-async fn create_conversation(server: &axum_test::TestServer) -> api::models::ConversationObject {
+async fn create_conversation(
+    server: &axum_test::TestServer,
+    api_key: String,
+) -> api::models::ConversationObject {
     let response = server
         .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", api_key))
         .json(&serde_json::json!({
             "name": "Test Conversation",
             "description": "A test conversation"
@@ -220,13 +422,15 @@ async fn create_conversation(server: &axum_test::TestServer) -> api::models::Con
     response.json::<api::models::ConversationObject>()
 }
 
+#[allow(dead_code)]
 async fn get_conversation(
     server: &axum_test::TestServer,
     conversation_id: String,
+    api_key: String,
 ) -> api::models::ConversationObject {
     let response = server
         .get(format!("/v1/conversations/{conversation_id}").as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", api_key))
         .await;
     assert_eq!(response.status_code(), 200);
     response.json::<api::models::ConversationObject>()
@@ -235,10 +439,11 @@ async fn get_conversation(
 async fn list_conversation_items(
     server: &axum_test::TestServer,
     conversation_id: String,
+    api_key: String,
 ) -> api::models::ConversationItemList {
     let response = server
         .get(format!("/v1/conversations/{conversation_id}/items").as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", api_key))
         .await;
     assert_eq!(response.status_code(), 200);
     response.json::<api::models::ConversationItemList>()
@@ -250,10 +455,11 @@ async fn create_response(
     model: String,
     message: String,
     max_tokens: u32,
+    api_key: String,
 ) -> api::models::ResponseObject {
     let response = server
         .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", api_key))
         .json(&serde_json::json!({
             "conversation": {
                 "id": conversation_id,
@@ -275,10 +481,11 @@ async fn create_response_stream(
     model: String,
     message: String,
     max_tokens: u32,
+    api_key: String,
 ) -> (String, api::models::ResponseObject) {
     let response = server
         .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", api_key))
         .json(&serde_json::json!({
             "conversation": {
                 "id": conversation_id,
@@ -373,17 +580,19 @@ async fn test_conversations_api() {
 
     let server = axum_test::TestServer::new(app).unwrap();
 
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
     // Test that we can list conversations (should return empty array initially)
     let response = server
         .get("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", api_key))
         .await;
     assert_eq!(response.status_code(), 200);
 
     // Test creating a conversation
     let create_response = server
         .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", api_key))
         .json(&serde_json::json!({
             "name": "Test Conversation",
             "description": "A test conversation"
@@ -411,18 +620,19 @@ async fn test_streaming_responses_api() {
     let app = build_app(database, auth_components, domain_services);
 
     let server = axum_test::TestServer::new(app).unwrap();
+    let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Get available models
     let response = server
         .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", api_key))
         .await;
 
     let models = response.json::<api::models::ModelsResponse>();
     assert!(!models.data.is_empty());
 
     // Create a conversation
-    let conversation = create_conversation(&server).await;
+    let conversation = create_conversation(&server, api_key.clone()).await;
     println!("Conversation: {:?}", conversation);
 
     // Test streaming response
@@ -433,6 +643,7 @@ async fn test_streaming_responses_api() {
         models.data[0].id.clone(),
         message.clone(),
         50,
+        api_key.clone(),
     )
     .await;
 
@@ -446,23 +657,20 @@ async fn test_streaming_responses_api() {
     );
 
     // Verify the final response has content
-    assert_eq!(
-        streaming_response.output.iter().any(|o| {
-            if let ResponseOutputItem::Message { content, .. } = o {
-                content.iter().any(|c| {
-                    if let ResponseOutputContent::OutputText { text, .. } = c {
-                        println!("Final Response Text: {}", text);
-                        !text.is_empty()
-                    } else {
-                        false
-                    }
-                })
-            } else {
-                false
-            }
-        }),
-        true
-    );
+    assert!(streaming_response.output.iter().any(|o| {
+        if let ResponseOutputItem::Message { content, .. } = o {
+            content.iter().any(|c| {
+                if let ResponseOutputContent::OutputText { text, .. } = c {
+                    println!("Final Response Text: {}", text);
+                    !text.is_empty()
+                } else {
+                    false
+                }
+            })
+        } else {
+            false
+        }
+    }));
 
     // Verify streamed content matches final response content
     let final_text = streaming_response

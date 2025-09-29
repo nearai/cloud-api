@@ -1,4 +1,4 @@
-use crate::{conversions::authenticated_user_to_user_id, middleware::AuthenticatedUser, models::*};
+use crate::models::*;
 use axum::{
     extract::{Extension, Json, Path, Query, State},
     http::StatusCode,
@@ -14,8 +14,8 @@ use uuid::Uuid;
 // Helper functions for ID conversion
 fn parse_conversation_id(id_str: &str) -> Result<ConversationId, ConversationError> {
     // Handle both prefixed (conv_*) and raw UUID formats
-    let uuid = if id_str.starts_with("conv_") {
-        Uuid::parse_str(&id_str[5..])
+    let uuid = if let Some(stripped) = id_str.strip_prefix("conv_") {
+        Uuid::parse_str(stripped)
     } else {
         Uuid::parse_str(id_str)
     }
@@ -35,13 +35,31 @@ fn map_conversation_error_to_status(error: &ConversationError) -> StatusCode {
 }
 
 /// Create a new conversation
+///
+/// Creates a new conversation for the authenticated user.
+#[utoipa::path(
+    post,
+    path = "/conversations",
+    tag = "Conversations",
+    request_body = CreateConversationRequest,
+    responses(
+        (status = 201, description = "Conversation created successfully", body = ConversationObject),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn create_conversation(
     State(service): State<Arc<services::ConversationService>>,
-    Extension(user): Extension<AuthenticatedUser>,
+    Extension(api_key): Extension<services::auth::ApiKey>,
     Json(request): Json<CreateConversationRequest>,
 ) -> Result<(StatusCode, ResponseJson<ConversationObject>), (StatusCode, ResponseJson<ErrorResponse>)>
 {
-    debug!("Create conversation request from user: {}", user.0.id);
+    debug!("Create conversation request from key: {:?}", api_key);
 
     // Validate the request
     if let Err(error) = request.validate() {
@@ -55,7 +73,7 @@ pub async fn create_conversation(
     }
 
     let domain_request = ConversationRequest {
-        user_id: authenticated_user_to_user_id(user),
+        user_id: api_key.created_by_user_id.0.into(),
         metadata: request.metadata,
     };
 
@@ -64,7 +82,7 @@ pub async fn create_conversation(
             let http_conversation = convert_domain_conversation_to_http(domain_conversation);
             info!(
                 "Created conversation {} for user {}",
-                http_conversation.id, domain_request.user_id
+                http_conversation.id, api_key.created_by_user_id.0
             );
             Ok((StatusCode::CREATED, ResponseJson(http_conversation)))
         }
@@ -76,14 +94,35 @@ pub async fn create_conversation(
 }
 
 /// Get a conversation by ID
+///
+/// Returns details for a specific conversation.
+#[utoipa::path(
+    get,
+    path = "/conversations/{conversation_id}",
+    tag = "Conversations",
+    params(
+        ("conversation_id" = String, Path, description = "Conversation ID")
+    ),
+    responses(
+        (status = 200, description = "Conversation details", body = ConversationObject),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Conversation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn get_conversation(
     Path(conversation_id): Path<String>,
     State(service): State<Arc<services::ConversationService>>,
-    Extension(user): Extension<AuthenticatedUser>,
+    Extension(api_key): Extension<services::auth::ApiKey>,
 ) -> Result<ResponseJson<ConversationObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
         "Get conversation {} for user {}",
-        conversation_id, user.0.id
+        conversation_id, api_key.created_by_user_id.0
     );
 
     let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
@@ -96,10 +135,11 @@ pub async fn get_conversation(
         }
     };
 
-    let user_id = authenticated_user_to_user_id(user);
-
     match service
-        .get_conversation(&parsed_conversation_id, &user_id)
+        .get_conversation(
+            &parsed_conversation_id,
+            &api_key.created_by_user_id.0.into(),
+        )
         .await
     {
         Ok(Some(domain_conversation)) => {
@@ -121,15 +161,37 @@ pub async fn get_conversation(
 }
 
 /// Update a conversation
+///
+/// Updates a conversation's metadata.
+#[utoipa::path(
+    post,
+    path = "/conversations/{conversation_id}",
+    tag = "Conversations",
+    params(
+        ("conversation_id" = String, Path, description = "Conversation ID")
+    ),
+    request_body = UpdateConversationRequest,
+    responses(
+        (status = 200, description = "Conversation updated successfully", body = ConversationObject),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Conversation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn update_conversation(
     Path(conversation_id): Path<String>,
     State(service): State<Arc<services::ConversationService>>,
-    Extension(user): Extension<AuthenticatedUser>,
+    Extension(api_key): Extension<services::auth::ApiKey>,
     Json(request): Json<UpdateConversationRequest>,
 ) -> Result<ResponseJson<ConversationObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
         "Update conversation {} for user {}",
-        conversation_id, user.0.id
+        conversation_id, api_key.created_by_user_id.0
     );
 
     let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
@@ -142,18 +204,21 @@ pub async fn update_conversation(
         }
     };
 
-    let user_id = authenticated_user_to_user_id(user);
     let metadata = request.metadata.unwrap_or_else(|| serde_json::json!({}));
 
     match service
-        .update_conversation(&parsed_conversation_id, &user_id, metadata)
+        .update_conversation(
+            &parsed_conversation_id,
+            &api_key.created_by_user_id.0.into(),
+            metadata,
+        )
         .await
     {
         Ok(Some(domain_conversation)) => {
             let http_conversation = convert_domain_conversation_to_http(domain_conversation);
             info!(
                 "Updated conversation {} for user {}",
-                conversation_id, user_id
+                conversation_id, api_key.created_by_user_id.0
             );
             Ok(ResponseJson(http_conversation))
         }
@@ -172,14 +237,35 @@ pub async fn update_conversation(
 }
 
 /// Delete a conversation
+///
+/// Deletes a conversation permanently.
+#[utoipa::path(
+    delete,
+    path = "/conversations/{conversation_id}",
+    tag = "Conversations",
+    params(
+        ("conversation_id" = String, Path, description = "Conversation ID")
+    ),
+    responses(
+        (status = 200, description = "Conversation deleted successfully", body = ConversationDeleteResult),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Conversation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn delete_conversation(
     Path(conversation_id): Path<String>,
     State(service): State<Arc<services::ConversationService>>,
-    Extension(user): Extension<AuthenticatedUser>,
+    Extension(api_key): Extension<services::auth::ApiKey>,
 ) -> Result<ResponseJson<ConversationDeleteResult>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
         "Delete conversation {} for user {}",
-        conversation_id, user.0.id
+        conversation_id, api_key.created_by_user_id.0
     );
 
     let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
@@ -192,16 +278,17 @@ pub async fn delete_conversation(
         }
     };
 
-    let user_id = authenticated_user_to_user_id(user);
-
     match service
-        .delete_conversation(&parsed_conversation_id, &user_id)
+        .delete_conversation(
+            &parsed_conversation_id,
+            &api_key.created_by_user_id.0.into(),
+        )
         .await
     {
         Ok(true) => {
             info!(
                 "Deleted conversation {} for user {}",
-                conversation_id, user_id
+                conversation_id, api_key.created_by_user_id.0
             );
             Ok(ResponseJson(ConversationDeleteResult {
                 id: conversation_id,
@@ -224,20 +311,42 @@ pub async fn delete_conversation(
 }
 
 /// List conversations
+///
+/// Returns a list of conversations for the authenticated user.
+#[utoipa::path(
+    get,
+    path = "/conversations",
+    tag = "Conversations",
+    params(
+        ("limit" = Option<i32>, Query, description = "Maximum number of conversations to return"),
+        ("offset" = Option<i32>, Query, description = "Number of conversations to skip")
+    ),
+    responses(
+        (status = 200, description = "List of conversations", body = ConversationList),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn list_conversations(
     Query(params): Query<ListConversationsQuery>,
     State(service): State<Arc<services::ConversationService>>,
-    Extension(user): Extension<AuthenticatedUser>,
+    Extension(api_key): Extension<services::auth::ApiKey>,
 ) -> Result<ResponseJson<ConversationList>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
         "List conversations for user {} with limit={:?}, offset={:?}",
-        user.0.id, params.limit, params.offset
+        api_key.created_by_user_id.0, params.limit, params.offset
     );
 
-    let user_id = authenticated_user_to_user_id(user);
-
     match service
-        .list_conversations(&user_id, params.limit, params.offset)
+        .list_conversations(
+            &api_key.created_by_user_id.0.into(),
+            params.limit,
+            params.offset,
+        )
         .await
     {
         Ok(domain_conversations) => {
@@ -258,7 +367,7 @@ pub async fn list_conversations(
             // Determine if there are more conversations
             let has_more = params
                 .limit
-                .map_or(false, |limit| http_conversations.len() >= limit as usize);
+                .is_some_and(|limit| http_conversations.len() >= limit as usize);
 
             Ok(ResponseJson(ConversationList {
                 object: "list".to_string(),
@@ -276,15 +385,38 @@ pub async fn list_conversations(
 }
 
 /// List items in a conversation (extracts from responses)
+///
+/// Returns items (messages, responses, etc.) within a specific conversation.
+#[utoipa::path(
+    get,
+    path = "/conversations/{conversation_id}/items",
+    tag = "Conversations",
+    params(
+        ("conversation_id" = String, Path, description = "Conversation ID"),
+        ("limit" = Option<i32>, Query, description = "Maximum number of items to return"),
+        ("offset" = Option<i32>, Query, description = "Number of items to skip")
+    ),
+    responses(
+        (status = 200, description = "List of conversation items", body = ConversationItemList),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Conversation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn list_conversation_items(
     Path(conversation_id): Path<String>,
     Query(params): Query<ListItemsQuery>,
     State(service): State<Arc<services::ConversationService>>,
-    Extension(user): Extension<AuthenticatedUser>,
+    Extension(api_key): Extension<services::auth::ApiKey>,
 ) -> Result<ResponseJson<ConversationItemList>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
         "List items in conversation {} for user {}",
-        conversation_id, user.0.id
+        conversation_id, api_key.created_by_user_id.0
     );
 
     let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
@@ -297,10 +429,12 @@ pub async fn list_conversation_items(
         }
     };
 
-    let user_id = authenticated_user_to_user_id(user);
-
     match service
-        .get_conversation_messages(&parsed_conversation_id, &user_id, params.limit)
+        .get_conversation_messages(
+            &parsed_conversation_id,
+            &api_key.created_by_user_id.0.into(),
+            params.limit,
+        )
         .await
     {
         Ok(messages) => {

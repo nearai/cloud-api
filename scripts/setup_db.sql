@@ -1,11 +1,5 @@
--- Database setup script for platform-api
--- Run this to create the database
-
--- Create database (run as superuser)
-CREATE DATABASE platform_api;
-
--- Connect to the database
-\c platform_api;
+-- Database initialization script for platform-api
+-- This script runs automatically when PostgreSQL starts in Docker
 
 -- Create UUID extension if not exists
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";

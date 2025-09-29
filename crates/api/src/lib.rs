@@ -1,12 +1,15 @@
 pub mod conversions;
 pub mod middleware;
 pub mod models;
+pub mod openapi;
 pub mod routes;
 
 use crate::{
-    middleware::{auth_middleware, AuthState},
+    middleware::{auth::auth_middleware_with_api_key, auth_middleware, AuthState},
+    openapi::ApiDoc,
     routes::{
         api::{build_management_router, AppState},
+        attestation::{get_attestation_report, get_signature, verify_attestation},
         auth::{
             auth_success, current_user, github_login, google_login, login_page, logout,
             oauth_callback, StateStore,
@@ -17,18 +20,23 @@ use crate::{
 };
 use axum::{
     middleware::from_fn_with_state,
+    response::Html,
     routing::{get, post},
     Router,
 };
 use config::ApiConfig;
 use database::{
-    repositories::{ApiKeyRepository, PgOrganizationRepository, SessionRepository, UserRepository},
+    repositories::{
+        ApiKeyRepository, PgOrganizationRepository, SessionRepository, UserRepository,
+        WorkspaceRepository,
+    },
     Database,
 };
 use inference_providers::{InferenceProvider, VLlmConfig, VLlmProvider};
 use services::auth::{AuthService, AuthServiceTrait, MockAuthService, OAuthManager};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
+use utoipa::OpenApi;
 
 /// Service initialization components
 pub struct AuthComponents {
@@ -38,39 +46,63 @@ pub struct AuthComponents {
     pub auth_state_middleware: AuthState,
 }
 
+#[derive(Clone)]
 pub struct DomainServices {
     pub conversation_service: Arc<services::ConversationService>,
     pub response_service: Arc<services::ResponseService>,
     pub completion_service: Arc<services::CompletionServiceImpl>,
     pub models_service: Arc<services::models::ModelsServiceImpl>,
     pub mcp_manager: Arc<services::mcp::McpClientManager>,
+    pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+    pub attestation_service: Arc<services::attestation::AttestationService>,
+    pub organization_service: Arc<services::organization::OrganizationService>,
 }
 
-/// Initialize database connection
+/// Initialize database connection and run migrations
 pub async fn init_database() -> Arc<Database> {
     let db_config = config::DatabaseConfig::default();
-    Arc::new(
+    let database = Arc::new(
         Database::from_config(&db_config)
             .await
             .expect("Failed to connect to database"),
-    )
+    );
+
+    // Run database migrations
+    tracing::info!("Starting database migrations...");
+    database
+        .run_migrations()
+        .await
+        .expect("Failed to run database migrations");
+    tracing::info!("Database migrations completed.");
+
+    database
 }
 
 /// Initialize database with custom config for testing
 pub async fn init_database_with_config(db_config: &config::DatabaseConfig) -> Arc<Database> {
-    Arc::new(
+    let database = Arc::new(
         Database::from_config(db_config)
             .await
             .expect("Failed to connect to database"),
-    )
+    );
+
+    // Run database migrations
+    database
+        .run_migrations()
+        .await
+        .expect("Failed to run database migrations");
+
+    database
 }
 
 /// Initialize authentication services and middleware
 pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthComponents {
-    // Choose auth service implementation based on config
     let auth_service: Arc<dyn AuthServiceTrait> = if config.auth.mock {
-        // Use MockAuthService when mock auth is enabled
-        Arc::new(MockAuthService)
+        // TODO: fix this, it should not use the database pool
+        println!("config: {:?}", config);
+        Arc::new(MockAuthService {
+            apikey_repository: Arc::new(ApiKeyRepository::new(database.pool().clone())),
+        })
     } else {
         // Create repository instances
         let user_repository = Arc::new(UserRepository::new(database.pool().clone()))
@@ -83,14 +115,23 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
             Arc::new(PgOrganizationRepository::new(database.pool().clone()))
                 as Arc<dyn services::organization::ports::OrganizationRepository>;
 
-        // Create AuthService
+        // Create AuthService with workspace repository
+        let workspace_repository_for_auth =
+            Arc::new(WorkspaceRepository::new(database.pool().clone()))
+                as Arc<dyn services::auth::ports::WorkspaceRepository>;
+
         Arc::new(AuthService::new(
             user_repository,
             session_repository,
             api_key_repository,
             organization_repository,
+            workspace_repository_for_auth,
         ))
     };
+
+    // Create workspace repository
+    let workspace_repository = Arc::new(WorkspaceRepository::new(database.pool().clone()))
+        as Arc<dyn services::auth::ports::WorkspaceRepository>;
 
     // Create OAuth manager
     tracing::info!("Setting up OAuth providers");
@@ -99,7 +140,11 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
 
     // Create AuthState for middleware
     let oauth_manager_arc = Arc::new(oauth_manager);
-    let auth_state_middleware = AuthState::new(oauth_manager_arc.clone(), auth_service.clone());
+    let auth_state_middleware = AuthState::new(
+        oauth_manager_arc.clone(),
+        auth_service.clone(),
+        workspace_repository.clone(),
+    );
 
     AuthComponents {
         auth_service,
@@ -144,6 +189,12 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
         database.pool().clone(),
     ));
     let response_repo = Arc::new(database::PgResponseRepository::new(database.pool().clone()));
+    let organization_repo = Arc::new(database::PgOrganizationRepository::new(
+        database.pool().clone(),
+    ));
+    let attestation_repo = Arc::new(database::PgAttestationRepository::new(
+        database.pool().clone(),
+    ));
 
     // Create conversation service
     let conversation_service = Arc::new(services::ConversationService::new(
@@ -154,6 +205,12 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
     // Create inference provider pool
     let inference_provider_pool = init_inference_providers(config).await;
 
+    // Create attestation service
+    let attestation_service = Arc::new(services::attestation::AttestationService::new(
+        attestation_repo,
+        inference_provider_pool.clone(),
+    ));
+
     // Create models service
     let models_service = Arc::new(services::models::ModelsServiceImpl::new(
         inference_provider_pool.clone(),
@@ -162,17 +219,22 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
     // Create completion service
     let completion_service = Arc::new(services::CompletionServiceImpl::new(
         inference_provider_pool.clone(),
+        attestation_service.clone(),
     ));
 
     // Create response service
     let response_service = Arc::new(services::ResponseService::new(
         response_repo,
-        inference_provider_pool,
+        inference_provider_pool.clone(),
         conversation_service.clone(),
     ));
 
     // Create MCP client manager
     let mcp_manager = Arc::new(services::mcp::McpClientManager::new());
+
+    let organization_service = Arc::new(services::organization::OrganizationService::new(
+        organization_repo,
+    ));
 
     DomainServices {
         conversation_service,
@@ -180,6 +242,9 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
         completion_service,
         models_service,
         mcp_manager,
+        inference_provider_pool,
+        attestation_service,
+        organization_service,
     }
 }
 
@@ -216,6 +281,16 @@ pub fn build_app(
     auth_components: AuthComponents,
     domain_services: DomainServices,
 ) -> Router {
+    build_app_with_config(database, auth_components, domain_services, None)
+}
+
+/// Build the complete application router with config
+pub fn build_app_with_config(
+    database: Arc<Database>,
+    auth_components: AuthComponents,
+    domain_services: DomainServices,
+    _config: Option<&ApiConfig>,
+) -> Router {
     // Create organization service using the database's organization repository
     let organization_repo = Arc::new(database::PgOrganizationRepository::new(
         database.pool().clone(),
@@ -232,6 +307,7 @@ pub fn build_app(
         completion_service: domain_services.completion_service.clone(),
         models_service: domain_services.models_service.clone(),
         auth_service: auth_components.auth_service.clone(),
+        attestation_service: domain_services.attestation_service.clone(),
     };
 
     // Build individual route groups
@@ -255,19 +331,33 @@ pub fn build_app(
         &auth_components.auth_state_middleware,
     );
 
-    let management_routes =
-        build_management_router(app_state, auth_components.auth_state_middleware);
+    let management_routes = build_management_router(
+        app_state.clone(),
+        auth_components.auth_state_middleware.clone(),
+    );
 
-    // Combine all routes under /v1
-    Router::new().nest(
-        "/v1",
-        Router::new()
-            .nest("/auth", auth_routes)
-            .merge(completion_routes)
-            .merge(response_routes)
-            .merge(conversation_routes)
-            .merge(management_routes),
-    )
+    let workspace_routes =
+        build_workspace_routes(app_state.clone(), &auth_components.auth_state_middleware);
+
+    let attestation_routes =
+        build_attestation_routes(app_state, &auth_components.auth_state_middleware);
+
+    // Build OpenAPI and documentation routes
+    let openapi_routes = build_openapi_routes();
+
+    Router::new()
+        .nest(
+            "/v1",
+            Router::new()
+                .nest("/auth", auth_routes)
+                .merge(completion_routes)
+                .merge(response_routes)
+                .merge(conversation_routes)
+                .merge(management_routes)
+                .merge(workspace_routes)
+                .merge(attestation_routes.clone()),
+        )
+        .merge(openapi_routes)
 }
 
 /// Build authentication routes
@@ -306,7 +396,7 @@ pub fn build_completion_routes(app_state: AppState, auth_state_middleware: &Auth
         .with_state(app_state)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
-            auth_middleware,
+            auth_middleware_with_api_key,
         ))
 }
 
@@ -333,7 +423,7 @@ pub fn build_response_routes(
         .with_state(response_service)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
-            auth_middleware,
+            auth_middleware_with_api_key,
         ))
 }
 
@@ -364,13 +454,230 @@ pub fn build_conversation_routes(
         .with_state(conversation_service)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
+            auth_middleware_with_api_key,
+        ))
+}
+
+/// Build attestation routes with auth
+pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
+    Router::new()
+        .route("/signature/{chat_id}", get(get_signature))
+        .route("/verify/{chat_id}", post(verify_attestation))
+        .route("/attestation/report", get(get_attestation_report))
+        .with_state(app_state)
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            auth_middleware_with_api_key,
+        ))
+}
+
+/// Build workspace routes with auth
+pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
+    use crate::routes::workspaces::*;
+
+    Router::new()
+        // Workspace management routes
+        .route(
+            "/organizations/{org_id}/workspaces",
+            get(list_organization_workspaces).post(create_workspace),
+        )
+        .route(
+            "/workspaces/{workspace_id}",
+            get(get_workspace)
+                .put(update_workspace)
+                .delete(delete_workspace),
+        )
+        // Workspace API key management
+        .route(
+            "/workspaces/{workspace_id}/api-keys",
+            get(list_workspace_api_keys).post(create_workspace_api_key),
+        )
+        .route(
+            "/workspaces/{workspace_id}/api-keys/{key_id}",
+            axum::routing::delete(revoke_workspace_api_key),
+        )
+        .with_state(app_state)
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
             auth_middleware,
         ))
+}
+
+/// Build OpenAPI documentation routes  
+pub fn build_openapi_routes() -> Router {
+    Router::new().route("/docs", get(swagger_ui_handler)).route(
+        "/api-docs/openapi.json",
+        get(|| async { axum::Json(ApiDoc::openapi()) }),
+    )
+}
+
+/// Serve Swagger UI HTML page
+async fn swagger_ui_handler() -> Html<String> {
+    Html(r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Platform API Documentation</title>
+    <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui.css" />
+    <style>
+        html {
+            box-sizing: border-box;
+            overflow: -moz-scrollbars-vertical;
+            overflow-y: scroll;
+        }
+        *, *:before, *:after {
+            box-sizing: inherit;
+        }
+        body {
+            margin:0;
+            background: #fafafa;
+        }
+    </style>
+</head>
+<body>
+    <div id="swagger-ui"></div>
+    <script src="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui-bundle.js"></script>
+    <script src="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui-standalone-preset.js"></script>
+    <script>
+    window.onload = function() {
+        // Dynamically determine the server URL based on current location
+        const protocol = window.location.protocol;
+        const host = window.location.host;
+        const baseUrl = `${protocol}//${host}/v1`;
+        
+        // Fetch the OpenAPI spec and modify it to include the dynamic server
+        fetch('/api-docs/openapi.json')
+            .then(response => response.json())
+            .then(spec => {
+                // Add the current server to the spec
+                spec.servers = [{ 
+                    url: baseUrl,
+                    description: 'Current Server'
+                }];
+                
+                SwaggerUIBundle({
+                    spec: spec,
+                    dom_id: '#swagger-ui',
+                    deepLinking: true,
+                    presets: [
+                        SwaggerUIBundle.presets.apis,
+                        SwaggerUIStandalonePreset
+                    ],
+                    plugins: [
+                        SwaggerUIBundle.plugins.DownloadUrl
+                    ],
+                    layout: "StandaloneLayout",
+                    // Make authorization more prominent
+                    persistAuthorization: true,
+                    // Show auth section by default
+                    docExpansion: 'list',
+                    // Configure request interceptor for debugging
+                    requestInterceptor: function(req) {
+                        console.log('Swagger UI Request:', req);
+                        return req;
+                    }
+                });
+            })
+            .catch(error => {
+                console.error('Failed to load OpenAPI spec:', error);
+                // Fallback to URL-based loading if fetch fails
+                SwaggerUIBundle({
+                    url: '/api-docs/openapi.json',
+                    dom_id: '#swagger-ui',
+                    deepLinking: true,
+                    presets: [
+                        SwaggerUIBundle.presets.apis,
+                        SwaggerUIStandalonePreset
+                    ],
+                    plugins: [
+                        SwaggerUIBundle.plugins.DownloadUrl
+                    ],
+                    layout: "StandaloneLayout",
+                    // Make authorization more prominent
+                    persistAuthorization: true,
+                    // Show auth section by default
+                    docExpansion: 'list',
+                    // Configure request interceptor for debugging
+                    requestInterceptor: function(req) {
+                        console.log('Swagger UI Request:', req);
+                        return req;
+                    }
+                });
+            });
+    };
+    </script>
+</body>
+</html>"#.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openapi::ApiDoc;
+
+    #[test]
+    fn test_openapi_spec_generation() {
+        // Test that we can generate the OpenAPI spec without errors
+        let spec = ApiDoc::openapi();
+
+        // Basic validation
+        assert_eq!(spec.info.title, "Platform API");
+        assert_eq!(spec.info.version, "1.0.0");
+
+        // Ensure we have components defined
+        assert!(spec.components.is_some());
+        let components = spec.components.as_ref().unwrap();
+
+        // Check that some of our schemas are present
+        assert!(components.schemas.contains_key("ChatCompletionRequest"));
+        assert!(components.schemas.contains_key("ChatCompletionResponse"));
+        assert!(components.schemas.contains_key("Message"));
+        assert!(components.schemas.contains_key("ModelsResponse"));
+        assert!(components.schemas.contains_key("ErrorResponse"));
+
+        // Check that security schemes are configured
+        assert!(components.security_schemes.contains_key("bearer"));
+        assert!(components.security_schemes.contains_key("api_key"));
+
+        // Verify servers are not hardcoded (will be set dynamically on client)
+        assert!(spec.servers.is_none() || spec.servers.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_swagger_ui_html_contains_required_elements() {
+        // Test that the Swagger UI HTML contains the necessary elements
+        use axum::response::Html;
+
+        // Get the HTML response
+        let html = tokio_test::block_on(swagger_ui_handler());
+        let Html(html_content) = html;
+
+        // Verify essential Swagger UI elements are present
+        assert!(
+            html_content.contains("swagger-ui"),
+            "HTML should contain swagger-ui div"
+        );
+        assert!(
+            html_content.contains("swagger-ui-bundle.js"),
+            "HTML should include Swagger UI bundle"
+        );
+        assert!(
+            html_content.contains("swagger-ui-standalone-preset.js"),
+            "HTML should include standalone preset"
+        );
+        assert!(
+            html_content.contains("/api-docs/openapi.json"),
+            "HTML should reference our OpenAPI spec URL"
+        );
+        assert!(
+            html_content.contains("Platform API Documentation"),
+            "HTML should have the correct title"
+        );
+        assert!(
+            html_content.contains("SwaggerUIBundle"),
+            "HTML should initialize SwaggerUIBundle"
+        );
+    }
 
     /// Example of how to set up the application for E2E testing
     #[tokio::test]

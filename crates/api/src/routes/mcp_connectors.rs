@@ -13,7 +13,7 @@ use database::{
     Database,
 };
 use serde::{Deserialize, Serialize};
-use services::{McpClientManager, McpError, organization::ports::OrganizationRepository};
+use services::{organization::ports::OrganizationRepository, McpClientManager, McpError};
 use std::sync::Arc;
 use tracing::{error, info};
 use uuid::Uuid;

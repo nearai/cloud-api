@@ -5,10 +5,9 @@ use axum::{
     response::Response,
 };
 use database::User as DbUser;
-use services::auth::{AuthError, AuthServiceTrait, OAuthManager};
+use services::auth::{AuthError, AuthServiceTrait, OAuthManager, SessionToken};
 use std::sync::Arc;
 use tracing::{debug, error};
-use uuid::Uuid;
 
 /// Authenticated user information passed to route handlers
 #[derive(Clone)]
@@ -112,16 +111,9 @@ pub async fn auth_middleware(
         debug!("Found Authorization header: {}", auth_value);
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
             debug!("Extracted Bearer token: {}", token);
-            match Uuid::parse_str(token) {
-                Ok(uuid) => {
-                    debug!("Successfully parsed UUID: {}", uuid);
-                    authenticate_session(&state, uuid).await
-                }
-                Err(e) => {
-                    debug!("Failed to parse token as UUID: {}", e);
-                    Err(StatusCode::UNAUTHORIZED)
-                }
-            }
+            // Pass the token directly as SessionToken
+            let session_token = SessionToken(token.to_string());
+            authenticate_session(&state, session_token).await
         } else {
             debug!("Authorization header does not start with 'Bearer '");
             Err(StatusCode::UNAUTHORIZED)
@@ -142,7 +134,10 @@ pub async fn auth_middleware(
 }
 
 /// Authenticate using session token
-async fn authenticate_session(state: &AuthState, token: Uuid) -> Result<DbUser, StatusCode> {
+async fn authenticate_session(
+    state: &AuthState,
+    token: SessionToken,
+) -> Result<DbUser, StatusCode> {
     debug!("Authenticating session token: {}", token);
     // Use auth service
     {

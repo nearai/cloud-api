@@ -907,9 +907,44 @@ pub struct UpdateOrganizationMemberRequest {
     pub role: MemberRole,
 }
 
-/// User response model
+/// Public organization member response (for regular members)
+/// Contains member info with limited user details
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct UserResponse {
+pub struct PublicOrganizationMemberResponse {
+    pub id: String,
+    pub organization_id: String,
+    pub role: MemberRole,
+    pub joined_at: DateTime<Utc>,
+    pub user: PublicUserResponse,
+}
+
+/// Admin organization member response (for owners/admins)
+/// Contains member info with full user details including sensitive data
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminOrganizationMemberResponse {
+    pub id: String,
+    pub organization_id: String,
+    pub role: MemberRole,
+    pub joined_at: DateTime<Utc>,
+    pub invited_by: Option<String>,
+    pub user: AdminUserResponse,
+}
+
+/// Public user response model (for regular members)
+/// Only contains non-sensitive information visible to all organization members
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PublicUserResponse {
+    pub id: String,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Admin user response model (for owners/admins)
+/// Contains sensitive information only visible to organization owners/admins
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminUserResponse {
     pub id: String,
     pub email: String,
     pub username: Option<String>,
@@ -917,6 +952,7 @@ pub struct UserResponse {
     pub avatar_url: Option<String>,
     pub created_at: DateTime<Utc>,
     pub last_login_at: Option<DateTime<Utc>>,
+    pub is_active: bool,
 }
 
 /// API Key response model

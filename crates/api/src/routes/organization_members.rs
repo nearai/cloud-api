@@ -1,14 +1,33 @@
-use crate::{middleware::AuthenticatedUser, routes::api::AppState};
+use crate::{
+    conversions::{db_user_to_admin_user, db_user_to_public_user},
+    middleware::AuthenticatedUser,
+    models::{AdminOrganizationMemberResponse, MemberRole, PublicOrganizationMemberResponse},
+    routes::api::AppState,
+};
 use axum::{
     extract::{Extension, Json, Path, State},
     http::StatusCode,
 };
 use database::{AddOrganizationMemberRequest, OrganizationMember, UpdateOrganizationMemberRequest};
 use serde::Serialize;
+use services::organization::ports::MemberRole as ServicesMemberRole;
 use services::organization::ports::OrganizationRepository;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
+/// Union type for organization member responses
+/// Used to return different data based on requester's permissions
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum OrganizationMemberResponse {
+    /// Public response for regular members (limited user info)
+    Public(PublicOrganizationMemberResponse),
+    /// Admin response for owners/admins (full user info including sensitive data)
+    Admin(AdminOrganizationMemberResponse),
+}
+
+/// DEPRECATED: Legacy response type that exposes too much sensitive data
+#[deprecated(note = "Use OrganizationMemberResponse enum instead")]
 #[derive(Debug, Serialize)]
 pub struct OrganizationMemberWithUser {
     #[serde(flatten)]
@@ -204,33 +223,52 @@ pub async fn remove_organization_member(
     }
 }
 
-/// List organization members
+/// List organization members with role-based data filtering
+///
+/// Returns different levels of user information based on the requester's role:
+/// - Regular members: See limited user info (username, display name, avatar)
+/// - Owners/Admins: See full user info including email, last login, etc.
 pub async fn list_organization_members(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
-) -> Result<Json<Vec<OrganizationMemberWithUser>>, StatusCode> {
+) -> Result<Json<Vec<OrganizationMemberResponse>>, StatusCode> {
     debug!(
         "Listing members for organization: {} for user: {}",
         org_id, user.0.id
     );
 
-    // Check if user has access to this organization
-    match app_state
+    // Check if user has access to this organization and get their role
+    let requester_role = match app_state
         .db
         .organizations
         .get_member(org_id, user.0.id)
         .await
     {
-        Ok(Some(_)) => {
-            // User is a member, allow access
+        Ok(Some(member)) => member.role,
+        Ok(None) => {
+            warn!(
+                "User {} attempted to access organization {} members without membership",
+                user.0.id, org_id
+            );
+            return Err(StatusCode::FORBIDDEN);
         }
-        Ok(None) => return Err(StatusCode::FORBIDDEN),
         Err(e) => {
             error!("Failed to check organization membership: {}", e);
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
-    }
+    };
+
+    debug!(
+        "User {} has role {:?} in organization {}",
+        user.0.id, requester_role, org_id
+    );
+
+    // Determine if requester can see sensitive user data
+    let can_see_sensitive_data = matches!(
+        requester_role,
+        ServicesMemberRole::Owner | ServicesMemberRole::Admin
+    );
 
     // Get organization members
     let members = match app_state.db.organizations.list_members(org_id).await {
@@ -241,45 +279,54 @@ pub async fn list_organization_members(
         }
     };
 
-    // Get user details for each member
-    let mut members_with_users = Vec::new();
+    // Get user details for each member with appropriate data filtering
+    let mut member_responses = Vec::new();
     for member in members {
         if let Ok(Some(user_data)) = app_state.db.users.get_by_id(member.user_id.0).await {
-            members_with_users.push(OrganizationMemberWithUser {
-                member: crate::conversions::services_member_to_db_member(member),
-                user: user_data,
-            });
+            let response = if can_see_sensitive_data {
+                // Admin view: return full user details including sensitive data
+                OrganizationMemberResponse::Admin(AdminOrganizationMemberResponse {
+                    id: format!("{}_{}", member.organization_id.0, member.user_id.0), // Generate consistent ID
+                    organization_id: member.organization_id.0.to_string(),
+                    role: convert_services_role_to_api(&member.role),
+                    joined_at: member.joined_at,
+                    invited_by: None, // Services model doesn't include invited_by info
+                    user: db_user_to_admin_user(&user_data),
+                })
+            } else {
+                // Public view: return limited user details (no email, last_login, etc.)
+                OrganizationMemberResponse::Public(PublicOrganizationMemberResponse {
+                    id: format!("{}_{}", member.organization_id.0, member.user_id.0), // Generate consistent ID
+                    organization_id: member.organization_id.0.to_string(),
+                    role: convert_services_role_to_api(&member.role),
+                    joined_at: member.joined_at,
+                    user: db_user_to_public_user(&user_data),
+                })
+            };
+
+            member_responses.push(response);
         }
     }
 
-    Ok(Json(members_with_users))
-}
-
-/// Get current user's role in an organization
-pub async fn get_my_organization_role(
-    State(app_state): State<AppState>,
-    Extension(user): Extension<AuthenticatedUser>,
-    Path(org_id): Path<Uuid>,
-) -> Result<Json<OrganizationMember>, StatusCode> {
     debug!(
-        "Getting role for user: {} in organization: {}",
-        user.0.id, org_id
+        "Returning {} members for organization {} with {} access level",
+        member_responses.len(),
+        org_id,
+        if can_see_sensitive_data {
+            "admin"
+        } else {
+            "public"
+        }
     );
 
-    match app_state
-        .db
-        .organizations
-        .get_member(org_id, user.0.id)
-        .await
-    {
-        Ok(Some(member)) => {
-            let db_member = crate::conversions::services_member_to_db_member(member);
-            Ok(Json(db_member))
-        }
-        Ok(None) => Err(StatusCode::NOT_FOUND),
-        Err(e) => {
-            error!("Failed to get organization member: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+    Ok(Json(member_responses))
+}
+
+/// Helper function to convert services member role to API member role
+fn convert_services_role_to_api(role: &ServicesMemberRole) -> MemberRole {
+    match role {
+        ServicesMemberRole::Owner => MemberRole::Owner,
+        ServicesMemberRole::Admin => MemberRole::Admin,
+        ServicesMemberRole::Member => MemberRole::Member,
     }
 }

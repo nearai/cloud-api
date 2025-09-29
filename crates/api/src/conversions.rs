@@ -372,19 +372,6 @@ pub fn authenticated_user_to_user_id(user: AuthenticatedUser) -> services::UserI
     services::UserId(user.0.id)
 }
 
-/// Convert services User to API UserResponse
-pub fn services_user_to_api_response(user: services::auth::User) -> crate::models::UserResponse {
-    crate::models::UserResponse {
-        id: user.id.0.to_string(), // UserId contains a Uuid
-        email: user.email,
-        username: Some(user.username), // Convert String to Option<String>
-        display_name: user.display_name,
-        avatar_url: user.avatar_url,
-        created_at: user.created_at,
-        last_login_at: user.last_login, // Field is called last_login, not last_login_at
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,5 +418,31 @@ mod tests {
         assert_eq!(domain_params.max_tokens, Some(100));
         assert_eq!(domain_params.temperature, Some(0.7));
         assert_eq!(domain_params.stop, Some(vec!["\\n".to_string()]));
+    }
+}
+
+// Secure user conversion functions
+/// Convert database::User to PublicUserResponse (safe for all members)
+pub fn db_user_to_public_user(user: &database::User) -> PublicUserResponse {
+    PublicUserResponse {
+        id: user.id.to_string(),
+        username: Some(user.username.clone()),
+        display_name: user.display_name.clone(),
+        avatar_url: user.avatar_url.clone(),
+        created_at: user.created_at,
+    }
+}
+
+/// Convert database::User to AdminUserResponse (for owners/admins only)  
+pub fn db_user_to_admin_user(user: &database::User) -> AdminUserResponse {
+    AdminUserResponse {
+        id: user.id.to_string(),
+        email: user.email.clone(),
+        username: Some(user.username.clone()),
+        display_name: user.display_name.clone(),
+        avatar_url: user.avatar_url.clone(),
+        created_at: user.created_at,
+        last_login_at: user.last_login_at,
+        is_active: user.is_active,
     }
 }

@@ -34,17 +34,11 @@ dstack_client:
 auth:
   mock: true
   
-  # GitHub OAuth Configuration Example
-  # 
-  # To use GitHub OAuth:
-  # 1. Go to https://github.com/settings/developers
-  # 2. Create a new OAuth App
-  # 3. Set Authorization callback URL to: http://localhost:3000/v1/auth/callback
-  # 4. Copy Client ID and Client Secret
+
   github:
     client_id: "Ov23liu1DaGN6i5o8DwW"
     client_secret: "77c835278ff4a9411f3f4267e1f1d37080a9dda1"
-    redirect_url: "http://localhost:3000/v1/auth/callback"
+    redirect_url: "http://localhost:3001/auth/callback"  # Frontend callback URL
 
 database:
   host: "postgres"  # Docker service name

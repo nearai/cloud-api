@@ -76,9 +76,13 @@ impl InferenceProvider for VLlmProvider {
 
     async fn get_attestation_report(
         &self,
-        _signing_algo: Option<&str>,
+        model: String,
+        _signing_algo: Option<String>,
     ) -> Result<AttestationReport, CompletionError> {
-        let url = format!("{}/v1/attestation/report", self.config.base_url);
+        let url = format!(
+            "{}/v1/attestation/report?model={}",
+            self.config.base_url, model
+        );
         let response = self
             .client
             .get(&url)

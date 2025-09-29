@@ -1,3 +1,4 @@
+pub mod attestation;
 pub mod auth;
 pub mod completions;
 pub mod conversations;

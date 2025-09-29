@@ -273,12 +273,7 @@ impl ResponseService {
 
     /// Helper method to create the streaming events from LLM stream
     fn create_event_stream(
-        llm_stream: Pin<
-            Box<
-                dyn Stream<Item = Result<StreamChunk, inference_providers::models::CompletionError>>
-                    + Send,
-            >,
-        >,
+        llm_stream: inference_providers::StreamingResult,
         response_id: ResponseId,
         response_repository: Arc<dyn ports::ResponseRepository>,
         user_id: UserId,

@@ -123,6 +123,7 @@ pub enum McpError {
 // Repository traits
 #[async_trait]
 pub trait McpConnectorRepository: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     async fn create(
         &self,
         organization_id: OrganizationId,
@@ -139,6 +140,7 @@ pub trait McpConnectorRepository: Send + Sync {
         organization_id: OrganizationId,
     ) -> anyhow::Result<Option<McpConnector>>;
 
+    #[allow(clippy::too_many_arguments)]
     async fn update(
         &self,
         id: McpConnectorId,
@@ -283,6 +285,7 @@ pub trait McpService: Send + Sync {
     ) -> Result<McpConnector, McpError>;
 
     /// Update an existing MCP connector
+    #[allow(clippy::too_many_arguments)]
     async fn update_connector(
         &self,
         connector_id: McpConnectorId,

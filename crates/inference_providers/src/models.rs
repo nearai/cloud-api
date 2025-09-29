@@ -494,7 +494,173 @@ pub enum ListModelsError {
     Unknown,
 }
 
-#[derive(Debug, Error)]
+/// Chat signature for cryptographic verification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatSignature {
+    /// The text being signed (typically contains hashes)
+    pub text: String,
+    /// The cryptographic signature
+    pub signature: String,
+    /// The address that created the signature
+    pub signing_address: String,
+    /// The signing algorithm used (e.g., "ecdsa")
+    pub signing_algo: String,
+}
+
+/// Main attestation report response from /v1/attestation/report
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttestationReport {
+    /// Cryptographic signing address
+    /// - ECDSA: Ethereum-style address (e.g., "0x1234567890abcdef...")  
+    /// - Ed25519: Public key as hex string
+    pub signing_address: String,
+
+    /// Base64-encoded Intel TDX quote proving CPU-level attestation
+    pub intel_quote: String,
+
+    /// JSON string containing NVIDIA GPU attestation evidence
+    /// Must be parsed separately into NvidiaPayload
+    pub nvidia_payload: String,
+
+    /// TDX event log data as JSON object
+    pub event_log: serde_json::Value,
+
+    /// Additional TDX/tappd information as JSON object  
+    pub info: serde_json::Value,
+
+    /// Array of cached attestation reports (same structure as this object)
+    #[serde(default)]
+    pub all_attestations: Vec<AttestationReport>,
+}
+
+/// NVIDIA GPU attestation payload (parsed from nvidia_payload JSON string)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NvidiaPayload {
+    /// Public key used as nonce for attestation
+    pub nonce: String,
+
+    /// List of GPU attestation evidence
+    pub evidence_list: Vec<serde_json::Value>,
+
+    /// GPU architecture (e.g., "HOPPER")
+    pub arch: String,
+}
+
+/// Complete attestation data structure (internal proxy representation)
+/// This matches what the proxy stores in cache
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttestationData {
+    pub ecdsa: AttestationReport,
+    pub ed25519: AttestationReport,
+}
+
+/// Request parameters for /v1/attestation/report endpoint
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttestationReportParams {
+    /// Signing algorithm: "ecdsa" or "ed25519" (defaults to "ecdsa")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing_algo: Option<String>,
+}
+
+impl AttestationReport {
+    /// Parse the nvidia_payload JSON string into a structured object
+    pub fn parse_nvidia_payload(&self) -> Result<NvidiaPayload, serde_json::Error> {
+        serde_json::from_str(&self.nvidia_payload)
+    }
+
+    /// Verify this is a valid signing address format
+    pub fn is_valid_ecdsa_address(&self) -> bool {
+        self.signing_address.starts_with("0x") && self.signing_address.len() == 42
+    }
+
+    /// Verify this is a valid Ed25519 public key format
+    pub fn is_valid_ed25519_pubkey(&self) -> bool {
+        self.signing_address.len() == 64
+            && self.signing_address.chars().all(|c| c.is_ascii_hexdigit())
+    }
+}
+
+impl AttestationReportParams {
+    pub fn new() -> Self {
+        Self {
+            signing_algo: None, // Defaults to ECDSA
+        }
+    }
+
+    pub fn with_ecdsa() -> Self {
+        Self {
+            signing_algo: Some("ecdsa".to_string()),
+        }
+    }
+
+    pub fn with_ed25519() -> Self {
+        Self {
+            signing_algo: Some("ed25519".to_string()),
+        }
+    }
+}
+
+impl Default for AttestationReportParams {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ecdsa_address_validation() {
+        let report = AttestationReport {
+            signing_address: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+            intel_quote: "".to_string(),
+            nvidia_payload: "{}".to_string(),
+            event_log: serde_json::json!({}),
+            info: serde_json::json!({}),
+            all_attestations: vec![],
+        };
+
+        assert!(report.is_valid_ecdsa_address());
+        assert!(!report.is_valid_ed25519_pubkey());
+    }
+
+    #[test]
+    fn test_ed25519_pubkey_validation() {
+        let report = AttestationReport {
+            signing_address: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+                .to_string(),
+            intel_quote: "".to_string(),
+            nvidia_payload: "{}".to_string(),
+            event_log: serde_json::json!({}),
+            info: serde_json::json!({}),
+            all_attestations: vec![],
+        };
+
+        assert!(!report.is_valid_ecdsa_address());
+        assert!(report.is_valid_ed25519_pubkey());
+    }
+
+    #[test]
+    fn test_nvidia_payload_parsing() {
+        let payload_json = r#"{"nonce":"abc123","evidence_list":[],"arch":"HOPPER"}"#;
+        let report = AttestationReport {
+            signing_address: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+            intel_quote: "".to_string(),
+            nvidia_payload: payload_json.to_string(),
+            event_log: serde_json::json!({}),
+            info: serde_json::json!({}),
+            all_attestations: vec![],
+        };
+
+        let nvidia_payload = report.parse_nvidia_payload().unwrap();
+        assert_eq!(nvidia_payload.nonce, "abc123");
+        assert_eq!(nvidia_payload.arch, "HOPPER");
+        assert!(nvidia_payload.evidence_list.is_empty());
+    }
+}
+
+#[derive(Debug, Error, Clone, Serialize, Deserialize)]
 pub enum CompletionError {
     #[error("Failed to perform completion: {0}")]
     CompletionError(String),

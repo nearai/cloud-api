@@ -1,6 +1,6 @@
 use crate::models::{
-    ApiKeyResponse, CreateApiKeyRequest, CreateOrganizationRequest, OrganizationResponse,
-    UpdateOrganizationRequest,
+    ApiKeyResponse, CreateApiKeyRequest, CreateOrganizationRequest, ErrorResponse,
+    OrganizationResponse, UpdateOrganizationRequest,
 };
 use crate::{middleware::AuthenticatedUser, routes::api::AppState};
 use axum::{
@@ -8,24 +8,55 @@ use axum::{
     http::StatusCode,
 };
 use serde::Deserialize;
-use services::{
-    auth::AuthError,
-    organization::{OrganizationError, OrganizationId},
-};
+use services::organization::{OrganizationError, OrganizationId};
 use tracing::{debug, error};
+use utoipa;
 use uuid::Uuid;
 
-/// List all organizations for the authenticated user
+/// List organizations
+///
+/// Lists all organizations accessible to the authenticated user.
+#[utoipa::path(
+    get,
+    path = "/organizations",
+    tag = "Organizations",
+    responses(
+        (status = 200, description = "List of organizations", body = Vec<OrganizationResponse>),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn list_organizations(
-    State(_app_state): State<AppState>,
+    State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
-    Query(_params): Query<ListParams>,
+    Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<OrganizationResponse>>, StatusCode> {
     debug!("Listing organizations for user: {}", user.0.id);
 
-    // For now, return empty list until we implement the service method
-    // TODO: Implement proper organization listing in service layer
-    Ok(Json(vec![]))
+    let user_id = crate::conversions::authenticated_user_to_user_id(user);
+
+    match app_state
+        .organization_service
+        .list_organizations_for_user(user_id, params.limit, params.offset)
+        .await
+    {
+        Ok(organizations) => {
+            debug!("Found {} organizations for user", organizations.len());
+            let response: Vec<OrganizationResponse> = organizations
+                .into_iter()
+                .map(crate::conversions::services_org_to_api_org)
+                .collect();
+            Ok(Json(response))
+        }
+        Err(e) => {
+            error!("Failed to list organizations for user: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// Query parameters for listing
@@ -42,6 +73,24 @@ fn default_limit() -> i64 {
 }
 
 /// Create a new organization
+///
+/// Creates a new organization with the authenticated user as owner.
+#[utoipa::path(
+    post,
+    path = "/organizations",
+    tag = "Organizations",
+    request_body = CreateOrganizationRequest,
+    responses(
+        (status = 200, description = "Organization created successfully", body = OrganizationResponse),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 409, description = "Organization already exists", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+    )
+)]
 pub async fn create_organization(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -57,11 +106,41 @@ pub async fn create_organization(
 
     match app_state
         .organization_service
-        .create_organization(request.name, request.description, user_id.clone())
+        .create_organization(request.name.clone(), request.description, user_id.clone())
         .await
     {
         Ok(org) => {
             debug!("Created organization: {} with owner: {}", org.id, user_id.0);
+
+            // Create a default workspace for the organization
+            let workspace_repo = std::sync::Arc::new(
+                database::repositories::WorkspaceRepository::new(app_state.db.pool().clone()),
+            );
+            let default_workspace_request = database::CreateWorkspaceRequest {
+                name: "default".to_string(),
+                display_name: "Default Workspace".to_string(),
+                description: Some(format!("Default workspace for {}", request.name)),
+            };
+
+            match workspace_repo
+                .create(default_workspace_request, org.id.0, user_id.0)
+                .await
+            {
+                Ok(workspace) => {
+                    debug!(
+                        "Created default workspace: {} for organization: {}",
+                        workspace.id, org.id.0
+                    );
+                }
+                Err(e) => {
+                    // Log the error but don't fail the organization creation
+                    error!(
+                        "Failed to create default workspace for organization {}: {}",
+                        org.id.0, e
+                    );
+                }
+            }
+
             Ok(Json(crate::conversions::services_org_to_api_org(org)))
         }
         Err(OrganizationError::InvalidParams(msg)) => {
@@ -80,6 +159,27 @@ pub async fn create_organization(
 }
 
 /// Get organization by ID
+///
+/// Returns organization details for a specific organization ID.
+#[utoipa::path(
+    get,
+    path = "/organizations/{org_id}",
+    tag = "Organizations",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID")
+    ),
+    responses(
+        (status = 200, description = "Organization details", body = OrganizationResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn get_organization(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -120,6 +220,29 @@ pub async fn get_organization(
 }
 
 /// Update organization
+///
+/// Updates organization details for a specific organization ID.
+#[utoipa::path(
+    put,
+    path = "/organizations/{org_id}",
+    tag = "Organizations",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID")
+    ),
+    request_body = UpdateOrganizationRequest,
+    responses(
+        (status = 200, description = "Updated organization", body = OrganizationResponse),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn update_organization(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -157,6 +280,27 @@ pub async fn update_organization(
 }
 
 /// Delete organization (owner only)
+///
+/// Deletes an organization. Only the organization owner can perform this action.
+#[utoipa::path(
+    delete,
+    path = "/organizations/{org_id}",
+    tag = "Organizations",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID")
+    ),
+    responses(
+        (status = 200, description = "Organization deleted successfully"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn delete_organization(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -193,79 +337,64 @@ pub async fn delete_organization(
 }
 
 /// Create API key for organization
+///
+/// DEPRECATED: This endpoint is deprecated. Use workspace-based API key creation instead.
+/// Creates a new API key for an organization.
+#[deprecated(note = "Use POST /workspaces/{workspace_id}/api-keys instead")]
+#[utoipa::path(
+    post,
+    path = "/organizations/{org_id}/api-keys",
+    tag = "Organizations",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID")
+    ),
+    request_body = CreateApiKeyRequest,
+    responses(
+        (status = 410, description = "Gone - This endpoint is deprecated. Use workspace-based API key creation.", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+    )
+)]
 pub async fn create_organization_api_key(
-    State(app_state): State<AppState>,
-    Extension(user): Extension<AuthenticatedUser>,
-    Path(org_id): Path<Uuid>,
-    Json(request): Json<CreateApiKeyRequest>,
+    _state: State<AppState>,
+    _user: Extension<AuthenticatedUser>,
+    _org_id: Path<Uuid>,
+    _request: Json<CreateApiKeyRequest>,
 ) -> Result<Json<ApiKeyResponse>, StatusCode> {
-    debug!(
-        "Creating API key for organization: {} by user: {}",
-        org_id, user.0.id
-    );
-
-    let organization_id = OrganizationId(org_id);
-    let user_id = crate::conversions::authenticated_user_to_user_id(user);
-    let services_request = crate::conversions::api_key_req_to_services(
-        request,
-        organization_id.clone(),
-        user_id.clone(),
-    );
-
-    match app_state
-        .auth_service
-        .create_organization_api_key(organization_id, user_id, services_request)
-        .await
-    {
-        Ok(api_key) => {
-            debug!("Created API key: {:?}", api_key.id);
-            Ok(Json(crate::conversions::services_api_key_to_api_response(
-                api_key,
-            )))
-        }
-        Err(AuthError::Unauthorized) => Err(StatusCode::FORBIDDEN),
-        Err(e) => {
-            error!("Failed to create API key: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
+    // This endpoint is deprecated in favor of workspace-based API keys
+    error!("Attempted to use deprecated organization API key creation endpoint");
+    Err(StatusCode::GONE) // HTTP 410 Gone - indicates the endpoint is deprecated
 }
 
 /// List API keys for organization
+///
+/// DEPRECATED: This endpoint is deprecated. Use workspace-based API key listing instead.
+/// Returns a list of all API keys for an organization.
+#[deprecated(note = "Use GET /workspaces/{workspace_id}/api-keys instead")]
+#[utoipa::path(
+    get,
+    path = "/organizations/{org_id}/api-keys",
+    tag = "Organizations",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID")
+    ),
+    responses(
+        (status = 410, description = "Gone - This endpoint is deprecated. Use workspace-based API key listing.", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+        ("api_key" = [])
+    )
+)]
 pub async fn list_organization_api_keys(
-    State(app_state): State<AppState>,
-    Extension(user): Extension<AuthenticatedUser>,
-    Path(org_id): Path<Uuid>,
+    _state: State<AppState>,
+    _user: Extension<AuthenticatedUser>,
+    _org_id: Path<Uuid>,
 ) -> Result<Json<Vec<ApiKeyResponse>>, StatusCode> {
-    debug!(
-        "Listing API keys for organization: {} by user: {}",
-        org_id, user.0.id
-    );
-
-    let organization_id = OrganizationId(org_id);
-    let user_id = crate::conversions::authenticated_user_to_user_id(user);
-
-    match app_state
-        .auth_service
-        .list_organization_api_keys(organization_id, user_id)
-        .await
-    {
-        Ok(api_keys) => {
-            debug!(
-                "Found {} API keys for organization {}",
-                api_keys.len(),
-                org_id
-            );
-            let response: Vec<ApiKeyResponse> = api_keys
-                .into_iter()
-                .map(crate::conversions::services_api_key_to_api_response)
-                .collect();
-            Ok(Json(response))
-        }
-        Err(AuthError::Unauthorized) => Err(StatusCode::FORBIDDEN),
-        Err(e) => {
-            error!("Failed to list API keys: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
+    // This endpoint is deprecated in favor of workspace-based API keys
+    error!("Attempted to use deprecated organization API key listing endpoint");
+    Err(StatusCode::GONE) // HTTP 410 Gone - indicates the endpoint is deprecated
 }

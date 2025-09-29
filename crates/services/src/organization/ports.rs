@@ -153,4 +153,11 @@ pub trait OrganizationRepository: Send + Sync {
     async fn list_members(&self, org_id: Uuid) -> Result<Vec<OrganizationMember>>;
 
     async fn get_member_count(&self, org_id: Uuid) -> Result<i64>;
+
+    async fn list_organizations_by_user(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Organization>>;
 }

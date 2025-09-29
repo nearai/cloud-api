@@ -6,8 +6,8 @@ pub mod repositories;
 pub use models::*;
 pub use pool::{create_pool, DbPool};
 pub use repositories::{
-    ApiKeyRepository, McpConnectorRepository, PgConversationRepository, PgOrganizationRepository,
-    PgResponseRepository, SessionRepository, UserRepository,
+    ApiKeyRepository, McpConnectorRepository, PgAttestationRepository, PgConversationRepository,
+    PgOrganizationRepository, PgResponseRepository, SessionRepository, UserRepository,
 };
 
 use anyhow::Result;
@@ -21,6 +21,7 @@ pub struct Database {
     pub mcp_connectors: McpConnectorRepository,
     pub conversations: PgConversationRepository,
     pub responses: PgResponseRepository,
+    pub attestation: PgAttestationRepository,
     pool: DbPool,
 }
 
@@ -35,6 +36,7 @@ impl Database {
             mcp_connectors: McpConnectorRepository::new(pool.clone()),
             conversations: PgConversationRepository::new(pool.clone()),
             responses: PgResponseRepository::new(pool.clone()),
+            attestation: PgAttestationRepository::new(pool.clone()),
             pool,
         }
     }

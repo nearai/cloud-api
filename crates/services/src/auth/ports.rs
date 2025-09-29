@@ -16,6 +16,9 @@ pub struct SessionId(pub String);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKeyId(pub String);
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceId(pub Uuid);
+
 impl From<Uuid> for UserId {
     fn from(uuid: Uuid) -> Self {
         UserId(uuid)
@@ -188,52 +191,23 @@ pub trait SessionRepository: Send + Sync {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKey {
     pub id: ApiKeyId,
+    // Returned only on creation
+    pub key: Option<String>,
     pub name: String,
-    pub organization_id: OrganizationId,
+    pub workspace_id: WorkspaceId,
     pub created_by_user_id: UserId,
-    pub account_type: AccountType,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub is_active: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CreateApiKeyRequest {
     pub name: Option<String>,
-    pub organization_id: OrganizationId,
-    pub account_type: AccountType,
+    pub workspace_id: WorkspaceId,
     pub created_by_user_id: UserId,
     pub expires_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum AccountType {
-    User,
-    ServiceAccount,
-}
-
-impl std::fmt::Display for AccountType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                AccountType::User => "User",
-                AccountType::ServiceAccount => "ServiceAccount",
-            }
-        )
-    }
-}
-
-impl From<String> for AccountType {
-    fn from(s: String) -> Self {
-        match s.as_str() {
-            "User" => AccountType::User,
-            "ServiceAccount" => AccountType::ServiceAccount,
-            _ => panic!("Invalid account_type: {}", s),
-        }
-    }
 }
 
 #[async_trait]
@@ -242,10 +216,7 @@ pub trait ApiKeyRepository: Send + Sync {
 
     async fn create(&self, request: CreateApiKeyRequest) -> anyhow::Result<ApiKey>;
 
-    async fn list_by_organization(
-        &self,
-        organization_id: OrganizationId,
-    ) -> anyhow::Result<Vec<ApiKey>>;
+    async fn list_by_workspace(&self, workspace_id: WorkspaceId) -> anyhow::Result<Vec<ApiKey>>;
 
     async fn delete(&self, id: ApiKeyId) -> anyhow::Result<bool>;
     async fn update_last_used(&self, id: ApiKeyId) -> anyhow::Result<()>;
@@ -282,27 +253,25 @@ pub trait AuthServiceTrait: Send + Sync {
     async fn cleanup_expired_sessions(&self) -> Result<usize, AuthError>;
 
     /// Validate an API key and return the associated user
-    async fn validate_api_key(&self, api_key: String) -> Result<User, AuthError>;
+    async fn validate_api_key(&self, api_key: String) -> Result<ApiKey, AuthError>;
 
-    /// Create an API key for an organization with proper permission checking
-    async fn create_organization_api_key(
+    /// Create an API key for a workspace with proper permission checking
+    async fn create_workspace_api_key(
         &self,
-        organization_id: crate::organization::OrganizationId,
-        requester_id: UserId,
         request: CreateApiKeyRequest,
     ) -> Result<ApiKey, AuthError>;
 
-    /// Check if a user can manage API keys for an organization
-    async fn can_manage_organization_api_keys(
+    /// Check if a user can manage API keys for a workspace
+    async fn can_manage_workspace_api_keys(
         &self,
-        organization_id: crate::organization::OrganizationId,
+        workspace_id: WorkspaceId,
         user_id: UserId,
     ) -> Result<bool, AuthError>;
 
-    /// List API keys for an organization with proper permission checking
-    async fn list_organization_api_keys(
+    /// List API keys for a workspace with proper permission checking
+    async fn list_workspace_api_keys(
         &self,
-        organization_id: crate::organization::OrganizationId,
+        workspace_id: WorkspaceId,
         requester_id: UserId,
     ) -> Result<Vec<ApiKey>, AuthError>;
 }
@@ -312,6 +281,32 @@ pub struct AuthService {
     pub session_repository: Arc<dyn SessionRepository>,
     pub api_key_repository: Arc<dyn ApiKeyRepository>,
     pub organization_repository: Arc<dyn OrganizationRepository>,
+    pub workspace_repository: Arc<dyn WorkspaceRepository>,
+}
+
+/// Workspace domain model
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Workspace {
+    pub id: WorkspaceId,
+    pub name: String,
+    pub display_name: String,
+    pub description: Option<String>,
+    pub organization_id: crate::organization::OrganizationId,
+    pub created_by_user_id: UserId,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub is_active: bool,
+    pub settings: Option<serde_json::Value>,
+}
+
+/// Workspace repository trait for auth service
+#[async_trait]
+pub trait WorkspaceRepository: Send + Sync {
+    async fn get_workspace_with_organization(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> anyhow::Result<Option<(Workspace, crate::organization::Organization)>>;
+    async fn get_by_id(&self, workspace_id: WorkspaceId) -> anyhow::Result<Option<Workspace>>;
 }
 
 pub struct UserService {
@@ -323,7 +318,9 @@ const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
 
 /// Mock auth service that returns fake data for testing/development
 /// Used when mock auth is enabled
-pub struct MockAuthService;
+pub struct MockAuthService {
+    pub apikey_repository: Arc<dyn ApiKeyRepository>,
+}
 
 impl MockAuthService {
     fn create_mock_user() -> User {
@@ -358,24 +355,6 @@ impl MockAuthService {
         };
 
         (session, session_token.to_string())
-    }
-
-    fn create_mock_api_key(
-        &self,
-        organization_id: crate::organization::OrganizationId,
-        requester_id: UserId,
-    ) -> ApiKey {
-        ApiKey {
-            id: ApiKeyId(uuid::Uuid::new_v4().to_string()),
-            name: "Mock API Key".to_string(),
-            organization_id,
-            created_by_user_id: requester_id,
-            account_type: AccountType::User,
-            created_at: chrono::Utc::now(),
-            expires_at: None,
-            last_used_at: None,
-            is_active: true,
-        }
     }
 }
 
@@ -425,32 +404,38 @@ impl AuthServiceTrait for MockAuthService {
         Ok(0) // No sessions to clean up in mock
     }
 
-    async fn validate_api_key(&self, _api_key: String) -> Result<User, AuthError> {
-        Ok(Self::create_mock_user())
+    async fn validate_api_key(&self, api_key: String) -> Result<ApiKey, AuthError> {
+        self.apikey_repository
+            .validate(api_key)
+            .await
+            .unwrap()
+            .ok_or(AuthError::Unauthorized)
     }
 
-    async fn create_organization_api_key(
+    async fn create_workspace_api_key(
         &self,
-        organization_id: crate::organization::OrganizationId,
-        requester_id: UserId,
-        _request: CreateApiKeyRequest,
+        request: CreateApiKeyRequest,
     ) -> Result<ApiKey, AuthError> {
-        Ok(self.create_mock_api_key(organization_id, requester_id))
+        Ok(self.apikey_repository.create(request).await.unwrap())
     }
 
-    async fn can_manage_organization_api_keys(
+    async fn can_manage_workspace_api_keys(
         &self,
-        _organization_id: crate::organization::OrganizationId,
+        _workspace_id: WorkspaceId,
         _user_id: UserId,
     ) -> Result<bool, AuthError> {
         Ok(true) // Mock user can always manage API keys
     }
 
-    async fn list_organization_api_keys(
+    async fn list_workspace_api_keys(
         &self,
-        organization_id: crate::organization::OrganizationId,
-        requester_id: UserId,
+        workspace_id: WorkspaceId,
+        _requester_id: UserId,
     ) -> Result<Vec<ApiKey>, AuthError> {
-        Ok(vec![self.create_mock_api_key(organization_id, requester_id)])
+        Ok(self
+            .apikey_repository
+            .list_by_workspace(workspace_id)
+            .await
+            .unwrap())
     }
 }

@@ -5,11 +5,8 @@ use reqwest::Client;
 /// Configuration for vLLM provider
 #[derive(Debug, Clone)]
 pub struct VLlmConfig {
-    /// Base URL of the vLLM server (e.g., "http://localhost:8000")
     pub base_url: String,
-    /// Optional API key for authentication
     pub api_key: Option<String>,
-    /// HTTP request timeout in seconds
     pub timeout_seconds: u64,
 }
 
@@ -19,16 +16,6 @@ impl VLlmConfig {
             base_url,
             api_key,
             timeout_seconds: timeout_seconds.unwrap_or(30),
-        }
-    }
-}
-
-impl Default for VLlmConfig {
-    fn default() -> Self {
-        Self {
-            base_url: "http://localhost:8000".to_string(),
-            api_key: None,
-            timeout_seconds: 30,
         }
     }
 }
@@ -71,6 +58,41 @@ impl VLlmProvider {
 
 #[async_trait]
 impl InferenceProvider for VLlmProvider {
+    async fn get_signature(&self, chat_id: &str) -> Result<ChatSignature, CompletionError> {
+        let url = format!("{}/v1/signature/{}", self.config.base_url, chat_id);
+        let response = self
+            .client
+            .get(&url)
+            .headers(self.build_headers())
+            .send()
+            .await
+            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        let signature = response
+            .json()
+            .await
+            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        Ok(signature)
+    }
+
+    async fn get_attestation_report(
+        &self,
+        _signing_algo: Option<&str>,
+    ) -> Result<AttestationReport, CompletionError> {
+        let url = format!("{}/v1/attestation/report", self.config.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .headers(self.build_headers())
+            .send()
+            .await
+            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        let attestation_report = response
+            .json()
+            .await
+            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        Ok(attestation_report)
+    }
+
     /// Lists all available models from the vLLM server
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
         let url = format!("{}/v1/models", self.config.base_url);

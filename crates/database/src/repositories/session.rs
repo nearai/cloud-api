@@ -77,22 +77,24 @@ impl SessionRepository {
     }
 
     /// Validate a session token and return the associated session
-    pub async fn validate(&self, session_token: Uuid) -> Result<Option<Session>> {
+    pub async fn validate(&self, session_token: &str) -> Result<Option<Session>> {
         let client = self
             .pool
             .get()
             .await
             .context("Failed to get database connection")?;
 
+        // Hash the token directly (it already includes sess_ prefix if present)
+        let token_hash = Self::hash_session_token(session_token);
         let now = Utc::now();
 
         let row = client
             .query_opt(
                 r#"
             SELECT * FROM sessions 
-            WHERE id = $1 AND expires_at > $2
+            WHERE token_hash = $1 AND expires_at > $2
             "#,
-                &[&session_token, &now],
+                &[&token_hash, &now],
             )
             .await
             .context("Failed to validate session")?;
@@ -103,7 +105,7 @@ impl SessionRepository {
         }
     }
 
-    /// Get a session by ID
+    /// Get a session by its session ID (not user ID)
     pub async fn get_by_id(&self, id: Uuid) -> Result<Option<Session>> {
         let client = self
             .pool
@@ -122,7 +124,7 @@ impl SessionRepository {
         }
     }
 
-    /// List active sessions for a user
+    /// List active sessions for a specific user (by user ID)
     pub async fn list_by_user(&self, user_id: Uuid) -> Result<Vec<Session>> {
         let client = self
             .pool
@@ -260,9 +262,9 @@ impl services::auth::SessionRepository for SessionRepository {
 
     async fn validate(
         &self,
-        session_token: Uuid,
+        session_token: services::auth::SessionToken,
     ) -> anyhow::Result<Option<services::auth::Session>> {
-        let maybe_session = self.validate(session_token).await?;
+        let maybe_session = self.validate(&session_token.0).await?;
 
         Ok(maybe_session.map(|db_session| services::auth::Session {
             id: services::auth::SessionId(db_session.id.to_string()),
@@ -277,9 +279,10 @@ impl services::auth::SessionRepository for SessionRepository {
 
     async fn get_by_id(
         &self,
-        user_id: services::auth::UserId,
+        session_id: services::auth::SessionId,
     ) -> anyhow::Result<Option<services::auth::Session>> {
-        let maybe_session = self.get_by_id(user_id.0).await?;
+        let session_uuid = Uuid::parse_str(&session_id.0)?;
+        let maybe_session = self.get_by_id(session_uuid).await?;
 
         Ok(maybe_session.map(|db_session| services::auth::Session {
             id: services::auth::SessionId(db_session.id.to_string()),

@@ -9,7 +9,6 @@ pub use user_service::UserServiceImpl;
 
 use chrono::Utc;
 use std::sync::Arc;
-use uuid::Uuid;
 
 use crate::organization::OrganizationRepository;
 use async_trait::async_trait;
@@ -31,7 +30,7 @@ impl AuthServiceTrait for AuthService {
 
     async fn validate_session_token(
         &self,
-        session_token: Uuid,
+        session_token: SessionToken,
     ) -> Result<Option<Session>, AuthError> {
         self.session_repository
             .validate(session_token)
@@ -39,7 +38,7 @@ impl AuthServiceTrait for AuthService {
             .map_err(|e| AuthError::InternalError(format!("Failed to validate session: {}", e)))
     }
 
-    async fn validate_session(&self, session_token: Uuid) -> Result<User, AuthError> {
+    async fn validate_session(&self, session_token: SessionToken) -> Result<User, AuthError> {
         let session = self
             .validate_session_token(session_token)
             .await?

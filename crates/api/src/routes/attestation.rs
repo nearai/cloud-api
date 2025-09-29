@@ -150,16 +150,18 @@ pub async fn get_attestation_report(
     Query(params): Query<AttestationQuery>,
     State(app_state): State<AppState>,
 ) -> Result<Json<AttestationResponse>, (StatusCode, Json<serde_json::Value>)> {
-    if let None = params.model {
+    let model = if let Some(model) = params.model {
+        model
+    } else {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "model is required" })),
         ));
-    }
+    };
 
     let report = app_state
         .attestation_service
-        .get_attestation_report(params.model.unwrap(), params.signing_algo)
+        .get_attestation_report(model, params.signing_algo)
         .await
         .map_err(|e| {
             (

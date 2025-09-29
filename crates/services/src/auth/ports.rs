@@ -13,6 +13,9 @@ pub struct UserId(pub Uuid);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionId(pub String);
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SessionToken(pub String);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKeyId(pub String);
 
@@ -32,6 +35,12 @@ impl std::fmt::Display for UserId {
 }
 
 impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::fmt::Display for SessionToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -173,9 +182,9 @@ pub trait SessionRepository: Send + Sync {
         expires_in_hours: i64,
     ) -> anyhow::Result<(Session, String)>;
 
-    async fn validate(&self, session_token: Uuid) -> anyhow::Result<Option<Session>>;
+    async fn validate(&self, session_token: SessionToken) -> anyhow::Result<Option<Session>>;
 
-    async fn get_by_id(&self, id: UserId) -> anyhow::Result<Option<Session>>;
+    async fn get_by_id(&self, session_id: SessionId) -> anyhow::Result<Option<Session>>;
 
     async fn list_by_user(&self, user_id: UserId) -> anyhow::Result<Vec<Session>>;
 
@@ -237,11 +246,11 @@ pub trait AuthServiceTrait: Send + Sync {
     /// Validate a session token and return the session
     async fn validate_session_token(
         &self,
-        session_token: uuid::Uuid,
+        session_token: SessionToken,
     ) -> Result<Option<Session>, AuthError>;
 
     /// Validate a session token and return the associated user
-    async fn validate_session(&self, session_token: uuid::Uuid) -> Result<User, AuthError>;
+    async fn validate_session(&self, session_token: SessionToken) -> Result<User, AuthError>;
 
     /// Logout (revoke session)
     async fn logout(&self, session_id: SessionId) -> Result<bool, AuthError>;
@@ -372,14 +381,14 @@ impl AuthServiceTrait for MockAuthService {
 
     async fn validate_session_token(
         &self,
-        _session_token: uuid::Uuid,
+        _session_token: SessionToken,
     ) -> Result<Option<Session>, AuthError> {
         let mock_user = Self::create_mock_user();
         let (session, _) = self.create_mock_session(mock_user.id);
         Ok(Some(session))
     }
 
-    async fn validate_session(&self, session_token: uuid::Uuid) -> Result<User, AuthError> {
+    async fn validate_session(&self, session_token: SessionToken) -> Result<User, AuthError> {
         tracing::debug!(
             "MockAuthService::validate_session called with token: {}",
             session_token

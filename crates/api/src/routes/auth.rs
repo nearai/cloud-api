@@ -1,7 +1,3 @@
-// OAuth2 Authentication Routes
-//
-// Handles GitHub and Google OAuth2 login flows
-
 use crate::middleware::AuthenticatedUser;
 use axum::{
     extract::{Query, State},
@@ -30,6 +26,12 @@ pub struct OAuthState {
 pub struct OAuthCallback {
     code: String,
     state: String,
+}
+
+#[derive(Serialize)]
+pub struct TokenExchangeResponse {
+    access_token: String,
+    user: AuthResponse,
 }
 
 #[derive(Serialize)]
@@ -97,7 +99,12 @@ pub async fn google_login(
     Ok(Redirect::to(&auth_url))
 }
 
-/// Handle OAuth callback from both providers
+/// Handle OAuth callback - NEW frontend-centric flow
+///
+/// Frontend calls this endpoint with the OAuth code to exchange for session token.
+/// Can be called via:
+/// - GET /v1/auth/callback?code=xxx&state=yyy (direct OAuth callback)  
+/// - POST /v1/auth/callback with JSON body (explicit token exchange)
 pub async fn oauth_callback(
     Query(params): Query<OAuthCallback>,
     State((oauth, state_store, auth_service)): State<(
@@ -118,7 +125,14 @@ pub async fn oauth_callback(
         Some(state) => state,
         None => {
             error!("Invalid or expired OAuth state: {}", params.state);
-            return (StatusCode::BAD_REQUEST, "Invalid state parameter").into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_request",
+                    "error_description": "Invalid or expired state parameter"
+                })),
+            )
+                .into_response();
         }
     };
 
@@ -132,14 +146,34 @@ pub async fn oauth_callback(
                 .await
         }
         "google" => {
-            let verifier = oauth_state.pkce_verifier.unwrap();
+            let verifier = match oauth_state.pkce_verifier {
+                Some(v) => v,
+                None => {
+                    error!("Missing PKCE verifier for Google OAuth");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "server_error",
+                            "error_description": "Missing PKCE verifier for Google OAuth"
+                        })),
+                    )
+                        .into_response();
+                }
+            };
             oauth
                 .handle_google_callback(params.code, params.state, verifier)
                 .await
         }
         _ => {
             error!("Unknown provider: {}", oauth_state.provider);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Unknown provider").into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "Unknown OAuth provider"
+                })),
+            )
+                .into_response();
         }
     };
 
@@ -149,7 +183,10 @@ pub async fn oauth_callback(
             error!("OAuth authentication failed: {}", e);
             return (
                 StatusCode::UNAUTHORIZED,
-                format!("Authentication failed: {}", e),
+                Json(serde_json::json!({
+                    "error": "access_denied",
+                    "error_description": format!("OAuth authentication failed: {}", e)
+                })),
             )
                 .into_response();
         }
@@ -162,7 +199,10 @@ pub async fn oauth_callback(
             error!("Failed to get or create user: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("User creation failed: {}", e),
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": format!("User creation failed: {}", e)
+                })),
             )
                 .into_response();
         }
@@ -175,24 +215,25 @@ pub async fn oauth_callback(
         Ok((_session, session_token)) => {
             info!("Session created successfully for user: {}", user.email);
 
-            // Set session cookie and redirect to success page
-            let cookie = format!(
-                "session_id={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400",
-                session_token
-            );
+            let response = TokenExchangeResponse {
+                access_token: session_token,
+                user: AuthResponse {
+                    message: "Authenticated".to_string(),
+                    email: user.email.clone(),
+                    provider: oauth_state.provider,
+                },
+            };
 
-            (
-                StatusCode::SEE_OTHER,
-                [(SET_COOKIE, cookie)],
-                Redirect::to("/v1/auth/success"),
-            )
-                .into_response()
+            Json(response).into_response()
         }
         Err(e) => {
             error!("Failed to create session: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Session creation failed: {}", e),
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": format!("Session creation failed: {}", e)
+                })),
             )
                 .into_response()
         }
@@ -227,6 +268,9 @@ pub async fn logout(Extension(user): Extension<AuthenticatedUser>) -> Response {
 }
 
 /// Success page after authentication
+///
+/// NOTE: This endpoint is DEPRECATED as part of the old server-centric OAuth flow.
+/// In the new frontend-centric flow, the frontend handles the post-authentication experience.
 pub async fn auth_success() -> Html<&'static str> {
     Html(
         r#"<!DOCTYPE html>

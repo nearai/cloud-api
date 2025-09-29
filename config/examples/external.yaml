@@ -28,27 +28,14 @@ dstack_client:
 # Authentication configuration with both providers
 auth:
   enabled: true
-  
-  # GitHub OAuth Configuration Example
-  # 
-  # To use GitHub OAuth:
-  # 1. Go to https://github.com/settings/developers
-  # 2. Create a new OAuth App
-  # 3. Set Authorization callback URL to: http://localhost:3000/v1/auth/callback
-  # 4. Copy Client ID and Client Secret
+
   github:
     client_id: "YOUR_GITHUB_CLIENT_ID"
     client_secret: "YOUR_GITHUB_CLIENT_SECRET"
-    redirect_url: "http://localhost:3000/v1/auth/callback"
+    redirect_url: "http://localhost:3001/auth/callback"  # Frontend callback URL
   
-  # Google OAuth Configuration Example
-  # 
-  # To use Google OAuth:
-  # 1. Go to https://console.cloud.google.com/apis/credentials
-  # 2. Create a new OAuth 2.0 Client ID
-  # 3. Add http://localhost:3000/v1/auth/callback to Authorized redirect URIs
-  # 4. Copy Client ID and Client Secret
+
   google:
     client_id: "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com"
     client_secret: "YOUR_GOOGLE_CLIENT_SECRET"
-    redirect_url: "http://localhost:3000/v1/auth/callback"
+    redirect_url: "http://localhost:3001/auth/callback"  # Frontend callback URL

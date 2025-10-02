@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod api;
 pub mod attestation;
 pub mod auth;
@@ -5,6 +6,7 @@ pub mod common;
 pub mod completions;
 pub mod conversations;
 pub mod mcp_connectors;
+pub mod models;
 pub mod organization_members;
 pub mod organizations;
 pub mod responses;

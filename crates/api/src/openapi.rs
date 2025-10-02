@@ -44,6 +44,11 @@ use utoipa::{Modify, OpenApi};
         crate::routes::attestation::get_signature,
         crate::routes::attestation::get_attestation_report,
         crate::routes::attestation::verify_attestation,
+        // Model endpoints
+        crate::routes::models::list_models,
+        // Admin endpoints
+        crate::routes::admin::batch_upsert_models,
+        crate::routes::admin::get_model_pricing_history,
     ),
     components(
         schemas(
@@ -67,6 +72,9 @@ use utoipa::{Modify, OpenApi};
             crate::routes::attestation::Evidence,
             crate::routes::attestation::NvidiaPayload,
             crate::routes::attestation::Attestation,
+            // Model pricing models
+            ModelListResponse, ModelWithPricing, DecimalPrice, ModelMetadata,
+            UpdateModelApiRequest, ModelPricingHistoryEntry, ModelPricingHistoryResponse,
         ),
     ),
     modifiers(&SecurityAddon)

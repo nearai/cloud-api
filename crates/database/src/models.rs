@@ -322,3 +322,82 @@ pub struct Conversation {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+// ============================================
+// Model Pricing Models
+// ============================================
+
+/// Model pricing and metadata - stores information about models and their pricing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Model {
+    pub id: Uuid,
+    pub model_name: String,
+    pub model_display_name: String,
+    pub model_description: String,
+    pub model_icon: Option<String>,
+
+    // Input pricing using decimal representation
+    pub input_cost_amount: i64,
+    pub input_cost_scale: i32,
+    pub input_cost_currency: String,
+
+    // Output pricing using decimal representation
+    pub output_cost_amount: i64,
+    pub output_cost_scale: i32,
+    pub output_cost_currency: String,
+
+    // Model metadata
+    pub context_length: i32,
+    pub verifiable: bool,
+
+    // Tracking fields
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Request to update model pricing
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateModelPricingRequest {
+    pub input_cost_amount: Option<i64>,
+    pub input_cost_scale: Option<i32>,
+    pub input_cost_currency: Option<String>,
+    pub output_cost_amount: Option<i64>,
+    pub output_cost_scale: Option<i32>,
+    pub output_cost_currency: Option<String>,
+    pub model_display_name: Option<String>,
+    pub model_description: Option<String>,
+    pub model_icon: Option<String>,
+    pub context_length: Option<i32>,
+    pub verifiable: Option<bool>,
+    pub is_active: Option<bool>,
+}
+
+/// Model pricing history - stores historical pricing data for models
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPricingHistory {
+    pub id: Uuid,
+    pub model_id: Uuid,
+
+    // Pricing snapshot
+    pub input_cost_amount: i64,
+    pub input_cost_scale: i32,
+    pub input_cost_currency: String,
+    pub output_cost_amount: i64,
+    pub output_cost_scale: i32,
+    pub output_cost_currency: String,
+
+    // Model metadata snapshot
+    pub context_length: i32,
+    pub model_display_name: String,
+    pub model_description: String,
+
+    // Temporal fields
+    pub effective_from: DateTime<Utc>,
+    pub effective_until: Option<DateTime<Utc>>,
+
+    // Tracking fields
+    pub changed_by: Option<String>,
+    pub change_reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+}

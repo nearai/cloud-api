@@ -100,39 +100,9 @@ The application uses YAML configuration files located in the `config/` directory
 - `DB_USER` - Database username (default: postgres)
 - `DB_PASSWORD` - Database password (default: postgres)
 
-**Test Database Configuration:**
-- `TEST_DB_HOST` - Test database host
-- `TEST_DB_PORT` - Test database port
-- `TEST_DB_NAME` - Test database name
-- `TEST_DB_USER` - Test database username
-- `TEST_DB_PASSWORD` - Test database password
-
-## Architecture
-
-The project follows a modular architecture with separate crates:
-
-- **`api`** - HTTP API layer with Axum
-- **`config`** - Configuration management
-- **`database`** - Database layer with PostgreSQL
-- **`services`** - Business logic and domain services
-- **`inference_providers`** - Integration with AI inference providers
-
-## API Endpoints
-
-- `GET /v1/models` - List available models
-- `POST /v1/chat/completions` - Create chat completions
-- `GET /v1/conversations` - List conversations
-- `POST /v1/conversations` - Create conversation
-- `GET /v1/responses` - List responses
-- `POST /v1/responses` - Create response
-
 ## Contributing
 
 1. Ensure all tests pass: `cargo test`
 2. Check code formatting: `cargo fmt --check`
 3. Run linting: `cargo clippy`
 4. Ensure database migrations work with test setup
-
-## License
-
-[Add your license information here]

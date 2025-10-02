@@ -968,3 +968,113 @@ pub struct ApiKeyResponse {
     pub last_used_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
 }
+
+// ============================================
+// Model Listing API Models
+// ============================================
+
+/// Response for model list endpoint
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ModelListResponse {
+    pub models: Vec<ModelWithPricing>,
+    #[serde(rename = "totalModels")]
+    pub total_models: usize,
+    pub page: usize,
+    #[serde(rename = "pageSize")]
+    pub page_size: usize,
+    #[serde(rename = "totalPages")]
+    pub total_pages: usize,
+}
+
+/// Model with pricing information
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ModelWithPricing {
+    #[serde(rename = "modelId")]
+    pub model_id: String,
+    #[serde(rename = "inputCostPerToken")]
+    pub input_cost_per_token: DecimalPrice,
+    #[serde(rename = "outputCostPerToken")]
+    pub output_cost_per_token: DecimalPrice,
+    pub metadata: ModelMetadata,
+}
+
+/// Decimal price representation using amount/scale/currency
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct DecimalPrice {
+    pub amount: i64,
+    pub scale: i32,
+    pub currency: String,
+}
+
+/// Model metadata
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ModelMetadata {
+    pub verifiable: bool,
+    #[serde(rename = "contextLength")]
+    pub context_length: i32,
+    #[serde(rename = "modelDisplayName")]
+    pub model_display_name: String,
+    #[serde(rename = "modelDescription")]
+    pub model_description: String,
+    #[serde(rename = "modelIcon", skip_serializing_if = "Option::is_none")]
+    pub model_icon: Option<String>,
+}
+
+/// Request to update model pricing (admin endpoint)
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateModelApiRequest {
+    #[serde(rename = "inputCostPerToken")]
+    pub input_cost_per_token: Option<DecimalPrice>,
+    #[serde(rename = "outputCostPerToken")]
+    pub output_cost_per_token: Option<DecimalPrice>,
+    #[serde(rename = "modelDisplayName")]
+    pub model_display_name: Option<String>,
+    #[serde(rename = "modelDescription")]
+    pub model_description: Option<String>,
+    #[serde(rename = "modelIcon")]
+    pub model_icon: Option<String>,
+    #[serde(rename = "contextLength")]
+    pub context_length: Option<i32>,
+    pub verifiable: Option<bool>,
+    #[serde(rename = "isActive")]
+    pub is_active: Option<bool>,
+}
+
+/// Batch update request format - Array of model name to update data
+pub type BatchUpdateModelApiRequest = Vec<std::collections::HashMap<String, UpdateModelApiRequest>>;
+
+/// Model pricing history entry
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ModelPricingHistoryEntry {
+    pub id: String,
+    #[serde(rename = "modelId")]
+    pub model_id: String,
+    #[serde(rename = "inputCostPerToken")]
+    pub input_cost_per_token: DecimalPrice,
+    #[serde(rename = "outputCostPerToken")]
+    pub output_cost_per_token: DecimalPrice,
+    #[serde(rename = "contextLength")]
+    pub context_length: i32,
+    #[serde(rename = "modelDisplayName")]
+    pub model_display_name: String,
+    #[serde(rename = "modelDescription")]
+    pub model_description: String,
+    #[serde(rename = "effectiveFrom")]
+    pub effective_from: String,
+    #[serde(rename = "effectiveUntil")]
+    pub effective_until: Option<String>,
+    #[serde(rename = "changedBy")]
+    pub changed_by: Option<String>,
+    #[serde(rename = "changeReason")]
+    pub change_reason: Option<String>,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+}
+
+/// Model pricing history response
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ModelPricingHistoryResponse {
+    #[serde(rename = "modelName")]
+    pub model_name: String,
+    pub history: Vec<ModelPricingHistoryEntry>,
+}

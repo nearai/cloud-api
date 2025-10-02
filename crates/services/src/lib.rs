@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod attestation;
 pub mod auth;
 pub mod completions;

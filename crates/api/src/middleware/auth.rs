@@ -13,6 +13,10 @@ use tracing::{debug, error};
 #[derive(Clone)]
 pub struct AuthenticatedUser(pub DbUser);
 
+/// Authenticated admin user (extends AuthenticatedUser)
+#[derive(Clone)]
+pub struct AdminUser(pub DbUser);
+
 /// Authenticated API key with workspace and organization context
 #[derive(Clone, Debug)]
 pub struct AuthenticatedApiKey {
@@ -133,6 +137,82 @@ pub async fn auth_middleware(
     }
 }
 
+/// Admin authentication middleware - verifies user is authenticated AND has admin access
+pub async fn admin_middleware(
+    State(state): State<AuthState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    // Try to extract authentication from various sources
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|h| h.to_str().ok());
+
+    tracing::debug!("Admin auth middleware: {:?}", auth_header);
+
+    let auth_result = if let Some(auth_value) = auth_header {
+        debug!("Found Authorization header: {}", auth_value);
+        if let Some(token) = auth_value.strip_prefix("Bearer ") {
+            debug!("Extracted Bearer token for admin auth: {}", token);
+            // Pass the token directly as SessionToken
+            let session_token = SessionToken(token.to_string());
+            authenticate_session(&state, session_token).await
+        } else {
+            debug!("Authorization header does not start with 'Bearer '");
+            Err(StatusCode::UNAUTHORIZED)
+        }
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    };
+
+    match auth_result {
+        Ok(user) => {
+            // Check if user has admin access based on email domain
+            let is_admin = check_admin_access(&state, &user);
+
+            if !is_admin {
+                error!(
+                    "User {} ({}) attempted admin action without admin privileges",
+                    user.id, user.email
+                );
+                return Err(StatusCode::FORBIDDEN);
+            }
+
+            debug!(
+                "Admin access granted for user: {} ({})",
+                user.id, user.email
+            );
+
+            // Add both AuthenticatedUser and AdminUser extensions
+            let mut request = request;
+            request
+                .extensions_mut()
+                .insert(AuthenticatedUser(user.clone()));
+            request.extensions_mut().insert(AdminUser(user));
+            Ok(next.run(request).await)
+        }
+        Err(status) => Err(status),
+    }
+}
+
+/// Check if a user has admin access based on their email domain
+fn check_admin_access(state: &AuthState, user: &DbUser) -> bool {
+    if state.admin_domains.is_empty() {
+        return false;
+    }
+
+    // Extract domain from email (everything after @)
+    if let Some(domain) = user.email.split('@').nth(1) {
+        state
+            .admin_domains
+            .iter()
+            .any(|admin_domain| domain.eq_ignore_ascii_case(admin_domain))
+    } else {
+        false
+    }
+}
+
 /// Authenticate using session token
 async fn authenticate_session(
     state: &AuthState,
@@ -242,6 +322,7 @@ pub struct AuthState {
     pub oauth_manager: Arc<OAuthManager>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub workspace_repository: Arc<dyn services::auth::ports::WorkspaceRepository>,
+    pub admin_domains: Vec<String>,
 }
 
 impl AuthState {
@@ -249,11 +330,13 @@ impl AuthState {
         oauth_manager: Arc<OAuthManager>,
         auth_service: Arc<dyn AuthServiceTrait>,
         workspace_repository: Arc<dyn services::auth::ports::WorkspaceRepository>,
+        admin_domains: Vec<String>,
     ) -> Self {
         Self {
             oauth_manager,
             auth_service,
             workspace_repository,
+            admin_domains,
         }
     }
 }

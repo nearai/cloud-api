@@ -45,6 +45,7 @@ fn test_config() -> ApiConfig {
             mock: true,
             github: None,
             google: None,
+            admin_domains: vec!["test.com".to_string()],
         },
         database: db_config_for_tests(),
     }
@@ -75,14 +76,14 @@ async fn assert_mock_user_in_db(database: &Arc<Database>) {
     let pool = database.pool();
     let client = pool.get().await.expect("Failed to get database connection");
 
-    // Insert mock user if it doesn't exist
+    // Insert mock user if it doesn't exist with admin domain email
     let _ = client.execute(
         "INSERT INTO users (id, email, username, display_name, avatar_url, auth_provider, provider_user_id, created_at, updated_at) 
          VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-         ON CONFLICT DO NOTHING",
+         ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email",
         &[
             &uuid::Uuid::parse_str(MOCK_USER_ID).unwrap(),
-            &"test@example.com",
+            &"admin@test.com", // Using test.com domain for admin access
             &"testuser", 
             &Some("Test User".to_string()),
             &Some("https://example.com/avatar.jpg".to_string()),
@@ -180,6 +181,32 @@ async fn list_models(
         .await;
     assert_eq!(response.status_code(), 200);
     response.json::<api::models::ModelsResponse>()
+}
+
+async fn admin_batch_upsert_models(
+    server: &axum_test::TestServer,
+    models: Vec<(String, serde_json::Value)>,
+    session_id: String,
+) -> Vec<api::models::ModelWithPricing> {
+    let mut batch = Vec::new();
+    for (model_name, data) in models {
+        let mut map = serde_json::Map::new();
+        map.insert(model_name, data);
+        batch.push(serde_json::Value::Object(map));
+    }
+
+    let response = server
+        .patch("/v1/admin/models")
+        .add_header("Authorization", format!("Bearer {}", session_id))
+        .json(&serde_json::Value::Array(batch))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Admin batch upsert should succeed"
+    );
+    response.json::<Vec<api::models::ModelWithPricing>>()
 }
 
 #[tokio::test]
@@ -696,4 +723,59 @@ async fn test_streaming_responses_api() {
         streamed_content, final_text,
         "Streamed content should match final response text"
     );
+}
+
+#[tokio::test]
+async fn test_admin_update_model() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock admin user with admin domain email
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database, auth_components, domain_services);
+
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Upsert models (using session token with admin domain email)
+    let models = vec![(
+        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 1000000,
+                "scale": 9,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 2000000,
+                "scale": 9,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Updated Model Name",
+            "modelDescription": "Updated model description",
+            "contextLength": 128000,
+            "verifiable": true,
+            "isActive": true
+        }),
+    )];
+
+    let updated_models = admin_batch_upsert_models(&server, models, get_session_id()).await;
+
+    println!("Updated models: {:?}", updated_models);
+    assert_eq!(updated_models.len(), 1);
+    let updated_model = &updated_models[0];
+    assert_eq!(updated_model.model_id, "Qwen/Qwen3-30B-A3B-Instruct-2507");
+    assert_eq!(
+        updated_model.metadata.model_display_name,
+        "Updated Model Name"
+    );
+    assert_eq!(updated_model.input_cost_per_token.amount, 1000000);
 }

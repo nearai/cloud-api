@@ -15,7 +15,9 @@ use crate::{
             oauth_callback, StateStore,
         },
         completions::{chat_completions, completions, models, quote},
-        conversations, responses,
+        conversations,
+        models::{list_models, ModelsAppState},
+        responses,
     },
 };
 use axum::{
@@ -33,7 +35,10 @@ use database::{
     Database,
 };
 use inference_providers::{InferenceProvider, VLlmConfig, VLlmProvider};
-use services::auth::{AuthService, AuthServiceTrait, MockAuthService, OAuthManager};
+use services::{
+    auth::{AuthService, AuthServiceTrait, MockAuthService, OAuthManager},
+    models::ModelsService,
+};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 use utoipa::OpenApi;
@@ -144,6 +149,7 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
         oauth_manager_arc.clone(),
         auth_service.clone(),
         workspace_repository.clone(),
+        config.auth.admin_domains.clone(),
     );
 
     AuthComponents {
@@ -195,6 +201,9 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
     let attestation_repo = Arc::new(database::PgAttestationRepository::new(
         database.pool().clone(),
     ));
+    let models_repo = Arc::new(database::repositories::ModelRepository::new(
+        database.pool().clone(),
+    ));
 
     // Create conversation service
     let conversation_service = Arc::new(services::ConversationService::new(
@@ -214,6 +223,7 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
     // Create models service
     let models_service = Arc::new(services::models::ModelsServiceImpl::new(
         inference_provider_pool.clone(),
+        models_repo,
     ));
 
     // Create completion service
@@ -340,7 +350,11 @@ pub fn build_app_with_config(
         build_workspace_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
     let attestation_routes =
-        build_attestation_routes(app_state, &auth_components.auth_state_middleware);
+        build_attestation_routes(app_state.clone(), &auth_components.auth_state_middleware);
+
+    let model_routes = build_model_routes(domain_services.models_service.clone());
+
+    let admin_routes = build_admin_routes(database.clone(), &auth_components.auth_state_middleware);
 
     // Build OpenAPI and documentation routes
     let openapi_routes = build_openapi_routes();
@@ -355,7 +369,9 @@ pub fn build_app_with_config(
                 .merge(conversation_routes)
                 .merge(management_routes)
                 .merge(workspace_routes)
-                .merge(attestation_routes.clone()),
+                .merge(attestation_routes.clone())
+                .merge(model_routes)
+                .merge(admin_routes),
         )
         .merge(openapi_routes)
 }
@@ -497,6 +513,53 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
             axum::routing::delete(revoke_workspace_api_key),
         )
         .with_state(app_state)
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            auth_middleware,
+        ))
+}
+
+/// Build model routes (public endpoints)
+pub fn build_model_routes(models_service: Arc<dyn ModelsService>) -> Router {
+    let models_app_state = ModelsAppState { models_service };
+
+    Router::new()
+        // Public endpoint - no auth required
+        .route("/model/list", get(list_models))
+        .with_state(models_app_state)
+}
+
+/// Build admin routes (authenticated endpoints)
+pub fn build_admin_routes(database: Arc<Database>, auth_state_middleware: &AuthState) -> Router {
+    use crate::middleware::admin_middleware;
+    use crate::routes::admin::{
+        batch_upsert_models, get_model_pricing_history, AdminAppState,
+    };
+    use database::repositories::ModelRepository;
+    use services::admin::AdminServiceImpl;
+
+    // Create model repository
+    let model_repository = Arc::new(ModelRepository::new(database.pool().clone()));
+
+    // Create admin service with model repository for pricing updates and history
+    let admin_service = Arc::new(AdminServiceImpl::new(
+        model_repository as Arc<dyn services::admin::AdminRepository>,
+    )) as Arc<dyn services::admin::AdminService + Send + Sync>;
+
+    let admin_app_state = AdminAppState { admin_service };
+
+    Router::new()
+        .route("/admin/models", axum::routing::patch(batch_upsert_models))
+        .route(
+            "/admin/models/{model_name}/pricing-history",
+            axum::routing::get(get_model_pricing_history),
+        )
+        .with_state(admin_app_state)
+        // Chain admin middleware after auth middleware for proper authorization
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            admin_middleware,
+        ))
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware,
@@ -706,6 +769,7 @@ mod tests {
                 mock: true,
                 github: None,
                 google: None,
+                admin_domains: vec![],
             },
             database: config::DatabaseConfig {
                 host: "localhost".to_string(),
@@ -771,6 +835,7 @@ mod tests {
                 mock: true,
                 github: None,
                 google: None,
+                admin_domains: vec![],
             },
             database: config::DatabaseConfig {
                 host: "localhost".to_string(),

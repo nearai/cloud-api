@@ -136,6 +136,28 @@ pub struct AuthConfig {
     pub github: Option<GitHubOAuthConfig>,
     #[serde(default)]
     pub google: Option<GoogleOAuthConfig>,
+    /// Email domains that are granted platform admin access
+    /// Users with emails from these domains will have admin privileges
+    #[serde(default)]
+    pub admin_domains: Vec<String>,
+}
+
+impl AuthConfig {
+    /// Check if an email address belongs to an admin domain
+    pub fn is_admin_email(&self, email: &str) -> bool {
+        if self.admin_domains.is_empty() {
+            return false;
+        }
+
+        // Extract domain from email (everything after @)
+        if let Some(domain) = email.split('@').nth(1) {
+            self.admin_domains
+                .iter()
+                .any(|admin_domain| domain.eq_ignore_ascii_case(admin_domain))
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,5 +210,44 @@ impl From<ApiConfig> for DomainConfig {
             dstack_client: api_config.dstack_client,
             auth: api_config.auth,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_admin_email() {
+        let config = AuthConfig {
+            mock: false,
+            github: None,
+            google: None,
+            admin_domains: vec!["near.ai".to_string(), "near.org".to_string()],
+        };
+
+        // Test admin domains
+        assert!(config.is_admin_email("alice@near.ai"));
+        assert!(config.is_admin_email("bob@near.org"));
+        assert!(config.is_admin_email("admin@NEAR.AI")); // Case insensitive
+
+        // Test non-admin domains
+        assert!(!config.is_admin_email("user@example.com"));
+        assert!(!config.is_admin_email("attacker@near.ai.evil.com"));
+        assert!(!config.is_admin_email("invalid-email"));
+        assert!(!config.is_admin_email(""));
+    }
+
+    #[test]
+    fn test_is_admin_email_empty_config() {
+        let config = AuthConfig {
+            mock: false,
+            github: None,
+            google: None,
+            admin_domains: vec![],
+        };
+
+        // Should return false when no admin domains configured
+        assert!(!config.is_admin_email("admin@near.ai"));
     }
 }

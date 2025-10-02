@@ -335,7 +335,7 @@ impl MockAuthService {
     fn create_mock_user() -> User {
         User {
             id: UserId(uuid::Uuid::parse_str(MOCK_USER_ID).expect("Invalid mock user ID")),
-            email: "test@example.com".to_string(),
+            email: "admin@test.com".to_string(),
             username: "testuser".to_string(),
             display_name: Some("Test User".to_string()),
             avatar_url: Some("https://example.com/avatar.jpg".to_string()),

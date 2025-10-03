@@ -2,7 +2,7 @@ use crate::models::{
     DecimalPrice, ErrorResponse, ModelListResponse, ModelMetadata, ModelWithPricing,
 };
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Json as ResponseJson,
 };
@@ -92,7 +92,7 @@ pub async fn list_models(
     let api_models: Vec<ModelWithPricing> = paginated_models
         .iter()
         .map(|model| ModelWithPricing {
-            model_id: model.id.to_string(),
+            model_id: model.model_name.clone(),
             input_cost_per_token: DecimalPrice {
                 amount: model.input_cost_amount,
                 scale: model.input_cost_scale,
@@ -122,4 +122,83 @@ pub async fn list_models(
     };
 
     Ok(ResponseJson(response))
+}
+
+/// Get details of a single model by model name
+///
+/// Returns the details of a specific model including pricing and metadata information.
+/// This is a public endpoint that does not require authentication.
+/// Model names can contain forward slashes (e.g., "openai/gpt-oss-120b").
+#[utoipa::path(
+    get,
+    path = "/model/{model_name}",
+    tag = "Models",
+    params(
+        ("model_name" = String, Path, description = "The model name to retrieve (can contain slashes)")
+    ),
+    responses(
+        (status = 200, description = "Model details with pricing", body = ModelWithPricing),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
+pub async fn get_model_by_name(
+    State(app_state): State<ModelsAppState>,
+    Path(model_name): Path<String>,
+) -> Result<ResponseJson<ModelWithPricing>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    // Remove leading slash if present (from catch-all path parameter)
+    let model_name = model_name.trim_start_matches('/');
+    debug!("Get model request for: {}", model_name);
+
+    // Get the model from the service
+    let model = app_state
+        .models_service
+        .get_model_by_name(&model_name)
+        .await
+        .map_err(|e| match e {
+            services::models::ModelsError::NotFound(_) => {
+                error!("Model not found: {}", model_name);
+                (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        format!("Model '{}' not found", model_name),
+                        "model_not_found".to_string(),
+                    )),
+                )
+            }
+            _ => {
+                error!("Failed to get model: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve model".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
+        })?;
+
+    // Convert to API model
+    let api_model = ModelWithPricing {
+        model_id: model.model_name,
+        input_cost_per_token: DecimalPrice {
+            amount: model.input_cost_amount,
+            scale: model.input_cost_scale,
+            currency: model.input_cost_currency,
+        },
+        output_cost_per_token: DecimalPrice {
+            amount: model.output_cost_amount,
+            scale: model.output_cost_scale,
+            currency: model.output_cost_currency,
+        },
+        metadata: ModelMetadata {
+            verifiable: model.verifiable,
+            context_length: model.context_length,
+            model_display_name: model.model_display_name,
+            model_description: model.model_description,
+            model_icon: model.model_icon,
+        },
+    };
+
+    Ok(ResponseJson(api_model))
 }

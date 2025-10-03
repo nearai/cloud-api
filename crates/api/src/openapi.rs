@@ -46,6 +46,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::attestation::verify_attestation,
         // Model endpoints
         crate::routes::models::list_models,
+        crate::routes::models::get_model_by_name,
         // Admin endpoints
         crate::routes::admin::batch_upsert_models,
         crate::routes::admin::get_model_pricing_history,

@@ -60,40 +60,28 @@ pub async fn batch_upsert_models(
 
     // Extract all model updates from the batch request
     let mut models = Vec::new();
-    for model_map in &batch_request {
-        if model_map.is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                ResponseJson(ErrorResponse::new(
-                    "Each entry must contain at least one model".to_string(),
-                    "invalid_request".to_string(),
-                )),
-            ));
-        }
-
-        for (model_name, request) in model_map.iter() {
-            let service_request = UpdateModelAdminRequest {
-                input_cost_amount: request.input_cost_per_token.as_ref().map(|p| p.amount),
-                input_cost_scale: request.input_cost_per_token.as_ref().map(|p| p.scale),
-                input_cost_currency: request
-                    .input_cost_per_token
-                    .as_ref()
-                    .map(|p| p.currency.clone()),
-                output_cost_amount: request.output_cost_per_token.as_ref().map(|p| p.amount),
-                output_cost_scale: request.output_cost_per_token.as_ref().map(|p| p.scale),
-                output_cost_currency: request
-                    .output_cost_per_token
-                    .as_ref()
-                    .map(|p| p.currency.clone()),
-                model_display_name: request.model_display_name.clone(),
-                model_description: request.model_description.clone(),
-                model_icon: request.model_icon.clone(),
-                context_length: request.context_length,
-                verifiable: request.verifiable,
-                is_active: request.is_active,
-            };
-            models.push((model_name.clone(), service_request));
-        }
+    for (model_name, request) in batch_request.iter() {
+        let service_request = UpdateModelAdminRequest {
+            input_cost_amount: request.input_cost_per_token.as_ref().map(|p| p.amount),
+            input_cost_scale: request.input_cost_per_token.as_ref().map(|p| p.scale),
+            input_cost_currency: request
+                .input_cost_per_token
+                .as_ref()
+                .map(|p| p.currency.clone()),
+            output_cost_amount: request.output_cost_per_token.as_ref().map(|p| p.amount),
+            output_cost_scale: request.output_cost_per_token.as_ref().map(|p| p.scale),
+            output_cost_currency: request
+                .output_cost_per_token
+                .as_ref()
+                .map(|p| p.currency.clone()),
+            model_display_name: request.model_display_name.clone(),
+            model_description: request.model_description.clone(),
+            model_icon: request.model_icon.clone(),
+            context_length: request.context_length,
+            verifiable: request.verifiable,
+            is_active: request.is_active,
+        };
+        models.push((model_name.clone(), service_request));
     }
 
     let updated_models = app_state
@@ -127,32 +115,28 @@ pub async fn batch_upsert_models(
 
     // Convert to API response - we need to get model names from the original request
     let mut api_models = Vec::new();
-    let mut model_index = 0;
-    for model_map in &batch_request {
-        for (model_name, _) in model_map.iter() {
-            let updated_model = &updated_models[model_index];
-            api_models.push(ModelWithPricing {
-                model_id: model_name.clone(),
-                input_cost_per_token: DecimalPrice {
-                    amount: updated_model.input_cost_amount,
-                    scale: updated_model.input_cost_scale,
-                    currency: updated_model.input_cost_currency.clone(),
-                },
-                output_cost_per_token: DecimalPrice {
-                    amount: updated_model.output_cost_amount,
-                    scale: updated_model.output_cost_scale,
-                    currency: updated_model.output_cost_currency.clone(),
-                },
-                metadata: ModelMetadata {
-                    verifiable: updated_model.verifiable,
-                    context_length: updated_model.context_length,
-                    model_display_name: updated_model.model_display_name.clone(),
-                    model_description: updated_model.model_description.clone(),
-                    model_icon: updated_model.model_icon.clone(),
-                },
-            });
-            model_index += 1;
-        }
+    for (model_index, (model_name, _)) in batch_request.iter().enumerate() {
+        let updated_model = &updated_models[model_index];
+        api_models.push(ModelWithPricing {
+            model_id: model_name.clone(),
+            input_cost_per_token: DecimalPrice {
+                amount: updated_model.input_cost_amount,
+                scale: updated_model.input_cost_scale,
+                currency: updated_model.input_cost_currency.clone(),
+            },
+            output_cost_per_token: DecimalPrice {
+                amount: updated_model.output_cost_amount,
+                scale: updated_model.output_cost_scale,
+                currency: updated_model.output_cost_currency.clone(),
+            },
+            metadata: ModelMetadata {
+                verifiable: updated_model.verifiable,
+                context_length: updated_model.context_length,
+                model_display_name: updated_model.model_display_name.clone(),
+                model_description: updated_model.model_description.clone(),
+                model_icon: updated_model.model_icon.clone(),
+            },
+        });
     }
 
     Ok(ResponseJson(api_models))

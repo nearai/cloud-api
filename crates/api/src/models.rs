@@ -999,7 +999,7 @@ pub struct ModelWithPricing {
 }
 
 /// Decimal price representation using amount/scale/currency
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DecimalPrice {
     pub amount: i64,
     pub scale: i32,
@@ -1021,7 +1021,7 @@ pub struct ModelMetadata {
 }
 
 /// Request to update model pricing (admin endpoint)
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UpdateModelApiRequest {
     #[serde(rename = "inputCostPerToken")]
     pub input_cost_per_token: Option<DecimalPrice>,
@@ -1041,7 +1041,7 @@ pub struct UpdateModelApiRequest {
 }
 
 /// Batch update request format - Array of model name to update data
-pub type BatchUpdateModelApiRequest = Vec<std::collections::HashMap<String, UpdateModelApiRequest>>;
+pub type BatchUpdateModelApiRequest = std::collections::HashMap<String, UpdateModelApiRequest>;
 
 /// Model pricing history entry
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

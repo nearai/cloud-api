@@ -16,7 +16,7 @@ use crate::{
         },
         completions::{chat_completions, completions, models, quote},
         conversations,
-        models::{list_models, ModelsAppState},
+        models::{get_model_by_name, list_models, ModelsAppState},
         responses,
     },
 };
@@ -524,17 +524,16 @@ pub fn build_model_routes(models_service: Arc<dyn ModelsService>) -> Router {
     let models_app_state = ModelsAppState { models_service };
 
     Router::new()
-        // Public endpoint - no auth required
+        // Public endpoints - no auth required
         .route("/model/list", get(list_models))
+        .route("/model/{*model_name}", get(get_model_by_name))
         .with_state(models_app_state)
 }
 
 /// Build admin routes (authenticated endpoints)
 pub fn build_admin_routes(database: Arc<Database>, auth_state_middleware: &AuthState) -> Router {
     use crate::middleware::admin_middleware;
-    use crate::routes::admin::{
-        batch_upsert_models, get_model_pricing_history, AdminAppState,
-    };
+    use crate::routes::admin::{batch_upsert_models, get_model_pricing_history, AdminAppState};
     use database::repositories::ModelRepository;
     use services::admin::AdminServiceImpl;
 

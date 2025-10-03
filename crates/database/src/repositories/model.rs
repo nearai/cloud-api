@@ -365,6 +365,28 @@ impl services::models::ModelsRepository for ModelRepository {
             })
             .collect())
     }
+
+    async fn get_model_by_name(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<services::models::ModelWithPricing>> {
+        let model_opt = self.get_by_name(model_name).await?;
+        Ok(model_opt.map(|m| services::models::ModelWithPricing {
+            id: m.id,
+            model_name: m.model_name,
+            model_display_name: m.model_display_name,
+            model_description: m.model_description,
+            model_icon: m.model_icon,
+            input_cost_amount: m.input_cost_amount,
+            input_cost_scale: m.input_cost_scale,
+            input_cost_currency: m.input_cost_currency,
+            output_cost_amount: m.output_cost_amount,
+            output_cost_scale: m.output_cost_scale,
+            output_cost_currency: m.output_cost_currency,
+            context_length: m.context_length,
+            verifiable: m.verifiable,
+        }))
+    }
 }
 
 // Implement AdminRepository trait from services

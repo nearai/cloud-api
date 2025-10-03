@@ -1,7 +1,8 @@
 use api::{
     build_app, init_auth_services, init_database_with_config, init_domain_services,
     models::{
-        ConversationContentPart, ConversationItem, ResponseOutputContent, ResponseOutputItem,
+        BatchUpdateModelApiRequest, ConversationContentPart, ConversationItem,
+        ResponseOutputContent, ResponseOutputItem,
     },
 };
 use chrono::Utc;
@@ -185,20 +186,13 @@ async fn list_models(
 
 async fn admin_batch_upsert_models(
     server: &axum_test::TestServer,
-    models: Vec<(String, serde_json::Value)>,
+    models: BatchUpdateModelApiRequest,
     session_id: String,
 ) -> Vec<api::models::ModelWithPricing> {
-    let mut batch = Vec::new();
-    for (model_name, data) in models {
-        let mut map = serde_json::Map::new();
-        map.insert(model_name, data);
-        batch.push(serde_json::Value::Object(map));
-    }
-
     let response = server
         .patch("/v1/admin/models")
         .add_header("Authorization", format!("Bearer {}", session_id))
-        .json(&serde_json::Value::Array(batch))
+        .json(&models)
         .await;
 
     assert_eq!(
@@ -725,6 +719,32 @@ async fn test_streaming_responses_api() {
     );
 }
 
+fn generate_model() -> BatchUpdateModelApiRequest {
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 1000000,
+                "scale": 9,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 2000000,
+                "scale": 9,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Updated Model Name",
+            "modelDescription": "Updated model description",
+            "contextLength": 128000,
+            "verifiable": true,
+            "isActive": true
+        }))
+        .unwrap(),
+    );
+    batch
+}
+
 #[tokio::test]
 async fn test_admin_update_model() {
     let _ = tracing_subscriber::fmt()
@@ -746,36 +766,126 @@ async fn test_admin_update_model() {
     let server = axum_test::TestServer::new(app).unwrap();
 
     // Upsert models (using session token with admin domain email)
-    let models = vec![(
-        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
-        serde_json::json!({
-            "inputCostPerToken": {
-                "amount": 1000000,
-                "scale": 9,
-                "currency": "USD"
-            },
-            "outputCostPerToken": {
-                "amount": 2000000,
-                "scale": 9,
-                "currency": "USD"
-            },
-            "modelDisplayName": "Updated Model Name",
-            "modelDescription": "Updated model description",
-            "contextLength": 128000,
-            "verifiable": true,
-            "isActive": true
-        }),
-    )];
-
-    let updated_models = admin_batch_upsert_models(&server, models, get_session_id()).await;
-
+    let batch = generate_model();
+    let model_name = batch.keys().next().unwrap().clone();
+    let updated_models = admin_batch_upsert_models(&server, batch, get_session_id()).await;
     println!("Updated models: {:?}", updated_models);
     assert_eq!(updated_models.len(), 1);
     let updated_model = &updated_models[0];
-    assert_eq!(updated_model.model_id, "Qwen/Qwen3-30B-A3B-Instruct-2507");
+    assert_eq!(updated_model.model_id, model_name);
     assert_eq!(
         updated_model.metadata.model_display_name,
         "Updated Model Name"
     );
     assert_eq!(updated_model.input_cost_per_token.amount, 1000000);
+}
+
+#[tokio::test]
+async fn test_get_model_by_name() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock admin user with admin domain email
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database, auth_components, domain_services);
+
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Upsert a model with a name containing forward slashes
+    let batch = generate_model();
+    let model_name = batch.keys().next().unwrap().clone();
+    let model_request = batch.get(&model_name).unwrap().clone();
+
+    let upserted_models = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+
+    println!("Upserted models: {:?}", upserted_models);
+    assert_eq!(upserted_models.len(), 1);
+
+    // Test retrieving the model by name (public endpoint - no auth required)
+    let response = server
+        .get(format!("/v1/model/{}", model_name).as_str())
+        .await;
+
+    println!("Response status: {}", response.status_code());
+    assert_eq!(response.status_code(), 200);
+
+    let model_resp = response.json::<api::models::ModelWithPricing>();
+    println!("Retrieved model: {:?}", model_resp);
+
+    // Verify the model details match what we upserted
+    assert_eq!(model_resp.model_id, model_name);
+    assert_eq!(
+        model_resp.metadata.model_display_name,
+        model_request.model_display_name.as_deref().unwrap()
+    );
+    assert_eq!(
+        model_resp.metadata.model_description,
+        model_request.model_description.as_deref().unwrap()
+    );
+    assert_eq!(
+        model_resp.metadata.context_length,
+        model_request.context_length.unwrap()
+    );
+    assert_eq!(
+        model_resp.metadata.verifiable,
+        model_request.verifiable.unwrap()
+    );
+    assert_eq!(
+        model_resp.input_cost_per_token.amount,
+        model_request.input_cost_per_token.as_ref().unwrap().amount
+    );
+    assert_eq!(
+        model_resp.input_cost_per_token.scale,
+        model_request.input_cost_per_token.as_ref().unwrap().scale
+    );
+    assert_eq!(
+        model_resp.input_cost_per_token.currency,
+        model_request
+            .input_cost_per_token
+            .as_ref()
+            .unwrap()
+            .currency
+    );
+    assert_eq!(
+        model_resp.output_cost_per_token.amount,
+        model_request.output_cost_per_token.as_ref().unwrap().amount
+    );
+    assert_eq!(
+        model_resp.output_cost_per_token.scale,
+        model_request.output_cost_per_token.as_ref().unwrap().scale
+    );
+    assert_eq!(
+        model_resp.output_cost_per_token.currency,
+        model_request
+            .output_cost_per_token
+            .as_ref()
+            .unwrap()
+            .currency
+    );
+
+    // Test retrieving a non-existent model
+    let response = server.get("/v1/model/nonexistent/model").await;
+
+    println!(
+        "Non-existent model response status: {}",
+        response.status_code()
+    );
+    assert_eq!(response.status_code(), 404);
+
+    let error = response.json::<api::models::ErrorResponse>();
+    println!("Error response: {:?}", error);
+    assert_eq!(error.error.r#type, "model_not_found");
+    assert!(error
+        .error
+        .message
+        .contains("Model 'nonexistent/model' not found"));
 }

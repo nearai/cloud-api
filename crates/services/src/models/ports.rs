@@ -45,6 +45,8 @@ pub enum ModelsError {
     InternalError(String),
     #[error("Invalid parameters: {0}")]
     InvalidParams(String),
+    #[error("Model not found: {0}")]
+    NotFound(String),
 }
 
 /// Repository trait for accessing model data
@@ -52,6 +54,12 @@ pub enum ModelsError {
 pub trait ModelsRepository: Send + Sync {
     /// Get all active models with pricing
     async fn get_all_active_models(&self) -> Result<Vec<ModelWithPricing>, anyhow::Error>;
+
+    /// Get a specific model by name
+    async fn get_model_by_name(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<ModelWithPricing>, anyhow::Error>;
 }
 
 #[async_trait]
@@ -61,4 +69,7 @@ pub trait ModelsService: Send + Sync {
 
     /// Get models with pricing and metadata (from database)
     async fn get_models_with_pricing(&self) -> Result<Vec<ModelWithPricing>, ModelsError>;
+
+    /// Get a specific model by name
+    async fn get_model_by_name(&self, model_name: &str) -> Result<ModelWithPricing, ModelsError>;
 }

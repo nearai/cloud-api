@@ -52,4 +52,12 @@ impl ModelsService for ModelsServiceImpl {
             .await
             .map_err(|e| ModelsError::InternalError(e.to_string()))
     }
+
+    async fn get_model_by_name(&self, model_name: &str) -> Result<ModelWithPricing, ModelsError> {
+        self.models_repository
+            .get_model_by_name(model_name)
+            .await
+            .map_err(|e| ModelsError::InternalError(e.to_string()))?
+            .ok_or_else(|| ModelsError::NotFound(format!("Model '{}' not found", model_name)))
+    }
 }

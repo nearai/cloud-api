@@ -1,5 +1,6 @@
 use crate::{
     conversions::{current_unix_timestamp, generate_completion_id},
+    middleware::auth::AuthenticatedApiKey,
     models::*,
     routes::{api::AppState, common::map_domain_error_to_status},
 };
@@ -25,6 +26,9 @@ use uuid::Uuid;
 fn convert_chat_request_to_service(
     request: &ChatCompletionRequest,
     user_id: Uuid,
+    api_key_id: String,
+    organization_id: Uuid,
+    workspace_id: Uuid,
 ) -> ServiceCompletionRequest {
     ServiceCompletionRequest {
         model: request.model.clone(),
@@ -42,6 +46,9 @@ fn convert_chat_request_to_service(
         stop: request.stop.clone(),
         stream: request.stream,
         user_id: user_id.into(),
+        api_key_id,
+        organization_id,
+        workspace_id,
         metadata: None,
     }
 }
@@ -50,6 +57,9 @@ fn convert_chat_request_to_service(
 fn convert_text_request_to_service(
     request: &CompletionRequest,
     user_id: Uuid,
+    api_key_id: String,
+    organization_id: Uuid,
+    workspace_id: Uuid,
 ) -> ServiceCompletionRequest {
     ServiceCompletionRequest {
         model: request.model.clone(),
@@ -63,6 +73,9 @@ fn convert_text_request_to_service(
         stop: request.stop.clone(),
         stream: request.stream,
         user_id: user_id.into(),
+        api_key_id,
+        organization_id,
+        workspace_id,
         metadata: None,
     }
 }
@@ -87,15 +100,20 @@ fn convert_text_request_to_service(
 )]
 pub async fn chat_completions(
     State(app_state): State<AppState>,
-    Extension(api_key): Extension<services::auth::ApiKey>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
-    debug!("Chat completions request from api key: {:?}", api_key);
     debug!(
-        "Request model: {}, stream: {:?}, messages: {}",
+        "Chat completions request from api key: {:?}",
+        api_key.api_key.id
+    );
+    debug!(
+        "Request model: {}, stream: {:?}, messages: {}, org: {}, workspace: {}",
         request.model,
         request.stream,
-        request.messages.len()
+        request.messages.len(),
+        api_key.organization.id,
+        api_key.workspace.id.0
     );
     // Validate the request
     if let Err(error) = request.validate() {
@@ -110,9 +128,15 @@ pub async fn chat_completions(
     }
 
     // Convert HTTP request to service parameters
-    let service_request = convert_chat_request_to_service(&request, api_key.created_by_user_id.0);
+    let service_request = convert_chat_request_to_service(
+        &request,
+        api_key.api_key.created_by_user_id.0,
+        api_key.api_key.id.0.clone(),
+        api_key.organization.id.0,
+        api_key.workspace.id.0,
+    );
 
-    // Call the completion service - it only supports streaming
+    // Call the completion service - it handles usage tracking internally
     match app_state
         .completion_service
         .create_completion_stream(service_request)
@@ -198,6 +222,7 @@ pub async fn chat_completions(
                 }
 
                 // Build the complete response
+                let final_usage = usage.unwrap_or_else(|| Usage::new(0, 0));
                 let response = ChatCompletionResponse {
                     id: format!("chatcmpl-{}", generate_completion_id()),
                     object: "chat.completion".to_string(),
@@ -212,7 +237,7 @@ pub async fn chat_completions(
                         },
                         finish_reason: Some("stop".to_string()),
                     }],
-                    usage: usage.unwrap_or_else(|| Usage::new(0, 0)),
+                    usage: final_usage,
                 };
 
                 (StatusCode::OK, ResponseJson(response)).into_response()
@@ -250,15 +275,20 @@ pub async fn chat_completions(
 )]
 pub async fn completions(
     State(app_state): State<AppState>,
-    Extension(api_key): Extension<services::auth::ApiKey>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
     Json(request): Json<CompletionRequest>,
 ) -> axum::response::Response {
-    debug!("Text completions request from key: {:?}", api_key);
     debug!(
-        "Request model: {}, stream: {:?}, prompt length: {} chars",
+        "Text completions request from key: {:?}",
+        api_key.api_key.id
+    );
+    debug!(
+        "Request model: {}, stream: {:?}, prompt length: {} chars, org: {}, workspace: {}",
         request.model,
         request.stream,
-        request.prompt.len()
+        request.prompt.len(),
+        api_key.organization.id,
+        api_key.workspace.id.0
     );
     // Validate the request
     if let Err(error) = request.validate() {
@@ -273,9 +303,15 @@ pub async fn completions(
     }
 
     // Convert HTTP request to service parameters
-    let service_request = convert_text_request_to_service(&request, api_key.created_by_user_id.0);
+    let service_request = convert_text_request_to_service(
+        &request,
+        api_key.api_key.created_by_user_id.0,
+        api_key.api_key.id.0.clone(),
+        api_key.organization.id.0,
+        api_key.workspace.id.0,
+    );
 
-    // Call the completion service - it only supports streaming
+    // Call the completion service - it handles usage tracking internally
     match app_state
         .completion_service
         .create_completion_stream(service_request)
@@ -401,6 +437,7 @@ pub async fn completions(
                 }
 
                 // Build the complete response
+                let final_usage = usage.unwrap_or_else(|| Usage::new(0, 0));
                 let response = CompletionResponse {
                     id: format!("cmpl-{}", generate_completion_id()),
                     object: "text_completion".to_string(),
@@ -412,7 +449,7 @@ pub async fn completions(
                         logprobs: None,
                         finish_reason: Some("stop".to_string()),
                     }],
-                    usage: usage.unwrap_or_else(|| Usage::new(0, 0)),
+                    usage: final_usage,
                 };
 
                 (StatusCode::OK, ResponseJson(response)).into_response()
@@ -449,7 +486,7 @@ pub async fn models(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<services::auth::ApiKey>,
 ) -> Result<ResponseJson<ModelsResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    debug!("Models list request from key: {:?}", api_key);
+    debug!("Models list request from key: {:?}", api_key.id);
 
     let models = app_state.models_service.get_models().await.map_err(|e| {
         (

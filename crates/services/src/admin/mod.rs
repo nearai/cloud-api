@@ -67,6 +67,52 @@ impl AdminService for AdminServiceImpl {
 
         Ok(history)
     }
+
+    async fn update_organization_limits(
+        &self,
+        organization_id: uuid::Uuid,
+        limits: OrganizationLimitsUpdate,
+    ) -> Result<OrganizationLimits, AdminError> {
+        // Validate limits
+        Self::validate_organization_limits(&limits)?;
+
+        let updated_limits = self
+            .repository
+            .update_organization_limits(organization_id, limits)
+            .await
+            .map_err(|e| {
+                let error_msg = e.to_string();
+                if error_msg.contains("Organization not found") {
+                    AdminError::OrganizationNotFound(format!(
+                        "Organization '{}' not found",
+                        organization_id
+                    ))
+                } else {
+                    AdminError::InternalError(error_msg)
+                }
+            })?;
+
+        Ok(updated_limits)
+    }
+
+    async fn get_organization_limits_history(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<Vec<OrganizationLimitsHistoryEntry>, AdminError> {
+        let history = self
+            .repository
+            .get_organization_limits_history(organization_id)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+
+        if history.is_empty() {
+            return Err(AdminError::OrganizationNotFound(
+                organization_id.to_string(),
+            ));
+        }
+
+        Ok(history)
+    }
 }
 
 impl AdminServiceImpl {
@@ -74,19 +120,19 @@ impl AdminServiceImpl {
         model_name: &str,
         request: &UpdateModelAdminRequest,
     ) -> Result<(), AdminError> {
-        // Validate pricing scales if provided
+        // Validate pricing scales if provided (0-30 to support high-precision cryptocurrencies)
         if let Some(scale) = request.input_cost_scale {
-            if !(0..=20).contains(&scale) {
+            if !(0..=30).contains(&scale) {
                 return Err(AdminError::InvalidPricing(
-                    "Input cost scale must be between 0 and 20".to_string(),
+                    "Input cost scale must be between 0 and 30".to_string(),
                 ));
             }
         }
 
         if let Some(scale) = request.output_cost_scale {
-            if !(0..=20).contains(&scale) {
+            if !(0..=30).contains(&scale) {
                 return Err(AdminError::InvalidPricing(
-                    "Output cost scale must be between 0 and 20".to_string(),
+                    "Output cost scale must be between 0 and 30".to_string(),
                 ));
             }
         }
@@ -114,6 +160,42 @@ impl AdminServiceImpl {
                     "Model description cannot be empty".to_string(),
                 ));
             }
+        }
+
+        Ok(())
+    }
+
+    fn validate_organization_limits(limits: &OrganizationLimitsUpdate) -> Result<(), AdminError> {
+        // Validate amount is non-negative
+        if limits.spend_limit_amount < 0 {
+            return Err(AdminError::InvalidLimits(
+                "Spend limit amount cannot be negative".to_string(),
+            ));
+        }
+
+        // Validate scale is reasonable (between 0 and 30)
+        // Supports high-precision cryptocurrencies:
+        // - NEAR: 24 decimals (yoctoNEAR)
+        // - Ethereum: 18 decimals (wei)
+        // - Bitcoin: 8 decimals (satoshi)
+        if !(0..=30).contains(&limits.spend_limit_scale) {
+            return Err(AdminError::InvalidLimits(
+                "Spend limit scale must be between 0 and 30".to_string(),
+            ));
+        }
+
+        // Validate currency is not empty
+        if limits.spend_limit_currency.trim().is_empty() {
+            return Err(AdminError::InvalidLimits(
+                "Currency cannot be empty".to_string(),
+            ));
+        }
+
+        // Validate currency code length (typically 3 characters: USD, EUR, BTC, etc.)
+        if limits.spend_limit_currency.len() > 10 {
+            return Err(AdminError::InvalidLimits(
+                "Currency code is too long (max 10 characters)".to_string(),
+            ));
         }
 
         Ok(())

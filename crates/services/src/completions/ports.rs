@@ -49,7 +49,10 @@ pub struct CompletionRequest {
     pub top_p: Option<f32>,
     pub stop: Option<Vec<String>>,
     pub stream: Option<bool>,
-    pub user_id: UserId,
+    pub user_id: UserId,    // For provider user field
+    pub api_key_id: String, // For usage tracking
+    pub organization_id: Uuid,
+    pub workspace_id: Uuid,
     pub metadata: Option<serde_json::Value>,
 }
 

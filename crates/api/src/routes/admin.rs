@@ -1,7 +1,8 @@
 use crate::middleware::AdminUser;
 use crate::models::{
     BatchUpdateModelApiRequest, DecimalPrice, ErrorResponse, ModelMetadata,
-    ModelPricingHistoryEntry, ModelPricingHistoryResponse, ModelWithPricing,
+    ModelPricingHistoryEntry, ModelPricingHistoryResponse, ModelWithPricing, SpendLimit,
+    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
 };
 use axum::{
     extract::{Path, State},
@@ -230,6 +231,108 @@ pub async fn get_model_pricing_history(
     let response = ModelPricingHistoryResponse {
         model_name,
         history: history_entries,
+    };
+
+    Ok(ResponseJson(response))
+}
+
+/// Update organization limits (Admin only)
+///
+/// Updates spending limits for a specific organization. This endpoint is typically called by
+/// a billing service with an admin API key when a customer makes a purchase.
+#[utoipa::path(
+    patch,
+    path = "/admin/organizations/{org_id}/limits",
+    tag = "Admin",
+    params(
+        ("org_id" = String, Path, description = "Organization ID to update limits for")
+    ),
+    request_body = UpdateOrganizationLimitsRequest,
+    responses(
+        (status = 200, description = "Organization limits updated successfully", body = UpdateOrganizationLimitsResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = [])
+    )
+)]
+pub async fn update_organization_limits(
+    State(app_state): State<AdminAppState>,
+    Path(org_id): Path<String>,
+    Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    ResponseJson(request): ResponseJson<UpdateOrganizationLimitsRequest>,
+) -> Result<ResponseJson<UpdateOrganizationLimitsResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
+{
+    debug!(
+        "Update organization limits request for org_id: {}, amount: {}, scale: {}, currency: {}",
+        org_id, request.spend_limit.amount, request.spend_limit.scale, request.spend_limit.currency
+    );
+
+    // Parse organization ID
+    let organization_id = uuid::Uuid::parse_str(&org_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Invalid organization ID format".to_string(),
+                "invalid_id".to_string(),
+            )),
+        )
+    })?;
+
+    // Convert API request to service request
+    let service_request = services::admin::OrganizationLimitsUpdate {
+        spend_limit_amount: request.spend_limit.amount,
+        spend_limit_scale: request.spend_limit.scale,
+        spend_limit_currency: request.spend_limit.currency.clone(),
+        changed_by: request.changed_by,
+        change_reason: request.change_reason,
+    };
+
+    // Update organization limits via admin service
+    let updated_limits = app_state
+        .admin_service
+        .update_organization_limits(organization_id, service_request)
+        .await
+        .map_err(|e| {
+            error!("Failed to update organization limits: {}", e);
+            match e {
+                services::admin::AdminError::OrganizationNotFound(msg) => (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        msg,
+                        "organization_not_found".to_string(),
+                    )),
+                ),
+                services::admin::AdminError::InvalidLimits(msg) => (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(msg, "invalid_limits".to_string())),
+                ),
+                services::admin::AdminError::Unauthorized(msg) => (
+                    StatusCode::UNAUTHORIZED,
+                    ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to update organization limits".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+
+    // Convert service response to API response
+    let response = UpdateOrganizationLimitsResponse {
+        organization_id: updated_limits.organization_id.to_string(),
+        spend_limit: SpendLimit {
+            amount: updated_limits.spend_limit_amount,
+            scale: updated_limits.spend_limit_scale,
+            currency: updated_limits.spend_limit_currency,
+        },
+        updated_at: updated_limits.effective_from.to_rfc3339(),
     };
 
     Ok(ResponseJson(response))

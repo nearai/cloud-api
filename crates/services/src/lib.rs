@@ -8,6 +8,7 @@ pub mod mcp;
 pub mod models;
 pub mod organization;
 pub mod responses;
+pub mod usage;
 
 // Re-export commonly used types for backward compatibility
 pub use completions::{

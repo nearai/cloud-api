@@ -1078,3 +1078,38 @@ pub struct ModelPricingHistoryResponse {
     pub model_name: String,
     pub history: Vec<ModelPricingHistoryEntry>,
 }
+
+// ============================================
+// Organization Limits API Models (Admin)
+// ============================================
+
+/// Request to update organization limits (Admin only)
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateOrganizationLimitsRequest {
+    #[serde(rename = "spendLimit")]
+    pub spend_limit: SpendLimit,
+    #[serde(rename = "changedBy", skip_serializing_if = "Option::is_none")]
+    pub changed_by: Option<String>,
+    #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
+    pub change_reason: Option<String>,
+}
+
+/// Spend limit with amount, scale, and currency (using decimal representation)
+/// Examples:
+///   $100.00 USD: amount=10000, scale=2, currency="USD"
+///   0.0001 BTC: amount=1, scale=4, currency="BTC"
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SpendLimit {
+    pub amount: i64,
+    pub scale: i32,
+    pub currency: String,
+}
+
+/// Response after updating organization limits
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UpdateOrganizationLimitsResponse {
+    pub organization_id: String,
+    #[serde(rename = "spendLimit")]
+    pub spend_limit: SpendLimit,
+    pub updated_at: String,
+}

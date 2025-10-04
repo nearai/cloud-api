@@ -61,6 +61,7 @@ pub struct DomainServices {
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub attestation_service: Arc<services::attestation::AttestationService>,
     pub organization_service: Arc<services::organization::OrganizationService>,
+    pub usage_service: Arc<dyn services::usage::UsageService + Send + Sync>,
 }
 
 /// Initialize database connection and run migrations
@@ -223,13 +224,27 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
     // Create models service
     let models_service = Arc::new(services::models::ModelsServiceImpl::new(
         inference_provider_pool.clone(),
-        models_repo,
+        models_repo.clone(),
     ));
 
-    // Create completion service
+    // Create usage tracking service (needs to be created before completion service)
+    let usage_repository = Arc::new(database::repositories::OrganizationUsageRepository::new(
+        database.pool().clone(),
+    ));
+    let limits_repository_for_usage = Arc::new(
+        database::repositories::OrganizationLimitsRepository::new(database.pool().clone()),
+    );
+    let usage_service = Arc::new(services::usage::UsageServiceImpl::new(
+        usage_repository as Arc<dyn services::usage::UsageRepository>,
+        models_repo.clone() as Arc<dyn services::usage::ModelRepository>,
+        limits_repository_for_usage as Arc<dyn services::usage::OrganizationLimitsRepository>,
+    )) as Arc<dyn services::usage::UsageService + Send + Sync>;
+
+    // Create completion service with usage tracking
     let completion_service = Arc::new(services::CompletionServiceImpl::new(
         inference_provider_pool.clone(),
         attestation_service.clone(),
+        usage_service.clone(),
     ));
 
     // Create response service
@@ -255,6 +270,7 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
         inference_provider_pool,
         attestation_service,
         organization_service,
+        usage_service,
     }
 }
 
@@ -318,6 +334,12 @@ pub fn build_app_with_config(
         models_service: domain_services.models_service.clone(),
         auth_service: auth_components.auth_service.clone(),
         attestation_service: domain_services.attestation_service.clone(),
+        usage_service: domain_services.usage_service.clone(),
+    };
+
+    // Create usage state for middleware
+    let usage_state = middleware::UsageState {
+        usage_service: domain_services.usage_service.clone(),
     };
 
     // Build individual route groups
@@ -328,8 +350,11 @@ pub fn build_app_with_config(
         &auth_components.auth_state_middleware,
     );
 
-    let completion_routes =
-        build_completion_routes(app_state.clone(), &auth_components.auth_state_middleware);
+    let completion_routes = build_completion_routes(
+        app_state.clone(),
+        &auth_components.auth_state_middleware,
+        usage_state,
+    );
 
     let response_routes = build_response_routes(
         domain_services.response_service,
@@ -402,18 +427,41 @@ pub fn build_auth_routes(
         .with_state(auth_state)
 }
 
-/// Build completion routes with auth
-pub fn build_completion_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
-    Router::new()
+/// Build completion routes with auth and usage tracking
+pub fn build_completion_routes(
+    app_state: AppState,
+    auth_state_middleware: &AuthState,
+    usage_state: middleware::UsageState,
+) -> Router {
+    // Routes that require credits (actual inference)
+    let inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
         .route("/completions", post(completions))
+        .with_state(app_state.clone())
+        // First check usage limits for inference endpoints
+        .layer(from_fn_with_state(
+            usage_state,
+            middleware::usage_check_middleware,
+        ))
+        // Then authenticate with workspace context (provides organization)
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::auth_middleware_with_workspace_context,
+        ));
+
+    // Routes that don't require credits (metadata)
+    let metadata_routes = Router::new()
         .route("/models", get(models))
         .route("/quote", get(quote))
         .with_state(app_state)
+        // Only require API key, no usage check
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware_with_api_key,
-        ))
+        ));
+
+    // Merge routes
+    Router::new().merge(inference_routes).merge(metadata_routes)
 }
 
 /// Build response routes with auth
@@ -533,16 +581,18 @@ pub fn build_model_routes(models_service: Arc<dyn ModelsService>) -> Router {
 /// Build admin routes (authenticated endpoints)
 pub fn build_admin_routes(database: Arc<Database>, auth_state_middleware: &AuthState) -> Router {
     use crate::middleware::admin_middleware;
-    use crate::routes::admin::{batch_upsert_models, get_model_pricing_history, AdminAppState};
-    use database::repositories::ModelRepository;
+    use crate::routes::admin::{
+        batch_upsert_models, get_model_pricing_history, update_organization_limits, AdminAppState,
+    };
+    use database::repositories::AdminCompositeRepository;
     use services::admin::AdminServiceImpl;
 
-    // Create model repository
-    let model_repository = Arc::new(ModelRepository::new(database.pool().clone()));
+    // Create composite admin repository (handles both models and organization limits)
+    let admin_repository = Arc::new(AdminCompositeRepository::new(database.pool().clone()));
 
-    // Create admin service with model repository for pricing updates and history
+    // Create admin service with composite repository
     let admin_service = Arc::new(AdminServiceImpl::new(
-        model_repository as Arc<dyn services::admin::AdminRepository>,
+        admin_repository as Arc<dyn services::admin::AdminRepository>,
     )) as Arc<dyn services::admin::AdminService + Send + Sync>;
 
     let admin_app_state = AdminAppState { admin_service };
@@ -553,15 +603,15 @@ pub fn build_admin_routes(database: Arc<Database>, auth_state_middleware: &AuthS
             "/admin/models/{model_name}/pricing-history",
             axum::routing::get(get_model_pricing_history),
         )
+        .route(
+            "/admin/organizations/{org_id}/limits",
+            axum::routing::patch(update_organization_limits),
+        )
         .with_state(admin_app_state)
-        // Chain admin middleware after auth middleware for proper authorization
+        // Admin middleware handles both authentication and authorization
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             admin_middleware,
-        ))
-        .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            auth_middleware,
         ))
 }
 

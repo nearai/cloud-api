@@ -21,6 +21,7 @@ pub struct AppState {
     pub models_service: Arc<dyn ModelsService>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub attestation_service: Arc<dyn AttestationService>,
+    pub usage_service: Arc<dyn services::usage::UsageService + Send + Sync>,
 }
 
 // Import route handlers
@@ -73,6 +74,15 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
         .route(
             "/{id}/mcp-connectors/{connector_id}/usage",
             get(get_mcp_usage_logs),
+        )
+        // Usage tracking routes
+        .route(
+            "/{id}/usage/balance",
+            get(crate::routes::usage::get_organization_balance),
+        )
+        .route(
+            "/{id}/usage/history",
+            get(crate::routes::usage::get_organization_usage_history),
         );
 
     // User routes

@@ -50,6 +50,7 @@ use utoipa::{Modify, OpenApi};
         // Admin endpoints
         crate::routes::admin::batch_upsert_models,
         crate::routes::admin::get_model_pricing_history,
+        crate::routes::admin::update_organization_limits,
     ),
     components(
         schemas(
@@ -76,6 +77,8 @@ use utoipa::{Modify, OpenApi};
             // Model pricing models
             ModelListResponse, ModelWithPricing, DecimalPrice, ModelMetadata,
             UpdateModelApiRequest, ModelPricingHistoryEntry, ModelPricingHistoryResponse,
+            // Organization limits models (Admin)
+            UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, SpendLimit,
         ),
     ),
     modifiers(&SecurityAddon)

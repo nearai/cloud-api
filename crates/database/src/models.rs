@@ -401,3 +401,102 @@ pub struct ModelPricingHistory {
     pub change_reason: Option<String>,
     pub created_at: DateTime<Utc>,
 }
+
+// ============================================
+// Organization Limits Models
+// ============================================
+
+/// Organization limits history - stores historical spending limit data for organizations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrganizationLimitsHistory {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+
+    // Spend limit using decimal representation
+    pub spend_limit_amount: i64,
+    pub spend_limit_scale: i32,
+    pub spend_limit_currency: String,
+
+    // Temporal fields
+    pub effective_from: DateTime<Utc>,
+    pub effective_until: Option<DateTime<Utc>>,
+
+    // Tracking fields
+    pub changed_by: Option<String>,
+    pub change_reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Request to update organization limits
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateOrganizationLimitsDbRequest {
+    pub spend_limit_amount: i64,
+    pub spend_limit_scale: i32,
+    pub spend_limit_currency: String,
+    pub changed_by: Option<String>,
+    pub change_reason: Option<String>,
+}
+
+// ============================================
+// Organization Usage Tracking Models
+// ============================================
+
+/// Organization usage log entry - records individual API calls with costs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrganizationUsageLog {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub workspace_id: Uuid,
+    pub api_key_id: Uuid,
+    pub response_id: Option<Uuid>,
+    pub model_id: String,
+    pub input_tokens: i32,
+    pub output_tokens: i32,
+    pub total_tokens: i32,
+    pub input_cost_amount: i64,
+    pub input_cost_scale: i32,
+    pub input_cost_currency: String,
+    pub output_cost_amount: i64,
+    pub output_cost_scale: i32,
+    pub output_cost_currency: String,
+    pub total_cost_amount: i64,
+    pub total_cost_scale: i32,
+    pub total_cost_currency: String,
+    pub request_type: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Organization balance summary - cached aggregate spending
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrganizationBalance {
+    pub organization_id: Uuid,
+    pub total_spent_amount: i64,
+    pub total_spent_scale: i32,
+    pub total_spent_currency: String,
+    pub last_usage_at: Option<DateTime<Utc>>,
+    pub total_requests: i64,
+    pub total_tokens: i64,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Request to record usage
+#[derive(Debug, Clone)]
+pub struct RecordUsageRequest {
+    pub organization_id: Uuid,
+    pub workspace_id: Uuid,
+    pub api_key_id: Uuid,
+    pub response_id: Option<Uuid>,
+    pub model_id: String,
+    pub input_tokens: i32,
+    pub output_tokens: i32,
+    pub input_cost_amount: i64,
+    pub input_cost_scale: i32,
+    pub input_cost_currency: String,
+    pub output_cost_amount: i64,
+    pub output_cost_scale: i32,
+    pub output_cost_currency: String,
+    pub total_cost_amount: i64,
+    pub total_cost_scale: i32,
+    pub total_cost_currency: String,
+    pub request_type: String,
+}

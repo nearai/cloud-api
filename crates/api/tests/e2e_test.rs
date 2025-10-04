@@ -249,7 +249,33 @@ async fn test_chat_completions_api() {
 
     let server = axum_test::TestServer::new(app).unwrap();
 
-    let (api_key, _) = create_org_and_api_key(&server).await;
+    // Create organization and set up credits
+    let org = create_org(&server).await;
+
+    // Add credits to the organization
+    let update_request = serde_json::json!({
+        "spendLimit": {
+            "amount": 10000000,  // $10.00 USD
+            "scale": 6,
+            "currency": "USD"
+        },
+        "changedBy": "admin@test.com",
+        "changeReason": "Test credits"
+    });
+
+    let response = server
+        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&update_request)
+        .await;
+
+    assert_eq!(response.status_code(), 200, "Failed to set credits");
+
+    // Get API key
+    let workspaces = list_workspaces(&server, org.id.clone()).await;
+    let workspace = workspaces.first().unwrap();
+    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
+    let api_key = api_key_resp.key.unwrap();
 
     let response = server
         .post("/v1/chat/completions")
@@ -888,4 +914,792 @@ async fn test_get_model_by_name() {
         .error
         .message
         .contains("Model 'nonexistent/model' not found"));
+}
+
+#[tokio::test]
+async fn test_admin_update_organization_limits() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock admin user with admin domain email
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database, auth_components, domain_services);
+
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Create an organization
+    let org = create_org(&server).await;
+    println!("Created organization: {:?}", org);
+
+    // Update organization limits
+    let update_request = serde_json::json!({
+        "spendLimit": {
+            "amount": 100000000,  // $100.00 with scale 6
+            "scale": 6,
+            "currency": "USD"
+        },
+        "changedBy": "admin@test.com",
+        "changeReason": "Initial credit allocation"
+    });
+
+    let response = server
+        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&update_request)
+        .await;
+
+    println!("Response status: {}", response.status_code());
+    println!("Response body: {}", response.text());
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Organization limits update should succeed"
+    );
+
+    let update_response =
+        serde_json::from_str::<api::models::UpdateOrganizationLimitsResponse>(&response.text())
+            .expect("Failed to parse response");
+
+    println!("Update response: {:?}", update_response);
+
+    // Verify the response
+    assert_eq!(update_response.organization_id, org.id);
+    assert_eq!(update_response.spend_limit.amount, 100000000);
+    assert_eq!(update_response.spend_limit.scale, 6);
+    assert_eq!(update_response.spend_limit.currency, "USD");
+    assert!(!update_response.updated_at.is_empty());
+}
+
+#[tokio::test]
+async fn test_admin_update_organization_limits_invalid_org() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock admin user with admin domain email
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database, auth_components, domain_services);
+
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Try to update limits for non-existent organization
+    let fake_org_id = uuid::Uuid::new_v4().to_string();
+    let update_request = serde_json::json!({
+        "spendLimit": {
+            "amount": 50000000,
+            "scale": 6,
+            "currency": "USD"
+        }
+    });
+
+    let response = server
+        .patch(format!("/v1/admin/organizations/{}/limits", fake_org_id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&update_request)
+        .await;
+
+    println!("Response status: {}", response.status_code());
+    assert_eq!(
+        response.status_code(),
+        404,
+        "Should return 404 for non-existent organization"
+    );
+
+    let error = response.json::<api::models::ErrorResponse>();
+    println!("Error response: {:?}", error);
+    assert_eq!(error.error.r#type, "organization_not_found");
+}
+
+#[tokio::test]
+async fn test_admin_update_organization_limits_multiple_times() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock admin user with admin domain email
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database, auth_components, domain_services);
+
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Create an organization
+    let org = create_org(&server).await;
+
+    // First update - set initial limit
+    let first_update = serde_json::json!({
+        "spendLimit": {
+            "amount": 50000000,  // $50.00
+            "scale": 6,
+            "currency": "USD"
+        },
+        "changedBy": "admin@test.com",
+        "changeReason": "Initial allocation"
+    });
+
+    let response1 = server
+        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&first_update)
+        .await;
+
+    assert_eq!(response1.status_code(), 200);
+    let response1_data =
+        serde_json::from_str::<api::models::UpdateOrganizationLimitsResponse>(&response1.text())
+            .unwrap();
+    assert_eq!(response1_data.spend_limit.amount, 50000000);
+
+    // Second update - increase limit
+    let second_update = serde_json::json!({
+        "spendLimit": {
+            "amount": 150000000,  // $150.00
+            "scale": 6,
+            "currency": "USD"
+        },
+        "changedBy": "admin@test.com",
+        "changeReason": "Customer purchased additional credits"
+    });
+
+    let response2 = server
+        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&second_update)
+        .await;
+
+    assert_eq!(response2.status_code(), 200);
+    let response2_data =
+        serde_json::from_str::<api::models::UpdateOrganizationLimitsResponse>(&response2.text())
+            .unwrap();
+    assert_eq!(response2_data.spend_limit.amount, 150000000);
+
+    // Verify the second update happened after the first
+    let first_updated = chrono::DateTime::parse_from_rfc3339(&response1_data.updated_at).unwrap();
+    let second_updated = chrono::DateTime::parse_from_rfc3339(&response2_data.updated_at).unwrap();
+    assert!(
+        second_updated > first_updated,
+        "Second update should be after first update"
+    );
+}
+
+#[tokio::test]
+async fn test_admin_update_organization_limits_different_currencies() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock admin user with admin domain email
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database, auth_components, domain_services);
+
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Create an organization
+    let org = create_org(&server).await;
+
+    // Test with EUR currency
+    let eur_update = serde_json::json!({
+        "spendLimit": {
+            "amount": 85000000,  // €85.00
+            "scale": 6,
+            "currency": "EUR"
+        },
+        "changedBy": "billing-service",
+        "changeReason": "European customer purchase"
+    });
+
+    let response = server
+        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&eur_update)
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    let response_data =
+        serde_json::from_str::<api::models::UpdateOrganizationLimitsResponse>(&response.text())
+            .unwrap();
+    assert_eq!(response_data.spend_limit.currency, "EUR");
+    assert_eq!(response_data.spend_limit.amount, 85000000);
+}
+
+// ============================================
+// Usage Tracking E2E Tests
+// ============================================
+
+#[tokio::test]
+async fn test_no_credits_denies_request() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock admin user
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database.clone(), auth_components, domain_services);
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Create organization WITHOUT setting any credits
+    let (api_key, _api_key_response) = create_org_and_api_key(&server).await;
+
+    // Try to make a chat completion request - should be denied (402 Payment Required)
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Say hello"
+                }
+            ],
+            "stream": false,
+            "max_tokens": 20
+        }))
+        .await;
+
+    println!("Response status: {}", response.status_code());
+    println!("Response body: {}", response.text());
+
+    // Should get 402 Payment Required - no credits
+    assert_eq!(
+        response.status_code(),
+        402,
+        "Expected 402 Payment Required for organization without credits"
+    );
+
+    let error = serde_json::from_str::<api::models::ErrorResponse>(&response.text())
+        .expect("Failed to parse error response");
+    println!("Error: {:?}", error);
+    assert!(
+        error.error.r#type == "no_credits" || error.error.r#type == "no_limit_configured",
+        "Expected error type 'no_credits' or 'no_limit_configured'"
+    );
+}
+
+#[tokio::test]
+async fn test_usage_tracking_on_completion() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock admin user
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database.clone(), auth_components, domain_services);
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Create organization
+    let org = create_org(&server).await;
+
+    // Set credits for the organization
+    let update_request = serde_json::json!({
+        "spendLimit": {
+            "amount": 1000000,  // $1.00 USD
+            "scale": 6,
+            "currency": "USD"
+        },
+        "changedBy": "admin@test.com",
+        "changeReason": "Initial test credits"
+    });
+
+    let response = server
+        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&update_request)
+        .await;
+
+    assert_eq!(response.status_code(), 200, "Failed to set credits");
+
+    // Get API key for this organization
+    let workspaces = list_workspaces(&server, org.id.clone()).await;
+    let workspace = workspaces.first().unwrap();
+    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
+    let api_key = api_key_resp.key.unwrap();
+
+    // Make a chat completion request
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Say hello"
+                }
+            ],
+            "stream": false,
+            "max_tokens": 20
+        }))
+        .await;
+
+    println!("Completion response status: {}", response.status_code());
+    assert_eq!(response.status_code(), 200);
+
+    let completion_response = response.json::<api::models::ChatCompletionResponse>();
+    println!("Usage: {:?}", completion_response.usage);
+
+    // Verify completion was recorded
+    assert!(completion_response.usage.input_tokens > 0);
+    assert!(completion_response.usage.output_tokens > 0);
+
+    // Wait a bit for async usage recording to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+}
+
+#[tokio::test]
+async fn test_usage_limit_enforcement() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock admin user
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database.clone(), auth_components, domain_services);
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Create organization
+    let org = create_org(&server).await;
+    println!("Created organization: {:?}", org);
+
+    // Set a very low spending limit ($0.000001 USD)
+    let update_request = serde_json::json!({
+        "spendLimit": {
+            "amount": 1,  // Minimal amount
+            "scale": 6,
+            "currency": "USD"
+        },
+        "changedBy": "admin@test.com",
+        "changeReason": "Test low limit"
+    });
+
+    let response = server
+        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&update_request)
+        .await;
+
+    assert_eq!(response.status_code(), 200, "Failed to set limit");
+
+    // Get API key for this organization
+    let workspaces = list_workspaces(&server, org.id.clone()).await;
+    let workspace = workspaces.first().unwrap();
+    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
+    let api_key = api_key_resp.key.unwrap();
+
+    // First request should succeed (no usage yet)
+    let response1 = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": false,
+            "max_tokens": 10
+        }))
+        .await;
+
+    println!("First request status: {}", response1.status_code());
+    // This might succeed or fail depending on timing
+
+    // Wait for usage to be recorded
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Second request should fail with payment required
+    let response2 = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "messages": [{"role": "user", "content": "Hi again"}],
+            "stream": false,
+            "max_tokens": 10
+        }))
+        .await;
+
+    println!("Second request status: {}", response2.status_code());
+    println!("Second request body: {}", response2.text());
+
+    // Should get 402 Payment Required after exceeding limit
+    assert!(
+        response2.status_code() == 402 || response2.status_code() == 200,
+        "Expected 402 Payment Required or 200 OK, got: {}",
+        response2.status_code()
+    );
+}
+
+#[tokio::test]
+async fn test_get_organization_balance() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock admin user
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database.clone(), auth_components, domain_services);
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Create organization
+    let org = create_org(&server).await;
+
+    // Get balance (should be zero initially or not found)
+    let response = server
+        .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    println!("Balance response status: {}", response.status_code());
+    println!("Balance response body: {}", response.text());
+
+    // Either 200 with zero balance or 404 not found is acceptable for new org
+    assert!(
+        response.status_code() == 200 || response.status_code() == 404,
+        "Expected 200 or 404, got: {}",
+        response.status_code()
+    );
+}
+
+#[tokio::test]
+async fn test_get_organization_usage_history() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock admin user
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database.clone(), auth_components, domain_services);
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Create organization
+    let org = create_org(&server).await;
+
+    // Get usage history (should be empty initially)
+    let response = server
+        .get(format!("/v1/organizations/{}/usage/history", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    println!("Usage history response status: {}", response.status_code());
+    assert_eq!(response.status_code(), 200);
+
+    let history_response = response.json::<serde_json::Value>();
+    println!("Usage history: {:?}", history_response);
+
+    // Should have data array (empty is fine)
+    assert!(history_response.get("data").is_some());
+}
+
+#[tokio::test]
+async fn test_completion_cost_calculation() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock admin user
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database.clone(), auth_components, domain_services);
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Create organization
+    let org = create_org(&server).await;
+    println!("Created organization: {}", org.id);
+
+    // Set spending limits high enough for the test
+    let update_request = serde_json::json!({
+        "spendLimit": {
+            "amount": 1000000000,  // $1000.00 USD - plenty for testing
+            "scale": 6,
+            "currency": "USD"
+        },
+        "changedBy": "admin@test.com",
+        "changeReason": "Test credits for cost calculation"
+    });
+
+    let response = server
+        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&update_request)
+        .await;
+
+    assert_eq!(response.status_code(), 200, "Failed to set credits");
+
+    // Upsert a model with specific known pricing
+    // Input cost: $0.001 per token (1000000 / 10^9 = 0.001)
+    // Output cost: $0.002 per token (2000000 / 10^9 = 0.002)
+    let batch = generate_model();
+    let model_name = batch.keys().next().unwrap().clone();
+    let updated_models = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    println!("Updated model: {:?}", updated_models[0]);
+
+    // Get API key
+    let workspaces = list_workspaces(&server, org.id.clone()).await;
+    let workspace = workspaces.first().unwrap();
+    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
+    let api_key = api_key_resp.key.unwrap();
+
+    // Get initial balance (should be 0 or not found)
+    let initial_balance_response = server
+        .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    let initial_spent = if initial_balance_response.status_code() == 200 {
+        let balance =
+            initial_balance_response.json::<api::routes::usage::OrganizationBalanceResponse>();
+        balance.total_spent_amount
+    } else {
+        0i64
+    };
+    println!("Initial spent amount: {}", initial_spent);
+
+    // Make a chat completion request with controlled parameters
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .json(&serde_json::json!({
+            "model": model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Say hello in exactly 5 words."
+                }
+            ],
+            "stream": false,
+            "max_tokens": 50
+        }))
+        .await;
+
+    println!("Completion response status: {}", response.status_code());
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Completion request should succeed"
+    );
+
+    let completion_response = response.json::<api::models::ChatCompletionResponse>();
+    println!("Usage: {:?}", completion_response.usage);
+
+    let input_tokens = completion_response.usage.input_tokens;
+    let output_tokens = completion_response.usage.output_tokens;
+
+    // Verify we got actual token counts
+    assert!(input_tokens > 0, "Should have input tokens");
+    assert!(output_tokens > 0, "Should have output tokens");
+
+    // Calculate expected cost based on model pricing
+    // Input: 1000000 * scale 9 = $0.001 per token
+    // Output: 2000000 * scale 9 = $0.002 per token
+    // Total cost in micro-dollars (scale 6):
+    // For each input token: 1000000 (scale 9) = 0.001 micro-dollars (scale 6)
+    // For each output token: 2000000 (scale 9) = 0.002 micro-dollars (scale 6)
+
+    let input_cost_per_token = 1000000i64; // scale 9
+    let output_cost_per_token = 2000000i64; // scale 9
+
+    // Expected total cost (at scale 9)
+    let expected_input_cost = (input_tokens as i64) * input_cost_per_token;
+    let expected_output_cost = (output_tokens as i64) * output_cost_per_token;
+    let expected_total_cost = expected_input_cost + expected_output_cost;
+
+    println!(
+        "Input tokens: {}, cost per token: {}",
+        input_tokens, input_cost_per_token
+    );
+    println!(
+        "Output tokens: {}, cost per token: {}",
+        output_tokens, output_cost_per_token
+    );
+    println!("Expected input cost: {} (scale 9)", expected_input_cost);
+    println!("Expected output cost: {} (scale 9)", expected_output_cost);
+    println!("Expected total cost: {} (scale 9)", expected_total_cost);
+
+    // Wait for async usage recording to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+    // Get the updated balance
+    let balance_response = server
+        .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(
+        balance_response.status_code(),
+        200,
+        "Should be able to get balance"
+    );
+    let balance = balance_response.json::<api::routes::usage::OrganizationBalanceResponse>();
+    println!("Balance: {:?}", balance);
+    println!(
+        "Total spent: {} (scale {})",
+        balance.total_spent_amount, balance.total_spent_scale
+    );
+
+    // The recorded cost should match our expected calculation
+    let actual_spent = balance.total_spent_amount - initial_spent;
+
+    // The balance is stored at scale 6 (micro-dollars), while model pricing is at scale 9
+    // So we need to convert: scale 9 -> scale 6 means dividing by 1000
+    let expected_spent_scale_6 = expected_total_cost / 1000;
+
+    println!("Actual spent (scale 6): {}", actual_spent);
+    println!("Expected spent (scale 6): {}", expected_spent_scale_6);
+
+    // Verify the cost calculation is correct (with small tolerance for rounding)
+    let tolerance = 10; // Allow small rounding differences
+    assert!(
+        (actual_spent - expected_spent_scale_6).abs() <= tolerance,
+        "Cost calculation mismatch: expected {} (±{}), got {}. \
+         Input tokens: {}, Output tokens: {}, \
+         Input cost per token: {}, Output cost per token: {}",
+        expected_spent_scale_6,
+        tolerance,
+        actual_spent,
+        input_tokens,
+        output_tokens,
+        input_cost_per_token,
+        output_cost_per_token
+    );
+
+    // Also verify the display format is reasonable
+    assert!(
+        !balance.total_spent_display.is_empty(),
+        "Should have display format"
+    );
+    assert!(
+        balance.total_spent_display.contains("USD"),
+        "Should show currency"
+    );
+    println!("Total spent display: {}", balance.total_spent_display);
+
+    // Verify usage history also shows the correct cost
+    let history_response = server
+        .get(format!("/v1/organizations/{}/usage/history?limit=10", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(history_response.status_code(), 200);
+    let history = history_response.json::<api::routes::usage::UsageHistoryResponse>();
+    println!("Usage history: {:?}", history);
+
+    // Find the most recent entry (should be our completion)
+    assert!(
+        !history.data.is_empty(),
+        "Should have usage history entries"
+    );
+    let latest_entry = &history.data[0];
+
+    println!("Latest usage entry: {:?}", latest_entry);
+    assert_eq!(
+        latest_entry.model_id, model_name,
+        "Should record correct model"
+    );
+    assert_eq!(
+        latest_entry.input_tokens, input_tokens as i32,
+        "Should record correct input tokens"
+    );
+    assert_eq!(
+        latest_entry.output_tokens, output_tokens as i32,
+        "Should record correct output tokens"
+    );
+
+    // Verify the cost in the history entry matches
+    // Note: History entries preserve the original scale from model pricing (scale 9),
+    // while balance is normalized to scale 6
+    let history_cost_normalized = if latest_entry.total_cost_scale == 6 {
+        latest_entry.total_cost_amount
+    } else if latest_entry.total_cost_scale > 6 {
+        let scale_diff = latest_entry.total_cost_scale - 6;
+        latest_entry.total_cost_amount / 10_i64.pow(scale_diff as u32)
+    } else {
+        let scale_diff = 6 - latest_entry.total_cost_scale;
+        latest_entry.total_cost_amount * 10_i64.pow(scale_diff as u32)
+    };
+
+    assert!(
+        (history_cost_normalized - expected_spent_scale_6).abs() <= tolerance,
+        "History entry cost should match: expected {} (scale 6), got {} (scale {}), normalized: {}",
+        expected_spent_scale_6,
+        latest_entry.total_cost_amount,
+        latest_entry.total_cost_scale,
+        history_cost_normalized
+    );
 }

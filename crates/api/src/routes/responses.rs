@@ -110,10 +110,9 @@ pub async fn create_response(
     let domain_input = request.input.clone().map(|input| match input {
         ResponseInput::Text(text) => DomainResponseInput::Text(text),
         ResponseInput::Items(items) => {
-            #[allow(clippy::unnecessary_filter_map)]
             let messages = items
                 .into_iter()
-                .filter_map(|item| match item {
+                .map(|item| match item {
                     ResponseInputItem::Message { role, content } => {
                         let text = match content {
                             ResponseContent::Text(t) => t,
@@ -129,10 +128,10 @@ pub async fn create_response(
                                     .join(" ")
                             }
                         };
-                        Some(ResponseMessage {
+                        ResponseMessage {
                             role,
                             content: text,
-                        })
+                        }
                     }
                 })
                 .collect();

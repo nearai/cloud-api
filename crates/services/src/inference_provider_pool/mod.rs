@@ -2,23 +2,40 @@ use async_trait::async_trait;
 use inference_providers::{
     models::{CompletionError, ListModelsError, ModelsResponse, StreamChunk},
     AttestationReport, ChatCompletionParams, ChatSignature, CompletionParams, InferenceProvider,
-    StreamingResult, StreamingResultExt,
+    StreamingResult, StreamingResultExt, VLlmConfig, VLlmProvider,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct InferenceProviderPool {
-    providers: Vec<Arc<dyn InferenceProvider + Send + Sync>>,
-    model_mapping: Arc<RwLock<HashMap<String, Arc<dyn InferenceProvider + Send + Sync>>>>,
+    /// Discovery URL for dynamic model discovery
+    discovery_url: String,
+    /// Optional API key for authenticating with discovered providers
+    api_key: Option<String>,
+    /// HTTP timeout for discovery requests
+    discovery_timeout: Duration,
+    /// Map of model name -> list of providers (for load balancing)
+    model_mapping: Arc<RwLock<HashMap<String, Vec<Arc<dyn InferenceProvider + Send + Sync>>>>>,
+    /// Round-robin index for each model
+    load_balancer_index: Arc<RwLock<HashMap<String, usize>>>,
+    /// Map of chat_id -> provider for sticky routing
     chat_id_mapping: Arc<RwLock<HashMap<String, Arc<dyn InferenceProvider + Send + Sync>>>>,
 }
 
 impl InferenceProviderPool {
-    pub fn new(providers: Vec<Arc<dyn InferenceProvider + Send + Sync>>) -> Self {
+    /// Create a new pool with discovery URL and optional API key
+    pub fn new(
+        discovery_url: String,
+        api_key: Option<String>,
+        discovery_timeout_secs: u64,
+    ) -> Self {
         Self {
-            providers,
+            discovery_url,
+            api_key,
+            discovery_timeout: Duration::from_secs(discovery_timeout_secs),
             model_mapping: Arc::new(RwLock::new(HashMap::new())),
+            load_balancer_index: Arc::new(RwLock::new(HashMap::new())),
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -26,9 +43,10 @@ impl InferenceProviderPool {
     /// Initialize model discovery - should be called during application startup
     pub async fn initialize(&self) -> Result<(), ListModelsError> {
         tracing::info!(
-            "Initializing model discovery for {} providers",
-            self.providers.len()
+            url = %self.discovery_url,
+            "Initializing model discovery from discovery server"
         );
+
         match self.discover_models().await {
             Ok(models_response) => {
                 tracing::info!(
@@ -42,6 +60,55 @@ impl InferenceProviderPool {
                 Err(e)
             }
         }
+    }
+
+    /// Fetch and parse models from discovery endpoint
+    async fn fetch_from_discovery(&self) -> Result<HashMap<String, String>, ListModelsError> {
+        tracing::info!(
+            url = %self.discovery_url,
+            "Fetching models from discovery server"
+        );
+
+        let client = reqwest::Client::builder()
+            .timeout(self.discovery_timeout)
+            .build()
+            .map_err(|e| {
+                ListModelsError::FetchError(format!("Failed to create HTTP client: {}", e))
+            })?;
+
+        let response = client
+            .get(&self.discovery_url)
+            .send()
+            .await
+            .map_err(|e| ListModelsError::FetchError(format!("HTTP request failed: {}", e)))?;
+
+        let discovery_map: HashMap<String, String> = response
+            .json()
+            .await
+            .map_err(|e| ListModelsError::FetchError(format!("Failed to parse JSON: {}", e)))?;
+
+        tracing::debug!(entries = discovery_map.len(), "Received discovery response");
+
+        Ok(discovery_map)
+    }
+
+    /// Parse IP-based keys like "160.72.54.186:8000"
+    /// Returns None for keys that don't match IP:PORT format (e.g., "redpill:...")
+    fn parse_ip_port(key: &str) -> Option<(String, u16)> {
+        let parts: Vec<&str> = key.split(':').collect();
+        if parts.len() != 2 {
+            return None;
+        }
+
+        let ip = parts[0];
+        let port = parts[1].parse::<u16>().ok()?;
+
+        // Verify it's a valid IP address
+        if ip.parse::<IpAddr>().is_err() {
+            return None;
+        }
+
+        Some((ip.to_string(), port))
     }
 
     /// Ensure models are discovered before using them
@@ -61,63 +128,126 @@ impl InferenceProviderPool {
     }
 
     async fn discover_models(&self) -> Result<ModelsResponse, ListModelsError> {
-        tracing::debug!(
-            providers_count = self.providers.len(),
-            "Starting model discovery across all providers"
-        );
+        tracing::info!("Starting model discovery from discovery endpoint");
 
-        // Collect all models from all providers
-        let mut all_models = Vec::new();
+        // Fetch from discovery server
+        let discovery_map = self.fetch_from_discovery().await?;
+
         let mut model_mapping = self.model_mapping.write().await;
         model_mapping.clear();
 
-        for (provider_idx, provider) in self.providers.iter().enumerate() {
-            tracing::debug!(
-                provider_index = provider_idx,
-                "Discovering models from provider"
+        // Group by model name
+        let mut model_to_endpoints: HashMap<String, Vec<(String, u16)>> = HashMap::new();
+
+        for (key, model_name) in discovery_map {
+            // Filter out non-IP keys
+            if let Some((ip, port)) = Self::parse_ip_port(&key) {
+                tracing::debug!(
+                    key = %key,
+                    model = %model_name,
+                    ip = %ip,
+                    port = port,
+                    "Adding IP-based provider"
+                );
+
+                model_to_endpoints
+                    .entry(model_name)
+                    .or_insert_with(Vec::new)
+                    .push((ip, port));
+            } else {
+                tracing::debug!(
+                    key = %key,
+                    model = %model_name,
+                    "Skipping non-IP key"
+                );
+            }
+        }
+
+        // Create providers for each endpoint
+        let mut all_models = Vec::new();
+
+        for (model_name, endpoints) in model_to_endpoints {
+            tracing::info!(
+                model = %model_name,
+                providers_count = endpoints.len(),
+                "Discovered model with {} provider(s)",
+                endpoints.len()
             );
 
-            match provider.models().await {
-                Ok(models_response) => {
-                    tracing::info!(
-                        provider_index = provider_idx,
-                        models_count = models_response.data.len(),
-                        "Successfully discovered models from provider"
-                    );
+            let mut providers_for_model = Vec::new();
 
-                    for model in &models_response.data {
-                        tracing::debug!(
-                            provider_index = provider_idx,
-                            model_id = %model.id,
-                            "Adding model to mapping"
-                        );
-                        // Map each model to its provider
-                        model_mapping.insert(model.id.clone(), provider.clone());
-                        all_models.push(model.clone());
-                    }
-                }
-                Err(e) => {
-                    // Log error but continue with other providers
-                    tracing::error!(
-                        provider_index = provider_idx,
-                        error = %e,
-                        "Provider failed to list models, continuing with other providers"
-                    );
-                }
+            for (ip, port) in endpoints {
+                let url = format!("http://{}:{}", ip, port);
+                tracing::debug!(
+                    model = %model_name,
+                    url = %url,
+                    "Creating provider for model"
+                );
+
+                let provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
+                    url,
+                    self.api_key.clone(),
+                    None,
+                ))) as Arc<dyn InferenceProvider + Send + Sync>;
+
+                providers_for_model.push(provider);
             }
+
+            model_mapping.insert(model_name.clone(), providers_for_model);
+
+            all_models.push(inference_providers::models::ModelInfo {
+                id: model_name,
+                object: "model".to_string(),
+                created: 0,
+                owned_by: "discovered".to_string(),
+            });
         }
 
         tracing::info!(
             total_models = all_models.len(),
-            total_providers = self.providers.len(),
+            total_providers = model_mapping.values().map(|v| v.len()).sum::<usize>(),
             model_ids = ?all_models.iter().map(|m| &m.id).collect::<Vec<_>>(),
-            "Model discovery completed"
+            "Model discovery from endpoint completed"
         );
 
         Ok(ModelsResponse {
             object: "list".to_string(),
             data: all_models,
         })
+    }
+
+    /// Get the next provider for a model using round-robin load balancing
+    async fn get_next_provider_for_model(
+        &self,
+        model_id: &str,
+    ) -> Option<Arc<dyn InferenceProvider + Send + Sync>> {
+        let model_mapping = self.model_mapping.read().await;
+        let providers = model_mapping.get(model_id)?;
+
+        if providers.is_empty() {
+            return None;
+        }
+
+        if providers.len() == 1 {
+            return Some(providers[0].clone());
+        }
+
+        // Get current index for this model
+        let mut indices = self.load_balancer_index.write().await;
+        let index = indices.entry(model_id.to_string()).or_insert(0);
+        let provider = providers[*index % providers.len()].clone();
+
+        // Increment for next request
+        *index = (*index + 1) % providers.len();
+
+        tracing::debug!(
+            model = %model_id,
+            providers_count = providers.len(),
+            selected_index = *index - 1,
+            "Selected provider using round-robin load balancing"
+        );
+
+        Some(provider)
     }
 
     /// Store a mapping of chat_id to provider
@@ -153,17 +283,22 @@ impl InferenceProvider for InferenceProviderPool {
             return provider.get_signature(chat_id).await;
         }
 
-        // Fallback to trying all providers if chat_id mapping not found
+        // Fallback to trying all discovered providers if chat_id mapping not found
         tracing::warn!(
             chat_id = %chat_id,
-            "No provider mapping found for chat_id, trying all providers"
+            "No provider mapping found for chat_id, trying all discovered providers"
         );
-        for provider in &self.providers {
-            match provider.get_signature(chat_id).await {
-                Ok(signature) => return Ok(signature),
-                Err(_) => continue, // Try next provider
+
+        let model_mapping = self.model_mapping.read().await;
+        for providers in model_mapping.values() {
+            for provider in providers {
+                match provider.get_signature(chat_id).await {
+                    Ok(signature) => return Ok(signature),
+                    Err(_) => continue, // Try next provider
+                }
             }
         }
+
         Err(CompletionError::CompletionError(format!(
             "No provider found with signature for chat_id: {}",
             chat_id
@@ -175,8 +310,8 @@ impl InferenceProvider for InferenceProviderPool {
         model: String,
         signing_algo: Option<String>,
     ) -> Result<AttestationReport, CompletionError> {
-        let providers = self.model_mapping.read().await.get(&model).cloned();
-        if let Some(provider) = providers {
+        // Get the first provider for this model
+        if let Some(provider) = self.get_next_provider_for_model(&model).await {
             return provider.get_attestation_report(model, signing_algo).await;
         }
         Err(CompletionError::CompletionError(
@@ -202,17 +337,8 @@ impl InferenceProvider for InferenceProviderPool {
         // Ensure models are discovered first
         self.ensure_models_discovered().await?;
 
-        let model_mapping = self.model_mapping.read().await;
-        let available_models: Vec<_> = model_mapping.keys().collect();
-
-        tracing::debug!(
-            model_id = %model_id,
-            available_models = ?available_models,
-            mapping_size = model_mapping.len(),
-            "Checking model availability in provider pool"
-        );
-
-        match model_mapping.get(&model_id) {
+        // Use load balancing to get the next provider
+        match self.get_next_provider_for_model(&model_id).await {
             Some(provider) => {
                 tracing::info!(
                     model_id = %model_id,
@@ -235,11 +361,12 @@ impl InferenceProvider for InferenceProviderPool {
                 Ok(Box::pin(peekable))
             }
             None => {
+                let model_mapping = self.model_mapping.read().await;
+                let available_models: Vec<_> = model_mapping.keys().collect();
+
                 tracing::error!(
                     model_id = %model_id,
                     available_models = ?available_models,
-                    providers_count = %self.providers.len(),
-                    mapping_size = model_mapping.len(),
                     "Model not found in provider pool"
                 );
                 Err(CompletionError::CompletionError(format!(
@@ -259,16 +386,16 @@ impl InferenceProvider for InferenceProviderPool {
         // Ensure models are discovered first
         self.ensure_models_discovered().await?;
 
-        let model_mapping = self.model_mapping.read().await;
-        let available_models: Vec<_> = model_mapping.keys().collect();
-
-        match model_mapping.get(&model_id) {
+        // Use load balancing to get the next provider
+        match self.get_next_provider_for_model(&model_id).await {
             Some(provider) => provider.text_completion_stream(params).await,
             None => {
+                let model_mapping = self.model_mapping.read().await;
+                let available_models: Vec<_> = model_mapping.keys().collect();
+
                 tracing::error!(
                     model_id = %model_id,
                     available_models = ?available_models,
-                    providers_count = %self.providers.len(),
                     "Model not found in provider pool. Available models: {:?}",
                     available_models
                 );
@@ -278,5 +405,39 @@ impl InferenceProvider for InferenceProviderPool {
                 )))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_ip_port() {
+        // Valid IP-based keys
+        assert_eq!(
+            InferenceProviderPool::parse_ip_port("160.72.54.186:8000"),
+            Some(("160.72.54.186".to_string(), 8000))
+        );
+        assert_eq!(
+            InferenceProviderPool::parse_ip_port("154.57.34.78:8001"),
+            Some(("154.57.34.78".to_string(), 8001))
+        );
+
+        // Invalid keys (should be filtered out)
+        assert_eq!(
+            InferenceProviderPool::parse_ip_port("redpill:phala/qwen-2.5-7b-instruct"),
+            None
+        );
+        assert_eq!(InferenceProviderPool::parse_ip_port("invalid"), None);
+        assert_eq!(InferenceProviderPool::parse_ip_port("not-an-ip:8000"), None);
+        assert_eq!(
+            InferenceProviderPool::parse_ip_port("256.256.256.256:8000"),
+            None
+        ); // Invalid IP
+        assert_eq!(
+            InferenceProviderPool::parse_ip_port("192.168.1.1:70000"),
+            None
+        ); // Invalid port
     }
 }

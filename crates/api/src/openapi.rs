@@ -1,5 +1,5 @@
 use crate::models::*;
-use utoipa::openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
 /// OpenAPI documentation configuration
@@ -7,7 +7,7 @@ use utoipa::{Modify, OpenApi};
 #[openapi(
     info(
         title = "Platform API",
-        description = "A comprehensive platform API for AI model inference, conversation management, and organization administration.\n\n## Authentication\n\nThis API supports two authentication methods:\n\n1. **Bearer Token (Session)**: Use `Authorization: Bearer <uuid>` with a session token\n2. **API Key**: Use `Authorization: Bearer sk_<key>` with an API key\n\nClick the **Authorize** button above to configure authentication.",
+        description = "A comprehensive platform API for AI model inference, conversation management, and organization administration.\n\n## Authentication\n\nThis API supports two authentication methods:\n\n1. **Session Token (User Authentication)**: Use `Authorization: Bearer <session_token>` with a session token obtained from OAuth login\n2. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk_<api_key>` with an API key (prefix: `sk_`)\n\nClick the **Authorize** button above to configure authentication.",
         version = "1.0.0",
         contact(
             name = "Platform API Team",
@@ -144,27 +144,39 @@ pub struct SecurityAddon;
 impl Modify for SecurityAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         if let Some(components) = openapi.components.as_mut() {
-            // Bearer token authentication (JWT/session tokens)
+            // Session Token authentication (User authentication via OAuth)
             components.add_security_scheme(
-                "bearer",
+                "session_token",
                 SecurityScheme::Http(
                     HttpBuilder::new()
                         .scheme(HttpAuthScheme::Bearer)
-                        .bearer_format("JWT")
+                        .bearer_format("session_token")
+                        .description(Some("Session token obtained from OAuth login (Authorization: Bearer <session_token>)"))
                         .build(),
                 ),
             );
-            // API Key authentication
+            // API Key authentication (Programmatic access)
             components.add_security_scheme(
                 "api_key",
-                SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("X-API-Key"))),
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("api_key")
+                        .description(Some(
+                            "API key for programmatic access (Authorization: Bearer sk_<api_key>)",
+                        ))
+                        .build(),
+                ),
             );
         }
 
         // Set global security requirement - endpoints need at least one of these
         openapi.security = Some(vec![
-            // Allow Bearer token
-            utoipa::openapi::security::SecurityRequirement::new("bearer", Vec::<String>::new()),
+            // Allow Session Token
+            utoipa::openapi::security::SecurityRequirement::new(
+                "session_token",
+                Vec::<String>::new(),
+            ),
             // OR API key
             utoipa::openapi::security::SecurityRequirement::new("api_key", Vec::<String>::new()),
         ]);

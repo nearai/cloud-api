@@ -3,7 +3,6 @@ use std::{collections::HashMap, env};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfig {
-    pub providers: Vec<ProviderConfig>,
     pub server: ServerConfig,
     pub model_discovery: ModelDiscoveryConfig,
     #[serde(default)]
@@ -62,6 +61,8 @@ pub struct ServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDiscoveryConfig {
+    pub discovery_server_url: String,
+    pub api_key: Option<String>,
     pub refresh_interval: u64, // seconds
     pub timeout: u64,          // seconds
 }
@@ -69,6 +70,9 @@ pub struct ModelDiscoveryConfig {
 impl Default for ModelDiscoveryConfig {
     fn default() -> Self {
         Self {
+            discovery_server_url: env::var("MODEL_DISCOVERY_SERVER_URL")
+                .expect("MODEL_DISCOVERY_SERVER_URL environment variable is required"),
+            api_key: env::var("MODEL_DISCOVERY_API_KEY").ok(),
             refresh_interval: env::var("MODEL_DISCOVERY_REFRESH_INTERVAL")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -104,17 +108,6 @@ impl Default for LoggingConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderConfig {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub provider_type: String, // "vllm", "redpill"
-    pub url: String,
-    pub api_key: Option<String>,
-    pub enabled: bool,
-    pub priority: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DstackClientConfig {
     pub url: String,
 }
@@ -122,7 +115,6 @@ pub struct DstackClientConfig {
 // Domain-specific configuration types that will be used by domain layer
 #[derive(Debug, Clone)]
 pub struct DomainConfig {
-    pub providers: Vec<ProviderConfig>,
     pub model_discovery: ModelDiscoveryConfig,
     pub dstack_client: DstackClientConfig,
     pub auth: AuthConfig,
@@ -205,7 +197,6 @@ impl From<GoogleOAuthConfig> for OAuthProviderConfig {
 impl From<ApiConfig> for DomainConfig {
     fn from(api_config: ApiConfig) -> Self {
         Self {
-            providers: api_config.providers,
             model_discovery: api_config.model_discovery,
             dstack_client: api_config.dstack_client,
             auth: api_config.auth,

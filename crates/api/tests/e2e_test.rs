@@ -18,19 +18,13 @@ const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
 /// Helper function to create a test configuration
 fn test_config() -> ApiConfig {
     ApiConfig {
-        providers: vec![config::ProviderConfig {
-            name: "vllm-prod-1".to_string(),
-            provider_type: "vllm".to_string(),
-            url: "http://REDACTED_IP2:8000".to_string(),
-            api_key: Some("REDACTED".to_string()),
-            enabled: true,
-            priority: 1,
-        }],
         server: config::ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 0, // Use port 0 to get a random available port
         },
         model_discovery: config::ModelDiscoveryConfig {
+            discovery_server_url: "http://REDACTED_DISCOVERY:8080/models".to_string(),
+            api_key: Some("REDACTED".to_string()),
             refresh_interval: 0,
             timeout: 5,
         },

@@ -34,7 +34,6 @@ use database::{
     },
     Database,
 };
-use inference_providers::{InferenceProvider, VLlmConfig, VLlmProvider};
 use services::{
     auth::{AuthService, AuthServiceTrait, MockAuthService, OAuthManager},
     models::ModelsService,
@@ -278,25 +277,40 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
 pub async fn init_inference_providers(
     config: &ApiConfig,
 ) -> Arc<services::inference_provider_pool::InferenceProviderPool> {
-    let providers: Vec<Arc<dyn InferenceProvider + Send + Sync>> = config
-        .providers
-        .iter()
-        .map(|p| {
-            Arc::new(VLlmProvider::new(VLlmConfig::new(
-                p.url.clone(),
-                p.api_key.clone(),
-                None,
-            ))) as Arc<dyn InferenceProvider + Send + Sync>
-        })
-        .collect();
+    let discovery_url = config.model_discovery.discovery_server_url.clone();
+    let api_key = config.model_discovery.api_key.clone();
 
-    let pool = Arc::new(services::inference_provider_pool::InferenceProviderPool::new(providers));
+    // Create pool with discovery URL and API key
+    let pool = Arc::new(
+        services::inference_provider_pool::InferenceProviderPool::new(
+            discovery_url,
+            api_key,
+            config.model_discovery.timeout,
+        ),
+    );
 
     // Initialize model discovery during startup
     if let Err(e) = pool.initialize().await {
         tracing::warn!("Failed to initialize model discovery during startup: {}", e);
         tracing::info!("Models will be discovered on first request");
     }
+
+    // Start periodic refresh task
+    let pool_clone = pool.clone();
+    let refresh_interval = config.model_discovery.refresh_interval;
+
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(refresh_interval));
+        loop {
+            interval.tick().await;
+            tracing::debug!("Running periodic model discovery refresh");
+            // Re-run model discovery
+            if let Err(e) = pool_clone.initialize().await {
+                tracing::error!("Failed to refresh model discovery: {}", e);
+            }
+        }
+    });
 
     pool
 }
@@ -344,7 +358,7 @@ pub fn build_app_with_config(
     let api_key_repository = Arc::new(database::repositories::ApiKeyRepository::new(
         database.pool().clone(),
     ));
-    
+
     let usage_state = middleware::UsageState {
         usage_service: domain_services.usage_service.clone(),
         usage_repository,
@@ -812,12 +826,13 @@ mod tests {
     async fn test_app_setup() {
         // Create a test configuration
         let config = ApiConfig {
-            providers: vec![],
             server: config::ServerConfig {
                 host: "127.0.0.1".to_string(),
                 port: 0, // Use port 0 for testing to get a random available port
             },
             model_discovery: config::ModelDiscoveryConfig {
+                discovery_server_url: "http://localhost:8080/models".to_string(),
+                api_key: Some("test-key".to_string()),
                 refresh_interval: 0,
                 timeout: 5,
             },
@@ -878,12 +893,13 @@ mod tests {
 
         // Create a test configuration
         let config = ApiConfig {
-            providers: vec![],
             server: config::ServerConfig {
                 host: "127.0.0.1".to_string(),
                 port: 0,
             },
             model_discovery: config::ModelDiscoveryConfig {
+                discovery_server_url: "http://localhost:8080/models".to_string(),
+                api_key: Some("test-key".to_string()),
                 refresh_interval: 0,
                 timeout: 5,
             },

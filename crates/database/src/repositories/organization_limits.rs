@@ -69,22 +69,18 @@ impl OrganizationLimitsRepository {
                 r#"
                 INSERT INTO organization_limits_history (
                     organization_id,
-                    spend_limit_amount,
-                    spend_limit_scale,
-                    spend_limit_currency,
+                    spend_limit,
                     effective_from,
                     changed_by,
                     change_reason
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-                RETURNING id, organization_id, spend_limit_amount, spend_limit_scale,
-                          spend_limit_currency, effective_from, effective_until,
+                ) VALUES ($1, $2, $3, $4, $5)
+                RETURNING id, organization_id, spend_limit,
+                          effective_from, effective_until,
                           changed_by, change_reason, created_at
                 "#,
                 &[
                     &organization_id,
-                    &request.spend_limit_amount,
-                    &request.spend_limit_scale,
-                    &request.spend_limit_currency,
+                    &request.spend_limit,
                     &now,
                     &request.changed_by,
                     &request.change_reason,
@@ -115,8 +111,8 @@ impl OrganizationLimitsRepository {
         let rows = client
             .query(
                 r#"
-                SELECT id, organization_id, spend_limit_amount, spend_limit_scale,
-                       spend_limit_currency, effective_from, effective_until,
+                SELECT id, organization_id, spend_limit,
+                       effective_from, effective_until,
                        changed_by, change_reason, created_at
                 FROM organization_limits_history
                 WHERE organization_id = $1 AND effective_until IS NULL
@@ -149,8 +145,8 @@ impl OrganizationLimitsRepository {
         let rows = client
             .query(
                 r#"
-                SELECT id, organization_id, spend_limit_amount, spend_limit_scale,
-                       spend_limit_currency, effective_from, effective_until,
+                SELECT id, organization_id, spend_limit,
+                       effective_from, effective_until,
                        changed_by, change_reason, created_at
                 FROM organization_limits_history
                 WHERE organization_id = $1
@@ -173,9 +169,7 @@ impl OrganizationLimitsRepository {
         OrganizationLimitsHistory {
             id: row.get("id"),
             organization_id: row.get("organization_id"),
-            spend_limit_amount: row.get("spend_limit_amount"),
-            spend_limit_scale: row.get("spend_limit_scale"),
-            spend_limit_currency: row.get("spend_limit_currency"),
+            spend_limit: row.get("spend_limit"),
             effective_from: row.get("effective_from"),
             effective_until: row.get("effective_until"),
             changed_by: row.get("changed_by"),

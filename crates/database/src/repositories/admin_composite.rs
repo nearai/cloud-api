@@ -35,12 +35,8 @@ impl AdminRepository for AdminCompositeRepository {
     ) -> Result<ModelPricing> {
         // Convert service request to database request
         let db_request = UpdateModelPricingRequest {
-            input_cost_amount: request.input_cost_amount,
-            input_cost_scale: request.input_cost_scale,
-            input_cost_currency: request.input_cost_currency,
-            output_cost_amount: request.output_cost_amount,
-            output_cost_scale: request.output_cost_scale,
-            output_cost_currency: request.output_cost_currency,
+            input_cost_per_token: request.input_cost_per_token,
+            output_cost_per_token: request.output_cost_per_token,
             model_display_name: request.model_display_name,
             model_description: request.model_description,
             model_icon: request.model_icon,
@@ -58,12 +54,8 @@ impl AdminRepository for AdminCompositeRepository {
             model_display_name: model.model_display_name,
             model_description: model.model_description,
             model_icon: model.model_icon,
-            input_cost_amount: model.input_cost_amount,
-            input_cost_scale: model.input_cost_scale,
-            input_cost_currency: model.input_cost_currency,
-            output_cost_amount: model.output_cost_amount,
-            output_cost_scale: model.output_cost_scale,
-            output_cost_currency: model.output_cost_currency,
+            input_cost_per_token: model.input_cost_per_token,
+            output_cost_per_token: model.output_cost_per_token,
             context_length: model.context_length,
             verifiable: model.verifiable,
             is_active: model.is_active,
@@ -81,12 +73,8 @@ impl AdminRepository for AdminCompositeRepository {
             .map(|h| ModelPricingHistoryEntry {
                 id: h.id,
                 model_id: h.model_id,
-                input_cost_amount: h.input_cost_amount,
-                input_cost_scale: h.input_cost_scale,
-                input_cost_currency: h.input_cost_currency,
-                output_cost_amount: h.output_cost_amount,
-                output_cost_scale: h.output_cost_scale,
-                output_cost_currency: h.output_cost_currency,
+                input_cost_per_token: h.input_cost_per_token,
+                output_cost_per_token: h.output_cost_per_token,
                 context_length: h.context_length,
                 model_display_name: h.model_display_name,
                 model_description: h.model_description,
@@ -105,9 +93,7 @@ impl AdminRepository for AdminCompositeRepository {
         limits: OrganizationLimitsUpdate,
     ) -> Result<OrganizationLimits> {
         let db_request = UpdateOrganizationLimitsDbRequest {
-            spend_limit_amount: limits.spend_limit_amount,
-            spend_limit_scale: limits.spend_limit_scale,
-            spend_limit_currency: limits.spend_limit_currency,
+            spend_limit: limits.spend_limit,
             changed_by: limits.changed_by,
             change_reason: limits.change_reason,
         };
@@ -119,9 +105,7 @@ impl AdminRepository for AdminCompositeRepository {
 
         Ok(OrganizationLimits {
             organization_id: history.organization_id,
-            spend_limit_amount: history.spend_limit_amount,
-            spend_limit_scale: history.spend_limit_scale,
-            spend_limit_currency: history.spend_limit_currency,
+            spend_limit: history.spend_limit,
             effective_from: history.effective_from,
         })
     }
@@ -134,9 +118,7 @@ impl AdminRepository for AdminCompositeRepository {
 
         Ok(limits_opt.map(|h| OrganizationLimits {
             organization_id: h.organization_id,
-            spend_limit_amount: h.spend_limit_amount,
-            spend_limit_scale: h.spend_limit_scale,
-            spend_limit_currency: h.spend_limit_currency,
+            spend_limit: h.spend_limit,
             effective_from: h.effective_from,
         }))
     }
@@ -152,9 +134,7 @@ impl AdminRepository for AdminCompositeRepository {
             .map(|h| OrganizationLimitsHistoryEntry {
                 id: h.id,
                 organization_id: h.organization_id,
-                spend_limit_amount: h.spend_limit_amount,
-                spend_limit_scale: h.spend_limit_scale,
-                spend_limit_currency: h.spend_limit_currency,
+                spend_limit: h.spend_limit,
                 effective_from: h.effective_from,
                 effective_until: h.effective_until,
                 changed_by: h.changed_by,

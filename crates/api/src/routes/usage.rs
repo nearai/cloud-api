@@ -10,13 +10,12 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// Get organization balance response
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationBalanceResponse {
     pub organization_id: String,
-    pub total_spent_amount: i64,
-    pub total_spent_scale: i32,
-    pub total_spent_currency: String,
-    pub total_spent_display: String, // Human readable, e.g., "12.50 USD"
+    pub total_spent: i64,            // In nano-dollars (scale 9)
+    pub total_spent_display: String, // Human readable, e.g., "$12.50"
     pub last_usage_at: Option<String>,
     pub total_requests: i64,
     pub total_tokens: i64,
@@ -24,6 +23,7 @@ pub struct OrganizationBalanceResponse {
 }
 
 /// Usage history entry
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UsageHistoryEntryResponse {
     pub id: String,
@@ -33,10 +33,8 @@ pub struct UsageHistoryEntryResponse {
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub total_tokens: i32,
-    pub total_cost_amount: i64,
-    pub total_cost_scale: i32,
-    pub total_cost_currency: String,
-    pub total_cost_display: String, // Human readable
+    pub total_cost: i64,            // In nano-dollars (scale 9)
+    pub total_cost_display: String, // Human readable, e.g., "$0.00123"
     pub request_type: String,
     pub created_at: String,
 }
@@ -126,14 +124,8 @@ pub async fn get_organization_balance(
     match balance {
         Some(balance) => Ok(ResponseJson(OrganizationBalanceResponse {
             organization_id: balance.organization_id.to_string(),
-            total_spent_amount: balance.total_spent_amount,
-            total_spent_scale: balance.total_spent_scale,
-            total_spent_currency: balance.total_spent_currency.clone(),
-            total_spent_display: format_amount(
-                balance.total_spent_amount,
-                balance.total_spent_scale,
-                &balance.total_spent_currency,
-            ),
+            total_spent: balance.total_spent,
+            total_spent_display: format_amount(balance.total_spent),
             last_usage_at: balance.last_usage_at.map(|dt| dt.to_rfc3339()),
             total_requests: balance.total_requests,
             total_tokens: balance.total_tokens,
@@ -223,14 +215,8 @@ pub async fn get_organization_usage_history(
             input_tokens: entry.input_tokens,
             output_tokens: entry.output_tokens,
             total_tokens: entry.total_tokens,
-            total_cost_amount: entry.total_cost_amount,
-            total_cost_scale: entry.total_cost_scale,
-            total_cost_currency: entry.total_cost_currency.clone(),
-            total_cost_display: format_amount(
-                entry.total_cost_amount,
-                entry.total_cost_scale,
-                &entry.total_cost_currency,
-            ),
+            total_cost: entry.total_cost,
+            total_cost_display: format_amount(entry.total_cost),
             request_type: entry.request_type,
             created_at: entry.created_at.to_rfc3339(),
         })
@@ -244,19 +230,20 @@ pub async fn get_organization_usage_history(
     }))
 }
 
-/// Helper function to format amount with currency
-fn format_amount(amount: i64, scale: i32, currency: &str) -> String {
-    let divisor = 10_i64.pow(scale as u32);
+/// Helper function to format amount (fixed scale 9 = nano-dollars, USD)
+fn format_amount(amount: i64) -> String {
+    const SCALE: i32 = 9;
+    let divisor = 10_i64.pow(SCALE as u32);
     let whole = amount / divisor;
     let fraction = amount % divisor;
 
     if fraction == 0 {
-        format!("{} {}", whole, currency)
+        format!("${}.00", whole)
     } else {
         // Remove trailing zeros from fraction
-        let fraction_str = format!("{:0width$}", fraction, width = scale as usize);
+        let fraction_str = format!("{:09}", fraction);
         let trimmed = fraction_str.trim_end_matches('0');
-        format!("{}.{} {}", whole, trimmed, currency)
+        format!("${}.{}", whole, trimmed)
     }
 }
 
@@ -266,10 +253,12 @@ mod tests {
 
     #[test]
     fn test_format_amount() {
-        assert_eq!(format_amount(1000000, 6, "USD"), "1 USD");
-        assert_eq!(format_amount(1500000, 6, "USD"), "1.5 USD");
-        assert_eq!(format_amount(1230000, 6, "USD"), "1.23 USD");
-        assert_eq!(format_amount(100, 6, "USD"), "0.0001 USD");
-        assert_eq!(format_amount(1, 6, "USD"), "0.000001 USD");
+        // Test with scale 9 (nano-dollars, USD)
+        assert_eq!(format_amount(1000000000), "$1.00");
+        assert_eq!(format_amount(1500000000), "$1.5");
+        assert_eq!(format_amount(1230000000), "$1.23");
+        assert_eq!(format_amount(100000), "$0.0001");
+        assert_eq!(format_amount(1), "$0.000000001");
+        assert_eq!(format_amount(0), "$0.00");
     }
 }

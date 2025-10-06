@@ -28,8 +28,7 @@ impl ModelRepository {
                 r#"
                 SELECT 
                     id, model_name, model_display_name, model_description, model_icon,
-                    input_cost_amount, input_cost_scale, input_cost_currency,
-                    output_cost_amount, output_cost_scale, output_cost_currency,
+                    input_cost_per_token, output_cost_per_token,
                     context_length, verifiable, is_active, created_at, updated_at
                 FROM models 
                 WHERE is_active = true
@@ -60,8 +59,7 @@ impl ModelRepository {
                 r#"
                 SELECT 
                     id, model_name, model_display_name, model_description, model_icon,
-                    input_cost_amount, input_cost_scale, input_cost_currency,
-                    output_cost_amount, output_cost_scale, output_cost_currency,
+                    input_cost_per_token, output_cost_per_token,
                     context_length, verifiable, is_active, created_at, updated_at
                 FROM models 
                 WHERE model_name = $1
@@ -96,38 +94,28 @@ impl ModelRepository {
                 r#"
                 INSERT INTO models (
                     model_name, 
-                    input_cost_amount, input_cost_scale, input_cost_currency,
-                    output_cost_amount, output_cost_scale, output_cost_currency,
+                    input_cost_per_token, output_cost_per_token,
                     model_display_name, model_description, model_icon,
                     context_length, verifiable, is_active
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 ON CONFLICT (model_name) DO UPDATE SET
-                    input_cost_amount = COALESCE($2, models.input_cost_amount),
-                    input_cost_scale = COALESCE($3, models.input_cost_scale),
-                    input_cost_currency = COALESCE($4, models.input_cost_currency),
-                    output_cost_amount = COALESCE($5, models.output_cost_amount),
-                    output_cost_scale = COALESCE($6, models.output_cost_scale),
-                    output_cost_currency = COALESCE($7, models.output_cost_currency),
-                    model_display_name = COALESCE($8, models.model_display_name),
-                    model_description = COALESCE($9, models.model_description),
-                    model_icon = COALESCE($10, models.model_icon),
-                    context_length = COALESCE($11, models.context_length),
-                    verifiable = COALESCE($12, models.verifiable),
-                    is_active = COALESCE($13, models.is_active),
+                    input_cost_per_token = COALESCE($2, models.input_cost_per_token),
+                    output_cost_per_token = COALESCE($3, models.output_cost_per_token),
+                    model_display_name = COALESCE($4, models.model_display_name),
+                    model_description = COALESCE($5, models.model_description),
+                    model_icon = COALESCE($6, models.model_icon),
+                    context_length = COALESCE($7, models.context_length),
+                    verifiable = COALESCE($8, models.verifiable),
+                    is_active = COALESCE($9, models.is_active),
                     updated_at = NOW()
                 RETURNING id, model_name, model_display_name, model_description, model_icon,
-                          input_cost_amount, input_cost_scale, input_cost_currency,
-                          output_cost_amount, output_cost_scale, output_cost_currency,
+                          input_cost_per_token, output_cost_per_token,
                           context_length, verifiable, is_active, created_at, updated_at
                 "#,
                 &[
                     &model_name,
-                    &update_request.input_cost_amount,
-                    &update_request.input_cost_scale,
-                    &update_request.input_cost_currency,
-                    &update_request.output_cost_amount,
-                    &update_request.output_cost_scale,
-                    &update_request.output_cost_currency,
+                    &update_request.input_cost_per_token,
+                    &update_request.output_cost_per_token,
                     &update_request.model_display_name,
                     &update_request.model_description,
                     &update_request.model_icon,
@@ -155,13 +143,11 @@ impl ModelRepository {
                 r#"
                 INSERT INTO models (
                     model_name, model_display_name, model_description, model_icon,
-                    input_cost_amount, input_cost_scale, input_cost_currency,
-                    output_cost_amount, output_cost_scale, output_cost_currency,
+                    input_cost_per_token, output_cost_per_token,
                     context_length, verifiable, is_active
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 RETURNING id, model_name, model_display_name, model_description, model_icon,
-                          input_cost_amount, input_cost_scale, input_cost_currency,
-                          output_cost_amount, output_cost_scale, output_cost_currency,
+                          input_cost_per_token, output_cost_per_token,
                           context_length, verifiable, is_active, created_at, updated_at
                 "#,
                 &[
@@ -169,12 +155,8 @@ impl ModelRepository {
                     &model.model_display_name,
                     &model.model_description,
                     &model.model_icon,
-                    &model.input_cost_amount,
-                    &model.input_cost_scale,
-                    &model.input_cost_currency,
-                    &model.output_cost_amount,
-                    &model.output_cost_scale,
-                    &model.output_cost_currency,
+                    &model.input_cost_per_token,
+                    &model.output_cost_per_token,
                     &model.context_length,
                     &model.verifiable,
                     &model.is_active,
@@ -201,8 +183,7 @@ impl ModelRepository {
             .query(
                 r#"
                 SELECT 
-                    id, model_id, input_cost_amount, input_cost_scale, input_cost_currency,
-                    output_cost_amount, output_cost_scale, output_cost_currency,
+                    id, model_id, input_cost_per_token, output_cost_per_token,
                     context_length, model_display_name, model_description,
                     effective_from, effective_until, changed_by, change_reason, created_at
                 FROM model_pricing_history
@@ -237,8 +218,7 @@ impl ModelRepository {
             .query(
                 r#"
                 SELECT 
-                    id, model_id, input_cost_amount, input_cost_scale, input_cost_currency,
-                    output_cost_amount, output_cost_scale, output_cost_currency,
+                    id, model_id, input_cost_per_token, output_cost_per_token,
                     context_length, model_display_name, model_description,
                     effective_from, effective_until, changed_by, change_reason, created_at
                 FROM model_pricing_history
@@ -275,8 +255,7 @@ impl ModelRepository {
             .query(
                 r#"
                 SELECT 
-                    h.id, h.model_id, h.input_cost_amount, h.input_cost_scale, h.input_cost_currency,
-                    h.output_cost_amount, h.output_cost_scale, h.output_cost_currency,
+                    h.id, h.model_id, h.input_cost_per_token, h.output_cost_per_token,
                     h.context_length, h.model_display_name, h.model_description,
                     h.effective_from, h.effective_until, h.changed_by, h.change_reason, h.created_at
                 FROM model_pricing_history h
@@ -304,12 +283,8 @@ impl ModelRepository {
             model_display_name: row.get("model_display_name"),
             model_description: row.get("model_description"),
             model_icon: row.get("model_icon"),
-            input_cost_amount: row.get("input_cost_amount"),
-            input_cost_scale: row.get("input_cost_scale"),
-            input_cost_currency: row.get("input_cost_currency"),
-            output_cost_amount: row.get("output_cost_amount"),
-            output_cost_scale: row.get("output_cost_scale"),
-            output_cost_currency: row.get("output_cost_currency"),
+            input_cost_per_token: row.get("input_cost_per_token"),
+            output_cost_per_token: row.get("output_cost_per_token"),
             context_length: row.get("context_length"),
             verifiable: row.get("verifiable"),
             is_active: row.get("is_active"),
@@ -323,12 +298,8 @@ impl ModelRepository {
         ModelPricingHistory {
             id: row.get("id"),
             model_id: row.get("model_id"),
-            input_cost_amount: row.get("input_cost_amount"),
-            input_cost_scale: row.get("input_cost_scale"),
-            input_cost_currency: row.get("input_cost_currency"),
-            output_cost_amount: row.get("output_cost_amount"),
-            output_cost_scale: row.get("output_cost_scale"),
-            output_cost_currency: row.get("output_cost_currency"),
+            input_cost_per_token: row.get("input_cost_per_token"),
+            output_cost_per_token: row.get("output_cost_per_token"),
             context_length: row.get("context_length"),
             model_display_name: row.get("model_display_name"),
             model_description: row.get("model_description"),
@@ -354,12 +325,8 @@ impl services::models::ModelsRepository for ModelRepository {
                 model_display_name: m.model_display_name,
                 model_description: m.model_description,
                 model_icon: m.model_icon,
-                input_cost_amount: m.input_cost_amount,
-                input_cost_scale: m.input_cost_scale,
-                input_cost_currency: m.input_cost_currency,
-                output_cost_amount: m.output_cost_amount,
-                output_cost_scale: m.output_cost_scale,
-                output_cost_currency: m.output_cost_currency,
+                input_cost_per_token: m.input_cost_per_token,
+                output_cost_per_token: m.output_cost_per_token,
                 context_length: m.context_length,
                 verifiable: m.verifiable,
             })
@@ -377,12 +344,8 @@ impl services::models::ModelsRepository for ModelRepository {
             model_display_name: m.model_display_name,
             model_description: m.model_description,
             model_icon: m.model_icon,
-            input_cost_amount: m.input_cost_amount,
-            input_cost_scale: m.input_cost_scale,
-            input_cost_currency: m.input_cost_currency,
-            output_cost_amount: m.output_cost_amount,
-            output_cost_scale: m.output_cost_scale,
-            output_cost_currency: m.output_cost_currency,
+            input_cost_per_token: m.input_cost_per_token,
+            output_cost_per_token: m.output_cost_per_token,
             context_length: m.context_length,
             verifiable: m.verifiable,
         }))

@@ -120,22 +120,7 @@ impl AdminServiceImpl {
         model_name: &str,
         request: &UpdateModelAdminRequest,
     ) -> Result<(), AdminError> {
-        // Validate pricing scales if provided (0-30 to support high-precision cryptocurrencies)
-        if let Some(scale) = request.input_cost_scale {
-            if !(0..=30).contains(&scale) {
-                return Err(AdminError::InvalidPricing(
-                    "Input cost scale must be between 0 and 30".to_string(),
-                ));
-            }
-        }
-
-        if let Some(scale) = request.output_cost_scale {
-            if !(0..=30).contains(&scale) {
-                return Err(AdminError::InvalidPricing(
-                    "Output cost scale must be between 0 and 30".to_string(),
-                ));
-            }
-        }
+        // All costs use fixed scale 9 (nano-dollars) and USD - no scale/currency validation needed
 
         // Validate model name
         if model_name.trim().is_empty() {
@@ -166,35 +151,12 @@ impl AdminServiceImpl {
     }
 
     fn validate_organization_limits(limits: &OrganizationLimitsUpdate) -> Result<(), AdminError> {
+        // All amounts use fixed scale 9 (nano-dollars) and USD - no scale/currency validation needed
+
         // Validate amount is non-negative
-        if limits.spend_limit_amount < 0 {
+        if limits.spend_limit < 0 {
             return Err(AdminError::InvalidLimits(
-                "Spend limit amount cannot be negative".to_string(),
-            ));
-        }
-
-        // Validate scale is reasonable (between 0 and 30)
-        // Supports high-precision cryptocurrencies:
-        // - NEAR: 24 decimals (yoctoNEAR)
-        // - Ethereum: 18 decimals (wei)
-        // - Bitcoin: 8 decimals (satoshi)
-        if !(0..=30).contains(&limits.spend_limit_scale) {
-            return Err(AdminError::InvalidLimits(
-                "Spend limit scale must be between 0 and 30".to_string(),
-            ));
-        }
-
-        // Validate currency is not empty
-        if limits.spend_limit_currency.trim().is_empty() {
-            return Err(AdminError::InvalidLimits(
-                "Currency cannot be empty".to_string(),
-            ));
-        }
-
-        // Validate currency code length (typically 3 characters: USD, EUR, BTC, etc.)
-        if limits.spend_limit_currency.len() > 10 {
-            return Err(AdminError::InvalidLimits(
-                "Currency code is too long (max 10 characters)".to_string(),
+                "Spend limit cannot be negative".to_string(),
             ));
         }
 

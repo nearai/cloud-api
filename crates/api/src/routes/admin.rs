@@ -63,18 +63,8 @@ pub async fn batch_upsert_models(
     let mut models = Vec::new();
     for (model_name, request) in batch_request.iter() {
         let service_request = UpdateModelAdminRequest {
-            input_cost_amount: request.input_cost_per_token.as_ref().map(|p| p.amount),
-            input_cost_scale: request.input_cost_per_token.as_ref().map(|p| p.scale),
-            input_cost_currency: request
-                .input_cost_per_token
-                .as_ref()
-                .map(|p| p.currency.clone()),
-            output_cost_amount: request.output_cost_per_token.as_ref().map(|p| p.amount),
-            output_cost_scale: request.output_cost_per_token.as_ref().map(|p| p.scale),
-            output_cost_currency: request
-                .output_cost_per_token
-                .as_ref()
-                .map(|p| p.currency.clone()),
+            input_cost_per_token: request.input_cost_per_token.as_ref().map(|p| p.amount),
+            output_cost_per_token: request.output_cost_per_token.as_ref().map(|p| p.amount),
             model_display_name: request.model_display_name.clone(),
             model_description: request.model_description.clone(),
             model_icon: request.model_icon.clone(),
@@ -121,14 +111,14 @@ pub async fn batch_upsert_models(
         api_models.push(ModelWithPricing {
             model_id: model_name.clone(),
             input_cost_per_token: DecimalPrice {
-                amount: updated_model.input_cost_amount,
-                scale: updated_model.input_cost_scale,
-                currency: updated_model.input_cost_currency.clone(),
+                amount: updated_model.input_cost_per_token,
+                scale: 9,
+                currency: "USD".to_string(),
             },
             output_cost_per_token: DecimalPrice {
-                amount: updated_model.output_cost_amount,
-                scale: updated_model.output_cost_scale,
-                currency: updated_model.output_cost_currency.clone(),
+                amount: updated_model.output_cost_per_token,
+                scale: 9,
+                currency: "USD".to_string(),
             },
             metadata: ModelMetadata {
                 verifiable: updated_model.verifiable,
@@ -208,14 +198,14 @@ pub async fn get_model_pricing_history(
             id: h.id.to_string(),
             model_id: h.model_id.to_string(),
             input_cost_per_token: DecimalPrice {
-                amount: h.input_cost_amount,
-                scale: h.input_cost_scale,
-                currency: h.input_cost_currency,
+                amount: h.input_cost_per_token,
+                scale: 9,
+                currency: "USD".to_string(),
             },
             output_cost_per_token: DecimalPrice {
-                amount: h.output_cost_amount,
-                scale: h.output_cost_scale,
-                currency: h.output_cost_currency,
+                amount: h.output_cost_per_token,
+                scale: 9,
+                currency: "USD".to_string(),
             },
             context_length: h.context_length,
             model_display_name: h.model_display_name,
@@ -284,9 +274,7 @@ pub async fn update_organization_limits(
 
     // Convert API request to service request
     let service_request = services::admin::OrganizationLimitsUpdate {
-        spend_limit_amount: request.spend_limit.amount,
-        spend_limit_scale: request.spend_limit.scale,
-        spend_limit_currency: request.spend_limit.currency.clone(),
+        spend_limit: request.spend_limit.amount,
         changed_by: request.changed_by,
         change_reason: request.change_reason,
     };
@@ -328,9 +316,9 @@ pub async fn update_organization_limits(
     let response = UpdateOrganizationLimitsResponse {
         organization_id: updated_limits.organization_id.to_string(),
         spend_limit: SpendLimit {
-            amount: updated_limits.spend_limit_amount,
-            scale: updated_limits.spend_limit_scale,
-            currency: updated_limits.spend_limit_currency,
+            amount: updated_limits.spend_limit,
+            scale: 9,
+            currency: "USD".to_string(),
         },
         updated_at: updated_limits.effective_from.to_rfc3339(),
     };

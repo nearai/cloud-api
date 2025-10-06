@@ -220,7 +220,6 @@ CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
 
 CREATE TRIGGER update_workspaces_updated_at BEFORE UPDATE ON workspaces
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
 CREATE TRIGGER update_mcp_connectors_updated_at BEFORE UPDATE ON mcp_connectors
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 

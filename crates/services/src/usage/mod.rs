@@ -27,6 +27,7 @@ impl UsageServiceImpl {
 #[async_trait::async_trait]
 impl UsageService for UsageServiceImpl {
     /// Calculate cost for a given model and token usage
+    /// All costs use fixed scale of 9 (nano-dollars) and USD currency
     async fn calculate_cost(
         &self,
         model_id: &str,
@@ -41,22 +42,15 @@ impl UsageService for UsageServiceImpl {
             .map_err(|e| UsageError::InternalError(format!("Failed to get model: {}", e)))?
             .ok_or_else(|| UsageError::ModelNotFound(format!("Model '{}' not found", model_id)))?;
 
-        // Calculate costs: (tokens * cost_per_token_amount)
-        // The cost is already in the smallest unit (e.g., micro-dollars if scale=6)
-        let input_cost = (input_tokens as i64) * model.input_cost_amount;
-        let output_cost = (output_tokens as i64) * model.output_cost_amount;
+        // Calculate costs: tokens * cost_per_token (all in nano-dollars, scale 9)
+        let input_cost = (input_tokens as i64) * model.input_cost_per_token;
+        let output_cost = (output_tokens as i64) * model.output_cost_per_token;
         let total_cost = input_cost + output_cost;
 
         Ok(CostBreakdown {
-            input_cost_amount: input_cost,
-            input_cost_scale: model.input_cost_scale,
-            input_cost_currency: model.input_cost_currency.clone(),
-            output_cost_amount: output_cost,
-            output_cost_scale: model.output_cost_scale,
-            output_cost_currency: model.output_cost_currency.clone(),
-            total_cost_amount: total_cost,
-            total_cost_scale: model.input_cost_scale, // Use same scale for total
-            total_cost_currency: model.input_cost_currency.clone(),
+            input_cost,
+            output_cost,
+            total_cost,
         })
     }
 
@@ -80,15 +74,9 @@ impl UsageService for UsageServiceImpl {
             model_id: request.model_id,
             input_tokens: request.input_tokens as i32,
             output_tokens: request.output_tokens as i32,
-            input_cost_amount: cost.input_cost_amount,
-            input_cost_scale: cost.input_cost_scale,
-            input_cost_currency: cost.input_cost_currency,
-            output_cost_amount: cost.output_cost_amount,
-            output_cost_scale: cost.output_cost_scale,
-            output_cost_currency: cost.output_cost_currency,
-            total_cost_amount: cost.total_cost_amount,
-            total_cost_scale: cost.total_cost_scale,
-            total_cost_currency: cost.total_cost_currency,
+            input_cost: cost.input_cost,
+            output_cost: cost.output_cost,
+            total_cost: cost.total_cost,
             request_type: request.request_type,
         };
 
@@ -123,37 +111,15 @@ impl UsageService for UsageServiceImpl {
 
         match (balance, limit) {
             (Some(balance), Some(limit)) => {
-                // Check if currencies match
-                if balance.total_spent_currency != limit.spend_limit_currency {
-                    return Ok(UsageCheckResult::CurrencyMismatch {
-                        spent_currency: balance.total_spent_currency,
-                        limit_currency: limit.spend_limit_currency,
-                    });
-                }
-
-                // Check if scales match
-                if balance.total_spent_scale != limit.spend_limit_scale {
-                    // Convert to same scale (this is simplified, production would need proper decimal math)
-                    return Err(UsageError::InternalError(
-                        "Scale mismatch between balance and limit".to_string(),
-                    ));
-                }
-
-                // Compare amounts - deny if spent >= limit
-                if balance.total_spent_amount >= limit.spend_limit_amount {
+                // Compare amounts - deny if spent >= limit (all in same scale 9)
+                if balance.total_spent >= limit.spend_limit {
                     Ok(UsageCheckResult::LimitExceeded {
-                        spent_amount: balance.total_spent_amount,
-                        spent_scale: balance.total_spent_scale,
-                        spent_currency: balance.total_spent_currency,
-                        limit_amount: limit.spend_limit_amount,
-                        limit_scale: limit.spend_limit_scale,
-                        limit_currency: limit.spend_limit_currency,
+                        spent: balance.total_spent,
+                        limit: limit.spend_limit,
                     })
                 } else {
                     Ok(UsageCheckResult::Allowed {
-                        remaining_amount: limit.spend_limit_amount - balance.total_spent_amount,
-                        remaining_scale: balance.total_spent_scale,
-                        remaining_currency: balance.total_spent_currency,
+                        remaining: limit.spend_limit - balance.total_spent,
                     })
                 }
             }
@@ -165,11 +131,9 @@ impl UsageService for UsageServiceImpl {
             (None, Some(limit)) => {
                 // No usage yet, but limit exists
                 // Check if limit is > 0 (has credits)
-                if limit.spend_limit_amount > 0 {
+                if limit.spend_limit > 0 {
                     Ok(UsageCheckResult::Allowed {
-                        remaining_amount: limit.spend_limit_amount,
-                        remaining_scale: limit.spend_limit_scale,
-                        remaining_currency: limit.spend_limit_currency,
+                        remaining: limit.spend_limit,
                     })
                 } else {
                     // Limit is set to 0 - no credits
@@ -197,9 +161,7 @@ impl UsageService for UsageServiceImpl {
 
         Ok(balance.map(|b| OrganizationBalanceInfo {
             organization_id: b.organization_id,
-            total_spent_amount: b.total_spent_amount,
-            total_spent_scale: b.total_spent_scale,
-            total_spent_currency: b.total_spent_currency,
+            total_spent: b.total_spent,
             last_usage_at: b.last_usage_at,
             total_requests: b.total_requests,
             total_tokens: b.total_tokens,

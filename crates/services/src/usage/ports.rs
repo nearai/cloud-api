@@ -93,6 +93,7 @@ pub struct RecordUsageServiceRequest {
 }
 
 /// Request to record usage (database layer)
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
 pub struct RecordUsageDbRequest {
     pub organization_id: Uuid,
@@ -102,82 +103,57 @@ pub struct RecordUsageDbRequest {
     pub model_id: String,
     pub input_tokens: i32,
     pub output_tokens: i32,
-    pub input_cost_amount: i64,
-    pub input_cost_scale: i32,
-    pub input_cost_currency: String,
-    pub output_cost_amount: i64,
-    pub output_cost_scale: i32,
-    pub output_cost_currency: String,
-    pub total_cost_amount: i64,
-    pub total_cost_scale: i32,
-    pub total_cost_currency: String,
+    pub input_cost: i64,
+    pub output_cost: i64,
+    pub total_cost: i64,
     pub request_type: String,
 }
 
 /// Model pricing information
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
 pub struct ModelPricing {
-    pub input_cost_amount: i64,
-    pub input_cost_scale: i32,
-    pub input_cost_currency: String,
-    pub output_cost_amount: i64,
-    pub output_cost_scale: i32,
-    pub output_cost_currency: String,
+    pub input_cost_per_token: i64,
+    pub output_cost_per_token: i64,
 }
 
 /// Organization spending limit
+/// All amounts use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
 pub struct OrganizationLimit {
-    pub spend_limit_amount: i64,
-    pub spend_limit_scale: i32,
-    pub spend_limit_currency: String,
+    pub spend_limit: i64,
 }
 
 /// Cost breakdown for a request
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
 pub struct CostBreakdown {
-    pub input_cost_amount: i64,
-    pub input_cost_scale: i32,
-    pub input_cost_currency: String,
-    pub output_cost_amount: i64,
-    pub output_cost_scale: i32,
-    pub output_cost_currency: String,
-    pub total_cost_amount: i64,
-    pub total_cost_scale: i32,
-    pub total_cost_currency: String,
+    pub input_cost: i64,
+    pub output_cost: i64,
+    pub total_cost: i64,
 }
 
 /// Result of checking if organization can use credits
+/// All amounts use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
 pub enum UsageCheckResult {
     Allowed {
-        remaining_amount: i64,
-        remaining_scale: i32,
-        remaining_currency: String,
+        remaining: i64,
     },
     LimitExceeded {
-        spent_amount: i64,
-        spent_scale: i32,
-        spent_currency: String,
-        limit_amount: i64,
-        limit_scale: i32,
-        limit_currency: String,
+        spent: i64,
+        limit: i64,
     },
     NoCredits,  // No credits available - must purchase credits
     NoLimitSet, // No spending limit configured - must set limit
-    CurrencyMismatch {
-        spent_currency: String,
-        limit_currency: String,
-    },
 }
 
 /// Organization balance information
+/// All amounts use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
 pub struct OrganizationBalanceInfo {
     pub organization_id: Uuid,
-    pub total_spent_amount: i64,
-    pub total_spent_scale: i32,
-    pub total_spent_currency: String,
+    pub total_spent: i64,
     pub last_usage_at: Option<DateTime<Utc>>,
     pub total_requests: i64,
     pub total_tokens: i64,
@@ -185,6 +161,7 @@ pub struct OrganizationBalanceInfo {
 }
 
 /// Usage log entry
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
 pub struct UsageLogEntry {
     pub id: Uuid,
@@ -196,15 +173,9 @@ pub struct UsageLogEntry {
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub total_tokens: i32,
-    pub input_cost_amount: i64,
-    pub input_cost_scale: i32,
-    pub input_cost_currency: String,
-    pub output_cost_amount: i64,
-    pub output_cost_scale: i32,
-    pub output_cost_currency: String,
-    pub total_cost_amount: i64,
-    pub total_cost_scale: i32,
-    pub total_cost_currency: String,
+    pub input_cost: i64,
+    pub output_cost: i64,
+    pub total_cost: i64,
     pub request_type: String,
     pub created_at: DateTime<Utc>,
 }

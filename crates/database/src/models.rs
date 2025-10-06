@@ -328,6 +328,7 @@ pub struct Conversation {
 // ============================================
 
 /// Model pricing and metadata - stores information about models and their pricing
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
     pub id: Uuid,
@@ -336,15 +337,9 @@ pub struct Model {
     pub model_description: String,
     pub model_icon: Option<String>,
 
-    // Input pricing using decimal representation
-    pub input_cost_amount: i64,
-    pub input_cost_scale: i32,
-    pub input_cost_currency: String,
-
-    // Output pricing using decimal representation
-    pub output_cost_amount: i64,
-    pub output_cost_scale: i32,
-    pub output_cost_currency: String,
+    // Pricing (fixed scale 9 = nano-dollars, USD only)
+    pub input_cost_per_token: i64,
+    pub output_cost_per_token: i64,
 
     // Model metadata
     pub context_length: i32,
@@ -357,14 +352,11 @@ pub struct Model {
 }
 
 /// Request to update model pricing
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateModelPricingRequest {
-    pub input_cost_amount: Option<i64>,
-    pub input_cost_scale: Option<i32>,
-    pub input_cost_currency: Option<String>,
-    pub output_cost_amount: Option<i64>,
-    pub output_cost_scale: Option<i32>,
-    pub output_cost_currency: Option<String>,
+    pub input_cost_per_token: Option<i64>,
+    pub output_cost_per_token: Option<i64>,
     pub model_display_name: Option<String>,
     pub model_description: Option<String>,
     pub model_icon: Option<String>,
@@ -374,18 +366,15 @@ pub struct UpdateModelPricingRequest {
 }
 
 /// Model pricing history - stores historical pricing data for models
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPricingHistory {
     pub id: Uuid,
     pub model_id: Uuid,
 
-    // Pricing snapshot
-    pub input_cost_amount: i64,
-    pub input_cost_scale: i32,
-    pub input_cost_currency: String,
-    pub output_cost_amount: i64,
-    pub output_cost_scale: i32,
-    pub output_cost_currency: String,
+    // Pricing snapshot (fixed scale 9 = nano-dollars, USD only)
+    pub input_cost_per_token: i64,
+    pub output_cost_per_token: i64,
 
     // Model metadata snapshot
     pub context_length: i32,
@@ -407,15 +396,14 @@ pub struct ModelPricingHistory {
 // ============================================
 
 /// Organization limits history - stores historical spending limit data for organizations
+/// All amounts use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrganizationLimitsHistory {
     pub id: Uuid,
     pub organization_id: Uuid,
 
-    // Spend limit using decimal representation
-    pub spend_limit_amount: i64,
-    pub spend_limit_scale: i32,
-    pub spend_limit_currency: String,
+    // Spend limit (fixed scale 9 = nano-dollars, USD only)
+    pub spend_limit: i64,
 
     // Temporal fields
     pub effective_from: DateTime<Utc>,
@@ -428,11 +416,10 @@ pub struct OrganizationLimitsHistory {
 }
 
 /// Request to update organization limits
+/// All amounts use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateOrganizationLimitsDbRequest {
-    pub spend_limit_amount: i64,
-    pub spend_limit_scale: i32,
-    pub spend_limit_currency: String,
+    pub spend_limit: i64,
     pub changed_by: Option<String>,
     pub change_reason: Option<String>,
 }
@@ -442,6 +429,7 @@ pub struct UpdateOrganizationLimitsDbRequest {
 // ============================================
 
 /// Organization usage log entry - records individual API calls with costs
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrganizationUsageLog {
     pub id: Uuid,
@@ -453,26 +441,19 @@ pub struct OrganizationUsageLog {
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub total_tokens: i32,
-    pub input_cost_amount: i64,
-    pub input_cost_scale: i32,
-    pub input_cost_currency: String,
-    pub output_cost_amount: i64,
-    pub output_cost_scale: i32,
-    pub output_cost_currency: String,
-    pub total_cost_amount: i64,
-    pub total_cost_scale: i32,
-    pub total_cost_currency: String,
+    pub input_cost: i64,
+    pub output_cost: i64,
+    pub total_cost: i64,
     pub request_type: String,
     pub created_at: DateTime<Utc>,
 }
 
 /// Organization balance summary - cached aggregate spending
+/// All amounts use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrganizationBalance {
     pub organization_id: Uuid,
-    pub total_spent_amount: i64,
-    pub total_spent_scale: i32,
-    pub total_spent_currency: String,
+    pub total_spent: i64,
     pub last_usage_at: Option<DateTime<Utc>>,
     pub total_requests: i64,
     pub total_tokens: i64,
@@ -480,6 +461,7 @@ pub struct OrganizationBalance {
 }
 
 /// Request to record usage
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
 pub struct RecordUsageRequest {
     pub organization_id: Uuid,
@@ -489,14 +471,8 @@ pub struct RecordUsageRequest {
     pub model_id: String,
     pub input_tokens: i32,
     pub output_tokens: i32,
-    pub input_cost_amount: i64,
-    pub input_cost_scale: i32,
-    pub input_cost_currency: String,
-    pub output_cost_amount: i64,
-    pub output_cost_scale: i32,
-    pub output_cost_currency: String,
-    pub total_cost_amount: i64,
-    pub total_cost_scale: i32,
-    pub total_cost_currency: String,
+    pub input_cost: i64,
+    pub output_cost: i64,
+    pub total_cost: i64,
     pub request_type: String,
 }

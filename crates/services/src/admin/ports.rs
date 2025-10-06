@@ -1,14 +1,11 @@
 use async_trait::async_trait;
 
 /// Request to update model pricing and metadata
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
 pub struct UpdateModelAdminRequest {
-    pub input_cost_amount: Option<i64>,
-    pub input_cost_scale: Option<i32>,
-    pub input_cost_currency: Option<String>,
-    pub output_cost_amount: Option<i64>,
-    pub output_cost_scale: Option<i32>,
-    pub output_cost_currency: Option<String>,
+    pub input_cost_per_token: Option<i64>,
+    pub output_cost_per_token: Option<i64>,
     pub model_display_name: Option<String>,
     pub model_description: Option<String>,
     pub model_icon: Option<String>,
@@ -18,33 +15,27 @@ pub struct UpdateModelAdminRequest {
 }
 
 /// Model pricing information (result after update)
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
 pub struct ModelPricing {
     pub model_display_name: String,
     pub model_description: String,
     pub model_icon: Option<String>,
-    pub input_cost_amount: i64,
-    pub input_cost_scale: i32,
-    pub input_cost_currency: String,
-    pub output_cost_amount: i64,
-    pub output_cost_scale: i32,
-    pub output_cost_currency: String,
+    pub input_cost_per_token: i64,
+    pub output_cost_per_token: i64,
     pub context_length: i32,
     pub verifiable: bool,
     pub is_active: bool,
 }
 
 /// Model pricing history entry
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
 pub struct ModelPricingHistoryEntry {
     pub id: uuid::Uuid,
     pub model_id: uuid::Uuid,
-    pub input_cost_amount: i64,
-    pub input_cost_scale: i32,
-    pub input_cost_currency: String,
-    pub output_cost_amount: i64,
-    pub output_cost_scale: i32,
-    pub output_cost_currency: String,
+    pub input_cost_per_token: i64,
+    pub output_cost_per_token: i64,
     pub context_length: i32,
     pub model_display_name: String,
     pub model_description: String,
@@ -56,33 +47,30 @@ pub struct ModelPricingHistoryEntry {
 }
 
 /// Request to update organization limits
+/// All amounts use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
 pub struct OrganizationLimitsUpdate {
-    pub spend_limit_amount: i64,
-    pub spend_limit_scale: i32,
-    pub spend_limit_currency: String,
+    pub spend_limit: i64,
     pub changed_by: Option<String>,
     pub change_reason: Option<String>,
 }
 
 /// Organization limits (current active limits)
+/// All amounts use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
 pub struct OrganizationLimits {
     pub organization_id: uuid::Uuid,
-    pub spend_limit_amount: i64,
-    pub spend_limit_scale: i32,
-    pub spend_limit_currency: String,
+    pub spend_limit: i64,
     pub effective_from: chrono::DateTime<chrono::Utc>,
 }
 
 /// Organization limits history entry
+/// All amounts use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
 pub struct OrganizationLimitsHistoryEntry {
     pub id: uuid::Uuid,
     pub organization_id: uuid::Uuid,
-    pub spend_limit_amount: i64,
-    pub spend_limit_scale: i32,
-    pub spend_limit_currency: String,
+    pub spend_limit: i64,
     pub effective_from: chrono::DateTime<chrono::Utc>,
     pub effective_until: Option<chrono::DateTime<chrono::Utc>>,
     pub changed_by: Option<String>,

@@ -12,10 +12,7 @@ impl services::usage::ports::OrganizationLimitsRepository for OrganizationLimits
         let limit = self.get_current_limits(organization_id).await?;
 
         Ok(limit.map(|l| OrganizationLimit {
-            spend_limit_amount: l.spend_limit_amount,
-            spend_limit_scale: l.spend_limit_scale,
-            spend_limit_currency: l.spend_limit_currency,
+            spend_limit: l.spend_limit,
         }))
     }
 }
-

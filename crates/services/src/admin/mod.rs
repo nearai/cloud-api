@@ -17,8 +17,8 @@ impl AdminServiceImpl {
 impl AdminService for AdminServiceImpl {
     async fn batch_upsert_models(
         &self,
-        models: Vec<(String, UpdateModelAdminRequest)>,
-    ) -> Result<Vec<ModelPricing>, AdminError> {
+        models: BatchUpdateModelAdminRequest,
+    ) -> Result<BatchUpdateModelAdminResponse, AdminError> {
         if models.is_empty() {
             return Err(AdminError::InvalidPricing(
                 "At least one model must be provided".to_string(),
@@ -31,14 +31,14 @@ impl AdminService for AdminServiceImpl {
         }
 
         // Upsert all models
-        let mut results = Vec::new();
+        let mut results = std::collections::HashMap::new();
         for (model_name, request) in models {
             let pricing = self
                 .repository
                 .upsert_model_pricing(&model_name, request)
                 .await
                 .map_err(|e| AdminError::InternalError(e.to_string()))?;
-            results.push(pricing);
+            results.insert(model_name, pricing);
         }
 
         Ok(results)

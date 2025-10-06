@@ -876,15 +876,6 @@ pub struct OrganizationResponse {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Organization member response model
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct OrganizationMemberResponse {
-    pub organization_id: String,
-    pub user_id: String,
-    pub role: MemberRole,
-    pub joined_at: DateTime<Utc>,
-}
-
 /// Member role enum for API
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -953,6 +944,43 @@ pub struct AdminUserResponse {
     pub created_at: DateTime<Utc>,
     pub last_login_at: Option<DateTime<Utc>>,
     pub is_active: bool,
+}
+
+/// User response model (full user profile)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserResponse {
+    pub id: String,
+    pub email: String,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub last_login_at: Option<DateTime<Utc>>,
+    pub is_active: bool,
+    pub auth_provider: String,
+}
+
+/// Session response model
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SessionResponse {
+    pub id: String,
+    pub user_id: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub ip_address: Option<String>,
+    pub user_agent: Option<String>,
+}
+
+/// Organization member response model (non-sensitive)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OrganizationMemberResponse {
+    pub id: String,
+    pub organization_id: String,
+    pub user_id: String,
+    pub role: MemberRole,
+    pub joined_at: DateTime<Utc>,
+    pub invited_by: Option<String>,
 }
 
 /// List users response model (admin only)

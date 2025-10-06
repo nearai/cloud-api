@@ -59,21 +59,25 @@ pub async fn batch_upsert_models(
         ));
     }
 
-    // Extract all model updates from the batch request
-    let mut models = Vec::new();
-    for (model_name, request) in batch_request.iter() {
-        let service_request = UpdateModelAdminRequest {
-            input_cost_per_token: request.input_cost_per_token.as_ref().map(|p| p.amount),
-            output_cost_per_token: request.output_cost_per_token.as_ref().map(|p| p.amount),
-            model_display_name: request.model_display_name.clone(),
-            model_description: request.model_description.clone(),
-            model_icon: request.model_icon.clone(),
-            context_length: request.context_length,
-            verifiable: request.verifiable,
-            is_active: request.is_active,
-        };
-        models.push((model_name.clone(), service_request));
-    }
+    // Convert API request to service request
+    let models = batch_request
+        .iter()
+        .map(|(model_name, request)| {
+            (
+                model_name.clone(),
+                UpdateModelAdminRequest {
+                    input_cost_per_token: request.input_cost_per_token.as_ref().map(|p| p.amount),
+                    output_cost_per_token: request.output_cost_per_token.as_ref().map(|p| p.amount),
+                    model_display_name: request.model_display_name.clone(),
+                    model_description: request.model_description.clone(),
+                    model_icon: request.model_icon.clone(),
+                    context_length: request.context_length,
+                    verifiable: request.verifiable,
+                    is_active: request.is_active,
+                },
+            )
+        })
+        .collect();
 
     let updated_models = app_state
         .admin_service
@@ -104,12 +108,11 @@ pub async fn batch_upsert_models(
             }
         })?;
 
-    // Convert to API response - we need to get model names from the original request
-    let mut api_models = Vec::new();
-    for (model_index, (model_name, _)) in batch_request.iter().enumerate() {
-        let updated_model = &updated_models[model_index];
-        api_models.push(ModelWithPricing {
-            model_id: model_name.clone(),
+    // Convert to API response - map from HashMap to Vec
+    let api_models: Vec<ModelWithPricing> = updated_models
+        .into_iter()
+        .map(|(model_name, updated_model)| ModelWithPricing {
+            model_id: model_name,
             input_cost_per_token: DecimalPrice {
                 amount: updated_model.input_cost_per_token,
                 scale: 9,
@@ -123,12 +126,12 @@ pub async fn batch_upsert_models(
             metadata: ModelMetadata {
                 verifiable: updated_model.verifiable,
                 context_length: updated_model.context_length,
-                model_display_name: updated_model.model_display_name.clone(),
-                model_description: updated_model.model_description.clone(),
-                model_icon: updated_model.model_icon.clone(),
+                model_display_name: updated_model.model_display_name,
+                model_description: updated_model.model_description,
+                model_icon: updated_model.model_icon,
             },
-        });
-    }
+        })
+        .collect();
 
     Ok(ResponseJson(api_models))
 }

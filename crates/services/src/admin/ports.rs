@@ -14,6 +14,12 @@ pub struct UpdateModelAdminRequest {
     pub is_active: Option<bool>,
 }
 
+/// Batch update request format - Map of model name to update data
+pub type BatchUpdateModelAdminRequest = std::collections::HashMap<String, UpdateModelAdminRequest>;
+
+/// Batch update response format - Map of model name to pricing data
+pub type BatchUpdateModelAdminResponse = std::collections::HashMap<String, ModelPricing>;
+
 /// Model pricing information (result after update)
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
@@ -136,8 +142,8 @@ pub trait AdminService: Send + Sync {
     /// Batch upsert models pricing and metadata (admin only)
     async fn batch_upsert_models(
         &self,
-        models: Vec<(String, UpdateModelAdminRequest)>,
-    ) -> Result<Vec<ModelPricing>, AdminError>;
+        models: BatchUpdateModelAdminRequest,
+    ) -> Result<BatchUpdateModelAdminResponse, AdminError>;
 
     /// Get pricing history for a model (admin only)
     async fn get_pricing_history(

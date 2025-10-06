@@ -90,7 +90,6 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
         .route("/me", get(get_current_user))
         .route("/me/profile", put(update_current_user_profile))
         .route("/me/organizations", get(get_user_organizations))
-        .route("/", get(list_users))
         .route("/{id}", get(get_user))
         .route("/{id}/organizations", get(get_user_organizations_by_id))
         .route(

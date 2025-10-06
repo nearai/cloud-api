@@ -315,10 +315,12 @@ pub fn services_member_to_api_member(
     member: services::organization::ports::OrganizationMember,
 ) -> crate::models::OrganizationMemberResponse {
     crate::models::OrganizationMemberResponse {
+        id: format!("{}_{}", member.organization_id.0, member.user_id.0),
         organization_id: member.organization_id.0.to_string(),
         user_id: member.user_id.0.to_string(),
         role: services_role_to_api_role(member.role),
         joined_at: member.joined_at,
+        invited_by: None, // Not available in ports model
     }
 }
 

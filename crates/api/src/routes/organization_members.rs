@@ -1,47 +1,57 @@
 use crate::{
-    conversions::{db_user_to_admin_user, db_user_to_public_user},
+    conversions::db_user_to_public_user,
     middleware::AuthenticatedUser,
-    models::{AdminOrganizationMemberResponse, MemberRole, PublicOrganizationMemberResponse},
+    models::{ErrorResponse, MemberRole, PublicOrganizationMemberResponse},
     routes::api::AppState,
 };
 use axum::{
     extract::{Extension, Json, Path, State},
     http::StatusCode,
 };
-use database::{AddOrganizationMemberRequest, OrganizationMember, UpdateOrganizationMemberRequest};
-use serde::Serialize;
+use database;
 use services::organization::ports::MemberRole as ServicesMemberRole;
 use services::organization::ports::OrganizationRepository;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-/// Union type for organization member responses
-/// Used to return different data based on requester's permissions
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-pub enum OrganizationMemberResponse {
-    /// Public response for regular members (limited user info)
-    Public(PublicOrganizationMemberResponse),
-    /// Admin response for owners/admins (full user info including sensitive data)
-    Admin(AdminOrganizationMemberResponse),
-}
-
 /// DEPRECATED: Legacy response type that exposes too much sensitive data
-#[deprecated(note = "Use OrganizationMemberResponse enum instead")]
-#[derive(Debug, Serialize)]
+#[deprecated(note = "Use PublicOrganizationMemberResponse instead")]
+#[derive(Debug, serde::Serialize)]
 pub struct OrganizationMemberWithUser {
     #[serde(flatten)]
-    pub member: OrganizationMember,
+    pub member: database::OrganizationMember,
     pub user: database::User,
 }
 
 /// Add a member to an organization
+///
+/// Adds a new member to the organization. The authenticated user must be an owner or admin.
+#[utoipa::path(
+    post,
+    path = "/organizations/{org_id}/members",
+    tag = "Organization Members",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID")
+    ),
+    request_body = crate::models::AddOrganizationMemberRequest,
+    responses(
+        (status = 200, description = "Member added successfully", body = crate::models::OrganizationMemberResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden - not an admin or owner", body = ErrorResponse),
+        (status = 404, description = "User not found", body = ErrorResponse),
+        (status = 409, description = "User is already a member", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+    )
+)]
 pub async fn add_organization_member(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
-    Json(request): Json<AddOrganizationMemberRequest>,
-) -> Result<Json<OrganizationMember>, StatusCode> {
+    Json(request): Json<crate::models::AddOrganizationMemberRequest>,
+) -> Result<Json<crate::models::OrganizationMemberResponse>, StatusCode> {
     debug!(
         "Adding member to organization: {} by user: {}",
         org_id, user.0.id
@@ -66,12 +76,28 @@ pub async fn add_organization_member(
         }
     }
 
+    // Convert user_id from String to Uuid
+    let user_id_to_add = request
+        .user_id
+        .parse::<Uuid>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
     // Verify the user to be added exists
-    if let Ok(None) = app_state.db.users.get_by_id(request.user_id).await {
+    if let Ok(None) = app_state.db.users.get_by_id(user_id_to_add).await {
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let services_request = crate::conversions::db_add_member_req_to_services(request);
+    // Convert API request to database request
+    let db_request = database::AddOrganizationMemberRequest {
+        user_id: user_id_to_add,
+        role: match request.role {
+            crate::models::MemberRole::Owner => database::OrganizationRole::Owner,
+            crate::models::MemberRole::Admin => database::OrganizationRole::Admin,
+            crate::models::MemberRole::Member => database::OrganizationRole::Member,
+        },
+    };
+
+    let services_request = crate::conversions::db_add_member_req_to_services(db_request);
     match app_state
         .db
         .organizations
@@ -79,8 +105,8 @@ pub async fn add_organization_member(
         .await
     {
         Ok(member) => {
-            let db_member = crate::conversions::services_member_to_db_member(member);
-            Ok(Json(db_member))
+            let response = crate::conversions::services_member_to_api_member(member);
+            Ok(Json(response))
         }
         Err(e) => {
             if e.to_string().contains("already a member") {
@@ -94,12 +120,34 @@ pub async fn add_organization_member(
 }
 
 /// Update an organization member's role
+///
+/// Updates a member's role in the organization. The authenticated user must be an owner or admin.
+/// Only owners can promote members to owner role.
+#[utoipa::path(
+    put,
+    path = "/organizations/{org_id}/members/{user_id}",
+    tag = "Organization Members",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID"),
+        ("user_id" = Uuid, Path, description = "User ID of the member to update")
+    ),
+    request_body = crate::models::UpdateOrganizationMemberRequest,
+    responses(
+        (status = 200, description = "Member updated successfully", body = crate::models::OrganizationMemberResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden - not an admin or owner", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+    )
+)]
 pub async fn update_organization_member(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path((org_id, user_id)): Path<(Uuid, Uuid)>,
-    Json(request): Json<UpdateOrganizationMemberRequest>,
-) -> Result<Json<OrganizationMember>, StatusCode> {
+    Json(request): Json<crate::models::UpdateOrganizationMemberRequest>,
+) -> Result<Json<crate::models::OrganizationMemberResponse>, StatusCode> {
     debug!(
         "Updating member {} in organization: {} by user: {}",
         user_id, org_id, user.0.id
@@ -118,7 +166,7 @@ pub async fn update_organization_member(
             }
 
             // Prevent non-owners from promoting to owner
-            if matches!(request.role, database::OrganizationRole::Owner)
+            if matches!(request.role, crate::models::MemberRole::Owner)
                 && !matches!(
                     member.role,
                     services::organization::ports::MemberRole::Owner
@@ -134,7 +182,16 @@ pub async fn update_organization_member(
         }
     }
 
-    let services_request = crate::conversions::db_update_member_req_to_services(request);
+    // Convert API request to database request
+    let db_request = database::UpdateOrganizationMemberRequest {
+        role: match request.role {
+            crate::models::MemberRole::Owner => database::OrganizationRole::Owner,
+            crate::models::MemberRole::Admin => database::OrganizationRole::Admin,
+            crate::models::MemberRole::Member => database::OrganizationRole::Member,
+        },
+    };
+
+    let services_request = crate::conversions::db_update_member_req_to_services(db_request);
     match app_state
         .db
         .organizations
@@ -142,8 +199,8 @@ pub async fn update_organization_member(
         .await
     {
         Ok(member) => {
-            let db_member = crate::conversions::services_member_to_db_member(member);
-            Ok(Json(db_member))
+            let response = crate::conversions::services_member_to_api_member(member);
+            Ok(Json(response))
         }
         Err(e) => {
             error!("Failed to update organization member: {}", e);
@@ -153,6 +210,29 @@ pub async fn update_organization_member(
 }
 
 /// Remove a member from an organization
+///
+/// Removes a member from the organization. The authenticated user must be an owner or admin,
+/// or the member can remove themselves. The last owner cannot be removed.
+#[utoipa::path(
+    delete,
+    path = "/organizations/{org_id}/members/{user_id}",
+    tag = "Organization Members",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID"),
+        ("user_id" = Uuid, Path, description = "User ID of the member to remove")
+    ),
+    responses(
+        (status = 204, description = "Member removed successfully"),
+        (status = 400, description = "Bad request - cannot remove last owner", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden - not an admin or owner", body = ErrorResponse),
+        (status = 404, description = "Member not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+    )
+)]
 pub async fn remove_organization_member(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -223,29 +303,48 @@ pub async fn remove_organization_member(
     }
 }
 
-/// List organization members with role-based data filtering
+/// List organization members with limited user information
 ///
-/// Returns different levels of user information based on the requester's role:
-/// - Regular members: See limited user info (username, display name, avatar)
-/// - Owners/Admins: See full user info including email, last login, etc.
+/// Returns limited user information for privacy and security:
+/// - All members: See only public user info (username, display name, avatar)
+/// - Sensitive data (email, last login, etc.) is not exposed to any organization members
+#[utoipa::path(
+    get,
+    path = "/organizations/{org_id}/members",
+    tag = "Organization Members",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID")
+    ),
+    responses(
+        (status = 200, description = "List of organization members with public user information", body = Vec<crate::models::PublicOrganizationMemberResponse>),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden - not a member of the organization", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+    )
+)]
 pub async fn list_organization_members(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
-) -> Result<Json<Vec<OrganizationMemberResponse>>, StatusCode> {
+) -> Result<Json<Vec<PublicOrganizationMemberResponse>>, StatusCode> {
     debug!(
         "Listing members for organization: {} for user: {}",
         org_id, user.0.id
     );
 
-    // Check if user has access to this organization and get their role
-    let requester_role = match app_state
+    // Check if user has access to this organization
+    match app_state
         .db
         .organizations
         .get_member(org_id, user.0.id)
         .await
     {
-        Ok(Some(member)) => member.role,
+        Ok(Some(_member)) => {
+            // User is a member, proceed
+        }
         Ok(None) => {
             warn!(
                 "User {} attempted to access organization {} members without membership",
@@ -259,17 +358,6 @@ pub async fn list_organization_members(
         }
     };
 
-    debug!(
-        "User {} has role {:?} in organization {}",
-        user.0.id, requester_role, org_id
-    );
-
-    // Determine if requester can see sensitive user data
-    let can_see_sensitive_data = matches!(
-        requester_role,
-        ServicesMemberRole::Owner | ServicesMemberRole::Admin
-    );
-
     // Get organization members
     let members = match app_state.db.organizations.list_members(org_id).await {
         Ok(members) => members,
@@ -279,29 +367,17 @@ pub async fn list_organization_members(
         }
     };
 
-    // Get user details for each member with appropriate data filtering
+    // Get user details for each member with limited public information only
     let mut member_responses = Vec::new();
     for member in members {
         if let Ok(Some(user_data)) = app_state.db.users.get_by_id(member.user_id.0).await {
-            let response = if can_see_sensitive_data {
-                // Admin view: return full user details including sensitive data
-                OrganizationMemberResponse::Admin(AdminOrganizationMemberResponse {
-                    id: format!("{}_{}", member.organization_id.0, member.user_id.0), // Generate consistent ID
-                    organization_id: member.organization_id.0.to_string(),
-                    role: convert_services_role_to_api(&member.role),
-                    joined_at: member.joined_at,
-                    invited_by: None, // Services model doesn't include invited_by info
-                    user: db_user_to_admin_user(&user_data),
-                })
-            } else {
-                // Public view: return limited user details (no email, last_login, etc.)
-                OrganizationMemberResponse::Public(PublicOrganizationMemberResponse {
-                    id: format!("{}_{}", member.organization_id.0, member.user_id.0), // Generate consistent ID
-                    organization_id: member.organization_id.0.to_string(),
-                    role: convert_services_role_to_api(&member.role),
-                    joined_at: member.joined_at,
-                    user: db_user_to_public_user(&user_data),
-                })
+            // Return only public user details (no email, last_login, etc.)
+            let response = PublicOrganizationMemberResponse {
+                id: format!("{}_{}", member.organization_id.0, member.user_id.0),
+                organization_id: member.organization_id.0.to_string(),
+                role: convert_services_role_to_api(&member.role),
+                joined_at: member.joined_at,
+                user: db_user_to_public_user(&user_data),
             };
 
             member_responses.push(response);
@@ -309,14 +385,9 @@ pub async fn list_organization_members(
     }
 
     debug!(
-        "Returning {} members for organization {} with {} access level",
+        "Returning {} members for organization {} with public access level",
         member_responses.len(),
         org_id,
-        if can_see_sensitive_data {
-            "admin"
-        } else {
-            "public"
-        }
     );
 
     Ok(Json(member_responses))

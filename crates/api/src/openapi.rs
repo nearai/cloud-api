@@ -54,7 +54,28 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::list_users,
         // Workspace endpoints
         crate::routes::workspaces::create_workspace,
+        crate::routes::workspaces::list_organization_workspaces,
+        crate::routes::workspaces::get_workspace,
+        crate::routes::workspaces::update_workspace,
+        crate::routes::workspaces::delete_workspace,
+        crate::routes::workspaces::create_workspace_api_key,
+        crate::routes::workspaces::list_workspace_api_keys,
+        crate::routes::workspaces::revoke_workspace_api_key,
         crate::routes::workspaces::update_api_key_spend_limit,
+        // Organization Members endpoints
+        crate::routes::organization_members::add_organization_member,
+        crate::routes::organization_members::update_organization_member,
+        crate::routes::organization_members::remove_organization_member,
+        crate::routes::organization_members::list_organization_members,
+        // Users endpoints
+        crate::routes::users::get_current_user,
+        crate::routes::users::get_user,
+        crate::routes::users::update_current_user_profile,
+        crate::routes::users::get_user_organizations,
+        crate::routes::users::get_user_organizations_by_id,
+        crate::routes::users::get_user_sessions,
+        crate::routes::users::revoke_user_session,
+        crate::routes::users::revoke_all_user_sessions,
         // Usage endpoints
         crate::routes::usage::get_organization_balance,
         crate::routes::usage::get_organization_usage_history,
@@ -69,6 +90,23 @@ use utoipa::{Modify, OpenApi};
             CreateOrganizationRequest, OrganizationResponse,
             UpdateOrganizationRequest, CreateApiKeyRequest, ApiKeyResponse,
             UpdateApiKeySpendLimitRequest,
+            // Workspace models
+            crate::routes::workspaces::CreateWorkspaceRequest,
+            crate::routes::workspaces::UpdateWorkspaceRequest,
+            crate::routes::workspaces::WorkspaceResponse,
+            // Organization Members models
+            AddOrganizationMemberRequest,
+            UpdateOrganizationMemberRequest,
+            OrganizationMemberResponse,
+            PublicOrganizationMemberResponse,
+            AdminOrganizationMemberResponse,
+            // Users models
+            UserResponse,
+            SessionResponse,
+            PublicUserResponse,
+            AdminUserResponse,
+            crate::routes::users::UpdateUserProfileRequest,
+            crate::routes::users::SearchParams,
             // Conversation models
             CreateConversationRequest, ConversationObject, ConversationList,
             UpdateConversationRequest, ConversationDeleteResult, ConversationItemList,

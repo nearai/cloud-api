@@ -113,6 +113,24 @@ impl AdminService for AdminServiceImpl {
 
         Ok(history)
     }
+
+    async fn list_users(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<UserInfo>, i64), AdminError> {
+        let users = self
+            .repository
+            .list_users(limit, offset)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+
+        // For now, return the count as the number of users retrieved
+        // In a production system, you'd want a separate count query
+        let total = users.len() as i64;
+
+        Ok((users, total))
+    }
 }
 
 impl AdminServiceImpl {

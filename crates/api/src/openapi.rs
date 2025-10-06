@@ -51,6 +51,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::batch_upsert_models,
         crate::routes::admin::get_model_pricing_history,
         crate::routes::admin::update_organization_limits,
+        crate::routes::admin::list_users,
         // Workspace endpoints
         crate::routes::workspaces::create_workspace,
         crate::routes::workspaces::update_api_key_spend_limit,
@@ -86,6 +87,8 @@ use utoipa::{Modify, OpenApi};
             UpdateModelApiRequest, ModelPricingHistoryEntry, ModelPricingHistoryResponse,
             // Organization limits models (Admin)
             UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, SpendLimit,
+            // User models (Admin)
+            ListUsersResponse, AdminUserResponse,
             // Usage tracking models
             crate::routes::usage::OrganizationBalanceResponse,
             crate::routes::usage::UsageHistoryResponse,

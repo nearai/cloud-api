@@ -338,8 +338,17 @@ pub fn build_app_with_config(
     };
 
     // Create usage state for middleware
+    let usage_repository = Arc::new(database::repositories::OrganizationUsageRepository::new(
+        database.pool().clone(),
+    ));
+    let api_key_repository = Arc::new(database::repositories::ApiKeyRepository::new(
+        database.pool().clone(),
+    ));
+    
     let usage_state = middleware::UsageState {
         usage_service: domain_services.usage_service.clone(),
+        usage_repository,
+        api_key_repository,
     };
 
     // Build individual route groups
@@ -559,6 +568,10 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
         .route(
             "/workspaces/{workspace_id}/api-keys/{key_id}",
             axum::routing::delete(revoke_workspace_api_key),
+        )
+        .route(
+            "/workspaces/{workspace_id}/api-keys/{key_id}/spend-limit",
+            axum::routing::patch(update_api_key_spend_limit),
         )
         .with_state(app_state)
         .layer(from_fn_with_state(

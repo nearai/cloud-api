@@ -186,4 +186,18 @@ impl UsageService for UsageServiceImpl {
 
         Ok(logs)
     }
+
+    /// Get current spending limit for an organization
+    async fn get_limit(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<Option<OrganizationLimit>, UsageError> {
+        let limit = self
+            .limits_repository
+            .get_current_limits(organization_id)
+            .await
+            .map_err(|e| UsageError::InternalError(format!("Failed to get limits: {}", e)))?;
+
+        Ok(limit)
+    }
 }

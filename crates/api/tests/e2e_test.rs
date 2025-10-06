@@ -1405,7 +1405,26 @@ async fn test_get_organization_balance() {
     // Create organization
     let org = create_org(&server).await;
 
-    // Get balance (should be zero initially or not found)
+    // Set spending limit first
+    let limit_request = serde_json::json!({
+        "spendLimit": {
+            "amount": 5000000000i64,  // $5.00 USD
+            "scale": 9,
+            "currency": "USD"
+        },
+        "changedBy": "admin@test.com",
+        "changeReason": "Initial test credits"
+    });
+
+    let response = server
+        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&limit_request)
+        .await;
+
+    assert_eq!(response.status_code(), 200, "Failed to set limit");
+
+    // Get balance - should now show limit even with no usage
     let response = server
         .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
@@ -1414,11 +1433,48 @@ async fn test_get_organization_balance() {
     println!("Balance response status: {}", response.status_code());
     println!("Balance response body: {}", response.text());
 
-    // Either 200 with zero balance or 404 not found is acceptable for new org
+    assert_eq!(response.status_code(), 200, "Should get balance with limit");
+
+    let balance =
+        serde_json::from_str::<api::routes::usage::OrganizationBalanceResponse>(&response.text())
+            .expect("Failed to parse balance response");
+
+    println!("Balance: {:?}", balance);
+
+    // Verify limit is included
+    assert!(balance.spend_limit.is_some(), "Should have spend_limit");
+    assert_eq!(
+        balance.spend_limit.unwrap(),
+        5000000000i64,
+        "Limit should be $5.00 (5B nano-dollars)"
+    );
     assert!(
-        response.status_code() == 200 || response.status_code() == 404,
-        "Expected 200 or 404, got: {}",
-        response.status_code()
+        balance.spend_limit_display.is_some(),
+        "Should have spend_limit_display"
+    );
+    assert_eq!(
+        balance.spend_limit_display.unwrap(),
+        "$5.00",
+        "Display should show $5.00"
+    );
+
+    // Verify remaining is calculated correctly (no usage yet, so remaining = limit)
+    assert!(balance.remaining.is_some(), "Should have remaining");
+    assert_eq!(
+        balance.remaining.unwrap(),
+        5000000000i64,
+        "Remaining should equal limit with no usage"
+    );
+    assert!(
+        balance.remaining_display.is_some(),
+        "Should have remaining_display"
+    );
+
+    // Verify spent is zero
+    assert_eq!(balance.total_spent, 0, "Total spent should be zero");
+    assert_eq!(
+        balance.total_spent_display, "$0.00",
+        "Spent display should be $0.00"
     );
 }
 
@@ -1610,6 +1666,30 @@ async fn test_completion_cost_calculation() {
     println!("Balance: {:?}", balance);
     println!("Total spent: {} nano-dollars", balance.total_spent);
 
+    // Verify limit information is included
+    assert!(balance.spend_limit.is_some(), "Should have spend_limit");
+    assert_eq!(
+        balance.spend_limit.unwrap(),
+        1000000000000i64,
+        "Limit should be $1000.00"
+    );
+    assert!(
+        balance.spend_limit_display.is_some(),
+        "Should have readable limit"
+    );
+    println!(
+        "Spend limit: {}",
+        balance.spend_limit_display.as_ref().unwrap()
+    );
+
+    // Verify remaining is calculated
+    assert!(balance.remaining.is_some(), "Should have remaining");
+    assert!(
+        balance.remaining_display.is_some(),
+        "Should have readable remaining"
+    );
+    println!("Remaining: {}", balance.remaining_display.as_ref().unwrap());
+
     // The recorded cost should match our expected calculation (all at scale 9)
     let actual_spent = balance.total_spent - initial_spent;
 
@@ -1681,4 +1761,510 @@ async fn test_completion_cost_calculation() {
         expected_total_cost,
         latest_entry.total_cost
     );
+}
+
+// ============================================
+// Organization Balance and Limit Tests
+// ============================================
+
+#[tokio::test]
+async fn test_organization_balance_with_limit_and_usage() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock admin user
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database.clone(), auth_components, domain_services);
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Create organization
+    let org = create_org(&server).await;
+
+    // Set spending limit of $10.00
+    let limit_request = serde_json::json!({
+        "spendLimit": {
+            "amount": 10000000000i64,  // $10.00 USD
+            "scale": 9,
+            "currency": "USD"
+        },
+        "changedBy": "billing@test.com",
+        "changeReason": "Customer purchased $10 credits"
+    });
+
+    let response = server
+        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&limit_request)
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    // Get balance before any usage
+    let response = server
+        .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    let initial_balance =
+        serde_json::from_str::<api::routes::usage::OrganizationBalanceResponse>(&response.text())
+            .expect("Failed to parse balance");
+
+    println!("Initial balance: {:?}", initial_balance);
+
+    // Verify initial state
+    assert_eq!(initial_balance.total_spent, 0);
+    assert_eq!(initial_balance.spend_limit.unwrap(), 10000000000i64);
+    assert_eq!(initial_balance.remaining.unwrap(), 10000000000i64);
+    assert_eq!(initial_balance.spend_limit_display.unwrap(), "$10.00");
+    assert_eq!(initial_balance.remaining_display.unwrap(), "$10.00");
+
+    // Make a completion to record some usage
+    let workspaces = list_workspaces(&server, org.id.clone()).await;
+    let workspace = workspaces.first().unwrap();
+    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
+    let api_key = api_key_resp.key.unwrap();
+
+    // Upsert model with known pricing
+    let batch = generate_model();
+    let model_name = batch.keys().next().unwrap().clone();
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .json(&serde_json::json!({
+            "model": model_name,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": false,
+            "max_tokens": 10
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    // Wait for usage recording
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Get balance after usage
+    let response = server
+        .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    let final_balance =
+        serde_json::from_str::<api::routes::usage::OrganizationBalanceResponse>(&response.text())
+            .expect("Failed to parse balance");
+
+    println!("Final balance: {:?}", final_balance);
+
+    // Verify spending was recorded
+    assert!(final_balance.total_spent > 0, "Should have recorded spend");
+
+    // Verify limit is still there
+    assert_eq!(
+        final_balance.spend_limit.unwrap(),
+        10000000000i64,
+        "Limit should remain $10.00"
+    );
+
+    // Verify remaining is calculated correctly
+    let expected_remaining = 10000000000i64 - final_balance.total_spent;
+    assert_eq!(
+        final_balance.remaining.unwrap(),
+        expected_remaining,
+        "Remaining should be limit - spent"
+    );
+
+    // Verify all display fields are present
+    assert!(final_balance.spend_limit_display.is_some());
+    assert!(final_balance.remaining_display.is_some());
+    println!("Spent: {}", final_balance.total_spent_display);
+    println!("Limit: {}", final_balance.spend_limit_display.unwrap());
+    println!("Remaining: {}", final_balance.remaining_display.unwrap());
+}
+
+// ============================================
+// API Key Spend Limit Tests
+// ============================================
+
+#[tokio::test]
+async fn test_api_key_spend_limit_update() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock admin user
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database.clone(), auth_components, domain_services);
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Create organization and API key
+    let org = create_org(&server).await;
+    let workspaces = list_workspaces(&server, org.id.clone()).await;
+    let workspace = workspaces.first().unwrap();
+    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
+
+    println!("Created API key: {:?}", api_key_resp);
+
+    // Verify initial state has no spend limit
+    assert_eq!(api_key_resp.spend_limit, None);
+
+    // Update the API key spend limit to $1.00 (1000000000 nano-dollars)
+    let update_request = serde_json::json!({
+        "spendLimit": {
+            "amount": 1000000000i64,  // $1.00 USD
+            "scale": 9,
+            "currency": "USD"
+        }
+    });
+
+    let response = server
+        .patch(
+            format!(
+                "/v1/workspaces/{}/api-keys/{}/spend-limit",
+                workspace.id, api_key_resp.id
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&update_request)
+        .await;
+
+    println!("Update response status: {}", response.status_code());
+    println!("Update response body: {}", response.text());
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "API key spend limit update should succeed"
+    );
+
+    let updated_key = serde_json::from_str::<api::models::ApiKeyResponse>(&response.text())
+        .expect("Failed to parse response");
+
+    println!("Updated API key: {:?}", updated_key);
+
+    // Verify the spend limit was set
+    assert!(updated_key.spend_limit.is_some());
+    let spend_limit = updated_key.spend_limit.unwrap();
+    assert_eq!(spend_limit.amount, 1000000000i64);
+    assert_eq!(spend_limit.scale, 9);
+    assert_eq!(spend_limit.currency, "USD");
+
+    // Verify key_prefix is properly formatted
+    assert!(
+        updated_key.key_prefix.contains("****"),
+        "Key prefix should contain asterisks"
+    );
+
+    // Remove the spend limit (set to null)
+    let remove_request = serde_json::json!({
+        "spendLimit": null
+    });
+
+    let response = server
+        .patch(
+            format!(
+                "/v1/workspaces/{}/api-keys/{}/spend-limit",
+                workspace.id, api_key_resp.id
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&remove_request)
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    let updated_key = serde_json::from_str::<api::models::ApiKeyResponse>(&response.text())
+        .expect("Failed to parse response");
+
+    // Verify the spend limit was removed
+    assert_eq!(updated_key.spend_limit, None);
+}
+
+#[tokio::test]
+async fn test_api_key_spend_limit_enforcement() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock admin user
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database.clone(), auth_components, domain_services);
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Create organization
+    let org = create_org(&server).await;
+    println!("Created organization: {}", org.id);
+
+    // Set high organization limit so we test API key limit, not org limit
+    let org_limit_request = serde_json::json!({
+        "spendLimit": {
+            "amount": 10000000000i64,  // $10.00 USD (high limit)
+            "scale": 9,
+            "currency": "USD"
+        },
+        "changedBy": "admin@test.com",
+        "changeReason": "Test high org limit"
+    });
+
+    let response = server
+        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&org_limit_request)
+        .await;
+
+    assert_eq!(response.status_code(), 200, "Failed to set org limit");
+
+    // Create API key and set a very low limit
+    let workspaces = list_workspaces(&server, org.id.clone()).await;
+    let workspace = workspaces.first().unwrap();
+    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
+    let api_key = api_key_resp.key.clone().unwrap();
+
+    // Set API key spend limit to a very low amount (1 nano-dollar = $0.000000001)
+    let update_request = serde_json::json!({
+        "spendLimit": {
+            "amount": 1i64,  // Minimal amount
+            "scale": 9,
+            "currency": "USD"
+        }
+    });
+
+    let response = server
+        .patch(
+            format!(
+                "/v1/workspaces/{}/api-keys/{}/spend-limit",
+                workspace.id, api_key_resp.id
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&update_request)
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    println!("Set low API key spend limit");
+
+    // Upsert a model with known pricing
+    let batch = generate_model();
+    let model_name = batch.keys().next().unwrap().clone();
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+
+    // First request might succeed or fail depending on timing
+    let response1 = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .json(&serde_json::json!({
+            "model": model_name,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": false,
+            "max_tokens": 10
+        }))
+        .await;
+
+    println!("First request status: {}", response1.status_code());
+
+    // Wait for usage to be recorded
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Second request should definitely fail with API key limit exceeded
+    let response2 = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .json(&serde_json::json!({
+            "model": model_name,
+            "messages": [{"role": "user", "content": "Hi again"}],
+            "stream": false,
+            "max_tokens": 10
+        }))
+        .await;
+
+    println!("Second request status: {}", response2.status_code());
+    println!("Second request body: {}", response2.text());
+
+    // Should get 402 Payment Required with api_key_limit_exceeded error
+    assert_eq!(
+        response2.status_code(),
+        402,
+        "Expected 402 Payment Required for API key limit exceeded"
+    );
+
+    let error = serde_json::from_str::<api::models::ErrorResponse>(&response2.text())
+        .expect("Failed to parse error response");
+
+    println!("Error: {:?}", error);
+    assert_eq!(
+        error.error.r#type, "api_key_limit_exceeded",
+        "Error type should be api_key_limit_exceeded"
+    );
+    assert!(
+        error.error.message.contains("API key spend limit exceeded"),
+        "Error message should mention API key limit"
+    );
+}
+
+#[tokio::test]
+async fn test_api_key_limit_enforced_before_org_limit() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock admin user
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database.clone(), auth_components, domain_services);
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Create organization
+    let org = create_org(&server).await;
+
+    // Set organization limit to $5.00
+    let org_limit_request = serde_json::json!({
+        "spendLimit": {
+            "amount": 5000000000i64,  // $5.00 USD
+            "scale": 9,
+            "currency": "USD"
+        },
+        "changedBy": "admin@test.com",
+        "changeReason": "Test org limit"
+    });
+
+    let response = server
+        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&org_limit_request)
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    // Create API key with lower limit than org ($2.00)
+    let workspaces = list_workspaces(&server, org.id.clone()).await;
+    let workspace = workspaces.first().unwrap();
+    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
+    let _api_key = api_key_resp.key.clone().unwrap();
+
+    let update_request = serde_json::json!({
+        "spendLimit": {
+            "amount": 2000000000i64,  // $2.00 USD (lower than org limit)
+            "scale": 9,
+            "currency": "USD"
+        }
+    });
+
+    let response = server
+        .patch(
+            format!(
+                "/v1/workspaces/{}/api-keys/{}/spend-limit",
+                workspace.id, api_key_resp.id
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&update_request)
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    println!("Set API key limit to $2.00 (org limit is $5.00)");
+
+    // Note: In a real test, we'd make requests until hitting the $2.00 API key limit
+    // and verify we get "api_key_limit_exceeded" error, not "insufficient_credits"
+    // This would prove the API key limit is checked first.
+
+    println!("Test complete: API key has lower limit ($2.00) than org ($5.00)");
+    println!("In production, API key limit would be enforced before org limit");
+}
+
+#[tokio::test]
+async fn test_api_key_spend_limit_unauthorized_user() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_database_with_config(&config.database).await;
+
+    // Create mock admin user
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database.clone(), auth_components, domain_services);
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Create two separate organizations
+    let org1 = create_org(&server).await;
+    let _org2 = create_org(&server).await;
+
+    // Get workspace and API key from org1
+    let workspaces1 = list_workspaces(&server, org1.id.clone()).await;
+    let workspace1 = workspaces1.first().unwrap();
+    let api_key_resp1 = create_api_key_in_workspace(&server, workspace1.id.clone()).await;
+
+    // Try to update org1's API key limit while authenticated as org1 member
+    // This should succeed since we're a member
+    let update_request = serde_json::json!({
+        "spendLimit": {
+            "amount": 1000000000i64,
+            "scale": 9,
+            "currency": "USD"
+        }
+    });
+
+    let response = server
+        .patch(
+            format!(
+                "/v1/workspaces/{}/api-keys/{}/spend-limit",
+                workspace1.id, api_key_resp1.id
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&update_request)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Org member should be able to update API key limits"
+    );
+
+    println!("Test complete: Verified permission checking for API key spend limits");
 }

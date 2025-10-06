@@ -51,6 +51,12 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::batch_upsert_models,
         crate::routes::admin::get_model_pricing_history,
         crate::routes::admin::update_organization_limits,
+        // Workspace endpoints
+        crate::routes::workspaces::create_workspace,
+        crate::routes::workspaces::update_api_key_spend_limit,
+        // Usage endpoints
+        crate::routes::usage::get_organization_balance,
+        crate::routes::usage::get_organization_usage_history,
     ),
     components(
         schemas(
@@ -61,6 +67,7 @@ use utoipa::{Modify, OpenApi};
             // Organization models
             CreateOrganizationRequest, OrganizationResponse,
             UpdateOrganizationRequest, CreateApiKeyRequest, ApiKeyResponse,
+            UpdateApiKeySpendLimitRequest,
             // Conversation models
             CreateConversationRequest, ConversationObject, ConversationList,
             UpdateConversationRequest, ConversationDeleteResult, ConversationItemList,
@@ -79,6 +86,10 @@ use utoipa::{Modify, OpenApi};
             UpdateModelApiRequest, ModelPricingHistoryEntry, ModelPricingHistoryResponse,
             // Organization limits models (Admin)
             UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, SpendLimit,
+            // Usage tracking models
+            crate::routes::usage::OrganizationBalanceResponse,
+            crate::routes::usage::UsageHistoryResponse,
+            crate::routes::usage::UsageHistoryEntryResponse,
         ),
     ),
     modifiers(&SecurityAddon)

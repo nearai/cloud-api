@@ -354,16 +354,33 @@ pub fn api_key_req_to_services_workspace(
 pub fn services_api_key_to_api_response(
     api_key: services::auth::ApiKey,
 ) -> crate::models::ApiKeyResponse {
+    let spend_limit = api_key
+        .spend_limit
+        .map(|amount| crate::models::DecimalPrice {
+            amount,
+            scale: 9,
+            currency: "USD".to_string(),
+        });
+
+    // Format key_prefix with "****" to indicate it's a partial key
+    // e.g., "sk_abc123" becomes "sk_abc1****"
+    let formatted_prefix = if api_key.key_prefix.len() > 6 {
+        format!("{}****", &api_key.key_prefix[..6])
+    } else {
+        format!("{}****", api_key.key_prefix)
+    };
+
     crate::models::ApiKeyResponse {
         id: api_key.id.0,                 // ApiKeyId contains a String
         name: Some(api_key.name.clone()), // Convert String to Option<String>
         key: api_key.key,                 // Returned only on creation
-        key_prefix: format!("{}...", &api_key.name[..4.min(api_key.name.len())]), // Create key prefix from name
+        key_prefix: formatted_prefix,     // Use stored prefix with asterisks
         workspace_id: api_key.workspace_id.0.to_string(),
         created_by_user_id: api_key.created_by_user_id.0.to_string(),
         created_at: api_key.created_at,
         last_used_at: api_key.last_used_at,
         expires_at: api_key.expires_at,
+        spend_limit,
     }
 }
 

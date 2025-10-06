@@ -1,7 +1,10 @@
 use crate::{
     conversions::authenticated_user_to_user_id,
     middleware::{auth::AuthenticatedApiKey, AuthenticatedUser},
-    models::{ApiKeyResponse, CreateApiKeyRequest, ErrorResponse},
+    models::{
+        ApiKeyResponse, CreateApiKeyRequest, DecimalPrice, ErrorResponse,
+        UpdateApiKeySpendLimitRequest,
+    },
     routes::api::AppState,
 };
 use axum::{
@@ -770,4 +773,181 @@ pub async fn revoke_api_key_with_context(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+/// Update API key spend limit
+///
+/// Updates the spending limit for a specific API key. The user must be a member of the
+/// organization that owns the workspace. Set spend_limit to null to remove the limit.
+#[utoipa::path(
+    patch,
+    path = "/workspaces/{workspace_id}/api-keys/{key_id}/spend-limit",
+    tag = "Workspaces",
+    params(
+        ("workspace_id" = Uuid, Path, description = "Workspace ID"),
+        ("key_id" = Uuid, Path, description = "API Key ID")
+    ),
+    request_body = UpdateApiKeySpendLimitRequest,
+    responses(
+        (status = 200, description = "Spend limit updated successfully", body = ApiKeyResponse),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden - not authorized to update this key", body = ErrorResponse),
+        (status = 404, description = "API key or workspace not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = []),
+    )
+)]
+pub async fn update_api_key_spend_limit(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path((workspace_id, api_key_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<UpdateApiKeySpendLimitRequest>,
+) -> Result<Json<ApiKeyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    debug!(
+        "Updating spend limit for API key: {} in workspace: {} by user: {}",
+        api_key_id, workspace_id, user.0.id
+    );
+
+    let user_id = authenticated_user_to_user_id(user.clone());
+
+    // Get the API key to validate it belongs to the specified workspace
+    let api_key = app_state
+        .db
+        .api_keys
+        .get_by_id(api_key_id)
+        .await
+        .map_err(|e| {
+            error!("Failed to get API key: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to get API key".to_string(),
+                    "internal_error".to_string(),
+                )),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse::new(
+                    "API key not found".to_string(),
+                    "not_found".to_string(),
+                )),
+            )
+        })?;
+
+    // Validate the API key belongs to the specified workspace
+    if api_key.workspace_id != workspace_id {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "API key not found in this workspace".to_string(),
+                "not_found".to_string(),
+            )),
+        ));
+    }
+
+    // Get workspace to find organization
+    let workspace_repo = Arc::new(DbWorkspaceRepository::new(app_state.db.pool().clone()));
+    let workspace = workspace_repo
+        .get_by_id(workspace_id)
+        .await
+        .map_err(|e| {
+            error!("Failed to get workspace: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to get workspace".to_string(),
+                    "internal_error".to_string(),
+                )),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse::new(
+                    "Workspace not found".to_string(),
+                    "not_found".to_string(),
+                )),
+            )
+        })?;
+
+    // Check organization membership and role
+    let organization_id = OrganizationId(workspace.organization_id);
+    let is_member = app_state
+        .organization_service
+        .is_member(organization_id, user_id.clone())
+        .await
+        .map_err(|e| {
+            error!("Failed to check organization membership: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to verify permissions".to_string(),
+                    "internal_error".to_string(),
+                )),
+            )
+        })?;
+
+    if !is_member {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "Not authorized to update API key spend limit".to_string(),
+                "forbidden".to_string(),
+            )),
+        ));
+    }
+
+    // Convert spend limit from API format to nano-dollars (scale 9)
+    let spend_limit_nano = request.spend_limit.map(|limit| limit.amount);
+
+    // Update the spend limit
+    let updated_key = app_state
+        .db
+        .api_keys
+        .update_spend_limit(api_key_id, spend_limit_nano)
+        .await
+        .map_err(|e| {
+            error!("Failed to update API key spend limit: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to update spend limit".to_string(),
+                    "internal_error".to_string(),
+                )),
+            )
+        })?;
+
+    // Convert to API response
+    let spend_limit_response = updated_key.spend_limit.map(|amount| DecimalPrice {
+        amount,
+        scale: 9,
+        currency: "USD".to_string(),
+    });
+
+    // Format key_prefix with "****" to indicate it's a partial key
+    let formatted_prefix = if updated_key.key_prefix.len() > 6 {
+        format!("{}****", &updated_key.key_prefix[..6])
+    } else {
+        format!("{}****", updated_key.key_prefix)
+    };
+
+    let response = ApiKeyResponse {
+        id: updated_key.id.to_string(),
+        name: Some(updated_key.name),
+        key: None, // Don't return the actual key
+        key_prefix: formatted_prefix,
+        workspace_id: updated_key.workspace_id.to_string(),
+        created_by_user_id: updated_key.created_by_user_id.to_string(),
+        created_at: updated_key.created_at,
+        last_used_at: updated_key.last_used_at,
+        expires_at: updated_key.expires_at,
+        spend_limit: spend_limit_response,
+    };
+
+    Ok(Json(response))
 }

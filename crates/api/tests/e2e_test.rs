@@ -252,11 +252,11 @@ async fn test_chat_completions_api() {
     // Create organization and set up credits
     let org = create_org(&server).await;
 
-    // Add credits to the organization
+    // Add credits to the organization (scale 9 = nano-dollars)
     let update_request = serde_json::json!({
         "spendLimit": {
-            "amount": 10000000,  // $10.00 USD
-            "scale": 6,
+            "amount": 10000000000i64,  // $10.00 USD (in nano-dollars)
+            "scale": 9,
             "currency": "USD"
         },
         "changedBy": "admin@test.com",
@@ -940,11 +940,11 @@ async fn test_admin_update_organization_limits() {
     let org = create_org(&server).await;
     println!("Created organization: {:?}", org);
 
-    // Update organization limits
+    // Update organization limits (scale 9 = nano-dollars)
     let update_request = serde_json::json!({
         "spendLimit": {
-            "amount": 100000000,  // $100.00 with scale 6
-            "scale": 6,
+            "amount": 100000000000i64,  // $100.00 USD (in nano-dollars)
+            "scale": 9,
             "currency": "USD"
         },
         "changedBy": "admin@test.com",
@@ -974,8 +974,8 @@ async fn test_admin_update_organization_limits() {
 
     // Verify the response
     assert_eq!(update_response.organization_id, org.id);
-    assert_eq!(update_response.spend_limit.amount, 100000000);
-    assert_eq!(update_response.spend_limit.scale, 6);
+    assert_eq!(update_response.spend_limit.amount, 100000000000i64);
+    assert_eq!(update_response.spend_limit.scale, 9);
     assert_eq!(update_response.spend_limit.currency, "USD");
     assert!(!update_response.updated_at.is_empty());
 }
@@ -1004,8 +1004,8 @@ async fn test_admin_update_organization_limits_invalid_org() {
     let fake_org_id = uuid::Uuid::new_v4().to_string();
     let update_request = serde_json::json!({
         "spendLimit": {
-            "amount": 50000000,
-            "scale": 6,
+            "amount": 50000000000i64,
+            "scale": 9,
             "currency": "USD"
         }
     });
@@ -1051,11 +1051,11 @@ async fn test_admin_update_organization_limits_multiple_times() {
     // Create an organization
     let org = create_org(&server).await;
 
-    // First update - set initial limit
+    // First update - set initial limit (scale 9 = nano-dollars)
     let first_update = serde_json::json!({
         "spendLimit": {
-            "amount": 50000000,  // $50.00
-            "scale": 6,
+            "amount": 50000000000i64,  // $50.00 USD (in nano-dollars)
+            "scale": 9,
             "currency": "USD"
         },
         "changedBy": "admin@test.com",
@@ -1072,13 +1072,13 @@ async fn test_admin_update_organization_limits_multiple_times() {
     let response1_data =
         serde_json::from_str::<api::models::UpdateOrganizationLimitsResponse>(&response1.text())
             .unwrap();
-    assert_eq!(response1_data.spend_limit.amount, 50000000);
+    assert_eq!(response1_data.spend_limit.amount, 50000000000i64);
 
     // Second update - increase limit
     let second_update = serde_json::json!({
         "spendLimit": {
-            "amount": 150000000,  // $150.00
-            "scale": 6,
+            "amount": 150000000000i64,  // $150.00 USD (in nano-dollars)
+            "scale": 9,
             "currency": "USD"
         },
         "changedBy": "admin@test.com",
@@ -1095,7 +1095,7 @@ async fn test_admin_update_organization_limits_multiple_times() {
     let response2_data =
         serde_json::from_str::<api::models::UpdateOrganizationLimitsResponse>(&response2.text())
             .unwrap();
-    assert_eq!(response2_data.spend_limit.amount, 150000000);
+    assert_eq!(response2_data.spend_limit.amount, 150000000000i64);
 
     // Verify the second update happened after the first
     let first_updated = chrono::DateTime::parse_from_rfc3339(&response1_data.updated_at).unwrap();
@@ -1107,7 +1107,7 @@ async fn test_admin_update_organization_limits_multiple_times() {
 }
 
 #[tokio::test]
-async fn test_admin_update_organization_limits_different_currencies() {
+async fn test_admin_update_organization_limits_usd_only() {
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_max_level(LevelFilter::DEBUG)
@@ -1129,29 +1129,29 @@ async fn test_admin_update_organization_limits_different_currencies() {
     // Create an organization
     let org = create_org(&server).await;
 
-    // Test with EUR currency
-    let eur_update = serde_json::json!({
+    // All currencies are USD now (fixed scale 9)
+    let usd_update = serde_json::json!({
         "spendLimit": {
-            "amount": 85000000,  // €85.00
-            "scale": 6,
-            "currency": "EUR"
+            "amount": 85000000000i64,  // $85.00 USD (in nano-dollars)
+            "scale": 9,
+            "currency": "USD"
         },
         "changedBy": "billing-service",
-        "changeReason": "European customer purchase"
+        "changeReason": "Customer purchase"
     });
 
     let response = server
         .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&eur_update)
+        .json(&usd_update)
         .await;
 
     assert_eq!(response.status_code(), 200);
     let response_data =
         serde_json::from_str::<api::models::UpdateOrganizationLimitsResponse>(&response.text())
             .unwrap();
-    assert_eq!(response_data.spend_limit.currency, "EUR");
-    assert_eq!(response_data.spend_limit.amount, 85000000);
+    assert_eq!(response_data.spend_limit.currency, "USD");
+    assert_eq!(response_data.spend_limit.amount, 85000000000i64);
 }
 
 // ============================================
@@ -1238,11 +1238,11 @@ async fn test_usage_tracking_on_completion() {
     // Create organization
     let org = create_org(&server).await;
 
-    // Set credits for the organization
+    // Set credits for the organization (scale 9 = nano-dollars)
     let update_request = serde_json::json!({
         "spendLimit": {
-            "amount": 1000000,  // $1.00 USD
-            "scale": 6,
+            "amount": 1000000000i64,  // $1.00 USD (in nano-dollars)
+            "scale": 9,
             "currency": "USD"
         },
         "changedBy": "admin@test.com",
@@ -1317,11 +1317,11 @@ async fn test_usage_limit_enforcement() {
     let org = create_org(&server).await;
     println!("Created organization: {:?}", org);
 
-    // Set a very low spending limit ($0.000001 USD)
+    // Set a very low spending limit ($0.000000001 USD = 1 nano-dollar)
     let update_request = serde_json::json!({
         "spendLimit": {
-            "amount": 1,  // Minimal amount
-            "scale": 6,
+            "amount": 1,  // Minimal amount (1 nano-dollar)
+            "scale": 9,
             "currency": "USD"
         },
         "changedBy": "admin@test.com",
@@ -1483,11 +1483,11 @@ async fn test_completion_cost_calculation() {
     let org = create_org(&server).await;
     println!("Created organization: {}", org.id);
 
-    // Set spending limits high enough for the test
+    // Set spending limits high enough for the test (scale 9 = nano-dollars)
     let update_request = serde_json::json!({
         "spendLimit": {
-            "amount": 1000000000,  // $1000.00 USD - plenty for testing
-            "scale": 6,
+            "amount": 1000000000000i64,  // $1000.00 USD (in nano-dollars)
+            "scale": 9,
             "currency": "USD"
         },
         "changedBy": "admin@test.com",
@@ -1525,11 +1525,11 @@ async fn test_completion_cost_calculation() {
     let initial_spent = if initial_balance_response.status_code() == 200 {
         let balance =
             initial_balance_response.json::<api::routes::usage::OrganizationBalanceResponse>();
-        balance.total_spent_amount
+        balance.total_spent
     } else {
         0i64
     };
-    println!("Initial spent amount: {}", initial_spent);
+    println!("Initial spent amount (nano-dollars): {}", initial_spent);
 
     // Make a chat completion request with controlled parameters
     let response = server
@@ -1565,15 +1565,12 @@ async fn test_completion_cost_calculation() {
     assert!(input_tokens > 0, "Should have input tokens");
     assert!(output_tokens > 0, "Should have output tokens");
 
-    // Calculate expected cost based on model pricing
-    // Input: 1000000 * scale 9 = $0.001 per token
-    // Output: 2000000 * scale 9 = $0.002 per token
-    // Total cost in micro-dollars (scale 6):
-    // For each input token: 1000000 (scale 9) = 0.001 micro-dollars (scale 6)
-    // For each output token: 2000000 (scale 9) = 0.002 micro-dollars (scale 6)
+    // Calculate expected cost based on model pricing (all at scale 9)
+    // Input: 1000000 nano-dollars = $0.000001 per token
+    // Output: 2000000 nano-dollars = $0.000002 per token
 
-    let input_cost_per_token = 1000000i64; // scale 9
-    let output_cost_per_token = 2000000i64; // scale 9
+    let input_cost_per_token = 1000000i64; // nano-dollars
+    let output_cost_per_token = 2000000i64; // nano-dollars
 
     // Expected total cost (at scale 9)
     let expected_input_cost = (input_tokens as i64) * input_cost_per_token;
@@ -1581,16 +1578,19 @@ async fn test_completion_cost_calculation() {
     let expected_total_cost = expected_input_cost + expected_output_cost;
 
     println!(
-        "Input tokens: {}, cost per token: {}",
+        "Input tokens: {}, cost per token: {} nano-dollars",
         input_tokens, input_cost_per_token
     );
     println!(
-        "Output tokens: {}, cost per token: {}",
+        "Output tokens: {}, cost per token: {} nano-dollars",
         output_tokens, output_cost_per_token
     );
-    println!("Expected input cost: {} (scale 9)", expected_input_cost);
-    println!("Expected output cost: {} (scale 9)", expected_output_cost);
-    println!("Expected total cost: {} (scale 9)", expected_total_cost);
+    println!("Expected input cost: {} nano-dollars", expected_input_cost);
+    println!(
+        "Expected output cost: {} nano-dollars",
+        expected_output_cost
+    );
+    println!("Expected total cost: {} nano-dollars", expected_total_cost);
 
     // Wait for async usage recording to complete
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
@@ -1608,29 +1608,22 @@ async fn test_completion_cost_calculation() {
     );
     let balance = balance_response.json::<api::routes::usage::OrganizationBalanceResponse>();
     println!("Balance: {:?}", balance);
-    println!(
-        "Total spent: {} (scale {})",
-        balance.total_spent_amount, balance.total_spent_scale
-    );
+    println!("Total spent: {} nano-dollars", balance.total_spent);
 
-    // The recorded cost should match our expected calculation
-    let actual_spent = balance.total_spent_amount - initial_spent;
+    // The recorded cost should match our expected calculation (all at scale 9)
+    let actual_spent = balance.total_spent - initial_spent;
 
-    // The balance is stored at scale 6 (micro-dollars), while model pricing is at scale 9
-    // So we need to convert: scale 9 -> scale 6 means dividing by 1000
-    let expected_spent_scale_6 = expected_total_cost / 1000;
-
-    println!("Actual spent (scale 6): {}", actual_spent);
-    println!("Expected spent (scale 6): {}", expected_spent_scale_6);
+    println!("Actual spent: {} nano-dollars", actual_spent);
+    println!("Expected spent: {} nano-dollars", expected_total_cost);
 
     // Verify the cost calculation is correct (with small tolerance for rounding)
     let tolerance = 10; // Allow small rounding differences
     assert!(
-        (actual_spent - expected_spent_scale_6).abs() <= tolerance,
+        (actual_spent - expected_total_cost).abs() <= tolerance,
         "Cost calculation mismatch: expected {} (±{}), got {}. \
          Input tokens: {}, Output tokens: {}, \
          Input cost per token: {}, Output cost per token: {}",
-        expected_spent_scale_6,
+        expected_total_cost,
         tolerance,
         actual_spent,
         input_tokens,
@@ -1639,14 +1632,14 @@ async fn test_completion_cost_calculation() {
         output_cost_per_token
     );
 
-    // Also verify the display format is reasonable
+    // Verify the display format is reasonable
     assert!(
         !balance.total_spent_display.is_empty(),
         "Should have display format"
     );
     assert!(
-        balance.total_spent_display.contains("USD"),
-        "Should show currency"
+        balance.total_spent_display.starts_with("$"),
+        "Should show dollar sign"
     );
     println!("Total spent display: {}", balance.total_spent_display);
 
@@ -1681,25 +1674,11 @@ async fn test_completion_cost_calculation() {
         "Should record correct output tokens"
     );
 
-    // Verify the cost in the history entry matches
-    // Note: History entries preserve the original scale from model pricing (scale 9),
-    // while balance is normalized to scale 6
-    let history_cost_normalized = if latest_entry.total_cost_scale == 6 {
-        latest_entry.total_cost_amount
-    } else if latest_entry.total_cost_scale > 6 {
-        let scale_diff = latest_entry.total_cost_scale - 6;
-        latest_entry.total_cost_amount / 10_i64.pow(scale_diff as u32)
-    } else {
-        let scale_diff = 6 - latest_entry.total_cost_scale;
-        latest_entry.total_cost_amount * 10_i64.pow(scale_diff as u32)
-    };
-
+    // Verify the cost in the history entry matches (all at scale 9 now)
     assert!(
-        (history_cost_normalized - expected_spent_scale_6).abs() <= tolerance,
-        "History entry cost should match: expected {} (scale 6), got {} (scale {}), normalized: {}",
-        expected_spent_scale_6,
-        latest_entry.total_cost_amount,
-        latest_entry.total_cost_scale,
-        history_cost_normalized
+        (latest_entry.total_cost - expected_total_cost).abs() <= tolerance,
+        "History entry cost should match: expected {} nano-dollars, got {}",
+        expected_total_cost,
+        latest_entry.total_cost
     );
 }

@@ -16,6 +16,7 @@ pub struct ModelInfo {
 }
 
 /// Model with pricing and metadata information
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
 pub struct ModelWithPricing {
     pub id: Uuid,
@@ -24,15 +25,9 @@ pub struct ModelWithPricing {
     pub model_description: String,
     pub model_icon: Option<String>,
 
-    // Input pricing using decimal representation
-    pub input_cost_amount: i64,
-    pub input_cost_scale: i32,
-    pub input_cost_currency: String,
-
-    // Output pricing using decimal representation
-    pub output_cost_amount: i64,
-    pub output_cost_scale: i32,
-    pub output_cost_currency: String,
+    // Pricing (fixed scale 9 = nano-dollars, USD only)
+    pub input_cost_per_token: i64,
+    pub output_cost_per_token: i64,
 
     // Model metadata
     pub context_length: i32,

@@ -94,14 +94,14 @@ pub async fn list_models(
         .map(|model| ModelWithPricing {
             model_id: model.model_name.clone(),
             input_cost_per_token: DecimalPrice {
-                amount: model.input_cost_amount,
-                scale: model.input_cost_scale,
-                currency: model.input_cost_currency.clone(),
+                amount: model.input_cost_per_token,
+                scale: 9,
+                currency: "USD".to_string(),
             },
             output_cost_per_token: DecimalPrice {
-                amount: model.output_cost_amount,
-                scale: model.output_cost_scale,
-                currency: model.output_cost_currency.clone(),
+                amount: model.output_cost_per_token,
+                scale: 9,
+                currency: "USD".to_string(),
             },
             metadata: ModelMetadata {
                 verifiable: model.verifiable,
@@ -182,14 +182,14 @@ pub async fn get_model_by_name(
     let api_model = ModelWithPricing {
         model_id: model.model_name,
         input_cost_per_token: DecimalPrice {
-            amount: model.input_cost_amount,
-            scale: model.input_cost_scale,
-            currency: model.input_cost_currency,
+            amount: model.input_cost_per_token,
+            scale: 9,
+            currency: "USD".to_string(),
         },
         output_cost_per_token: DecimalPrice {
-            amount: model.output_cost_amount,
-            scale: model.output_cost_scale,
-            currency: model.output_cost_currency,
+            amount: model.output_cost_per_token,
+            scale: 9,
+            currency: "USD".to_string(),
         },
         metadata: ModelMetadata {
             verifiable: model.verifiable,

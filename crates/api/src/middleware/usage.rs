@@ -60,42 +60,28 @@ pub async fn usage_check_middleware(
         })?;
 
     match check_result {
-        UsageCheckResult::Allowed {
-            remaining_amount,
-            remaining_scale,
-            remaining_currency,
-        } => {
+        UsageCheckResult::Allowed { remaining } => {
             debug!(
-                "Organization {} has sufficient credits. Remaining: {} (scale: {}, currency: {})",
-                organization_id, remaining_amount, remaining_scale, remaining_currency
+                "Organization {} has sufficient credits. Remaining: {}",
+                organization_id,
+                format_amount(remaining)
             );
             Ok(next.run(request).await)
         }
-        UsageCheckResult::LimitExceeded {
-            spent_amount,
-            spent_scale,
-            spent_currency,
-            limit_amount,
-            limit_scale,
-            limit_currency,
-        } => {
+        UsageCheckResult::LimitExceeded { spent, limit } => {
             warn!(
-                "Organization {} exceeded credit limit. Spent: {} {}, Limit: {} {}",
+                "Organization {} exceeded credit limit. Spent: {}, Limit: {}",
                 organization_id,
-                format_amount(spent_amount, spent_scale),
-                spent_currency,
-                format_amount(limit_amount, limit_scale),
-                limit_currency
+                format_amount(spent),
+                format_amount(limit)
             );
             Err((
                 StatusCode::PAYMENT_REQUIRED,
                 axum::Json(ErrorResponse::new(
                     format!(
-                        "Credit limit exceeded. Spent: {} {}, Limit: {} {}. Please purchase more credits.",
-                        format_amount(spent_amount, spent_scale),
-                        spent_currency,
-                        format_amount(limit_amount, limit_scale),
-                        limit_currency
+                        "Credit limit exceeded. Spent: {}, Limit: {}. Please purchase more credits.",
+                        format_amount(spent),
+                        format_amount(limit)
                     ),
                     "insufficient_credits".to_string(),
                 )),
@@ -128,40 +114,23 @@ pub async fn usage_check_middleware(
                 )),
             ))
         }
-        UsageCheckResult::CurrencyMismatch {
-            spent_currency,
-            limit_currency,
-        } => {
-            tracing::error!(
-                "Currency mismatch for organization {}: spent in {}, limit in {}",
-                organization_id,
-                spent_currency,
-                limit_currency
-            );
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(ErrorResponse::new(
-                    format!(
-                        "Currency mismatch: spending tracked in {}, limit set in {}. Please contact support.",
-                        spent_currency, limit_currency
-                    ),
-                    "currency_mismatch".to_string(),
-                )),
-            ))
-        }
     }
 }
 
-/// Helper function to format amount with scale for display
-fn format_amount(amount: i64, scale: i32) -> String {
-    let divisor = 10_i64.pow(scale as u32);
+/// Helper function to format amount (fixed scale 9 = nano-dollars, USD)
+fn format_amount(amount: i64) -> String {
+    const SCALE: i32 = 9;
+    let divisor = 10_i64.pow(SCALE as u32);
     let whole = amount / divisor;
     let fraction = amount % divisor;
 
     if fraction == 0 {
-        format!("{}", whole)
+        format!("${}.00", whole)
     } else {
-        format!("{}.{:0width$}", whole, fraction, width = scale as usize)
+        // Format with leading zeros, then trim trailing zeros
+        let fraction_str = format!("{:09}", fraction);
+        let trimmed = fraction_str.trim_end_matches('0');
+        format!("${}.{}", whole, trimmed)
     }
 }
 
@@ -171,17 +140,11 @@ mod tests {
 
     #[test]
     fn test_format_amount() {
-        // Test with scale 6 (micro-dollars)
-        assert_eq!(format_amount(1000000, 6), "1");
-        assert_eq!(format_amount(1500000, 6), "1.500000");
-        assert_eq!(format_amount(100, 6), "0.000100");
-
-        // Test with scale 2 (cents)
-        assert_eq!(format_amount(100, 2), "1");
-        assert_eq!(format_amount(150, 2), "1.50");
-        assert_eq!(format_amount(1, 2), "0.01");
-
-        // Test with scale 0
-        assert_eq!(format_amount(100, 0), "100");
+        // Test with scale 9 (nano-dollars)
+        assert_eq!(format_amount(1000000000), "$1.00");
+        assert_eq!(format_amount(1500000000), "$1.5");
+        assert_eq!(format_amount(100), "$0.0000001");
+        assert_eq!(format_amount(1), "$0.000000001");
+        assert_eq!(format_amount(0), "$0.00");
     }
 }

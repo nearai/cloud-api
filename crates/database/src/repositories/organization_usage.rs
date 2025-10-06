@@ -39,11 +39,9 @@ impl OrganizationUsageRepository {
                 INSERT INTO organization_usage_log (
                     id, organization_id, workspace_id, api_key_id, response_id,
                     model_id, input_tokens, output_tokens, total_tokens,
-                    input_cost_amount, input_cost_scale, input_cost_currency,
-                    output_cost_amount, output_cost_scale, output_cost_currency,
-                    total_cost_amount, total_cost_scale, total_cost_currency,
+                    input_cost, output_cost, total_cost,
                     request_type, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                 RETURNING *
                 "#,
                 &[
@@ -56,15 +54,9 @@ impl OrganizationUsageRepository {
                     &request.input_tokens,
                     &request.output_tokens,
                     &total_tokens,
-                    &request.input_cost_amount,
-                    &request.input_cost_scale,
-                    &request.input_cost_currency,
-                    &request.output_cost_amount,
-                    &request.output_cost_scale,
-                    &request.output_cost_currency,
-                    &request.total_cost_amount,
-                    &request.total_cost_scale,
-                    &request.total_cost_currency,
+                    &request.input_cost,
+                    &request.output_cost,
+                    &request.total_cost,
                     &request.request_type,
                     &now,
                 ],
@@ -72,49 +64,28 @@ impl OrganizationUsageRepository {
             .await
             .context("Failed to insert usage log")?;
 
-        // Normalize cost to balance table scale (scale 6)
-        // Balance table uses scale 6, while model costs may use different scales (e.g., scale 9)
-        const BALANCE_SCALE: i32 = 6;
-        let normalized_cost = if request.total_cost_scale == BALANCE_SCALE {
-            request.total_cost_amount
-        } else if request.total_cost_scale > BALANCE_SCALE {
-            // Scale down: divide by 10^(difference)
-            let scale_diff = request.total_cost_scale - BALANCE_SCALE;
-            let divisor = 10_i64.pow(scale_diff as u32);
-            request.total_cost_amount / divisor
-        } else {
-            // Scale up: multiply by 10^(difference)
-            let scale_diff = BALANCE_SCALE - request.total_cost_scale;
-            let multiplier = 10_i64.pow(scale_diff as u32);
-            request.total_cost_amount * multiplier
-        };
-
-        // Update organization balance
+        // Update organization balance (all costs use fixed scale 9)
         transaction
             .execute(
                 r#"
                 INSERT INTO organization_balance (
                     organization_id,
-                    total_spent_amount,
-                    total_spent_scale,
-                    total_spent_currency,
+                    total_spent,
                     last_usage_at,
                     total_requests,
                     total_tokens,
                     updated_at
-                ) VALUES ($1, $2, $3, $4, $5, 1, $6, $7)
+                ) VALUES ($1, $2, $3, 1, $4, $5)
                 ON CONFLICT (organization_id) DO UPDATE SET
-                    total_spent_amount = organization_balance.total_spent_amount + $2,
+                    total_spent = organization_balance.total_spent + $2,
                     total_requests = organization_balance.total_requests + 1,
-                    total_tokens = organization_balance.total_tokens + $6,
-                    last_usage_at = $5,
-                    updated_at = $7
+                    total_tokens = organization_balance.total_tokens + $4,
+                    last_usage_at = $3,
+                    updated_at = $5
                 "#,
                 &[
                     &request.organization_id,
-                    &normalized_cost,
-                    &BALANCE_SCALE,
-                    &request.total_cost_currency,
+                    &request.total_cost,
                     &now,
                     &(total_tokens as i64),
                     &now,
@@ -142,9 +113,8 @@ impl OrganizationUsageRepository {
         let row_opt = client
             .query_opt(
                 r#"
-                SELECT organization_id, total_spent_amount, total_spent_scale,
-                       total_spent_currency, last_usage_at, total_requests,
-                       total_tokens, updated_at
+                SELECT organization_id, total_spent, last_usage_at, 
+                       total_requests, total_tokens, updated_at
                 FROM organization_balance
                 WHERE organization_id = $1
                 "#,
@@ -177,9 +147,7 @@ impl OrganizationUsageRepository {
                 r#"
                 SELECT id, organization_id, workspace_id, api_key_id, response_id,
                        model_id, input_tokens, output_tokens, total_tokens,
-                       input_cost_amount, input_cost_scale, input_cost_currency,
-                       output_cost_amount, output_cost_scale, output_cost_currency,
-                       total_cost_amount, total_cost_scale, total_cost_currency,
+                       input_cost, output_cost, total_cost,
                        request_type, created_at
                 FROM organization_usage_log
                 WHERE organization_id = $1
@@ -213,7 +181,7 @@ impl OrganizationUsageRepository {
                 SELECT 
                     COUNT(*) as request_count,
                     SUM(total_tokens) as total_tokens,
-                    SUM(total_cost_amount) as total_cost
+                    SUM(total_cost) as total_cost
                 FROM organization_usage_log
                 WHERE organization_id = $1
                   AND created_at >= $2
@@ -242,15 +210,9 @@ impl OrganizationUsageRepository {
             input_tokens: row.get("input_tokens"),
             output_tokens: row.get("output_tokens"),
             total_tokens: row.get("total_tokens"),
-            input_cost_amount: row.get("input_cost_amount"),
-            input_cost_scale: row.get("input_cost_scale"),
-            input_cost_currency: row.get("input_cost_currency"),
-            output_cost_amount: row.get("output_cost_amount"),
-            output_cost_scale: row.get("output_cost_scale"),
-            output_cost_currency: row.get("output_cost_currency"),
-            total_cost_amount: row.get("total_cost_amount"),
-            total_cost_scale: row.get("total_cost_scale"),
-            total_cost_currency: row.get("total_cost_currency"),
+            input_cost: row.get("input_cost"),
+            output_cost: row.get("output_cost"),
+            total_cost: row.get("total_cost"),
             request_type: row.get("request_type"),
             created_at: row.get("created_at"),
         }
@@ -259,9 +221,7 @@ impl OrganizationUsageRepository {
     fn row_to_balance(&self, row: &Row) -> OrganizationBalance {
         OrganizationBalance {
             organization_id: row.get("organization_id"),
-            total_spent_amount: row.get("total_spent_amount"),
-            total_spent_scale: row.get("total_spent_scale"),
-            total_spent_currency: row.get("total_spent_currency"),
+            total_spent: row.get("total_spent"),
             last_usage_at: row.get("last_usage_at"),
             total_requests: row.get("total_requests"),
             total_tokens: row.get("total_tokens"),

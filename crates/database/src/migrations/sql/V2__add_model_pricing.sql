@@ -2,6 +2,7 @@
 -- This migration adds a table to store model pricing information and metadata
 
 -- Models table for storing model pricing and metadata
+-- All costs use fixed scale of 9 (nano-dollars) and USD currency
 CREATE TABLE models (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     model_name VARCHAR(500) NOT NULL UNIQUE, -- e.g., "openai/gpt-oss-120b"
@@ -9,14 +10,10 @@ CREATE TABLE models (
     model_description TEXT NOT NULL,
     model_icon VARCHAR(500), -- URL to model icon
     
-    -- Pricing information using decimal representation
-    input_cost_amount BIGINT NOT NULL DEFAULT 0, -- Amount in smallest currency unit
-    input_cost_scale INT NOT NULL DEFAULT 9, -- Number of decimal places  
-    input_cost_currency VARCHAR(10) NOT NULL DEFAULT 'USD',
-    
-    output_cost_amount BIGINT NOT NULL DEFAULT 0, -- Amount in smallest currency unit
-    output_cost_scale INT NOT NULL DEFAULT 9, -- Number of decimal places
-    output_cost_currency VARCHAR(10) NOT NULL DEFAULT 'USD',
+    -- Pricing information (fixed scale 9 = nano-dollars, USD only)
+    -- Example: $0.001 per token = 1,000,000 nano-dollars
+    input_cost_per_token BIGINT NOT NULL DEFAULT 0,  -- Cost per input token in nano-dollars
+    output_cost_per_token BIGINT NOT NULL DEFAULT 0, -- Cost per output token in nano-dollars
     
     -- Model metadata
     context_length INTEGER NOT NULL DEFAULT 0,
@@ -34,18 +31,14 @@ CREATE INDEX idx_models_active ON models(is_active);
 CREATE INDEX idx_models_created ON models(created_at);
 
 -- Model pricing history table for tracking pricing changes over time
+-- All costs use fixed scale of 9 (nano-dollars) and USD currency
 CREATE TABLE model_pricing_history (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     model_id UUID NOT NULL REFERENCES models(id) ON DELETE CASCADE,
     
-    -- Pricing information snapshot
-    input_cost_amount BIGINT NOT NULL,
-    input_cost_scale INT NOT NULL,
-    input_cost_currency VARCHAR(10) NOT NULL,
-    
-    output_cost_amount BIGINT NOT NULL,
-    output_cost_scale INT NOT NULL,
-    output_cost_currency VARCHAR(10) NOT NULL,
+    -- Pricing information snapshot (fixed scale 9 = nano-dollars, USD only)
+    input_cost_per_token BIGINT NOT NULL,
+    output_cost_per_token BIGINT NOT NULL,
     
     -- Model metadata snapshot
     context_length INTEGER NOT NULL,
@@ -81,12 +74,8 @@ BEGIN
     -- Insert new pricing history record
     INSERT INTO model_pricing_history (
         model_id,
-        input_cost_amount,
-        input_cost_scale,
-        input_cost_currency,
-        output_cost_amount,
-        output_cost_scale,
-        output_cost_currency,
+        input_cost_per_token,
+        output_cost_per_token,
         context_length,
         model_display_name,
         model_description,
@@ -96,12 +85,8 @@ BEGIN
         change_reason
     ) VALUES (
         NEW.id,
-        NEW.input_cost_amount,
-        NEW.input_cost_scale,
-        NEW.input_cost_currency,
-        NEW.output_cost_amount,
-        NEW.output_cost_scale,
-        NEW.output_cost_currency,
+        NEW.input_cost_per_token,
+        NEW.output_cost_per_token,
         NEW.context_length,
         NEW.model_display_name,
         NEW.model_description,
@@ -121,8 +106,7 @@ $$ LANGUAGE plpgsql;
 -- Trigger to automatically track pricing changes on INSERT and UPDATE
 CREATE TRIGGER model_pricing_change_trigger
 AFTER INSERT OR UPDATE OF 
-    input_cost_amount, input_cost_scale, input_cost_currency,
-    output_cost_amount, output_cost_scale, output_cost_currency,
+    input_cost_per_token, output_cost_per_token,
     context_length, model_display_name, model_description
 ON models
 FOR EACH ROW

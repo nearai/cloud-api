@@ -18,15 +18,9 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             model_id: request.model_id,
             input_tokens: request.input_tokens,
             output_tokens: request.output_tokens,
-            input_cost_amount: request.input_cost_amount,
-            input_cost_scale: request.input_cost_scale,
-            input_cost_currency: request.input_cost_currency,
-            output_cost_amount: request.output_cost_amount,
-            output_cost_scale: request.output_cost_scale,
-            output_cost_currency: request.output_cost_currency,
-            total_cost_amount: request.total_cost_amount,
-            total_cost_scale: request.total_cost_scale,
-            total_cost_currency: request.total_cost_currency,
+            input_cost: request.input_cost,
+            output_cost: request.output_cost,
+            total_cost: request.total_cost,
             request_type: request.request_type,
         };
 
@@ -42,15 +36,9 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             input_tokens: log.input_tokens,
             output_tokens: log.output_tokens,
             total_tokens: log.total_tokens,
-            input_cost_amount: log.input_cost_amount,
-            input_cost_scale: log.input_cost_scale,
-            input_cost_currency: log.input_cost_currency,
-            output_cost_amount: log.output_cost_amount,
-            output_cost_scale: log.output_cost_scale,
-            output_cost_currency: log.output_cost_currency,
-            total_cost_amount: log.total_cost_amount,
-            total_cost_scale: log.total_cost_scale,
-            total_cost_currency: log.total_cost_currency,
+            input_cost: log.input_cost,
+            output_cost: log.output_cost,
+            total_cost: log.total_cost,
             request_type: log.request_type,
             created_at: log.created_at,
         })
@@ -64,9 +52,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
 
         Ok(balance.map(|b| OrganizationBalanceInfo {
             organization_id: b.organization_id,
-            total_spent_amount: b.total_spent_amount,
-            total_spent_scale: b.total_spent_scale,
-            total_spent_currency: b.total_spent_currency,
+            total_spent: b.total_spent,
             last_usage_at: b.last_usage_at,
             total_requests: b.total_requests,
             total_tokens: b.total_tokens,
@@ -96,19 +82,12 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 input_tokens: log.input_tokens,
                 output_tokens: log.output_tokens,
                 total_tokens: log.total_tokens,
-                input_cost_amount: log.input_cost_amount,
-                input_cost_scale: log.input_cost_scale,
-                input_cost_currency: log.input_cost_currency,
-                output_cost_amount: log.output_cost_amount,
-                output_cost_scale: log.output_cost_scale,
-                output_cost_currency: log.output_cost_currency,
-                total_cost_amount: log.total_cost_amount,
-                total_cost_scale: log.total_cost_scale,
-                total_cost_currency: log.total_cost_currency,
+                input_cost: log.input_cost,
+                output_cost: log.output_cost,
+                total_cost: log.total_cost,
                 request_type: log.request_type,
                 created_at: log.created_at,
             })
             .collect())
     }
 }
-

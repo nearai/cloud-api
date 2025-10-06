@@ -15,6 +15,30 @@ impl OrganizationUsageRepository {
         Self { pool }
     }
 
+    /// Get total spend for a specific API key
+    pub async fn get_api_key_spend(&self, api_key_id: Uuid) -> Result<i64> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let row = client
+            .query_one(
+                r#"
+                SELECT COALESCE(SUM(total_cost), 0)::BIGINT as total_spend
+                FROM organization_usage_log
+                WHERE api_key_id = $1
+                "#,
+                &[&api_key_id],
+            )
+            .await
+            .context("Failed to get API key spend")?;
+
+        let total_spend: i64 = row.get("total_spend");
+        Ok(total_spend)
+    }
+
     /// Record usage and update balance atomically
     pub async fn record_usage(&self, request: RecordUsageRequest) -> Result<OrganizationUsageLog> {
         let mut client = self

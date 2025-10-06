@@ -85,7 +85,8 @@ pub struct Workspace {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKey {
     pub id: Uuid,
-    pub key_hash: String, // Store hashed API key
+    pub key_hash: String,   // Store hashed API key
+    pub key_prefix: String, // First 8-10 chars for display (e.g., "sk_abc123")
     pub name: String,
     pub workspace_id: Uuid, // Changed from organization_id to workspace_id
     pub created_by_user_id: Uuid,
@@ -93,6 +94,8 @@ pub struct ApiKey {
     pub expires_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub is_active: bool,
+    /// Optional spending limit in nano-dollars (scale 9, USD). None means no limit.
+    pub spend_limit: Option<i64>,
 }
 
 /// Session for OAuth authentication

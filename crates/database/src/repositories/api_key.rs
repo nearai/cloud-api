@@ -29,6 +29,13 @@ impl ApiKeyRepository {
         format!("{:x}", hasher.finalize())
     }
 
+    /// Extract key prefix from a generated key for display purposes
+    fn extract_key_prefix(key: &str) -> String {
+        // Take first 10 characters (e.g., "sk_abc1234" from "sk_abc1234567890...")
+        let prefix_len = 10.min(key.len());
+        key[..prefix_len].to_string()
+    }
+
     /// Create a new API key
     pub async fn create(&self, request: CreateApiKeyRequest) -> Result<(String, ApiKey)> {
         let client = self
@@ -40,6 +47,7 @@ impl ApiKeyRepository {
         let id = Uuid::new_v4();
         let key = Self::generate_api_key();
         let key_hash = Self::hash_api_key(&key);
+        let key_prefix = Self::extract_key_prefix(&key);
         let now = Utc::now();
 
         // Use name as Option<String>
@@ -49,15 +57,16 @@ impl ApiKeyRepository {
             .query_one(
                 r#"
                 INSERT INTO api_keys (
-                    id, key_hash, name, workspace_id, created_by_user_id,
+                    id, key_hash, key_prefix, name, workspace_id, created_by_user_id,
                     created_at, expires_at, last_used_at, is_active
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, true)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true)
                 RETURNING *
                 "#,
                 &[
                     &id,
                     &key_hash,
+                    &key_prefix,
                     &name,
                     &request.workspace_id.0,
                     &request.created_by_user_id.0,
@@ -78,6 +87,7 @@ impl ApiKeyRepository {
             ApiKey {
                 id,
                 key_hash,
+                key_prefix,
                 name,
                 created_at: now,
                 expires_at: request.expires_at,
@@ -85,6 +95,7 @@ impl ApiKeyRepository {
                 is_active: true,
                 created_by_user_id: request.created_by_user_id.0,
                 workspace_id: request.workspace_id.0,
+                spend_limit: None,
             },
         ))
     }
@@ -103,6 +114,7 @@ impl ApiKeyRepository {
         let id = Uuid::new_v4();
         let key = Self::generate_api_key();
         let key_hash = Self::hash_api_key(&key);
+        let key_prefix = Self::extract_key_prefix(&key);
         let now = Utc::now();
 
         // Use name as Option<String>
@@ -112,15 +124,16 @@ impl ApiKeyRepository {
             .query_one(
                 r#"
                 INSERT INTO api_keys (
-                    id, key_hash, name, workspace_id, created_by_user_id,
+                    id, key_hash, key_prefix, name, workspace_id, created_by_user_id,
                     created_at, expires_at, last_used_at, is_active
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, true)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true)
                 RETURNING *
                 "#,
                 &[
                     &id,
                     &key_hash,
+                    &key_prefix,
                     &name,
                     &request.workspace_id.0,
                     &request.created_by_user_id.0,
@@ -350,11 +363,32 @@ impl ApiKeyRepository {
         }
     }
 
+    /// Update spend limit for an API key
+    pub async fn update_spend_limit(&self, id: Uuid, spend_limit: Option<i64>) -> Result<ApiKey> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let row = client
+            .query_one(
+                "UPDATE api_keys SET spend_limit = $1 WHERE id = $2 AND is_active = true RETURNING *",
+                &[&spend_limit, &id],
+            )
+            .await
+            .context("Failed to update API key spend limit")?;
+
+        debug!("Updated spend limit for API key: {}", id);
+        self.row_to_api_key(row)
+    }
+
     // Helper function to convert database row to ApiKey
     fn row_to_api_key(&self, row: tokio_postgres::Row) -> Result<ApiKey> {
         Ok(ApiKey {
             id: row.get("id"),
             key_hash: row.get("key_hash"),
+            key_prefix: row.get("key_prefix"),
             name: row.get("name"),
             workspace_id: row.get("workspace_id"),
             created_by_user_id: row.get("created_by_user_id"),
@@ -362,6 +396,7 @@ impl ApiKeyRepository {
             expires_at: row.get("expires_at"),
             last_used_at: row.get("last_used_at"),
             is_active: row.get("is_active"),
+            spend_limit: row.get("spend_limit"),
         })
     }
 }
@@ -374,6 +409,7 @@ fn db_apikey_to_service_apikey(
     services::auth::ApiKey {
         id: services::auth::ports::ApiKeyId(db_api_key.id.to_string()),
         key: api_key,
+        key_prefix: db_api_key.key_prefix,
         name: db_api_key.name,
         workspace_id: WorkspaceId(db_api_key.workspace_id),
         created_by_user_id: services::auth::ports::UserId(db_api_key.created_by_user_id),
@@ -381,6 +417,7 @@ fn db_apikey_to_service_apikey(
         expires_at: db_api_key.expires_at,
         last_used_at: db_api_key.last_used_at,
         is_active: db_api_key.is_active,
+        spend_limit: db_api_key.spend_limit,
     }
 }
 
@@ -414,5 +451,16 @@ impl services::auth::ports::ApiKeyRepository for ApiKeyRepository {
 
     async fn update_last_used(&self, id: services::auth::ports::ApiKeyId) -> anyhow::Result<()> {
         self.update_last_used(Uuid::parse_str(&id.0)?).await
+    }
+
+    async fn update_spend_limit(
+        &self,
+        id: services::auth::ports::ApiKeyId,
+        spend_limit: Option<i64>,
+    ) -> anyhow::Result<services::auth::ApiKey> {
+        let db_api_key = self
+            .update_spend_limit(Uuid::parse_str(&id.0)?, spend_limit)
+            .await?;
+        Ok(db_apikey_to_service_apikey(None, db_api_key))
     }
 }

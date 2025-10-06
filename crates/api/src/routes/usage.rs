@@ -16,6 +16,14 @@ pub struct OrganizationBalanceResponse {
     pub organization_id: String,
     pub total_spent: i64,            // In nano-dollars (scale 9)
     pub total_spent_display: String, // Human readable, e.g., "$12.50"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spend_limit: Option<i64>, // In nano-dollars (scale 9), None if not set
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spend_limit_display: Option<String>, // Human readable, e.g., "$100.00"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<i64>, // Remaining credits in nano-dollars
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_display: Option<String>, // Human readable remaining
     pub last_usage_at: Option<String>,
     pub total_requests: i64,
     pub total_tokens: i64,
@@ -121,23 +129,78 @@ pub async fn get_organization_balance(
             )
         })?;
 
+    // Get spending limit
+    let limit = app_state
+        .usage_service
+        .get_limit(organization_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to get limit: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to retrieve limit".to_string(),
+                    "internal_error".to_string(),
+                )),
+            )
+        })?;
+
     match balance {
-        Some(balance) => Ok(ResponseJson(OrganizationBalanceResponse {
-            organization_id: balance.organization_id.to_string(),
-            total_spent: balance.total_spent,
-            total_spent_display: format_amount(balance.total_spent),
-            last_usage_at: balance.last_usage_at.map(|dt| dt.to_rfc3339()),
-            total_requests: balance.total_requests,
-            total_tokens: balance.total_tokens,
-            updated_at: balance.updated_at.to_rfc3339(),
-        })),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            ResponseJson(ErrorResponse::new(
-                "No usage data found for organization".to_string(),
-                "not_found".to_string(),
-            )),
-        )),
+        Some(balance) => {
+            let (spend_limit, spend_limit_display, remaining, remaining_display) =
+                if let Some(limit_info) = limit {
+                    let remaining_amount = limit_info.spend_limit - balance.total_spent;
+                    (
+                        Some(limit_info.spend_limit),
+                        Some(format_amount(limit_info.spend_limit)),
+                        Some(remaining_amount),
+                        Some(format_amount(remaining_amount)),
+                    )
+                } else {
+                    (None, None, None, None)
+                };
+
+            Ok(ResponseJson(OrganizationBalanceResponse {
+                organization_id: balance.organization_id.to_string(),
+                total_spent: balance.total_spent,
+                total_spent_display: format_amount(balance.total_spent),
+                spend_limit,
+                spend_limit_display,
+                remaining,
+                remaining_display,
+                last_usage_at: balance.last_usage_at.map(|dt| dt.to_rfc3339()),
+                total_requests: balance.total_requests,
+                total_tokens: balance.total_tokens,
+                updated_at: balance.updated_at.to_rfc3339(),
+            }))
+        }
+        None => {
+            // No balance yet, but may have a limit
+            if let Some(limit_info) = limit {
+                // Organization has a limit but no usage yet - return with zero balance
+                Ok(ResponseJson(OrganizationBalanceResponse {
+                    organization_id: org_id,
+                    total_spent: 0,
+                    total_spent_display: format_amount(0),
+                    spend_limit: Some(limit_info.spend_limit),
+                    spend_limit_display: Some(format_amount(limit_info.spend_limit)),
+                    remaining: Some(limit_info.spend_limit),
+                    remaining_display: Some(format_amount(limit_info.spend_limit)),
+                    last_usage_at: None,
+                    total_requests: 0,
+                    total_tokens: 0,
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                }))
+            } else {
+                Err((
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        "No usage data or limit found for organization".to_string(),
+                        "not_found".to_string(),
+                    )),
+                ))
+            }
+        }
     }
 }
 

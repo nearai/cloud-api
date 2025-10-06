@@ -202,6 +202,8 @@ pub struct ApiKey {
     pub id: ApiKeyId,
     // Returned only on creation
     pub key: Option<String>,
+    /// First 8-10 characters of the key for display purposes (e.g., "sk_abc123")
+    pub key_prefix: String,
     pub name: String,
     pub workspace_id: WorkspaceId,
     pub created_by_user_id: UserId,
@@ -209,6 +211,8 @@ pub struct ApiKey {
     pub expires_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub is_active: bool,
+    /// Optional spending limit in nano-dollars (scale 9, USD). None means no limit.
+    pub spend_limit: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -228,7 +232,14 @@ pub trait ApiKeyRepository: Send + Sync {
     async fn list_by_workspace(&self, workspace_id: WorkspaceId) -> anyhow::Result<Vec<ApiKey>>;
 
     async fn delete(&self, id: ApiKeyId) -> anyhow::Result<bool>;
+
     async fn update_last_used(&self, id: ApiKeyId) -> anyhow::Result<()>;
+
+    async fn update_spend_limit(
+        &self,
+        id: ApiKeyId,
+        spend_limit: Option<i64>,
+    ) -> anyhow::Result<ApiKey>;
 }
 
 // Service interfaces

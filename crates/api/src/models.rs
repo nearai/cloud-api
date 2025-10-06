@@ -967,6 +967,15 @@ pub struct ApiKeyResponse {
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spend_limit: Option<DecimalPrice>,
+}
+
+/// Request to update API key spend limit
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateApiKeySpendLimitRequest {
+    #[serde(rename = "spendLimit")]
+    pub spend_limit: Option<DecimalPrice>,
 }
 
 // ============================================
@@ -999,7 +1008,7 @@ pub struct ModelWithPricing {
 }
 
 /// Decimal price representation using amount/scale/currency
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct DecimalPrice {
     pub amount: i64,
     pub scale: i32,

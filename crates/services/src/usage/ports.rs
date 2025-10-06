@@ -34,6 +34,12 @@ pub trait UsageService: Send + Sync {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<Vec<UsageLogEntry>, UsageError>;
+
+    /// Get current spending limit for an organization
+    async fn get_limit(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<Option<OrganizationLimit>, UsageError>;
 }
 
 // ============================================
@@ -137,13 +143,8 @@ pub struct CostBreakdown {
 /// All amounts use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
 pub enum UsageCheckResult {
-    Allowed {
-        remaining: i64,
-    },
-    LimitExceeded {
-        spent: i64,
-        limit: i64,
-    },
+    Allowed { remaining: i64 },
+    LimitExceeded { spent: i64, limit: i64 },
     NoCredits,  // No credits available - must purchase credits
     NoLimitSet, // No spending limit configured - must set limit
 }

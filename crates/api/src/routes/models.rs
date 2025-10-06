@@ -128,13 +128,15 @@ pub async fn list_models(
 ///
 /// Returns the details of a specific model including pricing and metadata information.
 /// This is a public endpoint that does not require authentication.
-/// Model names can contain forward slashes (e.g., "openai/gpt-oss-120b").
+///
+/// **Note:** Model names containing forward slashes (e.g., "Qwen/Qwen3-30B-A3B-Instruct-2507") must be URL-encoded.
+/// For example, use "Qwen%2FQwen3-30B-A3B-Instruct-2507" in the URL path.
 #[utoipa::path(
     get,
     path = "/model/{model_name}",
     tag = "Models",
     params(
-        ("model_name" = String, Path, description = "The model name to retrieve (can contain slashes)")
+        ("model_name" = String, Path, description = "The model name to retrieve (URL-encode if it contains slashes)")
     ),
     responses(
         (status = 200, description = "Model details with pricing", body = ModelWithPricing),
@@ -146,8 +148,6 @@ pub async fn get_model_by_name(
     State(app_state): State<ModelsAppState>,
     Path(model_name): Path<String>,
 ) -> Result<ResponseJson<ModelWithPricing>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    // Remove leading slash if present (from catch-all path parameter)
-    let model_name = model_name.trim_start_matches('/');
     debug!("Get model request for: {}", model_name);
 
     // Get the model from the service

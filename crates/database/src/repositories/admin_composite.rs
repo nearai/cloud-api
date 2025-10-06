@@ -1,11 +1,11 @@
 use crate::models::{UpdateModelPricingRequest, UpdateOrganizationLimitsDbRequest};
 use crate::pool::DbPool;
-use crate::repositories::{ModelRepository, OrganizationLimitsRepository};
+use crate::repositories::{ModelRepository, OrganizationLimitsRepository, UserRepository};
 use anyhow::Result;
 use async_trait::async_trait;
 use services::admin::{
     AdminRepository, ModelPricing, ModelPricingHistoryEntry, OrganizationLimits,
-    OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate, UpdateModelAdminRequest,
+    OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate, UpdateModelAdminRequest, UserInfo,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -15,13 +15,15 @@ use uuid::Uuid;
 pub struct AdminCompositeRepository {
     model_repo: Arc<ModelRepository>,
     limits_repo: Arc<OrganizationLimitsRepository>,
+    user_repo: Arc<UserRepository>,
 }
 
 impl AdminCompositeRepository {
     pub fn new(pool: DbPool) -> Self {
         Self {
             model_repo: Arc::new(ModelRepository::new(pool.clone())),
-            limits_repo: Arc::new(OrganizationLimitsRepository::new(pool)),
+            limits_repo: Arc::new(OrganizationLimitsRepository::new(pool.clone())),
+            user_repo: Arc::new(UserRepository::new(pool)),
         }
     }
 }
@@ -140,6 +142,24 @@ impl AdminRepository for AdminCompositeRepository {
                 changed_by: h.changed_by,
                 change_reason: h.change_reason,
                 created_at: h.created_at,
+            })
+            .collect())
+    }
+
+    async fn list_users(&self, limit: i64, offset: i64) -> Result<Vec<UserInfo>> {
+        let users = self.user_repo.list(limit, offset).await?;
+
+        Ok(users
+            .into_iter()
+            .map(|u| UserInfo {
+                id: u.id,
+                email: u.email,
+                username: u.username,
+                display_name: u.display_name,
+                avatar_url: u.avatar_url,
+                created_at: u.created_at,
+                last_login_at: u.last_login_at,
+                is_active: u.is_active,
             })
             .collect())
     }

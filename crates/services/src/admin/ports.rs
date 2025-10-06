@@ -84,6 +84,19 @@ pub struct OrganizationLimitsHistoryEntry {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// User information for admin endpoints
+#[derive(Debug, Clone)]
+pub struct UserInfo {
+    pub id: uuid::Uuid,
+    pub email: String,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_login_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub is_active: bool,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
     #[error("Model not found: {0}")]
@@ -134,6 +147,9 @@ pub trait AdminRepository: Send + Sync {
         &self,
         organization_id: uuid::Uuid,
     ) -> Result<Vec<OrganizationLimitsHistoryEntry>, anyhow::Error>;
+
+    /// List all users with pagination (admin only)
+    async fn list_users(&self, limit: i64, offset: i64) -> Result<Vec<UserInfo>, anyhow::Error>;
 }
 
 /// Admin service trait for managing platform configuration
@@ -163,4 +179,8 @@ pub trait AdminService: Send + Sync {
         &self,
         organization_id: uuid::Uuid,
     ) -> Result<Vec<OrganizationLimitsHistoryEntry>, AdminError>;
+
+    /// List all users with pagination (admin only)
+    async fn list_users(&self, limit: i64, offset: i64)
+        -> Result<(Vec<UserInfo>, i64), AdminError>;
 }

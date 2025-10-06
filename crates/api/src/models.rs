@@ -955,6 +955,15 @@ pub struct AdminUserResponse {
     pub is_active: bool,
 }
 
+/// List users response model (admin only)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListUsersResponse {
+    pub users: Vec<AdminUserResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 /// API Key response model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiKeyResponse {

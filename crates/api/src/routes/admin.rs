@@ -1,8 +1,8 @@
 use crate::middleware::AdminUser;
 use crate::models::{
-    BatchUpdateModelApiRequest, DecimalPrice, ErrorResponse, ModelMetadata,
-    ModelPricingHistoryEntry, ModelPricingHistoryResponse, ModelWithPricing, SpendLimit,
-    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
+    AdminUserResponse, BatchUpdateModelApiRequest, DecimalPrice, ErrorResponse, ListUsersResponse,
+    ModelMetadata, ModelPricingHistoryEntry, ModelPricingHistoryResponse, ModelWithPricing,
+    SpendLimit, UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
 };
 use axum::{
     extract::{Path, State},
@@ -327,4 +327,85 @@ pub async fn update_organization_limits(
     };
 
     Ok(ResponseJson(response))
+}
+
+/// List all registered users with pagination (Admin only)
+///
+/// Returns a paginated list of all users in the system. Only authenticated admins can perform this operation.
+#[utoipa::path(
+    get,
+    path = "/admin/users",
+    tag = "Admin",
+    params(
+        ("limit" = Option<i64>, Query, description = "Maximum number of users to return (default: 50)"),
+        ("offset" = Option<i64>, Query, description = "Number of users to skip (default: 0)")
+    ),
+    responses(
+        (status = 200, description = "Users retrieved successfully", body = ListUsersResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("bearer" = [])
+    )
+)]
+pub async fn list_users(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    axum::extract::Query(params): axum::extract::Query<ListUsersQueryParams>,
+) -> Result<ResponseJson<ListUsersResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let limit = params.limit.unwrap_or(50).min(100); // Cap at 100 for safety
+    let offset = params.offset.unwrap_or(0);
+
+    debug!("List users request with limit={}, offset={}", limit, offset);
+
+    let (users, total) = app_state
+        .admin_service
+        .list_users(limit, offset)
+        .await
+        .map_err(|e| {
+            error!("Failed to list users: {}", e);
+            match e {
+                services::admin::AdminError::Unauthorized(msg) => (
+                    StatusCode::UNAUTHORIZED,
+                    ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve users".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+
+    let user_responses: Vec<AdminUserResponse> = users
+        .into_iter()
+        .map(|u| AdminUserResponse {
+            id: u.id.to_string(),
+            email: u.email,
+            username: Some(u.username),
+            display_name: u.display_name,
+            avatar_url: u.avatar_url,
+            created_at: u.created_at,
+            last_login_at: u.last_login_at,
+            is_active: u.is_active,
+        })
+        .collect();
+
+    let response = ListUsersResponse {
+        users: user_responses,
+        total,
+        limit,
+        offset,
+    };
+
+    Ok(ResponseJson(response))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ListUsersQueryParams {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
 }

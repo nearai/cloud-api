@@ -601,7 +601,7 @@ pub fn build_model_routes(models_service: Arc<dyn ModelsService>) -> Router {
     Router::new()
         // Public endpoints - no auth required
         .route("/model/list", get(list_models))
-        .route("/model/{*model_name}", get(get_model_by_name))
+        .route("/model/{model_name}", get(get_model_by_name))
         .with_state(models_app_state)
 }
 

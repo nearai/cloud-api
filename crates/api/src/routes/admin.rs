@@ -139,12 +139,15 @@ pub async fn batch_upsert_models(
 /// Get pricing history for a model (Admin only)
 ///
 /// Returns the complete pricing history for a specific model, showing all pricing changes over time.
+///
+/// **Note:** Model names containing forward slashes (e.g., "Qwen/Qwen3-30B-A3B-Instruct-2507") must be URL-encoded.
+/// For example, use "Qwen%2FQwen3-30B-A3B-Instruct-2507" in the URL path.
 #[utoipa::path(
     get,
     path = "/admin/models/{model_name}/pricing-history",
     tag = "Admin",
     params(
-        ("model_name" = String, Path, description = "Model name to get pricing history for")
+        ("model_name" = String, Path, description = "Model name to get pricing history for (URL-encode if it contains slashes)")
     ),
     responses(
         (status = 200, description = "Pricing history retrieved successfully", body = ModelPricingHistoryResponse),

@@ -24,25 +24,6 @@ pub struct DatabaseConfig {
     pub max_connections: usize,
 }
 
-impl Default for DatabaseConfig {
-    fn default() -> Self {
-        Self {
-            host: env::var("DB_HOST").unwrap_or_else(|_| "localhost".to_string()),
-            port: env::var("DB_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(5432),
-            database: env::var("DB_NAME").unwrap_or_else(|_| "platform_api".to_string()),
-            username: env::var("DB_USER").unwrap_or_else(|_| "postgres".to_string()),
-            password: env::var("DB_PASSWORD").unwrap_or_else(|_| "postgres".to_string()),
-            max_connections: env::var("DB_MAX_CONNECTIONS")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(20),
-        }
-    }
-}
-
 impl DatabaseConfig {
     /// Create a connection URL for this database configuration
     pub fn connection_url(&self) -> String {

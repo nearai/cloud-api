@@ -45,6 +45,15 @@ impl ApiConfig {
 
     /// Load configuration from default locations
     pub fn load() -> Result<Self, ConfigError> {
+        // Check for CONFIG_FILE environment variable first
+        if let Ok(config_path) = std::env::var("CONFIG_FILE") {
+            if std::path::Path::new(&config_path).exists() {
+                return Self::load_from_file(&config_path);
+            } else {
+                return Err(ConfigError::FileNotFound { paths: config_path });
+            }
+        }
+
         // Try different config locations in order
         let config_paths = ["config/config.yaml", "config.yaml", "config/default.yaml"];
 

@@ -263,6 +263,9 @@ pub trait AuthServiceTrait: Send + Sync {
     /// Validate a session token and return the associated user
     async fn validate_session(&self, session_token: SessionToken) -> Result<User, AuthError>;
 
+    /// Get a user by their ID
+    async fn get_user_by_id(&self, user_id: UserId) -> Result<User, AuthError>;
+
     /// Logout (revoke session)
     async fn logout(&self, session_id: SessionId) -> Result<bool, AuthError>;
 
@@ -407,6 +410,10 @@ impl AuthServiceTrait for MockAuthService {
         let user = Self::create_mock_user();
         tracing::debug!("MockAuthService returning mock user: {}", user.email);
         Ok(user)
+    }
+
+    async fn get_user_by_id(&self, _user_id: UserId) -> Result<User, AuthError> {
+        Ok(Self::create_mock_user())
     }
 
     async fn logout(&self, _session_id: SessionId) -> Result<bool, AuthError> {

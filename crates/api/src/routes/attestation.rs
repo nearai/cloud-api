@@ -2,7 +2,8 @@ use crate::routes::api::AppState;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::Json,
+    response::Json as ResponseJson,
+    Extension,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
@@ -109,14 +110,14 @@ impl From<inference_providers::AttestationReport> for Attestation {
         (status = 400, description = "Invalid parameters")
     ),
     security(
-        ("bearer_token" = [])
+        ("api_key" = [])
     )
 )]
 pub async fn get_signature(
     Path(chat_id): Path<String>,
     Query(_params): Query<SignatureQuery>,
     State(app_state): State<AppState>,
-) -> Result<Json<SignatureResponse>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<ResponseJson<SignatureResponse>, (StatusCode, ResponseJson<serde_json::Value>)> {
     let signature = app_state
         .attestation_service
         .get_chat_signature(chat_id.as_str())
@@ -124,12 +125,12 @@ pub async fn get_signature(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
+                ResponseJson(serde_json::json!({ "error": e.to_string() })),
             )
         })?;
 
     let signature = signature.into();
-    Ok(Json(signature))
+    Ok(ResponseJson(signature))
 }
 
 #[utoipa::path(
@@ -143,19 +144,19 @@ pub async fn get_signature(
         (status = 503, description = "Attestation service unavailable")
     ),
     security(
-        ("bearer_token" = [])
+        ("api_key" = [])
     )
 )]
 pub async fn get_attestation_report(
     Query(params): Query<AttestationQuery>,
     State(app_state): State<AppState>,
-) -> Result<Json<AttestationResponse>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<ResponseJson<AttestationResponse>, (StatusCode, ResponseJson<serde_json::Value>)> {
     let model = if let Some(model) = params.model {
         model
     } else {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "model is required" })),
+            ResponseJson(serde_json::json!({ "error": "model is required" })),
         ));
     };
 
@@ -166,12 +167,12 @@ pub async fn get_attestation_report(
         .map_err(|e| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": e.to_string() })),
+                ResponseJson(serde_json::json!({ "error": e.to_string() })),
             )
         })?;
 
     let response = report.into();
-    Ok(Json(response))
+    Ok(ResponseJson(response))
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -199,14 +200,75 @@ pub struct VerifyResponse {
         (status = 200, description = "Verification completed", body = VerifyResponse)
     ),
     security(
-        ("bearer_token" = [])
+        ("api_key" = [])
     )
 )]
 pub async fn verify_attestation(
     Path(_chat_id): Path<String>,
     State(_app_state): State<AppState>,
-    Json(_req): Json<VerifyRequest>,
-) -> Result<Json<VerifyResponse>, (StatusCode, Json<serde_json::Value>)> {
+    ResponseJson(_req): ResponseJson<VerifyRequest>,
+) -> Result<ResponseJson<VerifyResponse>, (StatusCode, ResponseJson<serde_json::Value>)> {
+    unimplemented!()
+}
+
+/// Quote response containing gateway quote and allowlist
+#[derive(Debug, Serialize, ToSchema)]
+pub struct QuoteResponse {
+    pub gateway: GatewayQuote,
+    pub allowlist: Vec<ServiceAllowlistEntry>,
+}
+
+/// Gateway quote information
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GatewayQuote {
+    pub quote: String,
+    pub measurement: String,
+    pub svn: u32,
+    pub build: BuildInfo,
+}
+
+/// Service allowlist entry
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ServiceAllowlistEntry {
+    pub service: String,
+    pub expected_measurements: Vec<String>,
+    pub min_svn: u32,
+    pub identifier: String,
+}
+
+/// Build information
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BuildInfo {
+    pub image: String,
+    pub sbom: String,
+}
+
+/// Error response
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ErrorResponse {
+    pub error: String,
+}
+
+/// Get TDX quote
+///
+/// Returns a TDX quote for testing purposes.
+#[utoipa::path(
+    get,
+    path = "/v1/attestation/quote", 
+    tag = "Attestation",
+    responses(
+        (status = 200, description = "TDX quote", body = QuoteResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 501, description = "Not implemented", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn quote(
+    State(_app_state): State<AppState>,
+    Extension(_api_key): Extension<services::auth::ApiKey>,
+) -> Result<ResponseJson<QuoteResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     unimplemented!()
 }
 

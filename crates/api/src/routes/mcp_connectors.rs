@@ -1,3 +1,7 @@
+/// MCP Connectors routes
+///
+/// These are disabled for now, but are kept here for reference. Implementation will be updated later on.
+/// These endpoints were designed to be part of Platform API, but they will now be part of Chat API.
 use crate::{middleware::AuthenticatedUser, routes::api::AppState};
 use axum::{
     extract::{Path, Query, State},

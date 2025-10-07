@@ -43,7 +43,7 @@ pub struct OrganizationMemberWithUser {
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = [])
     )
 )]
 pub async fn add_organization_member(
@@ -139,7 +139,7 @@ pub async fn add_organization_member(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = [])
     )
 )]
 pub async fn update_organization_member(
@@ -230,7 +230,7 @@ pub async fn update_organization_member(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = [])
     )
 )]
 pub async fn remove_organization_member(
@@ -322,7 +322,7 @@ pub async fn remove_organization_member(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = [])
     )
 )]
 pub async fn list_organization_members(

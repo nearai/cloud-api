@@ -9,12 +9,12 @@ use crate::{
     openapi::ApiDoc,
     routes::{
         api::{build_management_router, AppState},
-        attestation::{get_attestation_report, get_signature, verify_attestation},
+        attestation::{get_attestation_report, get_signature, quote, verify_attestation},
         auth::{
             auth_success, current_user, github_login, google_login, login_page, logout,
             oauth_callback, StateStore,
         },
-        completions::{chat_completions, completions, models, quote},
+        completions::{chat_completions, completions, models},
         conversations,
         models::{get_model_by_name, list_models, ModelsAppState},
         responses,
@@ -475,7 +475,6 @@ pub fn build_completion_routes(
     // Routes that don't require credits (metadata)
     let metadata_routes = Router::new()
         .route("/models", get(models))
-        .route("/quote", get(quote))
         .with_state(app_state)
         // Only require API key, no usage check
         .layer(from_fn_with_state(
@@ -551,6 +550,7 @@ pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &Aut
         .route("/signature/{chat_id}", get(get_signature))
         .route("/verify/{chat_id}", post(verify_attestation))
         .route("/attestation/report", get(get_attestation_report))
+        .route("/attestation/quote", get(quote))
         .with_state(app_state)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
@@ -777,7 +777,7 @@ mod tests {
         assert!(components.schemas.contains_key("ErrorResponse"));
 
         // Check that security schemes are configured
-        assert!(components.security_schemes.contains_key("bearer"));
+        assert!(components.security_schemes.contains_key("session_token"));
         assert!(components.security_schemes.contains_key("api_key"));
 
         // Verify servers are not hardcoded (will be set dynamically on client)

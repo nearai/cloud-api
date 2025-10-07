@@ -1,7 +1,4 @@
-use crate::{
-    auth::ports::{Session, SessionId, User, UserId},
-    organization::Organization,
-};
+use crate::auth::ports::{Session, SessionId, User, UserId};
 use async_trait::async_trait;
 
 /// Errors that can occur during user service operations
@@ -36,12 +33,6 @@ pub trait UserServiceTrait: Send + Sync {
         display_name: Option<String>,
         avatar_url: Option<String>,
     ) -> Result<User, UserServiceError>;
-
-    /// Get all organizations that a user is a member of
-    async fn get_user_organizations(
-        &self,
-        user_id: UserId,
-    ) -> Result<Vec<Organization>, UserServiceError>;
 
     /// Get all sessions for a user
     async fn get_user_sessions(&self, user_id: UserId) -> Result<Vec<Session>, UserServiceError>;

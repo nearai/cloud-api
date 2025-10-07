@@ -152,7 +152,7 @@ impl InferenceProviderPool {
 
                 model_to_endpoints
                     .entry(model_name)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push((ip, port));
             } else {
                 tracing::debug!(

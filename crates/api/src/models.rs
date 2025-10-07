@@ -864,10 +864,43 @@ pub struct AddOrganizationMemberRequest {
     pub role: MemberRole,
 }
 
+/// Individual invitation entry with email and role
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct InvitationEntry {
+    pub email: String,
+    pub role: MemberRole,
+}
+
+/// Request to invite organization members by email
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct InviteOrganizationMemberByEmailRequest {
+    pub invitations: Vec<InvitationEntry>,
+}
+
 /// Request to update an organization member
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateOrganizationMemberRequest {
     pub role: MemberRole,
+}
+
+/// Result of a single invitation attempt
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct InvitationResult {
+    pub email: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member: Option<OrganizationMemberResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Response for batch invitation requests
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct InviteOrganizationMemberByEmailResponse {
+    pub results: Vec<InvitationResult>,
+    pub total: usize,
+    pub successful: usize,
+    pub failed: usize,
 }
 
 /// Public organization member response (for regular members)
@@ -985,6 +1018,50 @@ pub struct ApiKeyResponse {
 pub struct UpdateApiKeySpendLimitRequest {
     #[serde(rename = "spendLimit")]
     pub spend_limit: Option<DecimalPrice>,
+}
+
+// ============================================
+// Organization Invitations API Models
+// ============================================
+
+/// Organization invitation status
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum InvitationStatus {
+    Pending,
+    Accepted,
+    Declined,
+    Expired,
+}
+
+/// Organization invitation response
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OrganizationInvitationResponse {
+    pub id: String,
+    pub organization_id: String,
+    pub email: String,
+    pub role: MemberRole,
+    pub invited_by_user_id: String,
+    pub status: InvitationStatus,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub responded_at: Option<DateTime<Utc>>,
+}
+
+/// Organization invitation with organization details
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OrganizationInvitationWithOrgResponse {
+    #[serde(flatten)]
+    pub invitation: OrganizationInvitationResponse,
+    pub organization_name: String,
+    pub invited_by_display_name: Option<String>,
+}
+
+/// Accept invitation response
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AcceptInvitationResponse {
+    pub organization_member: OrganizationMemberResponse,
+    pub message: String,
 }
 
 // ============================================

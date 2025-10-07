@@ -1,11 +1,18 @@
-use crate::{middleware::AuthenticatedUser, models::ErrorResponse, routes::api::AppState};
+use crate::{
+    conversions::{
+        authenticated_user_to_user_id, services_invitation_to_api, services_member_to_api_member,
+    },
+    middleware::AuthenticatedUser,
+    models::ErrorResponse,
+    routes::api::AppState,
+};
 use axum::{
     extract::{Extension, Json, Path, State},
     http::StatusCode,
 };
 use database::{Session, User};
 use serde::Deserialize;
-use services::organization::ports::OrganizationRepository;
+use services::organization::{ports::OrganizationRepository, OrganizationError};
 use tracing::{debug, error};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -90,74 +97,6 @@ pub async fn get_current_user(
     }
 }
 
-/// Get a user by ID
-///
-/// Returns the profile of a user by their ID. Users can access their own profile
-/// or profiles of users in the same organization.
-#[utoipa::path(
-    get,
-    path = "/users/{user_id}",
-    tag = "Users",
-    params(
-        ("user_id" = Uuid, Path, description = "User ID")
-    ),
-    responses(
-        (status = 200, description = "User profile", body = crate::models::UserResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden - not in same organization", body = ErrorResponse),
-        (status = 404, description = "User not found", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    ),
-    security(
-        ("session_token" = [])
-    )
-)]
-pub async fn get_user(
-    State(app_state): State<AppState>,
-    Extension(current_user): Extension<AuthenticatedUser>,
-    Path(user_id): Path<Uuid>,
-) -> Result<Json<crate::models::UserResponse>, StatusCode> {
-    debug!("Getting user: {} for user: {}", user_id, current_user.0.id);
-
-    // Users can get their own profile or profiles of users in the same organization
-    if current_user.0.id != user_id {
-        // Check if they share an organization
-        let query = "
-            SELECT COUNT(*) as count
-            FROM organization_members om1
-            JOIN organization_members om2 ON om1.organization_id = om2.organization_id
-            WHERE om1.user_id = $1 AND om2.user_id = $2
-        ";
-
-        let client = app_state.db.pool().get().await.map_err(|e| {
-            error!("Failed to get database connection: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-        let row = client
-            .query_one(query, &[&current_user.0.id, &user_id])
-            .await
-            .map_err(|e| {
-                error!("Failed to check shared organizations: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-        let count: i64 = row.get("count");
-        if count == 0 {
-            return Err(StatusCode::FORBIDDEN);
-        }
-    }
-
-    match app_state.db.users.get_by_id(user_id).await {
-        Ok(Some(user)) => Ok(Json(db_user_to_api_user(&user))),
-        Ok(None) => Err(StatusCode::NOT_FOUND),
-        Err(e) => {
-            error!("Failed to get user: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
-}
-
 /// Update current user's profile
 ///
 /// Updates the profile information for the currently authenticated user.
@@ -221,49 +160,6 @@ pub async fn get_user_organizations(
         current_user.0.id
     );
 
-    get_user_organizations_by_id(
-        State(app_state),
-        Extension(current_user.clone()),
-        Path(current_user.0.id),
-    )
-    .await
-}
-
-/// Get user's organizations by ID
-///
-/// Returns all organizations for a specific user. Users can only access their own organizations.
-#[utoipa::path(
-    get,
-    path = "/users/{user_id}/organizations",
-    tag = "Users",
-    params(
-        ("user_id" = Uuid, Path, description = "User ID")
-    ),
-    responses(
-        (status = 200, description = "List of user's organizations", body = Vec<crate::models::OrganizationResponse>),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden - can only access own organizations", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    ),
-    security(
-        ("session_token" = [])
-    )
-)]
-pub async fn get_user_organizations_by_id(
-    State(app_state): State<AppState>,
-    Extension(current_user): Extension<AuthenticatedUser>,
-    Path(user_id): Path<Uuid>,
-) -> Result<Json<Vec<crate::models::OrganizationResponse>>, StatusCode> {
-    debug!(
-        "Getting organizations for user: {} requested by: {}",
-        user_id, current_user.0.id
-    );
-
-    // Users can only get their own orgs
-    if current_user.0.id != user_id {
-        return Err(StatusCode::FORBIDDEN);
-    }
-
     // Get all organization memberships for the user
     let query = "
         SELECT DISTINCT o.* 
@@ -278,10 +174,13 @@ pub async fn get_user_organizations_by_id(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let rows = client.query(query, &[&user_id]).await.map_err(|e| {
-        error!("Failed to query user organizations: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let rows = client
+        .query(query, &[&current_user.0.id])
+        .await
+        .map_err(|e| {
+            error!("Failed to query user organizations: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let mut organizations = Vec::new();
     for row in rows {
@@ -296,18 +195,14 @@ pub async fn get_user_organizations_by_id(
 
 /// Get user's sessions
 ///
-/// Returns all active sessions for a specific user. Users can only access their own sessions.
+/// Returns all active sessions for the currently authenticated user.
 #[utoipa::path(
     get,
-    path = "/users/{user_id}/sessions",
+    path = "/users/me/sessions",
     tag = "Users",
-    params(
-        ("user_id" = Uuid, Path, description = "User ID")
-    ),
     responses(
         (status = 200, description = "List of user sessions", body = Vec<crate::models::SessionResponse>),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden - can only access own sessions", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -317,19 +212,10 @@ pub async fn get_user_organizations_by_id(
 pub async fn get_user_sessions(
     State(app_state): State<AppState>,
     Extension(current_user): Extension<AuthenticatedUser>,
-    Path(user_id): Path<Uuid>,
 ) -> Result<Json<Vec<crate::models::SessionResponse>>, StatusCode> {
-    debug!(
-        "Getting sessions for user: {} requested by: {}",
-        user_id, current_user.0.id
-    );
+    debug!("Getting sessions for user: {}", current_user.0.id);
 
-    // Users can only get their own sessions
-    if current_user.0.id != user_id {
-        return Err(StatusCode::FORBIDDEN);
-    }
-
-    match app_state.db.sessions.list_by_user(user_id).await {
+    match app_state.db.sessions.list_by_user(current_user.0.id).await {
         Ok(sessions) => {
             let api_sessions = sessions.iter().map(db_session_to_api_session).collect();
             Ok(Json(api_sessions))
@@ -343,19 +229,17 @@ pub async fn get_user_sessions(
 
 /// Revoke a user session
 ///
-/// Revokes a specific session for a user. Users can only revoke their own sessions.
+/// Revokes a specific session for the currently authenticated user.
 #[utoipa::path(
     delete,
-    path = "/users/{user_id}/sessions/{session_id}",
+    path = "/users/me/sessions/{session_id}",
     tag = "Users",
     params(
-        ("user_id" = Uuid, Path, description = "User ID"),
         ("session_id" = Uuid, Path, description = "Session ID to revoke")
     ),
     responses(
         (status = 204, description = "Session revoked successfully"),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden - can only revoke own sessions", body = ErrorResponse),
         (status = 404, description = "Session not found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -366,22 +250,17 @@ pub async fn get_user_sessions(
 pub async fn revoke_user_session(
     State(app_state): State<AppState>,
     Extension(current_user): Extension<AuthenticatedUser>,
-    Path((user_id, session_id)): Path<(Uuid, Uuid)>,
+    Path(session_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
     debug!(
-        "Revoking session: {} for user: {} requested by: {}",
-        session_id, user_id, current_user.0.id
+        "Revoking session: {} for user: {}",
+        session_id, current_user.0.id
     );
-
-    // Users can only revoke their own sessions
-    if current_user.0.id != user_id {
-        return Err(StatusCode::FORBIDDEN);
-    }
 
     // Verify the session belongs to the user
     match app_state.db.sessions.get_by_id(session_id).await {
         Ok(Some(session)) => {
-            if session.user_id != user_id {
+            if session.user_id != current_user.0.id {
                 return Err(StatusCode::NOT_FOUND);
             }
         }
@@ -404,18 +283,14 @@ pub async fn revoke_user_session(
 
 /// Revoke all sessions for a user
 ///
-/// Revokes all active sessions for a user. Users can only revoke their own sessions.
+/// Revokes all active sessions for the currently authenticated user.
 #[utoipa::path(
     delete,
-    path = "/users/{user_id}/sessions",
+    path = "/users/me/sessions",
     tag = "Users",
-    params(
-        ("user_id" = Uuid, Path, description = "User ID")
-    ),
     responses(
         (status = 200, description = "All sessions revoked successfully", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden - can only revoke own sessions", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -425,25 +300,269 @@ pub async fn revoke_user_session(
 pub async fn revoke_all_user_sessions(
     State(app_state): State<AppState>,
     Extension(current_user): Extension<AuthenticatedUser>,
-    Path(user_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    debug!(
-        "Revoking all sessions for user: {} requested by: {}",
-        user_id, current_user.0.id
-    );
+    debug!("Revoking all sessions for user: {}", current_user.0.id);
 
-    // Users can only revoke their own sessions
-    if current_user.0.id != user_id {
-        return Err(StatusCode::FORBIDDEN);
-    }
-
-    match app_state.db.sessions.revoke_all_for_user(user_id).await {
+    match app_state
+        .db
+        .sessions
+        .revoke_all_for_user(current_user.0.id)
+        .await
+    {
         Ok(count) => Ok(Json(serde_json::json!({
             "message": format!("Revoked {} sessions", count),
             "count": count
         }))),
         Err(e) => {
             error!("Failed to revoke all user sessions: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// List pending invitations for the current user
+///
+/// Returns all pending organization invitations for the authenticated user's email.
+#[utoipa::path(
+    get,
+    path = "/users/me/invitations",
+    tag = "Users",
+    responses(
+        (status = 200, description = "List of pending invitations", body = Vec<crate::models::OrganizationInvitationResponse>),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_user_invitations(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Result<Json<Vec<crate::models::OrganizationInvitationResponse>>, StatusCode> {
+    debug!("Listing invitations for user: {}", user.0.email);
+
+    match app_state
+        .organization_service
+        .list_user_invitations(&user.0.email)
+        .await
+    {
+        Ok(invitations) => {
+            let responses: Vec<crate::models::OrganizationInvitationResponse> = invitations
+                .into_iter()
+                .map(services_invitation_to_api)
+                .collect();
+            Ok(Json(responses))
+        }
+        Err(e) => {
+            error!("Failed to list user invitations: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Accept an organization invitation
+///
+/// Accepts a pending invitation and adds the user as a member of the organization.
+#[utoipa::path(
+    post,
+    path = "/users/me/invitations/{invitation_id}/accept",
+    tag = "Users",
+    params(
+        ("invitation_id" = Uuid, Path, description = "Invitation ID")
+    ),
+    responses(
+        (status = 200, description = "Invitation accepted successfully", body = crate::models::AcceptInvitationResponse),
+        (status = 400, description = "Bad request - invitation expired or invalid", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden - invitation belongs to another user", body = ErrorResponse),
+        (status = 404, description = "Invitation not found", body = ErrorResponse),
+        (status = 409, description = "User is already a member", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn accept_invitation(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(invitation_id): Path<Uuid>,
+) -> Result<Json<crate::models::AcceptInvitationResponse>, StatusCode> {
+    debug!(
+        "User {} accepting invitation {}",
+        user.0.email, invitation_id
+    );
+
+    let user_id = authenticated_user_to_user_id(user.clone());
+
+    match app_state
+        .organization_service
+        .accept_invitation(invitation_id, user_id, &user.0.email)
+        .await
+    {
+        Ok(member) => {
+            let response = crate::models::AcceptInvitationResponse {
+                organization_member: services_member_to_api_member(member),
+                message: "Successfully joined organization".to_string(),
+            };
+            Ok(Json(response))
+        }
+        Err(OrganizationError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
+        Err(OrganizationError::InvalidParams(_)) => Err(StatusCode::BAD_REQUEST),
+        Err(OrganizationError::AlreadyMember) => Err(StatusCode::CONFLICT),
+        Err(e) => {
+            error!("Failed to accept invitation: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Decline an organization invitation
+///
+/// Declines a pending invitation to join an organization.
+#[utoipa::path(
+    post,
+    path = "/users/me/invitations/{invitation_id}/decline",
+    tag = "Users",
+    params(
+        ("invitation_id" = Uuid, Path, description = "Invitation ID")
+    ),
+    responses(
+        (status = 200, description = "Invitation declined successfully"),
+        (status = 400, description = "Bad request - invitation not pending", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden - invitation belongs to another user", body = ErrorResponse),
+        (status = 404, description = "Invitation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn decline_invitation(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(invitation_id): Path<Uuid>,
+) -> Result<StatusCode, StatusCode> {
+    debug!(
+        "User {} declining invitation {}",
+        user.0.email, invitation_id
+    );
+
+    match app_state
+        .organization_service
+        .decline_invitation(invitation_id, &user.0.email)
+        .await
+    {
+        Ok(()) => Ok(StatusCode::OK),
+        Err(OrganizationError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
+        Err(OrganizationError::InvalidParams(_)) => Err(StatusCode::BAD_REQUEST),
+        Err(e) => {
+            error!("Failed to decline invitation: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Get invitation details by token (public endpoint)
+///
+/// Returns invitation details for a specific token. This is a public endpoint
+/// that allows users to view invitation details before logging in.
+#[utoipa::path(
+    get,
+    path = "/invitations/{token}",
+    tag = "Invitations",
+    params(
+        ("token" = String, Path, description = "Invitation token")
+    ),
+    responses(
+        (status = 200, description = "Invitation details", body = crate::models::OrganizationInvitationResponse),
+        (status = 404, description = "Invitation not found", body = ErrorResponse),
+        (status = 410, description = "Invitation expired or no longer pending", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
+pub async fn get_invitation_by_token(
+    State(app_state): State<AppState>,
+    Path(token): Path<String>,
+) -> Result<Json<crate::models::OrganizationInvitationResponse>, StatusCode> {
+    debug!("Getting invitation by token");
+
+    match app_state
+        .organization_service
+        .get_invitation_by_token(&token)
+        .await
+    {
+        Ok(invitation) => {
+            let response = services_invitation_to_api(invitation);
+            Ok(Json(response))
+        }
+        Err(OrganizationError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(OrganizationError::InvalidParams(_)) => {
+            // Invitation expired or not pending
+            Err(StatusCode::GONE) // 410 Gone
+        }
+        Err(e) => {
+            error!("Failed to get invitation by token: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Accept invitation by token (requires authentication)
+///
+/// Accepts an invitation using its token. The authenticated user's email
+/// must match the invitation email.
+#[utoipa::path(
+    post,
+    path = "/invitations/{token}/accept",
+    tag = "Invitations",
+    params(
+        ("token" = String, Path, description = "Invitation token")
+    ),
+    responses(
+        (status = 200, description = "Invitation accepted successfully", body = crate::models::AcceptInvitationResponse),
+        (status = 400, description = "Bad request - invitation expired or invalid", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden - invitation belongs to another user", body = ErrorResponse),
+        (status = 404, description = "Invitation not found", body = ErrorResponse),
+        (status = 409, description = "User is already a member", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn accept_invitation_by_token(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(token): Path<String>,
+) -> Result<Json<crate::models::AcceptInvitationResponse>, StatusCode> {
+    debug!("User {} accepting invitation by token", user.0.email);
+
+    let user_id = authenticated_user_to_user_id(user.clone());
+
+    match app_state
+        .organization_service
+        .accept_invitation_by_token(&token, user_id, &user.0.email)
+        .await
+    {
+        Ok(member) => {
+            let response = crate::models::AcceptInvitationResponse {
+                organization_member: services_member_to_api_member(member),
+                message: "Successfully joined organization".to_string(),
+            };
+            Ok(Json(response))
+        }
+        Err(OrganizationError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
+        Err(OrganizationError::InvalidParams(_)) => Err(StatusCode::BAD_REQUEST),
+        Err(OrganizationError::AlreadyMember) => Err(StatusCode::CONFLICT),
+        Err(e) => {
+            error!("Failed to accept invitation by token: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }

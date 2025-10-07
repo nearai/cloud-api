@@ -48,17 +48,21 @@ fn test_config() -> ApiConfig {
 
 /// Helper function to create test database configuration
 fn db_config_for_tests() -> config::DatabaseConfig {
-    // Default test database config
-    config::DatabaseConfig {
-        host: std::env::var("TEST_DB_HOST").unwrap_or_else(|_| "localhost".to_string()),
-        port: std::env::var("TEST_DB_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(5432),
-        database: std::env::var("TEST_DB_NAME").unwrap_or_else(|_| "platform_api".to_string()),
-        username: std::env::var("TEST_DB_USER").unwrap_or_else(|_| "postgres".to_string()),
-        password: std::env::var("TEST_DB_PASSWORD").unwrap_or_else(|_| "postgres".to_string()),
-        max_connections: 5,
+    // Load database config from config file for tests
+    // Falls back to localhost defaults if config file is not available
+    match config::ApiConfig::load() {
+        Ok(config) => config.database,
+        Err(_) => {
+            // Fallback to localhost defaults (for running tests without config file)
+            config::DatabaseConfig {
+                host: "localhost".to_string(),
+                port: 5432,
+                database: "platform_api".to_string(),
+                username: "postgres".to_string(),
+                password: "postgres".to_string(),
+                max_connections: 5,
+            }
+        }
     }
 }
 

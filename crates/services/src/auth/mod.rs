@@ -1,11 +1,9 @@
 pub mod oauth;
 pub mod ports;
-pub mod user_service;
 
 pub use oauth::OAuthManager;
 pub use ports::*;
 use tracing::debug;
-pub use user_service::UserServiceImpl;
 
 use chrono::Utc;
 use std::sync::Arc;

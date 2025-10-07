@@ -45,6 +45,10 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
             get(list_organization_members).post(add_organization_member),
         )
         .route(
+            "/{id}/members/invite-by-email",
+            axum::routing::post(invite_organization_member_by_email),
+        )
+        .route(
             "/{id}/members/{user_id}",
             put(update_organization_member).delete(remove_organization_member),
         )
@@ -90,13 +94,20 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
         .route("/me", get(get_current_user))
         .route("/me/profile", put(update_current_user_profile))
         .route("/me/organizations", get(get_user_organizations))
-        .route("/{id}", get(get_user))
-        .route("/{id}/organizations", get(get_user_organizations_by_id))
+        .route("/me/invitations", get(list_user_invitations))
         .route(
-            "/{id}/sessions",
+            "/me/invitations/{invitation_id}/accept",
+            axum::routing::post(accept_invitation),
+        )
+        .route(
+            "/me/invitations/{invitation_id}/decline",
+            axum::routing::post(decline_invitation),
+        )
+        .route(
+            "/me/sessions",
             get(get_user_sessions).delete(revoke_all_user_sessions),
         )
-        .route("/{id}/sessions/{session_id}", delete(revoke_user_session));
+        .route("/me/sessions/{session_id}", delete(revoke_user_session));
 
     // Combine all routes with auth middleware
     Router::new()

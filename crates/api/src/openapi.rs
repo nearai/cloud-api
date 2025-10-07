@@ -64,18 +64,23 @@ use utoipa::{Modify, OpenApi};
         crate::routes::workspaces::update_api_key_spend_limit,
         // Organization Members endpoints
         crate::routes::organization_members::add_organization_member,
+        crate::routes::organization_members::invite_organization_member_by_email,
         crate::routes::organization_members::update_organization_member,
         crate::routes::organization_members::remove_organization_member,
         crate::routes::organization_members::list_organization_members,
         // Users endpoints
         crate::routes::users::get_current_user,
-        crate::routes::users::get_user,
         crate::routes::users::update_current_user_profile,
         crate::routes::users::get_user_organizations,
-        crate::routes::users::get_user_organizations_by_id,
         crate::routes::users::get_user_sessions,
         crate::routes::users::revoke_user_session,
         crate::routes::users::revoke_all_user_sessions,
+        crate::routes::users::list_user_invitations,
+        crate::routes::users::accept_invitation,
+        crate::routes::users::decline_invitation,
+        // Invitation endpoints (token-based)
+        crate::routes::users::get_invitation_by_token,
+        crate::routes::users::accept_invitation_by_token,
         // Usage endpoints
         crate::routes::usage::get_organization_balance,
         crate::routes::usage::get_organization_usage_history,
@@ -95,10 +100,20 @@ use utoipa::{Modify, OpenApi};
             crate::routes::workspaces::WorkspaceResponse,
             // Organization Members models
             AddOrganizationMemberRequest,
+            InvitationEntry,
+            InviteOrganizationMemberByEmailRequest,
+            InvitationResult,
+            InviteOrganizationMemberByEmailResponse,
             UpdateOrganizationMemberRequest,
             OrganizationMemberResponse,
             PublicOrganizationMemberResponse,
             AdminOrganizationMemberResponse,
+            MemberRole,
+            // Organization Invitation models
+            InvitationStatus,
+            OrganizationInvitationResponse,
+            OrganizationInvitationWithOrgResponse,
+            AcceptInvitationResponse,
             // Users models
             UserResponse,
             SessionResponse,

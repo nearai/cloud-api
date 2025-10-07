@@ -1276,6 +1276,7 @@ dependencies = [
  "config",
  "deadpool-postgres",
  "postgres-types",
+ "rand 0.9.2",
  "refinery",
  "serde",
  "serde_json",

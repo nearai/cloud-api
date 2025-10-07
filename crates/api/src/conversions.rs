@@ -452,6 +452,79 @@ pub fn db_user_to_public_user(user: &database::User) -> PublicUserResponse {
     }
 }
 
+/// Convert services::auth::User to PublicUserResponse
+pub fn services_user_to_public_user(user: &services::auth::User) -> PublicUserResponse {
+    PublicUserResponse {
+        id: user.id.0.to_string(),
+        username: Some(user.username.clone()),
+        display_name: user.display_name.clone(),
+        avatar_url: user.avatar_url.clone(),
+        created_at: user.created_at,
+    }
+}
+
+/// Convert services OrganizationMemberWithUser to API PublicOrganizationMemberResponse
+pub fn services_member_with_user_to_api(
+    member: services::organization::OrganizationMemberWithUser,
+) -> crate::models::PublicOrganizationMemberResponse {
+    crate::models::PublicOrganizationMemberResponse {
+        id: format!("{}_{}", member.organization_id.0, member.user_id.0),
+        organization_id: member.organization_id.0.to_string(),
+        role: services_role_to_api_role(member.role),
+        joined_at: member.joined_at,
+        user: services_user_to_public_user(&member.user),
+    }
+}
+
+/// Convert services InvitationResult to API InvitationResult
+pub fn services_invitation_result_to_api(
+    result: services::organization::InvitationResult,
+) -> crate::models::InvitationResult {
+    crate::models::InvitationResult {
+        email: result.email,
+        success: result.success,
+        member: result.member.map(services_member_to_api_member),
+        error: result.error,
+    }
+}
+
+/// Convert services InvitationStatus to API InvitationStatus
+pub fn services_invitation_status_to_api(
+    status: services::organization::InvitationStatus,
+) -> crate::models::InvitationStatus {
+    match status {
+        services::organization::InvitationStatus::Pending => {
+            crate::models::InvitationStatus::Pending
+        }
+        services::organization::InvitationStatus::Accepted => {
+            crate::models::InvitationStatus::Accepted
+        }
+        services::organization::InvitationStatus::Declined => {
+            crate::models::InvitationStatus::Declined
+        }
+        services::organization::InvitationStatus::Expired => {
+            crate::models::InvitationStatus::Expired
+        }
+    }
+}
+
+/// Convert services OrganizationInvitation to API OrganizationInvitationResponse
+pub fn services_invitation_to_api(
+    invitation: services::organization::OrganizationInvitation,
+) -> crate::models::OrganizationInvitationResponse {
+    crate::models::OrganizationInvitationResponse {
+        id: invitation.id.to_string(),
+        organization_id: invitation.organization_id.0.to_string(),
+        email: invitation.email,
+        role: services_role_to_api_role(invitation.role),
+        invited_by_user_id: invitation.invited_by_user_id.0.to_string(),
+        status: services_invitation_status_to_api(invitation.status),
+        created_at: invitation.created_at,
+        expires_at: invitation.expires_at,
+        responded_at: invitation.responded_at,
+    }
+}
+
 /// Convert database::User to AdminUserResponse (for owners/admins only)  
 pub fn db_user_to_admin_user(user: &database::User) -> AdminUserResponse {
     AdminUserResponse {

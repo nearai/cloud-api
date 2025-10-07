@@ -64,10 +64,9 @@ pub struct DomainServices {
 }
 
 /// Initialize database connection and run migrations
-pub async fn init_database() -> Arc<Database> {
-    let db_config = config::DatabaseConfig::default();
+pub async fn init_database(db_config: &config::DatabaseConfig) -> Arc<Database> {
     let database = Arc::new(
-        Database::from_config(&db_config)
+        Database::from_config(db_config)
             .await
             .expect("Failed to connect to database"),
     );
@@ -861,7 +860,7 @@ mod tests {
         };
 
         // Initialize services
-        let database = init_database().await;
+        let database = init_database(&config.database).await;
         let auth_components = init_auth_services(database.clone(), &config);
         let domain_services = init_domain_services(database.clone(), &config).await;
 

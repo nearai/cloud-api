@@ -76,7 +76,7 @@ pub async fn list_models(
         })?;
 
     let total_models = models.len();
-    let total_pages = (total_models + query.page_size - 1) / query.page_size;
+    let total_pages = total_models.div_ceil(query.page_size);
 
     // Handle pagination
     let start_index = (query.page.saturating_sub(1)) * query.page_size;

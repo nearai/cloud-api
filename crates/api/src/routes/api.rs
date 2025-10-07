@@ -94,7 +94,6 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
     let user_routes = Router::new()
         .route("/me", get(get_current_user))
         .route("/me/profile", put(update_current_user_profile))
-        .route("/me/organizations", get(get_user_organizations))
         .route("/me/invitations", get(list_user_invitations))
         .route(
             "/me/invitations/{invitation_id}/accept",

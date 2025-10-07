@@ -49,7 +49,6 @@ fn map_conversation_error_to_status(error: &ConversationError) -> StatusCode {
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
         ("api_key" = [])
     )
 )]
@@ -111,7 +110,6 @@ pub async fn create_conversation(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
         ("api_key" = [])
     )
 )]
@@ -179,7 +177,6 @@ pub async fn get_conversation(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
         ("api_key" = [])
     )
 )]
@@ -254,7 +251,6 @@ pub async fn update_conversation(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
         ("api_key" = [])
     )
 )]
@@ -327,7 +323,6 @@ pub async fn delete_conversation(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
         ("api_key" = [])
     )
 )]
@@ -404,7 +399,6 @@ pub async fn list_conversations(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
         ("api_key" = [])
     )
 )]

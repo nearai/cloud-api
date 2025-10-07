@@ -269,7 +269,6 @@ pub async fn chat_completions(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
         ("api_key" = [])
     )
 )]
@@ -511,28 +510,4 @@ pub async fn models(
             .collect(),
     };
     Ok(ResponseJson(response))
-}
-
-/// Get TDX quote
-///
-/// Returns a TDX quote for testing purposes.
-#[utoipa::path(
-    get,
-    path = "/quote", 
-    tag = "Chat",
-    responses(
-        (status = 200, description = "TDX quote", body = QuoteResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 501, description = "Not implemented", body = ErrorResponse)
-    ),
-    security(
-        ("bearer" = []),
-        ("api_key" = [])
-    )
-)]
-pub async fn quote(
-    State(_app_state): State<AppState>,
-    Extension(_api_key): Extension<services::auth::ApiKey>,
-) -> Result<ResponseJson<QuoteResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    unimplemented!()
 }

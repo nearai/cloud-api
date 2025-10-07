@@ -95,7 +95,7 @@ fn default_limit() -> i64 {
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = []),
     )
 )]
 pub async fn create_workspace(
@@ -192,8 +192,7 @@ pub async fn create_workspace(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
-        ("api_key" = [])
+        ("session_token" = [])
     )
 )]
 pub async fn list_organization_workspaces(
@@ -270,8 +269,7 @@ pub async fn list_organization_workspaces(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
-        ("api_key" = [])
+        ("session_token" = [])
     )
 )]
 pub async fn get_workspace(
@@ -345,7 +343,7 @@ pub async fn get_workspace(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = []),
     )
 )]
 pub async fn update_workspace(
@@ -446,7 +444,7 @@ pub async fn update_workspace(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = []),
     )
 )]
 pub async fn delete_workspace(
@@ -538,7 +536,7 @@ pub async fn delete_workspace(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = []),
     )
 )]
 pub async fn create_workspace_api_key(
@@ -602,8 +600,7 @@ pub async fn create_workspace_api_key(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
-        ("api_key" = [])
+        ("session_token" = [])
     )
 )]
 pub async fn list_workspace_api_keys(
@@ -664,7 +661,7 @@ pub async fn list_workspace_api_keys(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = []),
     )
 )]
 pub async fn revoke_workspace_api_key(
@@ -797,7 +794,7 @@ pub async fn revoke_api_key_with_context(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = []),
     )
 )]
 pub async fn update_api_key_spend_limit(

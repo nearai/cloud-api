@@ -11,7 +11,7 @@ use utoipa::{Modify, OpenApi};
         version = "1.0.0",
         contact(
             name = "Platform API Team",
-            email = "api-support@example.com"
+            email = "support@near.ai"
         ),
         license(
             name = "MIT",
@@ -22,7 +22,6 @@ use utoipa::{Modify, OpenApi};
         crate::routes::completions::chat_completions,
         crate::routes::completions::completions,
         crate::routes::completions::models,
-        crate::routes::completions::quote,
         // Organization endpoints  
         crate::routes::organizations::list_organizations,
         crate::routes::organizations::create_organization,
@@ -44,6 +43,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::attestation::get_signature,
         crate::routes::attestation::get_attestation_report,
         crate::routes::attestation::verify_attestation,
+        crate::routes::attestation::quote,
         // Model endpoints
         crate::routes::models::list_models,
         crate::routes::models::get_model_by_name,
@@ -84,8 +84,7 @@ use utoipa::{Modify, OpenApi};
         schemas(
             // Core API models
             ChatCompletionRequest, ChatCompletionResponse, Message,
-            CompletionRequest, QuoteResponse, GatewayQuote, ServiceAllowlistEntry, BuildInfo,
-            ModelsResponse, ModelInfo, ErrorResponse,
+            CompletionRequest, ModelsResponse, ModelInfo, ErrorResponse,
             // Organization models
             CreateOrganizationRequest, OrganizationResponse,
             UpdateOrganizationRequest, CreateApiKeyRequest, ApiKeyResponse,
@@ -120,6 +119,11 @@ use utoipa::{Modify, OpenApi};
             crate::routes::attestation::Evidence,
             crate::routes::attestation::NvidiaPayload,
             crate::routes::attestation::Attestation,
+            crate::routes::attestation::QuoteResponse,
+            crate::routes::attestation::GatewayQuote,
+            crate::routes::attestation::ServiceAllowlistEntry,
+            crate::routes::attestation::BuildInfo,
+            crate::routes::attestation::ErrorResponse,
             // Model pricing models
             ModelListResponse, ModelWithPricing, DecimalPrice, ModelMetadata,
             UpdateModelApiRequest, ModelPricingHistoryEntry, ModelPricingHistoryResponse,

@@ -274,34 +274,6 @@ impl ErrorResponse {
     }
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct QuoteResponse {
-    pub gateway: GatewayQuote,
-    pub allowlist: Vec<ServiceAllowlistEntry>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct GatewayQuote {
-    pub quote: String,
-    pub measurement: String,
-    pub svn: u32,
-    pub build: BuildInfo,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ServiceAllowlistEntry {
-    pub service: String,
-    pub expected_measurements: Vec<String>,
-    pub min_svn: u32,
-    pub identifier: String,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct BuildInfo {
-    pub image: String,
-    pub sbom: String,
-}
-
 // ============================================
 // Response API Models
 // ============================================

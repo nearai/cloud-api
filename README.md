@@ -91,15 +91,6 @@ You can verify your test database setup using the provided script:
 
 The application uses YAML configuration files located in the `config/` directory.
 
-### Environment Variables
-
-**Database Configuration:**
-- `DB_HOST` - Database host (default: localhost)
-- `DB_PORT` - Database port (default: 5432)
-- `DB_NAME` - Database name (default: platform_api)
-- `DB_USER` - Database username (default: postgres)
-- `DB_PASSWORD` - Database password (default: postgres)
-
 ## Contributing
 
 1. Ensure all tests pass: `cargo test`

@@ -1,68 +1,36 @@
-# Development Docker Compose - Unsecure setup for dev purposes only
+# Simple Docker Compose for Development
+# Quick rebuild: docker compose up -d --build
+
 services:
-  # PostgreSQL Database
   postgres:
-    image: postgres:15-alpine
-    container_name: platform-api-postgres
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
     environment:
       POSTGRES_DB: platform_api
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      PGDATA: /var/lib/postgresql/data/pgdata
-    ports:
-      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./scripts/setup_db.sql:/docker-entrypoint-initdb.d/setup_db.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d platform_api"]
-      interval: 10s
-      timeout: 5s
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
       retries: 5
-      start_period: 10s
-    networks:
-      - platform-network
 
-  # Platform API Service
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      # Use cache for faster development builds
-      cache_from:
-        - rust:latest
-    container_name: platform-api-server
+    build: .
     ports:
       - "3000:3000"
+    environment:
+      CONFIG_FILE: config/docker.yaml
+      RUST_LOG: debug
+      RUST_BACKTRACE: "1"
+    volumes:
+      - ./config:/app/config:ro
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
-      # Database configuration (correct env var names for the application)
-      DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: platform_api
-      DB_USER: postgres
-      DB_PASSWORD: postgres
-      # Server configuration
-      SERVER_HOST: "0.0.0.0"
-      SERVER_PORT: 3000
-      # Development logging and debugging
-      RUST_LOG: debug,sqlx=warn
-      RUST_BACKTRACE: 1
-    volumes:
-      # Mount config directory for easy development changes
-      - ./config:/app/config
-      # Override with Docker-specific config
-      - ./config/docker.yaml:/app/config/config.yaml
-    networks:
-      - platform-network
-    restart: unless-stopped
 
 volumes:
   postgres_data:
-    driver: local
-
-networks:
-  platform-network:
-    driver: bridge

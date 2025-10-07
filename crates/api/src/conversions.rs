@@ -409,55 +409,6 @@ pub fn authenticated_user_to_user_id(user: AuthenticatedUser) -> services::UserI
     services::UserId(user.0.id)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_message_conversion() {
-        let http_msg = crate::models::Message {
-            role: "user".to_string(),
-            content: "Hello".to_string(),
-            name: None,
-        };
-
-        let domain_msg: services::ChatMessage = (&http_msg).into();
-        assert!(matches!(domain_msg.role, services::MessageRole::User));
-        assert_eq!(domain_msg.content, Some("Hello".to_string()));
-
-        let back_to_http: crate::models::Message = (&domain_msg).into();
-        assert_eq!(back_to_http.role, "user");
-        assert_eq!(back_to_http.content, "Hello");
-    }
-
-    #[test]
-    fn test_chat_completion_request_conversion() {
-        let http_req = ChatCompletionRequest {
-            model: "gpt-3.5-turbo".to_string(),
-            messages: vec![crate::models::Message {
-                role: "user".to_string(),
-                content: "Test message".to_string(),
-                name: None,
-            }],
-            max_tokens: Some(100),
-            temperature: Some(0.7),
-            top_p: Some(1.0),
-            n: Some(1),
-            stream: None,
-            stop: Some(vec!["\\n".to_string()]),
-            presence_penalty: None,
-            frequency_penalty: None,
-        };
-
-        let domain_params: services::ChatCompletionParams = (&http_req).into();
-        assert_eq!(domain_params.model, "gpt-3.5-turbo");
-        assert_eq!(domain_params.messages.len(), 1);
-        assert_eq!(domain_params.max_tokens, Some(100));
-        assert_eq!(domain_params.temperature, Some(0.7));
-        assert_eq!(domain_params.stop, Some(vec!["\\n".to_string()]));
-    }
-}
-
 // Secure user conversion functions
 /// Convert database::User to PublicUserResponse (safe for all members)
 pub fn db_user_to_public_user(user: &database::User) -> PublicUserResponse {
@@ -554,5 +505,54 @@ pub fn db_user_to_admin_user(user: &database::User) -> AdminUserResponse {
         created_at: user.created_at,
         last_login_at: user.last_login_at,
         is_active: user.is_active,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_message_conversion() {
+        let http_msg = crate::models::Message {
+            role: "user".to_string(),
+            content: "Hello".to_string(),
+            name: None,
+        };
+
+        let domain_msg: services::ChatMessage = (&http_msg).into();
+        assert!(matches!(domain_msg.role, services::MessageRole::User));
+        assert_eq!(domain_msg.content, Some("Hello".to_string()));
+
+        let back_to_http: crate::models::Message = (&domain_msg).into();
+        assert_eq!(back_to_http.role, "user");
+        assert_eq!(back_to_http.content, "Hello");
+    }
+
+    #[test]
+    fn test_chat_completion_request_conversion() {
+        let http_req = ChatCompletionRequest {
+            model: "gpt-3.5-turbo".to_string(),
+            messages: vec![crate::models::Message {
+                role: "user".to_string(),
+                content: "Test message".to_string(),
+                name: None,
+            }],
+            max_tokens: Some(100),
+            temperature: Some(0.7),
+            top_p: Some(1.0),
+            n: Some(1),
+            stream: None,
+            stop: Some(vec!["\\n".to_string()]),
+            presence_penalty: None,
+            frequency_penalty: None,
+        };
+
+        let domain_params: services::ChatCompletionParams = (&http_req).into();
+        assert_eq!(domain_params.model, "gpt-3.5-turbo");
+        assert_eq!(domain_params.messages.len(), 1);
+        assert_eq!(domain_params.max_tokens, Some(100));
+        assert_eq!(domain_params.temperature, Some(0.7));
+        assert_eq!(domain_params.stop, Some(vec!["\\n".to_string()]));
     }
 }

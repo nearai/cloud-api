@@ -264,7 +264,7 @@ fn db_user_to_service_user(db_user: User) -> services::auth::User {
         username: db_user.username,
         display_name: db_user.display_name,
         avatar_url: db_user.avatar_url,
-        organization_id: None, // TODO: Map from db_user if organization support is added
+        auth_provider: db_user.auth_provider,
         role: services::auth::UserRole::User, // TODO: Map from db_user if roles are added
         is_active: db_user.is_active,
         last_login: db_user.last_login_at,

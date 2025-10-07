@@ -1,6 +1,7 @@
 use crate::{
     conversions::{
         authenticated_user_to_user_id, services_invitation_to_api, services_member_to_api_member,
+        services_org_to_api_org, services_user_to_api_user,
     },
     middleware::AuthenticatedUser,
     models::ErrorResponse,
@@ -10,34 +11,19 @@ use axum::{
     extract::{Extension, Json, Path, State},
     http::StatusCode,
 };
-use database::{Session, User};
 use serde::Deserialize;
-use services::organization::{ports::OrganizationRepository, OrganizationError};
+use services::{organization::OrganizationError, user::UserServiceError};
 use tracing::{debug, error};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-/// Convert database User to API UserResponse
-fn db_user_to_api_user(user: &User) -> crate::models::UserResponse {
-    crate::models::UserResponse {
-        id: user.id.to_string(),
-        email: user.email.clone(),
-        username: user.username.clone(),
-        display_name: user.display_name.clone(),
-        avatar_url: user.avatar_url.clone(),
-        created_at: user.created_at,
-        updated_at: user.updated_at,
-        last_login_at: user.last_login_at,
-        is_active: user.is_active,
-        auth_provider: user.auth_provider.clone(),
-    }
-}
-
-/// Convert database Session to API SessionResponse
-fn db_session_to_api_session(session: &Session) -> crate::models::SessionResponse {
+/// Convert service Session to API SessionResponse
+fn services_session_to_api_session(
+    session: &services::auth::Session,
+) -> crate::models::SessionResponse {
     crate::models::SessionResponse {
-        id: session.id.to_string(),
-        user_id: session.user_id.to_string(),
+        id: session.id.0.to_string(), // SessionId is now Uuid
+        user_id: session.user_id.0.to_string(),
         created_at: session.created_at,
         expires_at: session.expires_at,
         ip_address: session.ip_address.clone(),
@@ -87,9 +73,11 @@ pub async fn get_current_user(
 ) -> Result<Json<crate::models::UserResponse>, StatusCode> {
     debug!("Getting current user: {}", user.0.id);
 
-    match app_state.db.users.get_by_id(user.0.id).await {
-        Ok(Some(user)) => Ok(Json(db_user_to_api_user(&user))),
-        Ok(None) => Err(StatusCode::NOT_FOUND),
+    let user_id = services::auth::UserId(user.0.id);
+
+    match app_state.user_service.get_user(user_id).await {
+        Ok(user) => Ok(Json(services_user_to_api_user(&user))),
+        Err(UserServiceError::UserNotFound) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
             error!("Failed to get current user: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -121,13 +109,15 @@ pub async fn update_current_user_profile(
 ) -> Result<Json<crate::models::UserResponse>, StatusCode> {
     debug!("Updating profile for user: {}", user.0.id);
 
+    let user_id = services::auth::UserId(user.0.id);
+
     match app_state
-        .db
-        .users
-        .update_profile(user.0.id, request.display_name, request.avatar_url)
+        .user_service
+        .update_profile(user_id, request.display_name, request.avatar_url)
         .await
     {
-        Ok(updated_user) => Ok(Json(db_user_to_api_user(&updated_user))),
+        Ok(updated_user) => Ok(Json(services_user_to_api_user(&updated_user))),
+        Err(UserServiceError::UserNotFound) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
             error!("Failed to update user profile: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -160,37 +150,21 @@ pub async fn get_user_organizations(
         current_user.0.id
     );
 
-    // Get all organization memberships for the user
-    let query = "
-        SELECT DISTINCT o.* 
-        FROM organizations o
-        JOIN organization_members om ON o.id = om.organization_id
-        WHERE om.user_id = $1 AND o.is_active = true
-        ORDER BY o.created_at DESC
-    ";
+    let user_id = services::auth::UserId(current_user.0.id);
 
-    let client = app_state.db.pool().get().await.map_err(|e| {
-        error!("Failed to get database connection: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let rows = client
-        .query(query, &[&current_user.0.id])
-        .await
-        .map_err(|e| {
-            error!("Failed to query user organizations: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    let mut organizations = Vec::new();
-    for row in rows {
-        if let Ok(Some(org)) = app_state.db.organizations.get_by_id(row.get("id")).await {
-            let db_org = crate::conversions::services_org_to_api_org(org);
-            organizations.push(db_org);
+    match app_state.user_service.get_user_organizations(user_id).await {
+        Ok(organizations) => {
+            let api_orgs = organizations
+                .into_iter()
+                .map(services_org_to_api_org)
+                .collect();
+            Ok(Json(api_orgs))
+        }
+        Err(e) => {
+            error!("Failed to get user organizations: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
-
-    Ok(Json(organizations))
 }
 
 /// Get user's sessions
@@ -215,9 +189,14 @@ pub async fn get_user_sessions(
 ) -> Result<Json<Vec<crate::models::SessionResponse>>, StatusCode> {
     debug!("Getting sessions for user: {}", current_user.0.id);
 
-    match app_state.db.sessions.list_by_user(current_user.0.id).await {
+    let user_id = services::auth::UserId(current_user.0.id);
+
+    match app_state.user_service.get_user_sessions(user_id).await {
         Ok(sessions) => {
-            let api_sessions = sessions.iter().map(db_session_to_api_session).collect();
+            let api_sessions = sessions
+                .iter()
+                .map(services_session_to_api_session)
+                .collect();
             Ok(Json(api_sessions))
         }
         Err(e) => {
@@ -257,23 +236,18 @@ pub async fn revoke_user_session(
         session_id, current_user.0.id
     );
 
-    // Verify the session belongs to the user
-    match app_state.db.sessions.get_by_id(session_id).await {
-        Ok(Some(session)) => {
-            if session.user_id != current_user.0.id {
-                return Err(StatusCode::NOT_FOUND);
-            }
-        }
-        Ok(None) => return Err(StatusCode::NOT_FOUND),
-        Err(e) => {
-            error!("Failed to get session: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    }
+    let user_id = services::auth::UserId(current_user.0.id);
+    let session_id = services::auth::SessionId(session_id);
 
-    match app_state.db.sessions.revoke(session_id).await {
+    match app_state
+        .user_service
+        .revoke_session(user_id, session_id)
+        .await
+    {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(UserServiceError::SessionNotFound) => Err(StatusCode::NOT_FOUND),
+        Err(UserServiceError::Unauthorized(_)) => Err(StatusCode::NOT_FOUND), // Don't leak that the session exists
         Err(e) => {
             error!("Failed to revoke session: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -303,12 +277,9 @@ pub async fn revoke_all_user_sessions(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     debug!("Revoking all sessions for user: {}", current_user.0.id);
 
-    match app_state
-        .db
-        .sessions
-        .revoke_all_for_user(current_user.0.id)
-        .await
-    {
+    let user_id = services::auth::UserId(current_user.0.id);
+
+    match app_state.user_service.revoke_all_sessions(user_id).await {
         Ok(count) => Ok(Json(serde_json::json!({
             "message": format!("Revoked {} sessions", count),
             "count": count

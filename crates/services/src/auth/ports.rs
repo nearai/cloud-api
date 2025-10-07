@@ -4,14 +4,14 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::organization::{OrganizationId, OrganizationRepository};
+use crate::organization::OrganizationRepository;
 
 // Domain ID types
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct UserId(pub Uuid);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionId(pub String);
+pub struct SessionId(pub Uuid);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SessionToken(pub String);
@@ -40,6 +40,12 @@ impl std::fmt::Display for SessionId {
     }
 }
 
+impl From<Uuid> for SessionId {
+    fn from(uuid: Uuid) -> Self {
+        SessionId(uuid)
+    }
+}
+
 impl std::fmt::Display for SessionToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -54,7 +60,7 @@ pub struct User {
     pub username: String,
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
-    pub organization_id: Option<OrganizationId>,
+    pub auth_provider: String,
     pub role: UserRole,
     pub is_active: bool,
     pub last_login: Option<DateTime<Utc>>,
@@ -353,7 +359,7 @@ impl MockAuthService {
             username: "testuser".to_string(),
             display_name: Some("Test User".to_string()),
             avatar_url: Some("https://example.com/avatar.jpg".to_string()),
-            organization_id: None,
+            auth_provider: "mock".to_string(),
             role: UserRole::User,
             is_active: true,
             last_login: Some(chrono::Utc::now()),
@@ -363,7 +369,7 @@ impl MockAuthService {
     }
 
     fn create_mock_session(&self, user_id: UserId) -> (Session, String) {
-        let session_id = SessionId(uuid::Uuid::new_v4().to_string());
+        let session_id = SessionId(uuid::Uuid::new_v4());
         let session_token = uuid::Uuid::new_v4();
         let expires_at = chrono::Utc::now() + chrono::Duration::hours(24);
 

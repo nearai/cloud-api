@@ -9,6 +9,7 @@ pub mod models;
 pub mod organization;
 pub mod responses;
 pub mod usage;
+pub mod user;
 
 // Re-export commonly used types for backward compatibility
 pub use completions::{

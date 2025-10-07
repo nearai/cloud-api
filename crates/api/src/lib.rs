@@ -61,6 +61,7 @@ pub struct DomainServices {
     pub attestation_service: Arc<services::attestation::AttestationService>,
     pub organization_service: Arc<services::organization::OrganizationService>,
     pub usage_service: Arc<dyn services::usage::UsageService + Send + Sync>,
+    pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
 }
 
 /// Initialize database connection and run migrations
@@ -262,10 +263,21 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
     ))
         as Arc<dyn services::organization::ports::OrganizationInvitationRepository>;
     let organization_service = Arc::new(services::organization::OrganizationService::new(
-        organization_repo,
-        user_repo,
+        organization_repo.clone(),
+        user_repo.clone(),
         invitation_repo,
     ));
+
+    // Create session repository for user service
+    let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
+        as Arc<dyn services::auth::SessionRepository>;
+
+    // Create user service
+    let user_service = Arc::new(services::user::UserService::new(
+        user_repo,
+        session_repo,
+        organization_repo,
+    )) as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
 
     DomainServices {
         conversation_service,
@@ -277,6 +289,7 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
         attestation_service,
         organization_service,
         usage_service,
+        user_service,
     }
 }
 
@@ -338,32 +351,17 @@ pub fn build_app_with_config(
     domain_services: DomainServices,
     _config: Option<&ApiConfig>,
 ) -> Router {
-    // Create organization service using the database's organization repository
-    let organization_repo = Arc::new(database::PgOrganizationRepository::new(
-        database.pool().clone(),
-    ));
-    let user_repo = Arc::new(database::UserRepository::new(database.pool().clone()))
-        as Arc<dyn services::auth::UserRepository>;
-    let invitation_repo = Arc::new(database::PgOrganizationInvitationRepository::new(
-        database.pool().clone(),
-    ))
-        as Arc<dyn services::organization::ports::OrganizationInvitationRepository>;
-    let organization_service = Arc::new(services::organization::OrganizationService::new(
-        organization_repo,
-        user_repo,
-        invitation_repo,
-    ));
-
     // Create app state for completions and management routes
     let app_state = AppState {
         db: database.clone(),
-        organization_service,
+        organization_service: domain_services.organization_service.clone(),
         mcp_manager: domain_services.mcp_manager.clone(),
         completion_service: domain_services.completion_service.clone(),
         models_service: domain_services.models_service.clone(),
         auth_service: auth_components.auth_service.clone(),
         attestation_service: domain_services.attestation_service.clone(),
         usage_service: domain_services.usage_service.clone(),
+        user_service: domain_services.user_service.clone(),
     };
 
     // Create usage state for middleware

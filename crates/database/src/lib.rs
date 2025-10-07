@@ -7,7 +7,8 @@ pub use models::*;
 pub use pool::{create_pool, DbPool};
 pub use repositories::{
     ApiKeyRepository, McpConnectorRepository, PgAttestationRepository, PgConversationRepository,
-    PgOrganizationRepository, PgResponseRepository, SessionRepository, UserRepository,
+    PgOrganizationInvitationRepository, PgOrganizationRepository, PgResponseRepository,
+    SessionRepository, UserRepository,
 };
 
 use anyhow::Result;

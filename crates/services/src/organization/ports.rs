@@ -1,4 +1,4 @@
-use super::super::auth::ports::UserId;
+use super::super::auth::ports::{User, UserId};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -76,6 +76,9 @@ pub enum OrganizationError {
     #[error("Organization not found")]
     NotFound,
 
+    #[error("User not found")]
+    UserNotFound,
+
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
 
@@ -84,6 +87,9 @@ pub enum OrganizationError {
 
     #[error("Internal error: {0}")]
     InternalError(String),
+
+    #[error("User is already a member")]
+    AlreadyMember,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +116,67 @@ pub struct AddOrganizationMemberRequest {
 #[derive(Debug, Clone)]
 pub struct UpdateOrganizationMemberRequest {
     pub role: MemberRole,
+}
+
+/// Organization member with full user information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrganizationMemberWithUser {
+    pub organization_id: OrganizationId,
+    pub user_id: UserId,
+    pub role: MemberRole,
+    pub joined_at: DateTime<Utc>,
+    pub user: User,
+}
+
+/// Result of a single invitation attempt
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvitationResult {
+    pub email: String,
+    pub success: bool,
+    pub member: Option<OrganizationMember>,
+    pub error: Option<String>,
+}
+
+/// Batch invitation response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchInvitationResponse {
+    pub results: Vec<InvitationResult>,
+    pub total: usize,
+    pub successful: usize,
+    pub failed: usize,
+}
+
+/// Organization invitation status
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum InvitationStatus {
+    Pending,
+    Accepted,
+    Declined,
+    Expired,
+}
+
+/// Organization invitation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrganizationInvitation {
+    pub id: Uuid,
+    pub organization_id: OrganizationId,
+    pub email: String,
+    pub role: MemberRole,
+    pub invited_by_user_id: UserId,
+    pub status: InvitationStatus,
+    pub token: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub responded_at: Option<DateTime<Utc>>,
+}
+
+/// Create invitation request
+#[derive(Debug, Clone)]
+pub struct CreateInvitationRequest {
+    pub email: String,
+    pub role: MemberRole,
+    pub expires_in_hours: i64,
 }
 
 #[async_trait]
@@ -160,4 +227,49 @@ pub trait OrganizationRepository: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Organization>>;
+}
+
+/// Repository trait for organization invitations
+#[async_trait]
+pub trait OrganizationInvitationRepository: Send + Sync {
+    /// Create a new invitation
+    async fn create(
+        &self,
+        org_id: Uuid,
+        request: CreateInvitationRequest,
+        invited_by: Uuid,
+    ) -> Result<OrganizationInvitation>;
+
+    /// Get invitation by ID
+    async fn get_by_id(&self, id: Uuid) -> Result<Option<OrganizationInvitation>>;
+
+    /// Get invitation by token
+    async fn get_by_token(&self, token: &str) -> Result<Option<OrganizationInvitation>>;
+
+    /// List invitations for an organization
+    async fn list_by_organization(
+        &self,
+        org_id: Uuid,
+        status: Option<InvitationStatus>,
+    ) -> Result<Vec<OrganizationInvitation>>;
+
+    /// List invitations for a user by email
+    async fn list_by_email(
+        &self,
+        email: &str,
+        status: Option<InvitationStatus>,
+    ) -> Result<Vec<OrganizationInvitation>>;
+
+    /// Update invitation status
+    async fn update_status(
+        &self,
+        id: Uuid,
+        status: InvitationStatus,
+    ) -> Result<OrganizationInvitation>;
+
+    /// Delete invitation
+    async fn delete(&self, id: Uuid) -> Result<bool>;
+
+    /// Mark expired invitations
+    async fn mark_expired(&self) -> Result<usize>;
 }

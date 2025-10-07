@@ -71,7 +71,7 @@ pub struct UpdateUserProfileRequest {
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = [])
     )
 )]
 pub async fn get_current_user(
@@ -109,7 +109,7 @@ pub async fn get_current_user(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = [])
     )
 )]
 pub async fn get_user(
@@ -172,7 +172,7 @@ pub async fn get_user(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = [])
     )
 )]
 pub async fn update_current_user_profile(
@@ -209,7 +209,7 @@ pub async fn update_current_user_profile(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = [])
     )
 )]
 pub async fn get_user_organizations(
@@ -246,7 +246,7 @@ pub async fn get_user_organizations(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = [])
     )
 )]
 pub async fn get_user_organizations_by_id(
@@ -311,7 +311,7 @@ pub async fn get_user_organizations_by_id(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = [])
     )
 )]
 pub async fn get_user_sessions(
@@ -360,7 +360,7 @@ pub async fn get_user_sessions(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = [])
     )
 )]
 pub async fn revoke_user_session(
@@ -419,7 +419,7 @@ pub async fn revoke_user_session(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = [])
     )
 )]
 pub async fn revoke_all_user_sessions(

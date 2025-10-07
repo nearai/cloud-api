@@ -58,6 +58,14 @@ impl AuthServiceTrait for AuthService {
             .ok_or(AuthError::UserNotFound)
     }
 
+    async fn get_user_by_id(&self, user_id: UserId) -> Result<User, AuthError> {
+        self.user_repository
+            .get_by_id(user_id)
+            .await
+            .map_err(|e| AuthError::InternalError(format!("Failed to get user: {}", e)))?
+            .ok_or(AuthError::UserNotFound)
+    }
+
     async fn logout(&self, session_id: SessionId) -> Result<bool, AuthError> {
         self.session_repository
             .revoke(session_id)

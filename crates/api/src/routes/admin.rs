@@ -35,7 +35,7 @@ pub struct AdminAppState {
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = [])
+        ("session_token" = [])
     )
 )]
 pub async fn batch_upsert_models(
@@ -156,7 +156,7 @@ pub async fn batch_upsert_models(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = [])
+        ("session_token" = [])
     )
 )]
 pub async fn get_model_pricing_history(
@@ -252,7 +252,7 @@ pub async fn get_model_pricing_history(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = [])
+        ("session_token" = [])
     )
 )]
 pub async fn update_organization_limits(
@@ -349,7 +349,7 @@ pub async fn update_organization_limits(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = [])
+        ("session_token" = [])
     )
 )]
 pub async fn list_users(

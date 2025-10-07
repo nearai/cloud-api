@@ -235,7 +235,8 @@ impl InferenceProviderPool {
         // Get current index for this model
         let mut indices = self.load_balancer_index.write().await;
         let index = indices.entry(model_id.to_string()).or_insert(0);
-        let provider = providers[*index % providers.len()].clone();
+        let selected_index = *index % providers.len();
+        let provider = providers[selected_index].clone();
 
         // Increment for next request
         *index = (*index + 1) % providers.len();
@@ -243,7 +244,7 @@ impl InferenceProviderPool {
         tracing::debug!(
             model = %model_id,
             providers_count = providers.len(),
-            selected_index = *index - 1,
+            selected_index = selected_index,
             "Selected provider using round-robin load balancing"
         );
 

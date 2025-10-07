@@ -22,6 +22,7 @@ pub struct AppState {
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub attestation_service: Arc<dyn AttestationService>,
     pub usage_service: Arc<dyn services::usage::UsageService + Send + Sync>,
+    pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
 }
 
 // Import route handlers

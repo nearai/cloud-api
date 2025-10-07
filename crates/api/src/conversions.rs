@@ -166,6 +166,24 @@ pub fn current_unix_timestamp() -> u64 {
         .as_secs()
 }
 
+// User-related conversions helper functions
+
+/// Convert services User to API UserResponse
+pub fn services_user_to_api_user(user: &services::auth::User) -> crate::models::UserResponse {
+    crate::models::UserResponse {
+        id: user.id.0.to_string(),
+        email: user.email.clone(),
+        username: user.username.clone(),
+        display_name: user.display_name.clone(),
+        avatar_url: user.avatar_url.clone(),
+        created_at: user.created_at,
+        updated_at: user.updated_at,
+        last_login_at: user.last_login,
+        is_active: user.is_active,
+        auth_provider: user.auth_provider.clone(),
+    }
+}
+
 // Organization-related conversions helper functions
 
 /// Convert services Organization to API OrganizationResponse

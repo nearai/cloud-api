@@ -248,7 +248,7 @@ impl services::auth::SessionRepository for SessionRepository {
             .await?;
 
         let service_session = services::auth::Session {
-            id: services::auth::SessionId(db_session.id.to_string()),
+            id: services::auth::SessionId(db_session.id),
             user_id: services::auth::UserId(db_session.user_id),
             token_hash: db_session.token_hash,
             created_at: db_session.created_at,
@@ -267,7 +267,7 @@ impl services::auth::SessionRepository for SessionRepository {
         let maybe_session = self.validate(&session_token.0).await?;
 
         Ok(maybe_session.map(|db_session| services::auth::Session {
-            id: services::auth::SessionId(db_session.id.to_string()),
+            id: services::auth::SessionId(db_session.id),
             user_id: services::auth::UserId(db_session.user_id),
             token_hash: db_session.token_hash,
             created_at: db_session.created_at,
@@ -281,11 +281,10 @@ impl services::auth::SessionRepository for SessionRepository {
         &self,
         session_id: services::auth::SessionId,
     ) -> anyhow::Result<Option<services::auth::Session>> {
-        let session_uuid = Uuid::parse_str(&session_id.0)?;
-        let maybe_session = self.get_by_id(session_uuid).await?;
+        let maybe_session = self.get_by_id(session_id.0).await?;
 
         Ok(maybe_session.map(|db_session| services::auth::Session {
-            id: services::auth::SessionId(db_session.id.to_string()),
+            id: services::auth::SessionId(db_session.id),
             user_id: services::auth::UserId(db_session.user_id),
             token_hash: db_session.token_hash,
             created_at: db_session.created_at,
@@ -304,7 +303,7 @@ impl services::auth::SessionRepository for SessionRepository {
         Ok(db_sessions
             .into_iter()
             .map(|db_session| services::auth::Session {
-                id: services::auth::SessionId(db_session.id.to_string()),
+                id: services::auth::SessionId(db_session.id),
                 user_id: services::auth::UserId(db_session.user_id),
                 token_hash: db_session.token_hash,
                 created_at: db_session.created_at,
@@ -320,13 +319,11 @@ impl services::auth::SessionRepository for SessionRepository {
         session_id: services::auth::SessionId,
         additional_hours: i64,
     ) -> anyhow::Result<bool> {
-        let session_uuid = Uuid::parse_str(&session_id.0)?;
-        self.extend(session_uuid, additional_hours).await
+        self.extend(session_id.0, additional_hours).await
     }
 
     async fn revoke(&self, session_id: services::auth::SessionId) -> anyhow::Result<bool> {
-        let session_uuid = Uuid::parse_str(&session_id.0)?;
-        self.revoke(session_uuid).await
+        self.revoke(session_id.0).await
     }
 
     async fn revoke_all_for_user(&self, user_id: services::auth::UserId) -> anyhow::Result<usize> {

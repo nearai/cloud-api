@@ -47,6 +47,42 @@ pub struct OrganizationMember {
     pub invited_by: Option<Uuid>,
 }
 
+/// Organization invitation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrganizationInvitation {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub email: String,
+    pub role: OrganizationRole,
+    pub invited_by_user_id: Uuid,
+    pub status: InvitationStatus,
+    pub token: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub responded_at: Option<DateTime<Utc>>,
+}
+
+/// Invitation status
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum InvitationStatus {
+    Pending,
+    Accepted,
+    Declined,
+    Expired,
+}
+
+impl std::fmt::Display for InvitationStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InvitationStatus::Pending => write!(f, "pending"),
+            InvitationStatus::Accepted => write!(f, "accepted"),
+            InvitationStatus::Declined => write!(f, "declined"),
+            InvitationStatus::Expired => write!(f, "expired"),
+        }
+    }
+}
+
 /// Role within an organization
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]

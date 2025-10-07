@@ -197,6 +197,8 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
     let organization_repo = Arc::new(database::PgOrganizationRepository::new(
         database.pool().clone(),
     ));
+    let user_repo = Arc::new(database::UserRepository::new(database.pool().clone()))
+        as Arc<dyn services::auth::UserRepository>;
     let attestation_repo = Arc::new(database::PgAttestationRepository::new(
         database.pool().clone(),
     ));
@@ -255,8 +257,14 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
     // Create MCP client manager
     let mcp_manager = Arc::new(services::mcp::McpClientManager::new());
 
+    let invitation_repo = Arc::new(database::PgOrganizationInvitationRepository::new(
+        database.pool().clone(),
+    ))
+        as Arc<dyn services::organization::ports::OrganizationInvitationRepository>;
     let organization_service = Arc::new(services::organization::OrganizationService::new(
         organization_repo,
+        user_repo,
+        invitation_repo,
     ));
 
     DomainServices {
@@ -334,8 +342,16 @@ pub fn build_app_with_config(
     let organization_repo = Arc::new(database::PgOrganizationRepository::new(
         database.pool().clone(),
     ));
+    let user_repo = Arc::new(database::UserRepository::new(database.pool().clone()))
+        as Arc<dyn services::auth::UserRepository>;
+    let invitation_repo = Arc::new(database::PgOrganizationInvitationRepository::new(
+        database.pool().clone(),
+    ))
+        as Arc<dyn services::organization::ports::OrganizationInvitationRepository>;
     let organization_service = Arc::new(services::organization::OrganizationService::new(
         organization_repo,
+        user_repo,
+        invitation_repo,
     ));
 
     // Create app state for completions and management routes
@@ -403,6 +419,9 @@ pub fn build_app_with_config(
 
     let admin_routes = build_admin_routes(database.clone(), &auth_components.auth_state_middleware);
 
+    let invitation_routes =
+        build_invitation_routes(app_state.clone(), &auth_components.auth_state_middleware);
+
     // Build OpenAPI and documentation routes
     let openapi_routes = build_openapi_routes();
 
@@ -418,9 +437,32 @@ pub fn build_app_with_config(
                 .merge(workspace_routes)
                 .merge(attestation_routes.clone())
                 .merge(model_routes)
-                .merge(admin_routes),
+                .merge(admin_routes)
+                .merge(invitation_routes),
         )
         .merge(openapi_routes)
+}
+
+/// Build invitation routes with selective auth
+pub fn build_invitation_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
+    use crate::routes::users::{accept_invitation_by_token, get_invitation_by_token};
+    use axum::routing::{get, post};
+
+    Router::new().nest(
+        "/invitations",
+        Router::new()
+            // Public route - no auth required to view invitation
+            .route("/{token}", get(get_invitation_by_token))
+            // Auth required to accept
+            .route(
+                "/{token}/accept",
+                post(accept_invitation_by_token).layer(from_fn_with_state(
+                    auth_state_middleware.clone(),
+                    auth_middleware,
+                )),
+            )
+            .with_state(app_state),
+    )
 }
 
 /// Build authentication routes

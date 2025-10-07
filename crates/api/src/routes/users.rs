@@ -1,7 +1,7 @@
 use crate::{
     conversions::{
         authenticated_user_to_user_id, services_invitation_to_api, services_member_to_api_member,
-        services_org_to_api_org, services_user_to_api_user,
+        services_user_to_api_user,
     },
     middleware::AuthenticatedUser,
     models::ErrorResponse,
@@ -120,48 +120,6 @@ pub async fn update_current_user_profile(
         Err(UserServiceError::UserNotFound) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
             error!("Failed to update user profile: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
-}
-
-/// Get user's organizations (current user)
-///
-/// Returns all organizations that the currently authenticated user is a member of.
-#[utoipa::path(
-    get,
-    path = "/users/me/organizations",
-    tag = "Users",
-    responses(
-        (status = 200, description = "List of user's organizations", body = Vec<crate::models::OrganizationResponse>),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    ),
-    security(
-        ("session_token" = [])
-    )
-)]
-pub async fn get_user_organizations(
-    State(app_state): State<AppState>,
-    Extension(current_user): Extension<AuthenticatedUser>,
-) -> Result<Json<Vec<crate::models::OrganizationResponse>>, StatusCode> {
-    debug!(
-        "Getting organizations for current user: {}",
-        current_user.0.id
-    );
-
-    let user_id = services::auth::UserId(current_user.0.id);
-
-    match app_state.user_service.get_user_organizations(user_id).await {
-        Ok(organizations) => {
-            let api_orgs = organizations
-                .into_iter()
-                .map(services_org_to_api_org)
-                .collect();
-            Ok(Json(api_orgs))
-        }
-        Err(e) => {
-            error!("Failed to get user organizations: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }

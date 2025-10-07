@@ -1,7 +1,4 @@
-use crate::{
-    auth::ports::{Session, SessionId, SessionRepository, User, UserId, UserRepository},
-    organization::{Organization, OrganizationRepository},
-};
+use crate::auth::ports::{Session, SessionId, SessionRepository, User, UserId, UserRepository};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::debug;
@@ -13,19 +10,16 @@ pub use ports::*;
 pub struct UserService {
     user_repository: Arc<dyn UserRepository>,
     session_repository: Arc<dyn SessionRepository>,
-    organization_repository: Arc<dyn OrganizationRepository>,
 }
 
 impl UserService {
     pub fn new(
         user_repository: Arc<dyn UserRepository>,
         session_repository: Arc<dyn SessionRepository>,
-        organization_repository: Arc<dyn OrganizationRepository>,
     ) -> Self {
         Self {
             user_repository,
             session_repository,
-            organization_repository,
         }
     }
 }
@@ -57,22 +51,6 @@ impl UserServiceTrait for UserService {
                 UserServiceError::InternalError(format!("Failed to update profile: {}", e))
             })?
             .ok_or(UserServiceError::UserNotFound)
-    }
-
-    async fn get_user_organizations(
-        &self,
-        user_id: UserId,
-    ) -> Result<Vec<Organization>, UserServiceError> {
-        debug!("Getting organizations for user: {}", user_id);
-
-        // Get all active organizations for the user
-        // Using a large limit since most users won't have hundreds of orgs
-        self.organization_repository
-            .list_organizations_by_user(user_id.0, 1000, 0)
-            .await
-            .map_err(|e| {
-                UserServiceError::InternalError(format!("Failed to get user organizations: {}", e))
-            })
     }
 
     async fn get_user_sessions(&self, user_id: UserId) -> Result<Vec<Session>, UserServiceError> {

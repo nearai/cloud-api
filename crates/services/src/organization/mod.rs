@@ -800,7 +800,7 @@ impl OrganizationService {
             .map_err(|e| {
                 OrganizationError::InternalError(format!("Failed to get invitation: {}", e))
             })?
-            .ok_or_else(|| OrganizationError::NotFound)?;
+            .ok_or(OrganizationError::NotFound)?;
 
         // Check if already expired (but don't auto-update here for GET)
         if invitation.status != ports::InvitationStatus::Pending {
@@ -839,7 +839,7 @@ impl OrganizationService {
             .map_err(|e| {
                 OrganizationError::InternalError(format!("Failed to get invitation: {}", e))
             })?
-            .ok_or_else(|| OrganizationError::NotFound)?;
+            .ok_or(OrganizationError::NotFound)?;
 
         // Use the existing accept_invitation logic with the invitation ID
         self.accept_invitation(invitation.id, user_id, user_email)
@@ -861,7 +861,7 @@ impl OrganizationService {
             .map_err(|e| {
                 OrganizationError::InternalError(format!("Failed to get invitation: {}", e))
             })?
-            .ok_or_else(|| OrganizationError::NotFound)?;
+            .ok_or(OrganizationError::NotFound)?;
 
         // Verify the invitation belongs to this user
         if invitation.email.to_lowercase() != user_email.to_lowercase() {
@@ -945,7 +945,7 @@ impl OrganizationService {
             .map_err(|e| {
                 OrganizationError::InternalError(format!("Failed to get invitation: {}", e))
             })?
-            .ok_or_else(|| OrganizationError::NotFound)?;
+            .ok_or(OrganizationError::NotFound)?;
 
         // Verify the invitation belongs to this user
         if invitation.email.to_lowercase() != user_email.to_lowercase() {

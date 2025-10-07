@@ -26,8 +26,7 @@ use uuid::Uuid;
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
-        ("api_key" = [])
+        ("session_token" = [])
     )
 )]
 pub async fn list_organizations(
@@ -88,7 +87,7 @@ fn default_limit() -> i64 {
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = []),
     )
 )]
 pub async fn create_organization(
@@ -176,8 +175,7 @@ pub async fn create_organization(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
-        ("api_key" = [])
+        ("session_token" = [])
     )
 )]
 pub async fn get_organization(
@@ -239,8 +237,7 @@ pub async fn get_organization(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
-        ("api_key" = [])
+        ("session_token" = [])
     )
 )]
 pub async fn update_organization(
@@ -297,8 +294,7 @@ pub async fn update_organization(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
-        ("api_key" = [])
+        ("session_token" = [])
     )
 )]
 pub async fn delete_organization(
@@ -354,7 +350,7 @@ pub async fn delete_organization(
         (status = 401, description = "Unauthorized", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
+        ("session_token" = []),
     )
 )]
 pub async fn create_organization_api_key(
@@ -385,8 +381,7 @@ pub async fn create_organization_api_key(
         (status = 401, description = "Unauthorized", body = ErrorResponse)
     ),
     security(
-        ("bearer" = []),
-        ("api_key" = [])
+        ("session_token" = [])
     )
 )]
 pub async fn list_organization_api_keys(

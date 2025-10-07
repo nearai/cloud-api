@@ -97,7 +97,7 @@ pub async fn auth_middleware_with_workspace_context(
     }
 }
 
-/// Authentication middleware that validates session tokens or API keys
+/// Authentication middleware that validates session tokens only
 pub async fn auth_middleware(
     State(state): State<AuthState>,
     request: Request,
@@ -109,7 +109,7 @@ pub async fn auth_middleware(
         .get("authorization")
         .and_then(|h| h.to_str().ok());
 
-    tracing::debug!("Auth middleware: {:?}", auth_header);
+    tracing::debug!("Auth middleware (session token only): {:?}", auth_header);
 
     let auth_result = if let Some(auth_value) = auth_header {
         debug!("Found Authorization header: {}", auth_value);

@@ -87,7 +87,7 @@ fn default_limit() -> i64 {
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = [])
+        ("session_token" = [])
     )
 )]
 pub async fn get_organization_balance(
@@ -223,7 +223,7 @@ pub async fn get_organization_balance(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
-        ("bearer" = [])
+        ("session_token" = [])
     )
 )]
 pub async fn get_organization_usage_history(

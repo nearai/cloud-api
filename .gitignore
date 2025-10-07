@@ -1,4 +1,5 @@
 target/
 config/config.yaml
+config/docker.yaml
 config/examples/production.yaml
 .cursor

@@ -36,7 +36,7 @@ use database::{
 };
 use services::{
     auth::{AuthService, AuthServiceTrait, MockAuthService, OAuthManager},
-    models::ModelsService,
+    models::ModelsServiceTrait,
 };
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
@@ -59,8 +59,8 @@ pub struct DomainServices {
     pub mcp_manager: Arc<services::mcp::McpClientManager>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub attestation_service: Arc<services::attestation::AttestationService>,
-    pub organization_service: Arc<services::organization::OrganizationService>,
-    pub usage_service: Arc<dyn services::usage::UsageService + Send + Sync>,
+    pub organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
+    pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
 }
 
@@ -239,7 +239,7 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
         usage_repository as Arc<dyn services::usage::UsageRepository>,
         models_repo.clone() as Arc<dyn services::usage::ModelRepository>,
         limits_repository_for_usage as Arc<dyn services::usage::OrganizationLimitsRepository>,
-    )) as Arc<dyn services::usage::UsageService + Send + Sync>;
+    )) as Arc<dyn services::usage::UsageServiceTrait + Send + Sync>;
 
     // Create completion service with usage tracking
     let completion_service = Arc::new(services::CompletionServiceImpl::new(
@@ -262,7 +262,7 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
         database.pool().clone(),
     ))
         as Arc<dyn services::organization::ports::OrganizationInvitationRepository>;
-    let organization_service = Arc::new(services::organization::OrganizationService::new(
+    let organization_service = Arc::new(services::organization::OrganizationServiceImpl::new(
         organization_repo.clone(),
         user_repo.clone(),
         invitation_repo,
@@ -630,7 +630,7 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
 }
 
 /// Build model routes (public endpoints)
-pub fn build_model_routes(models_service: Arc<dyn ModelsService>) -> Router {
+pub fn build_model_routes(models_service: Arc<dyn ModelsServiceTrait>) -> Router {
     let models_app_state = ModelsAppState { models_service };
 
     Router::new()

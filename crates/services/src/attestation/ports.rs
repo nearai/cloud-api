@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use inference_providers::AttestationReport;
 
 #[async_trait]
-pub trait AttestationService: Send + Sync {
+pub trait AttestationServiceTrait: Send + Sync {
     async fn get_chat_signature(&self, chat_id: &str) -> Result<ChatSignature, CompletionError>;
     async fn get_attestation_report(
         &self,

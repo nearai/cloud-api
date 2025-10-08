@@ -59,7 +59,8 @@ pub struct DomainServices {
     pub mcp_manager: Arc<services::mcp::McpClientManager>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub attestation_service: Arc<services::attestation::AttestationService>,
-    pub organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
+    pub organization_service:
+        Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
 }

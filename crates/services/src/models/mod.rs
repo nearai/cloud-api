@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use inference_providers::InferenceProvider;
-pub use ports::{ModelInfo, ModelWithPricing, ModelsError, ModelsRepository, ModelsService};
+pub use ports::{ModelInfo, ModelWithPricing, ModelsError, ModelsRepository, ModelsServiceTrait};
 
 use crate::inference_provider_pool::InferenceProviderPool;
 
@@ -26,7 +26,7 @@ impl ModelsServiceImpl {
 }
 
 #[async_trait]
-impl ModelsService for ModelsServiceImpl {
+impl ModelsServiceTrait for ModelsServiceImpl {
     async fn get_models(&self) -> Result<Vec<ModelInfo>, ModelsError> {
         self.inference_provider_pool
             .models()

@@ -146,34 +146,6 @@ impl ConversationService {
             })
     }
 
-    /// List conversations for a user
-    pub async fn list_conversations(
-        &self,
-        user_id: &UserId,
-        limit: Option<i32>,
-        offset: Option<i32>,
-    ) -> Result<Vec<ports::Conversation>, ports::ConversationError> {
-        let limit = limit.unwrap_or(20).min(100) as i64;
-        let offset = offset.unwrap_or(0) as i64;
-
-        tracing::info!("Listing conversations for user: {}", user_id.0);
-
-        let db_conversations = self
-            .conv_repo
-            .list_by_user(user_id.clone(), limit, offset)
-            .await
-            .map_err(|e| {
-                ports::ConversationError::InternalError(format!(
-                    "Failed to list conversations: {}",
-                    e
-                ))
-            })?;
-
-        tracing::info!("Found {} conversations", db_conversations.len());
-
-        Ok(db_conversations)
-    }
-
     /// Get conversation messages by extracting from responses
     pub async fn get_conversation_messages(
         &self,

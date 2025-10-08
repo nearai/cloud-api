@@ -4,7 +4,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use services::usage::{UsageCheckResult, UsageService};
+use services::usage::{UsageCheckResult, UsageServiceTrait};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
@@ -14,7 +14,7 @@ use crate::models::ErrorResponse;
 /// State for usage middleware
 #[derive(Clone)]
 pub struct UsageState {
-    pub usage_service: Arc<dyn UsageService + Send + Sync>,
+    pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     pub usage_repository: Arc<database::repositories::OrganizationUsageRepository>,
     pub api_key_repository: Arc<database::repositories::ApiKeyRepository>,
 }

@@ -1,8 +1,8 @@
 pub mod ports;
 
-use crate::attestation::ports::AttestationService;
+use crate::attestation::ports::AttestationServiceTrait;
 use crate::inference_provider_pool::InferenceProviderPool;
-use crate::usage::{RecordUsageServiceRequest, UsageService};
+use crate::usage::{RecordUsageServiceRequest, UsageServiceTrait};
 use inference_providers::{
     ChatMessage, InferenceProvider, MessageRole, StreamChunk, StreamingResult,
 };
@@ -19,8 +19,8 @@ where
     S: Stream<Item = Result<StreamChunk, inference_providers::CompletionError>> + Unpin,
 {
     inner: S,
-    attestation_service: Arc<dyn AttestationService>,
-    usage_service: Arc<dyn UsageService + Send + Sync>,
+    attestation_service: Arc<dyn AttestationServiceTrait>,
+    usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     organization_id: Uuid,
     workspace_id: Uuid,
     api_key_id: Uuid,
@@ -98,15 +98,15 @@ where
 
 pub struct CompletionServiceImpl {
     pub inference_provider_pool: Arc<InferenceProviderPool>,
-    pub attestation_service: Arc<dyn AttestationService>,
-    pub usage_service: Arc<dyn UsageService + Send + Sync>,
+    pub attestation_service: Arc<dyn AttestationServiceTrait>,
+    pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
 }
 
 impl CompletionServiceImpl {
     pub fn new(
         inference_provider_pool: Arc<InferenceProviderPool>,
-        attestation_service: Arc<dyn AttestationService>,
-        usage_service: Arc<dyn UsageService + Send + Sync>,
+        attestation_service: Arc<dyn AttestationServiceTrait>,
+        usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     ) -> Self {
         Self {
             inference_provider_pool,
@@ -158,7 +158,7 @@ impl CompletionServiceImpl {
 }
 
 #[async_trait::async_trait]
-impl ports::CompletionService for CompletionServiceImpl {
+impl ports::CompletionServiceTrait for CompletionServiceImpl {
     async fn create_completion_stream(
         &self,
         request: ports::CompletionRequest,

@@ -67,15 +67,4 @@ pub trait ConversationRepository: Send + Sync {
 
     /// Delete a conversation (will cascade delete associated responses)
     async fn delete(&self, id: ConversationId, user_id: UserId) -> Result<bool>;
-
-    /// List conversations for a user
-    async fn list_by_user(
-        &self,
-        user_id: UserId,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<Conversation>>;
-
-    /// Count total conversations for a user
-    async fn count_by_user(&self, user_id: UserId) -> Result<i64>;
 }

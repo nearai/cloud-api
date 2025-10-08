@@ -1,4 +1,4 @@
-use crate::{middleware::AuthenticatedUser, models::*};
+use crate::models::*;
 use axum::{
     extract::{Extension, Json, Path, Query, State},
     http::StatusCode,
@@ -220,29 +220,81 @@ pub async fn create_response(
                 let mut final_response: Option<ResponseObject> = None;
 
                 let mut stream = Box::pin(stream);
+                let mut event_count = 0;
+                let mut delta_count = 0;
                 while let Some(event) = stream.next().await {
+                    event_count += 1;
+                    tracing::debug!(
+                        "Non-streaming collection: received event #{} type={} delta={:?}",
+                        event_count,
+                        event.event_type,
+                        event.delta
+                    );
                     match event.event_type.as_str() {
                         "response.created" => {
                             // Extract response ID from JSON response object
                             if let Some(response) = &event.response {
                                 if let Some(id) = response.get("id").and_then(|v| v.as_str()) {
                                     response_id = Some(id.to_string());
+                                    tracing::debug!("Non-streaming: extracted response_id={}", id);
                                 }
                             }
                         }
                         "response.output_text.delta" => {
                             // Accumulate content deltas
                             if let Some(delta) = &event.delta {
+                                delta_count += 1;
+                                tracing::debug!(
+                                    "Non-streaming: delta #{} len={} content='{}'",
+                                    delta_count,
+                                    delta.len(),
+                                    delta
+                                );
                                 content.push_str(delta);
                             }
                         }
                         "response.completed" => {
                             status = DomainResponseStatus::Completed;
+                            tracing::debug!(
+                                "Non-streaming: response.completed event, accumulated_content_len={}",
+                                content.len()
+                            );
                             // Convert the JSON response to a ResponseObject
                             if let Some(response_json) = event.response {
+                                tracing::debug!(
+                                    "Non-streaming: response.completed has response JSON: {:?}",
+                                    response_json
+                                );
                                 if let Ok(response_obj) =
                                     serde_json::from_value::<ResponseObject>(response_json)
                                 {
+                                    tracing::debug!(
+                                        "Non-streaming: parsed ResponseObject, checking output text"
+                                    );
+                                    // Log the output text from the final response
+                                    for (idx, output_item) in response_obj.output.iter().enumerate()
+                                    {
+                                        if let ResponseOutputItem::Message {
+                                            content: msg_content,
+                                            ..
+                                        } = output_item
+                                        {
+                                            for (cidx, content_part) in
+                                                msg_content.iter().enumerate()
+                                            {
+                                                if let ResponseOutputContent::OutputText {
+                                                    text,
+                                                    ..
+                                                } = content_part
+                                                {
+                                                    tracing::debug!(
+                                                        "Non-streaming: final_response output[{}].content[{}] text_len={} text='{}'",
+                                                        idx, cidx, text.len(), text
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
                                     final_response = Some(response_obj);
                                 }
                             }
@@ -255,6 +307,12 @@ pub async fn create_response(
                         }
                     }
                 }
+                tracing::info!(
+                    "Non-streaming: collected {} events, {} deltas, accumulated_content_len={}",
+                    event_count,
+                    delta_count,
+                    content.len()
+                );
 
                 // Use final response from completed event or build fallback response
                 let response = if let Some(final_resp) = final_response {
@@ -328,7 +386,7 @@ pub async fn get_response(
     Path(_response_id): Path<String>,
     Query(_params): Query<GetResponseQuery>,
     State(_service): State<Arc<ResponseService>>,
-    Extension(_user): Extension<AuthenticatedUser>,
+    Extension(_api_key): Extension<services::auth::ApiKey>,
 ) -> Result<ResponseJson<ResponseObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement get_response method in ResponseService
     Err((
@@ -344,7 +402,7 @@ pub async fn get_response(
 pub async fn delete_response(
     Path(_response_id): Path<String>,
     State(_service): State<Arc<ResponseService>>,
-    Extension(_user): Extension<AuthenticatedUser>,
+    Extension(_api_key): Extension<services::auth::ApiKey>,
 ) -> Result<ResponseJson<ResponseDeleteResult>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement delete_response method in ResponseService
     Err((
@@ -360,7 +418,7 @@ pub async fn delete_response(
 pub async fn cancel_response(
     Path(_response_id): Path<String>,
     State(_service): State<Arc<ResponseService>>,
-    Extension(_user): Extension<AuthenticatedUser>,
+    Extension(_api_key): Extension<services::auth::ApiKey>,
 ) -> Result<ResponseJson<ResponseObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement cancel_response method in ResponseService
     Err((
@@ -377,7 +435,7 @@ pub async fn list_input_items(
     Path(_response_id): Path<String>,
     Query(_params): Query<ListInputItemsQuery>,
     State(_service): State<Arc<ResponseService>>,
-    Extension(_user): Extension<AuthenticatedUser>,
+    Extension(_api_key): Extension<services::auth::ApiKey>,
 ) -> Result<ResponseJson<ResponseInputItemList>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement get_response method in ResponseService to support listing input items
     Err((

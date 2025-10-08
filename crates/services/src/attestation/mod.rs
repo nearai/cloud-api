@@ -1,13 +1,14 @@
 pub mod models;
-pub use models::ChatSignature;
+use dstack_sdk::dstack_client;
+pub use models::{AttestationError, ChatSignature};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use inference_providers::{AttestationReport, InferenceProvider};
 
 use crate::{
-    attestation::ports::AttestationRepository, inference_provider_pool::InferenceProviderPool,
-    CompletionError,
+    attestation::{models::GetQuoteResponse, ports::AttestationRepository},
+    inference_provider_pool::InferenceProviderPool,
 };
 
 pub mod ports;
@@ -30,8 +31,8 @@ impl AttestationService {
 }
 
 #[async_trait]
-impl ports::AttestationService for AttestationService {
-    async fn get_chat_signature(&self, chat_id: &str) -> Result<ChatSignature, CompletionError> {
+impl ports::AttestationServiceTrait for AttestationService {
+    async fn get_chat_signature(&self, chat_id: &str) -> Result<ChatSignature, AttestationError> {
         if let Some(provider) = self
             .inference_provider_pool
             .get_provider_by_chat_id(chat_id)
@@ -39,7 +40,7 @@ impl ports::AttestationService for AttestationService {
         {
             let provider_signature = provider.get_signature(chat_id).await.map_err(|e| {
                 tracing::error!("Failed to get chat signature: {:?}", e);
-                CompletionError::ProviderError(e.to_string())
+                AttestationError::ProviderError(e.to_string())
             })?;
             let signature = ChatSignature {
                 text: provider_signature.text,
@@ -52,7 +53,7 @@ impl ports::AttestationService for AttestationService {
                 .await
                 .map_err(|e| {
                     tracing::error!("Failed to add chat signature: {:?}", e);
-                    CompletionError::InternalError(e.to_string())
+                    AttestationError::RepositoryError(e.to_string())
                 })?;
             return Ok(signature);
         }
@@ -63,10 +64,19 @@ impl ports::AttestationService for AttestationService {
         &self,
         model: String,
         signing_algo: Option<String>,
-    ) -> Result<AttestationReport, CompletionError> {
+    ) -> Result<AttestationReport, AttestationError> {
         self.inference_provider_pool
             .get_attestation_report(model, signing_algo)
             .await
-            .map_err(|e| CompletionError::ProviderError(e.to_string()))
+            .map_err(|e| AttestationError::ProviderError(e.to_string()))
+    }
+
+    async fn get_quote(&self) -> Result<GetQuoteResponse, AttestationError> {
+        let client = dstack_client::DstackClient::new(None);
+        let quote = client
+            .get_quote(vec![])
+            .await
+            .map_err(|e| AttestationError::ClientError(e.to_string()))?;
+        Ok(GetQuoteResponse::from(quote))
     }
 }

@@ -150,6 +150,20 @@ pub async fn get_model_by_name(
 ) -> Result<ResponseJson<ModelWithPricing>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!("Get model request for: {}", model_name);
 
+    // Log available models for debugging
+    match app_state.models_service.get_models_with_pricing().await {
+        Ok(all_models) => {
+            debug!(
+                "Available models in database ({}): {:?}",
+                all_models.len(),
+                all_models.iter().map(|m| &m.model_name).collect::<Vec<_>>()
+            );
+        }
+        Err(e) => {
+            debug!("Failed to fetch all models for debugging: {}", e);
+        }
+    }
+
     // Get the model from the service
     let model = app_state
         .models_service
@@ -157,7 +171,7 @@ pub async fn get_model_by_name(
         .await
         .map_err(|e| match e {
             services::models::ModelsError::NotFound(_) => {
-                error!("Model not found: {}", model_name);
+                error!("Model not found: '{}' (URL-decoded query)", model_name);
                 (
                     StatusCode::NOT_FOUND,
                     ResponseJson(ErrorResponse::new(
@@ -167,7 +181,7 @@ pub async fn get_model_by_name(
                 )
             }
             _ => {
-                error!("Failed to get model: {}", e);
+                error!("Failed to get model '{}': {}", model_name, e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(

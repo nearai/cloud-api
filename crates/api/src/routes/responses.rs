@@ -220,29 +220,70 @@ pub async fn create_response(
                 let mut final_response: Option<ResponseObject> = None;
 
                 let mut stream = Box::pin(stream);
+                let mut event_count = 0;
+                let mut delta_count = 0;
                 while let Some(event) = stream.next().await {
+                    event_count += 1;
+                    tracing::debug!(
+                        "Non-streaming collection: received event #{} type={} delta={:?}",
+                        event_count,
+                        event.event_type,
+                        event.delta
+                    );
                     match event.event_type.as_str() {
                         "response.created" => {
                             // Extract response ID from JSON response object
                             if let Some(response) = &event.response {
                                 if let Some(id) = response.get("id").and_then(|v| v.as_str()) {
                                     response_id = Some(id.to_string());
+                                    tracing::debug!("Non-streaming: extracted response_id={}", id);
                                 }
                             }
                         }
                         "response.output_text.delta" => {
                             // Accumulate content deltas
                             if let Some(delta) = &event.delta {
+                                delta_count += 1;
+                                tracing::debug!(
+                                    "Non-streaming: delta #{} len={} content='{}'",
+                                    delta_count,
+                                    delta.len(),
+                                    delta
+                                );
                                 content.push_str(delta);
                             }
                         }
                         "response.completed" => {
                             status = DomainResponseStatus::Completed;
+                            tracing::debug!(
+                                "Non-streaming: response.completed event, accumulated_content_len={}",
+                                content.len()
+                            );
                             // Convert the JSON response to a ResponseObject
                             if let Some(response_json) = event.response {
+                                tracing::debug!(
+                                    "Non-streaming: response.completed has response JSON: {:?}",
+                                    response_json
+                                );
                                 if let Ok(response_obj) =
                                     serde_json::from_value::<ResponseObject>(response_json)
                                 {
+                                    tracing::debug!(
+                                        "Non-streaming: parsed ResponseObject, checking output text"
+                                    );
+                                    // Log the output text from the final response
+                                    for (idx, output_item) in response_obj.output.iter().enumerate() {
+                                        if let ResponseOutputItem::Message { content: msg_content, .. } = output_item {
+                                            for (cidx, content_part) in msg_content.iter().enumerate() {
+                                                if let ResponseOutputContent::OutputText { text, .. } = content_part {
+                                                    tracing::debug!(
+                                                        "Non-streaming: final_response output[{}].content[{}] text_len={} text='{}'",
+                                                        idx, cidx, text.len(), text
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
                                     final_response = Some(response_obj);
                                 }
                             }
@@ -255,6 +296,12 @@ pub async fn create_response(
                         }
                     }
                 }
+                tracing::info!(
+                    "Non-streaming: collected {} events, {} deltas, accumulated_content_len={}",
+                    event_count,
+                    delta_count,
+                    content.len()
+                );
 
                 // Use final response from completed event or build fallback response
                 let response = if let Some(final_resp) = final_response {

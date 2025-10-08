@@ -272,10 +272,21 @@ pub async fn create_response(
                                         "Non-streaming: parsed ResponseObject, checking output text"
                                     );
                                     // Log the output text from the final response
-                                    for (idx, output_item) in response_obj.output.iter().enumerate() {
-                                        if let ResponseOutputItem::Message { content: msg_content, .. } = output_item {
-                                            for (cidx, content_part) in msg_content.iter().enumerate() {
-                                                if let ResponseOutputContent::OutputText { text, .. } = content_part {
+                                    for (idx, output_item) in response_obj.output.iter().enumerate()
+                                    {
+                                        if let ResponseOutputItem::Message {
+                                            content: msg_content,
+                                            ..
+                                        } = output_item
+                                        {
+                                            for (cidx, content_part) in
+                                                msg_content.iter().enumerate()
+                                            {
+                                                if let ResponseOutputContent::OutputText {
+                                                    text,
+                                                    ..
+                                                } = content_part
+                                                {
                                                     tracing::debug!(
                                                         "Non-streaming: final_response output[{}].content[{}] text_len={} text='{}'",
                                                         idx, cidx, text.len(), text

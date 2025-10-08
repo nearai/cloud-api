@@ -1,4 +1,4 @@
-use crate::{middleware::AuthenticatedUser, models::*};
+use crate::models::*;
 use axum::{
     extract::{Extension, Json, Path, Query, State},
     http::StatusCode,
@@ -328,7 +328,7 @@ pub async fn get_response(
     Path(_response_id): Path<String>,
     Query(_params): Query<GetResponseQuery>,
     State(_service): State<Arc<ResponseService>>,
-    Extension(_user): Extension<AuthenticatedUser>,
+    Extension(_api_key): Extension<services::auth::ApiKey>,
 ) -> Result<ResponseJson<ResponseObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement get_response method in ResponseService
     Err((
@@ -344,7 +344,7 @@ pub async fn get_response(
 pub async fn delete_response(
     Path(_response_id): Path<String>,
     State(_service): State<Arc<ResponseService>>,
-    Extension(_user): Extension<AuthenticatedUser>,
+    Extension(_api_key): Extension<services::auth::ApiKey>,
 ) -> Result<ResponseJson<ResponseDeleteResult>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement delete_response method in ResponseService
     Err((
@@ -360,7 +360,7 @@ pub async fn delete_response(
 pub async fn cancel_response(
     Path(_response_id): Path<String>,
     State(_service): State<Arc<ResponseService>>,
-    Extension(_user): Extension<AuthenticatedUser>,
+    Extension(_api_key): Extension<services::auth::ApiKey>,
 ) -> Result<ResponseJson<ResponseObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement cancel_response method in ResponseService
     Err((
@@ -377,7 +377,7 @@ pub async fn list_input_items(
     Path(_response_id): Path<String>,
     Query(_params): Query<ListInputItemsQuery>,
     State(_service): State<Arc<ResponseService>>,
-    Extension(_user): Extension<AuthenticatedUser>,
+    Extension(_api_key): Extension<services::auth::ApiKey>,
 ) -> Result<ResponseJson<ResponseInputItemList>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement get_response method in ResponseService to support listing input items
     Err((

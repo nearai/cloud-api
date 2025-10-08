@@ -25,7 +25,7 @@ impl UsageServiceImpl {
 }
 
 #[async_trait::async_trait]
-impl UsageService for UsageServiceImpl {
+impl UsageServiceTrait for UsageServiceImpl {
     /// Calculate cost for a given model and token usage
     /// All costs use fixed scale of 9 (nano-dollars) and USD currency
     async fn calculate_cost(

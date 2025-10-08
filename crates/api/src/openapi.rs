@@ -133,9 +133,6 @@ use utoipa::{Modify, OpenApi};
             crate::routes::attestation::NvidiaPayload,
             crate::routes::attestation::Attestation,
             crate::routes::attestation::QuoteResponse,
-            crate::routes::attestation::GatewayQuote,
-            crate::routes::attestation::ServiceAllowlistEntry,
-            crate::routes::attestation::BuildInfo,
             crate::routes::attestation::ErrorResponse,
             // Model pricing models
             ModelListResponse, ModelWithPricing, DecimalPrice, ModelMetadata,

@@ -6,7 +6,7 @@ use uuid::Uuid;
 // ============================================
 
 #[async_trait::async_trait]
-pub trait UsageService: Send + Sync {
+pub trait UsageServiceTrait: Send + Sync {
     /// Calculate cost for a given model and token usage
     async fn calculate_cost(
         &self,

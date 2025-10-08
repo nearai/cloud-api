@@ -7,14 +7,14 @@ use axum::{
     response::Json as ResponseJson,
 };
 use serde::Deserialize;
-use services::models::ModelsService;
+use services::models::ModelsServiceTrait;
 use std::sync::Arc;
 use tracing::{debug, error};
 use utoipa::IntoParams;
 
 #[derive(Clone)]
 pub struct ModelsAppState {
-    pub models_service: Arc<dyn ModelsService + Send + Sync>,
+    pub models_service: Arc<dyn ModelsServiceTrait + Send + Sync>,
 }
 
 /// Query parameters for model listing

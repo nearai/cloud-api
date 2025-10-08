@@ -79,7 +79,7 @@ pub struct ModelCapabilities {
 
 // Port/Trait definitions (no implementations!)
 #[async_trait]
-pub trait CompletionService: Send + Sync {
+pub trait CompletionServiceTrait: Send + Sync {
     /// Create a streaming completion
     async fn create_completion_stream(
         &self,

@@ -1,16 +1,17 @@
 pub mod ports;
 use super::auth::ports::{UserId, UserRepository};
 use anyhow::Result;
+use async_trait::async_trait;
 pub use ports::*;
 use std::sync::Arc;
 
-pub struct OrganizationService {
+pub struct OrganizationServiceImpl {
     repository: Arc<dyn OrganizationRepository>,
     user_repository: Arc<dyn UserRepository>,
     invitation_repository: Arc<dyn ports::OrganizationInvitationRepository>,
 }
 
-impl OrganizationService {
+impl OrganizationServiceImpl {
     pub fn new(
         repository: Arc<dyn OrganizationRepository>,
         user_repository: Arc<dyn UserRepository>,
@@ -23,8 +24,8 @@ impl OrganizationService {
         }
     }
 
-    /// Create a new organization
-    pub async fn create_organization(
+    /// Create a new organization (private helper)
+    async fn create_organization_impl(
         &self,
         name: String,
         description: Option<String>,
@@ -51,8 +52,8 @@ impl OrganizationService {
             })
     }
 
-    /// Get an organization by ID
-    pub async fn get_organization(
+    /// Get an organization by ID (private helper)
+    async fn get_organization_impl(
         &self,
         id: OrganizationId,
     ) -> Result<Organization, OrganizationError> {
@@ -65,8 +66,8 @@ impl OrganizationService {
             .ok_or(OrganizationError::NotFound)
     }
 
-    /// Update an organization
-    pub async fn update_organization(
+    /// Update an organization (private helper)
+    async fn update_organization_impl(
         &self,
         id: OrganizationId,
         user_id: UserId,
@@ -76,7 +77,7 @@ impl OrganizationService {
         settings: Option<serde_json::Value>,
     ) -> Result<Organization, OrganizationError> {
         // Check if user has permission
-        let org = self.get_organization(id.clone()).await?;
+        let org = self.get_organization_impl(id.clone()).await?;
         if org.owner_id != user_id {
             // Check if user is admin
             if let Ok(Some(member)) = self.repository.get_member(id.0, user_id.0).await {
@@ -113,14 +114,14 @@ impl OrganizationService {
         })
     }
 
-    /// Delete an organization (owner only)
-    pub async fn delete_organization(
+    /// Delete an organization (owner only, private helper)
+    async fn delete_organization_impl(
         &self,
         id: OrganizationId,
         user_id: UserId,
     ) -> Result<bool, OrganizationError> {
         // Check if user is the owner
-        let org = self.get_organization(id.clone()).await?;
+        let org = self.get_organization_impl(id.clone()).await?;
         if org.owner_id != user_id {
             return Err(OrganizationError::Unauthorized(
                 "Only the owner can delete an organization".to_string(),
@@ -132,8 +133,8 @@ impl OrganizationService {
         })
     }
 
-    /// List organizations accessible to a user (where they are a member)
-    pub async fn list_organizations_for_user(
+    /// List organizations accessible to a user (where they are a member, private helper)
+    async fn list_organizations_for_user_impl(
         &self,
         user_id: UserId,
         limit: i64,
@@ -150,8 +151,8 @@ impl OrganizationService {
             })
     }
 
-    /// Add a member to an organization
-    pub async fn add_member(
+    /// Add a member to an organization (private helper)
+    async fn add_member_impl(
         &self,
         organization_id: OrganizationId,
         requester_id: UserId,
@@ -159,7 +160,7 @@ impl OrganizationService {
         role: MemberRole,
     ) -> Result<OrganizationMember, OrganizationError> {
         // Check if requester has permission
-        let org = self.get_organization(organization_id.clone()).await?;
+        let org = self.get_organization_impl(organization_id.clone()).await?;
         if org.owner_id != requester_id {
             // Check if user is admin
             if let Ok(Some(member)) = self
@@ -197,15 +198,15 @@ impl OrganizationService {
             .map_err(|e| OrganizationError::InternalError(format!("Failed to add member: {}", e)))
     }
 
-    /// Remove a member from an organization
-    pub async fn remove_member(
+    /// Remove a member from an organization (private helper)
+    async fn remove_member_impl(
         &self,
         organization_id: OrganizationId,
         requester_id: UserId,
         member_id: UserId,
     ) -> Result<bool, OrganizationError> {
         // Check if requester has permission
-        let org = self.get_organization(organization_id.clone()).await?;
+        let org = self.get_organization_impl(organization_id.clone()).await?;
 
         // Can't remove the owner
         if member_id == org.owner_id {
@@ -241,14 +242,14 @@ impl OrganizationService {
             })
     }
 
-    /// Get all members of an organization
-    pub async fn get_members(
+    /// Get all members of an organization (private helper)
+    async fn get_members_impl(
         &self,
         organization_id: OrganizationId,
         requester_id: UserId,
     ) -> Result<Vec<OrganizationMember>, OrganizationError> {
         // Check if requester is a member
-        let org = self.get_organization(organization_id.clone()).await?;
+        let org = self.get_organization_impl(organization_id.clone()).await?;
         if org.owner_id != requester_id {
             if let Ok(Some(_)) = self
                 .repository
@@ -269,8 +270,8 @@ impl OrganizationService {
             .map_err(|e| OrganizationError::InternalError(format!("Failed to get members: {}", e)))
     }
 
-    /// Update a member's role
-    pub async fn update_member_role(
+    /// Update a member's role (private helper)
+    async fn update_member_role_impl(
         &self,
         organization_id: OrganizationId,
         requester_id: UserId,
@@ -278,7 +279,7 @@ impl OrganizationService {
         new_role: MemberRole,
     ) -> Result<OrganizationMember, OrganizationError> {
         // Check if requester has permission
-        let org = self.get_organization(organization_id.clone()).await?;
+        let org = self.get_organization_impl(organization_id.clone()).await?;
 
         // Only owner can change roles
         if org.owner_id != requester_id {
@@ -311,14 +312,14 @@ impl OrganizationService {
             })
     }
 
-    /// Check if a user is a member of an organization
-    pub async fn is_member(
+    /// Check if a user is a member of an organization (private helper)
+    async fn is_member_impl(
         &self,
         organization_id: OrganizationId,
         user_id: UserId,
     ) -> Result<bool, OrganizationError> {
         // Check if user is owner
-        let org = self.get_organization(organization_id.clone()).await?;
+        let org = self.get_organization_impl(organization_id.clone()).await?;
         if org.owner_id == user_id {
             return Ok(true);
         }
@@ -335,14 +336,14 @@ impl OrganizationService {
         Ok(member.is_some())
     }
 
-    /// Get a user's role in an organization
-    pub async fn get_user_role(
+    /// Get a user's role in an organization (private helper)
+    async fn get_user_role_impl(
         &self,
         organization_id: OrganizationId,
         user_id: UserId,
     ) -> Result<Option<MemberRole>, OrganizationError> {
         // Check if user is owner
-        let org = self.get_organization(organization_id.clone()).await?;
+        let org = self.get_organization_impl(organization_id.clone()).await?;
         if org.owner_id == user_id {
             return Ok(Some(MemberRole::Owner));
         }
@@ -359,14 +360,14 @@ impl OrganizationService {
         Ok(member.map(|m| m.role))
     }
 
-    /// Get the number of members in an organization
-    pub async fn get_member_count(
+    /// Get the number of members in an organization (private helper)
+    async fn get_member_count_impl(
         &self,
         organization_id: OrganizationId,
         requester_id: UserId,
     ) -> Result<i64, OrganizationError> {
         // Check if requester is a member
-        let org = self.get_organization(organization_id.clone()).await?;
+        let org = self.get_organization_impl(organization_id.clone()).await?;
         if org.owner_id != requester_id {
             if let Ok(Some(_)) = self
                 .repository
@@ -389,8 +390,8 @@ impl OrganizationService {
             })
     }
 
-    /// Get organization by name
-    pub async fn get_organization_by_name(
+    /// Get organization by name (private helper)
+    async fn get_organization_by_name_impl(
         &self,
         name: &str,
     ) -> Result<Option<Organization>, OrganizationError> {
@@ -399,14 +400,14 @@ impl OrganizationService {
         })
     }
 
-    /// List organization members with full user information
-    pub async fn get_members_with_users(
+    /// List organization members with full user information (private helper)
+    async fn get_members_with_users_impl(
         &self,
         organization_id: OrganizationId,
         requester_id: UserId,
     ) -> Result<Vec<OrganizationMemberWithUser>, OrganizationError> {
         // Check if requester is a member
-        let org = self.get_organization(organization_id.clone()).await?;
+        let org = self.get_organization_impl(organization_id.clone()).await?;
         if org.owner_id != requester_id {
             if let Ok(Some(_)) = self
                 .repository
@@ -447,15 +448,15 @@ impl OrganizationService {
         Ok(members_with_users)
     }
 
-    /// Invite members by email (batch operation)
-    pub async fn invite_members_by_email(
+    /// Invite members by email (batch operation, private helper)
+    async fn invite_members_by_email_impl(
         &self,
         organization_id: OrganizationId,
         requester_id: UserId,
         invitations: Vec<(String, MemberRole)>, // (email, role) pairs
     ) -> Result<BatchInvitationResponse, OrganizationError> {
         // Check if requester has permission
-        let org = self.get_organization(organization_id.clone()).await?;
+        let org = self.get_organization_impl(organization_id.clone()).await?;
         if org.owner_id != requester_id {
             // Check if user is admin
             if let Ok(Some(member)) = self
@@ -551,8 +552,8 @@ impl OrganizationService {
         })
     }
 
-    /// Add a member by user ID (validates user exists)
-    pub async fn add_member_validated(
+    /// Add a member by user ID (validates user exists, private helper)
+    async fn add_member_validated_impl(
         &self,
         organization_id: OrganizationId,
         requester_id: UserId,
@@ -568,12 +569,12 @@ impl OrganizationService {
             .ok_or(OrganizationError::UserNotFound)?;
 
         // Use existing add_member logic
-        self.add_member(organization_id, requester_id, new_member_id, role)
+        self.add_member_impl(organization_id, requester_id, new_member_id, role)
             .await
     }
 
-    /// Update member role with additional validation
-    pub async fn update_member_role_validated(
+    /// Update member role with additional validation (private helper)
+    async fn update_member_role_validated_impl(
         &self,
         organization_id: OrganizationId,
         requester_id: UserId,
@@ -581,7 +582,7 @@ impl OrganizationService {
         new_role: MemberRole,
     ) -> Result<OrganizationMember, OrganizationError> {
         // Check if requester has permission (only owner or admin can update roles)
-        let org = self.get_organization(organization_id.clone()).await?;
+        let org = self.get_organization_impl(organization_id.clone()).await?;
 
         let requester_member = if org.owner_id == requester_id {
             // Owner has Owner role implicitly
@@ -613,12 +614,12 @@ impl OrganizationService {
         }
 
         // Use existing update_member_role logic
-        self.update_member_role(organization_id, requester_id, member_id, new_role)
+        self.update_member_role_impl(organization_id, requester_id, member_id, new_role)
             .await
     }
 
-    /// Remove member with last owner protection
-    pub async fn remove_member_validated(
+    /// Remove member with last owner protection (private helper)
+    async fn remove_member_validated_impl(
         &self,
         organization_id: OrganizationId,
         requester_id: UserId,
@@ -654,7 +655,7 @@ impl OrganizationService {
             true
         } else {
             // Check requester permissions
-            let org = self.get_organization(organization_id.clone()).await?;
+            let org = self.get_organization_impl(organization_id.clone()).await?;
             if org.owner_id == requester_id {
                 true
             } else if let Ok(Some(member)) = self
@@ -682,8 +683,8 @@ impl OrganizationService {
             })
     }
 
-    /// Create invitations for users (supports unregistered users)
-    pub async fn create_invitations(
+    /// Create invitations for users (supports unregistered users, private helper)
+    async fn create_invitations_impl(
         &self,
         organization_id: OrganizationId,
         requester_id: UserId,
@@ -691,7 +692,7 @@ impl OrganizationService {
         expires_in_hours: i64,
     ) -> Result<BatchInvitationResponse, OrganizationError> {
         // Check if requester has permission
-        let org = self.get_organization(organization_id.clone()).await?;
+        let org = self.get_organization_impl(organization_id.clone()).await?;
         if org.owner_id != requester_id {
             if let Ok(Some(member)) = self
                 .repository
@@ -775,8 +776,8 @@ impl OrganizationService {
         })
     }
 
-    /// List pending invitations for a user by email
-    pub async fn list_user_invitations(
+    /// List pending invitations for a user by email (private helper)
+    async fn list_user_invitations_impl(
         &self,
         email: &str,
     ) -> Result<Vec<ports::OrganizationInvitation>, OrganizationError> {
@@ -788,8 +789,8 @@ impl OrganizationService {
             })
     }
 
-    /// Get invitation by token (public, for viewing before auth)
-    pub async fn get_invitation_by_token(
+    /// Get invitation by token (public, for viewing before auth, private helper)
+    async fn get_invitation_by_token_impl(
         &self,
         token: &str,
     ) -> Result<ports::OrganizationInvitation, OrganizationError> {
@@ -824,8 +825,8 @@ impl OrganizationService {
         Ok(invitation)
     }
 
-    /// Accept invitation by token
-    pub async fn accept_invitation_by_token(
+    /// Accept invitation by token (private helper)
+    async fn accept_invitation_by_token_impl(
         &self,
         token: &str,
         user_id: UserId,
@@ -842,12 +843,12 @@ impl OrganizationService {
             .ok_or(OrganizationError::NotFound)?;
 
         // Use the existing accept_invitation logic with the invitation ID
-        self.accept_invitation(invitation.id, user_id, user_email)
+        self.accept_invitation_impl(invitation.id, user_id, user_email)
             .await
     }
 
-    /// Accept an invitation (creates membership if user is registered)
-    pub async fn accept_invitation(
+    /// Accept an invitation (creates membership if user is registered, private helper)
+    async fn accept_invitation_impl(
         &self,
         invitation_id: uuid::Uuid,
         user_id: UserId,
@@ -931,8 +932,8 @@ impl OrganizationService {
         Ok(member)
     }
 
-    /// Decline an invitation
-    pub async fn decline_invitation(
+    /// Decline an invitation (private helper)
+    async fn decline_invitation_impl(
         &self,
         invitation_id: uuid::Uuid,
         user_email: &str,
@@ -972,15 +973,15 @@ impl OrganizationService {
         Ok(())
     }
 
-    /// List invitations for an organization (admin/owner only)
-    pub async fn list_organization_invitations(
+    /// List invitations for an organization (admin/owner only, private helper)
+    async fn list_organization_invitations_impl(
         &self,
         organization_id: OrganizationId,
         requester_id: UserId,
         status: Option<ports::InvitationStatus>,
     ) -> Result<Vec<ports::OrganizationInvitation>, OrganizationError> {
         // Check if requester has permission
-        let org = self.get_organization(organization_id.clone()).await?;
+        let org = self.get_organization_impl(organization_id.clone()).await?;
         if org.owner_id != requester_id {
             if let Ok(Some(member)) = self
                 .repository
@@ -1005,5 +1006,244 @@ impl OrganizationService {
             .map_err(|e| {
                 OrganizationError::InternalError(format!("Failed to list invitations: {}", e))
             })
+    }
+}
+
+// Implement the trait for the service
+#[async_trait]
+impl OrganizationServiceTrait for OrganizationServiceImpl {
+    async fn create_organization(
+        &self,
+        name: String,
+        description: Option<String>,
+        owner_id: UserId,
+    ) -> Result<Organization, OrganizationError> {
+        self.create_organization_impl(name, description, owner_id)
+            .await
+    }
+
+    async fn get_organization(
+        &self,
+        id: OrganizationId,
+    ) -> Result<Organization, OrganizationError> {
+        self.get_organization_impl(id).await
+    }
+
+    async fn update_organization(
+        &self,
+        id: OrganizationId,
+        user_id: UserId,
+        display_name: Option<String>,
+        description: Option<String>,
+        rate_limit: Option<i32>,
+        settings: Option<serde_json::Value>,
+    ) -> Result<Organization, OrganizationError> {
+        self.update_organization_impl(id, user_id, display_name, description, rate_limit, settings)
+            .await
+    }
+
+    async fn delete_organization(
+        &self,
+        id: OrganizationId,
+        user_id: UserId,
+    ) -> Result<bool, OrganizationError> {
+        self.delete_organization_impl(id, user_id).await
+    }
+
+    async fn list_organizations_for_user(
+        &self,
+        user_id: UserId,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Organization>, OrganizationError> {
+        self.list_organizations_for_user_impl(user_id, limit, offset)
+            .await
+    }
+
+    async fn add_member(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        new_member_id: UserId,
+        role: MemberRole,
+    ) -> Result<OrganizationMember, OrganizationError> {
+        self.add_member_impl(organization_id, requester_id, new_member_id, role)
+            .await
+    }
+
+    async fn remove_member(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        member_id: UserId,
+    ) -> Result<bool, OrganizationError> {
+        self.remove_member_impl(organization_id, requester_id, member_id)
+            .await
+    }
+
+    async fn get_members(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+    ) -> Result<Vec<OrganizationMember>, OrganizationError> {
+        self.get_members_impl(organization_id, requester_id).await
+    }
+
+    async fn update_member_role(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        member_id: UserId,
+        new_role: MemberRole,
+    ) -> Result<OrganizationMember, OrganizationError> {
+        self.update_member_role_impl(organization_id, requester_id, member_id, new_role)
+            .await
+    }
+
+    async fn is_member(
+        &self,
+        organization_id: OrganizationId,
+        user_id: UserId,
+    ) -> Result<bool, OrganizationError> {
+        self.is_member_impl(organization_id, user_id).await
+    }
+
+    async fn get_user_role(
+        &self,
+        organization_id: OrganizationId,
+        user_id: UserId,
+    ) -> Result<Option<MemberRole>, OrganizationError> {
+        self.get_user_role_impl(organization_id, user_id).await
+    }
+
+    async fn get_member_count(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+    ) -> Result<i64, OrganizationError> {
+        self.get_member_count_impl(organization_id, requester_id)
+            .await
+    }
+
+    async fn get_organization_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<Organization>, OrganizationError> {
+        self.get_organization_by_name_impl(name).await
+    }
+
+    async fn get_members_with_users(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+    ) -> Result<Vec<OrganizationMemberWithUser>, OrganizationError> {
+        self.get_members_with_users_impl(organization_id, requester_id)
+            .await
+    }
+
+    async fn invite_members_by_email(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        invitations: Vec<(String, MemberRole)>,
+    ) -> Result<BatchInvitationResponse, OrganizationError> {
+        self.invite_members_by_email_impl(organization_id, requester_id, invitations)
+            .await
+    }
+
+    async fn add_member_validated(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        new_member_id: UserId,
+        role: MemberRole,
+    ) -> Result<OrganizationMember, OrganizationError> {
+        self.add_member_validated_impl(organization_id, requester_id, new_member_id, role)
+            .await
+    }
+
+    async fn update_member_role_validated(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        member_id: UserId,
+        new_role: MemberRole,
+    ) -> Result<OrganizationMember, OrganizationError> {
+        self.update_member_role_validated_impl(organization_id, requester_id, member_id, new_role)
+            .await
+    }
+
+    async fn remove_member_validated(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        member_id: UserId,
+    ) -> Result<bool, OrganizationError> {
+        self.remove_member_validated_impl(organization_id, requester_id, member_id)
+            .await
+    }
+
+    async fn create_invitations(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        invitations: Vec<(String, MemberRole)>,
+        expires_in_hours: i64,
+    ) -> Result<BatchInvitationResponse, OrganizationError> {
+        self.create_invitations_impl(organization_id, requester_id, invitations, expires_in_hours)
+            .await
+    }
+
+    async fn list_user_invitations(
+        &self,
+        email: &str,
+    ) -> Result<Vec<OrganizationInvitation>, OrganizationError> {
+        self.list_user_invitations_impl(email).await
+    }
+
+    async fn get_invitation_by_token(
+        &self,
+        token: &str,
+    ) -> Result<OrganizationInvitation, OrganizationError> {
+        self.get_invitation_by_token_impl(token).await
+    }
+
+    async fn accept_invitation_by_token(
+        &self,
+        token: &str,
+        user_id: UserId,
+        user_email: &str,
+    ) -> Result<OrganizationMember, OrganizationError> {
+        self.accept_invitation_by_token_impl(token, user_id, user_email)
+            .await
+    }
+
+    async fn accept_invitation(
+        &self,
+        invitation_id: uuid::Uuid,
+        user_id: UserId,
+        user_email: &str,
+    ) -> Result<OrganizationMember, OrganizationError> {
+        self.accept_invitation_impl(invitation_id, user_id, user_email)
+            .await
+    }
+
+    async fn decline_invitation(
+        &self,
+        invitation_id: uuid::Uuid,
+        user_email: &str,
+    ) -> Result<(), OrganizationError> {
+        self.decline_invitation_impl(invitation_id, user_email)
+            .await
+    }
+
+    async fn list_organization_invitations(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        status: Option<InvitationStatus>,
+    ) -> Result<Vec<OrganizationInvitation>, OrganizationError> {
+        self.list_organization_invitations_impl(organization_id, requester_id, status)
+            .await
     }
 }

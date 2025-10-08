@@ -306,79 +306,6 @@ pub async fn delete_conversation(
     }
 }
 
-/// List conversations
-///
-/// Returns a list of conversations for the authenticated user.
-#[utoipa::path(
-    get,
-    path = "/conversations",
-    tag = "Conversations",
-    params(
-        ("limit" = Option<i32>, Query, description = "Maximum number of conversations to return"),
-        ("offset" = Option<i32>, Query, description = "Number of conversations to skip")
-    ),
-    responses(
-        (status = 200, description = "List of conversations", body = ConversationList),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    ),
-    security(
-        ("api_key" = [])
-    )
-)]
-pub async fn list_conversations(
-    Query(params): Query<ListConversationsQuery>,
-    State(service): State<Arc<services::ConversationService>>,
-    Extension(api_key): Extension<services::auth::ApiKey>,
-) -> Result<ResponseJson<ConversationList>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    debug!(
-        "List conversations for user {} with limit={:?}, offset={:?}",
-        api_key.created_by_user_id.0, params.limit, params.offset
-    );
-
-    match service
-        .list_conversations(
-            &api_key.created_by_user_id.0.into(),
-            params.limit,
-            params.offset,
-        )
-        .await
-    {
-        Ok(domain_conversations) => {
-            let http_conversations: Vec<ConversationObject> = domain_conversations
-                .into_iter()
-                .map(convert_domain_conversation_to_http)
-                .collect();
-
-            let first_id = http_conversations
-                .first()
-                .map(|c| c.id.clone())
-                .unwrap_or_default();
-            let last_id = http_conversations
-                .last()
-                .map(|c| c.id.clone())
-                .unwrap_or_default();
-
-            // Determine if there are more conversations
-            let has_more = params
-                .limit
-                .is_some_and(|limit| http_conversations.len() >= limit as usize);
-
-            Ok(ResponseJson(ConversationList {
-                object: "list".to_string(),
-                data: http_conversations,
-                first_id,
-                last_id,
-                has_more,
-            }))
-        }
-        Err(error) => Err((
-            map_conversation_error_to_status(&error),
-            ResponseJson(error.into()),
-        )),
-    }
-}
-
 /// List items in a conversation (extracts from responses)
 ///
 /// Returns items (messages, responses, etc.) within a specific conversation.
@@ -496,12 +423,6 @@ impl From<ConversationError> for ErrorResponse {
 }
 
 // Query parameter structs
-#[derive(Debug, Deserialize)]
-pub struct ListConversationsQuery {
-    pub limit: Option<i32>,
-    pub offset: Option<i32>,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct ListItemsQuery {
     pub limit: Option<i32>,

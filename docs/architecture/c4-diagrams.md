@@ -895,27 +895,27 @@ Visualization of the multi-tenant hierarchy and permission inheritance.
 
 ```mermaid
 graph TD
-    subgraph Organization["🏢 Organization (Tenant Root)"]
-        OrgSettings[Settings:<br/>- Rate limits<br/>- Monthly usage limits<br/>- Billing info]
+    subgraph Organization["🏢 Organization - Tenant Root"]
+        OrgSettings["⚙️ Organization Settings<br/>• Rate limits<br/>• Monthly usage limits<br/>• Billing information"]
         
         subgraph Members["👥 Organization Members"]
-            Owner[Owner Role:<br/>- Full control<br/>- Billing access<br/>- Delete org]
-            Admin[Admin Role:<br/>- Manage members<br/>- Create workspaces<br/>- Manage API keys]
-            Member[Member Role:<br/>- View org<br/>- Use API keys]
+            Owner["👑 Owner Role<br/>• Full control<br/>• Billing access<br/>• Delete organization"]
+            Admin["⭐ Admin Role<br/>• Manage members<br/>• Create workspaces<br/>• Manage API keys"]
+            Member["👤 Member Role<br/>• View organization<br/>• Use API keys"]
         end
         
         subgraph Workspaces["📁 Workspaces"]
-            WS1[Workspace: Production<br/>Settings: { ... }]
-            WS2[Workspace: Development<br/>Settings: { ... }]
-            WS3[Workspace: Staging<br/>Settings: { ... }]
+            WS1["📦 Workspace: Production<br/>Custom settings"]
+            WS2["📦 Workspace: Development<br/>Custom settings"]
+            WS3["📦 Workspace: Staging<br/>Custom settings"]
             
-            subgraph APIKeys1["🔑 API Keys (Production)"]
-                Key1[sk_live_prod_xxx<br/>Last used: 2h ago<br/>Spend limit: $1000/mo]
-                Key2[sk_live_backup_xxx<br/>Last used: 3d ago<br/>Spend limit: $500/mo]
+            subgraph APIKeys1["🔑 Production API Keys"]
+                Key1["🔐 sk_live_prod_xxx<br/>Last used: 2h ago<br/>Spend limit: $1000/mo"]
+                Key2["🔐 sk_live_backup_xxx<br/>Last used: 3d ago<br/>Spend limit: $500/mo"]
             end
             
-            subgraph APIKeys2["🔑 API Keys (Development)"]
-                Key3[sk_test_dev_xxx<br/>Last used: 10m ago<br/>No spend limit]
+            subgraph APIKeys2["🔑 Development API Keys"]
+                Key3["🔐 sk_test_dev_xxx<br/>Last used: 10m ago<br/>No spend limit"]
             end
             
             WS1 --> APIKeys1
@@ -923,17 +923,17 @@ graph TD
         end
     end
     
-    Owner --> |Can manage| Members
-    Admin --> |Can manage| Members
-    Owner --> |Can create/delete| Workspaces
-    Admin --> |Can create| Workspaces
-    Owner --> |Can manage| APIKeys1
-    Admin --> |Can manage| APIKeys1
-    Owner --> |Can manage| APIKeys2
-    Admin --> |Can manage| APIKeys2
-    Member --> |Can view| Workspaces
-    Member --> |Can use| APIKeys1
-    Member --> |Can use| APIKeys2
+    Owner -->|Can manage| Members
+    Admin -->|Can manage| Members
+    Owner -->|Can create/delete| Workspaces
+    Admin -->|Can create| Workspaces
+    Owner -->|Can manage| APIKeys1
+    Admin -->|Can manage| APIKeys1
+    Owner -->|Can manage| APIKeys2
+    Admin -->|Can manage| APIKeys2
+    Member -->|Can view| Workspaces
+    Member -->|Can use| APIKeys1
+    Member -->|Can use| APIKeys2
     
     OrgSettings -.->|Inherited by| Workspaces
     OrgSettings -.->|Enforced on| APIKeys1
@@ -1352,7 +1352,6 @@ erDiagram
 - `GET /v1/model/{model_name}` - Get model details with pricing (public)
 
 **Conversations:**
-- `GET /v1/conversations` - List conversations
 - `POST /v1/conversations` - Create conversation
 - `GET /v1/conversations/{id}` - Get conversation
 - `POST /v1/conversations/{id}` - Update conversation

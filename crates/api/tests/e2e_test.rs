@@ -627,13 +627,6 @@ async fn test_conversations_api() {
 
     let (api_key, _) = create_org_and_api_key(&server).await;
 
-    // Test that we can list conversations (should return empty array initially)
-    let response = server
-        .get("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {}", api_key))
-        .await;
-    assert_eq!(response.status_code(), 200);
-
     // Test creating a conversation
     let create_response = server
         .post("/v1/conversations")

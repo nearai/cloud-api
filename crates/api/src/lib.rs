@@ -555,7 +555,6 @@ pub fn build_conversation_routes(
     auth_state_middleware: &AuthState,
 ) -> Router {
     Router::new()
-        .route("/conversations", get(conversations::list_conversations))
         .route("/conversations", post(conversations::create_conversation))
         .route(
             "/conversations/{conversation_id}",

@@ -6,8 +6,9 @@ use axum::{
 };
 use database::Database;
 use services::{
-    attestation::ports::AttestationService, auth::AuthServiceTrait, completions::CompletionService,
-    mcp::McpClientManager, models::ModelsService, organization::OrganizationService,
+    attestation::ports::AttestationServiceTrait, auth::AuthServiceTrait,
+    completions::CompletionServiceTrait, mcp::McpClientManager, models::ModelsServiceTrait,
+    organization::OrganizationServiceTrait,
 };
 use std::sync::Arc;
 
@@ -15,13 +16,13 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Database>, // Still need DB for now, other routes depend on it
-    pub organization_service: Arc<OrganizationService>,
+    pub organization_service: Arc<dyn OrganizationServiceTrait + Send + Sync>,
     pub mcp_manager: Arc<McpClientManager>,
-    pub completion_service: Arc<dyn CompletionService>,
-    pub models_service: Arc<dyn ModelsService>,
+    pub completion_service: Arc<dyn CompletionServiceTrait>,
+    pub models_service: Arc<dyn ModelsServiceTrait>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
-    pub attestation_service: Arc<dyn AttestationService>,
-    pub usage_service: Arc<dyn services::usage::UsageService + Send + Sync>,
+    pub attestation_service: Arc<dyn AttestationServiceTrait>,
+    pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
 }
 

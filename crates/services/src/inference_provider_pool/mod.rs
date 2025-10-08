@@ -7,6 +7,8 @@ use inference_providers::{
 use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 
+type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
+
 #[derive(Clone)]
 pub struct InferenceProviderPool {
     /// Discovery URL for dynamic model discovery
@@ -16,11 +18,11 @@ pub struct InferenceProviderPool {
     /// HTTP timeout for discovery requests
     discovery_timeout: Duration,
     /// Map of model name -> list of providers (for load balancing)
-    model_mapping: Arc<RwLock<HashMap<String, Vec<Arc<dyn InferenceProvider + Send + Sync>>>>>,
+    model_mapping: Arc<RwLock<HashMap<String, Vec<Arc<InferenceProviderTrait>>>>>,
     /// Round-robin index for each model
     load_balancer_index: Arc<RwLock<HashMap<String, usize>>>,
     /// Map of chat_id -> provider for sticky routing
-    chat_id_mapping: Arc<RwLock<HashMap<String, Arc<dyn InferenceProvider + Send + Sync>>>>,
+    chat_id_mapping: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
 }
 
 impl InferenceProviderPool {
@@ -188,7 +190,7 @@ impl InferenceProviderPool {
                     url,
                     self.api_key.clone(),
                     None,
-                ))) as Arc<dyn InferenceProvider + Send + Sync>;
+                ))) as Arc<InferenceProviderTrait>;
 
                 providers_for_model.push(provider);
             }

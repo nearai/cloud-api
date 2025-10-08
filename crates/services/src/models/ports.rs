@@ -58,7 +58,7 @@ pub trait ModelsRepository: Send + Sync {
 }
 
 #[async_trait]
-pub trait ModelsService: Send + Sync {
+pub trait ModelsServiceTrait: Send + Sync {
     /// Get basic model info (from inference providers)
     async fn get_models(&self) -> Result<Vec<ModelInfo>, ModelsError>;
 

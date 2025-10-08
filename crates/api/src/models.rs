@@ -674,16 +674,6 @@ pub struct ConversationObject {
     pub metadata: serde_json::Value,
 }
 
-/// List of conversations
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ConversationList {
-    pub object: String, // "list"
-    pub data: Vec<ConversationObject>,
-    pub first_id: String,
-    pub last_id: String,
-    pub has_more: bool,
-}
-
 /// Deleted conversation result
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ConversationDeleteResult {

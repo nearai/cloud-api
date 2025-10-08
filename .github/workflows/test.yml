@@ -49,20 +49,6 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-cargo-
 
-    - name: Install PostgreSQL client
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y postgresql-client
-
-    - name: Set up and verify database
-      run: ./scripts/test-db-setup.sh
-      env:
-        TEST_DB_HOST: localhost
-        TEST_DB_PORT: 5432
-        TEST_DB_NAME: platform_api
-        TEST_DB_USER: postgres
-        TEST_DB_PASSWORD: postgres
-
     - name: Run cargo fmt
       run: cargo fmt --all -- --check
 

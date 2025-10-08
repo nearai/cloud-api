@@ -35,7 +35,6 @@ use utoipa::{Modify, OpenApi};
         crate::routes::conversations::get_conversation,
         crate::routes::conversations::update_conversation,
         crate::routes::conversations::delete_conversation,
-        crate::routes::conversations::list_conversations,
         crate::routes::conversations::list_conversation_items,
         // Response endpoints
         crate::routes::responses::create_response,
@@ -121,7 +120,7 @@ use utoipa::{Modify, OpenApi};
             crate::routes::users::UpdateUserProfileRequest,
             crate::routes::users::SearchParams,
             // Conversation models
-            CreateConversationRequest, ConversationObject, ConversationList,
+            CreateConversationRequest, ConversationObject,
             UpdateConversationRequest, ConversationDeleteResult, ConversationItemList,
             // Response models
             CreateResponseRequest, ResponseObject,
@@ -134,9 +133,6 @@ use utoipa::{Modify, OpenApi};
             crate::routes::attestation::NvidiaPayload,
             crate::routes::attestation::Attestation,
             crate::routes::attestation::QuoteResponse,
-            crate::routes::attestation::GatewayQuote,
-            crate::routes::attestation::ServiceAllowlistEntry,
-            crate::routes::attestation::BuildInfo,
             crate::routes::attestation::ErrorResponse,
             // Model pricing models
             ModelListResponse, ModelWithPricing, DecimalPrice, ModelMetadata,

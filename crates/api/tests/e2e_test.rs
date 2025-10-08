@@ -1,5 +1,5 @@
 use api::{
-    build_app, init_auth_services, init_database_with_config, init_domain_services,
+    build_app, init_auth_services, init_domain_services,
     models::{
         BatchUpdateModelApiRequest, ConversationContentPart, ConversationItem,
         ResponseOutputContent, ResponseOutputItem,
@@ -10,7 +10,11 @@ use config::ApiConfig;
 use database::Database;
 use inference_providers::{models::ChatCompletionChunk, StreamChunk};
 use std::sync::Arc;
+use tokio::sync::OnceCell;
 use tracing::level_filters::LevelFilter;
+
+// Global once cell to ensure migrations only run once across all tests
+static MIGRATIONS_INITIALIZED: OnceCell<()> = OnceCell::const_new();
 
 // Constants for mock test data
 const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
@@ -68,6 +72,27 @@ fn db_config_for_tests() -> config::DatabaseConfig {
 
 fn get_session_id() -> String {
     "402af343-70ba-4a8a-b926-012f71e86769".to_string()
+}
+
+/// Initialize database with migrations running only once
+async fn init_test_database(config: &config::DatabaseConfig) -> Arc<Database> {
+    let database = Arc::new(
+        Database::from_config(config)
+            .await
+            .expect("Failed to connect to database"),
+    );
+
+    // Ensure migrations only run once across all parallel tests
+    MIGRATIONS_INITIALIZED
+        .get_or_init(|| async {
+            database
+                .run_migrations()
+                .await
+                .expect("Failed to run database migrations");
+        })
+        .await;
+
+    database
 }
 
 /// Create the mock user in the database to satisfy foreign key constraints
@@ -209,7 +234,7 @@ async fn test_models_api() {
         .with_max_level(LevelFilter::DEBUG)
         .try_init();
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock user in database for foreign key constraints
     assert_mock_user_in_db(&database).await;
@@ -235,7 +260,7 @@ async fn test_chat_completions_api() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock user in database for foreign key constraints
     assert_mock_user_in_db(&database).await;
@@ -388,7 +413,7 @@ async fn test_responses_api() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock user in database for foreign key constraints
     assert_mock_user_in_db(&database).await;
@@ -632,7 +657,7 @@ async fn create_response_stream(
 async fn test_conversations_api() {
     // Setup
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock user in database for foreign key constraints
     assert_mock_user_in_db(&database).await;
@@ -666,7 +691,7 @@ async fn test_streaming_responses_api() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock user in database for foreign key constraints
     assert_mock_user_in_db(&database).await;
@@ -789,7 +814,7 @@ async fn test_admin_update_model() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock admin user with admin domain email
     assert_mock_user_in_db(&database).await;
@@ -824,7 +849,7 @@ async fn test_get_model_by_name() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock admin user with admin domain email
     assert_mock_user_in_db(&database).await;
@@ -954,7 +979,7 @@ async fn test_admin_update_organization_limits() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock admin user with admin domain email
     assert_mock_user_in_db(&database).await;
@@ -1018,7 +1043,7 @@ async fn test_admin_update_organization_limits_invalid_org() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock admin user with admin domain email
     assert_mock_user_in_db(&database).await;
@@ -1066,7 +1091,7 @@ async fn test_admin_update_organization_limits_multiple_times() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock admin user with admin domain email
     assert_mock_user_in_db(&database).await;
@@ -1144,7 +1169,7 @@ async fn test_admin_update_organization_limits_usd_only() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock admin user with admin domain email
     assert_mock_user_in_db(&database).await;
@@ -1196,7 +1221,7 @@ async fn test_no_credits_denies_request() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock admin user
     assert_mock_user_in_db(&database).await;
@@ -1254,7 +1279,7 @@ async fn test_usage_tracking_on_completion() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock admin user
     assert_mock_user_in_db(&database).await;
@@ -1332,7 +1357,7 @@ async fn test_usage_limit_enforcement() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock admin user
     assert_mock_user_in_db(&database).await;
@@ -1421,7 +1446,7 @@ async fn test_get_organization_balance() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock admin user
     assert_mock_user_in_db(&database).await;
@@ -1516,7 +1541,7 @@ async fn test_get_organization_usage_history() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock admin user
     assert_mock_user_in_db(&database).await;
@@ -1554,7 +1579,7 @@ async fn test_completion_cost_calculation() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock admin user
     assert_mock_user_in_db(&database).await;
@@ -1805,7 +1830,7 @@ async fn test_organization_balance_with_limit_and_usage() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock admin user
     assert_mock_user_in_db(&database).await;
@@ -1936,7 +1961,7 @@ async fn test_api_key_spend_limit_update() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock admin user
     assert_mock_user_in_db(&database).await;
@@ -2040,7 +2065,7 @@ async fn test_api_key_spend_limit_enforcement() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock admin user
     assert_mock_user_in_db(&database).await;
@@ -2170,7 +2195,7 @@ async fn test_api_key_limit_enforced_before_org_limit() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock admin user
     assert_mock_user_in_db(&database).await;
@@ -2248,7 +2273,7 @@ async fn test_api_key_spend_limit_unauthorized_user() {
         .try_init();
 
     let config = test_config();
-    let database = init_database_with_config(&config.database).await;
+    let database = init_test_database(&config.database).await;
 
     // Create mock admin user
     assert_mock_user_in_db(&database).await;

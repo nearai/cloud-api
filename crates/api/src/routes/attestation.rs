@@ -211,36 +211,22 @@ pub async fn verify_attestation(
     unimplemented!()
 }
 
-/// Build information
-#[derive(Debug, Serialize, ToSchema)]
-pub struct BuildInfo {
-    pub image: String,
-    pub sbom: String,
-}
-
-/// Gateway quote information
-#[derive(Debug, Serialize, ToSchema)]
-pub struct GatewayQuote {
-    pub quote: String,
-    pub measurement: String,
-    pub svn: u32,
-    pub build: BuildInfo,
-}
-
-/// Service allowlist entry
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ServiceAllowlistEntry {
-    pub service: String,
-    pub expected_measurements: Vec<String>,
-    pub min_svn: u32,
-    pub identifier: String,
-}
-
 /// Quote response containing gateway quote and allowlist
 #[derive(Debug, Serialize, ToSchema)]
 pub struct QuoteResponse {
-    pub gateway: GatewayQuote,
-    pub allowlist: Vec<ServiceAllowlistEntry>,
+    /// The attestation quote in hexadecimal format
+    pub quote: String,
+    /// The event log associated with the quote
+    pub event_log: String,
+}
+
+impl From<services::attestation::models::GetQuoteResponse> for QuoteResponse {
+    fn from(response: services::attestation::models::GetQuoteResponse) -> Self {
+        Self {
+            quote: response.quote,
+            event_log: response.event_log,
+        }
+    }
 }
 
 /// Get TDX quote
@@ -260,10 +246,23 @@ pub struct QuoteResponse {
     )
 )]
 pub async fn quote(
-    State(_app_state): State<AppState>,
+    State(app_state): State<AppState>,
     Extension(_api_key): Extension<services::auth::ApiKey>,
 ) -> Result<ResponseJson<QuoteResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    unimplemented!()
+    let quote = app_state
+        .attestation_service
+        .get_quote()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        })?
+        .into();
+    Ok(ResponseJson(quote))
 }
 
 /// Error response

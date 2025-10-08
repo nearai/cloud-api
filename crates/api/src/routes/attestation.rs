@@ -15,13 +15,6 @@ pub struct SignatureQuery {
     pub signing_algo: Option<String>,
 }
 
-/// Query parameters for attestation report
-#[derive(Debug, Serialize, Deserialize, ToSchema, IntoParams)]
-pub struct AttestationQuery {
-    pub model: Option<String>,
-    pub signing_algo: Option<String>,
-}
-
 /// Response for signature endpoint
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SignatureResponse {
@@ -38,61 +31,6 @@ impl From<services::attestation::ChatSignature> for SignatureResponse {
             signature: sig.signature,
             signing_address: sig.signing_address,
             signing_algo: sig.signing_algo,
-        }
-    }
-}
-
-/// Evidence item in NVIDIA payload
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct Evidence {
-    pub certificate: String,
-}
-
-/// NVIDIA attestation payload
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct NvidiaPayload {
-    pub nonce: String,
-    pub evidence_list: Vec<Evidence>,
-}
-
-/// Individual attestation entry
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct Attestation {
-    pub signing_address: String,
-    pub intel_quote: String,
-    pub nvidia_payload: String, // Stored as JSON string
-}
-
-/// Response for attestation report endpoint
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct AttestationResponse {
-    pub signing_address: String,
-    pub intel_quote: String,
-    pub nvidia_payload: String, // Stored as JSON string
-    pub all_attestations: Vec<Attestation>,
-}
-
-impl From<inference_providers::AttestationReport> for AttestationResponse {
-    fn from(report: inference_providers::AttestationReport) -> Self {
-        Self {
-            signing_address: report.signing_address,
-            intel_quote: report.intel_quote,
-            nvidia_payload: report.nvidia_payload,
-            all_attestations: report
-                .all_attestations
-                .into_iter()
-                .map(Attestation::from)
-                .collect(),
-        }
-    }
-}
-
-impl From<inference_providers::AttestationReport> for Attestation {
-    fn from(report: inference_providers::AttestationReport) -> Self {
-        Self {
-            signing_address: report.signing_address,
-            intel_quote: report.intel_quote,
-            nvidia_payload: report.nvidia_payload,
         }
     }
 }
@@ -131,6 +69,68 @@ pub async fn get_signature(
 
     let signature = signature.into();
     Ok(ResponseJson(signature))
+}
+
+/// Query parameters for attestation report
+#[derive(Debug, Serialize, Deserialize, ToSchema, IntoParams)]
+pub struct AttestationQuery {
+    pub model: Option<String>,
+    pub signing_algo: Option<String>,
+}
+
+/// Evidence item in NVIDIA payload
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct Evidence {
+    pub certificate: String,
+}
+
+/// NVIDIA attestation payload
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct NvidiaPayload {
+    pub nonce: String,
+    pub evidence_list: Vec<Evidence>,
+}
+
+/// Individual attestation entry
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct Attestation {
+    pub signing_address: String,
+    pub intel_quote: String,
+    pub nvidia_payload: String, // Stored as JSON string
+}
+
+impl From<inference_providers::AttestationReport> for Attestation {
+    fn from(report: inference_providers::AttestationReport) -> Self {
+        Self {
+            signing_address: report.signing_address,
+            intel_quote: report.intel_quote,
+            nvidia_payload: report.nvidia_payload,
+        }
+    }
+}
+
+/// Response for attestation report endpoint
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AttestationResponse {
+    pub signing_address: String,
+    pub intel_quote: String,
+    pub nvidia_payload: String, // Stored as JSON string
+    pub all_attestations: Vec<Attestation>,
+}
+
+impl From<inference_providers::AttestationReport> for AttestationResponse {
+    fn from(report: inference_providers::AttestationReport) -> Self {
+        Self {
+            signing_address: report.signing_address,
+            intel_quote: report.intel_quote,
+            nvidia_payload: report.nvidia_payload,
+            all_attestations: report
+                .all_attestations
+                .into_iter()
+                .map(Attestation::from)
+                .collect(),
+        }
+    }
 }
 
 #[utoipa::path(
@@ -211,11 +211,11 @@ pub async fn verify_attestation(
     unimplemented!()
 }
 
-/// Quote response containing gateway quote and allowlist
+/// Build information
 #[derive(Debug, Serialize, ToSchema)]
-pub struct QuoteResponse {
-    pub gateway: GatewayQuote,
-    pub allowlist: Vec<ServiceAllowlistEntry>,
+pub struct BuildInfo {
+    pub image: String,
+    pub sbom: String,
 }
 
 /// Gateway quote information
@@ -236,17 +236,11 @@ pub struct ServiceAllowlistEntry {
     pub identifier: String,
 }
 
-/// Build information
+/// Quote response containing gateway quote and allowlist
 #[derive(Debug, Serialize, ToSchema)]
-pub struct BuildInfo {
-    pub image: String,
-    pub sbom: String,
-}
-
-/// Error response
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ErrorResponse {
-    pub error: String,
+pub struct QuoteResponse {
+    pub gateway: GatewayQuote,
+    pub allowlist: Vec<ServiceAllowlistEntry>,
 }
 
 /// Get TDX quote
@@ -272,6 +266,8 @@ pub async fn quote(
     unimplemented!()
 }
 
-// Re-export types for use in router configuration
-pub use AttestationResponse as AttestationResponseType;
-pub use SignatureResponse as SignatureResponseType;
+/// Error response
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ErrorResponse {
+    pub error: String,
+}

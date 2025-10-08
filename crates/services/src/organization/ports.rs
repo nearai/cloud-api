@@ -273,3 +273,198 @@ pub trait OrganizationInvitationRepository: Send + Sync {
     /// Mark expired invitations
     async fn mark_expired(&self) -> Result<usize>;
 }
+
+/// Service trait for organization operations
+#[async_trait]
+pub trait OrganizationServiceTrait: Send + Sync {
+    /// Create a new organization
+    async fn create_organization(
+        &self,
+        name: String,
+        description: Option<String>,
+        owner_id: UserId,
+    ) -> Result<Organization, OrganizationError>;
+
+    /// Get an organization by ID
+    async fn get_organization(&self, id: OrganizationId)
+        -> Result<Organization, OrganizationError>;
+
+    /// Update an organization
+    async fn update_organization(
+        &self,
+        id: OrganizationId,
+        user_id: UserId,
+        display_name: Option<String>,
+        description: Option<String>,
+        rate_limit: Option<i32>,
+        settings: Option<serde_json::Value>,
+    ) -> Result<Organization, OrganizationError>;
+
+    /// Delete an organization (owner only)
+    async fn delete_organization(
+        &self,
+        id: OrganizationId,
+        user_id: UserId,
+    ) -> Result<bool, OrganizationError>;
+
+    /// List organizations accessible to a user (where they are a member)
+    async fn list_organizations_for_user(
+        &self,
+        user_id: UserId,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Organization>, OrganizationError>;
+
+    /// Add a member to an organization
+    async fn add_member(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        new_member_id: UserId,
+        role: MemberRole,
+    ) -> Result<OrganizationMember, OrganizationError>;
+
+    /// Remove a member from an organization
+    async fn remove_member(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        member_id: UserId,
+    ) -> Result<bool, OrganizationError>;
+
+    /// Get all members of an organization
+    async fn get_members(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+    ) -> Result<Vec<OrganizationMember>, OrganizationError>;
+
+    /// Update a member's role
+    async fn update_member_role(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        member_id: UserId,
+        new_role: MemberRole,
+    ) -> Result<OrganizationMember, OrganizationError>;
+
+    /// Check if a user is a member of an organization
+    async fn is_member(
+        &self,
+        organization_id: OrganizationId,
+        user_id: UserId,
+    ) -> Result<bool, OrganizationError>;
+
+    /// Get a user's role in an organization
+    async fn get_user_role(
+        &self,
+        organization_id: OrganizationId,
+        user_id: UserId,
+    ) -> Result<Option<MemberRole>, OrganizationError>;
+
+    /// Get the number of members in an organization
+    async fn get_member_count(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+    ) -> Result<i64, OrganizationError>;
+
+    /// Get organization by name
+    async fn get_organization_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<Organization>, OrganizationError>;
+
+    /// List organization members with full user information
+    async fn get_members_with_users(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+    ) -> Result<Vec<OrganizationMemberWithUser>, OrganizationError>;
+
+    /// Invite members by email (batch operation)
+    async fn invite_members_by_email(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        invitations: Vec<(String, MemberRole)>,
+    ) -> Result<BatchInvitationResponse, OrganizationError>;
+
+    /// Add a member by user ID (validates user exists)
+    async fn add_member_validated(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        new_member_id: UserId,
+        role: MemberRole,
+    ) -> Result<OrganizationMember, OrganizationError>;
+
+    /// Update member role with additional validation
+    async fn update_member_role_validated(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        member_id: UserId,
+        new_role: MemberRole,
+    ) -> Result<OrganizationMember, OrganizationError>;
+
+    /// Remove member with last owner protection
+    async fn remove_member_validated(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        member_id: UserId,
+    ) -> Result<bool, OrganizationError>;
+
+    /// Create invitations for users (supports unregistered users)
+    async fn create_invitations(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        invitations: Vec<(String, MemberRole)>,
+        expires_in_hours: i64,
+    ) -> Result<BatchInvitationResponse, OrganizationError>;
+
+    /// List pending invitations for a user by email
+    async fn list_user_invitations(
+        &self,
+        email: &str,
+    ) -> Result<Vec<OrganizationInvitation>, OrganizationError>;
+
+    /// Get invitation by token (public, for viewing before auth)
+    async fn get_invitation_by_token(
+        &self,
+        token: &str,
+    ) -> Result<OrganizationInvitation, OrganizationError>;
+
+    /// Accept invitation by token
+    async fn accept_invitation_by_token(
+        &self,
+        token: &str,
+        user_id: UserId,
+        user_email: &str,
+    ) -> Result<OrganizationMember, OrganizationError>;
+
+    /// Accept an invitation (creates membership if user is registered)
+    async fn accept_invitation(
+        &self,
+        invitation_id: uuid::Uuid,
+        user_id: UserId,
+        user_email: &str,
+    ) -> Result<OrganizationMember, OrganizationError>;
+
+    /// Decline an invitation
+    async fn decline_invitation(
+        &self,
+        invitation_id: uuid::Uuid,
+        user_email: &str,
+    ) -> Result<(), OrganizationError>;
+
+    /// List invitations for an organization (admin/owner only)
+    async fn list_organization_invitations(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        status: Option<InvitationStatus>,
+    ) -> Result<Vec<OrganizationInvitation>, OrganizationError>;
+}

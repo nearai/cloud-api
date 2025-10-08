@@ -30,7 +30,7 @@ impl AttestationService {
 }
 
 #[async_trait]
-impl ports::AttestationService for AttestationService {
+impl ports::AttestationServiceTrait for AttestationService {
     async fn get_chat_signature(&self, chat_id: &str) -> Result<ChatSignature, CompletionError> {
         if let Some(provider) = self
             .inference_provider_pool

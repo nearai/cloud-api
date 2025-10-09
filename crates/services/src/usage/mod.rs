@@ -8,6 +8,7 @@ pub struct UsageServiceImpl {
     usage_repository: Arc<dyn UsageRepository>,
     model_repository: Arc<dyn ModelRepository>,
     limits_repository: Arc<dyn OrganizationLimitsRepository>,
+    workspace_service: Arc<dyn crate::workspace::WorkspaceServiceTrait>,
 }
 
 impl UsageServiceImpl {
@@ -15,11 +16,13 @@ impl UsageServiceImpl {
         usage_repository: Arc<dyn UsageRepository>,
         model_repository: Arc<dyn ModelRepository>,
         limits_repository: Arc<dyn OrganizationLimitsRepository>,
+        workspace_service: Arc<dyn crate::workspace::WorkspaceServiceTrait>,
     ) -> Self {
         Self {
             usage_repository,
             model_repository,
             limits_repository,
+            workspace_service,
         }
     }
 }
@@ -199,5 +202,81 @@ impl UsageServiceTrait for UsageServiceImpl {
             .map_err(|e| UsageError::InternalError(format!("Failed to get limits: {}", e)))?;
 
         Ok(limit)
+    }
+
+    /// Get usage history for a specific API key
+    async fn get_usage_history_by_api_key(
+        &self,
+        api_key_id: Uuid,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<Vec<UsageLogEntry>, UsageError> {
+        let logs = self
+            .usage_repository
+            .get_usage_history_by_api_key(api_key_id, limit, offset)
+            .await
+            .map_err(|e| {
+                UsageError::InternalError(format!("Failed to get API key usage history: {}", e))
+            })?;
+
+        Ok(logs)
+    }
+
+    /// Get usage history for a specific API key with permission checking
+    async fn get_api_key_usage_history_with_permissions(
+        &self,
+        workspace_id: Uuid,
+        api_key_id: Uuid,
+        user_id: Uuid,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<Vec<UsageLogEntry>, UsageError> {
+        // Check if the user has permission to access this workspace's API keys
+        let can_access = self
+            .workspace_service
+            .can_manage_api_keys(
+                crate::workspace::WorkspaceId(workspace_id),
+                crate::auth::UserId(user_id),
+            )
+            .await
+            .map_err(|e| {
+                UsageError::InternalError(format!("Failed to check workspace permissions: {}", e))
+            })?;
+
+        if !can_access {
+            return Err(UsageError::Unauthorized(
+                "Access denied to this workspace".to_string(),
+            ));
+        }
+
+        // Get the API key through the workspace service to verify it exists and belongs to the workspace
+        let api_keys = self
+            .workspace_service
+            .list_api_keys(
+                crate::workspace::WorkspaceId(workspace_id),
+                crate::auth::UserId(user_id),
+            )
+            .await
+            .map_err(|e| UsageError::InternalError(format!("Failed to get API keys: {}", e)))?;
+
+        // Find the specific API key
+        let api_key_str = api_key_id.to_string();
+        let _api_key = api_keys
+            .iter()
+            .find(|k| k.id.0 == api_key_str)
+            .ok_or_else(|| {
+                UsageError::NotFound("API key not found in this workspace".to_string())
+            })?;
+
+        // Get the usage history
+        let logs = self
+            .usage_repository
+            .get_usage_history_by_api_key(api_key_id, limit, offset)
+            .await
+            .map_err(|e| {
+                UsageError::InternalError(format!("Failed to get usage history: {}", e))
+            })?;
+
+        Ok(logs)
     }
 }

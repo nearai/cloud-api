@@ -80,6 +80,7 @@ use utoipa::{Modify, OpenApi};
         // Usage endpoints
         crate::routes::usage::get_organization_balance,
         crate::routes::usage::get_organization_usage_history,
+        crate::routes::usage::get_api_key_usage_history,
     ),
     components(
         schemas(

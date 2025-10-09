@@ -20,6 +20,7 @@ futures = "0.3"
 futures-util = "0.3"
 thiserror = "2.0"
 config = { path = "../config" }
+rand = "0.8"
 # OAuth2 authentication
 oauth2 = { version = "5", features = ["reqwest"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }

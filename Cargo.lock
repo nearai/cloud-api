@@ -4273,6 +4273,7 @@ dependencies = [
  "hex",
  "inference_providers",
  "oauth2",
+ "rand 0.8.5",
  "reqwest",
  "rmcp",
  "serde",

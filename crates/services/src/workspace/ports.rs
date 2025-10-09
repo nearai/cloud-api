@@ -99,6 +99,16 @@ pub trait WorkspaceRepository: Send + Sync {
         &self,
         organization_id: OrganizationId,
     ) -> anyhow::Result<Vec<Workspace>>;
+
+    /// Create a new workspace
+    async fn create(
+        &self,
+        name: String,
+        display_name: String,
+        description: Option<String>,
+        organization_id: OrganizationId,
+        created_by_user_id: UserId,
+    ) -> anyhow::Result<Workspace>;
 }
 
 // Repository trait for API key data access
@@ -146,6 +156,16 @@ pub trait WorkspaceServiceTrait: Send + Sync {
         organization_id: OrganizationId,
         requester_id: UserId,
     ) -> Result<Vec<Workspace>, WorkspaceError>;
+
+    /// Create a new workspace in an organization with permission checking
+    async fn create_workspace(
+        &self,
+        name: String,
+        display_name: String,
+        description: Option<String>,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+    ) -> Result<Workspace, WorkspaceError>;
 
     /// Create an API key for a workspace with permission checking
     async fn create_api_key(&self, request: CreateApiKeyRequest) -> Result<ApiKey, WorkspaceError>;

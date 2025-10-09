@@ -110,24 +110,22 @@ pub async fn create_organization(
         Ok(org) => {
             debug!("Created organization: {} with owner: {}", org.id, user_id.0);
 
-            // Create a default workspace for the organization
-            let workspace_repo = std::sync::Arc::new(
-                database::repositories::WorkspaceRepository::new(app_state.db.pool().clone()),
-            );
-            let default_workspace_request = database::CreateWorkspaceRequest {
-                name: "default".to_string(),
-                display_name: "Default Workspace".to_string(),
-                description: Some(format!("Default workspace for {}", request.name)),
-            };
-
-            match workspace_repo
-                .create(default_workspace_request, org.id.0, user_id.0)
+            // Create a default workspace for the organization using workspace service
+            match app_state
+                .workspace_service
+                .create_workspace(
+                    "default".to_string(),
+                    "Default Workspace".to_string(),
+                    Some(format!("Default workspace for {}", request.name)),
+                    org.id.clone(),
+                    user_id.clone(),
+                )
                 .await
             {
                 Ok(workspace) => {
                     debug!(
                         "Created default workspace: {} for organization: {}",
-                        workspace.id, org.id.0
+                        workspace.id.0, org.id.0
                     );
                 }
                 Err(e) => {

@@ -7,4 +7,4 @@ edition = "2021"
 version = "0.0.0"
 authors = ["support@near.ai"]
 license = "MIT"
-description = "Platform API"
+description = "NEAR AI Cloud API"

@@ -1,6 +1,6 @@
-# Platform API - C4 Architecture Documentation
+# NEAR AI Cloud API - C4 Architecture Documentation
 
-This document provides comprehensive architecture views of the Platform API system using the C4 model (Context and Container levels).
+This document provides comprehensive architecture views of the NEAR AI Cloud API system using the C4 model (Context and Container levels).
 
 ## Table of Contents
 - [Quick Overview](#quick-overview)
@@ -16,7 +16,7 @@ This document provides comprehensive architecture views of the Platform API syst
 
 ## Quick Overview
 
-The Platform API is a **multi-tenant AI inference platform** running in a **Trusted Execution Environment (TEE)** that provides:
+The NEAR AI Cloud API is a **multi-tenant AI inference platform** running in a **Trusted Execution Environment (TEE)** that provides:
 
 1. **Management Plane** (Session Auth via OAuth)
    - Organization, workspace, and team management
@@ -51,12 +51,12 @@ The Platform API is a **multi-tenant AI inference platform** running in a **Trus
 
 ## Level 1: System Context Diagram
 
-The System Context diagram shows how the Platform API fits into the broader ecosystem, including external actors and systems.
+The System Context diagram shows how the NEAR AI Cloud API fits into the broader ecosystem, including external actors and systems.
 
 ```mermaid
 graph TB
     subgraph TEE["🔒 Trusted Execution Environment (TEE)"]
-        PlatformAPI["<b>Platform API</b><br/>[Rust Application]<br/><br/>Multi-tenant AI inference<br/>platform providing secure<br/>access to language models"]
+        PlatformAPI["<b>Cloud API</b><br/>[Rust Application]<br/><br/>Multi-tenant AI inference<br/>platform providing secure<br/>access to language models"]
     end
     
     %% External Actors
@@ -113,7 +113,7 @@ graph TB
 
 | Element | Type | Description |
 |---------|------|-------------|
-| **Platform API** | Core System | Multi-tenant AI inference API running in a Trusted Execution Environment (TEE) for enhanced security |
+| **Cloud API** | Core System | Multi-tenant AI inference API running in a Trusted Execution Environment (TEE) for enhanced security |
 | **PostgreSQL** | Database | Persistent storage for all application data |
 | **OAuth Providers** | External Services | GitHub and Google for user authentication |
 | **Model Discovery Server** | External Service | Provides dynamic model catalog and provider endpoints |
@@ -129,7 +129,7 @@ The Container diagram shows the high-level technology choices and how responsibi
 ```mermaid
 graph TB
     subgraph TEE["🔒 Trusted Execution Environment"]
-        subgraph API["Platform API Container [Rust/Axum]"]
+        subgraph API["Cloud API Container [Rust/Axum]"]
             subgraph Routes["API Routes Layer"]
                 AuthRoutes["<b>Auth Routes</b><br/>OAuth flows,<br/>login, sessions"]
                 OrgRoutes["<b>Organization Routes</b><br/>CRUD operations"]
@@ -350,7 +350,7 @@ graph TB
 
 ## Key Flows (Sequence Diagrams)
 
-This section illustrates the key operational flows in the Platform API using sequence diagrams.
+This section illustrates the key operational flows in the Cloud API using sequence diagrams.
 
 ### 1. OAuth Authentication Flow
 
@@ -999,7 +999,7 @@ Database
 
 1. **Session-Based (OAuth)** - For management operations:
    ```
-   User → OAuth Provider → Platform API → Session Token → Cookie
+   User → OAuth Provider → Cloud API → Session Token → Cookie
    ```
    - **Providers**: GitHub OAuth, Google OAuth
    - Session stored in database with expiration
@@ -1089,7 +1089,7 @@ The system discovers available models dynamically:
 
 ### 6. Trusted Execution Environment (TEE)
 
-The Platform API runs inside a TEE, providing:
+The Cloud API runs inside a TEE, providing:
 
 - **Attestation**: Cryptographic proof of execution environment
 - **Chat Signatures**: Verifiable signatures for AI-generated content
@@ -1098,7 +1098,7 @@ The Platform API runs inside a TEE, providing:
 
 **Attestation Flow:**
 ```
-Client → GET /attestation → Platform API
+Client → GET /attestation → Cloud API
     → Inference Provider → TEE Attestation Report
     → Signed Response → Client (verifies signature)
 ```
@@ -1381,7 +1381,7 @@ erDiagram
 
 ## Conclusion
 
-The Platform API is a modern, multi-tenant AI inference platform built with Rust, designed for security, scalability, and flexibility. Key highlights:
+The NEAR AI Cloud API is a modern, multi-tenant AI inference platform built with Rust, designed for security, scalability, and flexibility. Key highlights:
 
 - 🔒 **TEE Security**: Runs in Trusted Execution Environment with cryptographic attestation
 - 🏢 **Multi-Tenancy**: Organizations → Workspaces → API Keys hierarchy

@@ -61,7 +61,7 @@ fn db_config_for_tests() -> config::DatabaseConfig {
             config::DatabaseConfig {
                 host: "localhost".to_string(),
                 port: 5432,
-                database: "platform_api".to_string(),
+                database: "cloud_api".to_string(),
                 username: "postgres".to_string(),
                 password: "postgres".to_string(),
                 max_connections: 5,

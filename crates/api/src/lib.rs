@@ -733,7 +733,7 @@ async fn swagger_ui_handler() -> Html<String> {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Platform API Documentation</title>
+    <title>NEAR AI Cloud API Documentation</title>
     <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui.css" />
     <style>
         html {
@@ -837,7 +837,7 @@ mod tests {
         let spec = ApiDoc::openapi();
 
         // Basic validation
-        assert_eq!(spec.info.title, "Platform API");
+        assert_eq!(spec.info.title, "NEAR AI Cloud API");
         assert_eq!(spec.info.version, "1.0.0");
 
         // Ensure we have components defined
@@ -886,7 +886,7 @@ mod tests {
             "HTML should reference our OpenAPI spec URL"
         );
         assert!(
-            html_content.contains("Platform API Documentation"),
+            html_content.contains("NEAR AI Cloud API Documentation"),
             "HTML should have the correct title"
         );
         assert!(

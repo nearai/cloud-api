@@ -11,8 +11,8 @@ use crate::{
         api::{build_management_router, AppState},
         attestation::{get_attestation_report, get_signature, quote, verify_attestation},
         auth::{
-            current_user, github_login, google_login, login_page, logout,
-            oauth_callback, StateStore,
+            current_user, github_login, google_login, login_page, logout, oauth_callback,
+            StateStore,
         },
         completions::{chat_completions, completions, models},
         conversations,
@@ -892,6 +892,8 @@ mod tests {
                 username: "test_user".to_string(),
                 password: "test_pass".to_string(),
                 max_connections: 5,
+                tls_enabled: false,
+                tls_ca_cert_path: None,
             },
         };
 
@@ -921,6 +923,8 @@ mod tests {
             username: "test_user".to_string(),
             password: "test_pass".to_string(),
             max_connections: 5,
+            tls_enabled: false,
+            tls_ca_cert_path: None,
         };
 
         // Initialize database with custom config
@@ -959,6 +963,8 @@ mod tests {
                 username: "test_user".to_string(),
                 password: "test_pass".to_string(),
                 max_connections: 5,
+                tls_enabled: false,
+                tls_ca_cert_path: None,
             },
         };
 

@@ -409,6 +409,53 @@ pub fn authenticated_user_to_user_id(user: AuthenticatedUser) -> services::UserI
     services::UserId(user.0.id)
 }
 
+/// Convert API key request to workspace services format
+pub fn api_key_req_to_workspace_services(
+    req: crate::models::CreateApiKeyRequest,
+    workspace_id: services::workspace::WorkspaceId,
+    created_by_user_id: services::UserId,
+) -> services::workspace::CreateApiKeyRequest {
+    services::workspace::CreateApiKeyRequest {
+        name: req.name,
+        expires_at: req.expires_at,
+        workspace_id,
+        created_by_user_id,
+    }
+}
+
+/// Convert workspace services ApiKey to API response
+pub fn workspace_api_key_to_api_response(
+    api_key: services::workspace::ApiKey,
+) -> crate::models::ApiKeyResponse {
+    let spend_limit = api_key
+        .spend_limit
+        .map(|amount| crate::models::DecimalPrice {
+            amount,
+            scale: 9,
+            currency: "USD".to_string(),
+        });
+
+    // Format key_prefix with "****" to indicate it's a partial key
+    let formatted_prefix = if api_key.key_prefix.len() > 6 {
+        format!("{}****", &api_key.key_prefix[..6])
+    } else {
+        format!("{}****", api_key.key_prefix)
+    };
+
+    crate::models::ApiKeyResponse {
+        id: api_key.id.0,
+        name: Some(api_key.name.clone()),
+        key: api_key.key,
+        key_prefix: formatted_prefix,
+        workspace_id: api_key.workspace_id.0.to_string(),
+        created_by_user_id: api_key.created_by_user_id.0.to_string(),
+        created_at: api_key.created_at,
+        last_used_at: api_key.last_used_at,
+        expires_at: api_key.expires_at,
+        spend_limit,
+    }
+}
+
 // Secure user conversion functions
 /// Convert database::User to PublicUserResponse (safe for all members)
 pub fn db_user_to_public_user(user: &database::User) -> PublicUserResponse {

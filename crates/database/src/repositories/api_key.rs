@@ -464,3 +464,89 @@ impl services::auth::ports::ApiKeyRepository for ApiKeyRepository {
         Ok(db_apikey_to_service_apikey(None, db_api_key))
     }
 }
+
+// Implement the workspace service layer trait
+#[async_trait]
+impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
+    async fn validate(
+        &self,
+        api_key: String,
+    ) -> anyhow::Result<Option<services::workspace::ApiKey>> {
+        let maybe_api_key = self.validate(&api_key).await?;
+        Ok(maybe_api_key.map(|db_api_key| db_apikey_to_workspace_service(None, db_api_key)))
+    }
+
+    async fn create(
+        &self,
+        request: services::workspace::CreateApiKeyRequest,
+    ) -> anyhow::Result<services::workspace::ApiKey> {
+        // Convert workspace service request to auth service request for internal use
+        let auth_request = services::auth::ports::CreateApiKeyRequest {
+            name: request.name,
+            workspace_id: services::auth::ports::WorkspaceId(request.workspace_id.0),
+            created_by_user_id: request.created_by_user_id.clone(),
+            expires_at: request.expires_at,
+        };
+        let (key, db_api_key) = self.create(auth_request).await?;
+        Ok(db_apikey_to_workspace_service(Some(key), db_api_key))
+    }
+
+    async fn get_by_id(
+        &self,
+        id: services::workspace::ApiKeyId,
+    ) -> anyhow::Result<Option<services::workspace::ApiKey>> {
+        let uuid = Uuid::parse_str(&id.0)?;
+        let maybe_api_key = self.get_by_id(uuid).await?;
+        Ok(maybe_api_key.map(|db_api_key| db_apikey_to_workspace_service(None, db_api_key)))
+    }
+
+    async fn list_by_workspace(
+        &self,
+        workspace_id: services::workspace::WorkspaceId,
+    ) -> anyhow::Result<Vec<services::workspace::ApiKey>> {
+        let api_keys = self.list_by_workspace(workspace_id.0).await?;
+        Ok(api_keys
+            .into_iter()
+            .map(|db_api_key| db_apikey_to_workspace_service(None, db_api_key))
+            .collect())
+    }
+
+    async fn delete(&self, id: services::workspace::ApiKeyId) -> anyhow::Result<bool> {
+        self.revoke(Uuid::parse_str(&id.0)?).await
+    }
+
+    async fn update_last_used(&self, id: services::workspace::ApiKeyId) -> anyhow::Result<()> {
+        self.update_last_used(Uuid::parse_str(&id.0)?).await
+    }
+
+    async fn update_spend_limit(
+        &self,
+        id: services::workspace::ApiKeyId,
+        spend_limit: Option<i64>,
+    ) -> anyhow::Result<services::workspace::ApiKey> {
+        let db_api_key = self
+            .update_spend_limit(Uuid::parse_str(&id.0)?, spend_limit)
+            .await?;
+        Ok(db_apikey_to_workspace_service(None, db_api_key))
+    }
+}
+
+// Conversion function for workspace service
+fn db_apikey_to_workspace_service(
+    api_key: Option<String>,
+    db_api_key: ApiKey,
+) -> services::workspace::ApiKey {
+    services::workspace::ApiKey {
+        id: services::workspace::ApiKeyId(db_api_key.id.to_string()),
+        key: api_key,
+        key_prefix: db_api_key.key_prefix,
+        name: db_api_key.name,
+        workspace_id: services::workspace::WorkspaceId(db_api_key.workspace_id),
+        created_by_user_id: services::auth::ports::UserId(db_api_key.created_by_user_id),
+        created_at: db_api_key.created_at,
+        expires_at: db_api_key.expires_at,
+        last_used_at: db_api_key.last_used_at,
+        is_active: db_api_key.is_active,
+        spend_limit: db_api_key.spend_limit,
+    }
+}

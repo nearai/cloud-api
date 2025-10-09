@@ -61,6 +61,7 @@ pub struct DomainServices {
     pub attestation_service: Arc<services::attestation::AttestationService>,
     pub organization_service:
         Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
+    pub workspace_service: Arc<dyn services::workspace::WorkspaceServiceTrait + Send + Sync>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
 }
@@ -229,25 +230,13 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
         models_repo.clone(),
     ));
 
-    // Create usage tracking service (needs to be created before completion service)
+    // Prepare repositories for usage service (will be created after workspace service)
     let usage_repository = Arc::new(database::repositories::OrganizationUsageRepository::new(
         database.pool().clone(),
     ));
     let limits_repository_for_usage = Arc::new(
         database::repositories::OrganizationLimitsRepository::new(database.pool().clone()),
     );
-    let usage_service = Arc::new(services::usage::UsageServiceImpl::new(
-        usage_repository as Arc<dyn services::usage::UsageRepository>,
-        models_repo.clone() as Arc<dyn services::usage::ModelRepository>,
-        limits_repository_for_usage as Arc<dyn services::usage::OrganizationLimitsRepository>,
-    )) as Arc<dyn services::usage::UsageServiceTrait + Send + Sync>;
-
-    // Create completion service with usage tracking
-    let completion_service = Arc::new(services::CompletionServiceImpl::new(
-        inference_provider_pool.clone(),
-        attestation_service.clone(),
-        usage_service.clone(),
-    ));
 
     // Create response service
     let response_service = Arc::new(services::ResponseService::new(
@@ -269,6 +258,37 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
         invitation_repo,
     ));
 
+    // Create workspace service with API key management (needs organization_service)
+    let workspace_repository = Arc::new(database::repositories::WorkspaceRepository::new(
+        database.pool().clone(),
+    )) as Arc<dyn services::workspace::WorkspaceRepository>;
+
+    let api_key_repository = Arc::new(database::repositories::ApiKeyRepository::new(
+        database.pool().clone(),
+    )) as Arc<dyn services::workspace::ApiKeyRepository>;
+
+    let workspace_service = Arc::new(services::workspace::WorkspaceServiceImpl::new(
+        workspace_repository,
+        api_key_repository,
+        organization_service.clone(),
+    ))
+        as Arc<dyn services::workspace::WorkspaceServiceTrait + Send + Sync>;
+
+    // Now create usage service with workspace_service
+    let usage_service = Arc::new(services::usage::UsageServiceImpl::new(
+        usage_repository as Arc<dyn services::usage::UsageRepository>,
+        models_repo.clone() as Arc<dyn services::usage::ModelRepository>,
+        limits_repository_for_usage as Arc<dyn services::usage::OrganizationLimitsRepository>,
+        workspace_service.clone(),
+    )) as Arc<dyn services::usage::UsageServiceTrait + Send + Sync>;
+
+    // Create completion service with usage tracking (needs usage_service)
+    let completion_service = Arc::new(services::CompletionServiceImpl::new(
+        inference_provider_pool.clone(),
+        attestation_service.clone(),
+        usage_service.clone(),
+    ));
+
     // Create session repository for user service
     let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
         as Arc<dyn services::auth::SessionRepository>;
@@ -286,6 +306,7 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
         inference_provider_pool,
         attestation_service,
         organization_service,
+        workspace_service,
         usage_service,
         user_service,
     }
@@ -353,6 +374,7 @@ pub fn build_app_with_config(
     let app_state = AppState {
         db: database.clone(),
         organization_service: domain_services.organization_service.clone(),
+        workspace_service: domain_services.workspace_service.clone(),
         mcp_manager: domain_services.mcp_manager.clone(),
         completion_service: domain_services.completion_service.clone(),
         models_service: domain_services.models_service.clone(),
@@ -621,6 +643,10 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
         .route(
             "/workspaces/{workspace_id}/api-keys/{key_id}/spend-limit",
             axum::routing::patch(update_api_key_spend_limit),
+        )
+        .route(
+            "/workspaces/{workspace_id}/api-keys/{key_id}/usage/history",
+            get(crate::routes::usage::get_api_key_usage_history),
         )
         .with_state(app_state)
         .layer(from_fn_with_state(

@@ -293,6 +293,129 @@ pub async fn get_organization_usage_history(
     }))
 }
 
+/// Get API key usage history
+///
+/// Returns paginated usage history for a specific API key
+#[utoipa::path(
+    get,
+    path = "/workspaces/{workspace_id}/api-keys/{api_key_id}/usage/history",
+    tag = "Usage",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("api_key_id" = String, Path, description = "API Key ID"),
+        ("limit" = Option<i64>, Query, description = "Number of records to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)")
+    ),
+    responses(
+        (status = 200, description = "Usage history", body = UsageHistoryResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_api_key_usage_history(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path((workspace_id, api_key_id)): Path<(String, String)>,
+    Query(query): Query<UsageHistoryQuery>,
+) -> Result<ResponseJson<UsageHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    tracing::debug!(
+        "Get usage history for API key {} in workspace {} by user {}, limit: {}, offset: {}",
+        api_key_id,
+        workspace_id,
+        user.0.id,
+        query.limit,
+        query.offset
+    );
+
+    let workspace_uuid = Uuid::parse_str(&workspace_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Invalid workspace ID".to_string(),
+                "invalid_id".to_string(),
+            )),
+        )
+    })?;
+
+    let api_key_uuid = Uuid::parse_str(&api_key_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Invalid API key ID".to_string(),
+                "invalid_id".to_string(),
+            )),
+        )
+    })?;
+
+    // Get usage history with permission checking handled by the service
+    let history = app_state
+        .usage_service
+        .get_api_key_usage_history_with_permissions(
+            workspace_uuid,
+            api_key_uuid,
+            user.0.id,
+            Some(query.limit),
+            Some(query.offset),
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to get usage history: {}", e);
+            match e {
+                services::usage::UsageError::Unauthorized(_) => (
+                    StatusCode::FORBIDDEN,
+                    ResponseJson(ErrorResponse::new(
+                        "Access denied to this workspace".to_string(),
+                        "forbidden".to_string(),
+                    )),
+                ),
+                services::usage::UsageError::NotFound(_) => (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        "API key not found in this workspace".to_string(),
+                        "not_found".to_string(),
+                    )),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve usage history".to_string(),
+                        "internal_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+
+    let total = history.len();
+    let data = history
+        .into_iter()
+        .map(|entry| UsageHistoryEntryResponse {
+            id: entry.id.to_string(),
+            workspace_id: entry.workspace_id.to_string(),
+            api_key_id: entry.api_key_id.to_string(),
+            model_id: entry.model_id,
+            input_tokens: entry.input_tokens,
+            output_tokens: entry.output_tokens,
+            total_tokens: entry.total_tokens,
+            total_cost: entry.total_cost,
+            total_cost_display: format_amount(entry.total_cost),
+            request_type: entry.request_type,
+            created_at: entry.created_at.to_rfc3339(),
+        })
+        .collect();
+
+    Ok(ResponseJson(UsageHistoryResponse {
+        data,
+        total,
+        limit: query.limit,
+        offset: query.offset,
+    }))
+}
+
 /// Helper function to format amount (fixed scale 9 = nano-dollars, USD)
 fn format_amount(amount: i64) -> String {
     const SCALE: i32 = 9;

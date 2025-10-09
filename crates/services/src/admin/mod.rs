@@ -68,6 +68,30 @@ impl AdminService for AdminServiceImpl {
         Ok(history)
     }
 
+    async fn delete_model(&self, model_name: &str) -> Result<(), AdminError> {
+        // Validate model name
+        if model_name.trim().is_empty() {
+            return Err(AdminError::InvalidPricing(
+                "Model name cannot be empty".to_string(),
+            ));
+        }
+
+        let deleted = self
+            .repository
+            .soft_delete_model(model_name)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+
+        if !deleted {
+            return Err(AdminError::ModelNotFound(format!(
+                "Model '{}' not found",
+                model_name
+            )));
+        }
+
+        Ok(())
+    }
+
     async fn update_organization_limits(
         &self,
         organization_id: uuid::Uuid,

@@ -275,6 +275,29 @@ impl ModelRepository {
         Ok(history)
     }
 
+    /// Soft delete a model by setting is_active to false
+    pub async fn soft_delete_model(&self, model_name: &str) -> Result<bool> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let result = client
+            .execute(
+                r#"
+                UPDATE models 
+                SET is_active = false, updated_at = NOW()
+                WHERE model_name = $1
+                "#,
+                &[&model_name],
+            )
+            .await
+            .context("Failed to soft delete model")?;
+
+        Ok(result > 0)
+    }
+
     /// Helper method to convert database row to Model
     fn row_to_model(&self, row: &Row) -> Model {
         Model {

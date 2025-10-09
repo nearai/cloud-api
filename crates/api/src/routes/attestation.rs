@@ -37,7 +37,7 @@ impl From<services::attestation::ChatSignature> for SignatureResponse {
 
 #[utoipa::path(
     get,
-    path = "/v1/signature/{chat_id}",
+    path = "/signature/{chat_id}",
     params(
         ("chat_id" = String, Path, description = "Chat completion ID"),
         SignatureQuery
@@ -135,7 +135,7 @@ impl From<inference_providers::AttestationReport> for AttestationResponse {
 
 #[utoipa::path(
     get,
-    path = "/v1/attestation/report",
+    path = "/attestation/report",
     params(
         AttestationQuery
     ),
@@ -191,7 +191,7 @@ pub struct VerifyResponse {
 
 #[utoipa::path(
     post,
-    path = "/v1/verify/{chat_id}",
+    path = "/verify/{chat_id}",
     params(
         ("chat_id" = String, Path, description = "Chat completion ID to verify")
     ),
@@ -234,7 +234,7 @@ impl From<services::attestation::models::GetQuoteResponse> for QuoteResponse {
 /// Returns a TDX quote for testing purposes.
 #[utoipa::path(
     get,
-    path = "/v1/attestation/quote", 
+    path = "/attestation/quote", 
     tag = "Attestation",
     responses(
         (status = 200, description = "TDX quote", body = QuoteResponse),

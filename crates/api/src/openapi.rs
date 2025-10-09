@@ -68,6 +68,7 @@ use utoipa::{Modify, OpenApi};
         // Users endpoints
         crate::routes::users::get_current_user,
         crate::routes::users::update_current_user_profile,
+        crate::routes::users::quick_setup,
         crate::routes::users::get_user_sessions,
         crate::routes::users::revoke_user_session,
         crate::routes::users::revoke_all_user_sessions,
@@ -118,6 +119,7 @@ use utoipa::{Modify, OpenApi};
             AdminUserResponse,
             crate::routes::users::UpdateUserProfileRequest,
             crate::routes::users::SearchParams,
+            crate::routes::users::QuickSetupResponse,
             // Conversation models
             CreateConversationRequest, ConversationObject,
             UpdateConversationRequest, ConversationDeleteResult, ConversationItemList,

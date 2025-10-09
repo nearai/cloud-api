@@ -65,6 +65,8 @@ fn db_config_for_tests() -> config::DatabaseConfig {
                 username: "postgres".to_string(),
                 password: "postgres".to_string(),
                 max_connections: 5,
+                tls_enabled: false,
+                tls_ca_cert_path: None,
             }
         }
     }

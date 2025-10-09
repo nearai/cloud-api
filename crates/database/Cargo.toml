@@ -17,6 +17,17 @@ tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"
 # Crate: https://crates.io/crates/deadpool-postgres
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
 
+# TLS support for PostgreSQL connections (required for remote databases like DigitalOcean)
+# Documentation: https://docs.rs/tokio-postgres-rustls/latest/tokio_postgres_rustls/
+tokio-postgres-rustls = "0.13"
+# Rustls with ring crypto provider
+rustls = { version = "0.23", features = ["ring"] }
+# Platform-native certificate verifier with OS integration and revocation support
+# Documentation: https://docs.rs/rustls-platform-verifier/latest/rustls_platform_verifier/
+rustls-platform-verifier = "0.6"
+# PEM file parsing for custom certificates
+rustls-pemfile = "2.0"
+
 # PostgreSQL types
 postgres-types = { version = "0.2", features = ["derive", "with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
 

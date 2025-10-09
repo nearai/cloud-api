@@ -413,6 +413,25 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
             .map(db_workspace_to_workspace_service)
             .collect())
     }
+
+    async fn create(
+        &self,
+        name: String,
+        display_name: String,
+        description: Option<String>,
+        organization_id: services::organization::OrganizationId,
+        created_by_user_id: services::auth::ports::UserId,
+    ) -> anyhow::Result<services::workspace::Workspace> {
+        let request = crate::models::CreateWorkspaceRequest {
+            name,
+            display_name,
+            description,
+        };
+        let db_workspace = self
+            .create(request, organization_id.0, created_by_user_id.0)
+            .await?;
+        Ok(db_workspace_to_workspace_service(db_workspace))
+    }
 }
 
 // Conversion function for workspace service

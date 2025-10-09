@@ -46,6 +46,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::models::get_model_by_name,
         // Admin endpoints
         crate::routes::admin::batch_upsert_models,
+        crate::routes::admin::delete_model,
         crate::routes::admin::get_model_pricing_history,
         crate::routes::admin::update_organization_limits,
         crate::routes::admin::list_users,

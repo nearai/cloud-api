@@ -680,8 +680,8 @@ pub fn build_model_routes(models_service: Arc<dyn ModelsServiceTrait>) -> Router
 pub fn build_admin_routes(database: Arc<Database>, auth_state_middleware: &AuthState) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
-        batch_upsert_models, get_model_pricing_history, list_users, update_organization_limits,
-        AdminAppState,
+        batch_upsert_models, delete_model, get_model_pricing_history, list_users,
+        update_organization_limits, AdminAppState,
     };
     use database::repositories::AdminCompositeRepository;
     use services::admin::AdminServiceImpl;
@@ -698,6 +698,10 @@ pub fn build_admin_routes(database: Arc<Database>, auth_state_middleware: &AuthS
 
     Router::new()
         .route("/admin/models", axum::routing::patch(batch_upsert_models))
+        .route(
+            "/admin/models/{model_name}",
+            axum::routing::delete(delete_model),
+        )
         .route(
             "/admin/models/{model_name}/pricing-history",
             axum::routing::get(get_model_pricing_history),

@@ -267,49 +267,6 @@ pub async fn logout(Extension(user): Extension<AuthenticatedUser>) -> Response {
         .into_response()
 }
 
-/// Success page after authentication
-///
-/// NOTE: This endpoint is DEPRECATED as part of the old server-centric OAuth flow.
-/// In the new frontend-centric flow, the frontend handles the post-authentication experience.
-pub async fn auth_success() -> Html<&'static str> {
-    Html(
-        r#"<!DOCTYPE html>
-<html>
-<head>
-    <title>Authentication Successful</title>
-    <style>
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            margin: 0;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        }
-        .container {
-            background: white;
-            padding: 2rem;
-            border-radius: 8px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            text-align: center;
-        }
-        h1 { color: #2d3748; }
-        p { color: #4a5568; margin: 1rem 0; }
-        .success { color: #48bb78; font-weight: bold; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🎉 Authentication Successful!</h1>
-        <p class="success">You are now logged in.</p>
-        <p>You can close this window and return to your application.</p>
-    </div>
-</body>
-</html>"#,
-    )
-}
-
 /// Login page with OAuth provider options
 pub async fn login_page() -> Html<&'static str> {
     Html(

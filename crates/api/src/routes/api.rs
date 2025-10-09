@@ -40,7 +40,6 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
                 .put(update_organization)
                 .delete(delete_organization),
         )
-        .route("/{id}/api-keys/{key_id}", delete(revoke_api_key))
         // Organization member management
         .route(
             "/{id}/members",
@@ -116,24 +115,4 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
         .nest("/users", user_routes)
         .with_state(app_state)
         .layer(from_fn_with_state(auth_state, auth_middleware))
-}
-
-// Revoke an API key
-// DEPRECATED: This organization-based route is deprecated in favor of workspace-based revocation
-// Kept for backward compatibility but returns HTTP 410 Gone
-pub async fn revoke_api_key(
-    _state: axum::extract::State<AppState>,
-    _user: axum::extract::Extension<crate::middleware::AuthenticatedUser>,
-    axum::extract::Path((org_id, api_key_id)): axum::extract::Path<(uuid::Uuid, uuid::Uuid)>,
-) -> Result<axum::http::StatusCode, axum::http::StatusCode> {
-    use tracing::error;
-
-    error!(
-        "Attempted to use deprecated organization-based API key revocation for key: {} in org: {}",
-        api_key_id, org_id
-    );
-
-    // Return HTTP 410 Gone to indicate this endpoint is deprecated
-    // Clients should use /workspaces/{workspace_id}/api-keys/{key_id} instead
-    Err(axum::http::StatusCode::GONE)
 }

@@ -1,6 +1,6 @@
-# Platform API
+# NEAR AI Cloud API
 
-A Rust-based platform API with conversation management, response generation, and inference provider integration.
+A Rust-based cloud API for AI model inference, conversation management, and organization administration. Part of the NEAR AI platform alongside the Chat API.
 
 ## Quick Start
 
@@ -15,7 +15,7 @@ A Rust-based platform API with conversation management, response generation, and
 1. **Clone the repository**:
    ```bash
    git clone <repository-url>
-   cd platform-api
+   cd cloud-api
    ```
 
 2. **Start services with Docker Compose**:
@@ -25,7 +25,7 @@ A Rust-based platform API with conversation management, response generation, and
 
    This starts:
    - PostgreSQL database on port 5432
-   - Platform API on port 3000
+   - NEAR AI Cloud API on port 3000
 
 3. **Run without Docker**:
    ```bash
@@ -57,14 +57,14 @@ cargo test --test e2e_test
 # Start test database
 docker run --name test-postgres \
   -e POSTGRES_PASSWORD=postgres \
-  -e POSTGRES_DB=platform_api \
+  -e POSTGRES_DB=cloud_api \
   -p 5432:5432 \
   -d postgres:latest
 
 # Run tests
 TEST_DB_HOST=localhost \
 TEST_DB_PORT=5432 \
-TEST_DB_NAME=platform_api \
+TEST_DB_NAME=cloud_api \
 TEST_DB_USER=postgres \
 TEST_DB_PASSWORD=postgres \
 cargo test --test e2e_test
@@ -75,7 +75,7 @@ Set these environment variables before running tests:
 ```bash
 export TEST_DB_HOST=localhost
 export TEST_DB_PORT=5432
-export TEST_DB_NAME=platform_api_test  # Use a dedicated test database
+export TEST_DB_NAME=cloud_api_test  # Use a dedicated test database
 export TEST_DB_USER=your_username
 export TEST_DB_PASSWORD=your_password
 ```

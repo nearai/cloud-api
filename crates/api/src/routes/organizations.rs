@@ -1,6 +1,5 @@
 use crate::models::{
-    ApiKeyResponse, CreateApiKeyRequest, CreateOrganizationRequest, ErrorResponse,
-    OrganizationResponse, UpdateOrganizationRequest,
+    CreateOrganizationRequest, ErrorResponse, OrganizationResponse, UpdateOrganizationRequest,
 };
 use crate::{middleware::AuthenticatedUser, routes::api::AppState};
 use axum::{
@@ -330,66 +329,4 @@ pub async fn delete_organization(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
-}
-
-/// Create API key for organization
-///
-/// DEPRECATED: This endpoint is deprecated. Use workspace-based API key creation instead.
-/// Creates a new API key for an organization.
-#[deprecated(note = "Use POST /workspaces/{workspace_id}/api-keys instead")]
-#[utoipa::path(
-    post,
-    path = "/organizations/{org_id}/api-keys",
-    tag = "Organizations",
-    params(
-        ("org_id" = Uuid, Path, description = "Organization ID")
-    ),
-    request_body = CreateApiKeyRequest,
-    responses(
-        (status = 410, description = "Gone - This endpoint is deprecated. Use workspace-based API key creation.", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse)
-    ),
-    security(
-        ("session_token" = []),
-    )
-)]
-pub async fn create_organization_api_key(
-    _state: State<AppState>,
-    _user: Extension<AuthenticatedUser>,
-    _org_id: Path<Uuid>,
-    _request: Json<CreateApiKeyRequest>,
-) -> Result<Json<ApiKeyResponse>, StatusCode> {
-    // This endpoint is deprecated in favor of workspace-based API keys
-    error!("Attempted to use deprecated organization API key creation endpoint");
-    Err(StatusCode::GONE) // HTTP 410 Gone - indicates the endpoint is deprecated
-}
-
-/// List API keys for organization
-///
-/// DEPRECATED: This endpoint is deprecated. Use workspace-based API key listing instead.
-/// Returns a list of all API keys for an organization.
-#[deprecated(note = "Use GET /workspaces/{workspace_id}/api-keys instead")]
-#[utoipa::path(
-    get,
-    path = "/organizations/{org_id}/api-keys",
-    tag = "Organizations",
-    params(
-        ("org_id" = Uuid, Path, description = "Organization ID")
-    ),
-    responses(
-        (status = 410, description = "Gone - This endpoint is deprecated. Use workspace-based API key listing.", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse)
-    ),
-    security(
-        ("session_token" = [])
-    )
-)]
-pub async fn list_organization_api_keys(
-    _state: State<AppState>,
-    _user: Extension<AuthenticatedUser>,
-    _org_id: Path<Uuid>,
-) -> Result<Json<Vec<ApiKeyResponse>>, StatusCode> {
-    // This endpoint is deprecated in favor of workspace-based API keys
-    error!("Attempted to use deprecated organization API key listing endpoint");
-    Err(StatusCode::GONE) // HTTP 410 Gone - indicates the endpoint is deprecated
 }

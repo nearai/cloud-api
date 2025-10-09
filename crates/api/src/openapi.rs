@@ -28,8 +28,6 @@ use utoipa::{Modify, OpenApi};
         crate::routes::organizations::get_organization,
         crate::routes::organizations::update_organization,
         crate::routes::organizations::delete_organization,
-        crate::routes::organizations::create_organization_api_key,
-        crate::routes::organizations::list_organization_api_keys,
         // Conversation endpoints
         crate::routes::conversations::create_conversation,
         crate::routes::conversations::get_conversation,

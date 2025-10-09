@@ -16,15 +16,6 @@ use services::organization::{OrganizationError, OrganizationId};
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-/// DEPRECATED: Legacy response type that exposes too much sensitive data
-#[deprecated(note = "Use PublicOrganizationMemberResponse instead")]
-#[derive(Debug, serde::Serialize)]
-pub struct OrganizationMemberWithUser {
-    #[serde(flatten)]
-    pub member: database::OrganizationMember,
-    pub user: database::User,
-}
-
 /// Add a member to an organization
 ///
 /// Adds a new member to the organization. The authenticated user must be an owner or admin.

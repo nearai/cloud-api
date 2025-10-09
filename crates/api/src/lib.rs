@@ -11,7 +11,7 @@ use crate::{
         api::{build_management_router, AppState},
         attestation::{get_attestation_report, get_signature, quote, verify_attestation},
         auth::{
-            auth_success, current_user, github_login, google_login, login_page, logout,
+            current_user, github_login, google_login, login_page, logout,
             oauth_callback, StateStore,
         },
         completions::{chat_completions, completions, models},
@@ -483,7 +483,6 @@ pub fn build_auth_routes(
             )),
         )
         .route("/logout", post(logout))
-        .route("/success", get(auth_success))
         .with_state(auth_state)
 }
 

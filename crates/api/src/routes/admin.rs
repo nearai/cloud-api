@@ -263,8 +263,8 @@ pub async fn update_organization_limits(
 ) -> Result<ResponseJson<UpdateOrganizationLimitsResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
 {
     debug!(
-        "Update organization limits request for org_id: {}, amount: {}, scale: {}, currency: {}",
-        org_id, request.spend_limit.amount, request.spend_limit.scale, request.spend_limit.currency
+        "Update organization limits request for org_id: {}, amount: {} nano-dollars, currency: {}",
+        org_id, request.spend_limit.amount, request.spend_limit.currency
     );
 
     // Parse organization ID
@@ -323,7 +323,7 @@ pub async fn update_organization_limits(
         organization_id: updated_limits.organization_id.to_string(),
         spend_limit: SpendLimit {
             amount: updated_limits.spend_limit,
-            scale: 9,
+            scale: Some(9), // Always scale 9 (nano-dollars)
             currency: "USD".to_string(),
         },
         updated_at: updated_limits.effective_from.to_rfc3339(),

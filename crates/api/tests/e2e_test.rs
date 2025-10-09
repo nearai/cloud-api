@@ -997,11 +997,10 @@ async fn test_admin_update_organization_limits() {
     let org = create_org(&server).await;
     println!("Created organization: {:?}", org);
 
-    // Update organization limits (scale 9 = nano-dollars)
+    // Update organization limits (amount is in nano-dollars, scale 9 is implicit)
     let update_request = serde_json::json!({
         "spendLimit": {
             "amount": 100000000000i64,  // $100.00 USD (in nano-dollars)
-            "scale": 9,
             "currency": "USD"
         },
         "changedBy": "admin@test.com",
@@ -1032,7 +1031,7 @@ async fn test_admin_update_organization_limits() {
     // Verify the response
     assert_eq!(update_response.organization_id, org.id);
     assert_eq!(update_response.spend_limit.amount, 100000000000i64);
-    assert_eq!(update_response.spend_limit.scale, 9);
+    assert_eq!(update_response.spend_limit.scale, Some(9));
     assert_eq!(update_response.spend_limit.currency, "USD");
     assert!(!update_response.updated_at.is_empty());
 }

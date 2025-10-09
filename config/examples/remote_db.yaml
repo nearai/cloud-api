@@ -1,0 +1,51 @@
+server:
+  host: "0.0.0.0"
+  port: 3000
+
+model_discovery:
+  discovery_server_url: "http://51.91.160.170:8080/models"
+  api_key: "password"
+  refresh_interval: 300
+  timeout: 5
+
+logging:
+  level: "info"
+  format: "compact"
+  modules:
+    api: "info"
+    services: "info"
+
+dstack_client:
+  url: "http://localhost:8000"
+
+# Authentication configuration
+auth:
+  mock: false
+  
+  github:
+    client_id: "your_client_id"
+    client_secret: "your_client_secret"
+    redirect_url: "http://localhost:3000/v1/auth/callback"
+  
+  google:
+    client_id: "your_client_id"
+    client_secret: "your_client_secret"
+    redirect_url: "http://localhost:3000/v1/auth/callback"
+
+  admin_domains: ["test.com"]
+
+# Example configuration for connecting to a remote database with TLS
+database:
+  host: "your-remote-db.example.com"
+  port: 5432
+  database: "platform_api"
+  username: "your_username"
+  password: "your_password"
+  max_connections: 10
+  # Enable TLS for secure connections to remote databases (DigitalOcean, AWS RDS, etc.)
+  # Uses rustls with platform-native certificate verification (OS certificate store + revocation checking)
+  tls_enabled: true
+  # Optional: Path to custom CA certificate file (e.g., from DigitalOcean)
+  # If not specified, uses platform verifier (Security.framework on macOS, native stores on other OSes)
+  # tls_ca_cert_path: "/path/to/ca-certificate.crt"
+

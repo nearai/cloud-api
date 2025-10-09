@@ -186,6 +186,42 @@ impl OrganizationUsageRepository {
         Ok(rows.iter().map(|row| self.row_to_usage_log(row)).collect())
     }
 
+    /// Get usage history for a specific API key
+    pub async fn get_usage_history_by_api_key(
+        &self,
+        api_key_id: Uuid,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<Vec<OrganizationUsageLog>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let limit = limit.unwrap_or(100);
+        let offset = offset.unwrap_or(0);
+
+        let rows = client
+            .query(
+                r#"
+                SELECT id, organization_id, workspace_id, api_key_id, response_id,
+                       model_id, input_tokens, output_tokens, total_tokens,
+                       input_cost, output_cost, total_cost,
+                       request_type, created_at
+                FROM organization_usage_log
+                WHERE api_key_id = $1
+                ORDER BY created_at DESC
+                LIMIT $2 OFFSET $3
+                "#,
+                &[&api_key_id, &limit, &offset],
+            )
+            .await
+            .context("Failed to query usage history by API key")?;
+
+        Ok(rows.iter().map(|row| self.row_to_usage_log(row)).collect())
+    }
+
     /// Get usage statistics for a time period
     pub async fn get_usage_stats(
         &self,

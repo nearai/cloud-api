@@ -13,10 +13,7 @@ use axum::{
 };
 use database::repositories::WorkspaceRepository as DbWorkspaceRepository;
 use serde::{Deserialize, Serialize};
-use services::{
-    auth::{ports::WorkspaceId, AuthError},
-    organization::OrganizationId,
-};
+use services::organization::OrganizationId;
 use std::sync::Arc;
 use tracing::{debug, error};
 use utoipa::ToSchema;
@@ -551,19 +548,19 @@ pub async fn create_workspace_api_key(
     );
 
     let user_id = authenticated_user_to_user_id(user.clone());
-    let workspace_id_typed = WorkspaceId(workspace_id);
+    let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
 
     // Create API key request for services layer
-    let services_request = crate::conversions::api_key_req_to_services_workspace(
+    let services_request = crate::conversions::api_key_req_to_workspace_services(
         request,
         workspace_id_typed.clone(),
         user_id.clone(),
     );
 
-    // Use the auth service to create the API key
+    // Use the workspace service to create the API key
     match app_state
-        .auth_service
-        .create_workspace_api_key(services_request)
+        .workspace_service
+        .create_api_key(services_request)
         .await
     {
         Ok(api_key) => {
@@ -571,10 +568,11 @@ pub async fn create_workspace_api_key(
                 "Created API key: {:?} for workspace: {}",
                 api_key.id, workspace_id
             );
-            let response = crate::conversions::services_api_key_to_api_response(api_key);
+            let response = crate::conversions::workspace_api_key_to_api_response(api_key);
             Ok((StatusCode::CREATED, Json(response)))
         }
-        Err(AuthError::Unauthorized) => Err(StatusCode::FORBIDDEN),
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
+        Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
             error!("Failed to create API key: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -614,12 +612,12 @@ pub async fn list_workspace_api_keys(
     );
 
     let user_id = authenticated_user_to_user_id(user);
-    let workspace_id_typed = WorkspaceId(workspace_id);
+    let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
 
-    // Use auth service to list workspace API keys
+    // Use workspace service to list workspace API keys
     match app_state
-        .auth_service
-        .list_workspace_api_keys(workspace_id_typed, user_id)
+        .workspace_service
+        .list_api_keys(workspace_id_typed, user_id)
         .await
     {
         Ok(api_keys) => {
@@ -630,11 +628,12 @@ pub async fn list_workspace_api_keys(
             );
             let response: Vec<ApiKeyResponse> = api_keys
                 .into_iter()
-                .map(crate::conversions::services_api_key_to_api_response)
+                .map(crate::conversions::workspace_api_key_to_api_response)
                 .collect();
             Ok(Json(response))
         }
-        Err(AuthError::Unauthorized) => Err(StatusCode::FORBIDDEN),
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
+        Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
             error!("Failed to list API keys: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)

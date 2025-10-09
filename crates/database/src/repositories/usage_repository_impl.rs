@@ -90,4 +90,35 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             })
             .collect())
     }
+
+    async fn get_usage_history_by_api_key(
+        &self,
+        api_key_id: Uuid,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> anyhow::Result<Vec<UsageLogEntry>> {
+        let logs = self
+            .get_usage_history_by_api_key(api_key_id, limit, offset)
+            .await?;
+
+        Ok(logs
+            .into_iter()
+            .map(|log| UsageLogEntry {
+                id: log.id,
+                organization_id: log.organization_id,
+                workspace_id: log.workspace_id,
+                api_key_id: log.api_key_id,
+                response_id: log.response_id,
+                model_id: log.model_id,
+                input_tokens: log.input_tokens,
+                output_tokens: log.output_tokens,
+                total_tokens: log.total_tokens,
+                input_cost: log.input_cost,
+                output_cost: log.output_cost,
+                total_cost: log.total_cost,
+                request_type: log.request_type,
+                created_at: log.created_at,
+            })
+            .collect())
+    }
 }

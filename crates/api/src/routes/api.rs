@@ -8,7 +8,7 @@ use database::Database;
 use services::{
     attestation::ports::AttestationServiceTrait, auth::AuthServiceTrait,
     completions::CompletionServiceTrait, mcp::McpClientManager, models::ModelsServiceTrait,
-    organization::OrganizationServiceTrait,
+    organization::OrganizationServiceTrait, workspace::WorkspaceServiceTrait,
 };
 use std::sync::Arc;
 
@@ -17,6 +17,7 @@ use std::sync::Arc;
 pub struct AppState {
     pub db: Arc<Database>, // Still need DB for now, other routes depend on it
     pub organization_service: Arc<dyn OrganizationServiceTrait + Send + Sync>,
+    pub workspace_service: Arc<dyn WorkspaceServiceTrait + Send + Sync>,
     pub mcp_manager: Arc<McpClientManager>,
     pub completion_service: Arc<dyn CompletionServiceTrait>,
     pub models_service: Arc<dyn ModelsServiceTrait>,

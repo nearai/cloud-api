@@ -293,9 +293,19 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
     let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
         as Arc<dyn services::auth::SessionRepository>;
 
-    // Create user service
-    let user_service = Arc::new(services::user::UserService::new(user_repo, session_repo))
-        as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
+    // Create workspace repository for user service
+    let workspace_repository_for_user = Arc::new(database::repositories::WorkspaceRepository::new(
+        database.pool().clone(),
+    )) as Arc<dyn services::workspace::WorkspaceRepository>;
+
+    // Create user service (needs organization_service and workspace_service for quick_setup)
+    let user_service = Arc::new(services::user::UserService::new(
+        user_repo,
+        session_repo,
+        organization_service.clone(),
+        workspace_repository_for_user,
+        workspace_service.clone(),
+    )) as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
 
     DomainServices {
         conversation_service,

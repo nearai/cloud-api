@@ -114,6 +114,47 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .map_err(|e| WorkspaceError::InternalError(format!("Failed to list workspaces: {}", e)))
     }
 
+    async fn create_workspace(
+        &self,
+        name: String,
+        display_name: String,
+        description: Option<String>,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+    ) -> Result<Workspace, WorkspaceError> {
+        // Check if user is a member of the organization
+        let is_member = self
+            .organization_service
+            .is_member(organization_id.clone(), requester_id.clone())
+            .await
+            .map_err(|e| {
+                WorkspaceError::InternalError(format!(
+                    "Failed to check organization membership: {}",
+                    e
+                ))
+            })?;
+
+        if !is_member {
+            return Err(WorkspaceError::Unauthorized(
+                "User is not a member of this organization".to_string(),
+            ));
+        }
+
+        // Create the workspace
+        self.workspace_repository
+            .create(
+                name,
+                display_name,
+                description,
+                organization_id,
+                requester_id,
+            )
+            .await
+            .map_err(|e| {
+                WorkspaceError::InternalError(format!("Failed to create workspace: {}", e))
+            })
+    }
+
     async fn create_api_key(&self, request: CreateApiKeyRequest) -> Result<ApiKey, WorkspaceError> {
         let workspace_id = request.workspace_id.clone();
         let requester_id = request.created_by_user_id.clone();

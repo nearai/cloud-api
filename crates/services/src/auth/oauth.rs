@@ -215,7 +215,7 @@ impl OAuthManager {
             .http_client
             .get("https://api.github.com/user")
             .header("Authorization", format!("Bearer {}", access_token))
-            .header("User-Agent", "platform-api")
+            .header("User-Agent", "cloud-api")
             .send()
             .await
             .map_err(|e| AuthError::NetworkError(format!("Failed to fetch GitHub user: {}", e)))?;
@@ -238,7 +238,7 @@ impl OAuthManager {
                 .http_client
                 .get("https://api.github.com/user/emails")
                 .header("Authorization", format!("Bearer {}", access_token))
-                .header("User-Agent", "platform-api")
+                .header("User-Agent", "cloud-api")
                 .send()
                 .await
                 .map_err(|e| {

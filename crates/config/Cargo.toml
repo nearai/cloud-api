@@ -4,7 +4,7 @@ edition.workspace = true
 version.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Configuration management for platform-api"
+description = "Configuration management for cloud-api"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

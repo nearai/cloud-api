@@ -1,6 +1,6 @@
 // Configuration Management
 //
-// This crate handles all configuration loading and management for the platform-api.
+// This crate handles all configuration loading and management for the cloud-api.
 // It provides:
 // - Configuration structs and deserialization
 // - File loading logic

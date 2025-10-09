@@ -273,7 +273,7 @@ pub async fn login_page() -> Html<&'static str> {
         r##"<!DOCTYPE html>
 <html>
 <head>
-    <title>Login - Platform API</title>
+    <title>Login - NEAR AI Cloud API</title>
     <style>
         body { 
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -344,7 +344,7 @@ pub async fn login_page() -> Html<&'static str> {
 <body>
     <div class="container">
         <h1>Welcome</h1>
-        <p>Sign in to access the Platform API</p>
+        <p>Sign in to access the NEAR AI Cloud API</p>
         
         <a href="/v1/auth/github" class="login-btn github-btn">
             <svg viewBox="0 0 24 24" fill="currentColor">

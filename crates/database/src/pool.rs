@@ -160,7 +160,7 @@ mod tests {
         let local_config = config::DatabaseConfig {
             host: "localhost".to_string(),
             port: 5432,
-            database: "platform_api".to_string(),
+            database: "cloud_api".to_string(),
             username: "postgres".to_string(),
             password: "postgres".to_string(),
             max_connections: 5,
@@ -176,7 +176,7 @@ mod tests {
         let remote_config = config::DatabaseConfig {
             host: "prod-db.example.com".to_string(),
             port: 5432,
-            database: "platform_api_prod".to_string(),
+            database: "cloud_api_prod".to_string(),
             username: "app_user".to_string(),
             password: "secure_password".to_string(),
             max_connections: 20,

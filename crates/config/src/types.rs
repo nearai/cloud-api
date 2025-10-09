@@ -22,6 +22,14 @@ pub struct DatabaseConfig {
     pub username: String,
     pub password: String,
     pub max_connections: usize,
+    /// Enable TLS for database connections (required for remote databases like DigitalOcean)
+    /// Uses native-tls with system certificate store for verification
+    #[serde(default)]
+    pub tls_enabled: bool,
+    /// Path to a custom CA certificate file (optional)
+    /// If provided, this certificate will be added to the trust store
+    #[serde(default)]
+    pub tls_ca_cert_path: Option<String>,
 }
 
 impl DatabaseConfig {
@@ -221,5 +229,109 @@ mod tests {
 
         // Should return false when no admin domains configured
         assert!(!config.is_admin_email("admin@near.ai"));
+    }
+
+    #[test]
+    fn test_tls_disabled_by_default() {
+        let db_config = DatabaseConfig {
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "test_db".to_string(),
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            max_connections: 5,
+            tls_enabled: false,
+            tls_ca_cert_path: None,
+        };
+
+        assert_eq!(db_config.host, "localhost");
+        assert_eq!(db_config.port, 5432);
+        assert!(!db_config.tls_enabled);
+    }
+
+    #[test]
+    fn test_database_config_with_tls_enabled() {
+        let db_config = DatabaseConfig {
+            host: "remote.example.com".to_string(),
+            port: 5432,
+            database: "prod_db".to_string(),
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            max_connections: 10,
+            tls_enabled: true,
+            tls_ca_cert_path: None,
+        };
+
+        assert_eq!(db_config.host, "remote.example.com");
+        assert!(db_config.tls_enabled);
+    }
+
+    #[test]
+    fn test_database_config_connection_url() {
+        let db_config = DatabaseConfig {
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "mydb".to_string(),
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            max_connections: 5,
+            tls_enabled: false,
+            tls_ca_cert_path: None,
+        };
+
+        let url = db_config.connection_url();
+        assert_eq!(url, "postgres://admin:secret@localhost:5432/mydb");
+    }
+
+    #[test]
+    fn test_database_config_yaml_deserialization_without_tls() {
+        let yaml = r#"
+host: "localhost"
+port: 5432
+database: "test_db"
+username: "postgres"
+password: "postgres"
+max_connections: 5
+"#;
+        let db_config: DatabaseConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(db_config.host, "localhost");
+        assert_eq!(db_config.port, 5432);
+        assert!(!db_config.tls_enabled); // Should use default (false)
+    }
+
+    #[test]
+    fn test_database_config_yaml_deserialization_with_tls() {
+        let yaml = r#"
+host: "remote.example.com"
+port: 5432
+database: "prod_db"
+username: "dbuser"
+password: "dbpass"
+max_connections: 10
+tls_enabled: true
+"#;
+        let db_config: DatabaseConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(db_config.host, "remote.example.com");
+        assert!(db_config.tls_enabled);
+    }
+
+    #[test]
+    fn test_database_config_yaml_serialization() {
+        let db_config = DatabaseConfig {
+            host: "remote.db.com".to_string(),
+            port: 5432,
+            database: "myapp".to_string(),
+            username: "app_user".to_string(),
+            password: "app_pass".to_string(),
+            max_connections: 20,
+            tls_enabled: true,
+            tls_ca_cert_path: None,
+        };
+
+        let yaml = serde_yaml::to_string(&db_config).unwrap();
+        assert!(yaml.contains("host: remote.db.com"));
+        assert!(yaml.contains("tls_enabled: true"));
     }
 }

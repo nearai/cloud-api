@@ -1179,14 +1179,20 @@ pub struct UpdateOrganizationLimitsRequest {
     pub change_reason: Option<String>,
 }
 
-/// Spend limit with amount, scale, and currency (using decimal representation)
+/// Spend limit with amount, scale, and currency
+///
+/// The system always uses a fixed scale of 9 (nano-dollars = 1 billionth of a dollar).
+/// The scale field is provided in responses for client convenience, but is optional in requests.
+/// If provided in a request, the scale value is ignored and scale 9 is always used.
+///
 /// Examples:
-///   $100.00 USD: amount=10000, scale=2, currency="USD"
-///   0.0001 BTC: amount=1, scale=4, currency="BTC"
+///   $100.00 USD: amount=100000000000, scale=9, currency="USD"
+///   $0.01 USD: amount=10000000, scale=9, currency="USD"
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SpendLimit {
     pub amount: i64,
-    pub scale: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale: Option<i32>,
     pub currency: String,
 }
 

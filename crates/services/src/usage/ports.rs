@@ -40,6 +40,25 @@ pub trait UsageServiceTrait: Send + Sync {
         &self,
         organization_id: Uuid,
     ) -> Result<Option<OrganizationLimit>, UsageError>;
+
+    /// Get usage history for a specific API key
+    async fn get_usage_history_by_api_key(
+        &self,
+        api_key_id: Uuid,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<Vec<UsageLogEntry>, UsageError>;
+
+    /// Get usage history for a specific API key with permission checking
+    /// This method verifies the user has access to the workspace and that the API key exists
+    async fn get_api_key_usage_history_with_permissions(
+        &self,
+        workspace_id: Uuid,
+        api_key_id: Uuid,
+        user_id: Uuid,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<Vec<UsageLogEntry>, UsageError>;
 }
 
 // ============================================
@@ -61,6 +80,14 @@ pub trait UsageRepository: Send + Sync {
     async fn get_usage_history(
         &self,
         organization_id: Uuid,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> anyhow::Result<Vec<UsageLogEntry>>;
+
+    /// Get usage history for a specific API key
+    async fn get_usage_history_by_api_key(
+        &self,
+        api_key_id: Uuid,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> anyhow::Result<Vec<UsageLogEntry>>;
@@ -190,6 +217,8 @@ pub enum UsageError {
     ModelNotFound(String),
     InternalError(String),
     LimitExceeded(String),
+    Unauthorized(String),
+    NotFound(String),
 }
 
 impl std::fmt::Display for UsageError {
@@ -198,6 +227,8 @@ impl std::fmt::Display for UsageError {
             UsageError::ModelNotFound(msg) => write!(f, "Model not found: {}", msg),
             UsageError::InternalError(msg) => write!(f, "Internal error: {}", msg),
             UsageError::LimitExceeded(msg) => write!(f, "Limit exceeded: {}", msg),
+            UsageError::Unauthorized(msg) => write!(f, "Unauthorized: {}", msg),
+            UsageError::NotFound(msg) => write!(f, "Not found: {}", msg),
         }
     }
 }

@@ -371,3 +371,66 @@ impl services::auth::ports::WorkspaceRepository for WorkspaceRepository {
         }
     }
 }
+
+// Implement the workspace service layer trait
+#[async_trait]
+impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
+    async fn get_by_id(
+        &self,
+        workspace_id: services::workspace::WorkspaceId,
+    ) -> anyhow::Result<Option<services::workspace::Workspace>> {
+        match self.get_by_id(workspace_id.0).await? {
+            Some(db_workspace) => Ok(Some(db_workspace_to_workspace_service(db_workspace))),
+            None => Ok(None),
+        }
+    }
+
+    async fn get_workspace_with_organization(
+        &self,
+        workspace_id: services::workspace::WorkspaceId,
+    ) -> anyhow::Result<
+        Option<(
+            services::workspace::Workspace,
+            services::organization::Organization,
+        )>,
+    > {
+        match self.get_workspace_with_organization(workspace_id.0).await? {
+            Some((db_workspace, db_organization)) => Ok(Some((
+                db_workspace_to_workspace_service(db_workspace),
+                db_organization_to_service_organization(db_organization),
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    async fn list_by_organization(
+        &self,
+        organization_id: services::organization::OrganizationId,
+    ) -> anyhow::Result<Vec<services::workspace::Workspace>> {
+        let workspaces = self.list_by_organization(organization_id.0).await?;
+        Ok(workspaces
+            .into_iter()
+            .map(db_workspace_to_workspace_service)
+            .collect())
+    }
+}
+
+// Conversion function for workspace service
+fn db_workspace_to_workspace_service(
+    db_workspace: crate::models::Workspace,
+) -> services::workspace::Workspace {
+    services::workspace::Workspace {
+        id: services::workspace::WorkspaceId(db_workspace.id),
+        name: db_workspace.name,
+        display_name: db_workspace.display_name,
+        description: db_workspace.description,
+        organization_id: services::organization::ports::OrganizationId(
+            db_workspace.organization_id,
+        ),
+        created_by_user_id: services::auth::ports::UserId(db_workspace.created_by_user_id),
+        created_at: db_workspace.created_at,
+        updated_at: db_workspace.updated_at,
+        is_active: db_workspace.is_active,
+        settings: db_workspace.settings,
+    }
+}

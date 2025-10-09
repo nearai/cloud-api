@@ -6,11 +6,11 @@ use utoipa::{Modify, OpenApi};
 #[derive(OpenApi)]
 #[openapi(
     info(
-        title = "Platform API",
-        description = "A comprehensive platform API for AI model inference, conversation management, and organization administration.\n\n## Authentication\n\nThis API supports two authentication methods:\n\n1. **Session Token (User Authentication)**: Use `Authorization: Bearer <session_token>` with a session token obtained from OAuth login\n2. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk_<api_key>` with an API key (prefix: `sk_`)\n\nClick the **Authorize** button above to configure authentication.",
+        title = "NEAR AI Cloud API",
+        description = "A comprehensive cloud API for AI model inference, conversation management, and organization administration.\n\n## Authentication\n\nThis API supports two authentication methods:\n\n1. **Session Token (User Authentication)**: Use `Authorization: Bearer <session_token>` with a session token obtained from OAuth login\n2. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk_<api_key>` with an API key (prefix: `sk_`)\n\nClick the **Authorize** button above to configure authentication.",
         version = "1.0.0",
         contact(
-            name = "Platform API Team",
+            name = "NEAR AI Team",
             email = "support@near.ai"
         ),
         license(

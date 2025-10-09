@@ -332,6 +332,72 @@ pub async fn update_organization_limits(
     Ok(ResponseJson(response))
 }
 
+/// Delete a model (Admin only)
+///
+/// Soft deletes a model by setting is_active to false. This preserves historical usage records
+/// that reference the model name while preventing it from being used in new requests.
+///
+/// **Note:** Model names containing forward slashes (e.g., "Qwen/Qwen3-30B-A3B-Instruct-2507") must be URL-encoded.
+/// For example, use "Qwen%2FQwen3-30B-A3B-Instruct-2507" in the URL path.
+#[utoipa::path(
+    delete,
+    path = "/admin/models/{model_name}",
+    tag = "Admin",
+    params(
+        ("model_name" = String, Path, description = "Model name to delete (URL-encode if it contains slashes)")
+    ),
+    responses(
+        (status = 204, description = "Model deleted successfully"),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn delete_model(
+    State(app_state): State<AdminAppState>,
+    Path(model_name): Path<String>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<StatusCode, (StatusCode, ResponseJson<ErrorResponse>)> {
+    debug!("Delete model request for: {}", model_name);
+
+    app_state
+        .admin_service
+        .delete_model(&model_name)
+        .await
+        .map_err(|e| {
+            error!("Failed to delete model: {}", e);
+            match e {
+                services::admin::AdminError::ModelNotFound(_) => (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        format!("Model '{}' not found", model_name),
+                        "model_not_found".to_string(),
+                    )),
+                ),
+                services::admin::AdminError::InvalidPricing(msg) => (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
+                ),
+                services::admin::AdminError::Unauthorized(msg) => (
+                    StatusCode::UNAUTHORIZED,
+                    ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to delete model".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// List all registered users with pagination (Admin only)
 ///
 /// Returns a paginated list of all users in the system. Only authenticated admins can perform this operation.

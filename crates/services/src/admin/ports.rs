@@ -129,6 +129,9 @@ pub trait AdminRepository: Send + Sync {
         model_name: &str,
     ) -> Result<Vec<ModelPricingHistoryEntry>, anyhow::Error>;
 
+    /// Soft delete a model by setting is_active to false
+    async fn soft_delete_model(&self, model_name: &str) -> Result<bool, anyhow::Error>;
+
     /// Update organization limits (creates new history entry, closes previous)
     async fn update_organization_limits(
         &self,
@@ -166,6 +169,9 @@ pub trait AdminService: Send + Sync {
         &self,
         model_name: &str,
     ) -> Result<Vec<ModelPricingHistoryEntry>, AdminError>;
+
+    /// Soft delete a model by setting is_active to false (admin only)
+    async fn delete_model(&self, model_name: &str) -> Result<(), AdminError>;
 
     /// Update organization limits (admin only)
     async fn update_organization_limits(

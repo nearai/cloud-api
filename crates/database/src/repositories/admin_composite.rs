@@ -89,6 +89,10 @@ impl AdminRepository for AdminCompositeRepository {
             .collect())
     }
 
+    async fn soft_delete_model(&self, model_name: &str) -> Result<bool> {
+        self.model_repo.soft_delete_model(model_name).await
+    }
+
     async fn update_organization_limits(
         &self,
         organization_id: Uuid,

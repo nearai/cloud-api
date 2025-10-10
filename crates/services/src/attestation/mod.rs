@@ -33,31 +33,49 @@ impl AttestationService {
 #[async_trait]
 impl ports::AttestationServiceTrait for AttestationService {
     async fn get_chat_signature(&self, chat_id: &str) -> Result<ChatSignature, AttestationError> {
-        if let Some(provider) = self
+        // Only get from database
+        self.repository.get_chat_signature(chat_id).await
+    }
+
+    async fn store_chat_signature_from_provider(
+        &self,
+        chat_id: &str,
+    ) -> Result<(), AttestationError> {
+        // Get the provider for this chat
+        let provider = self
             .inference_provider_pool
             .get_provider_by_chat_id(chat_id)
             .await
-        {
-            let provider_signature = provider.get_signature(chat_id).await.map_err(|e| {
-                tracing::error!("Failed to get chat signature: {:?}", e);
-                AttestationError::ProviderError(e.to_string())
+            .ok_or_else(|| {
+                AttestationError::ProviderError(format!(
+                    "No provider found for chat_id: {}",
+                    chat_id
+                ))
             })?;
-            let signature = ChatSignature {
-                text: provider_signature.text,
-                signature: provider_signature.signature,
-                signing_address: provider_signature.signing_address,
-                signing_algo: provider_signature.signing_algo,
-            };
-            self.repository
-                .add_chat_signature(chat_id, signature.clone())
-                .await
-                .map_err(|e| {
-                    tracing::error!("Failed to add chat signature: {:?}", e);
-                    AttestationError::RepositoryError(e.to_string())
-                })?;
-            return Ok(signature);
-        }
-        self.repository.get_chat_signature(chat_id).await
+
+        // Fetch signature from provider
+        let provider_signature = provider.get_signature(chat_id).await.map_err(|e| {
+            tracing::error!("Failed to get chat signature from provider: {:?}", e);
+            AttestationError::ProviderError(e.to_string())
+        })?;
+
+        let signature = ChatSignature {
+            text: provider_signature.text,
+            signature: provider_signature.signature,
+            signing_address: provider_signature.signing_address,
+            signing_algo: provider_signature.signing_algo,
+        };
+
+        // Store in repository
+        self.repository
+            .add_chat_signature(chat_id, signature)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to store chat signature in repository: {:?}", e);
+                AttestationError::RepositoryError(e.to_string())
+            })?;
+
+        Ok(())
     }
 
     async fn get_attestation_report(

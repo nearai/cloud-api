@@ -207,6 +207,7 @@ impl UserServiceTrait for UserService {
             workspace_id: workspace.id.clone(),
             created_by_user_id: user_id.clone(),
             expires_at: None,
+            spend_limit: None,
         };
 
         let api_key = self

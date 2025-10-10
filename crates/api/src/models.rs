@@ -802,6 +802,9 @@ impl CreateConversationRequest {
 pub struct CreateApiKeyRequest {
     pub name: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "spendLimit")]
+    pub spend_limit: Option<DecimalPriceRequest>,
 }
 
 // ============================================
@@ -1032,6 +1035,18 @@ pub struct ApiKeyResponse {
 /// Request to update API key spend limit
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateApiKeySpendLimitRequest {
+    #[serde(rename = "spendLimit")]
+    pub spend_limit: Option<DecimalPriceRequest>,
+}
+
+/// Request to update API key (general update for name, expires_at, and/or spend_limit)
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateApiKeyRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "spendLimit")]
     pub spend_limit: Option<DecimalPriceRequest>,
 }

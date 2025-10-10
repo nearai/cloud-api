@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::auth::ports::UserId;
 use crate::organization::{OrganizationId, OrganizationServiceTrait};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 pub struct WorkspaceServiceImpl {
     workspace_repository: Arc<dyn WorkspaceRepository>,
@@ -283,6 +284,38 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
                     e
                 ))
             })
+    }
+
+    async fn update_api_key(
+        &self,
+        workspace_id: WorkspaceId,
+        api_key_id: ApiKeyId,
+        requester_id: UserId,
+        name: Option<String>,
+        expires_at: Option<Option<DateTime<Utc>>>,
+        spend_limit: Option<Option<i64>>,
+    ) -> Result<ApiKey, WorkspaceError> {
+        // Check permissions
+        self.check_workspace_permission(workspace_id.clone(), requester_id)
+            .await?;
+
+        // Verify the API key belongs to this workspace
+        let api_key = self
+            .api_key_repository
+            .get_by_id(api_key_id.clone())
+            .await
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get API key: {}", e)))?
+            .ok_or(WorkspaceError::ApiKeyNotFound)?;
+
+        if api_key.workspace_id.0 != workspace_id.0 {
+            return Err(WorkspaceError::ApiKeyNotFound);
+        }
+
+        // Update the API key
+        self.api_key_repository
+            .update(api_key_id, name, expires_at, spend_limit)
+            .await
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to update API key: {}", e)))
     }
 
     async fn can_manage_api_keys(

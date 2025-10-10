@@ -64,6 +64,8 @@ pub struct CreateApiKeyRequest {
     pub workspace_id: WorkspaceId,
     pub created_by_user_id: UserId,
     pub expires_at: Option<DateTime<Utc>>,
+    /// Optional spending limit in nano-dollars (scale 9, USD). None means no limit.
+    pub spend_limit: Option<i64>,
 }
 
 // Error types
@@ -130,6 +132,14 @@ pub trait ApiKeyRepository: Send + Sync {
         &self,
         id: ApiKeyId,
         spend_limit: Option<i64>,
+    ) -> anyhow::Result<ApiKey>;
+
+    async fn update(
+        &self,
+        id: ApiKeyId,
+        name: Option<String>,
+        expires_at: Option<Option<DateTime<Utc>>>,
+        spend_limit: Option<Option<i64>>,
     ) -> anyhow::Result<ApiKey>;
 }
 
@@ -200,6 +210,17 @@ pub trait WorkspaceServiceTrait: Send + Sync {
         api_key_id: ApiKeyId,
         requester_id: UserId,
         spend_limit: Option<i64>,
+    ) -> Result<ApiKey, WorkspaceError>;
+
+    /// Update API key (name, expires_at, and/or spend_limit) with permission checking
+    async fn update_api_key(
+        &self,
+        workspace_id: WorkspaceId,
+        api_key_id: ApiKeyId,
+        requester_id: UserId,
+        name: Option<String>,
+        expires_at: Option<Option<DateTime<Utc>>>,
+        spend_limit: Option<Option<i64>>,
     ) -> Result<ApiKey, WorkspaceError>;
 
     /// Check if a user can manage API keys for a workspace

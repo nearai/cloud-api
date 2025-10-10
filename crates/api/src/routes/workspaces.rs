@@ -3,7 +3,7 @@ use crate::{
     middleware::{auth::AuthenticatedApiKey, AuthenticatedUser},
     models::{
         ApiKeyResponse, CreateApiKeyRequest, DecimalPrice, ErrorResponse,
-        UpdateApiKeySpendLimitRequest,
+        UpdateApiKeyRequest, UpdateApiKeySpendLimitRequest,
     },
     routes::api::AppState,
 };
@@ -946,4 +946,104 @@ pub async fn update_api_key_spend_limit(
     };
 
     Ok(Json(response))
+}
+
+/// Update API key
+///
+/// Updates an API key's name, expiration date, and/or spending limit. The user must be a member of the
+/// organization that owns the workspace. All fields are optional - only provided fields will be updated.
+#[utoipa::path(
+    patch,
+    path = "/workspaces/{workspace_id}/api-keys/{key_id}",
+    tag = "Workspaces",
+    params(
+        ("workspace_id" = Uuid, Path, description = "Workspace ID"),
+        ("key_id" = Uuid, Path, description = "API Key ID")
+    ),
+    request_body = UpdateApiKeyRequest,
+    responses(
+        (status = 200, description = "API key updated successfully", body = ApiKeyResponse),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden - not authorized to update this key", body = ErrorResponse),
+        (status = 404, description = "API key or workspace not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = []),
+    )
+)]
+pub async fn update_workspace_api_key(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path((workspace_id, api_key_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<UpdateApiKeyRequest>,
+) -> Result<Json<ApiKeyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    debug!(
+        "Updating API key: {} in workspace: {} by user: {}",
+        api_key_id, workspace_id, user.0.id
+    );
+
+    let user_id = authenticated_user_to_user_id(user.clone());
+    let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
+    let api_key_id_typed = services::workspace::ApiKeyId(api_key_id.to_string());
+
+    // Convert spend limit from API format to nano-dollars (scale 9)
+    // If spend_limit is provided, wrap the amount in Some(Some(amount))
+    let spend_limit_nano = request.spend_limit.map(|limit| Some(limit.amount));
+
+    // Convert expires_at to Option<Option<DateTime<Utc>>>
+    // If expires_at is provided, wrap it in Some(Some(value))
+    let expires_at_opt = request.expires_at.map(Some);
+
+    // Call the workspace service to update the API key
+    match app_state
+        .workspace_service
+        .update_api_key(
+            workspace_id_typed,
+            api_key_id_typed,
+            user_id,
+            request.name,
+            expires_at_opt,
+            spend_limit_nano,
+        )
+        .await
+    {
+        Ok(updated_key) => {
+            debug!("Updated API key: {:?}", updated_key.id);
+            let response = crate::conversions::workspace_api_key_to_api_response(updated_key);
+            Ok(Json(response))
+        }
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "Not authorized to update this API key".to_string(),
+                "forbidden".to_string(),
+            )),
+        )),
+        Err(services::workspace::WorkspaceError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Workspace not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
+        Err(services::workspace::WorkspaceError::ApiKeyNotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "API key not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
+        Err(e) => {
+            error!("Failed to update API key: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to update API key".to_string(),
+                    "internal_error".to_string(),
+                )),
+            ))
+        }
+    }
 }

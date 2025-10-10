@@ -2,8 +2,8 @@ use crate::models::ApiKey;
 use crate::pool::DbPool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
-use services::auth::ports::{CreateApiKeyRequest, WorkspaceId};
+use chrono::{DateTime, Utc};
+use services::workspace::ports::CreateApiKeyRequest;
 use sha2::{Digest, Sha256};
 use tracing::debug;
 use uuid::Uuid;
@@ -58,9 +58,9 @@ impl ApiKeyRepository {
                 r#"
                 INSERT INTO api_keys (
                     id, key_hash, key_prefix, name, workspace_id, created_by_user_id,
-                    created_at, expires_at, last_used_at, is_active
+                    created_at, expires_at, last_used_at, is_active, spend_limit
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true, $9)
                 RETURNING *
                 "#,
                 &[
@@ -72,6 +72,7 @@ impl ApiKeyRepository {
                     &request.created_by_user_id.0,
                     &now,
                     &request.expires_at,
+                    &request.spend_limit,
                 ],
             )
             .await
@@ -95,7 +96,7 @@ impl ApiKeyRepository {
                 is_active: true,
                 created_by_user_id: request.created_by_user_id.0,
                 workspace_id: request.workspace_id.0,
-                spend_limit: None,
+                spend_limit: request.spend_limit,
             },
         ))
     }
@@ -125,9 +126,9 @@ impl ApiKeyRepository {
                 r#"
                 INSERT INTO api_keys (
                     id, key_hash, key_prefix, name, workspace_id, created_by_user_id,
-                    created_at, expires_at, last_used_at, is_active
+                    created_at, expires_at, last_used_at, is_active, spend_limit
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true, $9)
                 RETURNING *
                 "#,
                 &[
@@ -139,6 +140,7 @@ impl ApiKeyRepository {
                     &request.created_by_user_id.0,
                     &now,
                     &request.expires_at,
+                    &request.spend_limit,
                 ],
             )
             .await
@@ -383,6 +385,65 @@ impl ApiKeyRepository {
         self.row_to_api_key(row)
     }
 
+    /// Update an API key (name, expires_at, and/or spend_limit)
+    pub async fn update(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        expires_at: Option<Option<DateTime<Utc>>>,
+        spend_limit: Option<Option<i64>>,
+    ) -> Result<ApiKey> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        // Build dynamic UPDATE query based on provided fields
+        let mut updates = Vec::new();
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+        let mut param_idx = 1;
+
+        if let Some(ref n) = name {
+            updates.push(format!("name = ${}", param_idx));
+            params.push(n);
+            param_idx += 1;
+        }
+
+        if let Some(ref exp) = expires_at {
+            updates.push(format!("expires_at = ${}", param_idx));
+            params.push(exp);
+            param_idx += 1;
+        }
+
+        if let Some(ref spend) = spend_limit {
+            updates.push(format!("spend_limit = ${}", param_idx));
+            params.push(spend);
+            param_idx += 1;
+        }
+
+        if updates.is_empty() {
+            // No fields to update, just return the existing key
+            return self.get_by_id(id).await?.context("API key not found");
+        }
+
+        let query = format!(
+            "UPDATE api_keys SET {} WHERE id = ${} AND is_active = true RETURNING *",
+            updates.join(", "),
+            param_idx
+        );
+
+        params.push(&id);
+
+        let row = client
+            .query_one(&query, &params[..])
+            .await
+            .context("Failed to update API key")?;
+
+        debug!("Updated API key: {}", id);
+        self.row_to_api_key(row)
+    }
+
     // Helper function to convert database row to ApiKey
     fn row_to_api_key(&self, row: tokio_postgres::Row) -> Result<ApiKey> {
         Ok(ApiKey {
@@ -411,7 +472,7 @@ fn db_apikey_to_service_apikey(
         key: api_key,
         key_prefix: db_api_key.key_prefix,
         name: db_api_key.name,
-        workspace_id: WorkspaceId(db_api_key.workspace_id),
+        workspace_id: services::auth::ports::WorkspaceId(db_api_key.workspace_id),
         created_by_user_id: services::auth::ports::UserId(db_api_key.created_by_user_id),
         created_at: db_api_key.created_at,
         expires_at: db_api_key.expires_at,
@@ -436,7 +497,7 @@ impl services::auth::ports::ApiKeyRepository for ApiKeyRepository {
 
     async fn list_by_workspace(
         &self,
-        workspace_id: WorkspaceId,
+        workspace_id: services::auth::ports::WorkspaceId,
     ) -> anyhow::Result<Vec<services::auth::ApiKey>> {
         let api_keys = self.list_by_workspace(workspace_id.0).await?;
         Ok(api_keys
@@ -480,14 +541,7 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
         &self,
         request: services::workspace::CreateApiKeyRequest,
     ) -> anyhow::Result<services::workspace::ApiKey> {
-        // Convert workspace service request to auth service request for internal use
-        let auth_request = services::auth::ports::CreateApiKeyRequest {
-            name: request.name,
-            workspace_id: services::auth::ports::WorkspaceId(request.workspace_id.0),
-            created_by_user_id: request.created_by_user_id.clone(),
-            expires_at: request.expires_at,
-        };
-        let (key, db_api_key) = self.create(auth_request).await?;
+        let (key, db_api_key) = self.create(request).await?;
         Ok(db_apikey_to_workspace_service(Some(key), db_api_key))
     }
 
@@ -526,6 +580,19 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
     ) -> anyhow::Result<services::workspace::ApiKey> {
         let db_api_key = self
             .update_spend_limit(Uuid::parse_str(&id.0)?, spend_limit)
+            .await?;
+        Ok(db_apikey_to_workspace_service(None, db_api_key))
+    }
+
+    async fn update(
+        &self,
+        id: services::workspace::ApiKeyId,
+        name: Option<String>,
+        expires_at: Option<Option<DateTime<Utc>>>,
+        spend_limit: Option<Option<i64>>,
+    ) -> anyhow::Result<services::workspace::ApiKey> {
+        let db_api_key = self
+            .update(Uuid::parse_str(&id.0)?, name, expires_at, spend_limit)
             .await?;
         Ok(db_apikey_to_workspace_service(None, db_api_key))
     }

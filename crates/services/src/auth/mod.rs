@@ -139,43 +139,6 @@ impl AuthServiceTrait for AuthService {
             .ok_or(AuthError::Unauthorized)
     }
 
-    async fn create_workspace_api_key(
-        &self,
-        request: CreateApiKeyRequest,
-    ) -> Result<ApiKey, AuthError> {
-        let workspace_id = request.clone().workspace_id;
-        let requester_id = request.clone().created_by_user_id;
-
-        // Get workspace with organization info to check permissions
-        let (workspace, _organization) = self
-            .workspace_repository
-            .get_workspace_with_organization(workspace_id)
-            .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to get workspace info: {}", e)))?
-            .ok_or(AuthError::Unauthorized)?;
-
-        // Check if requester has permission to create API keys for this workspace's organization
-        let member = self
-            .organization_repository
-            .get_member(workspace.organization_id.0, requester_id.0)
-            .await
-            .map_err(|e| {
-                AuthError::InternalError(format!("Failed to check organization membership: {}", e))
-            })?
-            .ok_or(AuthError::Unauthorized)?;
-
-        // Check if the user has permission to manage API keys
-        if !member.role.can_manage_api_keys() {
-            return Err(AuthError::Unauthorized);
-        }
-
-        // Create the API key
-        self.api_key_repository
-            .create(request)
-            .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to create API key: {}", e)))
-    }
-
     async fn can_manage_workspace_api_keys(
         &self,
         workspace_id: WorkspaceId,

@@ -60,6 +60,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::workspaces::list_workspace_api_keys,
         crate::routes::workspaces::revoke_workspace_api_key,
         crate::routes::workspaces::update_api_key_spend_limit,
+        crate::routes::workspaces::update_workspace_api_key,
         // Organization Members endpoints
         crate::routes::organization_members::add_organization_member,
         crate::routes::organization_members::invite_organization_member_by_email,
@@ -92,7 +93,7 @@ use utoipa::{Modify, OpenApi};
             // Organization models
             CreateOrganizationRequest, OrganizationResponse,
             UpdateOrganizationRequest, CreateApiKeyRequest, ApiKeyResponse,
-            UpdateApiKeySpendLimitRequest,
+            UpdateApiKeySpendLimitRequest, UpdateApiKeyRequest,
             // Workspace models
             crate::routes::workspaces::CreateWorkspaceRequest,
             crate::routes::workspaces::UpdateWorkspaceRequest,

@@ -39,14 +39,18 @@ where
             Poll::Ready(Some(Ok(ref chunk))) => {
                 if let StreamChunk::Chat(ref chat_chunk) = chunk {
                     if let Some(usage) = &chat_chunk.usage {
-                        // Record attestation
+                        // Store attestation signature when completion finishes
                         let attestation_service = self.attestation_service.clone();
-                        let chat_chunk_clone = chat_chunk.clone();
+                        let chat_id = chat_chunk.id.clone();
                         tokio::spawn(async move {
-                            attestation_service
-                                .get_chat_signature(chat_chunk_clone.id.as_str())
+                            if let Err(e) = attestation_service
+                                .store_chat_signature_from_provider(chat_id.as_str())
                                 .await
-                                .unwrap();
+                            {
+                                tracing::error!("Failed to store chat signature: {:?}", e);
+                            } else {
+                                tracing::debug!("Stored signature for chat_id: {}", chat_id);
+                            }
                         });
 
                         // Record usage

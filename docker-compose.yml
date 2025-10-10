@@ -7,7 +7,7 @@ services:
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_DB: cloud_api
+      POSTGRES_DB: platform_api
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     volumes:

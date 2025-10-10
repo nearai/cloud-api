@@ -137,10 +137,10 @@ use utoipa::{Modify, OpenApi};
             crate::routes::attestation::QuoteResponse,
             crate::routes::attestation::ErrorResponse,
             // Model pricing models
-            ModelListResponse, ModelWithPricing, DecimalPrice, ModelMetadata,
+            ModelListResponse, ModelWithPricing, DecimalPrice, DecimalPriceRequest, ModelMetadata,
             UpdateModelApiRequest, ModelPricingHistoryEntry, ModelPricingHistoryResponse,
             // Organization limits models (Admin)
-            UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, SpendLimit,
+            UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, SpendLimit, SpendLimitRequest,
             // User models (Admin)
             ListUsersResponse, AdminUserResponse,
             // Usage tracking models

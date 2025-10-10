@@ -61,7 +61,7 @@ fn db_config_for_tests() -> config::DatabaseConfig {
             config::DatabaseConfig {
                 host: "localhost".to_string(),
                 port: 5432,
-                database: "cloud_api".to_string(),
+                database: "platform_api".to_string(),
                 username: "postgres".to_string(),
                 password: "postgres".to_string(),
                 max_connections: 5,
@@ -281,7 +281,6 @@ async fn test_chat_completions_api() {
     let update_request = serde_json::json!({
         "spendLimit": {
             "amount": 10000000000i64,  // $10.00 USD (in nano-dollars)
-            "scale": 9,
             "currency": "USD"
         },
         "changedBy": "admin@test.com",
@@ -789,12 +788,10 @@ fn generate_model() -> BatchUpdateModelApiRequest {
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
                 "amount": 1000000,
-                "scale": 9,
                 "currency": "USD"
             },
             "outputCostPerToken": {
                 "amount": 2000000,
-                "scale": 9,
                 "currency": "USD"
             },
             "modelDisplayName": "Updated Model Name",
@@ -915,7 +912,7 @@ async fn test_get_model_by_name() {
     );
     assert_eq!(
         model_resp.input_cost_per_token.scale,
-        model_request.input_cost_per_token.as_ref().unwrap().scale
+        9 // Scale is always 9 (nano-dollars)
     );
     assert_eq!(
         model_resp.input_cost_per_token.currency,
@@ -931,7 +928,7 @@ async fn test_get_model_by_name() {
     );
     assert_eq!(
         model_resp.output_cost_per_token.scale,
-        model_request.output_cost_per_token.as_ref().unwrap().scale
+        9 // Scale is always 9 (nano-dollars)
     );
     assert_eq!(
         model_resp.output_cost_per_token.currency,
@@ -1031,7 +1028,7 @@ async fn test_admin_update_organization_limits() {
     // Verify the response
     assert_eq!(update_response.organization_id, org.id);
     assert_eq!(update_response.spend_limit.amount, 100000000000i64);
-    assert_eq!(update_response.spend_limit.scale, Some(9));
+    assert_eq!(update_response.spend_limit.scale, 9); // Scale is always 9 (nano-dollars)
     assert_eq!(update_response.spend_limit.currency, "USD");
     assert!(!update_response.updated_at.is_empty());
 }
@@ -1061,7 +1058,6 @@ async fn test_admin_update_organization_limits_invalid_org() {
     let update_request = serde_json::json!({
         "spendLimit": {
             "amount": 50000000000i64,
-            "scale": 9,
             "currency": "USD"
         }
     });
@@ -1111,7 +1107,6 @@ async fn test_admin_update_organization_limits_multiple_times() {
     let first_update = serde_json::json!({
         "spendLimit": {
             "amount": 50000000000i64,  // $50.00 USD (in nano-dollars)
-            "scale": 9,
             "currency": "USD"
         },
         "changedBy": "admin@test.com",
@@ -1134,7 +1129,6 @@ async fn test_admin_update_organization_limits_multiple_times() {
     let second_update = serde_json::json!({
         "spendLimit": {
             "amount": 150000000000i64,  // $150.00 USD (in nano-dollars)
-            "scale": 9,
             "currency": "USD"
         },
         "changedBy": "admin@test.com",
@@ -1189,7 +1183,6 @@ async fn test_admin_update_organization_limits_usd_only() {
     let usd_update = serde_json::json!({
         "spendLimit": {
             "amount": 85000000000i64,  // $85.00 USD (in nano-dollars)
-            "scale": 9,
             "currency": "USD"
         },
         "changedBy": "billing-service",
@@ -1298,7 +1291,6 @@ async fn test_usage_tracking_on_completion() {
     let update_request = serde_json::json!({
         "spendLimit": {
             "amount": 1000000000i64,  // $1.00 USD (in nano-dollars)
-            "scale": 9,
             "currency": "USD"
         },
         "changedBy": "admin@test.com",
@@ -1377,7 +1369,6 @@ async fn test_usage_limit_enforcement() {
     let update_request = serde_json::json!({
         "spendLimit": {
             "amount": 1,  // Minimal amount (1 nano-dollar)
-            "scale": 9,
             "currency": "USD"
         },
         "changedBy": "admin@test.com",
@@ -1465,7 +1456,6 @@ async fn test_get_organization_balance() {
     let limit_request = serde_json::json!({
         "spendLimit": {
             "amount": 5000000000i64,  // $5.00 USD
-            "scale": 9,
             "currency": "USD"
         },
         "changedBy": "admin@test.com",
@@ -1599,7 +1589,6 @@ async fn test_completion_cost_calculation() {
     let update_request = serde_json::json!({
         "spendLimit": {
             "amount": 1000000000000i64,  // $1000.00 USD (in nano-dollars)
-            "scale": 9,
             "currency": "USD"
         },
         "changedBy": "admin@test.com",
@@ -1849,7 +1838,6 @@ async fn test_organization_balance_with_limit_and_usage() {
     let limit_request = serde_json::json!({
         "spendLimit": {
             "amount": 10000000000i64,  // $10.00 USD
-            "scale": 9,
             "currency": "USD"
         },
         "changedBy": "billing@test.com",
@@ -1988,7 +1976,6 @@ async fn test_api_key_spend_limit_update() {
     let update_request = serde_json::json!({
         "spendLimit": {
             "amount": 1000000000i64,  // $1.00 USD
-            "scale": 9,
             "currency": "USD"
         }
     });
@@ -2085,7 +2072,6 @@ async fn test_api_key_spend_limit_enforcement() {
     let org_limit_request = serde_json::json!({
         "spendLimit": {
             "amount": 10000000000i64,  // $10.00 USD (high limit)
-            "scale": 9,
             "currency": "USD"
         },
         "changedBy": "admin@test.com",
@@ -2110,7 +2096,6 @@ async fn test_api_key_spend_limit_enforcement() {
     let update_request = serde_json::json!({
         "spendLimit": {
             "amount": 1i64,  // Minimal amount
-            "scale": 9,
             "currency": "USD"
         }
     });
@@ -2214,7 +2199,6 @@ async fn test_api_key_limit_enforced_before_org_limit() {
     let org_limit_request = serde_json::json!({
         "spendLimit": {
             "amount": 5000000000i64,  // $5.00 USD
-            "scale": 9,
             "currency": "USD"
         },
         "changedBy": "admin@test.com",
@@ -2238,7 +2222,6 @@ async fn test_api_key_limit_enforced_before_org_limit() {
     let update_request = serde_json::json!({
         "spendLimit": {
             "amount": 2000000000i64,  // $2.00 USD (lower than org limit)
-            "scale": 9,
             "currency": "USD"
         }
     });
@@ -2299,7 +2282,6 @@ async fn test_api_key_spend_limit_unauthorized_user() {
     let update_request = serde_json::json!({
         "spendLimit": {
             "amount": 1000000000i64,
-            "scale": 9,
             "currency": "USD"
         }
     });

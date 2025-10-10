@@ -954,6 +954,32 @@ pub struct UserResponse {
     pub last_login_at: Option<DateTime<Utc>>,
     pub is_active: bool,
     pub auth_provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organizations: Option<Vec<UserOrganizationResponse>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspaces: Option<Vec<UserWorkspaceResponse>>,
+}
+
+/// User's organization with role (subset of OrganizationResponse)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserOrganizationResponse {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub role: MemberRole,
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+/// User's workspace (subset of WorkspaceResponse)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserWorkspaceResponse {
+    pub id: String,
+    pub name: String,
+    pub display_name: Option<String>,
+    pub organization_id: String,
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Session response model
@@ -1007,7 +1033,7 @@ pub struct ApiKeyResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateApiKeySpendLimitRequest {
     #[serde(rename = "spendLimit")]
-    pub spend_limit: Option<DecimalPrice>,
+    pub spend_limit: Option<DecimalPriceRequest>,
 }
 
 // ============================================
@@ -1083,7 +1109,26 @@ pub struct ModelWithPricing {
     pub metadata: ModelMetadata,
 }
 
-/// Decimal price representation using amount/scale/currency
+/// Decimal price for API requests
+///
+/// The system internally uses a fixed scale of 9 (nano-dollars = 1 billionth of a dollar).
+/// Clients must provide amounts in nano-dollars.
+///
+/// Examples:
+///   $100.00 USD: amount=100000000000, currency="USD"
+///   $1.00 USD: amount=1000000000, currency="USD"
+///   $0.01 USD: amount=10000000, currency="USD"
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct DecimalPriceRequest {
+    /// Amount in nano-dollars (scale 9). For example, $1.00 = 1000000000 nano-dollars.
+    pub amount: i64,
+    pub currency: String,
+}
+
+/// Decimal price for API responses
+///
+/// The system uses a fixed scale of 9 (nano-dollars = 1 billionth of a dollar).
+/// The scale field is included in responses for client convenience.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct DecimalPrice {
     pub amount: i64,
@@ -1109,9 +1154,9 @@ pub struct ModelMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UpdateModelApiRequest {
     #[serde(rename = "inputCostPerToken")]
-    pub input_cost_per_token: Option<DecimalPrice>,
+    pub input_cost_per_token: Option<DecimalPriceRequest>,
     #[serde(rename = "outputCostPerToken")]
-    pub output_cost_per_token: Option<DecimalPrice>,
+    pub output_cost_per_token: Option<DecimalPriceRequest>,
     #[serde(rename = "modelDisplayName")]
     pub model_display_name: Option<String>,
     #[serde(rename = "modelDescription")]
@@ -1172,18 +1217,33 @@ pub struct ModelPricingHistoryResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateOrganizationLimitsRequest {
     #[serde(rename = "spendLimit")]
-    pub spend_limit: SpendLimit,
+    pub spend_limit: SpendLimitRequest,
     #[serde(rename = "changedBy", skip_serializing_if = "Option::is_none")]
     pub changed_by: Option<String>,
     #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
     pub change_reason: Option<String>,
 }
 
-/// Spend limit with amount, scale, and currency
+/// Spend limit for API requests
 ///
-/// The system always uses a fixed scale of 9 (nano-dollars = 1 billionth of a dollar).
-/// The scale field is provided in responses for client convenience, but is optional in requests.
-/// If provided in a request, the scale value is ignored and scale 9 is always used.
+/// The system internally uses a fixed scale of 9 (nano-dollars = 1 billionth of a dollar).
+/// Clients must provide amounts in nano-dollars.
+///
+/// Examples:
+///   $100.00 USD: amount=100000000000, currency="USD"
+///   $1.00 USD: amount=1000000000, currency="USD"
+///   $0.01 USD: amount=10000000, currency="USD"
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SpendLimitRequest {
+    /// Amount in nano-dollars (scale 9). For example, $1.00 = 1000000000 nano-dollars.
+    pub amount: i64,
+    pub currency: String,
+}
+
+/// Spend limit for API responses
+///
+/// The system uses a fixed scale of 9 (nano-dollars = 1 billionth of a dollar).
+/// The scale field is included in responses for client convenience.
 ///
 /// Examples:
 ///   $100.00 USD: amount=100000000000, scale=9, currency="USD"
@@ -1191,8 +1251,7 @@ pub struct UpdateOrganizationLimitsRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SpendLimit {
     pub amount: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scale: Option<i32>,
+    pub scale: i32,
     pub currency: String,
 }
 

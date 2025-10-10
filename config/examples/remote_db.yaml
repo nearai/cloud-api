@@ -38,7 +38,7 @@ auth:
 database:
   host: "your-remote-db.example.com"
   port: 5432
-  database: "cloud_api"
+  database: "platform_api"
   username: "your_username"
   password: "your_password"
   max_connections: 10

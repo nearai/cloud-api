@@ -323,7 +323,7 @@ pub async fn update_organization_limits(
         organization_id: updated_limits.organization_id.to_string(),
         spend_limit: SpendLimit {
             amount: updated_limits.spend_limit,
-            scale: Some(9), // Always scale 9 (nano-dollars)
+            scale: 9, // Always scale 9 (nano-dollars)
             currency: "USD".to_string(),
         },
         updated_at: updated_limits.effective_from.to_rfc3339(),

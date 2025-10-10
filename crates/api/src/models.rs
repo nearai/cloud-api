@@ -1030,6 +1030,8 @@ pub struct ApiKeyResponse {
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spend_limit: Option<DecimalPrice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<DecimalPrice>,
 }
 
 /// Request to update API key spend limit

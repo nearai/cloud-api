@@ -228,8 +228,6 @@ pub trait ApiKeyRepository: Send + Sync {
 
     async fn create(&self, request: CreateApiKeyRequest) -> anyhow::Result<ApiKey>;
 
-    async fn list_by_workspace(&self, workspace_id: WorkspaceId) -> anyhow::Result<Vec<ApiKey>>;
-
     async fn delete(&self, id: ApiKeyId) -> anyhow::Result<bool>;
 
     async fn update_last_used(&self, id: ApiKeyId) -> anyhow::Result<()>;
@@ -283,13 +281,6 @@ pub trait AuthServiceTrait: Send + Sync {
         workspace_id: WorkspaceId,
         user_id: UserId,
     ) -> Result<bool, AuthError>;
-
-    /// List API keys for a workspace with proper permission checking
-    async fn list_workspace_api_keys(
-        &self,
-        workspace_id: WorkspaceId,
-        requester_id: UserId,
-    ) -> Result<Vec<ApiKey>, AuthError>;
 }
 
 pub struct AuthService {
@@ -438,17 +429,5 @@ impl AuthServiceTrait for MockAuthService {
         _user_id: UserId,
     ) -> Result<bool, AuthError> {
         Ok(true) // Mock user can always manage API keys
-    }
-
-    async fn list_workspace_api_keys(
-        &self,
-        workspace_id: WorkspaceId,
-        _requester_id: UserId,
-    ) -> Result<Vec<ApiKey>, AuthError> {
-        Ok(self
-            .apikey_repository
-            .list_by_workspace(workspace_id)
-            .await
-            .unwrap())
     }
 }

@@ -411,6 +411,7 @@ pub fn services_api_key_to_api_response(
         last_used_at: api_key.last_used_at,
         expires_at: api_key.expires_at,
         spend_limit,
+        usage: None, // Usage not fetched by default, use workspace_api_key_to_api_response_with_usage if needed
     }
 }
 
@@ -446,6 +447,12 @@ pub fn workspace_api_key_to_api_response(
             currency: "USD".to_string(),
         });
 
+    let usage_decimal = api_key.usage.map(|amount| crate::models::DecimalPrice {
+        amount,
+        scale: 9,
+        currency: "USD".to_string(),
+    });
+
     // Format key_prefix with "****" to indicate it's a partial key
     let formatted_prefix = if api_key.key_prefix.len() > 6 {
         format!("{}****", &api_key.key_prefix[..6])
@@ -464,6 +471,7 @@ pub fn workspace_api_key_to_api_response(
         last_used_at: api_key.last_used_at,
         expires_at: api_key.expires_at,
         spend_limit,
+        usage: usage_decimal,
     }
 }
 

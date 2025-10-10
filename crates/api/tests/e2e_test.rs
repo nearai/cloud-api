@@ -2307,3 +2307,183 @@ async fn test_api_key_spend_limit_unauthorized_user() {
 
     println!("Test complete: Verified permission checking for API key spend limits");
 }
+
+#[tokio::test]
+async fn test_list_workspace_api_keys_with_usage() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_test_database(&config.database).await;
+
+    // Create mock admin user
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(database.clone(), &config).await;
+
+    let app = build_app(database.clone(), auth_components, domain_services);
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Create organization
+    let org = create_org(&server).await;
+    println!("Created organization: {}", org.id);
+
+    // Set spending limit high enough for testing
+    let limit_request = serde_json::json!({
+        "spendLimit": {
+            "amount": 10000000000i64,  // $10.00 USD
+            "currency": "USD"
+        },
+        "changedBy": "admin@test.com",
+        "changeReason": "Test credits"
+    });
+
+    let response = server
+        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&limit_request)
+        .await;
+
+    assert_eq!(response.status_code(), 200, "Failed to set org limit");
+
+    // Get the default workspace
+    let workspaces = list_workspaces(&server, org.id.clone()).await;
+    let workspace = workspaces.first().unwrap();
+    println!("Using workspace: {}", workspace.id);
+
+    // Create first API key (will have usage)
+    let api_key_resp1 = create_api_key_in_workspace(&server, workspace.id.clone()).await;
+    let api_key1 = api_key_resp1.key.clone().unwrap();
+    println!("Created API key 1: {}", api_key_resp1.id);
+
+    // Create second API key (will not have usage)
+    let api_key_resp2 = create_api_key_in_workspace(&server, workspace.id.clone()).await;
+    println!("Created API key 2: {}", api_key_resp2.id);
+
+    // Upsert a model with known pricing
+    let batch = generate_model();
+    let model_name = batch.keys().next().unwrap().clone();
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+
+    // Make a completion request with the first API key to generate usage
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", api_key1))
+        .json(&serde_json::json!({
+            "model": model_name,
+            "messages": [{"role": "user", "content": "Hello world"}],
+            "stream": false,
+            "max_tokens": 10
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Completion request should succeed"
+    );
+
+    let completion_response = response.json::<api::models::ChatCompletionResponse>();
+    println!("Completion usage: {:?}", completion_response.usage);
+    assert!(
+        completion_response.usage.input_tokens > 0,
+        "Should have input tokens"
+    );
+    assert!(
+        completion_response.usage.output_tokens > 0,
+        "Should have output tokens"
+    );
+
+    // Wait for async usage recording to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+    // List all API keys for the workspace
+    let response = server
+        .get(format!("/v1/workspaces/{}/api-keys", workspace.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    println!("List API keys response status: {}", response.status_code());
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Should successfully list API keys"
+    );
+
+    let api_keys = response.json::<Vec<api::models::ApiKeyResponse>>();
+    println!("Number of API keys returned: {}", api_keys.len());
+
+    // Verify we have at least 2 API keys (the ones we created)
+    assert!(
+        api_keys.len() >= 2,
+        "Should have at least 2 API keys, got: {}",
+        api_keys.len()
+    );
+
+    // Find the API key that we used
+    let used_key = api_keys
+        .iter()
+        .find(|k| k.id == api_key_resp1.id)
+        .expect("Should find the first API key");
+
+    println!("Used API key: {:?}", used_key);
+
+    // Verify the used key has usage information
+    assert!(
+        used_key.usage.is_some(),
+        "Used API key should have usage information"
+    );
+
+    let usage = used_key.usage.as_ref().unwrap();
+    println!(
+        "API key usage: amount={}, scale={}, currency={}",
+        usage.amount, usage.scale, usage.currency
+    );
+
+    // Verify usage is greater than 0
+    assert!(
+        usage.amount > 0,
+        "Usage amount should be greater than 0, got: {}",
+        usage.amount
+    );
+    assert_eq!(usage.scale, 9, "Scale should be 9 (nano-dollars)");
+    assert_eq!(usage.currency, "USD", "Currency should be USD");
+
+    // Find the unused API key
+    let unused_key = api_keys
+        .iter()
+        .find(|k| k.id == api_key_resp2.id)
+        .expect("Should find the second API key");
+
+    println!("Unused API key: {:?}", unused_key);
+
+    // Verify the unused key either has no usage or usage is 0
+    if let Some(unused_usage) = &unused_key.usage {
+        assert_eq!(unused_usage.amount, 0, "Unused API key should have 0 usage");
+    } else {
+        println!("Unused API key has no usage field (acceptable)");
+    }
+
+    // Verify all keys have expected fields
+    for key in &api_keys {
+        assert!(!key.id.is_empty(), "API key should have an ID");
+        assert!(!key.key_prefix.is_empty(), "API key should have a prefix");
+        assert_eq!(
+            key.workspace_id, workspace.id,
+            "API key should belong to the workspace"
+        );
+        assert!(
+            key.key.is_none(),
+            "Listed keys should not include the full key"
+        );
+        println!(
+            "API key {}: prefix={}, usage={:?}",
+            key.id, key.key_prefix, key.usage
+        );
+    }
+
+    println!("Test complete: Successfully verified list_workspace_api_keys includes usage");
+}

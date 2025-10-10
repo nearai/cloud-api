@@ -163,39 +163,6 @@ impl AuthServiceTrait for AuthService {
 
         Ok(member.is_some_and(|m| m.role.can_manage_api_keys()))
     }
-
-    async fn list_workspace_api_keys(
-        &self,
-        workspace_id: WorkspaceId,
-        requester_id: UserId,
-    ) -> Result<Vec<ApiKey>, AuthError> {
-        // Clone workspace_id since we need to use it twice
-        let workspace_id_for_list = workspace_id.clone();
-
-        // Get workspace to find the parent organization
-        let workspace = self
-            .workspace_repository
-            .get_by_id(workspace_id)
-            .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to get workspace: {}", e)))?
-            .ok_or(AuthError::Unauthorized)?;
-
-        // Check if requester is a member of the workspace's organization
-        let _member = self
-            .organization_repository
-            .get_member(workspace.organization_id.0, requester_id.0)
-            .await
-            .map_err(|e| {
-                AuthError::InternalError(format!("Failed to check organization membership: {}", e))
-            })?
-            .ok_or(AuthError::Unauthorized)?;
-
-        // List API keys for the workspace
-        self.api_key_repository
-            .list_by_workspace(workspace_id_for_list)
-            .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to list API keys: {}", e)))
-    }
 }
 
 impl AuthService {

@@ -2,8 +2,8 @@ use crate::{
     conversions::authenticated_user_to_user_id,
     middleware::{auth::AuthenticatedApiKey, AuthenticatedUser},
     models::{
-        ApiKeyResponse, CreateApiKeyRequest, DecimalPrice, ErrorResponse,
-        UpdateApiKeyRequest, UpdateApiKeySpendLimitRequest,
+        ApiKeyResponse, CreateApiKeyRequest, DecimalPrice, ErrorResponse, UpdateApiKeyRequest,
+        UpdateApiKeySpendLimitRequest,
     },
     routes::api::AppState,
 };
@@ -582,13 +582,15 @@ pub async fn create_workspace_api_key(
 
 /// List API keys for workspace
 ///
-/// Returns a list of all API keys for a workspace.
+/// Returns a paginated list of all API keys for a workspace with usage information.
 #[utoipa::path(
     get,
     path = "/workspaces/{workspace_id}/api-keys",
     tag = "Workspaces",
     params(
-        ("workspace_id" = Uuid, Path, description = "Workspace ID")
+        ("workspace_id" = Uuid, Path, description = "Workspace ID"),
+        ("limit" = Option<i64>, Query, description = "Maximum number of results (default: 20)"),
+        ("offset" = Option<i64>, Query, description = "Number of results to skip (default: 0)")
     ),
     responses(
         (status = 200, description = "List of workspace API keys", body = Vec<ApiKeyResponse>),
@@ -605,19 +607,20 @@ pub async fn list_workspace_api_keys(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(workspace_id): Path<Uuid>,
+    Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<ApiKeyResponse>>, StatusCode> {
     debug!(
-        "Listing API keys for workspace: {} by user: {}",
-        workspace_id, user.0.id
+        "Listing API keys for workspace: {} by user: {} (limit: {}, offset: {})",
+        workspace_id, user.0.id, params.limit, params.offset
     );
 
     let user_id = authenticated_user_to_user_id(user);
     let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
 
-    // Use workspace service to list workspace API keys
+    // Use workspace service to list workspace API keys with pagination and usage data
     match app_state
         .workspace_service
-        .list_api_keys(workspace_id_typed, user_id)
+        .list_api_keys_paginated(workspace_id_typed, user_id, params.limit, params.offset)
         .await
     {
         Ok(api_keys) => {
@@ -943,6 +946,7 @@ pub async fn update_api_key_spend_limit(
         last_used_at: updated_key.last_used_at,
         expires_at: updated_key.expires_at,
         spend_limit: spend_limit_response,
+        usage: None, // Usage not fetched in this endpoint
     };
 
     Ok(Json(response))

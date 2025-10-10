@@ -250,20 +250,15 @@ impl UsageServiceTrait for UsageServiceImpl {
         }
 
         // Get the API key through the workspace service to verify it exists and belongs to the workspace
-        let api_keys = self
+        let _api_key = self
             .workspace_service
-            .list_api_keys(
+            .get_api_key(
                 crate::workspace::WorkspaceId(workspace_id),
+                crate::workspace::ApiKeyId(api_key_id.to_string()),
                 crate::auth::UserId(user_id),
             )
             .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get API keys: {}", e)))?;
-
-        // Find the specific API key
-        let api_key_str = api_key_id.to_string();
-        let _api_key = api_keys
-            .iter()
-            .find(|k| k.id.0 == api_key_str)
+            .map_err(|e| UsageError::InternalError(format!("Failed to get API key: {}", e)))?
             .ok_or_else(|| {
                 UsageError::NotFound("API key not found in this workspace".to_string())
             })?;

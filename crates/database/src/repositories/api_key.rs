@@ -97,6 +97,7 @@ impl ApiKeyRepository {
                 created_by_user_id: request.created_by_user_id.0,
                 workspace_id: request.workspace_id.0,
                 spend_limit: request.spend_limit,
+                usage: 0, // New API key has no usage yet
             },
         ))
     }
@@ -258,21 +259,50 @@ impl ApiKeyRepository {
         Ok(())
     }
 
-    /// List API keys for a workspace
-    pub async fn list_by_workspace(&self, workspace_id: Uuid) -> Result<Vec<ApiKey>> {
+    /// List API keys for a workspace with usage data
+    /// This is the primary method to list API keys, using an efficient JOIN query
+    pub async fn list_by_workspace_paginated(
+        &self,
+        workspace_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ApiKey>> {
         let client = self
             .pool
             .get()
             .await
             .context("Failed to get database connection")?;
 
-        let rows = client.query(
-            "SELECT * FROM api_keys WHERE workspace_id = $1 AND is_active = true ORDER BY created_at DESC",
-            &[&workspace_id],
-        ).await.context("Failed to list API keys")?;
+        let rows = client
+            .query(
+                r#"
+                SELECT 
+                    ak.id,
+                    ak.key_hash,
+                    ak.key_prefix,
+                    ak.name,
+                    ak.workspace_id,
+                    ak.created_by_user_id,
+                    ak.created_at,
+                    ak.expires_at,
+                    ak.last_used_at,
+                    ak.is_active,
+                    ak.spend_limit,
+                    COALESCE(SUM(usg.total_cost), 0)::BIGINT as usage
+                FROM api_keys ak
+                LEFT JOIN organization_usage_log usg ON ak.id = usg.api_key_id
+                WHERE ak.workspace_id = $1 AND ak.is_active = true
+                GROUP BY ak.id
+                ORDER BY ak.created_at DESC
+                LIMIT $2 OFFSET $3
+                "#,
+                &[&workspace_id, &limit, &offset],
+            )
+            .await
+            .context("Failed to list API keys with usage")?;
 
         rows.into_iter()
-            .map(|row| self.row_to_api_key(row))
+            .map(|row| self.row_to_api_key_with_usage(row))
             .collect()
     }
 
@@ -444,7 +474,7 @@ impl ApiKeyRepository {
         self.row_to_api_key(row)
     }
 
-    // Helper function to convert database row to ApiKey
+    // Helper function to convert database row to ApiKey (without usage data)
     fn row_to_api_key(&self, row: tokio_postgres::Row) -> Result<ApiKey> {
         Ok(ApiKey {
             id: row.get("id"),
@@ -458,6 +488,25 @@ impl ApiKeyRepository {
             last_used_at: row.get("last_used_at"),
             is_active: row.get("is_active"),
             spend_limit: row.get("spend_limit"),
+            usage: 0, // Default to 0 when not fetched from JOIN
+        })
+    }
+
+    // Helper function to convert database row to ApiKey (with usage data from JOIN)
+    fn row_to_api_key_with_usage(&self, row: tokio_postgres::Row) -> Result<ApiKey> {
+        Ok(ApiKey {
+            id: row.get("id"),
+            key_hash: row.get("key_hash"),
+            key_prefix: row.get("key_prefix"),
+            name: row.get("name"),
+            workspace_id: row.get("workspace_id"),
+            created_by_user_id: row.get("created_by_user_id"),
+            created_at: row.get("created_at"),
+            expires_at: row.get("expires_at"),
+            last_used_at: row.get("last_used_at"),
+            is_active: row.get("is_active"),
+            spend_limit: row.get("spend_limit"),
+            usage: row.get("usage"),
         })
     }
 }
@@ -493,17 +542,6 @@ impl services::auth::ports::ApiKeyRepository for ApiKeyRepository {
     async fn create(&self, request: CreateApiKeyRequest) -> anyhow::Result<services::auth::ApiKey> {
         let (key, db_api_key) = self.create(request).await?;
         Ok(db_apikey_to_service_apikey(Some(key), db_api_key))
-    }
-
-    async fn list_by_workspace(
-        &self,
-        workspace_id: services::auth::ports::WorkspaceId,
-    ) -> anyhow::Result<Vec<services::auth::ApiKey>> {
-        let api_keys = self.list_by_workspace(workspace_id.0).await?;
-        Ok(api_keys
-            .into_iter()
-            .map(|db_api_key| db_apikey_to_service_apikey(None, db_api_key))
-            .collect())
     }
 
     async fn delete(&self, id: services::auth::ports::ApiKeyId) -> anyhow::Result<bool> {
@@ -554,11 +592,15 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
         Ok(maybe_api_key.map(|db_api_key| db_apikey_to_workspace_service(None, db_api_key)))
     }
 
-    async fn list_by_workspace(
+    async fn list_by_workspace_paginated(
         &self,
         workspace_id: services::workspace::WorkspaceId,
+        limit: i64,
+        offset: i64,
     ) -> anyhow::Result<Vec<services::workspace::ApiKey>> {
-        let api_keys = self.list_by_workspace(workspace_id.0).await?;
+        let api_keys = self
+            .list_by_workspace_paginated(workspace_id.0, limit, offset)
+            .await?;
         Ok(api_keys
             .into_iter()
             .map(|db_api_key| db_apikey_to_workspace_service(None, db_api_key))
@@ -615,5 +657,6 @@ fn db_apikey_to_workspace_service(
         last_used_at: db_api_key.last_used_at,
         is_active: db_api_key.is_active,
         spend_limit: db_api_key.spend_limit,
+        usage: Some(db_api_key.usage), // Usage now comes from the database query
     }
 }

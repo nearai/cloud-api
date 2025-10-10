@@ -132,6 +132,8 @@ pub struct ApiKey {
     pub is_active: bool,
     /// Optional spending limit in nano-dollars (scale 9, USD). None means no limit.
     pub spend_limit: Option<i64>,
+    /// Total usage/spend in nano-dollars (scale 9, USD). Computed from usage logs.
+    pub usage: i64,
 }
 
 /// Session for OAuth authentication

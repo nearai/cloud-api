@@ -160,6 +160,7 @@ async fn create_api_key_in_workspace(
     let request = api::models::CreateApiKeyRequest {
         name: Some("Test API Key".to_string()),
         expires_at: Some(Utc::now() + chrono::Duration::days(90)),
+        spend_limit: None,
     };
     let response = server
         .post(format!("/v1/workspaces/{}/api-keys", workspace_id).as_str())

@@ -380,20 +380,6 @@ pub fn services_member_to_db_member(
     }
 }
 
-/// Convert API CreateApiKeyRequest to services request (workspace-based)
-pub fn api_key_req_to_services_workspace(
-    req: crate::models::CreateApiKeyRequest,
-    workspace_id: services::auth::ports::WorkspaceId,
-    created_by_user_id: services::UserId,
-) -> services::auth::CreateApiKeyRequest {
-    services::auth::CreateApiKeyRequest {
-        name: req.name,
-        expires_at: req.expires_at,
-        workspace_id,
-        created_by_user_id,
-    }
-}
-
 /// Convert services ApiKey to API response
 pub fn services_api_key_to_api_response(
     api_key: services::auth::ApiKey,
@@ -444,6 +430,7 @@ pub fn api_key_req_to_workspace_services(
         expires_at: req.expires_at,
         workspace_id,
         created_by_user_id,
+        spend_limit: req.spend_limit.map(|limit| limit.amount),
     }
 }
 

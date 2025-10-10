@@ -5,6 +5,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::organization::OrganizationRepository;
+use crate::workspace::CreateApiKeyRequest;
 
 // Domain ID types
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -221,14 +222,6 @@ pub struct ApiKey {
     pub spend_limit: Option<i64>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct CreateApiKeyRequest {
-    pub name: Option<String>,
-    pub workspace_id: WorkspaceId,
-    pub created_by_user_id: UserId,
-    pub expires_at: Option<DateTime<Utc>>,
-}
-
 #[async_trait]
 pub trait ApiKeyRepository: Send + Sync {
     async fn validate(&self, api_key: String) -> anyhow::Result<Option<ApiKey>>;
@@ -283,12 +276,6 @@ pub trait AuthServiceTrait: Send + Sync {
 
     /// Validate an API key and return the associated user
     async fn validate_api_key(&self, api_key: String) -> Result<ApiKey, AuthError>;
-
-    /// Create an API key for a workspace with proper permission checking
-    async fn create_workspace_api_key(
-        &self,
-        request: CreateApiKeyRequest,
-    ) -> Result<ApiKey, AuthError>;
 
     /// Check if a user can manage API keys for a workspace
     async fn can_manage_workspace_api_keys(
@@ -443,13 +430,6 @@ impl AuthServiceTrait for MockAuthService {
             .await
             .unwrap()
             .ok_or(AuthError::Unauthorized)
-    }
-
-    async fn create_workspace_api_key(
-        &self,
-        request: CreateApiKeyRequest,
-    ) -> Result<ApiKey, AuthError> {
-        Ok(self.apikey_repository.create(request).await.unwrap())
     }
 
     async fn can_manage_workspace_api_keys(

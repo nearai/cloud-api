@@ -73,10 +73,11 @@ impl AttestationRepository for PgAttestationRepository {
             )
             .await
             .map_err(|e| {
-                if let Some(db_err) = e.as_db_error() {
-                    if db_err.code() == &tokio_postgres::error::SqlState::NO_DATA_FOUND {
-                        return AttestationError::SignatureNotFound(chat_id.to_string());
-                    }
+                // query_one returns RowNotFound when no rows are found
+                if e.to_string()
+                    .contains("query returned an unexpected number of rows")
+                {
+                    return AttestationError::SignatureNotFound(chat_id.to_string());
                 }
                 AttestationError::RepositoryError(e.to_string())
             })?;

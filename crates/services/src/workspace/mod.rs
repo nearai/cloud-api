@@ -179,20 +179,27 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .map_err(|e| WorkspaceError::InternalError(format!("Failed to create API key: {}", e)))
     }
 
-    async fn list_api_keys(
+    async fn list_api_keys_paginated(
         &self,
         workspace_id: WorkspaceId,
         requester_id: UserId,
+        limit: i64,
+        offset: i64,
     ) -> Result<Vec<ApiKey>, WorkspaceError> {
         // Check permissions
         self.check_workspace_permission(workspace_id.clone(), requester_id)
             .await?;
 
-        // List API keys
+        // List API keys with pagination (repository now includes usage data via JOIN)
         self.api_key_repository
-            .list_by_workspace(workspace_id)
+            .list_by_workspace_paginated(workspace_id, limit, offset)
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to list API keys: {}", e)))
+            .map_err(|e| {
+                WorkspaceError::InternalError(format!(
+                    "Failed to list API keys with pagination: {}",
+                    e
+                ))
+            })
     }
 
     async fn get_api_key(

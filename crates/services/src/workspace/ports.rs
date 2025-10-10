@@ -56,6 +56,8 @@ pub struct ApiKey {
     pub is_active: bool,
     /// Optional spending limit in nano-dollars (scale 9, USD). None means no limit.
     pub spend_limit: Option<i64>,
+    /// Total usage/spend in nano-dollars (scale 9, USD). None if not fetched.
+    pub usage: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -122,7 +124,12 @@ pub trait ApiKeyRepository: Send + Sync {
 
     async fn get_by_id(&self, id: ApiKeyId) -> anyhow::Result<Option<ApiKey>>;
 
-    async fn list_by_workspace(&self, workspace_id: WorkspaceId) -> anyhow::Result<Vec<ApiKey>>;
+    async fn list_by_workspace_paginated(
+        &self,
+        workspace_id: WorkspaceId,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<ApiKey>>;
 
     async fn delete(&self, id: ApiKeyId) -> anyhow::Result<bool>;
 
@@ -180,11 +187,13 @@ pub trait WorkspaceServiceTrait: Send + Sync {
     /// Create an API key for a workspace with permission checking
     async fn create_api_key(&self, request: CreateApiKeyRequest) -> Result<ApiKey, WorkspaceError>;
 
-    /// List API keys for a workspace with permission checking
-    async fn list_api_keys(
+    /// List API keys for a workspace with pagination and permission checking
+    async fn list_api_keys_paginated(
         &self,
         workspace_id: WorkspaceId,
         requester_id: UserId,
+        limit: i64,
+        offset: i64,
     ) -> Result<Vec<ApiKey>, WorkspaceError>;
 
     /// Get a specific API key by ID with permission checking

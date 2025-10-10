@@ -121,4 +121,8 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             })
             .collect())
     }
+
+    async fn get_api_key_spend(&self, api_key_id: Uuid) -> anyhow::Result<i64> {
+        self.get_api_key_spend(api_key_id).await
+    }
 }

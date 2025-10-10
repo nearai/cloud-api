@@ -57,14 +57,14 @@ cargo test --test e2e_test
 # Start test database
 docker run --name test-postgres \
   -e POSTGRES_PASSWORD=postgres \
-  -e POSTGRES_DB=cloud_api \
+  -e POSTGRES_DB=platform_api \
   -p 5432:5432 \
   -d postgres:latest
 
 # Run tests
 TEST_DB_HOST=localhost \
 TEST_DB_PORT=5432 \
-TEST_DB_NAME=cloud_api \
+TEST_DB_NAME=platform_api \
 TEST_DB_USER=postgres \
 TEST_DB_PASSWORD=postgres \
 cargo test --test e2e_test
@@ -75,7 +75,7 @@ Set these environment variables before running tests:
 ```bash
 export TEST_DB_HOST=localhost
 export TEST_DB_PORT=5432
-export TEST_DB_NAME=cloud_api_test  # Use a dedicated test database
+export TEST_DB_NAME=platform_api_test  # Use a dedicated test database
 export TEST_DB_USER=your_username
 export TEST_DB_PASSWORD=your_password
 ```

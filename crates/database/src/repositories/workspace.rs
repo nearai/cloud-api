@@ -370,6 +370,25 @@ impl services::auth::ports::WorkspaceRepository for WorkspaceRepository {
             None => Ok(None),
         }
     }
+
+    async fn create(
+        &self,
+        name: String,
+        display_name: String,
+        description: Option<String>,
+        organization_id: services::organization::OrganizationId,
+        created_by_user_id: services::auth::ports::UserId,
+    ) -> anyhow::Result<services::auth::ports::Workspace> {
+        let request = crate::models::CreateWorkspaceRequest {
+            name,
+            display_name,
+            description,
+        };
+        let db_workspace = self
+            .create(request, organization_id.0, created_by_user_id.0)
+            .await?;
+        Ok(db_workspace_to_service_workspace(db_workspace))
+    }
 }
 
 // Implement the workspace service layer trait

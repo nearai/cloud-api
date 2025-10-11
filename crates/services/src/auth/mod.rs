@@ -72,6 +72,9 @@ impl AuthServiceTrait for AuthService {
     }
 
     async fn get_or_create_oauth_user(&self, oauth_info: OAuthUserInfo) -> Result<User, AuthError> {
+        use crate::organization::OrganizationId;
+        use rand::Rng;
+
         // Check if user already exists
         let existing_user = self
             .user_repository
@@ -110,17 +113,91 @@ impl AuthServiceTrait for AuthService {
         }
 
         // Create new user
-        self.user_repository
+        let new_user = self
+            .user_repository
             .create_from_oauth(
-                oauth_info.email,
-                oauth_info.username,
-                oauth_info.display_name,
-                oauth_info.avatar_url,
-                oauth_info.provider,
-                oauth_info.provider_user_id,
+                oauth_info.email.clone(),
+                oauth_info.username.clone(),
+                oauth_info.display_name.clone(),
+                oauth_info.avatar_url.clone(),
+                oauth_info.provider.clone(),
+                oauth_info.provider_user_id.clone(),
             )
             .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to create user: {}", e)))
+            .map_err(|e| AuthError::InternalError(format!("Failed to create user: {}", e)))?;
+
+        // Create default organization and workspace for new user
+        debug!(
+            "Creating default organization and workspace for new user: {}",
+            new_user.email
+        );
+
+        // Generate organization name from user email with random suffix
+        let org_name = {
+            let username = oauth_info.email.split('@').next().unwrap_or("user");
+            const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+            let mut rng = rand::thread_rng();
+            let suffix: String = (0..4)
+                .map(|_| {
+                    let idx = rng.gen_range(0..CHARSET.len());
+                    CHARSET[idx] as char
+                })
+                .collect();
+            format!("{}-org-{}", username, suffix)
+        }; // rng is dropped here
+
+        // Create organization
+        match self
+            .organization_service
+            .create_organization(org_name.clone(), None, new_user.id.clone())
+            .await
+        {
+            Ok(organization) => {
+                debug!(
+                    "Created default organization: {} for user: {}",
+                    organization.id.0, new_user.email
+                );
+
+                // Create default workspace
+                let workspace_result = self
+                    .workspace_repository
+                    .create(
+                        "default".to_string(),
+                        "default".to_string(),
+                        Some(format!("Default workspace for {}", org_name)),
+                        OrganizationId(organization.id.0),
+                        new_user.id.clone(),
+                    )
+                    .await;
+
+                match workspace_result {
+                    Ok(workspace) => {
+                        debug!(
+                            "Created default workspace: {} for user: {}",
+                            workspace.id.0, new_user.email
+                        );
+                    }
+                    Err(e) => {
+                        // Log error but don't fail user creation
+                        tracing::error!(
+                            "Failed to create default workspace for new user {}: {}",
+                            new_user.email,
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                // Log error but don't fail user creation
+                tracing::error!(
+                    "Failed to create default organization for new user {}: {}",
+                    new_user.email,
+                    e
+                );
+            }
+        }
+
+        Ok(new_user)
     }
 
     async fn cleanup_expired_sessions(&self) -> Result<usize, AuthError> {
@@ -172,6 +249,7 @@ impl AuthService {
         api_key_repository: Arc<dyn ApiKeyRepository>,
         organization_repository: Arc<dyn OrganizationRepository>,
         workspace_repository: Arc<dyn ports::WorkspaceRepository>,
+        organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
     ) -> Self {
         Self {
             user_repository,
@@ -179,6 +257,7 @@ impl AuthService {
             api_key_repository,
             organization_repository,
             workspace_repository,
+            organization_service,
         }
     }
 

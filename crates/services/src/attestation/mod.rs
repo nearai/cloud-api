@@ -9,6 +9,7 @@ use inference_providers::{AttestationReport, InferenceProvider};
 use crate::{
     attestation::{models::GetQuoteResponse, ports::AttestationRepository},
     inference_provider_pool::InferenceProviderPool,
+    models::ModelsRepository,
 };
 
 pub mod ports;
@@ -16,16 +17,19 @@ pub mod ports;
 pub struct AttestationService {
     pub repository: Arc<dyn AttestationRepository + Send + Sync>,
     pub inference_provider_pool: Arc<InferenceProviderPool>,
+    pub models_repository: Arc<dyn ModelsRepository>,
 }
 
 impl AttestationService {
     pub fn new(
         repository: Arc<dyn AttestationRepository + Send + Sync>,
         inference_provider_pool: Arc<InferenceProviderPool>,
+        models_repository: Arc<dyn ModelsRepository>,
     ) -> Self {
         Self {
             repository,
             inference_provider_pool,
+            models_repository,
         }
     }
 }
@@ -83,8 +87,26 @@ impl ports::AttestationServiceTrait for AttestationService {
         model: String,
         signing_algo: Option<String>,
     ) -> Result<AttestationReport, AttestationError> {
+        // Resolve model name (could be an alias) to canonical name
+        let canonical_name = self
+            .models_repository
+            .resolve_to_canonical_name(&model)
+            .await
+            .map_err(|e| {
+                AttestationError::ProviderError(format!("Failed to resolve model name: {}", e))
+            })?;
+
+        // Log if we resolved an alias
+        if canonical_name != model {
+            tracing::debug!(
+                requested_model = %model,
+                canonical_model = %canonical_name,
+                "Resolved alias to canonical model name for attestation report"
+            );
+        }
+
         self.inference_provider_pool
-            .get_attestation_report(model, signing_algo)
+            .get_attestation_report(canonical_name, signing_algo)
             .await
             .map_err(|e| AttestationError::ProviderError(e.to_string()))
     }

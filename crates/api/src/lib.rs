@@ -222,6 +222,7 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
     let attestation_service = Arc::new(services::attestation::AttestationService::new(
         attestation_repo,
         inference_provider_pool.clone(),
+        models_repo.clone(),
     ));
 
     // Create models service

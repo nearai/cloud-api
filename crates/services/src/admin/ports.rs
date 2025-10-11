@@ -12,6 +12,7 @@ pub struct UpdateModelAdminRequest {
     pub context_length: Option<i32>,
     pub verifiable: Option<bool>,
     pub is_active: Option<bool>,
+    pub aliases: Option<Vec<String>>,
 }
 
 /// Batch update request format - Map of model name to update data

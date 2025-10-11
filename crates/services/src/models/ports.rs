@@ -55,6 +55,11 @@ pub trait ModelsRepository: Send + Sync {
         &self,
         model_name: &str,
     ) -> Result<Option<ModelWithPricing>, anyhow::Error>;
+
+    /// Resolve a model name (which could be an alias) to its canonical name
+    /// If the input is an alias, resolves to the canonical name
+    /// If the input is already canonical, returns it as-is
+    async fn resolve_to_canonical_name(&self, model_name: &str) -> Result<String, anyhow::Error>;
 }
 
 #[async_trait]

@@ -1185,6 +1185,7 @@ pub struct UpdateModelApiRequest {
     pub verifiable: Option<bool>,
     #[serde(rename = "isActive")]
     pub is_active: Option<bool>,
+    pub aliases: Option<Vec<String>>,
 }
 
 /// Batch update request format - Array of model name to update data

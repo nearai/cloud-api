@@ -11,7 +11,12 @@ async fn main() {
     // Initialize core services
     let database = init_database(&config.database).await;
     let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
+    let domain_services = init_domain_services(
+        database.clone(),
+        &config,
+        auth_components.organization_service.clone(),
+    )
+    .await;
 
     // Build application router with config
     let app = build_app_with_config(database, auth_components, domain_services, Some(&config));

@@ -1,6 +1,8 @@
 use crate::models::{UpdateModelPricingRequest, UpdateOrganizationLimitsDbRequest};
 use crate::pool::DbPool;
-use crate::repositories::{ModelRepository, OrganizationLimitsRepository, UserRepository};
+use crate::repositories::{
+    ModelAliasRepository, ModelRepository, OrganizationLimitsRepository, UserRepository,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use services::admin::{
@@ -14,6 +16,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct AdminCompositeRepository {
     model_repo: Arc<ModelRepository>,
+    alias_repo: Arc<ModelAliasRepository>,
     limits_repo: Arc<OrganizationLimitsRepository>,
     user_repo: Arc<UserRepository>,
 }
@@ -22,6 +25,7 @@ impl AdminCompositeRepository {
     pub fn new(pool: DbPool) -> Self {
         Self {
             model_repo: Arc::new(ModelRepository::new(pool.clone())),
+            alias_repo: Arc::new(ModelAliasRepository::new(pool.clone())),
             limits_repo: Arc::new(OrganizationLimitsRepository::new(pool.clone())),
             user_repo: Arc::new(UserRepository::new(pool)),
         }
@@ -45,12 +49,20 @@ impl AdminRepository for AdminCompositeRepository {
             context_length: request.context_length,
             verifiable: request.verifiable,
             is_active: request.is_active,
+            aliases: request.aliases.clone(),
         };
 
         let model = self
             .model_repo
             .upsert_model_pricing(model_name, &db_request)
             .await?;
+
+        // Handle aliases if provided
+        if let Some(alias_names) = request.aliases {
+            self.alias_repo
+                .upsert_aliases_for_model(&model.id, &alias_names)
+                .await?;
+        }
 
         Ok(ModelPricing {
             model_display_name: model.model_display_name,

@@ -74,6 +74,7 @@ pub async fn batch_upsert_models(
                     context_length: request.context_length,
                     verifiable: request.verifiable,
                     is_active: request.is_active,
+                    aliases: request.aliases.clone(),
                 },
             )
         })

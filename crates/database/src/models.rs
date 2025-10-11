@@ -404,6 +404,7 @@ pub struct UpdateModelPricingRequest {
     pub context_length: Option<i32>,
     pub verifiable: Option<bool>,
     pub is_active: Option<bool>,
+    pub aliases: Option<Vec<String>>,
 }
 
 /// Model pricing history - stores historical pricing data for models
@@ -430,6 +431,19 @@ pub struct ModelPricingHistory {
     pub changed_by: Option<String>,
     pub change_reason: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+/// Model alias - maps client-facing alias names to canonical vLLM model names
+/// This allows clients to use friendly names that resolve to official model names
+/// Example: "phala/gpt-oss-120b" (alias) -> "openai/gpt-oss-120b" (canonical)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelAlias {
+    pub id: Uuid,
+    pub alias_name: String,
+    pub canonical_model_id: Uuid,
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 // ============================================

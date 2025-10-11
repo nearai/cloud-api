@@ -1,20 +1,31 @@
-use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, env};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ApiConfig {
     pub server: ServerConfig,
     pub model_discovery: ModelDiscoveryConfig,
-    #[serde(default)]
     pub logging: LoggingConfig,
     pub dstack_client: DstackClientConfig,
-    #[serde(default)]
     pub auth: AuthConfig,
     pub database: DatabaseConfig,
 }
 
+impl ApiConfig {
+    /// Load configuration from environment variables
+    pub fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            server: ServerConfig::from_env()?,
+            model_discovery: ModelDiscoveryConfig::from_env()?,
+            logging: LoggingConfig::from_env()?,
+            dstack_client: DstackClientConfig::from_env()?,
+            auth: AuthConfig::from_env()?,
+            database: DatabaseConfig::from_env()?,
+        })
+    }
+}
+
 /// Database configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct DatabaseConfig {
     pub host: String,
     pub port: u16,
@@ -24,11 +35,9 @@ pub struct DatabaseConfig {
     pub max_connections: usize,
     /// Enable TLS for database connections (required for remote databases like DigitalOcean)
     /// Uses native-tls with system certificate store for verification
-    #[serde(default)]
     pub tls_enabled: bool,
     /// Path to a custom CA certificate file (optional)
     /// If provided, this certificate will be added to the trust store
-    #[serde(default)]
     pub tls_ca_cert_path: Option<String>,
 }
 
@@ -40,20 +49,75 @@ impl DatabaseConfig {
             self.username, self.password, self.host, self.port, self.database
         )
     }
+
+    /// Load from environment variables
+    pub fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            host: env::var("DATABASE_HOST").map_err(|_| "DATABASE_HOST not set")?,
+            port: env::var("DATABASE_PORT")
+                .map_err(|_| "DATABASE_PORT not set")?
+                .parse()
+                .map_err(|_| "DATABASE_PORT must be a valid port number")?,
+            database: env::var("DATABASE_NAME").map_err(|_| "DATABASE_NAME not set")?,
+            username: env::var("DATABASE_USERNAME").map_err(|_| "DATABASE_USERNAME not set")?,
+            password: env::var("DATABASE_PASSWORD").map_err(|_| "DATABASE_PASSWORD not set")?,
+            max_connections: env::var("DATABASE_MAX_CONNECTIONS")
+                .unwrap_or_else(|_| "5".to_string())
+                .parse()
+                .map_err(|_| "DATABASE_MAX_CONNECTIONS must be a valid number")?,
+            tls_enabled: env::var("DATABASE_TLS_ENABLED")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .map_err(|_| "DATABASE_TLS_ENABLED must be true or false")?,
+            tls_ca_cert_path: env::var("DATABASE_TLS_CA_CERT_PATH").ok(),
+        })
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl ServerConfig {
+    /// Load from environment variables
+    pub fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            host: env::var("SERVER_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
+            port: env::var("SERVER_PORT")
+                .unwrap_or_else(|_| "3000".to_string())
+                .parse()
+                .map_err(|_| "SERVER_PORT must be a valid port number")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ModelDiscoveryConfig {
     pub discovery_server_url: String,
     pub api_key: Option<String>,
     pub refresh_interval: u64, // seconds
     pub timeout: u64,          // seconds
+}
+
+impl ModelDiscoveryConfig {
+    /// Load from environment variables
+    pub fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            discovery_server_url: env::var("MODEL_DISCOVERY_SERVER_URL")
+                .map_err(|_| "MODEL_DISCOVERY_SERVER_URL not set")?,
+            api_key: env::var("MODEL_DISCOVERY_API_KEY").ok(),
+            refresh_interval: env::var("MODEL_DISCOVERY_REFRESH_INTERVAL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300), // 5 minutes
+            timeout: env::var("MODEL_DISCOVERY_TIMEOUT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30), // 30 seconds
+        })
+    }
 }
 
 impl Default for ModelDiscoveryConfig {
@@ -75,11 +139,35 @@ impl Default for ModelDiscoveryConfig {
 }
 
 /// Logging Configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct LoggingConfig {
     pub level: String,
     pub format: String,
     pub modules: HashMap<String, String>,
+}
+
+impl LoggingConfig {
+    /// Load from environment variables
+    pub fn from_env() -> Result<Self, String> {
+        let mut modules = HashMap::new();
+
+        // Load module-specific log levels
+        if let Ok(level) = env::var("LOG_MODULE_API") {
+            modules.insert("api".to_string(), level);
+        }
+        if let Ok(level) = env::var("LOG_MODULE_SERVICES") {
+            modules.insert("services".to_string(), level);
+        }
+        if let Ok(level) = env::var("LOG_MODULE_DOMAIN") {
+            modules.insert("domain".to_string(), level);
+        }
+
+        Ok(Self {
+            level: env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string()),
+            format: env::var("LOG_FORMAT").unwrap_or_else(|_| "pretty".to_string()),
+            modules,
+        })
+    }
 }
 
 impl Default for LoggingConfig {
@@ -96,9 +184,19 @@ impl Default for LoggingConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct DstackClientConfig {
     pub url: String,
+}
+
+impl DstackClientConfig {
+    /// Load from environment variables
+    pub fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            url: env::var("DSTACK_CLIENT_URL")
+                .unwrap_or_else(|_| "http://localhost:8000".to_string()),
+        })
+    }
 }
 
 // Domain-specific configuration types that will be used by domain layer
@@ -110,20 +208,69 @@ pub struct DomainConfig {
 }
 
 // Simplified Authentication Configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct AuthConfig {
     pub mock: bool,
-    #[serde(default)]
     pub github: Option<GitHubOAuthConfig>,
-    #[serde(default)]
     pub google: Option<GoogleOAuthConfig>,
     /// Email domains that are granted platform admin access
     /// Users with emails from these domains will have admin privileges
-    #[serde(default)]
     pub admin_domains: Vec<String>,
 }
 
 impl AuthConfig {
+    /// Load from environment variables
+    pub fn from_env() -> Result<Self, String> {
+        let github = if let (Ok(client_id), Ok(client_secret), Ok(redirect_url)) = (
+            env::var("GITHUB_CLIENT_ID"),
+            env::var("GITHUB_CLIENT_SECRET"),
+            env::var("GITHUB_REDIRECT_URL"),
+        ) {
+            Some(GitHubOAuthConfig {
+                client_id,
+                client_secret,
+                redirect_url,
+            })
+        } else {
+            None
+        };
+
+        let google = if let (Ok(client_id), Ok(client_secret), Ok(redirect_url)) = (
+            env::var("GOOGLE_CLIENT_ID"),
+            env::var("GOOGLE_CLIENT_SECRET"),
+            env::var("GOOGLE_REDIRECT_URL"),
+        ) {
+            Some(GoogleOAuthConfig {
+                client_id,
+                client_secret,
+                redirect_url,
+            })
+        } else {
+            None
+        };
+
+        let admin_domains = env::var("AUTH_ADMIN_DOMAINS")
+            .ok()
+            .map(|domains| {
+                domains
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(Self {
+            mock: env::var("AUTH_MOCK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(false),
+            github,
+            google,
+            admin_domains,
+        })
+    }
+
     /// Check if an email address belongs to an admin domain
     pub fn is_admin_email(&self, email: &str) -> bool {
         if self.admin_domains.is_empty() {
@@ -141,14 +288,14 @@ impl AuthConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct GitHubOAuthConfig {
     pub client_id: String,
     pub client_secret: String,
     pub redirect_url: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct GoogleOAuthConfig {
     pub client_id: String,
     pub client_secret: String,
@@ -281,57 +428,5 @@ mod tests {
 
         let url = db_config.connection_url();
         assert_eq!(url, "postgres://admin:secret@localhost:5432/mydb");
-    }
-
-    #[test]
-    fn test_database_config_yaml_deserialization_without_tls() {
-        let yaml = r#"
-host: "localhost"
-port: 5432
-database: "test_db"
-username: "postgres"
-password: "postgres"
-max_connections: 5
-"#;
-        let db_config: DatabaseConfig = serde_yaml::from_str(yaml).unwrap();
-
-        assert_eq!(db_config.host, "localhost");
-        assert_eq!(db_config.port, 5432);
-        assert!(!db_config.tls_enabled); // Should use default (false)
-    }
-
-    #[test]
-    fn test_database_config_yaml_deserialization_with_tls() {
-        let yaml = r#"
-host: "remote.example.com"
-port: 5432
-database: "prod_db"
-username: "dbuser"
-password: "dbpass"
-max_connections: 10
-tls_enabled: true
-"#;
-        let db_config: DatabaseConfig = serde_yaml::from_str(yaml).unwrap();
-
-        assert_eq!(db_config.host, "remote.example.com");
-        assert!(db_config.tls_enabled);
-    }
-
-    #[test]
-    fn test_database_config_yaml_serialization() {
-        let db_config = DatabaseConfig {
-            host: "remote.db.com".to_string(),
-            port: 5432,
-            database: "myapp".to_string(),
-            username: "app_user".to_string(),
-            password: "app_pass".to_string(),
-            max_connections: 20,
-            tls_enabled: true,
-            tls_ca_cert_path: None,
-        };
-
-        let yaml = serde_yaml::to_string(&db_config).unwrap();
-        assert!(yaml.contains("host: remote.db.com"));
-        assert!(yaml.contains("tls_enabled: true"));
     }
 }

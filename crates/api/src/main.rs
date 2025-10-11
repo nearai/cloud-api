@@ -24,7 +24,9 @@ async fn main() {
 fn load_configuration() -> ApiConfig {
     ApiConfig::load().unwrap_or_else(|e| {
         eprintln!("Failed to load configuration: {}", e);
-        eprintln!("Application cannot start without a valid configuration file.");
+        eprintln!("Application cannot start without valid configuration.");
+        eprintln!("Please ensure environment variables are set or a .env file exists.");
+        eprintln!("See env.template for a complete list of required environment variables.");
         std::process::exit(1);
     })
 }

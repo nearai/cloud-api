@@ -48,6 +48,8 @@ pub struct AuthComponents {
     pub oauth_manager: Arc<OAuthManager>,
     pub state_store: StateStore,
     pub auth_state_middleware: AuthState,
+    pub organization_service:
+        Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
 }
 
 #[derive(Clone)]
@@ -104,6 +106,23 @@ pub async fn init_database_with_config(db_config: &config::DatabaseConfig) -> Ar
 
 /// Initialize authentication services and middleware
 pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthComponents {
+    // Create organization-related repositories first (needed for organization_service)
+    let organization_repo = Arc::new(PgOrganizationRepository::new(database.pool().clone()));
+    let user_repository = Arc::new(UserRepository::new(database.pool().clone()))
+        as Arc<dyn services::auth::UserRepository>;
+    let invitation_repo = Arc::new(database::PgOrganizationInvitationRepository::new(
+        database.pool().clone(),
+    ))
+        as Arc<dyn services::organization::ports::OrganizationInvitationRepository>;
+
+    // Create organization service early (needed by AuthService)
+    let organization_service = Arc::new(services::organization::OrganizationServiceImpl::new(
+        organization_repo.clone() as Arc<dyn services::organization::ports::OrganizationRepository>,
+        user_repository.clone(),
+        invitation_repo,
+    ))
+        as Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>;
+
     let auth_service: Arc<dyn AuthServiceTrait> = if config.auth.mock {
         // TODO: fix this, it should not use the database pool
         println!("config: {:?}", config);
@@ -112,15 +131,10 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
         })
     } else {
         // Create repository instances
-        let user_repository = Arc::new(UserRepository::new(database.pool().clone()))
-            as Arc<dyn services::auth::UserRepository>;
         let session_repository = Arc::new(SessionRepository::new(database.pool().clone()))
             as Arc<dyn services::auth::SessionRepository>;
         let api_key_repository = Arc::new(ApiKeyRepository::new(database.pool().clone()))
             as Arc<dyn services::auth::ApiKeyRepository>;
-        let organization_repository =
-            Arc::new(PgOrganizationRepository::new(database.pool().clone()))
-                as Arc<dyn services::organization::ports::OrganizationRepository>;
 
         // Create AuthService with workspace repository
         let workspace_repository_for_auth =
@@ -131,8 +145,9 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
             user_repository,
             session_repository,
             api_key_repository,
-            organization_repository,
+            organization_repo as Arc<dyn services::organization::ports::OrganizationRepository>,
             workspace_repository_for_auth,
+            organization_service.clone(),
         ))
     };
 
@@ -159,6 +174,7 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
         oauth_manager: oauth_manager_arc,
         state_store,
         auth_state_middleware,
+        organization_service,
     }
 }
 
@@ -191,15 +207,16 @@ pub fn create_oauth_manager(config: &ApiConfig) -> OAuthManager {
 }
 
 /// Initialize domain services
-pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -> DomainServices {
+pub async fn init_domain_services(
+    database: Arc<Database>,
+    config: &ApiConfig,
+    organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
+) -> DomainServices {
     // Create shared repositories
     let conversation_repo = Arc::new(database::PgConversationRepository::new(
         database.pool().clone(),
     ));
     let response_repo = Arc::new(database::PgResponseRepository::new(database.pool().clone()));
-    let organization_repo = Arc::new(database::PgOrganizationRepository::new(
-        database.pool().clone(),
-    ));
     let user_repo = Arc::new(database::UserRepository::new(database.pool().clone()))
         as Arc<dyn services::auth::UserRepository>;
     let attestation_repo = Arc::new(database::PgAttestationRepository::new(
@@ -248,16 +265,6 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
 
     // Create MCP client manager
     let mcp_manager = Arc::new(services::mcp::McpClientManager::new());
-
-    let invitation_repo = Arc::new(database::PgOrganizationInvitationRepository::new(
-        database.pool().clone(),
-    ))
-        as Arc<dyn services::organization::ports::OrganizationInvitationRepository>;
-    let organization_service = Arc::new(services::organization::OrganizationServiceImpl::new(
-        organization_repo.clone(),
-        user_repo.clone(),
-        invitation_repo,
-    ));
 
     // Create workspace service with API key management (needs organization_service)
     let workspace_repository = Arc::new(database::repositories::WorkspaceRepository::new(
@@ -942,7 +949,12 @@ mod tests {
         // Initialize services
         let database = init_database(&config.database).await;
         let auth_components = init_auth_services(database.clone(), &config);
-        let domain_services = init_domain_services(database.clone(), &config).await;
+        let domain_services = init_domain_services(
+            database.clone(),
+            &config,
+            auth_components.organization_service.clone(),
+        )
+        .await;
 
         // Build the application
         let _app = build_app(database, auth_components, domain_services);
@@ -1011,7 +1023,12 @@ mod tests {
         };
 
         let auth_components = init_auth_services(database.clone(), &config);
-        let domain_services = init_domain_services(database.clone(), &config).await;
+        let domain_services = init_domain_services(
+            database.clone(),
+            &config,
+            auth_components.organization_service.clone(),
+        )
+        .await;
 
         let _app = build_app(database, auth_components, domain_services);
 

@@ -289,6 +289,7 @@ pub struct AuthService {
     pub api_key_repository: Arc<dyn ApiKeyRepository>,
     pub organization_repository: Arc<dyn OrganizationRepository>,
     pub workspace_repository: Arc<dyn WorkspaceRepository>,
+    pub organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
 }
 
 /// Workspace domain model
@@ -314,6 +315,14 @@ pub trait WorkspaceRepository: Send + Sync {
         workspace_id: WorkspaceId,
     ) -> anyhow::Result<Option<(Workspace, crate::organization::Organization)>>;
     async fn get_by_id(&self, workspace_id: WorkspaceId) -> anyhow::Result<Option<Workspace>>;
+    async fn create(
+        &self,
+        name: String,
+        display_name: String,
+        description: Option<String>,
+        organization_id: crate::organization::OrganizationId,
+        created_by_user_id: UserId,
+    ) -> anyhow::Result<Workspace>;
 }
 
 pub struct UserService {

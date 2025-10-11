@@ -287,6 +287,7 @@ pub async fn init_domain_services(database: Arc<Database>, config: &ApiConfig) -
         inference_provider_pool.clone(),
         attestation_service.clone(),
         usage_service.clone(),
+        models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
     ));
 
     // Create session repository for user service

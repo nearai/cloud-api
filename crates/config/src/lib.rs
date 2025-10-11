@@ -2,13 +2,12 @@
 //
 // This crate handles all configuration loading and management for the cloud-api.
 // It provides:
-// - Configuration structs and deserialization
-// - File loading logic
+// - Configuration structs
+// - Environment variable loading
 // - Default configuration values
 //
 // This keeps configuration concerns separate from domain logic.
 
-use std::path::Path;
 use thiserror::Error;
 
 pub mod types;
@@ -18,54 +17,20 @@ pub use types::*;
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
-    #[error("Configuration file not found. Tried paths: {paths}")]
-    FileNotFound { paths: String },
-
-    #[error("Failed to read configuration file: {source}")]
-    IoError {
-        #[from]
-        source: std::io::Error,
-    },
-
-    #[error("Failed to parse configuration: {source}")]
-    ParseError {
-        #[from]
-        source: serde_yaml::Error,
-    },
+    #[error("Failed to load configuration from environment: {0}")]
+    EnvError(String),
 }
 
 /// Main configuration loading interface
 impl ApiConfig {
-    /// Load configuration from YAML file
-    pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
-        let content = std::fs::read_to_string(path)?;
-        let config: ApiConfig = serde_yaml::from_str(&content)?;
-        Ok(config)
-    }
-
-    /// Load configuration from default locations
+    /// Load configuration from environment variables
+    ///
+    /// This will attempt to load a .env file from the current directory first,
+    /// then read all configuration from environment variables.
     pub fn load() -> Result<Self, ConfigError> {
-        // Check for CONFIG_FILE environment variable first
-        if let Ok(config_path) = std::env::var("CONFIG_FILE") {
-            if std::path::Path::new(&config_path).exists() {
-                return Self::load_from_file(&config_path);
-            } else {
-                return Err(ConfigError::FileNotFound { paths: config_path });
-            }
-        }
+        // Try to load .env file if it exists (don't error if it doesn't)
+        let _ = dotenvy::dotenv();
 
-        // Try different config locations in order
-        let config_paths = ["config/config.yaml", "config.yaml", "config/default.yaml"];
-
-        for path in &config_paths {
-            if std::path::Path::new(path).exists() {
-                return Self::load_from_file(path);
-            }
-        }
-
-        // If no config file found, fail with descriptive error
-        Err(ConfigError::FileNotFound {
-            paths: config_paths.join(", "),
-        })
+        ApiConfig::from_env().map_err(ConfigError::EnvError)
     }
 }

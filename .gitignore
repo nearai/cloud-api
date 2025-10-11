@@ -4,3 +4,4 @@ config/docker.yaml
 config/examples/production.yaml
 .cursor
 *.crt
+.env

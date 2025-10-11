@@ -298,6 +298,40 @@ impl ModelRepository {
         Ok(result > 0)
     }
 
+    /// Resolve a model name (which could be an alias) to the canonical model name
+    /// If the name is already canonical, returns it as-is
+    /// If the name is an alias, resolves to the canonical name
+    pub async fn resolve_to_canonical_name(&self, model_name: &str) -> Result<String> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        // Try to resolve as an alias first
+        let rows = client
+            .query(
+                r#"
+                SELECT m.model_name
+                FROM model_aliases ma
+                JOIN models m ON ma.canonical_model_id = m.id
+                WHERE ma.alias_name = $1 AND ma.is_active = true AND m.is_active = true
+                LIMIT 1
+                "#,
+                &[&model_name],
+            )
+            .await
+            .context("Failed to resolve alias to canonical name")?;
+
+        if let Some(row) = rows.first() {
+            // It's an alias, return the canonical name
+            Ok(row.get::<_, String>("model_name"))
+        } else {
+            // Not an alias, assume it's already canonical (or doesn't exist, which will be caught later)
+            Ok(model_name.to_string())
+        }
+    }
+
     /// Helper method to convert database row to Model
     fn row_to_model(&self, row: &Row) -> Model {
         Model {
@@ -372,5 +406,9 @@ impl services::models::ModelsRepository for ModelRepository {
             context_length: m.context_length,
             verifiable: m.verifiable,
         }))
+    }
+
+    async fn resolve_to_canonical_name(&self, model_name: &str) -> Result<String> {
+        self.resolve_to_canonical_name(model_name).await
     }
 }

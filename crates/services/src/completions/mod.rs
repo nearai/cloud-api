@@ -2,6 +2,7 @@ pub mod ports;
 
 use crate::attestation::ports::AttestationServiceTrait;
 use crate::inference_provider_pool::InferenceProviderPool;
+use crate::models::ModelsRepository;
 use crate::usage::{RecordUsageServiceRequest, UsageServiceTrait};
 use inference_providers::{
     ChatMessage, InferenceProvider, MessageRole, StreamChunk, StreamingResult,
@@ -104,6 +105,7 @@ pub struct CompletionServiceImpl {
     pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub attestation_service: Arc<dyn AttestationServiceTrait>,
     pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
+    pub models_repository: Arc<dyn ModelsRepository>,
 }
 
 impl CompletionServiceImpl {
@@ -111,11 +113,13 @@ impl CompletionServiceImpl {
         inference_provider_pool: Arc<InferenceProviderPool>,
         attestation_service: Arc<dyn AttestationServiceTrait>,
         usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
+        models_repository: Arc<dyn ModelsRepository>,
     ) -> Self {
         Self {
             inference_provider_pool,
             attestation_service,
             usage_service,
+            models_repository,
         }
     }
 
@@ -173,13 +177,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let api_key_id = uuid::Uuid::parse_str(&request.api_key_id).map_err(|e| {
             ports::CompletionError::InvalidParams(format!("Invalid API key ID: {}", e))
         })?;
-        let model_id = request.model.clone();
         let is_streaming = request.stream.unwrap_or(false);
 
         let chat_messages = Self::prepare_chat_messages(&request.messages);
 
-        let chat_params = inference_providers::ChatCompletionParams {
-            model: request.model,
+        let mut chat_params = inference_providers::ChatCompletionParams {
+            model: request.model.clone(),
             messages: chat_messages,
             max_tokens: request.max_tokens,
             temperature: request.temperature,
@@ -204,6 +207,25 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             stream_options: None,
         };
 
+        // Resolve model name (could be an alias) to canonical name
+        let canonical_name = self
+            .models_repository
+            .resolve_to_canonical_name(&request.model)
+            .await
+            .map_err(|e| {
+                ports::CompletionError::InvalidModel(format!("Failed to resolve model name: {}", e))
+            })?;
+
+        // Update params with canonical name if it's different
+        if canonical_name != request.model {
+            tracing::debug!(
+                requested_model = %request.model,
+                canonical_model = %canonical_name,
+                "Resolved alias to canonical model name"
+            );
+            chat_params.model = canonical_name.clone();
+        }
+
         // Get the LLM stream
         let llm_stream = self
             .inference_provider_pool
@@ -221,13 +243,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         };
 
         // Create the completion event stream with usage tracking
+        // Use canonical_name for usage tracking to ensure pricing lookup works
         let event_stream = self
             .handle_stream_with_context(
                 llm_stream,
                 organization_id,
                 workspace_id,
                 api_key_id,
-                model_id,
+                canonical_name,
                 request_type,
             )
             .await;

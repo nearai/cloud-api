@@ -114,61 +114,51 @@ pub async fn create_workspace(
     let user_id = authenticated_user_to_user_id(user);
     let organization_id = OrganizationId(org_id);
 
-    // Check if user is a member of the organization
+    // Use the workspace service to create the workspace (it handles permission checking)
     match app_state
-        .organization_service
-        .is_member(organization_id.clone(), user_id.clone())
+        .workspace_service
+        .create_workspace(
+            request.name,
+            request.display_name.unwrap_or_default(),
+            request.description,
+            organization_id,
+            user_id,
+        )
         .await
     {
-        Ok(true) => {
-            // User is a member, create the workspace
-            // We need to use the database directly as we don't have a workspace service yet
-            let workspace_repo = Arc::new(DbWorkspaceRepository::new(app_state.db.pool().clone()));
-            let db_request = database::CreateWorkspaceRequest {
-                name: request.name,
-                display_name: request.display_name.unwrap_or_default(),
-                description: request.description,
+        Ok(workspace) => {
+            debug!(
+                "Created workspace: {} in organization: {}",
+                workspace.id.0, org_id
+            );
+            let response = WorkspaceResponse {
+                id: workspace.id.0.to_string(),
+                name: workspace.name,
+                display_name: Some(workspace.display_name),
+                description: workspace.description,
+                organization_id: workspace.organization_id.0.to_string(),
+                created_by_user_id: workspace.created_by_user_id.0.to_string(),
+                created_at: workspace.created_at,
+                updated_at: workspace.updated_at,
+                is_active: workspace.is_active,
+                settings: workspace.settings,
             };
-
-            match workspace_repo.create(db_request, org_id, user_id.0).await {
-                Ok(workspace) => {
-                    debug!(
-                        "Created workspace: {} in organization: {}",
-                        workspace.id, org_id
-                    );
-                    let response = WorkspaceResponse {
-                        id: workspace.id.to_string(),
-                        name: workspace.name,
-                        display_name: Some(workspace.display_name),
-                        description: workspace.description,
-                        organization_id: workspace.organization_id.to_string(),
-                        created_by_user_id: workspace.created_by_user_id.to_string(),
-                        created_at: workspace.created_at,
-                        updated_at: workspace.updated_at,
-                        is_active: workspace.is_active,
-                        settings: workspace.settings,
-                    };
-                    Ok((StatusCode::CREATED, Json(response)))
-                }
-                Err(e) => {
-                    if e.to_string().contains("duplicate key")
-                        || e.to_string().contains("already exists")
-                    {
-                        debug!("Workspace name already exists in organization");
-                        Err(StatusCode::CONFLICT)
-                    } else {
-                        error!("Failed to create workspace: {}", e);
-                        Err(StatusCode::INTERNAL_SERVER_ERROR)
-                    }
-                }
-            }
+            Ok((StatusCode::CREATED, Json(response)))
         }
-        Ok(false) => {
-            debug!("User is not a member of organization: {}", org_id);
+        Err(services::workspace::WorkspaceError::Unauthorized(msg)) => {
+            debug!("User is not authorized to create workspace: {}", msg);
             Err(StatusCode::FORBIDDEN)
         }
+        Err(services::workspace::WorkspaceError::AlreadyExists) => {
+            debug!("Workspace name already exists in organization");
+            Err(StatusCode::CONFLICT)
+        }
+        Err(services::workspace::WorkspaceError::InvalidParams(msg)) => {
+            debug!("Invalid workspace parameters: {}", msg);
+            Err(StatusCode::BAD_REQUEST)
+        }
         Err(e) => {
-            error!("Failed to check organization membership: {}", e);
+            error!("Failed to create workspace: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }

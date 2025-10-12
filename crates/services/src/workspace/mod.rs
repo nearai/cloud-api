@@ -152,7 +152,12 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             )
             .await
             .map_err(|e| {
-                WorkspaceError::InternalError(format!("Failed to create workspace: {}", e))
+                let error_msg = e.to_string();
+                if error_msg.contains("duplicate key") || error_msg.contains("already exists") {
+                    WorkspaceError::AlreadyExists
+                } else {
+                    WorkspaceError::InternalError(format!("Failed to create workspace: {}", e))
+                }
             })
     }
 

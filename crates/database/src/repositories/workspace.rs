@@ -113,6 +113,25 @@ impl WorkspaceRepository {
         }
     }
 
+    /// Count workspaces for an organization
+    pub async fn count_by_organization(&self, organization_id: Uuid) -> Result<i64> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let row = client
+            .query_one(
+                "SELECT COUNT(*) as count FROM workspaces WHERE organization_id = $1 AND is_active = true",
+                &[&organization_id],
+            )
+            .await
+            .context("Failed to count workspaces")?;
+
+        Ok(row.get::<_, i64>("count"))
+    }
+
     /// List workspaces for an organization
     pub async fn list_by_organization(&self, organization_id: Uuid) -> Result<Vec<Workspace>> {
         let client = self
@@ -125,6 +144,32 @@ impl WorkspaceRepository {
             .query(
                 "SELECT * FROM workspaces WHERE organization_id = $1 AND is_active = true ORDER BY created_at DESC",
                 &[&organization_id],
+            )
+            .await
+            .context("Failed to list workspaces")?;
+
+        rows.into_iter()
+            .map(|row| self.row_to_workspace(row))
+            .collect()
+    }
+
+    /// List workspaces for an organization with pagination
+    pub async fn list_by_organization_paginated(
+        &self,
+        organization_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Workspace>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let rows = client
+            .query(
+                "SELECT * FROM workspaces WHERE organization_id = $1 AND is_active = true ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+                &[&organization_id, &limit, &offset],
             )
             .await
             .context("Failed to list workspaces")?;

@@ -46,11 +46,23 @@ impl ModelsServiceTrait for ModelsServiceImpl {
             .map_err(|e| ModelsError::InternalError(e.to_string()))
     }
 
-    async fn get_models_with_pricing(&self) -> Result<Vec<ModelWithPricing>, ModelsError> {
-        self.models_repository
-            .get_all_active_models()
+    async fn get_models_with_pricing(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<ModelWithPricing>, i64), ModelsError> {
+        let total = self
+            .models_repository
+            .get_all_active_models_count()
             .await
-            .map_err(|e| ModelsError::InternalError(e.to_string()))
+            .map_err(|e| ModelsError::InternalError(e.to_string()))?;
+
+        let models = self
+            .models_repository
+            .get_all_active_models(limit, offset)
+            .await
+            .map_err(|e| ModelsError::InternalError(e.to_string()))?;
+        Ok((models, total))
     }
 
     async fn get_model_by_name(&self, model_name: &str) -> Result<ModelWithPricing, ModelsError> {

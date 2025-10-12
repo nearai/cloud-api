@@ -34,8 +34,8 @@ impl UsageServiceTrait for UsageServiceImpl {
     async fn calculate_cost(
         &self,
         model_id: &str,
-        input_tokens: u32,
-        output_tokens: u32,
+        input_tokens: i32,
+        output_tokens: i32,
     ) -> Result<CostBreakdown, UsageError> {
         // Get model pricing
         let model = self
@@ -75,8 +75,8 @@ impl UsageServiceTrait for UsageServiceImpl {
             api_key_id: request.api_key_id,
             response_id: request.response_id,
             model_id: request.model_id,
-            input_tokens: request.input_tokens as i32,
-            output_tokens: request.output_tokens as i32,
+            input_tokens: request.input_tokens,
+            output_tokens: request.output_tokens,
             input_cost: cost.input_cost,
             output_cost: cost.output_cost,
             total_cost: cost.total_cost,
@@ -178,8 +178,8 @@ impl UsageServiceTrait for UsageServiceImpl {
         organization_id: Uuid,
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> Result<Vec<UsageLogEntry>, UsageError> {
-        let logs = self
+    ) -> Result<(Vec<UsageLogEntry>, i64), UsageError> {
+        let (logs, total) = self
             .usage_repository
             .get_usage_history(organization_id, limit, offset)
             .await
@@ -187,7 +187,7 @@ impl UsageServiceTrait for UsageServiceImpl {
                 UsageError::InternalError(format!("Failed to get usage history: {}", e))
             })?;
 
-        Ok(logs)
+        Ok((logs, total))
     }
 
     /// Get current spending limit for an organization
@@ -210,8 +210,8 @@ impl UsageServiceTrait for UsageServiceImpl {
         api_key_id: Uuid,
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> Result<Vec<UsageLogEntry>, UsageError> {
-        let logs = self
+    ) -> Result<(Vec<UsageLogEntry>, i64), UsageError> {
+        let (logs, total) = self
             .usage_repository
             .get_usage_history_by_api_key(api_key_id, limit, offset)
             .await
@@ -219,7 +219,7 @@ impl UsageServiceTrait for UsageServiceImpl {
                 UsageError::InternalError(format!("Failed to get API key usage history: {}", e))
             })?;
 
-        Ok(logs)
+        Ok((logs, total))
     }
 
     /// Get usage history for a specific API key with permission checking
@@ -230,7 +230,7 @@ impl UsageServiceTrait for UsageServiceImpl {
         user_id: Uuid,
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> Result<Vec<UsageLogEntry>, UsageError> {
+    ) -> Result<(Vec<UsageLogEntry>, i64), UsageError> {
         // Check if the user has permission to access this workspace's API keys
         let can_access = self
             .workspace_service
@@ -264,7 +264,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             })?;
 
         // Get the usage history
-        let logs = self
+        let (logs, total) = self
             .usage_repository
             .get_usage_history_by_api_key(api_key_id, limit, offset)
             .await
@@ -272,6 +272,6 @@ impl UsageServiceTrait for UsageServiceImpl {
                 UsageError::InternalError(format!("Failed to get usage history: {}", e))
             })?;
 
-        Ok(logs)
+        Ok((logs, total))
     }
 }

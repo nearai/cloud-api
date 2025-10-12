@@ -15,8 +15,27 @@ impl ModelRepository {
         Self { pool }
     }
 
+    pub async fn get_all_active_models_count(&self) -> Result<i64> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let row = client
+            .query_one(
+                r#"
+                SELECT COUNT(*) as count FROM models WHERE is_active = true
+                "#,
+                &[],
+            )
+            .await
+            .context("Failed to query models")?;
+        Ok(row.get::<_, i64>("count"))
+    }
+
     /// Get all active models with pricing information
-    pub async fn get_all_active_models(&self) -> Result<Vec<Model>> {
+    pub async fn get_all_active_models(&self, limit: i64, offset: i64) -> Result<Vec<Model>> {
         let client = self
             .pool
             .get()
@@ -33,8 +52,9 @@ impl ModelRepository {
                 FROM models 
                 WHERE is_active = true
                 ORDER BY model_name ASC
+                LIMIT $1 OFFSET $2
                 "#,
-                &[],
+                &[&limit, &offset],
             )
             .await
             .context("Failed to query models")?;
@@ -240,10 +260,35 @@ impl ModelRepository {
         }
     }
 
-    /// Get pricing history for a model by model name
+    /// Get count of pricing history entries for a model by model name
+    pub async fn count_pricing_history_by_name(&self, model_name: &str) -> Result<i64> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let row = client
+            .query_one(
+                r#"
+                SELECT COUNT(*) as count
+                FROM model_pricing_history h
+                JOIN models m ON h.model_id = m.id
+                WHERE m.model_name = $1
+                "#,
+                &[&model_name],
+            )
+            .await
+            .context("Failed to count pricing history")?;
+        Ok(row.get::<_, i64>("count"))
+    }
+
+    /// Get pricing history for a model by model name with pagination
     pub async fn get_pricing_history_by_name(
         &self,
         model_name: &str,
+        limit: i64,
+        offset: i64,
     ) -> Result<Vec<ModelPricingHistory>> {
         let client = self
             .pool
@@ -262,8 +307,9 @@ impl ModelRepository {
                 JOIN models m ON h.model_id = m.id
                 WHERE m.model_name = $1
                 ORDER BY h.effective_from DESC
+                LIMIT $2 OFFSET $3
                 "#,
-                &[&model_name],
+                &[&model_name, &limit, &offset],
             )
             .await
             .context("Failed to query pricing history by name")?;
@@ -372,8 +418,16 @@ impl ModelRepository {
 // Implement ModelsRepository trait from services
 #[async_trait]
 impl services::models::ModelsRepository for ModelRepository {
-    async fn get_all_active_models(&self) -> Result<Vec<services::models::ModelWithPricing>> {
-        let models = self.get_all_active_models().await?;
+    async fn get_all_active_models_count(&self) -> Result<i64> {
+        self.get_all_active_models_count().await
+    }
+
+    async fn get_all_active_models(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<services::models::ModelWithPricing>> {
+        let models = self.get_all_active_models(limit, offset).await?;
         Ok(models
             .into_iter()
             .map(|m| services::models::ModelWithPricing {

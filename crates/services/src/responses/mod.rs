@@ -55,7 +55,7 @@ impl ResponseService {
             // Fetch existing conversation messages for LLM context
             match self
                 .conversation_service
-                .get_conversation_messages(conversation_id, &request.user_id, None)
+                .get_conversation_messages(conversation_id, &request.user_id, 100)
                 .await
             {
                 Ok(conversation_messages) => {

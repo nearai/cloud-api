@@ -30,12 +30,12 @@ impl InferenceProviderPool {
     pub fn new(
         discovery_url: String,
         api_key: Option<String>,
-        discovery_timeout_secs: u64,
+        discovery_timeout_secs: i64,
     ) -> Self {
         Self {
             discovery_url,
             api_key,
-            discovery_timeout: Duration::from_secs(discovery_timeout_secs),
+            discovery_timeout: Duration::from_secs(discovery_timeout_secs as u64),
             model_mapping: Arc::new(RwLock::new(HashMap::new())),
             load_balancer_index: Arc::new(RwLock::new(HashMap::new())),
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),

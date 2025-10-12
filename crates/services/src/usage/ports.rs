@@ -11,8 +11,8 @@ pub trait UsageServiceTrait: Send + Sync {
     async fn calculate_cost(
         &self,
         model_id: &str,
-        input_tokens: u32,
-        output_tokens: u32,
+        input_tokens: i32,
+        output_tokens: i32,
     ) -> Result<CostBreakdown, UsageError>;
 
     /// Record usage after an API call completes
@@ -28,12 +28,13 @@ pub trait UsageServiceTrait: Send + Sync {
     ) -> Result<Option<OrganizationBalanceInfo>, UsageError>;
 
     /// Get usage history for an organization
+    /// Returns a tuple of (entries, total_count)
     async fn get_usage_history(
         &self,
         organization_id: Uuid,
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> Result<Vec<UsageLogEntry>, UsageError>;
+    ) -> Result<(Vec<UsageLogEntry>, i64), UsageError>;
 
     /// Get current spending limit for an organization
     async fn get_limit(
@@ -42,15 +43,17 @@ pub trait UsageServiceTrait: Send + Sync {
     ) -> Result<Option<OrganizationLimit>, UsageError>;
 
     /// Get usage history for a specific API key
+    /// Returns a tuple of (entries, total_count)
     async fn get_usage_history_by_api_key(
         &self,
         api_key_id: Uuid,
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> Result<Vec<UsageLogEntry>, UsageError>;
+    ) -> Result<(Vec<UsageLogEntry>, i64), UsageError>;
 
     /// Get usage history for a specific API key with permission checking
     /// This method verifies the user has access to the workspace and that the API key exists
+    /// Returns a tuple of (entries, total_count)
     async fn get_api_key_usage_history_with_permissions(
         &self,
         workspace_id: Uuid,
@@ -58,7 +61,7 @@ pub trait UsageServiceTrait: Send + Sync {
         user_id: Uuid,
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> Result<Vec<UsageLogEntry>, UsageError>;
+    ) -> Result<(Vec<UsageLogEntry>, i64), UsageError>;
 }
 
 // ============================================
@@ -77,20 +80,22 @@ pub trait UsageRepository: Send + Sync {
     ) -> anyhow::Result<Option<OrganizationBalanceInfo>>;
 
     /// Get usage history for an organization
+    /// Returns a tuple of (entries, total_count)
     async fn get_usage_history(
         &self,
         organization_id: Uuid,
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> anyhow::Result<Vec<UsageLogEntry>>;
+    ) -> anyhow::Result<(Vec<UsageLogEntry>, i64)>;
 
     /// Get usage history for a specific API key
+    /// Returns a tuple of (entries, total_count)
     async fn get_usage_history_by_api_key(
         &self,
         api_key_id: Uuid,
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> anyhow::Result<Vec<UsageLogEntry>>;
+    ) -> anyhow::Result<(Vec<UsageLogEntry>, i64)>;
 
     /// Get total spend for a specific API key
     async fn get_api_key_spend(&self, api_key_id: Uuid) -> anyhow::Result<i64>;
@@ -123,8 +128,8 @@ pub struct RecordUsageServiceRequest {
     pub api_key_id: Uuid,
     pub response_id: Option<Uuid>,
     pub model_id: String,
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+    pub input_tokens: i32,
+    pub output_tokens: i32,
     pub request_type: String, // 'chat_completion', 'text_completion', 'response'
 }
 

@@ -131,10 +131,31 @@ impl OrganizationLimitsRepository {
         }
     }
 
+    /// Count limits history for an organization
+    pub async fn count_limits_history(&self, organization_id: Uuid) -> Result<i64> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let row = client
+            .query_one(
+                "SELECT COUNT(*) FROM organization_limits_history WHERE organization_id = $1",
+                &[&organization_id],
+            )
+            .await
+            .context("Failed to count limits history")?;
+
+        Ok(row.get("count"))
+    }
+
     /// Get all limits history for an organization
     pub async fn get_limits_history(
         &self,
         organization_id: Uuid,
+        limit: i64,
+        offset: i64,
     ) -> Result<Vec<OrganizationLimitsHistory>> {
         let client = self
             .pool
@@ -151,8 +172,9 @@ impl OrganizationLimitsRepository {
                 FROM organization_limits_history
                 WHERE organization_id = $1
                 ORDER BY effective_from DESC
+                LIMIT $2 OFFSET $3
                 "#,
-                &[&organization_id],
+                &[&organization_id, &limit, &offset],
             )
             .await
             .context("Failed to query organization limits history")?;

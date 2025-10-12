@@ -85,6 +85,9 @@ pub enum OrganizationError {
     #[error("Invalid parameters: {0}")]
     InvalidParams(String),
 
+    #[error("Organization already exists")]
+    AlreadyExists,
+
     #[error("Internal error: {0}")]
     InternalError(String),
 

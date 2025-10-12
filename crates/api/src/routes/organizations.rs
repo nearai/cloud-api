@@ -167,13 +167,13 @@ pub async fn create_organization(
             debug!("Invalid organization creation params: {}", msg);
             Err(StatusCode::BAD_REQUEST)
         }
+        Err(OrganizationError::AlreadyExists) => {
+            debug!("Organization already exists");
+            Err(StatusCode::CONFLICT)
+        }
         Err(e) => {
             error!("Failed to create organization: {}", e);
-            if e.to_string().contains("duplicate key") || e.to_string().contains("already exists") {
-                Err(StatusCode::CONFLICT)
-            } else {
-                Err(StatusCode::INTERNAL_SERVER_ERROR)
-            }
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }

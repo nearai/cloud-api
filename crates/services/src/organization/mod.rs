@@ -48,7 +48,15 @@ impl OrganizationServiceImpl {
             .create(request, owner_id.0)
             .await
             .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to create organization: {}", e))
+                let error_msg = e.to_string();
+                if error_msg.contains("duplicate key") || error_msg.contains("already exists") {
+                    OrganizationError::AlreadyExists
+                } else {
+                    OrganizationError::InternalError(format!(
+                        "Failed to create organization: {}",
+                        e
+                    ))
+                }
             })
     }
 

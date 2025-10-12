@@ -33,7 +33,7 @@ use crate::routes::{
     organizations::*,
     users::{
         accept_invitation, decline_invitation, get_current_user, get_user_sessions,
-        list_user_invitations, quick_setup, revoke_all_user_sessions, revoke_user_session,
+        list_user_invitations, revoke_all_user_sessions, revoke_user_session,
         update_current_user_profile,
     },
 };
@@ -103,7 +103,6 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
     let user_routes = Router::new()
         .route("/me", get(get_current_user))
         .route("/me/profile", put(update_current_user_profile))
-        .route("/me/quick-setup", axum::routing::post(quick_setup))
         .route("/me/invitations", get(list_user_invitations))
         .route(
             "/me/invitations/{invitation_id}/accept",

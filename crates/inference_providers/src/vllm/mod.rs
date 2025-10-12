@@ -7,11 +7,11 @@ use reqwest::Client;
 pub struct VLlmConfig {
     pub base_url: String,
     pub api_key: Option<String>,
-    pub timeout_seconds: u64,
+    pub timeout_seconds: i64,
 }
 
 impl VLlmConfig {
-    pub fn new(base_url: String, api_key: Option<String>, timeout_seconds: Option<u64>) -> Self {
+    pub fn new(base_url: String, api_key: Option<String>, timeout_seconds: Option<i64>) -> Self {
         Self {
             base_url,
             api_key,
@@ -33,7 +33,9 @@ impl VLlmProvider {
     /// Create a new vLLM provider with the given configuration
     pub fn new(config: VLlmConfig) -> Self {
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(config.timeout_seconds))
+            .timeout(std::time::Duration::from_secs(
+                config.timeout_seconds as u64,
+            ))
             .build()
             .expect("Failed to create HTTP client");
 

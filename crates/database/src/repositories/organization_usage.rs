@@ -150,6 +150,29 @@ impl OrganizationUsageRepository {
         Ok(row_opt.map(|row| self.row_to_balance(&row)))
     }
 
+    /// Count total usage history records for an organization
+    pub async fn count_usage_history(&self, organization_id: Uuid) -> Result<i64> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let row = client
+            .query_one(
+                r#"
+                SELECT COUNT(*) as count
+                FROM organization_usage_log
+                WHERE organization_id = $1
+                "#,
+                &[&organization_id],
+            )
+            .await
+            .context("Failed to count usage history")?;
+
+        Ok(row.get::<_, i64>("count"))
+    }
+
     /// Get usage history for an organization
     pub async fn get_usage_history(
         &self,
@@ -184,6 +207,29 @@ impl OrganizationUsageRepository {
             .context("Failed to query usage history")?;
 
         Ok(rows.iter().map(|row| self.row_to_usage_log(row)).collect())
+    }
+
+    /// Count total usage history records for an API key
+    pub async fn count_usage_history_by_api_key(&self, api_key_id: Uuid) -> Result<i64> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let row = client
+            .query_one(
+                r#"
+                SELECT COUNT(*) as count
+                FROM organization_usage_log
+                WHERE api_key_id = $1
+                "#,
+                &[&api_key_id],
+            )
+            .await
+            .context("Failed to count usage history by API key")?;
+
+        Ok(row.get::<_, i64>("count"))
     }
 
     /// Get usage history for a specific API key

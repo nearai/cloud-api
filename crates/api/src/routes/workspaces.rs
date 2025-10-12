@@ -2,8 +2,8 @@ use crate::{
     conversions::authenticated_user_to_user_id,
     middleware::{auth::AuthenticatedApiKey, AuthenticatedUser},
     models::{
-        ApiKeyResponse, CreateApiKeyRequest, DecimalPrice, ErrorResponse, UpdateApiKeyRequest,
-        UpdateApiKeySpendLimitRequest,
+        ApiKeyResponse, CreateApiKeyRequest, DecimalPrice, ErrorResponse, ListApiKeysResponse,
+        UpdateApiKeyRequest, UpdateApiKeySpendLimitRequest,
     },
     routes::api::AppState,
 };
@@ -54,17 +54,22 @@ pub struct WorkspaceResponse {
     pub settings: Option<serde_json::Value>,
 }
 
-/// Query parameters for listing
-#[derive(Debug, Deserialize)]
-pub struct ListParams {
-    #[serde(default = "default_limit")]
+/// Paginated workspaces list response
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListWorkspacesResponse {
+    pub workspaces: Vec<WorkspaceResponse>,
+    pub total: i64,
     pub limit: i64,
-    #[serde(default)]
     pub offset: i64,
 }
 
-fn default_limit() -> i64 {
-    20
+/// Query parameters for listing
+#[derive(Debug, Deserialize)]
+pub struct ListParams {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
 }
 
 // ============================================
@@ -183,7 +188,7 @@ pub async fn create_workspace(
         ("offset" = Option<i64>, Query, description = "Number of results to skip")
     ),
     responses(
-        (status = 200, description = "List of workspaces", body = Vec<WorkspaceResponse>),
+        (status = 200, description = "Paginated list of workspaces", body = ListWorkspacesResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden - not a member of organization", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
@@ -196,12 +201,19 @@ pub async fn list_organization_workspaces(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
-    Query(_params): Query<ListParams>,
-) -> Result<Json<Vec<WorkspaceResponse>>, StatusCode> {
+    Query(params): Query<ListParams>,
+) -> Result<Json<ListWorkspacesResponse>, StatusCode> {
     debug!(
         "Listing workspaces for organization: {} by user: {}",
         org_id, user.0.id
     );
+
+    // Validate pagination parameters
+    if let Err((status, _)) =
+        crate::routes::common::validate_limit_offset(params.limit, params.offset)
+    {
+        return Err(status);
+    }
 
     let user_id = authenticated_user_to_user_id(user);
     let organization_id = OrganizationId(org_id);
@@ -213,11 +225,24 @@ pub async fn list_organization_workspaces(
         .await
     {
         Ok(true) => {
-            // List workspaces
+            // List workspaces with DB-level pagination
             let workspace_repo = Arc::new(DbWorkspaceRepository::new(app_state.db.pool().clone()));
-            match workspace_repo.list_by_organization(org_id).await {
+
+            // Get total count and paginated results
+            let total = match workspace_repo.count_by_organization(org_id).await {
+                Ok(count) => count,
+                Err(e) => {
+                    error!("Failed to count workspaces: {}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            };
+
+            match workspace_repo
+                .list_by_organization_paginated(org_id, params.limit, params.offset)
+                .await
+            {
                 Ok(workspaces) => {
-                    let response: Vec<WorkspaceResponse> = workspaces
+                    let workspace_responses: Vec<WorkspaceResponse> = workspaces
                         .into_iter()
                         .map(|w| WorkspaceResponse {
                             id: w.id.to_string(),
@@ -232,7 +257,13 @@ pub async fn list_organization_workspaces(
                             settings: w.settings,
                         })
                         .collect();
-                    Ok(Json(response))
+
+                    Ok(Json(ListWorkspacesResponse {
+                        workspaces: workspace_responses,
+                        total,
+                        limit: params.limit,
+                        offset: params.offset,
+                    }))
                 }
                 Err(e) => {
                     error!("Failed to list workspaces: {}", e);
@@ -593,7 +624,7 @@ pub async fn create_workspace_api_key(
         ("offset" = Option<i64>, Query, description = "Number of results to skip (default: 0)")
     ),
     responses(
-        (status = 200, description = "List of workspace API keys", body = Vec<ApiKeyResponse>),
+        (status = 200, description = "Paginated list of workspace API keys", body = ListApiKeysResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Workspace not found", body = ErrorResponse),
@@ -608,14 +639,30 @@ pub async fn list_workspace_api_keys(
     Extension(user): Extension<AuthenticatedUser>,
     Path(workspace_id): Path<Uuid>,
     Query(params): Query<ListParams>,
-) -> Result<Json<Vec<ApiKeyResponse>>, StatusCode> {
+) -> Result<Json<ListApiKeysResponse>, StatusCode> {
     debug!(
         "Listing API keys for workspace: {} by user: {} (limit: {}, offset: {})",
         workspace_id, user.0.id, params.limit, params.offset
     );
 
+    // Validate pagination parameters
+    if let Err((status, _)) =
+        crate::routes::common::validate_limit_offset(params.limit, params.offset)
+    {
+        return Err(status);
+    }
+
     let user_id = authenticated_user_to_user_id(user);
     let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
+
+    // Get total count from repository
+    let total = match app_state.db.api_keys.count_by_workspace(workspace_id).await {
+        Ok(count) => count,
+        Err(e) => {
+            error!("Failed to count API keys for workspace: {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
 
     // Use workspace service to list workspace API keys with pagination and usage data
     match app_state
@@ -629,11 +676,17 @@ pub async fn list_workspace_api_keys(
                 api_keys.len(),
                 workspace_id
             );
-            let response: Vec<ApiKeyResponse> = api_keys
+            let api_key_responses: Vec<ApiKeyResponse> = api_keys
                 .into_iter()
                 .map(crate::conversions::workspace_api_key_to_api_response)
                 .collect();
-            Ok(Json(response))
+
+            Ok(Json(ListApiKeysResponse {
+                api_keys: api_key_responses,
+                total,
+                limit: params.limit,
+                offset: params.offset,
+            }))
         }
         Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
         Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),

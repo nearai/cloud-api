@@ -180,37 +180,6 @@ pub struct VerifyRequest {
     pub request_hash: Option<String>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct VerifyResponse {
-    pub valid: bool,
-    pub chat_id: String,
-    pub response_hash: String,
-    pub signature: Option<SignatureResponse>,
-    pub message: String,
-}
-
-#[utoipa::path(
-    post,
-    path = "/verify/{chat_id}",
-    params(
-        ("chat_id" = String, Path, description = "Chat completion ID to verify")
-    ),
-    request_body = VerifyRequest,
-    responses(
-        (status = 200, description = "Verification completed", body = VerifyResponse)
-    ),
-    security(
-        ("api_key" = [])
-    )
-)]
-pub async fn verify_attestation(
-    Path(_chat_id): Path<String>,
-    State(_app_state): State<AppState>,
-    ResponseJson(_req): ResponseJson<VerifyRequest>,
-) -> Result<ResponseJson<VerifyResponse>, (StatusCode, ResponseJson<serde_json::Value>)> {
-    unimplemented!()
-}
-
 /// Quote response containing gateway quote and allowlist
 #[derive(Debug, Serialize, ToSchema)]
 pub struct QuoteResponse {

@@ -124,11 +124,13 @@ pub trait AdminRepository: Send + Sync {
         request: UpdateModelAdminRequest,
     ) -> Result<ModelPricing, anyhow::Error>;
 
-    /// Get pricing history for a model
+    /// Get pricing history for a model with pagination
     async fn get_pricing_history(
         &self,
         model_name: &str,
-    ) -> Result<Vec<ModelPricingHistoryEntry>, anyhow::Error>;
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<ModelPricingHistoryEntry>, i64), anyhow::Error>;
 
     /// Soft delete a model by setting is_active to false
     async fn soft_delete_model(&self, model_name: &str) -> Result<bool, anyhow::Error>;
@@ -146,10 +148,18 @@ pub trait AdminRepository: Send + Sync {
         organization_id: uuid::Uuid,
     ) -> Result<Option<OrganizationLimits>, anyhow::Error>;
 
+    /// Count limits history for an organization
+    async fn count_organization_limits_history(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<i64, anyhow::Error>;
+
     /// Get limits history for an organization
     async fn get_organization_limits_history(
         &self,
         organization_id: uuid::Uuid,
+        limit: i64,
+        offset: i64,
     ) -> Result<Vec<OrganizationLimitsHistoryEntry>, anyhow::Error>;
 
     /// List all users with pagination (admin only)
@@ -165,11 +175,13 @@ pub trait AdminService: Send + Sync {
         models: BatchUpdateModelAdminRequest,
     ) -> Result<BatchUpdateModelAdminResponse, AdminError>;
 
-    /// Get pricing history for a model (admin only)
+    /// Get pricing history for a model with pagination (admin only)
     async fn get_pricing_history(
         &self,
         model_name: &str,
-    ) -> Result<Vec<ModelPricingHistoryEntry>, AdminError>;
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<ModelPricingHistoryEntry>, i64), AdminError>;
 
     /// Soft delete a model by setting is_active to false (admin only)
     async fn delete_model(&self, model_name: &str) -> Result<(), AdminError>;
@@ -185,7 +197,9 @@ pub trait AdminService: Send + Sync {
     async fn get_organization_limits_history(
         &self,
         organization_id: uuid::Uuid,
-    ) -> Result<Vec<OrganizationLimitsHistoryEntry>, AdminError>;
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<OrganizationLimitsHistoryEntry>, i64), AdminError>;
 
     /// List all users with pagination (admin only)
     async fn list_users(&self, limit: i64, offset: i64)

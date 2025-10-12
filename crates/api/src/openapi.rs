@@ -39,7 +39,6 @@ use utoipa::{Modify, OpenApi};
         // Attestation endpoints  
         crate::routes::attestation::get_signature,
         crate::routes::attestation::get_attestation_report,
-        crate::routes::attestation::verify_attestation,
         crate::routes::attestation::quote,
         // Model endpoints
         crate::routes::models::list_models,
@@ -120,7 +119,6 @@ use utoipa::{Modify, OpenApi};
             PublicUserResponse,
             AdminUserResponse,
             crate::routes::users::UpdateUserProfileRequest,
-            crate::routes::users::SearchParams,
             crate::routes::users::QuickSetupResponse,
             // Conversation models
             CreateConversationRequest, ConversationObject,
@@ -131,7 +129,6 @@ use utoipa::{Modify, OpenApi};
             crate::routes::attestation::SignatureResponse,
             crate::routes::attestation::AttestationResponse,
             crate::routes::attestation::VerifyRequest,
-            crate::routes::attestation::VerifyResponse,
             crate::routes::attestation::Evidence,
             crate::routes::attestation::NvidiaPayload,
             crate::routes::attestation::Attestation,
@@ -142,6 +139,7 @@ use utoipa::{Modify, OpenApi};
             UpdateModelApiRequest, ModelPricingHistoryEntry, ModelPricingHistoryResponse,
             // Organization limits models (Admin)
             UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, SpendLimit, SpendLimitRequest,
+            OrgLimitsHistoryEntry, OrgLimitsHistoryResponse,
             // User models (Admin)
             ListUsersResponse, AdminUserResponse,
             // Usage tracking models

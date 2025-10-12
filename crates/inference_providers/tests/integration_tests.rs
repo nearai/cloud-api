@@ -20,7 +20,7 @@ fn create_test_provider() -> VLlmProvider {
     let config = VLlmConfig {
         base_url: VLLM_BASE_URL.to_string(),
         api_key: Some(VLLM_API_KEY.to_string()),
-        timeout_seconds: TEST_TIMEOUT_SECS,
+        timeout_seconds: TEST_TIMEOUT_SECS as i64,
     };
     VLlmProvider::new(config)
 }

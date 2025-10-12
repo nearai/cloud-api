@@ -65,12 +65,14 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
         organization_id: Uuid,
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> anyhow::Result<Vec<UsageLogEntry>> {
+    ) -> anyhow::Result<(Vec<UsageLogEntry>, i64)> {
         let logs = self
             .get_usage_history(organization_id, limit, offset)
             .await?;
 
-        Ok(logs
+        let total = self.count_usage_history(organization_id).await?;
+
+        let entries = logs
             .into_iter()
             .map(|log| UsageLogEntry {
                 id: log.id,
@@ -88,7 +90,9 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 request_type: log.request_type,
                 created_at: log.created_at,
             })
-            .collect())
+            .collect();
+
+        Ok((entries, total))
     }
 
     async fn get_usage_history_by_api_key(
@@ -96,12 +100,14 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
         api_key_id: Uuid,
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> anyhow::Result<Vec<UsageLogEntry>> {
+    ) -> anyhow::Result<(Vec<UsageLogEntry>, i64)> {
         let logs = self
             .get_usage_history_by_api_key(api_key_id, limit, offset)
             .await?;
 
-        Ok(logs
+        let total = self.count_usage_history_by_api_key(api_key_id).await?;
+
+        let entries = logs
             .into_iter()
             .map(|log| UsageLogEntry {
                 id: log.id,
@@ -119,7 +125,9 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 request_type: log.request_type,
                 created_at: log.created_at,
             })
-            .collect())
+            .collect();
+
+        Ok((entries, total))
     }
 
     async fn get_api_key_spend(&self, api_key_id: Uuid) -> anyhow::Result<i64> {

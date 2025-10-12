@@ -7,7 +7,7 @@ use utoipa::ToSchema;
 pub struct StreamChunkResponse {
     pub id: String,
     pub object: String,
-    pub created: u64,
+    pub created: i64,
     pub model: String,
     pub choices: Vec<StreamChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16,7 +16,7 @@ pub struct StreamChunkResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StreamChoice {
-    pub index: u32,
+    pub index: i64,
     pub delta: Delta,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
@@ -35,13 +35,13 @@ pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<Message>,
     #[serde(default = "default_max_tokens")]
-    pub max_tokens: Option<u32>,
+    pub max_tokens: Option<i64>,
     #[serde(default = "default_temperature")]
     pub temperature: Option<f32>,
     #[serde(default = "default_top_p")]
     pub top_p: Option<f32>,
     #[serde(default = "default_n")]
-    pub n: Option<u32>,
+    pub n: Option<i64>,
     pub stream: Option<bool>,
     pub stop: Option<Vec<String>>,
     pub presence_penalty: Option<f32>,
@@ -59,7 +59,7 @@ pub struct Message {
 pub struct ChatCompletionResponse {
     pub id: String,
     pub object: String, // "chat.completion"
-    pub created: u64,
+    pub created: i64,
     pub model: String,
     pub choices: Vec<ChatChoice>,
     pub usage: Usage,
@@ -67,7 +67,7 @@ pub struct ChatCompletionResponse {
 
 #[derive(Debug, Serialize, ToSchema, Deserialize)]
 pub struct ChatChoice {
-    pub index: u32,
+    pub index: i64,
     pub message: Message,
     pub finish_reason: Option<String>, // "stop", "length", "content_filter"
 }
@@ -77,27 +77,27 @@ pub struct CompletionRequest {
     pub model: String,
     pub prompt: String,
     #[serde(default = "default_max_tokens")]
-    pub max_tokens: Option<u32>,
+    pub max_tokens: Option<i64>,
     #[serde(default = "default_temperature")]
     pub temperature: Option<f32>,
     #[serde(default = "default_top_p")]
     pub top_p: Option<f32>,
     #[serde(default = "default_n")]
-    pub n: Option<u32>,
+    pub n: Option<i64>,
     pub stream: Option<bool>,
-    pub logprobs: Option<u32>,
+    pub logprobs: Option<i64>,
     pub echo: Option<bool>,
     pub stop: Option<Vec<String>>,
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
-    pub best_of: Option<u32>,
+    pub best_of: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CompletionResponse {
     pub id: String,
     pub object: String, // "text_completion"
-    pub created: u64,
+    pub created: i64,
     pub model: String,
     pub choices: Vec<CompletionChoice>,
     pub usage: Usage,
@@ -113,13 +113,13 @@ pub struct ModelsResponse {
 pub struct ModelInfo {
     pub id: String,
     pub object: String,
-    pub created: u64,
+    pub created: i64,
     pub owned_by: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CompletionChoice {
-    pub index: u32,
+    pub index: i64,
     pub text: String,
     pub logprobs: Option<serde_json::Value>,
     pub finish_reason: Option<String>, // "stop", "length", "content_filter"
@@ -127,23 +127,23 @@ pub struct CompletionChoice {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Usage {
-    pub input_tokens: u32,
+    pub input_tokens: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens_details: Option<InputTokensDetails>,
-    pub output_tokens: u32,
+    pub output_tokens: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens_details: Option<OutputTokensDetails>,
-    pub total_tokens: u32,
+    pub total_tokens: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct InputTokensDetails {
-    pub cached_tokens: u32,
+    pub cached_tokens: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OutputTokensDetails {
-    pub reasoning_tokens: u32,
+    pub reasoning_tokens: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -159,7 +159,7 @@ pub struct ErrorDetail {
     pub code: Option<String>,
 }
 
-fn default_max_tokens() -> Option<u32> {
+fn default_max_tokens() -> Option<i64> {
     Some(100)
 }
 
@@ -171,7 +171,7 @@ fn default_top_p() -> Option<f32> {
     Some(1.0)
 }
 
-fn default_n() -> Option<u32> {
+fn default_n() -> Option<i64> {
     Some(1)
 }
 
@@ -237,7 +237,7 @@ impl CompletionRequest {
 }
 
 impl Usage {
-    pub fn new(input_tokens: u32, output_tokens: u32) -> Self {
+    pub fn new(input_tokens: i32, output_tokens: i32) -> Self {
         Self {
             input_tokens,
             input_tokens_details: Some(InputTokensDetails { cached_tokens: 0 }),
@@ -291,9 +291,9 @@ pub struct CreateResponseRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_output_tokens: Option<u32>,
+    pub max_output_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tool_calls: Option<u32>,
+    pub max_tool_calls: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -459,7 +459,7 @@ pub struct ResponseReasoningConfig {
 pub struct ResponseObject {
     pub id: String,
     pub object: String, // "response"
-    pub created_at: u64,
+    pub created_at: i64,
     pub status: ResponseStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ResponseError>,
@@ -468,9 +468,9 @@ pub struct ResponseObject {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_output_tokens: Option<u32>,
+    pub max_output_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tool_calls: Option<u32>,
+    pub max_tool_calls: Option<i64>,
     pub model: String,
     pub output: Vec<ResponseOutputItem>,
     pub parallel_tool_calls: bool,
@@ -670,7 +670,7 @@ pub struct UpdateConversationRequest {
 pub struct ConversationObject {
     pub id: String,
     pub object: String, // "conversation"
-    pub created_at: u64,
+    pub created_at: i64,
     pub metadata: serde_json::Value,
 }
 
@@ -841,6 +841,15 @@ pub struct OrganizationResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Paginated organizations list response
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListOrganizationsResponse {
+    pub organizations: Vec<OrganizationResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 /// Member role enum for API
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -905,6 +914,15 @@ pub struct PublicOrganizationMemberResponse {
     pub role: MemberRole,
     pub joined_at: DateTime<Utc>,
     pub user: PublicUserResponse,
+}
+
+/// List organization members response with pagination
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListOrganizationMembersResponse {
+    pub members: Vec<PublicOrganizationMemberResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
 }
 
 /// Admin organization member response (for owners/admins)
@@ -1034,6 +1052,15 @@ pub struct ApiKeyResponse {
     pub usage: Option<DecimalPrice>,
 }
 
+/// Paginated API keys list response
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListApiKeysResponse {
+    pub api_keys: Vec<ApiKeyResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 /// Request to update API key spend limit
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateApiKeySpendLimitRequest {
@@ -1105,13 +1132,9 @@ pub struct AcceptInvitationResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelListResponse {
     pub models: Vec<ModelWithPricing>,
-    #[serde(rename = "totalModels")]
-    pub total_models: usize,
-    pub page: usize,
-    #[serde(rename = "pageSize")]
-    pub page_size: usize,
-    #[serde(rename = "totalPages")]
-    pub total_pages: usize,
+    pub limit: i64,
+    pub offset: i64,
+    pub total: i64,
 }
 
 /// Model with pricing information
@@ -1149,7 +1172,7 @@ pub struct DecimalPriceRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct DecimalPrice {
     pub amount: i64,
-    pub scale: i32,
+    pub scale: i64,
     pub currency: String,
 }
 
@@ -1225,6 +1248,9 @@ pub struct ModelPricingHistoryResponse {
     #[serde(rename = "modelName")]
     pub model_name: String,
     pub history: Vec<ModelPricingHistoryEntry>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
 }
 
 // ============================================
@@ -1269,7 +1295,7 @@ pub struct SpendLimitRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SpendLimit {
     pub amount: i64,
-    pub scale: i32,
+    pub scale: i64,
     pub currency: String,
 }
 
@@ -1280,4 +1306,33 @@ pub struct UpdateOrganizationLimitsResponse {
     #[serde(rename = "spendLimit")]
     pub spend_limit: SpendLimit,
     pub updated_at: String,
+}
+
+/// Organization limits history entry
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct OrgLimitsHistoryEntry {
+    pub id: String,
+    #[serde(rename = "organizationId")]
+    pub organization_id: String,
+    #[serde(rename = "spendLimit")]
+    pub spend_limit: SpendLimit,
+    #[serde(rename = "effectiveFrom")]
+    pub effective_from: String,
+    #[serde(rename = "effectiveUntil")]
+    pub effective_until: Option<String>,
+    #[serde(rename = "changedBy")]
+    pub changed_by: Option<String>,
+    #[serde(rename = "changeReason")]
+    pub change_reason: Option<String>,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+}
+
+/// Organization limits history response
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct OrgLimitsHistoryResponse {
+    pub history: Vec<OrgLimitsHistoryEntry>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
 }

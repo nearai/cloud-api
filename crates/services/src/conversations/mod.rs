@@ -151,9 +151,9 @@ impl ConversationService {
         &self,
         conversation_id: &ConversationId,
         user_id: &UserId,
-        limit: Option<i32>,
+        limit: i64,
     ) -> Result<Vec<ports::ConversationMessage>, ports::ConversationError> {
-        let limit = limit.unwrap_or(50).min(100) as i64;
+        let limit = limit;
 
         // Get responses for this conversation
         let responses = self

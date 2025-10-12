@@ -76,13 +76,23 @@ impl AdminRepository for AdminCompositeRepository {
         })
     }
 
-    async fn get_pricing_history(&self, model_name: &str) -> Result<Vec<ModelPricingHistoryEntry>> {
-        let history = self
+    async fn get_pricing_history(
+        &self,
+        model_name: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<ModelPricingHistoryEntry>, i64)> {
+        let total = self
             .model_repo
-            .get_pricing_history_by_name(model_name)
+            .count_pricing_history_by_name(model_name)
             .await?;
 
-        Ok(history
+        let history = self
+            .model_repo
+            .get_pricing_history_by_name(model_name, limit, offset)
+            .await?;
+
+        let entries = history
             .into_iter()
             .map(|h| ModelPricingHistoryEntry {
                 id: h.id,
@@ -98,7 +108,9 @@ impl AdminRepository for AdminCompositeRepository {
                 change_reason: h.change_reason,
                 created_at: h.created_at,
             })
-            .collect())
+            .collect();
+
+        Ok((entries, total))
     }
 
     async fn soft_delete_model(&self, model_name: &str) -> Result<bool> {
@@ -141,11 +153,20 @@ impl AdminRepository for AdminCompositeRepository {
         }))
     }
 
+    async fn count_organization_limits_history(&self, organization_id: Uuid) -> Result<i64> {
+        self.limits_repo.count_limits_history(organization_id).await
+    }
+
     async fn get_organization_limits_history(
         &self,
         organization_id: Uuid,
+        limit: i64,
+        offset: i64,
     ) -> Result<Vec<OrganizationLimitsHistoryEntry>> {
-        let history = self.limits_repo.get_limits_history(organization_id).await?;
+        let history = self
+            .limits_repo
+            .get_limits_history(organization_id, limit, offset)
+            .await?;
 
         Ok(history
             .into_iter()

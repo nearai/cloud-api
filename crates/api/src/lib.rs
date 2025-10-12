@@ -285,19 +285,9 @@ pub async fn init_domain_services(
     let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
         as Arc<dyn services::auth::SessionRepository>;
 
-    // Create workspace repository for user service
-    let workspace_repository_for_user = Arc::new(database::repositories::WorkspaceRepository::new(
-        database.pool().clone(),
-    )) as Arc<dyn services::workspace::WorkspaceRepository>;
-
-    // Create user service (needs organization_service and workspace_service for quick_setup)
-    let user_service = Arc::new(services::user::UserService::new(
-        user_repo,
-        session_repo,
-        organization_service.clone(),
-        workspace_repository_for_user,
-        workspace_service.clone(),
-    )) as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
+    // Create user service
+    let user_service = Arc::new(services::user::UserService::new(user_repo, session_repo))
+        as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
 
     DomainServices {
         conversation_service,
@@ -671,8 +661,8 @@ pub fn build_model_routes(models_service: Arc<dyn ModelsServiceTrait>) -> Router
 pub fn build_admin_routes(database: Arc<Database>, auth_state_middleware: &AuthState) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
-        batch_upsert_models, delete_model, get_model_pricing_history, list_users,
-        update_organization_limits, AdminAppState,
+        batch_upsert_models, delete_model, get_model_pricing_history,
+        get_organization_limits_history, list_users, update_organization_limits, AdminAppState,
     };
     use database::repositories::AdminCompositeRepository;
     use services::admin::AdminServiceImpl;
@@ -700,6 +690,10 @@ pub fn build_admin_routes(database: Arc<Database>, auth_state_middleware: &AuthS
         .route(
             "/admin/organizations/{org_id}/limits",
             axum::routing::patch(update_organization_limits),
+        )
+        .route(
+            "/admin/organizations/{organization_id}/limits/history",
+            axum::routing::get(get_organization_limits_history),
         )
         .route("/admin/users", axum::routing::get(list_users))
         .with_state(admin_app_state)

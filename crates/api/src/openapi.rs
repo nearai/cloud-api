@@ -48,6 +48,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::delete_model,
         crate::routes::admin::get_model_pricing_history,
         crate::routes::admin::update_organization_limits,
+        crate::routes::admin::get_organization_limits_history,
         crate::routes::admin::list_users,
         // Workspace endpoints
         crate::routes::workspaces::create_workspace,
@@ -69,7 +70,6 @@ use utoipa::{Modify, OpenApi};
         // Users endpoints
         crate::routes::users::get_current_user,
         crate::routes::users::update_current_user_profile,
-        crate::routes::users::quick_setup,
         crate::routes::users::get_user_sessions,
         crate::routes::users::revoke_user_session,
         crate::routes::users::revoke_all_user_sessions,
@@ -119,7 +119,6 @@ use utoipa::{Modify, OpenApi};
             PublicUserResponse,
             AdminUserResponse,
             crate::routes::users::UpdateUserProfileRequest,
-            crate::routes::users::QuickSetupResponse,
             // Conversation models
             CreateConversationRequest, ConversationObject,
             UpdateConversationRequest, ConversationDeleteResult, ConversationItemList,

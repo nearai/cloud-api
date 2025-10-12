@@ -2,7 +2,8 @@ use crate::middleware::AdminUser;
 use crate::models::{
     AdminUserResponse, BatchUpdateModelApiRequest, DecimalPrice, ErrorResponse, ListUsersResponse,
     ModelMetadata, ModelPricingHistoryEntry, ModelPricingHistoryResponse, ModelWithPricing,
-    SpendLimit, UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
+    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, SpendLimit, UpdateOrganizationLimitsRequest,
+    UpdateOrganizationLimitsResponse,
 };
 use axum::{
     extract::{Path, State},
@@ -148,7 +149,9 @@ pub async fn batch_upsert_models(
     path = "/admin/models/{model_name}/pricing-history",
     tag = "Admin",
     params(
-        ("model_name" = String, Path, description = "Model name to get pricing history for (URL-encode if it contains slashes)")
+        ("model_name" = String, Path, description = "Model name to get pricing history for (URL-encode if it contains slashes)"),
+        ("limit" = i64, Query, description = "Maximum number of history entries to return (default: 50)"),
+        ("offset" = i64, Query, description = "Number of history entries to skip (default: 0)")
     ),
     responses(
         (status = 200, description = "Pricing history retrieved successfully", body = ModelPricingHistoryResponse),
@@ -164,12 +167,18 @@ pub async fn get_model_pricing_history(
     State(app_state): State<AdminAppState>,
     Path(model_name): Path<String>,
     Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    axum::extract::Query(params): axum::extract::Query<PricingHistoryQueryParams>,
 ) -> Result<ResponseJson<ModelPricingHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    debug!("Get pricing history request for model: {}", model_name);
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
-    let history = app_state
+    debug!(
+        "Get pricing history request for model: {}, limit={}, offset={}",
+        model_name, params.limit, params.offset
+    );
+
+    let (history, total) = app_state
         .admin_service
-        .get_pricing_history(&model_name)
+        .get_pricing_history(&model_name, params.limit, params.offset)
         .await
         .map_err(|e| {
             error!("Failed to get pricing history: {}", e);
@@ -228,6 +237,9 @@ pub async fn get_model_pricing_history(
     let response = ModelPricingHistoryResponse {
         model_name,
         history: history_entries,
+        total,
+        limit: params.limit,
+        offset: params.offset,
     };
 
     Ok(ResponseJson(response))
@@ -333,6 +345,113 @@ pub async fn update_organization_limits(
     Ok(ResponseJson(response))
 }
 
+/// Get limits history for an organization (Admin only)
+///
+/// Returns the complete limits history for a specific organization, showing all limits changes over time.
+/// Get limits history for an organization (Admin only)
+///
+/// Returns the complete limits history for a specific organization, showing all limits changes over time.
+#[utoipa::path(
+    get,
+    path = "/admin/organizations/{organization_id}/limits/history",
+    tag = "Admin",
+    params(
+        ("organization_id" = String, Path, description = "The organization's ID (as a UUID)"),
+        ("limit" = i64, Query, description = "Maximum number of history records to return (default: 50)"),
+        ("offset" = i64, Query, description = "Number of records to skip (default: 0)")
+    ),
+    responses(
+        (status = 200, description = "Limits history retrieved successfully", body = OrgLimitsHistoryResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_organization_limits_history(
+    State(app_state): State<AdminAppState>,
+    Path(organization_id): Path<String>,
+    Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    axum::extract::Query(params): axum::extract::Query<OrgLimitsHistoryQueryParams>,
+) -> Result<ResponseJson<OrgLimitsHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+
+    let organization_uuid = match uuid::Uuid::parse_str(&organization_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "Invalid organization ID format".to_string(),
+                    "invalid_request".to_string(),
+                )),
+            ));
+        }
+    };
+
+    debug!(
+        "Get limits history for organization_id={}, limit={}, offset={}",
+        organization_id, params.limit, params.offset
+    );
+
+    let (history, total) = app_state
+        .admin_service
+        .get_organization_limits_history(organization_uuid, params.limit, params.offset)
+        .await
+        .map_err(|e| {
+            error!("Failed to retrieve organization limits history: {}", e);
+            match e {
+                services::admin::AdminError::OrganizationNotFound(msg) => (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        msg,
+                        "organization_not_found".to_string(),
+                    )),
+                ),
+                services::admin::AdminError::Unauthorized(msg) => (
+                    StatusCode::UNAUTHORIZED,
+                    ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve limits history".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+
+    let entries: Vec<OrgLimitsHistoryEntry> = history
+        .into_iter()
+        .map(|h| OrgLimitsHistoryEntry {
+            id: h.id.to_string(),
+            organization_id: h.organization_id.to_string(),
+            spend_limit: SpendLimit {
+                amount: h.spend_limit,
+                scale: 9,
+                currency: "USD".to_string(),
+            },
+            effective_from: h.effective_from.to_rfc3339(),
+            effective_until: h.effective_until.map(|dt| dt.to_rfc3339()),
+            changed_by: h.changed_by,
+            change_reason: h.change_reason,
+            created_at: h.created_at.to_rfc3339(),
+        })
+        .collect();
+
+    let response = OrgLimitsHistoryResponse {
+        history: entries,
+        total,
+        limit: params.limit,
+        offset: params.offset,
+    };
+
+    Ok(ResponseJson(response))
+}
+
 /// Delete a model (Admin only)
 ///
 /// Soft deletes a model by setting is_active to false. This preserves historical usage records
@@ -407,8 +526,8 @@ pub async fn delete_model(
     path = "/admin/users",
     tag = "Admin",
     params(
-        ("limit" = Option<i64>, Query, description = "Maximum number of users to return (default: 50)"),
-        ("offset" = Option<i64>, Query, description = "Number of users to skip (default: 0)")
+        ("limit" = i64, Query, description = "Maximum number of users to return (default: 50)"),
+        ("offset" = i64, Query, description = "Number of users to skip (default: 0)")
     ),
     responses(
         (status = 200, description = "Users retrieved successfully", body = ListUsersResponse),
@@ -424,14 +543,16 @@ pub async fn list_users(
     Extension(_admin_user): Extension<AdminUser>, // Require admin auth
     axum::extract::Query(params): axum::extract::Query<ListUsersQueryParams>,
 ) -> Result<ResponseJson<ListUsersResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    let limit = params.limit.unwrap_or(50).min(100); // Cap at 100 for safety
-    let offset = params.offset.unwrap_or(0);
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
-    debug!("List users request with limit={}, offset={}", limit, offset);
+    debug!(
+        "List users request with limit={}, offset={}",
+        params.limit, params.offset
+    );
 
     let (users, total) = app_state
         .admin_service
-        .list_users(limit, offset)
+        .list_users(params.limit, params.offset)
         .await
         .map_err(|e| {
             error!("Failed to list users: {}", e);
@@ -467,8 +588,8 @@ pub async fn list_users(
     let response = ListUsersResponse {
         users: user_responses,
         total,
-        limit,
-        offset,
+        limit: params.limit,
+        offset: params.offset,
     };
 
     Ok(ResponseJson(response))
@@ -476,6 +597,24 @@ pub async fn list_users(
 
 #[derive(Debug, serde::Deserialize)]
 pub struct ListUsersQueryParams {
-    pub limit: Option<i64>,
-    pub offset: Option<i64>,
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct PricingHistoryQueryParams {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct OrgLimitsHistoryQueryParams {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
 }

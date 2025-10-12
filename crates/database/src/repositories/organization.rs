@@ -388,18 +388,26 @@ impl PgOrganizationRepository {
         Ok(rows_affected > 0)
     }
 
-    /// List members of an organization - internal method
-    async fn list_members_internal(&self, org_id: Uuid) -> Result<Vec<DbOrganizationMember>> {
+    /// List members of an organization with pagination - internal method
+    async fn list_members_paginated_internal(
+        &self,
+        org_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<DbOrganizationMember>> {
         let client = self
             .pool
             .get()
             .await
             .context("Failed to get database connection")?;
 
-        let rows = client.query(
-            "SELECT * FROM organization_members WHERE organization_id = $1 ORDER BY joined_at DESC",
-            &[&org_id],
-        ).await.context("Failed to list organization members")?;
+        let rows = client
+            .query(
+                "SELECT * FROM organization_members WHERE organization_id = $1 ORDER BY joined_at DESC LIMIT $2 OFFSET $3",
+                &[&org_id, &limit, &offset],
+            )
+            .await
+            .context("Failed to list organization members")?;
 
         rows.into_iter()
             .map(|row| self.row_to_db_org_member(row))
@@ -458,6 +466,30 @@ impl PgOrganizationRepository {
             joined_at: row.get("joined_at"),
             invited_by: row.get("invited_by"),
         })
+    }
+
+    /// Count organizations that a user is a member of
+    pub async fn count_organizations_by_user(&self, user_id: Uuid) -> Result<i64> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let row = client
+            .query_one(
+                r#"
+                SELECT COUNT(DISTINCT o.id) as count
+                FROM organizations o
+                INNER JOIN organization_members om ON o.id = om.organization_id
+                WHERE om.user_id = $1 AND o.is_active = true
+                "#,
+                &[&user_id],
+            )
+            .await
+            .context("Failed to count organizations by user")?;
+
+        Ok(row.get::<_, i64>("count"))
     }
 }
 
@@ -584,8 +616,15 @@ impl OrganizationRepository for PgOrganizationRepository {
         Ok(rows_affected > 0)
     }
 
-    async fn list_members(&self, org_id: Uuid) -> Result<Vec<OrganizationMember>> {
-        let db_members = self.list_members_internal(org_id).await?;
+    async fn list_members_paginated(
+        &self,
+        org_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<OrganizationMember>> {
+        let db_members = self
+            .list_members_paginated_internal(org_id, limit, offset)
+            .await?;
         db_members
             .into_iter()
             .map(|db_member| self.db_to_domain_member(db_member))
@@ -608,6 +647,11 @@ impl OrganizationRepository for PgOrganizationRepository {
             .context("Failed to count organization members")?;
 
         Ok(row.get("count"))
+    }
+
+    async fn count_organizations_by_user(&self, user_id: Uuid) -> Result<i64> {
+        // Delegate to the inherent method
+        self.count_organizations_by_user(user_id).await
     }
 
     async fn list_organizations_by_user(

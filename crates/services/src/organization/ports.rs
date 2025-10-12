@@ -217,9 +217,16 @@ pub trait OrganizationRepository: Send + Sync {
 
     async fn remove_member(&self, org_id: Uuid, user_id: Uuid) -> Result<bool>;
 
-    async fn list_members(&self, org_id: Uuid) -> Result<Vec<OrganizationMember>>;
+    async fn list_members_paginated(
+        &self,
+        org_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<OrganizationMember>>;
 
     async fn get_member_count(&self, org_id: Uuid) -> Result<i64>;
+
+    async fn count_organizations_by_user(&self, user_id: Uuid) -> Result<i64>;
 
     async fn list_organizations_by_user(
         &self,
@@ -332,13 +339,6 @@ pub trait OrganizationServiceTrait: Send + Sync {
         member_id: UserId,
     ) -> Result<bool, OrganizationError>;
 
-    /// Get all members of an organization
-    async fn get_members(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-    ) -> Result<Vec<OrganizationMember>, OrganizationError>;
-
     /// Update a member's role
     async fn update_member_role(
         &self,
@@ -375,11 +375,13 @@ pub trait OrganizationServiceTrait: Send + Sync {
         name: &str,
     ) -> Result<Option<Organization>, OrganizationError>;
 
-    /// List organization members with full user information
-    async fn get_members_with_users(
+    /// List organization members with full user information (paginated)
+    async fn get_members_with_users_paginated(
         &self,
         organization_id: OrganizationId,
         requester_id: UserId,
+        limit: i64,
+        offset: i64,
     ) -> Result<Vec<OrganizationMemberWithUser>, OrganizationError>;
 
     /// Invite members by email (batch operation)

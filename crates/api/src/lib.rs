@@ -9,7 +9,7 @@ use crate::{
     openapi::ApiDoc,
     routes::{
         api::{build_management_router, AppState},
-        attestation::{get_attestation_report, get_signature, quote, verify_attestation},
+        attestation::{get_attestation_report, get_signature, quote},
         auth::{
             current_user, github_login, google_login, login_page, logout, oauth_callback,
             StateStore,
@@ -83,23 +83,6 @@ pub async fn init_database(db_config: &config::DatabaseConfig) -> Arc<Database> 
         .await
         .expect("Failed to run database migrations");
     tracing::info!("Database migrations completed.");
-
-    database
-}
-
-/// Initialize database with custom config for testing
-pub async fn init_database_with_config(db_config: &config::DatabaseConfig) -> Arc<Database> {
-    let database = Arc::new(
-        Database::from_config(db_config)
-            .await
-            .expect("Failed to connect to database"),
-    );
-
-    // Run database migrations
-    database
-        .run_migrations()
-        .await
-        .expect("Failed to run database migrations");
 
     database
 }
@@ -355,7 +338,7 @@ pub async fn init_inference_providers(
 
     // Start periodic refresh task
     let pool_clone = pool.clone();
-    let refresh_interval = config.model_discovery.refresh_interval;
+    let refresh_interval = config.model_discovery.refresh_interval as u64;
 
     tokio::spawn(async move {
         let mut interval =
@@ -624,7 +607,6 @@ pub fn build_conversation_routes(
 pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
     Router::new()
         .route("/signature/{chat_id}", get(get_signature))
-        .route("/verify/{chat_id}", post(verify_attestation))
         .route("/attestation/report", get(get_attestation_report))
         .route("/attestation/quote", get(quote))
         .with_state(app_state)
@@ -982,7 +964,7 @@ mod tests {
         };
 
         // Initialize database with custom config
-        let database = init_database_with_config(&db_config).await;
+        let database = init_database(&db_config).await;
 
         // Create a test configuration
         let config = ApiConfig {

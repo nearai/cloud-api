@@ -31,17 +31,6 @@ fn services_session_to_api_session(
     }
 }
 
-/// Query parameters for searching users
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct SearchParams {
-    pub q: String,
-    #[serde(default = "default_limit")]
-    pub limit: i64,
-}
-
-fn default_limit() -> i64 {
-    20
-}
 
 /// User profile update request
 #[derive(Debug, Deserialize, ToSchema)]

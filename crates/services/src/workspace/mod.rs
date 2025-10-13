@@ -306,6 +306,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         name: Option<String>,
         expires_at: Option<Option<DateTime<Utc>>>,
         spend_limit: Option<Option<i64>>,
+        is_active: Option<bool>,
     ) -> Result<ApiKey, WorkspaceError> {
         // Check permissions
         self.check_workspace_permission(workspace_id.clone(), requester_id)
@@ -325,7 +326,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
 
         // Update the API key
         self.api_key_repository
-            .update(api_key_id, name, expires_at, spend_limit)
+            .update(api_key_id, name, expires_at, spend_limit, is_active)
             .await
             .map_err(|e| WorkspaceError::InternalError(format!("Failed to update API key: {}", e)))
     }

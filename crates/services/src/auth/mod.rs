@@ -9,6 +9,7 @@ use chrono::Utc;
 use std::sync::Arc;
 
 use crate::organization::OrganizationRepository;
+use crate::workspace::{ApiKey, ApiKeyRepository, WorkspaceId, WorkspaceRepository};
 use async_trait::async_trait;
 
 #[async_trait]
@@ -248,7 +249,7 @@ impl AuthService {
         session_repository: Arc<dyn SessionRepository>,
         api_key_repository: Arc<dyn ApiKeyRepository>,
         organization_repository: Arc<dyn OrganizationRepository>,
-        workspace_repository: Arc<dyn ports::WorkspaceRepository>,
+        workspace_repository: Arc<dyn WorkspaceRepository>,
         organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
     ) -> Self {
         Self {

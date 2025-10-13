@@ -108,7 +108,7 @@ async fn test_chat_completion_streaming() {
 
     let stream_result = timeout(
         Duration::from_secs(TEST_TIMEOUT_SECS),
-        provider.chat_completion_stream(params),
+        provider.chat_completion_stream(params, "test_request_hash".to_string()),
     )
     .await;
 
@@ -341,7 +341,9 @@ async fn test_error_handling() {
         stream_options: None,
     };
 
-    let result = provider.chat_completion_stream(params).await;
+    let result = provider
+        .chat_completion_stream(params, "test_request_hash".to_string())
+        .await;
     assert!(result.is_err(), "Should fail with invalid model");
 
     if let Err(e) = result {

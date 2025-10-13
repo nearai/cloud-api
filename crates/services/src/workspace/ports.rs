@@ -54,6 +54,7 @@ pub struct ApiKey {
     pub expires_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub is_active: bool,
+    pub deleted_at: Option<DateTime<Utc>>,
     /// Optional spending limit in nano-dollars (scale 9, USD). None means no limit.
     pub spend_limit: Option<i64>,
     /// Total usage/spend in nano-dollars (scale 9, USD). None if not fetched.
@@ -62,7 +63,7 @@ pub struct ApiKey {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CreateApiKeyRequest {
-    pub name: Option<String>,
+    pub name: String,
     pub workspace_id: WorkspaceId,
     pub created_by_user_id: UserId,
     pub expires_at: Option<DateTime<Utc>>,
@@ -150,10 +151,12 @@ pub trait ApiKeyRepository: Send + Sync {
         name: Option<String>,
         expires_at: Option<Option<DateTime<Utc>>>,
         spend_limit: Option<Option<i64>>,
+        is_active: Option<bool>,
     ) -> anyhow::Result<ApiKey>;
 }
 
 // Service trait
+#[allow(clippy::too_many_arguments)]
 #[async_trait]
 pub trait WorkspaceServiceTrait: Send + Sync {
     /// Get a workspace by ID
@@ -233,6 +236,7 @@ pub trait WorkspaceServiceTrait: Send + Sync {
         name: Option<String>,
         expires_at: Option<Option<DateTime<Utc>>>,
         spend_limit: Option<Option<i64>>,
+        is_active: Option<bool>,
     ) -> Result<ApiKey, WorkspaceError>;
 
     /// Check if a user can manage API keys for a workspace

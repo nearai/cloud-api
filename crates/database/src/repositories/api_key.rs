@@ -50,24 +50,21 @@ impl ApiKeyRepository {
         let key_prefix = Self::extract_key_prefix(&key);
         let now = Utc::now();
 
-        // Use name as Option<String>
-        let name = request.name.clone().unwrap_or_default();
-
         let _row = client
             .query_one(
                 r#"
                 INSERT INTO api_keys (
                     id, key_hash, key_prefix, name, workspace_id, created_by_user_id,
-                    created_at, expires_at, last_used_at, is_active, spend_limit
+                    created_at, expires_at, last_used_at, is_active, deleted_at, spend_limit
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true, $9)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true, NULL, $9)
                 RETURNING *
                 "#,
                 &[
                     &id,
                     &key_hash,
                     &key_prefix,
-                    &name,
+                    &request.name,
                     &request.workspace_id.0,
                     &request.created_by_user_id.0,
                     &now,
@@ -89,76 +86,18 @@ impl ApiKeyRepository {
                 id,
                 key_hash,
                 key_prefix,
-                name,
+                name: request.name,
                 created_at: now,
                 expires_at: request.expires_at,
                 last_used_at: None,
                 is_active: true,
+                deleted_at: None,
                 created_by_user_id: request.created_by_user_id.0,
                 workspace_id: request.workspace_id.0,
                 spend_limit: request.spend_limit,
                 usage: 0, // New API key has no usage yet
             },
         ))
-    }
-
-    /// Create a new API key and return it with the raw key for API response
-    pub async fn create_with_key(
-        &self,
-        request: CreateApiKeyRequest,
-    ) -> Result<crate::models::ApiKeyResponse> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
-        let id = Uuid::new_v4();
-        let key = Self::generate_api_key();
-        let key_hash = Self::hash_api_key(&key);
-        let key_prefix = Self::extract_key_prefix(&key);
-        let now = Utc::now();
-
-        // Use name as Option<String>
-        let name = request.name.clone().unwrap_or_default();
-
-        let _row = client
-            .query_one(
-                r#"
-                INSERT INTO api_keys (
-                    id, key_hash, key_prefix, name, workspace_id, created_by_user_id,
-                    created_at, expires_at, last_used_at, is_active, spend_limit
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true, $9)
-                RETURNING *
-                "#,
-                &[
-                    &id,
-                    &key_hash,
-                    &key_prefix,
-                    &name,
-                    &request.workspace_id.0,
-                    &request.created_by_user_id.0,
-                    &now,
-                    &request.expires_at,
-                    &request.spend_limit,
-                ],
-            )
-            .await
-            .context("Failed to create API key")?;
-
-        debug!(
-            "Created API key: {} for workspace: {} by user: {}",
-            id, request.workspace_id.0, request.created_by_user_id.0
-        );
-
-        Ok(crate::models::ApiKeyResponse {
-            id,
-            key, // Return the raw key for the API response
-            name,
-            created_at: now,
-            expires_at: request.expires_at,
-        })
     }
 
     /// Get an API key by ID
@@ -171,33 +110,11 @@ impl ApiKeyRepository {
 
         let row = client
             .query_opt(
-                "SELECT * FROM api_keys WHERE id = $1 AND is_active = true",
+                "SELECT * FROM api_keys WHERE id = $1 AND deleted_at IS NULL",
                 &[&id],
             )
             .await
             .context("Failed to query API key")?;
-
-        match row {
-            Some(row) => Ok(Some(self.row_to_api_key(row)?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Get an API key by its hash
-    pub async fn get_by_hash(&self, key_hash: &str) -> Result<Option<ApiKey>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
-        let row = client
-            .query_opt(
-                "SELECT * FROM api_keys WHERE key_hash = $1 AND is_active = true",
-                &[&key_hash],
-            )
-            .await
-            .context("Failed to query API key by hash")?;
 
         match row {
             Some(row) => Ok(Some(self.row_to_api_key(row)?)),
@@ -222,6 +139,7 @@ impl ApiKeyRepository {
             SELECT * FROM api_keys 
             WHERE key_hash = $1 
               AND is_active = true 
+              AND deleted_at IS NULL
               AND (expires_at IS NULL OR expires_at > NOW())
             "#,
                 &[&key_hash],
@@ -259,6 +177,27 @@ impl ApiKeyRepository {
         Ok(())
     }
 
+    pub async fn count_duplication(&self, workspace_id: &Uuid, name: &String) -> Result<i64> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let row = client
+            .query_one(
+                r#"
+                SELECT COUNT(*) as count FROM api_keys 
+                WHERE workspace_id = $1 AND name = $2 AND deleted_at IS NULL
+            "#,
+                &[workspace_id, name],
+            )
+            .await
+            .context("Failed to count API key duplication")?;
+
+        Ok(row.get::<_, i64>("count"))
+    }
+
     /// Count API keys for a workspace
     pub async fn count_by_workspace(&self, workspace_id: Uuid) -> Result<i64> {
         let client = self
@@ -269,7 +208,7 @@ impl ApiKeyRepository {
 
         let row = client
             .query_one(
-                "SELECT COUNT(*) as count FROM api_keys WHERE workspace_id = $1 AND is_active = true",
+                "SELECT COUNT(*) as count FROM api_keys WHERE workspace_id = $1 AND deleted_at IS NULL",
                 &[&workspace_id],
             )
             .await
@@ -306,11 +245,12 @@ impl ApiKeyRepository {
                     ak.expires_at,
                     ak.last_used_at,
                     ak.is_active,
+                    ak.deleted_at,
                     ak.spend_limit,
                     COALESCE(SUM(usg.total_cost), 0)::BIGINT as usage
                 FROM api_keys ak
                 LEFT JOIN organization_usage_log usg ON ak.id = usg.api_key_id
-                WHERE ak.workspace_id = $1 AND ak.is_active = true
+                WHERE ak.workspace_id = $1 AND ak.deleted_at IS NULL
                 GROUP BY ak.id
                 ORDER BY ak.created_at DESC
                 LIMIT $2 OFFSET $3
@@ -333,17 +273,20 @@ impl ApiKeyRepository {
             .await
             .context("Failed to get database connection")?;
 
-        let rows = client.query(
-            "SELECT * FROM api_keys WHERE created_by_user_id = $1 AND is_active = true ORDER BY created_at DESC",
-            &[&user_id],
-        ).await.context("Failed to list user's API keys")?;
+        let rows = client
+            .query(
+                "SELECT * FROM api_keys WHERE created_by_user_id = $1 ORDER BY created_at DESC",
+                &[&user_id],
+            )
+            .await
+            .context("Failed to list user's API keys")?;
 
         rows.into_iter()
             .map(|row| self.row_to_api_key(row))
             .collect()
     }
 
-    /// Revoke an API key
+    /// Soft delete an API key (sets deleted_at timestamp)
     pub async fn revoke(&self, id: Uuid) -> Result<bool> {
         let client = self
             .pool
@@ -353,11 +296,11 @@ impl ApiKeyRepository {
 
         let rows_affected = client
             .execute(
-                "UPDATE api_keys SET is_active = false WHERE id = $1",
+                "UPDATE api_keys SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL",
                 &[&id],
             )
             .await
-            .context("Failed to revoke API key")?;
+            .context("Failed to soft delete API key")?;
 
         Ok(rows_affected > 0)
     }
@@ -424,7 +367,7 @@ impl ApiKeyRepository {
 
         let row = client
             .query_one(
-                "UPDATE api_keys SET spend_limit = $1 WHERE id = $2 AND is_active = true RETURNING *",
+                "UPDATE api_keys SET spend_limit = $1 WHERE id = $2 RETURNING *",
                 &[&spend_limit, &id],
             )
             .await
@@ -441,6 +384,7 @@ impl ApiKeyRepository {
         name: Option<String>,
         expires_at: Option<Option<DateTime<Utc>>>,
         spend_limit: Option<Option<i64>>,
+        is_active: Option<bool>,
     ) -> Result<ApiKey> {
         let client = self
             .pool
@@ -471,13 +415,19 @@ impl ApiKeyRepository {
             param_idx += 1;
         }
 
+        if let Some(ref is_active) = is_active {
+            updates.push(format!("is_active = ${}", param_idx));
+            params.push(is_active);
+            param_idx += 1;
+        }
+
         if updates.is_empty() {
             // No fields to update, just return the existing key
             return self.get_by_id(id).await?.context("API key not found");
         }
 
         let query = format!(
-            "UPDATE api_keys SET {} WHERE id = ${} AND is_active = true RETURNING *",
+            "UPDATE api_keys SET {} WHERE id = ${} RETURNING *",
             updates.join(", "),
             param_idx
         );
@@ -506,6 +456,7 @@ impl ApiKeyRepository {
             expires_at: row.get("expires_at"),
             last_used_at: row.get("last_used_at"),
             is_active: row.get("is_active"),
+            deleted_at: row.get("deleted_at"),
             spend_limit: row.get("spend_limit"),
             usage: 0, // Default to 0 when not fetched from JOIN
         })
@@ -524,62 +475,10 @@ impl ApiKeyRepository {
             expires_at: row.get("expires_at"),
             last_used_at: row.get("last_used_at"),
             is_active: row.get("is_active"),
+            deleted_at: row.get("deleted_at"),
             spend_limit: row.get("spend_limit"),
             usage: row.get("usage"),
         })
-    }
-}
-
-// Convert database ApiKey to service ApiKey
-fn db_apikey_to_service_apikey(
-    api_key: Option<String>,
-    db_api_key: ApiKey,
-) -> services::auth::ApiKey {
-    services::auth::ApiKey {
-        id: services::auth::ports::ApiKeyId(db_api_key.id.to_string()),
-        key: api_key,
-        key_prefix: db_api_key.key_prefix,
-        name: db_api_key.name,
-        workspace_id: services::auth::ports::WorkspaceId(db_api_key.workspace_id),
-        created_by_user_id: services::auth::ports::UserId(db_api_key.created_by_user_id),
-        created_at: db_api_key.created_at,
-        expires_at: db_api_key.expires_at,
-        last_used_at: db_api_key.last_used_at,
-        is_active: db_api_key.is_active,
-        spend_limit: db_api_key.spend_limit,
-    }
-}
-
-// Implement the service trait
-#[async_trait]
-impl services::auth::ports::ApiKeyRepository for ApiKeyRepository {
-    async fn validate(&self, api_key: String) -> anyhow::Result<Option<services::auth::ApiKey>> {
-        let maybe_api_key = self.validate(&api_key).await?;
-        Ok(maybe_api_key.map(|db_api_key| db_apikey_to_service_apikey(None, db_api_key)))
-    }
-
-    async fn create(&self, request: CreateApiKeyRequest) -> anyhow::Result<services::auth::ApiKey> {
-        let (key, db_api_key) = self.create(request).await?;
-        Ok(db_apikey_to_service_apikey(Some(key), db_api_key))
-    }
-
-    async fn delete(&self, id: services::auth::ports::ApiKeyId) -> anyhow::Result<bool> {
-        self.revoke(Uuid::parse_str(&id.0)?).await
-    }
-
-    async fn update_last_used(&self, id: services::auth::ports::ApiKeyId) -> anyhow::Result<()> {
-        self.update_last_used(Uuid::parse_str(&id.0)?).await
-    }
-
-    async fn update_spend_limit(
-        &self,
-        id: services::auth::ports::ApiKeyId,
-        spend_limit: Option<i64>,
-    ) -> anyhow::Result<services::auth::ApiKey> {
-        let db_api_key = self
-            .update_spend_limit(Uuid::parse_str(&id.0)?, spend_limit)
-            .await?;
-        Ok(db_apikey_to_service_apikey(None, db_api_key))
     }
 }
 
@@ -651,9 +550,16 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
         name: Option<String>,
         expires_at: Option<Option<DateTime<Utc>>>,
         spend_limit: Option<Option<i64>>,
+        is_active: Option<bool>,
     ) -> anyhow::Result<services::workspace::ApiKey> {
         let db_api_key = self
-            .update(Uuid::parse_str(&id.0)?, name, expires_at, spend_limit)
+            .update(
+                Uuid::parse_str(&id.0)?,
+                name,
+                expires_at,
+                spend_limit,
+                is_active,
+            )
             .await?;
         Ok(db_apikey_to_workspace_service(None, db_api_key))
     }
@@ -675,6 +581,7 @@ fn db_apikey_to_workspace_service(
         expires_at: db_api_key.expires_at,
         last_used_at: db_api_key.last_used_at,
         is_active: db_api_key.is_active,
+        deleted_at: db_api_key.deleted_at,
         spend_limit: db_api_key.spend_limit,
         usage: Some(db_api_key.usage), // Usage now comes from the database query
     }

@@ -1007,6 +1007,7 @@ pub async fn update_api_key_spend_limit(
         last_used_at: updated_key.last_used_at,
         expires_at: updated_key.expires_at,
         spend_limit: spend_limit_response,
+        is_active: updated_key.is_active,
         usage: None, // Usage not fetched in this endpoint
     };
 

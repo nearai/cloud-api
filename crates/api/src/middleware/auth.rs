@@ -29,7 +29,7 @@ pub async fn auth_middleware_with_api_key(
     State(state): State<AuthState>,
     request: Request,
     next: Next,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
     let auth_header = request
         .headers()
         .get("authorization")
@@ -43,10 +43,22 @@ pub async fn auth_middleware_with_api_key(
             authenticate_api_key(&state, token).await
         } else {
             debug!("Authorization header does not start with 'Bearer '");
-            Err(StatusCode::UNAUTHORIZED)
+            Err((
+                StatusCode::UNAUTHORIZED,
+                axum::Json(crate::models::ErrorResponse::new(
+                    "Invalid authorization header format".to_string(),
+                    "invalid_auth_header".to_string(),
+                )),
+            ))
         }
     } else {
-        Err(StatusCode::UNAUTHORIZED)
+        Err((
+            StatusCode::UNAUTHORIZED,
+            axum::Json(crate::models::ErrorResponse::new(
+                "Missing authorization header".to_string(),
+                "missing_auth_header".to_string(),
+            )),
+        ))
     };
 
     match auth_result {
@@ -57,7 +69,7 @@ pub async fn auth_middleware_with_api_key(
             request.extensions_mut().insert(api_key);
             Ok(next.run(request).await)
         }
-        Err(status) => Err(status),
+        Err(error) => Err(error),
     }
 }
 
@@ -66,7 +78,7 @@ pub async fn auth_middleware_with_workspace_context(
     State(state): State<AuthState>,
     request: Request,
     next: Next,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
     let auth_header = request
         .headers()
         .get("authorization")
@@ -80,10 +92,22 @@ pub async fn auth_middleware_with_workspace_context(
             authenticate_api_key_with_context(&state, token).await
         } else {
             debug!("Authorization header does not start with 'Bearer '");
-            Err(StatusCode::UNAUTHORIZED)
+            Err((
+                StatusCode::UNAUTHORIZED,
+                axum::Json(crate::models::ErrorResponse::new(
+                    "Invalid authorization header format".to_string(),
+                    "invalid_auth_header".to_string(),
+                )),
+            ))
         }
     } else {
-        Err(StatusCode::UNAUTHORIZED)
+        Err((
+            StatusCode::UNAUTHORIZED,
+            axum::Json(crate::models::ErrorResponse::new(
+                "Missing authorization header".to_string(),
+                "missing_auth_header".to_string(),
+            )),
+        ))
     };
 
     match auth_result {
@@ -93,7 +117,7 @@ pub async fn auth_middleware_with_workspace_context(
             request.extensions_mut().insert(authenticated_api_key);
             Ok(next.run(request).await)
         }
-        Err(status) => Err(status),
+        Err(error) => Err(error),
     }
 }
 
@@ -248,7 +272,7 @@ async fn authenticate_session(
 async fn authenticate_api_key(
     state: &AuthState,
     api_key: &str,
-) -> Result<services::auth::ApiKey, StatusCode> {
+) -> Result<services::auth::ApiKey, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
     let auth_service = &state.auth_service;
     debug!("Calling auth service to validate API key: {}", api_key);
 
@@ -259,15 +283,33 @@ async fn authenticate_api_key(
         }
         Err(AuthError::Unauthorized) => {
             debug!("Invalid or expired API key");
-            Err(StatusCode::UNAUTHORIZED)
+            Err((
+                StatusCode::UNAUTHORIZED,
+                axum::Json(crate::models::ErrorResponse::new(
+                    "Invalid or expired API key".to_string(),
+                    "invalid_api_key".to_string(),
+                )),
+            ))
         }
         Err(AuthError::UserNotFound) => {
             error!("API key references non-existent user");
-            Err(StatusCode::UNAUTHORIZED)
+            Err((
+                StatusCode::UNAUTHORIZED,
+                axum::Json(crate::models::ErrorResponse::new(
+                    "API key references non-existent user".to_string(),
+                    "invalid_api_key".to_string(),
+                )),
+            ))
         }
         Err(e) => {
             error!("Failed to validate API key: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(crate::models::ErrorResponse::new(
+                    "Failed to validate API key".to_string(),
+                    "internal_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -276,7 +318,7 @@ async fn authenticate_api_key(
 async fn authenticate_api_key_with_context(
     state: &AuthState,
     api_key: &str,
-) -> Result<AuthenticatedApiKey, StatusCode> {
+) -> Result<AuthenticatedApiKey, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
     // First validate the API key
     let validated_api_key = authenticate_api_key(state, api_key).await?;
 
@@ -307,11 +349,23 @@ async fn authenticate_api_key_with_context(
         }
         Ok(None) => {
             error!("Workspace not found for API key");
-            Err(StatusCode::UNAUTHORIZED)
+            Err((
+                StatusCode::UNAUTHORIZED,
+                axum::Json(crate::models::ErrorResponse::new(
+                    "Workspace not found for API key".to_string(),
+                    "invalid_api_key".to_string(),
+                )),
+            ))
         }
         Err(e) => {
             error!("Failed to resolve workspace/organization: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(crate::models::ErrorResponse::new(
+                    "Failed to resolve workspace/organization".to_string(),
+                    "internal_error".to_string(),
+                )),
+            ))
         }
     }
 }

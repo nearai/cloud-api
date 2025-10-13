@@ -117,12 +117,12 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
         let session_repository = Arc::new(SessionRepository::new(database.pool().clone()))
             as Arc<dyn services::auth::SessionRepository>;
         let api_key_repository = Arc::new(ApiKeyRepository::new(database.pool().clone()))
-            as Arc<dyn services::auth::ApiKeyRepository>;
+            as Arc<dyn services::workspace::ApiKeyRepository>;
 
         // Create AuthService with workspace repository
         let workspace_repository_for_auth =
             Arc::new(WorkspaceRepository::new(database.pool().clone()))
-                as Arc<dyn services::auth::ports::WorkspaceRepository>;
+                as Arc<dyn services::workspace::WorkspaceRepository>;
 
         Arc::new(AuthService::new(
             user_repository,
@@ -136,7 +136,7 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
 
     // Create workspace repository
     let workspace_repository = Arc::new(WorkspaceRepository::new(database.pool().clone()))
-        as Arc<dyn services::auth::ports::WorkspaceRepository>;
+        as Arc<dyn services::workspace::WorkspaceRepository>;
 
     // Create OAuth manager
     tracing::info!("Setting up OAuth providers");

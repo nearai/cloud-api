@@ -380,41 +380,6 @@ pub fn services_member_to_db_member(
     }
 }
 
-/// Convert services ApiKey to API response
-pub fn services_api_key_to_api_response(
-    api_key: services::auth::ApiKey,
-) -> crate::models::ApiKeyResponse {
-    let spend_limit = api_key
-        .spend_limit
-        .map(|amount| crate::models::DecimalPrice {
-            amount,
-            scale: 9,
-            currency: "USD".to_string(),
-        });
-
-    // Format key_prefix with "****" to indicate it's a partial key
-    // e.g., "sk_abc123" becomes "sk_abc1****"
-    let formatted_prefix = if api_key.key_prefix.len() > 6 {
-        format!("{}****", &api_key.key_prefix[..6])
-    } else {
-        format!("{}****", api_key.key_prefix)
-    };
-
-    crate::models::ApiKeyResponse {
-        id: api_key.id.0,                 // ApiKeyId contains a String
-        name: Some(api_key.name.clone()), // Convert String to Option<String>
-        key: api_key.key,                 // Returned only on creation
-        key_prefix: formatted_prefix,     // Use stored prefix with asterisks
-        workspace_id: api_key.workspace_id.0.to_string(),
-        created_by_user_id: api_key.created_by_user_id.0.to_string(),
-        created_at: api_key.created_at,
-        last_used_at: api_key.last_used_at,
-        expires_at: api_key.expires_at,
-        spend_limit,
-        usage: None, // Usage not fetched by default, use workspace_api_key_to_api_response_with_usage if needed
-    }
-}
-
 /// Convert AuthenticatedUser to services UserId
 pub fn authenticated_user_to_user_id(user: AuthenticatedUser) -> services::UserId {
     services::UserId(user.0.id)
@@ -471,6 +436,8 @@ pub fn workspace_api_key_to_api_response(
         last_used_at: api_key.last_used_at,
         expires_at: api_key.expires_at,
         spend_limit,
+        is_active: api_key.is_active,
+        deleted_at: api_key.deleted_at,
         usage: usage_decimal,
     }
 }

@@ -484,7 +484,7 @@ pub async fn completions(
 )]
 pub async fn models(
     State(app_state): State<AppState>,
-    Extension(api_key): Extension<services::auth::ApiKey>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ModelsResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!("Models list request from key: {:?}", api_key.id);
 

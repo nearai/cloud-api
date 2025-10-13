@@ -5,7 +5,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::organization::OrganizationRepository;
-use crate::workspace::CreateApiKeyRequest;
+use crate::workspace::{ApiKey, ApiKeyRepository, WorkspaceId, WorkspaceRepository};
 
 // Domain ID types
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -16,12 +16,6 @@ pub struct SessionId(pub Uuid);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SessionToken(pub String);
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiKeyId(pub String);
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkspaceId(pub Uuid);
 
 impl From<Uuid> for UserId {
     fn from(uuid: Uuid) -> Self {
@@ -204,41 +198,6 @@ pub trait SessionRepository: Send + Sync {
     async fn cleanup_expired(&self) -> anyhow::Result<usize>;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiKey {
-    pub id: ApiKeyId,
-    // Returned only on creation
-    pub key: Option<String>,
-    /// First 8-10 characters of the key for display purposes (e.g., "sk_abc123")
-    pub key_prefix: String,
-    pub name: String,
-    pub workspace_id: WorkspaceId,
-    pub created_by_user_id: UserId,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: Option<DateTime<Utc>>,
-    pub last_used_at: Option<DateTime<Utc>>,
-    pub is_active: bool,
-    /// Optional spending limit in nano-dollars (scale 9, USD). None means no limit.
-    pub spend_limit: Option<i64>,
-}
-
-#[async_trait]
-pub trait ApiKeyRepository: Send + Sync {
-    async fn validate(&self, api_key: String) -> anyhow::Result<Option<ApiKey>>;
-
-    async fn create(&self, request: CreateApiKeyRequest) -> anyhow::Result<ApiKey>;
-
-    async fn delete(&self, id: ApiKeyId) -> anyhow::Result<bool>;
-
-    async fn update_last_used(&self, id: ApiKeyId) -> anyhow::Result<()>;
-
-    async fn update_spend_limit(
-        &self,
-        id: ApiKeyId,
-        spend_limit: Option<i64>,
-    ) -> anyhow::Result<ApiKey>;
-}
-
 // Service interfaces
 #[async_trait]
 pub trait AuthServiceTrait: Send + Sync {
@@ -290,39 +249,6 @@ pub struct AuthService {
     pub organization_repository: Arc<dyn OrganizationRepository>,
     pub workspace_repository: Arc<dyn WorkspaceRepository>,
     pub organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
-}
-
-/// Workspace domain model
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Workspace {
-    pub id: WorkspaceId,
-    pub name: String,
-    pub display_name: String,
-    pub description: Option<String>,
-    pub organization_id: crate::organization::OrganizationId,
-    pub created_by_user_id: UserId,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub is_active: bool,
-    pub settings: Option<serde_json::Value>,
-}
-
-/// Workspace repository trait for auth service
-#[async_trait]
-pub trait WorkspaceRepository: Send + Sync {
-    async fn get_workspace_with_organization(
-        &self,
-        workspace_id: WorkspaceId,
-    ) -> anyhow::Result<Option<(Workspace, crate::organization::Organization)>>;
-    async fn get_by_id(&self, workspace_id: WorkspaceId) -> anyhow::Result<Option<Workspace>>;
-    async fn create(
-        &self,
-        name: String,
-        display_name: String,
-        description: Option<String>,
-        organization_id: crate::organization::OrganizationId,
-        created_by_user_id: UserId,
-    ) -> anyhow::Result<Workspace>;
 }
 
 pub struct UserService {

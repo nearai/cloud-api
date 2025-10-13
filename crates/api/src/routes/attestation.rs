@@ -216,7 +216,7 @@ impl From<services::attestation::models::GetQuoteResponse> for QuoteResponse {
 )]
 pub async fn quote(
     State(app_state): State<AppState>,
-    Extension(_api_key): Extension<services::auth::ApiKey>,
+    Extension(_api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<QuoteResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     let quote = app_state
         .attestation_service

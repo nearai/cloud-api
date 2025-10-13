@@ -89,7 +89,7 @@ fn user_uuid_to_user_id(uuid: Uuid) -> UserId {
 )]
 pub async fn create_response(
     State(service): State<Arc<ResponseService>>,
-    Extension(api_key): Extension<services::auth::ApiKey>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
     Json(request): Json<CreateResponseRequest>,
 ) -> axum::response::Response {
     debug!("Create response request from key: {:?}", api_key);
@@ -386,7 +386,7 @@ pub async fn get_response(
     Path(_response_id): Path<String>,
     Query(_params): Query<GetResponseQuery>,
     State(_service): State<Arc<ResponseService>>,
-    Extension(_api_key): Extension<services::auth::ApiKey>,
+    Extension(_api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ResponseObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement get_response method in ResponseService
     Err((
@@ -402,7 +402,7 @@ pub async fn get_response(
 pub async fn delete_response(
     Path(_response_id): Path<String>,
     State(_service): State<Arc<ResponseService>>,
-    Extension(_api_key): Extension<services::auth::ApiKey>,
+    Extension(_api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ResponseDeleteResult>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement delete_response method in ResponseService
     Err((
@@ -418,7 +418,7 @@ pub async fn delete_response(
 pub async fn cancel_response(
     Path(_response_id): Path<String>,
     State(_service): State<Arc<ResponseService>>,
-    Extension(_api_key): Extension<services::auth::ApiKey>,
+    Extension(_api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ResponseObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement cancel_response method in ResponseService
     Err((
@@ -435,7 +435,7 @@ pub async fn list_input_items(
     Path(_response_id): Path<String>,
     Query(_params): Query<ListInputItemsQuery>,
     State(_service): State<Arc<ResponseService>>,
-    Extension(_api_key): Extension<services::auth::ApiKey>,
+    Extension(_api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ResponseInputItemList>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement get_response method in ResponseService to support listing input items
     Err((

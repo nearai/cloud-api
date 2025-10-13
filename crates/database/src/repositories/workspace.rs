@@ -142,7 +142,7 @@ impl WorkspaceRepository {
 
         let rows = client
             .query(
-                "SELECT * FROM workspaces WHERE organization_id = $1 AND is_active = true ORDER BY created_at DESC",
+                "SELECT * FROM workspaces WHERE organization_id = $1 AND is_active = true ORDER BY created_at ASC",
                 &[&organization_id],
             )
             .await
@@ -168,7 +168,7 @@ impl WorkspaceRepository {
 
         let rows = client
             .query(
-                "SELECT * FROM workspaces WHERE organization_id = $1 AND is_active = true ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+                "SELECT * FROM workspaces WHERE organization_id = $1 AND is_active = true ORDER BY created_at ASC LIMIT $2 OFFSET $3",
                 &[&organization_id, &limit, &offset],
             )
             .await
@@ -189,7 +189,7 @@ impl WorkspaceRepository {
 
         let rows = client
             .query(
-                "SELECT * FROM workspaces WHERE created_by_user_id = $1 AND is_active = true ORDER BY created_at DESC",
+                "SELECT * FROM workspaces WHERE created_by_user_id = $1 AND is_active = true ORDER BY created_at ASC",
                 &[&user_id],
             )
             .await

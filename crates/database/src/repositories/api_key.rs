@@ -479,60 +479,6 @@ impl ApiKeyRepository {
     }
 }
 
-// Convert database ApiKey to service ApiKey
-fn db_apikey_to_service_apikey(
-    api_key: Option<String>,
-    db_api_key: ApiKey,
-) -> services::auth::ApiKey {
-    services::auth::ApiKey {
-        id: services::auth::ports::ApiKeyId(db_api_key.id.to_string()),
-        key: api_key,
-        key_prefix: db_api_key.key_prefix,
-        name: db_api_key.name,
-        workspace_id: services::auth::ports::WorkspaceId(db_api_key.workspace_id),
-        created_by_user_id: services::auth::ports::UserId(db_api_key.created_by_user_id),
-        created_at: db_api_key.created_at,
-        expires_at: db_api_key.expires_at,
-        last_used_at: db_api_key.last_used_at,
-        is_active: db_api_key.is_active,
-        deleted_at: db_api_key.deleted_at,
-        spend_limit: db_api_key.spend_limit,
-    }
-}
-
-// Implement the service trait
-#[async_trait]
-impl services::auth::ports::ApiKeyRepository for ApiKeyRepository {
-    async fn validate(&self, api_key: String) -> anyhow::Result<Option<services::auth::ApiKey>> {
-        let maybe_api_key = self.validate(&api_key).await?;
-        Ok(maybe_api_key.map(|db_api_key| db_apikey_to_service_apikey(None, db_api_key)))
-    }
-
-    async fn create(&self, request: CreateApiKeyRequest) -> anyhow::Result<services::auth::ApiKey> {
-        let (key, db_api_key) = self.create(request).await?;
-        Ok(db_apikey_to_service_apikey(Some(key), db_api_key))
-    }
-
-    async fn delete(&self, id: services::auth::ports::ApiKeyId) -> anyhow::Result<bool> {
-        self.revoke(Uuid::parse_str(&id.0)?).await
-    }
-
-    async fn update_last_used(&self, id: services::auth::ports::ApiKeyId) -> anyhow::Result<()> {
-        self.update_last_used(Uuid::parse_str(&id.0)?).await
-    }
-
-    async fn update_spend_limit(
-        &self,
-        id: services::auth::ports::ApiKeyId,
-        spend_limit: Option<i64>,
-    ) -> anyhow::Result<services::auth::ApiKey> {
-        let db_api_key = self
-            .update_spend_limit(Uuid::parse_str(&id.0)?, spend_limit)
-            .await?;
-        Ok(db_apikey_to_service_apikey(None, db_api_key))
-    }
-}
-
 // Implement the workspace service layer trait
 #[async_trait]
 impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {

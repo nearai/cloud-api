@@ -54,6 +54,7 @@ pub struct CompletionRequest {
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
     pub metadata: Option<serde_json::Value>,
+    pub body_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

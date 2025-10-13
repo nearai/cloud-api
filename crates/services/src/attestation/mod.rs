@@ -40,7 +40,6 @@ impl AttestationService {
 #[async_trait]
 impl ports::AttestationServiceTrait for AttestationService {
     async fn get_chat_signature(&self, chat_id: &str) -> Result<ChatSignature, AttestationError> {
-        // Only get from database
         self.repository.get_chat_signature(chat_id).await
     }
 

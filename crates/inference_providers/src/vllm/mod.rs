@@ -80,7 +80,7 @@ impl InferenceProvider for VLlmProvider {
         &self,
         model: String,
         _signing_algo: Option<String>,
-    ) -> Result<AttestationReport, CompletionError> {
+    ) -> Result<Vec<VllmAttestationReport>, CompletionError> {
         let url = format!(
             "{}/v1/attestation/report?model={}",
             self.config.base_url, model
@@ -96,7 +96,7 @@ impl InferenceProvider for VLlmProvider {
             .json()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
-        Ok(attestation_report)
+        Ok(vec![attestation_report])
     }
 
     /// Lists all available models from the vLLM server

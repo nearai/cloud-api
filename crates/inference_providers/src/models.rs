@@ -509,7 +509,7 @@ pub struct ChatSignature {
 
 /// Main attestation report response from /v1/attestation/report
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttestationReport {
+pub struct VllmAttestationReport {
     /// Cryptographic signing address
     /// - ECDSA: Ethereum-style address (e.g., "0x1234567890abcdef...")  
     /// - Ed25519: Public key as hex string
@@ -530,7 +530,7 @@ pub struct AttestationReport {
 
     /// Array of cached attestation reports (same structure as this object)
     #[serde(default)]
-    pub all_attestations: Vec<AttestationReport>,
+    pub all_attestations: Vec<VllmAttestationReport>,
 }
 
 /// NVIDIA GPU attestation payload (parsed from nvidia_payload JSON string)
@@ -546,14 +546,6 @@ pub struct NvidiaPayload {
     pub arch: String,
 }
 
-/// Complete attestation data structure (internal proxy representation)
-/// This matches what the proxy stores in cache
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttestationData {
-    pub ecdsa: AttestationReport,
-    pub ed25519: AttestationReport,
-}
-
 /// Request parameters for /v1/attestation/report endpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttestationReportParams {
@@ -562,7 +554,7 @@ pub struct AttestationReportParams {
     pub signing_algo: Option<String>,
 }
 
-impl AttestationReport {
+impl VllmAttestationReport {
     /// Parse the nvidia_payload JSON string into a structured object
     pub fn parse_nvidia_payload(&self) -> Result<NvidiaPayload, serde_json::Error> {
         serde_json::from_str(&self.nvidia_payload)
@@ -612,7 +604,7 @@ mod tests {
 
     #[test]
     fn test_ecdsa_address_validation() {
-        let report = AttestationReport {
+        let report = VllmAttestationReport {
             signing_address: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
             intel_quote: "".to_string(),
             nvidia_payload: "{}".to_string(),
@@ -627,7 +619,7 @@ mod tests {
 
     #[test]
     fn test_ed25519_pubkey_validation() {
-        let report = AttestationReport {
+        let report = VllmAttestationReport {
             signing_address: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
                 .to_string(),
             intel_quote: "".to_string(),
@@ -644,7 +636,7 @@ mod tests {
     #[test]
     fn test_nvidia_payload_parsing() {
         let payload_json = r#"{"nonce":"abc123","evidence_list":[],"arch":"HOPPER"}"#;
-        let report = AttestationReport {
+        let report = VllmAttestationReport {
             signing_address: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
             intel_quote: "".to_string(),
             nvidia_payload: payload_json.to_string(),

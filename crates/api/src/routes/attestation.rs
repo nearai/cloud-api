@@ -3,7 +3,6 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::Json as ResponseJson,
-    Extension,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
@@ -99,8 +98,8 @@ pub struct Attestation {
     pub nvidia_payload: String, // Stored as JSON string
 }
 
-impl From<inference_providers::AttestationReport> for Attestation {
-    fn from(report: inference_providers::AttestationReport) -> Self {
+impl From<inference_providers::VllmAttestationReport> for Attestation {
+    fn from(report: inference_providers::VllmAttestationReport) -> Self {
         Self {
             signing_address: report.signing_address,
             intel_quote: report.intel_quote,
@@ -111,23 +110,54 @@ impl From<inference_providers::AttestationReport> for Attestation {
 
 /// Response for attestation report endpoint
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct AttestationResponse {
-    pub signing_address: String,
-    pub intel_quote: String,
-    pub nvidia_payload: String, // Stored as JSON string
-    pub all_attestations: Vec<Attestation>,
+
+pub struct DstackCpuQuote {
+    pub quote: String,
+    pub event_log: String,
 }
 
-impl From<inference_providers::AttestationReport> for AttestationResponse {
-    fn from(report: inference_providers::AttestationReport) -> Self {
+impl From<services::attestation::models::DstackCpuQuote> for DstackCpuQuote {
+    fn from(quote: services::attestation::models::DstackCpuQuote) -> Self {
+        Self {
+            quote: quote.quote,
+            event_log: quote.event_log,
+        }
+    }
+}
+
+/// VLLM attestation report
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct VllmAttestationReport {
+    pub signing_address: String,
+    pub intel_quote: String,
+    pub nvidia_payload: String,
+}
+
+impl From<services::attestation::models::VllmAttestationReport> for VllmAttestationReport {
+    fn from(report: services::attestation::models::VllmAttestationReport) -> Self {
         Self {
             signing_address: report.signing_address,
             intel_quote: report.intel_quote,
             nvidia_payload: report.nvidia_payload,
-            all_attestations: report
-                .all_attestations
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AttestationResponse {
+    pub cloud_api_attestation: DstackCpuQuote,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub vllm_proxy_attestations: Vec<VllmAttestationReport>,
+}
+
+impl From<services::attestation::models::AttestationReport> for AttestationResponse {
+    fn from(report: services::attestation::models::AttestationReport) -> Self {
+        Self {
+            cloud_api_attestation: report.cloud_api_attestation.into(),
+            vllm_proxy_attestations: report
+                .vllm_proxy_attestations
                 .into_iter()
-                .map(Attestation::from)
+                .map(VllmAttestationReport::from)
                 .collect(),
         }
     }
@@ -151,18 +181,9 @@ pub async fn get_attestation_report(
     Query(params): Query<AttestationQuery>,
     State(app_state): State<AppState>,
 ) -> Result<ResponseJson<AttestationResponse>, (StatusCode, ResponseJson<serde_json::Value>)> {
-    let model = if let Some(model) = params.model {
-        model
-    } else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            ResponseJson(serde_json::json!({ "error": "model is required" })),
-        ));
-    };
-
     let report = app_state
         .attestation_service
-        .get_attestation_report(model, params.signing_algo)
+        .get_attestation_report(params.model, params.signing_algo)
         .await
         .map_err(|e| {
             (
@@ -189,49 +210,13 @@ pub struct QuoteResponse {
     pub event_log: String,
 }
 
-impl From<services::attestation::models::GetQuoteResponse> for QuoteResponse {
-    fn from(response: services::attestation::models::GetQuoteResponse) -> Self {
+impl From<services::attestation::models::DstackCpuQuote> for QuoteResponse {
+    fn from(response: services::attestation::models::DstackCpuQuote) -> Self {
         Self {
             quote: response.quote,
             event_log: response.event_log,
         }
     }
-}
-
-/// Get TDX quote
-///
-/// Returns a TDX quote for testing purposes.
-#[utoipa::path(
-    get,
-    path = "/attestation/quote", 
-    tag = "Attestation",
-    responses(
-        (status = 200, description = "TDX quote", body = QuoteResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 501, description = "Not implemented", body = ErrorResponse)
-    ),
-    security(
-        ("api_key" = [])
-    )
-)]
-pub async fn quote(
-    State(app_state): State<AppState>,
-    Extension(_api_key): Extension<services::workspace::ApiKey>,
-) -> Result<ResponseJson<QuoteResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    let quote = app_state
-        .attestation_service
-        .get_quote()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-        })?
-        .into();
-    Ok(ResponseJson(quote))
 }
 
 /// Error response

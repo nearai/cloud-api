@@ -20,8 +20,8 @@ pub struct AdminUser(pub DbUser);
 /// Authenticated API key with workspace and organization context
 #[derive(Clone, Debug)]
 pub struct AuthenticatedApiKey {
-    pub api_key: services::auth::ApiKey,
-    pub workspace: services::auth::ports::Workspace,
+    pub api_key: services::workspace::ApiKey,
+    pub workspace: services::workspace::Workspace,
     pub organization: services::organization::Organization,
 }
 
@@ -272,7 +272,7 @@ async fn authenticate_session(
 async fn authenticate_api_key(
     state: &AuthState,
     api_key: &str,
-) -> Result<services::auth::ApiKey, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
+) -> Result<services::workspace::ApiKey, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
     let auth_service = &state.auth_service;
     debug!("Calling auth service to validate API key: {}", api_key);
 
@@ -375,7 +375,7 @@ async fn authenticate_api_key_with_context(
 pub struct AuthState {
     pub oauth_manager: Arc<OAuthManager>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
-    pub workspace_repository: Arc<dyn services::auth::ports::WorkspaceRepository>,
+    pub workspace_repository: Arc<dyn services::workspace::WorkspaceRepository>,
     pub admin_domains: Vec<String>,
 }
 
@@ -383,7 +383,7 @@ impl AuthState {
     pub fn new(
         oauth_manager: Arc<OAuthManager>,
         auth_service: Arc<dyn AuthServiceTrait>,
-        workspace_repository: Arc<dyn services::auth::ports::WorkspaceRepository>,
+        workspace_repository: Arc<dyn services::workspace::WorkspaceRepository>,
         admin_domains: Vec<String>,
     ) -> Self {
         Self {

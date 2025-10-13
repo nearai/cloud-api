@@ -412,6 +412,7 @@ pub fn services_api_key_to_api_response(
         expires_at: api_key.expires_at,
         spend_limit,
         is_active: api_key.is_active,
+        deleted_at: api_key.deleted_at,
         usage: None, // Usage not fetched by default, use workspace_api_key_to_api_response_with_usage if needed
     }
 }
@@ -473,6 +474,7 @@ pub fn workspace_api_key_to_api_response(
         expires_at: api_key.expires_at,
         spend_limit,
         is_active: api_key.is_active,
+        deleted_at: api_key.deleted_at,
         usage: usage_decimal,
     }
 }

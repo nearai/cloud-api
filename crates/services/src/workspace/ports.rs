@@ -54,6 +54,7 @@ pub struct ApiKey {
     pub expires_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub is_active: bool,
+    pub deleted_at: Option<DateTime<Utc>>,
     /// Optional spending limit in nano-dollars (scale 9, USD). None means no limit.
     pub spend_limit: Option<i64>,
     /// Total usage/spend in nano-dollars (scale 9, USD). None if not fetched.

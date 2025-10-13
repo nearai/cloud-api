@@ -800,7 +800,7 @@ impl CreateConversationRequest {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateApiKeyRequest {
-    pub name: Option<String>,
+    pub name: String,
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "spendLimit")]

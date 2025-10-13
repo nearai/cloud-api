@@ -168,7 +168,7 @@ impl WorkspaceRepository {
 
         let rows = client
             .query(
-                "SELECT * FROM workspaces WHERE organization_id = $1 AND is_active = true ORDER BY created_at ASC LIMIT $2 OFFSET $3",
+                "SELECT * FROM workspaces WHERE organization_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3",
                 &[&organization_id, &limit, &offset],
             )
             .await

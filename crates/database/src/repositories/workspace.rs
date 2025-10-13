@@ -347,25 +347,6 @@ impl WorkspaceRepository {
 }
 
 // Helper functions to convert database models to service domain models
-fn db_workspace_to_service_workspace(
-    db_workspace: crate::models::Workspace,
-) -> services::auth::ports::Workspace {
-    services::auth::ports::Workspace {
-        id: services::auth::ports::WorkspaceId(db_workspace.id),
-        name: db_workspace.name,
-        display_name: db_workspace.display_name,
-        description: db_workspace.description,
-        organization_id: services::organization::ports::OrganizationId(
-            db_workspace.organization_id,
-        ),
-        created_by_user_id: services::auth::ports::UserId(db_workspace.created_by_user_id),
-        created_at: db_workspace.created_at,
-        updated_at: db_workspace.updated_at,
-        is_active: db_workspace.is_active,
-        settings: db_workspace.settings,
-    }
-}
-
 fn db_organization_to_service_organization(
     db_organization: crate::models::Organization,
 ) -> services::organization::Organization {
@@ -382,57 +363,6 @@ fn db_organization_to_service_organization(
         is_active: db_organization.is_active,
         created_at: db_organization.created_at,
         updated_at: db_organization.updated_at,
-    }
-}
-
-// Implement the service layer trait
-#[async_trait]
-impl services::auth::ports::WorkspaceRepository for WorkspaceRepository {
-    async fn get_workspace_with_organization(
-        &self,
-        workspace_id: services::auth::ports::WorkspaceId,
-    ) -> anyhow::Result<
-        Option<(
-            services::auth::ports::Workspace,
-            services::organization::Organization,
-        )>,
-    > {
-        match self.get_workspace_with_organization(workspace_id.0).await? {
-            Some((db_workspace, db_organization)) => Ok(Some((
-                db_workspace_to_service_workspace(db_workspace),
-                db_organization_to_service_organization(db_organization),
-            ))),
-            None => Ok(None),
-        }
-    }
-
-    async fn get_by_id(
-        &self,
-        workspace_id: services::auth::ports::WorkspaceId,
-    ) -> anyhow::Result<Option<services::auth::ports::Workspace>> {
-        match self.get_by_id(workspace_id.0).await? {
-            Some(db_workspace) => Ok(Some(db_workspace_to_service_workspace(db_workspace))),
-            None => Ok(None),
-        }
-    }
-
-    async fn create(
-        &self,
-        name: String,
-        display_name: String,
-        description: Option<String>,
-        organization_id: services::organization::OrganizationId,
-        created_by_user_id: services::auth::ports::UserId,
-    ) -> anyhow::Result<services::auth::ports::Workspace> {
-        let request = crate::models::CreateWorkspaceRequest {
-            name,
-            display_name,
-            description,
-        };
-        let db_workspace = self
-            .create(request, organization_id.0, created_by_user_id.0)
-            .await?;
-        Ok(db_workspace_to_service_workspace(db_workspace))
     }
 }
 

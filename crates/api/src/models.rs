@@ -1078,6 +1078,8 @@ pub struct UpdateApiKeyRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "spendLimit")]
     pub spend_limit: Option<DecimalPriceRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_active: Option<bool>,
 }
 
 // ============================================

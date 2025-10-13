@@ -1071,6 +1071,7 @@ pub async fn update_workspace_api_key(
             request.name,
             expires_at_opt,
             spend_limit_nano,
+            request.is_active,
         )
         .await
     {

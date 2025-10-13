@@ -150,6 +150,7 @@ pub trait ApiKeyRepository: Send + Sync {
         name: Option<String>,
         expires_at: Option<Option<DateTime<Utc>>>,
         spend_limit: Option<Option<i64>>,
+        is_active: Option<bool>,
     ) -> anyhow::Result<ApiKey>;
 }
 
@@ -233,6 +234,7 @@ pub trait WorkspaceServiceTrait: Send + Sync {
         name: Option<String>,
         expires_at: Option<Option<DateTime<Utc>>>,
         spend_limit: Option<Option<i64>>,
+        is_active: Option<bool>,
     ) -> Result<ApiKey, WorkspaceError>;
 
     /// Check if a user can manage API keys for a workspace

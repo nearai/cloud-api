@@ -164,10 +164,7 @@ impl ApiKeyRepository {
             .context("Failed to get database connection")?;
 
         let row = client
-            .query_opt(
-                "SELECT * FROM api_keys WHERE id = $1 AND is_active = true",
-                &[&id],
-            )
+            .query_opt("SELECT * FROM api_keys WHERE id = $1", &[&id])
             .await
             .context("Failed to query API key")?;
 
@@ -455,6 +452,7 @@ impl ApiKeyRepository {
         name: Option<String>,
         expires_at: Option<Option<DateTime<Utc>>>,
         spend_limit: Option<Option<i64>>,
+        is_active: Option<bool>,
     ) -> Result<ApiKey> {
         let client = self
             .pool
@@ -485,13 +483,19 @@ impl ApiKeyRepository {
             param_idx += 1;
         }
 
+        if let Some(ref is_active) = is_active {
+            updates.push(format!("is_active = ${}", param_idx));
+            params.push(is_active);
+            param_idx += 1;
+        }
+
         if updates.is_empty() {
             // No fields to update, just return the existing key
             return self.get_by_id(id).await?.context("API key not found");
         }
 
         let query = format!(
-            "UPDATE api_keys SET {} WHERE id = ${} AND is_active = true RETURNING *",
+            "UPDATE api_keys SET {} WHERE id = ${} RETURNING *",
             updates.join(", "),
             param_idx
         );
@@ -665,9 +669,16 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
         name: Option<String>,
         expires_at: Option<Option<DateTime<Utc>>>,
         spend_limit: Option<Option<i64>>,
+        is_active: Option<bool>,
     ) -> anyhow::Result<services::workspace::ApiKey> {
         let db_api_key = self
-            .update(Uuid::parse_str(&id.0)?, name, expires_at, spend_limit)
+            .update(
+                Uuid::parse_str(&id.0)?,
+                name,
+                expires_at,
+                spend_limit,
+                is_active,
+            )
             .await?;
         Ok(db_apikey_to_workspace_service(None, db_api_key))
     }

@@ -280,7 +280,7 @@ impl ApiKeyRepository {
 
         let row = client
             .query_one(
-                "SELECT COUNT(*) as count FROM api_keys WHERE workspace_id = $1 AND is_active = true",
+                "SELECT COUNT(*) as count FROM api_keys WHERE workspace_id = $1",
                 &[&workspace_id],
             )
             .await

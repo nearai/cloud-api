@@ -66,9 +66,9 @@ use tokio_stream::StreamExt;
 
 // Re-export commonly used types for convenience
 pub use models::{
-    AttestationData, AttestationReport, AttestationReportParams, ChatCompletionParams, ChatDelta,
-    ChatMessage, ChatSignature, CompletionError, CompletionParams, FinishReason, MessageRole,
-    ModelInfo, NvidiaPayload, StreamChunk, StreamOptions, TokenUsage,
+    AttestationReportParams, ChatCompletionParams, ChatDelta, ChatMessage, ChatSignature,
+    CompletionError, CompletionParams, FinishReason, MessageRole, ModelInfo, NvidiaPayload,
+    StreamChunk, StreamOptions, TokenUsage, VllmAttestationReport,
 };
 pub use vllm::{VLlmConfig, VLlmProvider};
 
@@ -127,5 +127,5 @@ pub trait InferenceProvider {
         &self,
         model: String,
         signing_algo: Option<String>,
-    ) -> Result<AttestationReport, CompletionError>;
+    ) -> Result<Vec<VllmAttestationReport>, CompletionError>;
 }

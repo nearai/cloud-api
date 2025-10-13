@@ -323,7 +323,7 @@ pub async fn create_response(
                     ResponseObject {
                         id: response_id.unwrap_or_else(|| format!("resp_{}", Uuid::new_v4())),
                         object: "response".to_string(),
-                        created_at: chrono::Utc::now().timestamp() as u64,
+                        created_at: chrono::Utc::now().timestamp(),
                         status: match status {
                             DomainResponseStatus::InProgress => ResponseStatus::InProgress,
                             DomainResponseStatus::Completed => ResponseStatus::Completed,
@@ -478,7 +478,7 @@ fn convert_domain_response_to_http_with_request(
     ResponseObject {
         id: domain_response.id.to_string(),
         object: "response".to_string(),
-        created_at: domain_response.created_at.timestamp() as u64,
+        created_at: domain_response.created_at.timestamp(),
         status,
         error: None,
         incomplete_details: None,
@@ -507,16 +507,16 @@ fn convert_domain_response_to_http_with_request(
         usage: domain_response
             .usage
             .map(|u| Usage {
-                input_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                input_tokens: u.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
                 input_tokens_details: Some(InputTokensDetails { cached_tokens: 0 }),
                 output_tokens: u
                     .get("completion_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32,
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as i32,
                 output_tokens_details: Some(OutputTokensDetails {
                     reasoning_tokens: 0,
                 }),
-                total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                total_tokens: u.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             })
             .unwrap_or(Usage::new(10, 20)),
         user: None,
@@ -553,7 +553,7 @@ fn convert_domain_response_to_http_simple(domain_response: services::Response) -
     ResponseObject {
         id: domain_response.id.to_string(),
         object: "response".to_string(),
-        created_at: domain_response.created_at.timestamp() as u64,
+        created_at: domain_response.created_at.timestamp(),
         status,
         error: None,
         incomplete_details: None,
@@ -582,16 +582,16 @@ fn convert_domain_response_to_http_simple(domain_response: services::Response) -
         usage: domain_response
             .usage
             .map(|u| Usage {
-                input_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                input_tokens: u.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
                 input_tokens_details: Some(InputTokensDetails { cached_tokens: 0 }),
                 output_tokens: u
                     .get("completion_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32,
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as i32,
                 output_tokens_details: Some(OutputTokensDetails {
                     reasoning_tokens: 0,
                 }),
-                total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                total_tokens: u.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             })
             .unwrap_or(Usage::new(10, 20)),
         user: None,
@@ -608,7 +608,7 @@ pub struct GetResponseQuery {
     pub include: Vec<String>,
     #[serde(default)]
     pub include_obfuscation: Option<bool>,
-    pub starting_after: Option<i32>,
+    pub starting_after: Option<i64>,
     pub stream: Option<bool>,
 }
 
@@ -616,6 +616,6 @@ pub struct GetResponseQuery {
 pub struct ListInputItemsQuery {
     pub after: Option<String>,
     pub include: Option<Vec<String>>,
-    pub limit: Option<i32>,
+    pub limit: Option<i64>,
     pub order: Option<String>, // "asc" or "desc"
 }

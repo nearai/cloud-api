@@ -44,7 +44,7 @@ pub enum CompletionError {
 pub struct CompletionRequest {
     pub model: String,
     pub messages: Vec<CompletionMessage>,
-    pub max_tokens: Option<u32>,
+    pub max_tokens: Option<i64>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub stop: Option<Vec<String>>,

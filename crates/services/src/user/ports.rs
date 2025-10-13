@@ -1,6 +1,4 @@
 use crate::auth::ports::{Session, SessionId, User, UserId};
-use crate::organization::Organization;
-use crate::workspace::{ApiKey, Workspace};
 use async_trait::async_trait;
 
 /// Errors that can occur during user service operations
@@ -20,17 +18,6 @@ pub enum UserServiceError {
 
     #[error("Internal error: {0}")]
     InternalError(String),
-
-    #[error("Organization already exists")]
-    OrganizationAlreadyExists,
-}
-
-/// Response from quick setup containing all created resources
-#[derive(Debug, Clone)]
-pub struct QuickSetupResult {
-    pub organization: Organization,
-    pub workspace: Workspace,
-    pub api_key: ApiKey,
 }
 
 /// Service trait for user profile and session management
@@ -59,10 +46,4 @@ pub trait UserServiceTrait: Send + Sync {
 
     /// Revoke all sessions for a user
     async fn revoke_all_sessions(&self, user_id: UserId) -> Result<usize, UserServiceError>;
-
-    /// Quick setup: Create organization, workspace, and API key for a user
-    ///
-    /// This is a convenience method that creates all resources needed for a user to get started.
-    /// The organization name is derived from the user's email (e.g., "user@example.com" -> "user-org").
-    async fn quick_setup(&self, user_id: UserId) -> Result<QuickSetupResult, UserServiceError>;
 }

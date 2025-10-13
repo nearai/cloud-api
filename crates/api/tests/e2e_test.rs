@@ -55,7 +55,12 @@ fn db_config_for_tests() -> config::DatabaseConfig {
     // Load database config from config file for tests
     // Falls back to localhost defaults if config file is not available
     match config::ApiConfig::load() {
-        Ok(config) => config.database,
+        Ok(mut config) => {
+            // Override max_connections to prevent pool exhaustion when running tests in parallel
+            // Each test creates its own connection pool, so we need to keep this small
+            config.database.max_connections = 2;
+            config.database
+        }
         Err(_) => {
             // Fallback to localhost defaults (for running tests without config file)
             config::DatabaseConfig {
@@ -64,7 +69,7 @@ fn db_config_for_tests() -> config::DatabaseConfig {
                 database: "platform_api".to_string(),
                 username: "postgres".to_string(),
                 password: "postgres".to_string(),
-                max_connections: 5,
+                max_connections: 2,
                 tls_enabled: false,
                 tls_ca_cert_path: None,
             }
@@ -95,6 +100,77 @@ async fn init_test_database(config: &config::DatabaseConfig) -> Arc<Database> {
         .await;
 
     database
+}
+
+/// Setup a complete test server with all components initialized
+/// Returns the test server ready for making requests
+async fn setup_test_server() -> axum_test::TestServer {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(LevelFilter::DEBUG)
+        .try_init();
+
+    let config = test_config();
+    let database = init_test_database(&config.database).await;
+
+    // Create mock user in database for foreign key constraints
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+    let domain_services = init_domain_services(
+        database.clone(),
+        &config,
+        auth_components.organization_service.clone(),
+    )
+    .await;
+
+    let app = build_app(database, auth_components, domain_services);
+    axum_test::TestServer::new(app).unwrap()
+}
+
+/// Create an organization and set spending limit
+/// Returns the organization response
+async fn setup_org_with_credits(
+    server: &axum_test::TestServer,
+    amount_nano_dollars: i64,
+) -> api::models::OrganizationResponse {
+    let org = create_org(server).await;
+
+    let update_request = serde_json::json!({
+        "spendLimit": {
+            "amount": amount_nano_dollars,
+            "currency": "USD"
+        },
+        "changedBy": "admin@test.com",
+        "changeReason": "Test credits"
+    });
+
+    let response = server
+        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&update_request)
+        .await;
+
+    assert_eq!(response.status_code(), 200, "Failed to set credits");
+    org
+}
+
+/// Get an API key for an organization (using its default workspace)
+/// Returns the API key string
+async fn get_api_key_for_org(server: &axum_test::TestServer, org_id: String) -> String {
+    let workspaces = list_workspaces(server, org_id).await;
+    let workspace = workspaces.first().unwrap();
+    let api_key_resp = create_api_key_in_workspace(server, workspace.id.clone()).await;
+    api_key_resp.key.unwrap()
+}
+
+/// Setup a test model with pricing
+/// Returns the model name
+async fn setup_test_model(server: &axum_test::TestServer) -> String {
+    let batch = generate_model();
+    let model_name = batch.keys().next().unwrap().clone();
+    admin_batch_upsert_models(server, batch, get_session_id()).await;
+    model_name
 }
 
 /// Create the mock user in the database to satisfy foreign key constraints
@@ -180,7 +256,8 @@ async fn list_workspaces(
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .await;
     assert_eq!(response.status_code(), 200);
-    response.json::<Vec<api::routes::workspaces::WorkspaceResponse>>()
+    let list_response = response.json::<api::routes::workspaces::ListWorkspacesResponse>();
+    list_response.workspaces
 }
 
 async fn create_org_and_api_key(
@@ -231,24 +308,7 @@ async fn admin_batch_upsert_models(
 
 #[tokio::test]
 async fn test_models_api() {
-    // Setup
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock user in database for foreign key constraints
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database, auth_components, domain_services);
-
-    let server = axum_test::TestServer::new(app).unwrap();
-
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
     let response = list_models(&server, api_key).await;
 
@@ -257,50 +317,9 @@ async fn test_models_api() {
 
 #[tokio::test]
 async fn test_chat_completions_api() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock user in database for foreign key constraints
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database, auth_components, domain_services);
-
-    let server = axum_test::TestServer::new(app).unwrap();
-
-    // Create organization and set up credits
-    let org = create_org(&server).await;
-
-    // Add credits to the organization (scale 9 = nano-dollars)
-    let update_request = serde_json::json!({
-        "spendLimit": {
-            "amount": 10000000000i64,  // $10.00 USD (in nano-dollars)
-            "currency": "USD"
-        },
-        "changedBy": "admin@test.com",
-        "changeReason": "Test credits"
-    });
-
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&update_request)
-        .await;
-
-    assert_eq!(response.status_code(), 200, "Failed to set credits");
-
-    // Get API key
-    let workspaces = list_workspaces(&server, org.id.clone()).await;
-    let workspace = workspaces.first().unwrap();
-    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
-    let api_key = api_key_resp.key.unwrap();
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
 
     let response = server
         .post("/v1/chat/completions")
@@ -409,23 +428,7 @@ async fn test_chat_completions_api() {
 
 #[tokio::test]
 async fn test_responses_api() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock user in database for foreign key constraints
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database, auth_components, domain_services);
-
-    let server = axum_test::TestServer::new(app).unwrap();
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     let response = server
@@ -545,7 +548,7 @@ async fn create_response(
     conversation_id: String,
     model: String,
     message: String,
-    max_tokens: u32,
+    max_tokens: i64,
     api_key: String,
 ) -> api::models::ResponseObject {
     let response = server
@@ -571,7 +574,7 @@ async fn create_response_stream(
     conversation_id: String,
     model: String,
     message: String,
-    max_tokens: u32,
+    max_tokens: i64,
     api_key: String,
 ) -> (String, api::models::ResponseObject) {
     let response = server
@@ -657,20 +660,7 @@ async fn create_response_stream(
 
 #[tokio::test]
 async fn test_conversations_api() {
-    // Setup
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock user in database for foreign key constraints
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database, auth_components, domain_services);
-
-    let server = axum_test::TestServer::new(app).unwrap();
-
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Test creating a conversation
@@ -687,23 +677,7 @@ async fn test_conversations_api() {
 
 #[tokio::test]
 async fn test_streaming_responses_api() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock user in database for foreign key constraints
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database, auth_components, domain_services);
-
-    let server = axum_test::TestServer::new(app).unwrap();
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Get available models
@@ -808,23 +782,7 @@ fn generate_model() -> BatchUpdateModelApiRequest {
 
 #[tokio::test]
 async fn test_admin_update_model() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user with admin domain email
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database, auth_components, domain_services);
-
-    let server = axum_test::TestServer::new(app).unwrap();
+    let server = setup_test_server().await;
 
     // Upsert models (using session token with admin domain email)
     let batch = generate_model();
@@ -843,23 +801,7 @@ async fn test_admin_update_model() {
 
 #[tokio::test]
 async fn test_get_model_by_name() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user with admin domain email
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database, auth_components, domain_services);
-
-    let server = axum_test::TestServer::new(app).unwrap();
+    let server = setup_test_server().await;
 
     // Upsert a model with a name containing forward slashes
     let batch = generate_model();
@@ -973,23 +915,7 @@ async fn test_get_model_by_name() {
 
 #[tokio::test]
 async fn test_admin_update_organization_limits() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user with admin domain email
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database, auth_components, domain_services);
-
-    let server = axum_test::TestServer::new(app).unwrap();
+    let server = setup_test_server().await;
 
     // Create an organization
     let org = create_org(&server).await;
@@ -1036,23 +962,7 @@ async fn test_admin_update_organization_limits() {
 
 #[tokio::test]
 async fn test_admin_update_organization_limits_invalid_org() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user with admin domain email
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database, auth_components, domain_services);
-
-    let server = axum_test::TestServer::new(app).unwrap();
+    let server = setup_test_server().await;
 
     // Try to update limits for non-existent organization
     let fake_org_id = uuid::Uuid::new_v4().to_string();
@@ -1083,23 +993,7 @@ async fn test_admin_update_organization_limits_invalid_org() {
 
 #[tokio::test]
 async fn test_admin_update_organization_limits_multiple_times() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user with admin domain email
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database, auth_components, domain_services);
-
-    let server = axum_test::TestServer::new(app).unwrap();
+    let server = setup_test_server().await;
 
     // Create an organization
     let org = create_org(&server).await;
@@ -1159,23 +1053,7 @@ async fn test_admin_update_organization_limits_multiple_times() {
 
 #[tokio::test]
 async fn test_admin_update_organization_limits_usd_only() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user with admin domain email
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database, auth_components, domain_services);
-
-    let server = axum_test::TestServer::new(app).unwrap();
+    let server = setup_test_server().await;
 
     // Create an organization
     let org = create_org(&server).await;
@@ -1210,22 +1088,7 @@ async fn test_admin_update_organization_limits_usd_only() {
 
 #[tokio::test]
 async fn test_no_credits_denies_request() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database.clone(), auth_components, domain_services);
-    let server = axum_test::TestServer::new(app).unwrap();
+    let server = setup_test_server().await;
 
     // Create organization WITHOUT setting any credits
     let (api_key, _api_key_response) = create_org_and_api_key(&server).await;
@@ -1268,49 +1131,9 @@ async fn test_no_credits_denies_request() {
 
 #[tokio::test]
 async fn test_usage_tracking_on_completion() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database.clone(), auth_components, domain_services);
-    let server = axum_test::TestServer::new(app).unwrap();
-
-    // Create organization
-    let org = create_org(&server).await;
-
-    // Set credits for the organization (scale 9 = nano-dollars)
-    let update_request = serde_json::json!({
-        "spendLimit": {
-            "amount": 1000000000i64,  // $1.00 USD (in nano-dollars)
-            "currency": "USD"
-        },
-        "changedBy": "admin@test.com",
-        "changeReason": "Initial test credits"
-    });
-
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&update_request)
-        .await;
-
-    assert_eq!(response.status_code(), 200, "Failed to set credits");
-
-    // Get API key for this organization
-    let workspaces = list_workspaces(&server, org.id.clone()).await;
-    let workspace = workspaces.first().unwrap();
-    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
-    let api_key = api_key_resp.key.unwrap();
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 1000000000i64).await; // $1.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Make a chat completion request
     let response = server
@@ -1345,50 +1168,10 @@ async fn test_usage_tracking_on_completion() {
 
 #[tokio::test]
 async fn test_usage_limit_enforcement() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database.clone(), auth_components, domain_services);
-    let server = axum_test::TestServer::new(app).unwrap();
-
-    // Create organization
-    let org = create_org(&server).await;
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 1).await; // 1 nano-dollar (minimal)
     println!("Created organization: {:?}", org);
-
-    // Set a very low spending limit ($0.000000001 USD = 1 nano-dollar)
-    let update_request = serde_json::json!({
-        "spendLimit": {
-            "amount": 1,  // Minimal amount (1 nano-dollar)
-            "currency": "USD"
-        },
-        "changedBy": "admin@test.com",
-        "changeReason": "Test low limit"
-    });
-
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&update_request)
-        .await;
-
-    assert_eq!(response.status_code(), 200, "Failed to set limit");
-
-    // Get API key for this organization
-    let workspaces = list_workspaces(&server, org.id.clone()).await;
-    let workspace = workspaces.first().unwrap();
-    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
-    let api_key = api_key_resp.key.unwrap();
+    let api_key = get_api_key_for_org(&server, org.id).await;
 
     // First request should succeed (no usage yet)
     let response1 = server
@@ -1433,43 +1216,8 @@ async fn test_usage_limit_enforcement() {
 
 #[tokio::test]
 async fn test_get_organization_balance() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database.clone(), auth_components, domain_services);
-    let server = axum_test::TestServer::new(app).unwrap();
-
-    // Create organization
-    let org = create_org(&server).await;
-
-    // Set spending limit first
-    let limit_request = serde_json::json!({
-        "spendLimit": {
-            "amount": 5000000000i64,  // $5.00 USD
-            "currency": "USD"
-        },
-        "changedBy": "admin@test.com",
-        "changeReason": "Initial test credits"
-    });
-
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&limit_request)
-        .await;
-
-    assert_eq!(response.status_code(), 200, "Failed to set limit");
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 5000000000i64).await; // $5.00 USD
 
     // Get balance - should now show limit even with no usage
     let response = server
@@ -1527,24 +1275,7 @@ async fn test_get_organization_balance() {
 
 #[tokio::test]
 async fn test_get_organization_usage_history() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database.clone(), auth_components, domain_services);
-    let server = axum_test::TestServer::new(app).unwrap();
-
-    // Create organization
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     // Get usage history (should be empty initially)
@@ -1565,58 +1296,15 @@ async fn test_get_organization_usage_history() {
 
 #[tokio::test]
 async fn test_completion_cost_calculation() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database.clone(), auth_components, domain_services);
-    let server = axum_test::TestServer::new(app).unwrap();
-
-    // Create organization
-    let org = create_org(&server).await;
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 1000000000000i64).await; // $1000.00 USD
     println!("Created organization: {}", org.id);
 
-    // Set spending limits high enough for the test (scale 9 = nano-dollars)
-    let update_request = serde_json::json!({
-        "spendLimit": {
-            "amount": 1000000000000i64,  // $1000.00 USD (in nano-dollars)
-            "currency": "USD"
-        },
-        "changedBy": "admin@test.com",
-        "changeReason": "Test credits for cost calculation"
-    });
+    // Setup test model with known pricing
+    let model_name = setup_test_model(&server).await;
+    println!("Setup model: {}", model_name);
 
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&update_request)
-        .await;
-
-    assert_eq!(response.status_code(), 200, "Failed to set credits");
-
-    // Upsert a model with specific known pricing
-    // Input cost: $0.001 per token (1000000 / 10^9 = 0.001)
-    // Output cost: $0.002 per token (2000000 / 10^9 = 0.002)
-    let batch = generate_model();
-    let model_name = batch.keys().next().unwrap().clone();
-    let updated_models = admin_batch_upsert_models(&server, batch, get_session_id()).await;
-    println!("Updated model: {:?}", updated_models[0]);
-
-    // Get API key
-    let workspaces = list_workspaces(&server, org.id.clone()).await;
-    let workspace = workspaces.first().unwrap();
-    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
-    let api_key = api_key_resp.key.unwrap();
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
     // Get initial balance (should be 0 or not found)
     let initial_balance_response = server
@@ -1694,8 +1382,8 @@ async fn test_completion_cost_calculation() {
     );
     println!("Expected total cost: {} nano-dollars", expected_total_cost);
 
-    // Wait for async usage recording to complete
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    // Wait for async usage recording to complete (increased to 3s for reliability with remote DB)
+    tokio::time::sleep(tokio::time::Duration::from_millis(3000)).await;
 
     // Get the updated balance
     let balance_response = server
@@ -1792,11 +1480,11 @@ async fn test_completion_cost_calculation() {
         "Should record correct model"
     );
     assert_eq!(
-        latest_entry.input_tokens, input_tokens as i32,
+        latest_entry.input_tokens, input_tokens,
         "Should record correct input tokens"
     );
     assert_eq!(
-        latest_entry.output_tokens, output_tokens as i32,
+        latest_entry.output_tokens, output_tokens,
         "Should record correct output tokens"
     );
 
@@ -1815,43 +1503,8 @@ async fn test_completion_cost_calculation() {
 
 #[tokio::test]
 async fn test_organization_balance_with_limit_and_usage() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database.clone(), auth_components, domain_services);
-    let server = axum_test::TestServer::new(app).unwrap();
-
-    // Create organization
-    let org = create_org(&server).await;
-
-    // Set spending limit of $10.00
-    let limit_request = serde_json::json!({
-        "spendLimit": {
-            "amount": 10000000000i64,  // $10.00 USD
-            "currency": "USD"
-        },
-        "changedBy": "billing@test.com",
-        "changeReason": "Customer purchased $10 credits"
-    });
-
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&limit_request)
-        .await;
-
-    assert_eq!(response.status_code(), 200);
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
 
     // Get balance before any usage
     let response = server
@@ -1874,15 +1527,8 @@ async fn test_organization_balance_with_limit_and_usage() {
     assert_eq!(initial_balance.remaining_display.unwrap(), "$10.00");
 
     // Make a completion to record some usage
-    let workspaces = list_workspaces(&server, org.id.clone()).await;
-    let workspace = workspaces.first().unwrap();
-    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
-    let api_key = api_key_resp.key.unwrap();
-
-    // Upsert model with known pricing
-    let batch = generate_model();
-    let model_name = batch.keys().next().unwrap().clone();
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    let model_name = setup_test_model(&server).await;
 
     let response = server
         .post("/v1/chat/completions")
@@ -1945,22 +1591,7 @@ async fn test_organization_balance_with_limit_and_usage() {
 
 #[tokio::test]
 async fn test_api_key_spend_limit_update() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database.clone(), auth_components, domain_services);
-    let server = axum_test::TestServer::new(app).unwrap();
+    let server = setup_test_server().await;
 
     // Create organization and API key
     let org = create_org(&server).await;
@@ -2048,44 +1679,9 @@ async fn test_api_key_spend_limit_update() {
 
 #[tokio::test]
 async fn test_api_key_spend_limit_enforcement() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database.clone(), auth_components, domain_services);
-    let server = axum_test::TestServer::new(app).unwrap();
-
-    // Create organization
-    let org = create_org(&server).await;
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD (high limit)
     println!("Created organization: {}", org.id);
-
-    // Set high organization limit so we test API key limit, not org limit
-    let org_limit_request = serde_json::json!({
-        "spendLimit": {
-            "amount": 10000000000i64,  // $10.00 USD (high limit)
-            "currency": "USD"
-        },
-        "changedBy": "admin@test.com",
-        "changeReason": "Test high org limit"
-    });
-
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&org_limit_request)
-        .await;
-
-    assert_eq!(response.status_code(), 200, "Failed to set org limit");
 
     // Create API key and set a very low limit
     let workspaces = list_workspaces(&server, org.id.clone()).await;
@@ -2116,10 +1712,7 @@ async fn test_api_key_spend_limit_enforcement() {
     assert_eq!(response.status_code(), 200);
     println!("Set low API key spend limit");
 
-    // Upsert a model with known pricing
-    let batch = generate_model();
-    let model_name = batch.keys().next().unwrap().clone();
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let model_name = setup_test_model(&server).await;
 
     // First request might succeed or fail depending on timing
     let response1 = server
@@ -2176,43 +1769,8 @@ async fn test_api_key_spend_limit_enforcement() {
 
 #[tokio::test]
 async fn test_api_key_limit_enforced_before_org_limit() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database.clone(), auth_components, domain_services);
-    let server = axum_test::TestServer::new(app).unwrap();
-
-    // Create organization
-    let org = create_org(&server).await;
-
-    // Set organization limit to $5.00
-    let org_limit_request = serde_json::json!({
-        "spendLimit": {
-            "amount": 5000000000i64,  // $5.00 USD
-            "currency": "USD"
-        },
-        "changedBy": "admin@test.com",
-        "changeReason": "Test org limit"
-    });
-
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&org_limit_request)
-        .await;
-
-    assert_eq!(response.status_code(), 200);
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 5000000000i64).await; // $5.00 USD
 
     // Create API key with lower limit than org ($2.00)
     let workspaces = list_workspaces(&server, org.id.clone()).await;
@@ -2252,22 +1810,7 @@ async fn test_api_key_limit_enforced_before_org_limit() {
 
 #[tokio::test]
 async fn test_api_key_spend_limit_unauthorized_user() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database.clone(), auth_components, domain_services);
-    let server = axum_test::TestServer::new(app).unwrap();
+    let server = setup_test_server().await;
 
     // Create two separate organizations
     let org1 = create_org(&server).await;
@@ -2310,44 +1853,9 @@ async fn test_api_key_spend_limit_unauthorized_user() {
 
 #[tokio::test]
 async fn test_list_workspace_api_keys_with_usage() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database.clone(), auth_components, domain_services);
-    let server = axum_test::TestServer::new(app).unwrap();
-
-    // Create organization
-    let org = create_org(&server).await;
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     println!("Created organization: {}", org.id);
-
-    // Set spending limit high enough for testing
-    let limit_request = serde_json::json!({
-        "spendLimit": {
-            "amount": 10000000000i64,  // $10.00 USD
-            "currency": "USD"
-        },
-        "changedBy": "admin@test.com",
-        "changeReason": "Test credits"
-    });
-
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&limit_request)
-        .await;
-
-    assert_eq!(response.status_code(), 200, "Failed to set org limit");
 
     // Get the default workspace
     let workspaces = list_workspaces(&server, org.id.clone()).await;
@@ -2363,10 +1871,7 @@ async fn test_list_workspace_api_keys_with_usage() {
     let api_key_resp2 = create_api_key_in_workspace(&server, workspace.id.clone()).await;
     println!("Created API key 2: {}", api_key_resp2.id);
 
-    // Upsert a model with known pricing
-    let batch = generate_model();
-    let model_name = batch.keys().next().unwrap().clone();
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let model_name = setup_test_model(&server).await;
 
     // Make a completion request with the first API key to generate usage
     let response = server
@@ -2413,7 +1918,8 @@ async fn test_list_workspace_api_keys_with_usage() {
         "Should successfully list API keys"
     );
 
-    let api_keys = response.json::<Vec<api::models::ApiKeyResponse>>();
+    let list_response = response.json::<api::models::ListApiKeysResponse>();
+    let api_keys = list_response.api_keys;
     println!("Number of API keys returned: {}", api_keys.len());
 
     // Verify we have at least 2 API keys (the ones we created)
@@ -2490,44 +1996,9 @@ async fn test_list_workspace_api_keys_with_usage() {
 
 #[tokio::test]
 async fn test_high_context_length_completion() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database.clone(), auth_components, domain_services);
-    let server = axum_test::TestServer::new(app).unwrap();
-
-    // Create organization
-    let org = create_org(&server).await;
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 100000000000i64).await; // $100.00 USD
     println!("Created organization: {}", org.id);
-
-    // Set high spending limit for this test
-    let limit_request = serde_json::json!({
-        "spendLimit": {
-            "amount": 100000000000i64,  // $100.00 USD
-            "currency": "USD"
-        },
-        "changedBy": "admin@test.com",
-        "changeReason": "High context test credits"
-    });
-
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&limit_request)
-        .await;
-
-    assert_eq!(response.status_code(), 200, "Failed to set org limit");
 
     // Upsert Qwen3-30B model with high context length capability (260k)
     let mut batch = BatchUpdateModelApiRequest::new();
@@ -2555,11 +2026,7 @@ async fn test_high_context_length_completion() {
     println!("Updated Qwen3-30B model: {:?}", updated_models[0]);
     assert_eq!(updated_models[0].metadata.context_length, 262144);
 
-    // Get API key
-    let workspaces = list_workspaces(&server, org.id.clone()).await;
-    let workspace = workspaces.first().unwrap();
-    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
-    let api_key = api_key_resp.key.unwrap();
+    let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Generate a very long input to test high context length
     // Each word is roughly 1-2 tokens, so to get ~100k tokens we need a lot of text
@@ -2643,43 +2110,8 @@ async fn test_high_context_length_completion() {
 
 #[tokio::test]
 async fn test_high_context_streaming() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database.clone(), auth_components, domain_services);
-    let server = axum_test::TestServer::new(app).unwrap();
-
-    // Create organization
-    let org = create_org(&server).await;
-
-    // Set high spending limit
-    let limit_request = serde_json::json!({
-        "spendLimit": {
-            "amount": 100000000000i64,  // $100.00 USD
-            "currency": "USD"
-        },
-        "changedBy": "admin@test.com",
-        "changeReason": "High context streaming test"
-    });
-
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&limit_request)
-        .await;
-
-    assert_eq!(response.status_code(), 200);
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 100000000000i64).await; // $100.00 USD
 
     // Upsert Qwen3-30B model with high context length capability (260k)
     let mut batch = BatchUpdateModelApiRequest::new();
@@ -2705,11 +2137,7 @@ async fn test_high_context_streaming() {
 
     admin_batch_upsert_models(&server, batch, get_session_id()).await;
 
-    // Get API key
-    let workspaces = list_workspaces(&server, org.id.clone()).await;
-    let workspace = workspaces.first().unwrap();
-    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
-    let api_key = api_key_resp.key.unwrap();
+    let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Generate long context input
     let base_text = "This is a test message for streaming with high context length. ";
@@ -2757,17 +2185,16 @@ async fn test_high_context_streaming() {
                     break;
                 }
 
-                if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
-                    if let StreamChunk::Chat(chat_chunk) = chunk {
-                        if let Some(choice) = chat_chunk.choices.first() {
-                            if let Some(delta) = &choice.delta {
-                                if let Some(delta_content) = &delta.content {
-                                    content.push_str(delta_content.as_str());
-                                }
+                if let Ok(StreamChunk::Chat(chat_chunk)) = serde_json::from_str::<StreamChunk>(data)
+                {
+                    if let Some(choice) = chat_chunk.choices.first() {
+                        if let Some(delta) = &choice.delta {
+                            if let Some(delta_content) = &delta.content {
+                                content.push_str(delta_content.as_str());
+                            }
 
-                                if choice.finish_reason.is_some() || chat_chunk.usage.is_some() {
-                                    final_chunk = Some(chat_chunk.clone());
-                                }
+                            if choice.finish_reason.is_some() || chat_chunk.usage.is_some() {
+                                final_chunk = Some(chat_chunk.clone());
                             }
                         }
                     }
@@ -2803,44 +2230,9 @@ async fn test_high_context_streaming() {
 
 #[tokio::test]
 async fn test_model_aliases() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database.clone(), auth_components, domain_services);
-    let server = axum_test::TestServer::new(app).unwrap();
-
-    // Create organization
-    let org = create_org(&server).await;
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     println!("Created organization: {}", org.id);
-
-    // Set spending limit
-    let limit_request = serde_json::json!({
-        "spendLimit": {
-            "amount": 10000000000i64,  // $10.00 USD
-            "currency": "USD"
-        },
-        "changedBy": "admin@test.com",
-        "changeReason": "Test credits for alias testing"
-    });
-
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&limit_request)
-        .await;
-
-    assert_eq!(response.status_code(), 200, "Failed to set org limit");
 
     // Set up canonical models with aliases
     // Discovery returns these canonical names from vLLM:
@@ -2901,11 +2293,8 @@ async fn test_model_aliases() {
     println!("Updated {} models with aliases", updated_models.len());
     assert_eq!(updated_models.len(), 2);
 
-    // Get API key
-    let workspaces = list_workspaces(&server, org.id.clone()).await;
-    let workspace = workspaces.first().unwrap();
-    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
-    let api_key = api_key_resp.key.unwrap();
+    let org_id = org.id.clone();
+    let api_key = get_api_key_for_org(&server, org_id.clone()).await;
 
     // Test 1: Request using an alias should work
     println!("\n=== Test 1: Request with alias 'openai/gpt-oss-120b' ===");
@@ -3006,7 +2395,7 @@ async fn test_model_aliases() {
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
     let history_response = server
-        .get(format!("/v1/organizations/{}/usage/history?limit=50", org.id).as_str())
+        .get(format!("/v1/organizations/{}/usage/history?limit=50", org_id).as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .await;
 
@@ -3043,41 +2432,8 @@ async fn test_model_aliases() {
 
 #[tokio::test]
 async fn test_model_alias_consistency() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
-    // Create mock admin user
-    assert_mock_user_in_db(&database).await;
-
-    let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(database.clone(), &config).await;
-
-    let app = build_app(database.clone(), auth_components, domain_services);
-    let server = axum_test::TestServer::new(app).unwrap();
-
-    // Create organization
-    let org = create_org(&server).await;
-
-    // Set spending limit
-    let limit_request = serde_json::json!({
-        "spendLimit": {
-            "amount": 10000000000i64,
-            "currency": "USD"
-        },
-        "changedBy": "admin@test.com",
-        "changeReason": "Test credits"
-    });
-
-    server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&limit_request)
-        .await;
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
 
     // Set up model with multiple aliases
     let mut batch = BatchUpdateModelApiRequest::new();
@@ -3109,11 +2465,7 @@ async fn test_model_alias_consistency() {
     assert_eq!(updated_models.len(), 1);
     println!("Set up model with 2 aliases");
 
-    // Get API key
-    let workspaces = list_workspaces(&server, org.id.clone()).await;
-    let workspace = workspaces.first().unwrap();
-    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
-    let api_key = api_key_resp.key.unwrap();
+    let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Make request with first alias
     println!("\n=== Request 1: Using first alias 'qwen/qwen3-30b-a3b-instruct-2507' ===");

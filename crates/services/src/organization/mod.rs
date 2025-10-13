@@ -48,7 +48,15 @@ impl OrganizationServiceImpl {
             .create(request, owner_id.0)
             .await
             .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to create organization: {}", e))
+                let error_msg = e.to_string();
+                if error_msg.contains("duplicate key") || error_msg.contains("already exists") {
+                    OrganizationError::AlreadyExists
+                } else {
+                    OrganizationError::InternalError(format!(
+                        "Failed to create organization: {}",
+                        e
+                    ))
+                }
             })
     }
 
@@ -242,34 +250,6 @@ impl OrganizationServiceImpl {
             })
     }
 
-    /// Get all members of an organization (private helper)
-    async fn get_members_impl(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-    ) -> Result<Vec<OrganizationMember>, OrganizationError> {
-        // Check if requester is a member
-        let org = self.get_organization_impl(organization_id.clone()).await?;
-        if org.owner_id != requester_id {
-            if let Ok(Some(_)) = self
-                .repository
-                .get_member(organization_id.0, requester_id.0)
-                .await
-            {
-                // User is a member, can view member list
-            } else {
-                return Err(OrganizationError::Unauthorized(
-                    "Only members can view the member list".to_string(),
-                ));
-            }
-        }
-
-        self.repository
-            .list_members(organization_id.0)
-            .await
-            .map_err(|e| OrganizationError::InternalError(format!("Failed to get members: {}", e)))
-    }
-
     /// Update a member's role (private helper)
     async fn update_member_role_impl(
         &self,
@@ -400,11 +380,13 @@ impl OrganizationServiceImpl {
         })
     }
 
-    /// List organization members with full user information (private helper)
-    async fn get_members_with_users_impl(
+    /// List organization members with full user information (paginated, private helper)
+    async fn get_members_with_users_paginated_impl(
         &self,
         organization_id: OrganizationId,
         requester_id: UserId,
+        limit: i64,
+        offset: i64,
     ) -> Result<Vec<OrganizationMemberWithUser>, OrganizationError> {
         // Check if requester is a member
         let org = self.get_organization_impl(organization_id.clone()).await?;
@@ -422,10 +404,10 @@ impl OrganizationServiceImpl {
             }
         }
 
-        // Get members
+        // Get members with pagination
         let members = self
             .repository
-            .list_members(organization_id.0)
+            .list_members_paginated(organization_id.0, limit, offset)
             .await
             .map_err(|e| {
                 OrganizationError::InternalError(format!("Failed to get members: {}", e))
@@ -628,7 +610,7 @@ impl OrganizationServiceImpl {
         // Check if removing last owner
         let members = self
             .repository
-            .list_members(organization_id.0)
+            .list_members_paginated(organization_id.0, 1, 0)
             .await
             .map_err(|e| {
                 OrganizationError::InternalError(format!("Failed to list members: {}", e))
@@ -1081,14 +1063,6 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
             .await
     }
 
-    async fn get_members(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-    ) -> Result<Vec<OrganizationMember>, OrganizationError> {
-        self.get_members_impl(organization_id, requester_id).await
-    }
-
     async fn update_member_role(
         &self,
         organization_id: OrganizationId,
@@ -1132,12 +1106,14 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
         self.get_organization_by_name_impl(name).await
     }
 
-    async fn get_members_with_users(
+    async fn get_members_with_users_paginated(
         &self,
         organization_id: OrganizationId,
         requester_id: UserId,
+        limit: i64,
+        offset: i64,
     ) -> Result<Vec<OrganizationMemberWithUser>, OrganizationError> {
-        self.get_members_with_users_impl(organization_id, requester_id)
+        self.get_members_with_users_paginated_impl(organization_id, requester_id, limit, offset)
             .await
     }
 

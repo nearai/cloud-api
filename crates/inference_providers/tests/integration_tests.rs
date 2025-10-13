@@ -20,7 +20,7 @@ fn create_test_provider() -> VLlmProvider {
     let config = VLlmConfig {
         base_url: VLLM_BASE_URL.to_string(),
         api_key: Some(VLLM_API_KEY.to_string()),
-        timeout_seconds: TEST_TIMEOUT_SECS,
+        timeout_seconds: TEST_TIMEOUT_SECS as i64,
     };
     VLlmProvider::new(config)
 }
@@ -43,7 +43,7 @@ async fn test_models_endpoint() {
             for model in &models.data {
                 assert!(!model.id.is_empty(), "Model ID should not be empty");
                 assert!(!model.object.is_empty(), "Model object should not be empty");
-                assert!(!model.created > 0, "Model created should be greater than 0");
+                assert!(model.created > 0, "Model created should be greater than 0");
             }
         }
         Ok(Err(e)) => panic!("Models request failed: {}", e),

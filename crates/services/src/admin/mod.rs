@@ -47,7 +47,9 @@ impl AdminService for AdminServiceImpl {
     async fn get_pricing_history(
         &self,
         model_name: &str,
-    ) -> Result<Vec<ModelPricingHistoryEntry>, AdminError> {
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<ModelPricingHistoryEntry>, i64), AdminError> {
         // Validate model name
         if model_name.trim().is_empty() {
             return Err(AdminError::InvalidPricing(
@@ -55,17 +57,17 @@ impl AdminService for AdminServiceImpl {
             ));
         }
 
-        let history = self
+        let (history, total) = self
             .repository
-            .get_pricing_history(model_name)
+            .get_pricing_history(model_name, limit, offset)
             .await
             .map_err(|e| AdminError::InternalError(e.to_string()))?;
 
-        if history.is_empty() {
+        if total == 0 {
             return Err(AdminError::ModelNotFound(model_name.to_string()));
         }
 
-        Ok(history)
+        Ok((history, total))
     }
 
     async fn delete_model(&self, model_name: &str) -> Result<(), AdminError> {
@@ -122,10 +124,18 @@ impl AdminService for AdminServiceImpl {
     async fn get_organization_limits_history(
         &self,
         organization_id: uuid::Uuid,
-    ) -> Result<Vec<OrganizationLimitsHistoryEntry>, AdminError> {
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<OrganizationLimitsHistoryEntry>, i64), AdminError> {
+        let total = self
+            .repository
+            .count_organization_limits_history(organization_id)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+
         let history = self
             .repository
-            .get_organization_limits_history(organization_id)
+            .get_organization_limits_history(organization_id, limit, offset)
             .await
             .map_err(|e| AdminError::InternalError(e.to_string()))?;
 
@@ -135,7 +145,7 @@ impl AdminService for AdminServiceImpl {
             ));
         }
 
-        Ok(history)
+        Ok((history, total))
     }
 
     async fn list_users(

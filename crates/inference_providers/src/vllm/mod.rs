@@ -132,6 +132,7 @@ impl InferenceProvider for VLlmProvider {
     async fn chat_completion_stream(
         &self,
         params: ChatCompletionParams,
+        request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
         let url = format!("{}/v1/chat/completions", self.config.base_url);
 
@@ -142,10 +143,13 @@ impl InferenceProvider for VLlmProvider {
             include_usage: Some(true),
         });
 
+        let mut headers = self.build_headers();
+        headers.insert("X-Request-Hash", request_hash.parse().unwrap());
+
         let response = self
             .client
             .post(&url)
-            .headers(self.build_headers())
+            .headers(headers)
             .json(&streaming_params)
             .send()
             .await

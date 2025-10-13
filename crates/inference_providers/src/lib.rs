@@ -110,6 +110,7 @@ pub trait InferenceProvider {
     async fn chat_completion_stream(
         &self,
         params: ChatCompletionParams,
+        request_hash: String,
     ) -> Result<StreamingResult, CompletionError>;
 
     /// Performs a streaming text completion request

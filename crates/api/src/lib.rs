@@ -21,7 +21,7 @@ use crate::{
     },
 };
 use axum::{
-    middleware::from_fn_with_state,
+    middleware::{from_fn, from_fn_with_state},
     response::Html,
     routing::{get, post},
     Router,
@@ -519,7 +519,8 @@ pub fn build_completion_routes(
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
-        ));
+        ))
+        .layer(from_fn(middleware::body_hash_middleware));
 
     // Routes that don't require credits (metadata)
     let metadata_routes = Router::new()

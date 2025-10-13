@@ -229,7 +229,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // Get the LLM stream
         let llm_stream = self
             .inference_provider_pool
-            .chat_completion_stream(chat_params)
+            .chat_completion_stream(chat_params, request.body_hash.clone())
             .await
             .map_err(|e| {
                 ports::CompletionError::ProviderError(format!("Failed to create LLM stream: {}", e))

@@ -153,7 +153,7 @@ impl McpClientManager {
                     self.connection_timeout.as_secs()
                 );
                 McpError::ConnectionTimeout {
-                    seconds: self.connection_timeout.as_secs(),
+                    seconds: self.connection_timeout.as_secs() as i64,
                 }
             })?
             .map_err(|e| {
@@ -348,7 +348,7 @@ impl McpClientManager {
         connector_id: &McpConnectorId,
         name: String,
         arguments: Option<serde_json::Value>,
-        max_retries: u32,
+        max_retries: i64,
     ) -> Result<CallToolResult, McpError> {
         let mut last_error = None;
 

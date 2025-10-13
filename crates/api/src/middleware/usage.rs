@@ -180,7 +180,7 @@ pub async fn usage_check_middleware(
 
 /// Helper function to format amount (fixed scale 9 = nano-dollars, USD)
 fn format_amount(amount: i64) -> String {
-    const SCALE: i32 = 9;
+    const SCALE: i64 = 9;
     let divisor = 10_i64.pow(SCALE as u32);
     let whole = amount / divisor;
     let fraction = amount % divisor;

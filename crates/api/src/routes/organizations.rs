@@ -1,5 +1,6 @@
 use crate::models::{
-    CreateOrganizationRequest, ErrorResponse, OrganizationResponse, UpdateOrganizationRequest,
+    CreateOrganizationRequest, ErrorResponse, ListOrganizationsResponse, OrganizationResponse,
+    UpdateOrganizationRequest,
 };
 use crate::{middleware::AuthenticatedUser, routes::api::AppState};
 use axum::{
@@ -20,7 +21,7 @@ use uuid::Uuid;
     path = "/organizations",
     tag = "Organizations",
     responses(
-        (status = 200, description = "List of organizations", body = Vec<OrganizationResponse>),
+        (status = 200, description = "Paginated list of organizations", body = ListOrganizationsResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -31,11 +32,32 @@ use uuid::Uuid;
 pub async fn list_organizations(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
-    Query(params): Query<ListParams>,
-) -> Result<Json<Vec<OrganizationResponse>>, StatusCode> {
+    Query(params): Query<ListOrganizationsParams>,
+) -> Result<Json<ListOrganizationsResponse>, StatusCode> {
     debug!("Listing organizations for user: {}", user.0.id);
 
+    // Validate pagination parameters
+    if let Err((status, _)) =
+        crate::routes::common::validate_limit_offset(params.limit, params.offset)
+    {
+        return Err(status);
+    }
+
     let user_id = crate::conversions::authenticated_user_to_user_id(user);
+
+    // Get total count from repository
+    let total = match app_state
+        .db
+        .organizations
+        .count_organizations_by_user(user_id.0)
+        .await
+    {
+        Ok(count) => count,
+        Err(e) => {
+            error!("Failed to count organizations for user: {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
 
     match app_state
         .organization_service
@@ -44,11 +66,17 @@ pub async fn list_organizations(
     {
         Ok(organizations) => {
             debug!("Found {} organizations for user", organizations.len());
-            let response: Vec<OrganizationResponse> = organizations
+            let org_responses: Vec<OrganizationResponse> = organizations
                 .into_iter()
                 .map(crate::conversions::services_org_to_api_org)
                 .collect();
-            Ok(Json(response))
+
+            Ok(Json(ListOrganizationsResponse {
+                organizations: org_responses,
+                total,
+                limit: params.limit,
+                offset: params.offset,
+            }))
         }
         Err(e) => {
             error!("Failed to list organizations for user: {}", e);
@@ -59,15 +87,11 @@ pub async fn list_organizations(
 
 /// Query parameters for listing
 #[derive(Debug, Deserialize)]
-pub struct ListParams {
-    #[serde(default = "default_limit")]
+pub struct ListOrganizationsParams {
+    #[serde(default = "crate::routes::common::default_limit")]
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
-}
-
-fn default_limit() -> i64 {
-    20
 }
 
 /// Create a new organization
@@ -143,13 +167,13 @@ pub async fn create_organization(
             debug!("Invalid organization creation params: {}", msg);
             Err(StatusCode::BAD_REQUEST)
         }
+        Err(OrganizationError::AlreadyExists) => {
+            debug!("Organization already exists");
+            Err(StatusCode::CONFLICT)
+        }
         Err(e) => {
             error!("Failed to create organization: {}", e);
-            if e.to_string().contains("duplicate key") || e.to_string().contains("already exists") {
-                Err(StatusCode::CONFLICT)
-            } else {
-                Err(StatusCode::INTERNAL_SERVER_ERROR)
-            }
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }

@@ -89,7 +89,7 @@ pub struct ResponseRequest {
     pub instructions: Option<String>,
     pub conversation_id: Option<ConversationId>,
     pub previous_response_id: Option<ResponseId>,
-    pub max_output_tokens: Option<u32>,
+    pub max_output_tokens: Option<i64>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub user_id: UserId,

@@ -59,14 +59,10 @@ pub struct UsageHistoryResponse {
 /// Query parameters for usage history
 #[derive(Debug, Deserialize)]
 pub struct UsageHistoryQuery {
-    #[serde(default = "default_limit")]
+    #[serde(default = "crate::routes::common::default_limit")]
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
-}
-
-fn default_limit() -> i64 {
-    100
 }
 
 /// Get organization balance
@@ -240,6 +236,9 @@ pub async fn get_organization_usage_history(
         query.offset
     );
 
+    // Validate pagination parameters
+    crate::routes::common::validate_limit_offset(query.limit, query.offset)?;
+
     let organization_id = Uuid::parse_str(&org_id).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
@@ -252,7 +251,7 @@ pub async fn get_organization_usage_history(
 
     // TODO: Check if user has access to this organization
 
-    let history = app_state
+    let (history, total) = app_state
         .usage_service
         .get_usage_history(organization_id, Some(query.limit), Some(query.offset))
         .await
@@ -267,7 +266,6 @@ pub async fn get_organization_usage_history(
             )
         })?;
 
-    let total = history.len();
     let data = history
         .into_iter()
         .map(|entry| UsageHistoryEntryResponse {
@@ -287,7 +285,7 @@ pub async fn get_organization_usage_history(
 
     Ok(ResponseJson(UsageHistoryResponse {
         data,
-        total,
+        total: total as usize,
         limit: query.limit,
         offset: query.offset,
     }))
@@ -332,6 +330,9 @@ pub async fn get_api_key_usage_history(
         query.offset
     );
 
+    // Validate pagination parameters
+    crate::routes::common::validate_limit_offset(query.limit, query.offset)?;
+
     let workspace_uuid = Uuid::parse_str(&workspace_id).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
@@ -353,7 +354,7 @@ pub async fn get_api_key_usage_history(
     })?;
 
     // Get usage history with permission checking handled by the service
-    let history = app_state
+    let (history, total) = app_state
         .usage_service
         .get_api_key_usage_history_with_permissions(
             workspace_uuid,
@@ -390,7 +391,6 @@ pub async fn get_api_key_usage_history(
             }
         })?;
 
-    let total = history.len();
     let data = history
         .into_iter()
         .map(|entry| UsageHistoryEntryResponse {
@@ -410,7 +410,7 @@ pub async fn get_api_key_usage_history(
 
     Ok(ResponseJson(UsageHistoryResponse {
         data,
-        total,
+        total: total as usize,
         limit: query.limit,
         offset: query.offset,
     }))
@@ -418,7 +418,7 @@ pub async fn get_api_key_usage_history(
 
 /// Helper function to format amount (fixed scale 9 = nano-dollars, USD)
 fn format_amount(amount: i64) -> String {
-    const SCALE: i32 = 9;
+    const SCALE: i64 = 9;
     let divisor = 10_i64.pow(SCALE as u32);
     let whole = amount / divisor;
     let fraction = amount % divisor;

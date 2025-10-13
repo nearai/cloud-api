@@ -259,6 +259,25 @@ impl ApiKeyRepository {
         Ok(())
     }
 
+    /// Count API keys for a workspace
+    pub async fn count_by_workspace(&self, workspace_id: Uuid) -> Result<i64> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let row = client
+            .query_one(
+                "SELECT COUNT(*) as count FROM api_keys WHERE workspace_id = $1 AND is_active = true",
+                &[&workspace_id],
+            )
+            .await
+            .context("Failed to count API keys")?;
+
+        Ok(row.get::<_, i64>("count"))
+    }
+
     /// List API keys for a workspace with usage data
     /// This is the primary method to list API keys, using an efficient JOIN query
     pub async fn list_by_workspace_paginated(
@@ -344,7 +363,7 @@ impl ApiKeyRepository {
     }
 
     /// Delete expired API keys
-    pub async fn cleanup_expired(&self) -> Result<u64> {
+    pub async fn cleanup_expired(&self) -> Result<i64> {
         let client = self
             .pool
             .get()
@@ -356,7 +375,7 @@ impl ApiKeyRepository {
             &[],
         ).await.context("Failed to cleanup expired API keys")?;
 
-        Ok(rows_affected)
+        Ok(rows_affected as i64)
     }
 
     /// Get workspace info for an API key - used for auth resolution

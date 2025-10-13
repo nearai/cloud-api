@@ -33,29 +33,29 @@ pub async fn list_organizations(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<ListOrganizationsParams>,
-) -> Result<Json<ListOrganizationsResponse>, StatusCode> {
+) -> Result<Json<ListOrganizationsResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Listing organizations for user: {}", user.0.id);
 
-    // Validate pagination parameters
-    if let Err((status, _)) =
-        crate::routes::common::validate_limit_offset(params.limit, params.offset)
-    {
-        return Err(status);
-    }
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     let user_id = crate::conversions::authenticated_user_to_user_id(user);
 
-    // Get total count from repository
+    // Get total count from service
     let total = match app_state
-        .db
-        .organizations
-        .count_organizations_by_user(user_id.0)
+        .organization_service
+        .count_organizations_for_user(user_id.clone())
         .await
     {
         Ok(count) => count,
         Err(e) => {
             error!("Failed to count organizations for user: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to count organizations for user".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ));
         }
     };
 
@@ -80,7 +80,13 @@ pub async fn list_organizations(
         }
         Err(e) => {
             error!("Failed to list organizations for user: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to list organizations for user".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
         }
     }
 }

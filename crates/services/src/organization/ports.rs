@@ -325,6 +325,10 @@ pub trait OrganizationServiceTrait: Send + Sync {
         offset: i64,
     ) -> Result<Vec<Organization>, OrganizationError>;
 
+    /// Count organizations accessible to a user
+    async fn count_organizations_for_user(&self, user_id: UserId)
+        -> Result<i64, OrganizationError>;
+
     /// Add a member to an organization
     async fn add_member(
         &self,

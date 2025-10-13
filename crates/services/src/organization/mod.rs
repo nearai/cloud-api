@@ -1042,6 +1042,21 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
             .await
     }
 
+    async fn count_organizations_for_user(
+        &self,
+        user_id: UserId,
+    ) -> Result<i64, OrganizationError> {
+        self.repository
+            .count_organizations_by_user(user_id.0)
+            .await
+            .map_err(|e| {
+                OrganizationError::InternalError(format!(
+                    "Failed to count organizations for user: {}",
+                    e
+                ))
+            })
+    }
+
     async fn add_member(
         &self,
         organization_id: OrganizationId,

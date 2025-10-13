@@ -96,7 +96,7 @@ pub struct McpInitializeResult {
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum McpError {
     #[error("Connection timeout after {seconds}s")]
-    ConnectionTimeout { seconds: u64 },
+    ConnectionTimeout { seconds: i64 },
 
     #[error("Authentication failed: {reason}")]
     AuthenticationFailed { reason: String },

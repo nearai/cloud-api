@@ -97,8 +97,8 @@ impl ServerConfig {
 pub struct ModelDiscoveryConfig {
     pub discovery_server_url: String,
     pub api_key: Option<String>,
-    pub refresh_interval: u64, // seconds
-    pub timeout: u64,          // seconds
+    pub refresh_interval: i64, // seconds
+    pub timeout: i64,          // seconds
 }
 
 impl ModelDiscoveryConfig {

@@ -5,13 +5,15 @@ use crate::{
         services_member_with_user_to_api,
     },
     middleware::AuthenticatedUser,
-    models::{ErrorResponse, PublicOrganizationMemberResponse},
+    models::{ErrorResponse, ListOrganizationMembersResponse, PublicOrganizationMemberResponse},
     routes::api::AppState,
 };
 use axum::{
-    extract::{Extension, Json, Path, State},
+    extract::{Extension, Json, Path, Query, State},
     http::StatusCode,
+    response::Json as ResponseJson,
 };
+use serde::Deserialize;
 use services::organization::{OrganizationError, OrganizationId};
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -287,6 +289,15 @@ pub async fn remove_organization_member(
     }
 }
 
+/// Query parameters for listing organization members
+#[derive(Debug, Deserialize)]
+pub struct ListMembersParams {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
 /// List organization members with limited user information
 ///
 /// Returns limited user information for privacy and security:
@@ -297,10 +308,12 @@ pub async fn remove_organization_member(
     path = "/organizations/{org_id}/members",
     tag = "Organization Members",
     params(
-        ("org_id" = Uuid, Path, description = "Organization ID")
+        ("org_id" = Uuid, Path, description = "Organization ID"),
+        ("limit" = Option<i64>, Query, description = "Number of records to return (default: 100, max: 1000)"),
+        ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)")
     ),
     responses(
-        (status = 200, description = "List of organization members with public user information", body = Vec<crate::models::PublicOrganizationMemberResponse>),
+        (status = 200, description = "List of organization members with public user information", body = ListOrganizationMembersResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden - not a member of the organization", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
@@ -313,19 +326,42 @@ pub async fn list_organization_members(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
-) -> Result<Json<Vec<PublicOrganizationMemberResponse>>, StatusCode> {
+    Query(params): Query<ListMembersParams>,
+) -> Result<Json<ListOrganizationMembersResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     let user_id = user.0.id;
     debug!(
-        "Listing members for organization: {} for user: {}",
-        org_id, user_id
+        "Listing members for organization: {} for user: {} (limit: {}, offset: {})",
+        org_id, user_id, params.limit, params.offset
     );
+
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     let organization_id = OrganizationId(org_id);
     let requester_id = authenticated_user_to_user_id(user);
 
+    // Get total count from repository
+    let total = match app_state.db.organizations.get_member_count(org_id).await {
+        Ok(count) => count,
+        Err(e) => {
+            error!("Failed to count organization members: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to count organization members".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ));
+        }
+    };
+
     match app_state
         .organization_service
-        .get_members_with_users(organization_id, requester_id)
+        .get_members_with_users_paginated(
+            organization_id,
+            requester_id,
+            params.limit,
+            params.offset,
+        )
         .await
     {
         Ok(members) => {
@@ -335,24 +371,48 @@ pub async fn list_organization_members(
                 .collect();
 
             debug!(
-                "Returning {} members for organization {} with public access level",
+                "Returning {} members for organization {} with public access level (total: {})",
                 member_responses.len(),
                 org_id,
+                total
             );
 
-            Ok(Json(member_responses))
+            Ok(Json(ListOrganizationMembersResponse {
+                members: member_responses,
+                total,
+                limit: params.limit,
+                offset: params.offset,
+            }))
         }
         Err(OrganizationError::Unauthorized(_)) => {
             warn!(
                 "User {} attempted to access organization {} members without membership",
                 user_id, org_id
             );
-            Err(StatusCode::FORBIDDEN)
+            Err((
+                StatusCode::FORBIDDEN,
+                ResponseJson(ErrorResponse::new(
+                    "Forbidden".to_string(),
+                    "forbidden".to_string(),
+                )),
+            ))
         }
-        Err(OrganizationError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(OrganizationError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            ResponseJson(ErrorResponse::new(
+                "Not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
         Err(e) => {
             error!("Failed to list organization members: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to list organization members".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
         }
     }
 }

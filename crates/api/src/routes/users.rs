@@ -4,14 +4,14 @@ use crate::{
         services_user_to_api_user,
     },
     middleware::AuthenticatedUser,
-    models::{ApiKeyResponse, ErrorResponse},
+    models::ErrorResponse,
     routes::api::AppState,
 };
 use axum::{
     extract::{Extension, Json, Path, State},
     http::StatusCode,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use services::{organization::OrganizationError, user::UserServiceError};
 use tracing::{debug, error};
 use utoipa::ToSchema;
@@ -29,18 +29,6 @@ fn services_session_to_api_session(
         ip_address: session.ip_address.clone(),
         user_agent: session.user_agent.clone(),
     }
-}
-
-/// Query parameters for searching users
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct SearchParams {
-    pub q: String,
-    #[serde(default = "default_limit")]
-    pub limit: i64,
-}
-
-fn default_limit() -> i64 {
-    20
 }
 
 /// User profile update request
@@ -564,98 +552,4 @@ pub async fn accept_invitation_by_token(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
-}
-
-// ============================================
-// Temporary Quick Setup Endpoint
-// ============================================
-
-/// Response from quick setup containing all created resources
-#[derive(Debug, Serialize, ToSchema)]
-pub struct QuickSetupResponse {
-    pub organization_id: String,
-    pub organization_name: String,
-    pub workspace_id: String,
-    pub workspace_name: String,
-    pub api_key: ApiKeyResponse,
-}
-
-/// Quick setup: Create organization, workspace, and API key in one call (Temporary)
-///
-/// This is a temporary convenience endpoint that creates an organization, a workspace
-/// within that organization, and an API key for that workspace in a single call.
-/// Returns the API key which can be used immediately for API access.
-///
-/// The organization name is automatically derived from the authenticated user's email
-/// (e.g., "alice@example.com" becomes "alice-org"). This endpoint is designed for clients
-/// who want to hide organizational complexity from their users.
-#[utoipa::path(
-    post,
-    path = "/users/me/quick-setup",
-    tag = "Users",
-    responses(
-        (status = 201, description = "Setup completed successfully", body = QuickSetupResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 409, description = "Organization already exists for this user", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    ),
-    security(
-        ("session_token" = [])
-    )
-)]
-pub async fn quick_setup(
-    State(app_state): State<AppState>,
-    Extension(user): Extension<AuthenticatedUser>,
-) -> Result<(StatusCode, Json<QuickSetupResponse>), (StatusCode, Json<ErrorResponse>)> {
-    debug!("Quick setup for user: {}", user.0.id);
-
-    let user_id = authenticated_user_to_user_id(user);
-
-    // Call the user service to perform quick setup
-    let result = app_state
-        .user_service
-        .quick_setup(user_id)
-        .await
-        .map_err(|e| {
-            error!("Quick setup failed: {}", e);
-            match e {
-                UserServiceError::UserNotFound => (
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse::new(
-                        "User not found".to_string(),
-                        "user_not_found".to_string(),
-                    )),
-                ),
-                UserServiceError::OrganizationAlreadyExists => (
-                    StatusCode::CONFLICT,
-                    Json(ErrorResponse::new(
-                        "Organization already exists for this user".to_string(),
-                        "conflict".to_string(),
-                    )),
-                ),
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse::new(
-                        "Failed to complete quick setup".to_string(),
-                        "internal_error".to_string(),
-                    )),
-                ),
-            }
-        })?;
-
-    debug!(
-        "Quick setup completed: org={}, workspace={}, api_key={:?}",
-        result.organization.id.0, result.workspace.id.0, result.api_key.id
-    );
-
-    // Format response
-    let response = QuickSetupResponse {
-        organization_id: result.organization.id.0.to_string(),
-        organization_name: result.organization.name,
-        workspace_id: result.workspace.id.0.to_string(),
-        workspace_name: result.workspace.name,
-        api_key: crate::conversions::workspace_api_key_to_api_response(result.api_key),
-    };
-
-    Ok((StatusCode::CREATED, Json(response)))
 }

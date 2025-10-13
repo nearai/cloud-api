@@ -20,20 +20,10 @@ pub struct ModelsAppState {
 /// Query parameters for model listing
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ModelListQuery {
-    /// Page number (1-based)
-    #[serde(default = "default_page")]
-    pub page: usize,
-    /// Number of models per page
-    #[serde(default = "default_page_size")]
-    pub page_size: usize,
-}
-
-fn default_page() -> usize {
-    1
-}
-
-fn default_page_size() -> usize {
-    12
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
 }
 
 /// List all models with pricing information
@@ -55,14 +45,17 @@ pub async fn list_models(
     Query(query): Query<ModelListQuery>,
 ) -> Result<ResponseJson<ModelListResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
-        "Model list request: page={}, page_size={}",
-        query.page, query.page_size
+        "Model list request: limit={}, offset={}",
+        query.limit, query.offset
     );
 
+    // Validate pagination parameters
+    crate::routes::common::validate_limit_offset(query.limit, query.offset)?;
+
     // Get all models from the service
-    let models = app_state
+    let (models, total) = app_state
         .models_service
-        .get_models_with_pricing()
+        .get_models_with_pricing(query.limit, query.offset)
         .await
         .map_err(|e| {
             error!("Failed to get models: {}", e);
@@ -75,21 +68,8 @@ pub async fn list_models(
             )
         })?;
 
-    let total_models = models.len();
-    let total_pages = total_models.div_ceil(query.page_size);
-
-    // Handle pagination
-    let start_index = (query.page.saturating_sub(1)) * query.page_size;
-    let end_index = std::cmp::min(start_index + query.page_size, total_models);
-
-    let paginated_models = if start_index < total_models {
-        &models[start_index..end_index]
-    } else {
-        &[]
-    };
-
     // Convert to API models
-    let api_models: Vec<ModelWithPricing> = paginated_models
+    let api_models: Vec<ModelWithPricing> = models
         .iter()
         .map(|model| ModelWithPricing {
             model_id: model.model_name.clone(),
@@ -115,10 +95,9 @@ pub async fn list_models(
 
     let response = ModelListResponse {
         models: api_models,
-        total_models,
-        page: query.page,
-        page_size: query.page_size,
-        total_pages: if total_pages == 0 { 1 } else { total_pages },
+        total,
+        limit: query.limit,
+        offset: query.offset,
     };
 
     Ok(ResponseJson(response))
@@ -149,20 +128,6 @@ pub async fn get_model_by_name(
     Path(model_name): Path<String>,
 ) -> Result<ResponseJson<ModelWithPricing>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!("Get model request for: {}", model_name);
-
-    // Log available models for debugging
-    match app_state.models_service.get_models_with_pricing().await {
-        Ok(all_models) => {
-            debug!(
-                "Available models in database ({}): {:?}",
-                all_models.len(),
-                all_models.iter().map(|m| &m.model_name).collect::<Vec<_>>()
-            );
-        }
-        Err(e) => {
-            debug!("Failed to fetch all models for debugging: {}", e);
-        }
-    }
 
     // Get the model from the service
     let model = app_state

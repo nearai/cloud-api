@@ -82,6 +82,9 @@ pub enum WorkspaceError {
     #[error("Invalid parameters: {0}")]
     InvalidParams(String),
 
+    #[error("Workspace already exists")]
+    AlreadyExists,
+
     #[error("Internal error: {0}")]
     InternalError(String),
 

@@ -153,8 +153,6 @@ impl ConversationService {
         user_id: &UserId,
         limit: i64,
     ) -> Result<Vec<ports::ConversationMessage>, ports::ConversationError> {
-        let limit = limit;
-
         // Get responses for this conversation
         let responses = self
             .resp_repo

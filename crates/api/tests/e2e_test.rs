@@ -2185,17 +2185,16 @@ async fn test_high_context_streaming() {
                     break;
                 }
 
-                if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
-                    if let StreamChunk::Chat(chat_chunk) = chunk {
-                        if let Some(choice) = chat_chunk.choices.first() {
-                            if let Some(delta) = &choice.delta {
-                                if let Some(delta_content) = &delta.content {
-                                    content.push_str(delta_content.as_str());
-                                }
+                if let Ok(StreamChunk::Chat(chat_chunk)) = serde_json::from_str::<StreamChunk>(data)
+                {
+                    if let Some(choice) = chat_chunk.choices.first() {
+                        if let Some(delta) = &choice.delta {
+                            if let Some(delta_content) = &delta.content {
+                                content.push_str(delta_content.as_str());
+                            }
 
-                                if choice.finish_reason.is_some() || chat_chunk.usage.is_some() {
-                                    final_chunk = Some(chat_chunk.clone());
-                                }
+                            if choice.finish_reason.is_some() || chat_chunk.usage.is_some() {
+                                final_chunk = Some(chat_chunk.clone());
                             }
                         }
                     }

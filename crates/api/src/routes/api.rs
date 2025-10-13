@@ -4,7 +4,6 @@ use axum::{
     routing::{delete, get, put},
     Router,
 };
-use database::Database;
 use services::{
     attestation::ports::AttestationServiceTrait, auth::AuthServiceTrait,
     completions::CompletionServiceTrait, mcp::McpClientManager, models::ModelsServiceTrait,
@@ -15,7 +14,6 @@ use std::sync::Arc;
 /// Application state shared across all route handlers
 #[derive(Clone)]
 pub struct AppState {
-    pub db: Arc<Database>, // Still need DB for now, other routes depend on it
     pub organization_service: Arc<dyn OrganizationServiceTrait + Send + Sync>,
     pub workspace_service: Arc<dyn WorkspaceServiceTrait + Send + Sync>,
     pub mcp_manager: Arc<McpClientManager>,

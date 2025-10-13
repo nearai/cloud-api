@@ -563,6 +563,28 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
             .await?;
         Ok(db_apikey_to_workspace_service(None, db_api_key))
     }
+
+    async fn count_by_workspace(
+        &self,
+        workspace_id: services::workspace::WorkspaceId,
+    ) -> anyhow::Result<i64> {
+        self.count_by_workspace(workspace_id.0).await
+    }
+
+    async fn check_name_duplication(
+        &self,
+        workspace_id: services::workspace::WorkspaceId,
+        name: &str,
+    ) -> anyhow::Result<bool> {
+        let count = self
+            .count_duplication(&workspace_id.0, &name.to_string())
+            .await?;
+        Ok(count > 0)
+    }
+
+    async fn revoke(&self, id: services::workspace::ApiKeyId) -> anyhow::Result<bool> {
+        self.revoke(Uuid::parse_str(&id.0)?).await
+    }
 }
 
 // Conversion function for workspace service

@@ -115,6 +115,43 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .map_err(|e| WorkspaceError::InternalError(format!("Failed to list workspaces: {}", e)))
     }
 
+    async fn list_workspaces_for_organization_paginated(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Workspace>, WorkspaceError> {
+        // Check if user is a member of the organization
+        let is_member = self
+            .organization_service
+            .is_member(organization_id.clone(), requester_id)
+            .await
+            .map_err(|e| {
+                WorkspaceError::InternalError(format!(
+                    "Failed to check organization membership: {}",
+                    e
+                ))
+            })?;
+
+        if !is_member {
+            return Err(WorkspaceError::Unauthorized(
+                "User is not a member of this organization".to_string(),
+            ));
+        }
+
+        // List workspaces with pagination
+        self.workspace_repository
+            .list_by_organization_paginated(organization_id, limit, offset)
+            .await
+            .map_err(|e| {
+                WorkspaceError::InternalError(format!(
+                    "Failed to list workspaces with pagination: {}",
+                    e
+                ))
+            })
+    }
+
     async fn create_workspace(
         &self,
         name: String,
@@ -343,5 +380,144 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             Err(WorkspaceError::NotFound) => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    async fn update_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        requester_id: UserId,
+        display_name: Option<String>,
+        description: Option<String>,
+        settings: Option<serde_json::Value>,
+    ) -> Result<Workspace, WorkspaceError> {
+        // Check permissions
+        self.check_workspace_permission(workspace_id.clone(), requester_id)
+            .await?;
+
+        // Update the workspace
+        self.workspace_repository
+            .update(workspace_id, display_name, description, settings)
+            .await
+            .map_err(|e| {
+                WorkspaceError::InternalError(format!("Failed to update workspace: {}", e))
+            })?
+            .ok_or(WorkspaceError::NotFound)
+    }
+
+    async fn delete_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        requester_id: UserId,
+    ) -> Result<bool, WorkspaceError> {
+        // Check permissions
+        self.check_workspace_permission(workspace_id.clone(), requester_id)
+            .await?;
+
+        // Delete the workspace
+        self.workspace_repository
+            .delete(workspace_id)
+            .await
+            .map_err(|e| {
+                WorkspaceError::InternalError(format!("Failed to delete workspace: {}", e))
+            })
+    }
+
+    async fn count_workspaces_by_organization(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+    ) -> Result<i64, WorkspaceError> {
+        // Check if user is a member of the organization
+        let is_member = self
+            .organization_service
+            .is_member(organization_id.clone(), requester_id)
+            .await
+            .map_err(|e| {
+                WorkspaceError::InternalError(format!(
+                    "Failed to check organization membership: {}",
+                    e
+                ))
+            })?;
+
+        if !is_member {
+            return Err(WorkspaceError::Unauthorized(
+                "User is not a member of this organization".to_string(),
+            ));
+        }
+
+        // Count workspaces
+        self.workspace_repository
+            .count_by_organization(organization_id)
+            .await
+            .map_err(|e| {
+                WorkspaceError::InternalError(format!("Failed to count workspaces: {}", e))
+            })
+    }
+
+    async fn count_api_keys_by_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        requester_id: UserId,
+    ) -> Result<i64, WorkspaceError> {
+        // Check permissions
+        self.check_workspace_permission(workspace_id.clone(), requester_id)
+            .await?;
+
+        // Count API keys
+        self.api_key_repository
+            .count_by_workspace(workspace_id)
+            .await
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to count API keys: {}", e)))
+    }
+
+    async fn check_api_key_name_duplication(
+        &self,
+        workspace_id: WorkspaceId,
+        name: &str,
+        requester_id: UserId,
+    ) -> Result<bool, WorkspaceError> {
+        // Check permissions
+        self.check_workspace_permission(workspace_id.clone(), requester_id)
+            .await?;
+
+        // Check for duplication
+        self.api_key_repository
+            .check_name_duplication(workspace_id, name)
+            .await
+            .map_err(|e| {
+                WorkspaceError::InternalError(format!(
+                    "Failed to check API key name duplication: {}",
+                    e
+                ))
+            })
+    }
+
+    async fn revoke_api_key(
+        &self,
+        workspace_id: WorkspaceId,
+        api_key_id: ApiKeyId,
+        requester_id: UserId,
+    ) -> Result<bool, WorkspaceError> {
+        // Check permissions
+        self.check_workspace_permission(workspace_id.clone(), requester_id)
+            .await?;
+
+        // Verify the API key belongs to this workspace
+        let api_key = self
+            .api_key_repository
+            .get_by_id(api_key_id.clone())
+            .await
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get API key: {}", e)))?
+            .ok_or(WorkspaceError::ApiKeyNotFound)?;
+
+        if api_key.workspace_id.0 != workspace_id.0 {
+            return Err(WorkspaceError::ApiKeyNotFound);
+        }
+
+        // Revoke the API key
+        self.api_key_repository
+            .revoke(api_key_id)
+            .await
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to revoke API key: {}", e)))
     }
 }

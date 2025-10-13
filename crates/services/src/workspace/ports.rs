@@ -62,7 +62,7 @@ pub struct ApiKey {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CreateApiKeyRequest {
-    pub name: Option<String>,
+    pub name: String,
     pub workspace_id: WorkspaceId,
     pub created_by_user_id: UserId,
     pub expires_at: Option<DateTime<Utc>>,

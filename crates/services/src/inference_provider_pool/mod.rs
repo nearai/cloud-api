@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use inference_providers::{
     models::{CompletionError, ListModelsError, ModelsResponse, StreamChunk},
-    AttestationReport, ChatCompletionParams, ChatSignature, CompletionParams, InferenceProvider,
-    StreamingResult, StreamingResultExt, VLlmConfig, VLlmProvider,
+    ChatCompletionParams, ChatSignature, CompletionParams, InferenceProvider, StreamingResult,
+    StreamingResultExt, VLlmConfig, VLlmProvider, VllmAttestationReport,
 };
 use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
@@ -218,6 +218,14 @@ impl InferenceProviderPool {
         })
     }
 
+    async fn get_providers_for_model(
+        &self,
+        model_id: &str,
+    ) -> Option<Vec<Arc<InferenceProviderTrait>>> {
+        let model_mapping = self.model_mapping.read().await;
+        model_mapping.get(model_id).cloned()
+    }
+
     /// Get the next provider for a model using round-robin load balancing
     async fn get_next_provider_for_model(
         &self,
@@ -312,14 +320,25 @@ impl InferenceProvider for InferenceProviderPool {
         &self,
         model: String,
         signing_algo: Option<String>,
-    ) -> Result<AttestationReport, CompletionError> {
+    ) -> Result<Vec<VllmAttestationReport>, CompletionError> {
         // Get the first provider for this model
-        if let Some(provider) = self.get_next_provider_for_model(&model).await {
-            return provider.get_attestation_report(model, signing_algo).await;
+        let mut attestations = vec![];
+        if let Some(providers) = self.get_providers_for_model(&model).await {
+            for provider in providers {
+                attestations.extend(
+                    provider
+                        .get_attestation_report(model.clone(), signing_algo.clone())
+                        .await?,
+                );
+            }
         }
-        Err(CompletionError::CompletionError(
-            "No provider found that supports attestation reports".to_string(),
-        ))
+        if attestations.is_empty() {
+            return Err(CompletionError::CompletionError(format!(
+                "No provider found that supports attestation reports for model: {}",
+                model
+            )));
+        }
+        Ok(attestations)
     }
 
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {

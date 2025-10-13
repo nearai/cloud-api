@@ -9,7 +9,7 @@ use crate::{
     openapi::ApiDoc,
     routes::{
         api::{build_management_router, AppState},
-        attestation::{get_attestation_report, get_signature, quote},
+        attestation::{get_attestation_report, get_signature},
         auth::{
             current_user, github_login, google_login, login_page, logout, oauth_callback,
             StateStore,
@@ -597,7 +597,6 @@ pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &Aut
     Router::new()
         .route("/signature/{chat_id}", get(get_signature))
         .route("/attestation/report", get(get_attestation_report))
-        .route("/attestation/quote", get(quote))
         .with_state(app_state)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),

@@ -4,10 +4,13 @@ pub use models::{AttestationError, ChatSignature};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use inference_providers::{AttestationReport, InferenceProvider};
+use inference_providers::InferenceProvider;
 
 use crate::{
-    attestation::{models::GetQuoteResponse, ports::AttestationRepository},
+    attestation::{
+        models::{AttestationReport, DstackCpuQuote},
+        ports::AttestationRepository,
+    },
     inference_provider_pool::InferenceProviderPool,
     models::ModelsRepository,
 };
@@ -84,39 +87,61 @@ impl ports::AttestationServiceTrait for AttestationService {
 
     async fn get_attestation_report(
         &self,
-        model: String,
+        model: Option<String>,
         signing_algo: Option<String>,
     ) -> Result<AttestationReport, AttestationError> {
         // Resolve model name (could be an alias) to canonical name
-        let canonical_name = self
-            .models_repository
-            .resolve_to_canonical_name(&model)
-            .await
-            .map_err(|e| {
-                AttestationError::ProviderError(format!("Failed to resolve model name: {}", e))
-            })?;
+        let mut proxy_attestations = vec![];
+        if let Some(model) = model {
+            let canonical_name = self
+                .models_repository
+                .resolve_to_canonical_name(&model)
+                .await
+                .map_err(|e| {
+                    AttestationError::ProviderError(format!("Failed to resolve model name: {}", e))
+                })?;
 
-        // Log if we resolved an alias
-        if canonical_name != model {
-            tracing::debug!(
-                requested_model = %model,
-                canonical_model = %canonical_name,
-                "Resolved alias to canonical model name for attestation report"
-            );
+            // Log if we resolved an alias
+            if canonical_name != model {
+                tracing::debug!(
+                    requested_model = %model,
+                    canonical_model = %canonical_name,
+                    "Resolved alias to canonical model name for attestation report"
+                );
+            }
+
+            proxy_attestations = self
+                .inference_provider_pool
+                .get_attestation_report(canonical_name, signing_algo)
+                .await
+                .map_err(|e| AttestationError::ProviderError(e.to_string()))?;
+        }
+        let cloud_api_attestation;
+        if let Ok(_dev) = std::env::var("DEV") {
+            cloud_api_attestation = DstackCpuQuote {
+                quote: "0x1234567890abcdef".to_string(),
+                event_log: "0x1234567890abcdef".to_string(),
+            };
+        } else {
+            let client = dstack_client::DstackClient::new(None);
+            cloud_api_attestation = client
+                .get_quote(vec![8])
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        "Failed to get cloud API attestation, are you running in a CVM? {:?}",
+                        e
+                    );
+                    AttestationError::InternalError(
+                        "failed to get cloud API attestation".to_string(),
+                    )
+                })?
+                .into();
         }
 
-        self.inference_provider_pool
-            .get_attestation_report(canonical_name, signing_algo)
-            .await
-            .map_err(|e| AttestationError::ProviderError(e.to_string()))
-    }
-
-    async fn get_quote(&self) -> Result<GetQuoteResponse, AttestationError> {
-        let client = dstack_client::DstackClient::new(None);
-        let quote = client
-            .get_quote(vec![])
-            .await
-            .map_err(|e| AttestationError::ClientError(e.to_string()))?;
-        Ok(GetQuoteResponse::from(quote))
+        Ok(AttestationReport {
+            cloud_api_attestation: cloud_api_attestation.into(),
+            vllm_proxy_attestations: proxy_attestations,
+        })
     }
 }

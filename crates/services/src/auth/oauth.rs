@@ -297,7 +297,7 @@ impl OAuthManager {
 
 #[derive(Deserialize)]
 struct GitHubUser {
-    id: u64,
+    id: i64,
     email: Option<String>,
     #[serde(default)]
     login: String,

@@ -6,7 +6,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
     /// The Unix timestamp (in seconds) when the model was created
-    pub created: u64,
+    pub created: i64,
     /// The model identifier, which can be referenced in the API endpoints
     pub id: String,
     /// The object type, which is always "model"
@@ -47,8 +47,15 @@ pub enum ModelsError {
 /// Repository trait for accessing model data
 #[async_trait]
 pub trait ModelsRepository: Send + Sync {
+    /// Get all active models count
+    async fn get_all_active_models_count(&self) -> Result<i64, anyhow::Error>;
+
     /// Get all active models with pricing
-    async fn get_all_active_models(&self) -> Result<Vec<ModelWithPricing>, anyhow::Error>;
+    async fn get_all_active_models(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ModelWithPricing>, anyhow::Error>;
 
     /// Get a specific model by name
     async fn get_model_by_name(
@@ -68,7 +75,11 @@ pub trait ModelsServiceTrait: Send + Sync {
     async fn get_models(&self) -> Result<Vec<ModelInfo>, ModelsError>;
 
     /// Get models with pricing and metadata (from database)
-    async fn get_models_with_pricing(&self) -> Result<Vec<ModelWithPricing>, ModelsError>;
+    async fn get_models_with_pricing(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<ModelWithPricing>, i64), ModelsError>;
 
     /// Get a specific model by name
     async fn get_model_by_name(&self, model_name: &str) -> Result<ModelWithPricing, ModelsError>;

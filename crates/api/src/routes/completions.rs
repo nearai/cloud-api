@@ -468,6 +468,7 @@ pub async fn completions(
 /// List available models
 ///
 /// Lists all available AI models that can be used for completions.
+/// No pagination to follow the OpenAI API spec
 #[utoipa::path(
     get,
     path = "/models",

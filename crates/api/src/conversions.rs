@@ -157,13 +157,13 @@ pub fn generate_completion_id() -> String {
     format!("{:x}", hasher.finish())
 }
 
-pub fn current_unix_timestamp() -> u64 {
+pub fn current_unix_timestamp() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_secs()
+        .as_secs() as i64
 }
 
 // User-related conversions helper functions

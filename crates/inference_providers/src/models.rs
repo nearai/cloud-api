@@ -130,11 +130,11 @@ pub struct ChatCompletionParams {
 
     /// Maximum number of completion tokens to generate
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_completion_tokens: Option<u32>,
+    pub max_completion_tokens: Option<i64>,
 
     /// Legacy parameter - use max_completion_tokens instead
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
+    pub max_tokens: Option<i64>,
 
     /// Sampling temperature between 0 and 2
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -146,7 +146,7 @@ pub struct ChatCompletionParams {
 
     /// Number of chat completion choices to generate
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub n: Option<u32>,
+    pub n: Option<i64>,
 
     /// Whether to stream back partial progress
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -174,7 +174,7 @@ pub struct ChatCompletionParams {
 
     /// Number of most likely tokens to return at each position
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_logprobs: Option<u32>,
+    pub top_logprobs: Option<i64>,
 
     /// Unique identifier for the end-user
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -186,7 +186,7 @@ pub struct ChatCompletionParams {
 
     /// Random seed for deterministic sampling
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub seed: Option<u32>,
+    pub seed: Option<i64>,
 
     /// Tools that the model may call
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -224,7 +224,7 @@ pub struct CompletionParams {
 
     /// Maximum number of tokens to generate
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
+    pub max_tokens: Option<i64>,
 
     /// Sampling temperature (0-2)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -236,7 +236,7 @@ pub struct CompletionParams {
 
     /// Number of completions to generate
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub n: Option<u32>,
+    pub n: Option<i64>,
 
     /// Whether to stream partial progress
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -260,7 +260,7 @@ pub struct CompletionParams {
 
     /// Include log probabilities for N most likely tokens
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub logprobs: Option<u32>,
+    pub logprobs: Option<i64>,
 
     /// Echo the prompt in the completion
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -268,11 +268,11 @@ pub struct CompletionParams {
 
     /// Generate best_of completions server-side
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub best_of: Option<u32>,
+    pub best_of: Option<i64>,
 
     /// Random seed for deterministic sampling
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub seed: Option<u32>,
+    pub seed: Option<i64>,
 
     /// Unique identifier for end-user
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -297,13 +297,13 @@ pub enum FinishReason {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsage {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-    pub total_tokens: u32,
+    pub prompt_tokens: i32,
+    pub completion_tokens: i32,
+    pub total_tokens: i32,
 }
 
 impl TokenUsage {
-    pub fn new(prompt_tokens: u32, completion_tokens: u32) -> Self {
+    pub fn new(prompt_tokens: i32, completion_tokens: i32) -> Self {
         Self {
             prompt_tokens,
             completion_tokens,
@@ -324,7 +324,7 @@ pub struct ChatCompletionChunk {
     pub object: String,
 
     /// Unix timestamp of when the chunk was created
-    pub created: u64,
+    pub created: i64,
 
     /// Model used for the completion
     pub model: String,
@@ -353,7 +353,7 @@ pub struct CompletionChunk {
     pub object: String,
 
     /// Unix timestamp of when the chunk was created
-    pub created: u64,
+    pub created: i64,
 
     /// Model used for the completion
     pub model: String,
@@ -374,7 +374,7 @@ pub struct CompletionChunk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatChoice {
     /// Choice index
-    pub index: u32,
+    pub index: i64,
 
     /// Incremental message delta
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -393,7 +393,7 @@ pub struct ChatChoice {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextChoice {
     /// Choice index
-    pub index: u32,
+    pub index: i64,
 
     /// Generated text content
     pub text: String,
@@ -425,7 +425,7 @@ pub struct TextLogProbs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_logprobs: Option<Vec<serde_json::Map<String, serde_json::Value>>>,
     /// Text offsets for each token
-    pub text_offset: Vec<u32>,
+    pub text_offset: Vec<i64>,
 }
 
 /// Log probability information for a single token
@@ -468,7 +468,7 @@ pub enum StreamChunk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
     /// The Unix timestamp (in seconds) when the model was created
-    pub created: u64,
+    pub created: i64,
     /// The model identifier, which can be referenced in the API endpoints
     pub id: String,
     /// The object type, which is always "model"

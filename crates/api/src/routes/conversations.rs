@@ -315,8 +315,8 @@ pub async fn delete_conversation(
     tag = "Conversations",
     params(
         ("conversation_id" = String, Path, description = "Conversation ID"),
-        ("limit" = Option<i32>, Query, description = "Maximum number of items to return"),
-        ("offset" = Option<i32>, Query, description = "Number of items to skip")
+        ("limit" = Option<i64>, Query, description = "Maximum number of items to return"),
+        ("offset" = Option<i64>, Query, description = "Number of items to skip")
     ),
     responses(
         (status = 200, description = "List of conversation items", body = ConversationItemList),
@@ -339,6 +339,9 @@ pub async fn list_conversation_items(
         "List items in conversation {} for user {}",
         conversation_id, api_key.created_by_user_id.0
     );
+
+    // Validate pagination parameters
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
         Ok(id) => id,
@@ -396,7 +399,7 @@ fn convert_domain_conversation_to_http(
     ConversationObject {
         id: domain_conversation.id.to_string(),
         object: "conversation".to_string(),
-        created_at: domain_conversation.created_at.timestamp() as u64,
+        created_at: domain_conversation.created_at.timestamp(),
         metadata: domain_conversation.metadata,
     }
 }
@@ -425,7 +428,10 @@ impl From<ConversationError> for ErrorResponse {
 // Query parameter structs
 #[derive(Debug, Deserialize)]
 pub struct ListItemsQuery {
-    pub limit: Option<i32>,
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
     pub order: Option<String>, // "asc" or "desc"
     pub after: Option<String>,
     pub include: Option<Vec<String>>,

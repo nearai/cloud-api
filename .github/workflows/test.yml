@@ -58,20 +58,24 @@ jobs:
     - name: Run unit tests
       run: cargo test --lib --bins
       env:
-        TEST_DB_HOST: localhost
-        TEST_DB_PORT: 5432
-        TEST_DB_NAME: platform_api
-        TEST_DB_USER: postgres
-        TEST_DB_PASSWORD: postgres
+        DATABASE_HOST: localhost
+        DATABASE_PORT: 5432
+        DATABASE_NAME: platform_api
+        DATABASE_USERNAME: postgres
+        DATABASE_PASSWORD: postgres
+        DATABASE_MAX_CONNECTIONS: 5
+        DATABASE_TLS_ENABLED: "false"
 
     - name: Run integration tests
       run: cargo test --test e2e_test
       env:
-        TEST_DB_HOST: localhost
-        TEST_DB_PORT: 5432
-        TEST_DB_NAME: platform_api
-        TEST_DB_USER: postgres
-        TEST_DB_PASSWORD: postgres
+        DATABASE_HOST: localhost
+        DATABASE_PORT: 5432
+        DATABASE_NAME: platform_api
+        DATABASE_USERNAME: postgres
+        DATABASE_PASSWORD: postgres
+        DATABASE_MAX_CONNECTIONS: 5
+        DATABASE_TLS_ENABLED: "false"
         RUST_LOG: debug
 
     - name: Build release

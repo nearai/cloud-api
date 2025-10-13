@@ -9,7 +9,7 @@ use crate::{
     openapi::ApiDoc,
     routes::{
         api::{build_management_router, AppState},
-        attestation::{get_attestation_report, get_signature, quote, verify_attestation},
+        attestation::{get_attestation_report, get_signature, quote},
         auth::{
             current_user, github_login, google_login, login_page, logout, oauth_callback,
             StateStore,
@@ -83,23 +83,6 @@ pub async fn init_database(db_config: &config::DatabaseConfig) -> Arc<Database> 
         .await
         .expect("Failed to run database migrations");
     tracing::info!("Database migrations completed.");
-
-    database
-}
-
-/// Initialize database with custom config for testing
-pub async fn init_database_with_config(db_config: &config::DatabaseConfig) -> Arc<Database> {
-    let database = Arc::new(
-        Database::from_config(db_config)
-            .await
-            .expect("Failed to connect to database"),
-    );
-
-    // Run database migrations
-    database
-        .run_migrations()
-        .await
-        .expect("Failed to run database migrations");
 
     database
 }
@@ -302,19 +285,9 @@ pub async fn init_domain_services(
     let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
         as Arc<dyn services::auth::SessionRepository>;
 
-    // Create workspace repository for user service
-    let workspace_repository_for_user = Arc::new(database::repositories::WorkspaceRepository::new(
-        database.pool().clone(),
-    )) as Arc<dyn services::workspace::WorkspaceRepository>;
-
-    // Create user service (needs organization_service and workspace_service for quick_setup)
-    let user_service = Arc::new(services::user::UserService::new(
-        user_repo,
-        session_repo,
-        organization_service.clone(),
-        workspace_repository_for_user,
-        workspace_service.clone(),
-    )) as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
+    // Create user service
+    let user_service = Arc::new(services::user::UserService::new(user_repo, session_repo))
+        as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
 
     DomainServices {
         conversation_service,
@@ -355,7 +328,7 @@ pub async fn init_inference_providers(
 
     // Start periodic refresh task
     let pool_clone = pool.clone();
-    let refresh_interval = config.model_discovery.refresh_interval;
+    let refresh_interval = config.model_discovery.refresh_interval as u64;
 
     tokio::spawn(async move {
         let mut interval =
@@ -624,7 +597,6 @@ pub fn build_conversation_routes(
 pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
     Router::new()
         .route("/signature/{chat_id}", get(get_signature))
-        .route("/verify/{chat_id}", post(verify_attestation))
         .route("/attestation/report", get(get_attestation_report))
         .route("/attestation/quote", get(quote))
         .with_state(app_state)
@@ -689,8 +661,8 @@ pub fn build_model_routes(models_service: Arc<dyn ModelsServiceTrait>) -> Router
 pub fn build_admin_routes(database: Arc<Database>, auth_state_middleware: &AuthState) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
-        batch_upsert_models, delete_model, get_model_pricing_history, list_users,
-        update_organization_limits, AdminAppState,
+        batch_upsert_models, delete_model, get_model_pricing_history,
+        get_organization_limits_history, list_users, update_organization_limits, AdminAppState,
     };
     use database::repositories::AdminCompositeRepository;
     use services::admin::AdminServiceImpl;
@@ -718,6 +690,10 @@ pub fn build_admin_routes(database: Arc<Database>, auth_state_middleware: &AuthS
         .route(
             "/admin/organizations/{org_id}/limits",
             axum::routing::patch(update_organization_limits),
+        )
+        .route(
+            "/admin/organizations/{organization_id}/limits/history",
+            axum::routing::get(get_organization_limits_history),
         )
         .route("/admin/users", axum::routing::get(list_users))
         .with_state(admin_app_state)
@@ -982,7 +958,7 @@ mod tests {
         };
 
         // Initialize database with custom config
-        let database = init_database_with_config(&db_config).await;
+        let database = init_database(&db_config).await;
 
         // Create a test configuration
         let config = ApiConfig {

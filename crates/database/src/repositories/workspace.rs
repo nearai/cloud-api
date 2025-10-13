@@ -408,6 +408,21 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
             .collect())
     }
 
+    async fn list_by_organization_paginated(
+        &self,
+        organization_id: services::organization::OrganizationId,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<services::workspace::Workspace>> {
+        let workspaces = self
+            .list_by_organization_paginated(organization_id.0, limit, offset)
+            .await?;
+        Ok(workspaces
+            .into_iter()
+            .map(db_workspace_to_workspace_service)
+            .collect())
+    }
+
     async fn create(
         &self,
         name: String,
@@ -425,6 +440,35 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
             .create(request, organization_id.0, created_by_user_id.0)
             .await?;
         Ok(db_workspace_to_workspace_service(db_workspace))
+    }
+
+    async fn update(
+        &self,
+        workspace_id: services::workspace::WorkspaceId,
+        display_name: Option<String>,
+        description: Option<String>,
+        settings: Option<serde_json::Value>,
+    ) -> anyhow::Result<Option<services::workspace::Workspace>> {
+        let request = crate::models::UpdateWorkspaceRequest {
+            display_name,
+            description,
+            settings,
+        };
+        match self.update(workspace_id.0, request).await? {
+            Some(db_workspace) => Ok(Some(db_workspace_to_workspace_service(db_workspace))),
+            None => Ok(None),
+        }
+    }
+
+    async fn delete(&self, workspace_id: services::workspace::WorkspaceId) -> anyhow::Result<bool> {
+        self.delete(workspace_id.0).await
+    }
+
+    async fn count_by_organization(
+        &self,
+        organization_id: services::organization::OrganizationId,
+    ) -> anyhow::Result<i64> {
+        self.count_by_organization(organization_id.0).await
     }
 }
 

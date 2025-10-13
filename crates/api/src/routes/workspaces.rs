@@ -2,7 +2,7 @@ use crate::{
     conversions::authenticated_user_to_user_id,
     middleware::{auth::AuthenticatedApiKey, AuthenticatedUser},
     models::{
-        ApiKeyResponse, CreateApiKeyRequest, DecimalPrice, ErrorResponse, ListApiKeysResponse,
+        ApiKeyResponse, CreateApiKeyRequest, ErrorResponse, ListApiKeysResponse,
         UpdateApiKeyRequest, UpdateApiKeySpendLimitRequest,
     },
     routes::api::AppState,
@@ -11,10 +11,8 @@ use axum::{
     extract::{Extension, Json, Path, Query, State},
     http::StatusCode,
 };
-use database::repositories::WorkspaceRepository as DbWorkspaceRepository;
 use serde::{Deserialize, Serialize};
 use services::organization::OrganizationId;
-use std::sync::Arc;
 use tracing::{debug, error};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -208,62 +206,60 @@ pub async fn list_organization_workspaces(
     let user_id = authenticated_user_to_user_id(user);
     let organization_id = OrganizationId(org_id);
 
-    // Check if user is a member of the organization
-    match app_state
-        .organization_service
-        .is_member(organization_id.clone(), user_id)
+    // Get total count from service
+    let total = match app_state
+        .workspace_service
+        .count_workspaces_by_organization(organization_id.clone(), user_id.clone())
         .await
     {
-        Ok(true) => {
-            // List workspaces with DB-level pagination
-            let workspace_repo = Arc::new(DbWorkspaceRepository::new(app_state.db.pool().clone()));
-
-            // Get total count and paginated results
-            let total = match workspace_repo.count_by_organization(org_id).await {
-                Ok(count) => count,
-                Err(e) => {
-                    error!("Failed to count workspaces: {}", e);
-                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
-                }
-            };
-
-            match workspace_repo
-                .list_by_organization_paginated(org_id, params.limit, params.offset)
-                .await
-            {
-                Ok(workspaces) => {
-                    let workspace_responses: Vec<WorkspaceResponse> = workspaces
-                        .into_iter()
-                        .map(|w| WorkspaceResponse {
-                            id: w.id.to_string(),
-                            name: w.name,
-                            display_name: Some(w.display_name),
-                            description: w.description,
-                            organization_id: w.organization_id.to_string(),
-                            created_by_user_id: w.created_by_user_id.to_string(),
-                            created_at: w.created_at,
-                            updated_at: w.updated_at,
-                            is_active: w.is_active,
-                            settings: w.settings,
-                        })
-                        .collect();
-
-                    Ok(Json(ListWorkspacesResponse {
-                        workspaces: workspace_responses,
-                        total,
-                        limit: params.limit,
-                        offset: params.offset,
-                    }))
-                }
-                Err(e) => {
-                    error!("Failed to list workspaces: {}", e);
-                    Err(StatusCode::INTERNAL_SERVER_ERROR)
-                }
-            }
+        Ok(count) => count,
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => {
+            return Err(StatusCode::FORBIDDEN);
         }
-        Ok(false) => Err(StatusCode::FORBIDDEN),
         Err(e) => {
-            error!("Failed to check organization membership: {}", e);
+            error!("Failed to count workspaces: {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    // List workspaces with pagination using service
+    match app_state
+        .workspace_service
+        .list_workspaces_for_organization_paginated(
+            organization_id,
+            user_id,
+            params.limit,
+            params.offset,
+        )
+        .await
+    {
+        Ok(workspaces) => {
+            let workspace_responses: Vec<WorkspaceResponse> = workspaces
+                .into_iter()
+                .map(|w| WorkspaceResponse {
+                    id: w.id.0.to_string(),
+                    name: w.name,
+                    display_name: Some(w.display_name),
+                    description: w.description,
+                    organization_id: w.organization_id.0.to_string(),
+                    created_by_user_id: w.created_by_user_id.0.to_string(),
+                    created_at: w.created_at,
+                    updated_at: w.updated_at,
+                    is_active: w.is_active,
+                    settings: w.settings,
+                })
+                .collect();
+
+            Ok(Json(ListWorkspacesResponse {
+                workspaces: workspace_responses,
+                total,
+                limit: params.limit,
+                offset: params.offset,
+            }))
+        }
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
+        Err(e) => {
+            error!("Failed to list workspaces: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -298,42 +294,31 @@ pub async fn get_workspace(
     debug!("Getting workspace: {} by user: {}", workspace_id, user.0.id);
 
     let user_id = authenticated_user_to_user_id(user);
+    let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
 
-    // Get workspace and check permissions
-    let workspace_repo = Arc::new(DbWorkspaceRepository::new(app_state.db.pool().clone()));
-    match workspace_repo.get_by_id(workspace_id).await {
-        Ok(Some(workspace)) => {
-            let organization_id = OrganizationId(workspace.organization_id);
-
-            // Check if user is a member of the organization that owns this workspace
-            match app_state
-                .organization_service
-                .is_member(organization_id, user_id)
-                .await
-            {
-                Ok(true) => {
-                    let response = WorkspaceResponse {
-                        id: workspace.id.to_string(),
-                        name: workspace.name,
-                        display_name: Some(workspace.display_name),
-                        description: workspace.description,
-                        organization_id: workspace.organization_id.to_string(),
-                        created_by_user_id: workspace.created_by_user_id.to_string(),
-                        created_at: workspace.created_at,
-                        updated_at: workspace.updated_at,
-                        is_active: workspace.is_active,
-                        settings: workspace.settings,
-                    };
-                    Ok(Json(response))
-                }
-                Ok(false) => Err(StatusCode::FORBIDDEN),
-                Err(e) => {
-                    error!("Failed to check organization membership: {}", e);
-                    Err(StatusCode::INTERNAL_SERVER_ERROR)
-                }
-            }
+    // Get workspace using service (includes permission checking)
+    match app_state
+        .workspace_service
+        .get_workspace(workspace_id_typed, user_id)
+        .await
+    {
+        Ok(workspace) => {
+            let response = WorkspaceResponse {
+                id: workspace.id.0.to_string(),
+                name: workspace.name,
+                display_name: Some(workspace.display_name),
+                description: workspace.description,
+                organization_id: workspace.organization_id.0.to_string(),
+                created_by_user_id: workspace.created_by_user_id.0.to_string(),
+                created_at: workspace.created_at,
+                updated_at: workspace.updated_at,
+                is_active: workspace.is_active,
+                settings: workspace.settings,
+            };
+            Ok(Json(response))
         }
-        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
         Err(e) => {
             error!("Failed to get workspace: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -376,69 +361,39 @@ pub async fn update_workspace(
     );
 
     let user_id = authenticated_user_to_user_id(user);
+    let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
 
-    // Get workspace to check permissions
-    let workspace_repo = Arc::new(DbWorkspaceRepository::new(app_state.db.pool().clone()));
-    match workspace_repo.get_by_id(workspace_id).await {
-        Ok(Some(workspace)) => {
-            let organization_id = OrganizationId(workspace.organization_id);
-
-            // Check if user has permission to update (must be admin/owner or creator)
-            let can_update = if workspace.created_by_user_id == user_id.0 {
-                true
-            } else {
-                // Check organization membership and role
-                match app_state
-                    .organization_service
-                    .is_member(organization_id.clone(), user_id.clone())
-                    .await
-                {
-                    Ok(true) => {
-                        // For workspace updates, allow any member to update
-                        // This could be refined to check specific roles if needed
-                        true
-                    }
-                    _ => false,
-                }
+    // Update workspace using service (includes permission checking)
+    match app_state
+        .workspace_service
+        .update_workspace(
+            workspace_id_typed,
+            user_id,
+            request.display_name,
+            request.description,
+            request.settings,
+        )
+        .await
+    {
+        Ok(updated) => {
+            let response = WorkspaceResponse {
+                id: updated.id.0.to_string(),
+                name: updated.name,
+                display_name: Some(updated.display_name),
+                description: updated.description,
+                organization_id: updated.organization_id.0.to_string(),
+                created_by_user_id: updated.created_by_user_id.0.to_string(),
+                created_at: updated.created_at,
+                updated_at: updated.updated_at,
+                is_active: updated.is_active,
+                settings: updated.settings,
             };
-
-            if !can_update {
-                return Err(StatusCode::FORBIDDEN);
-            }
-
-            // Update the workspace
-            let db_request = database::UpdateWorkspaceRequest {
-                display_name: request.display_name,
-                description: request.description,
-                settings: request.settings,
-            };
-
-            match workspace_repo.update(workspace_id, db_request).await {
-                Ok(Some(updated)) => {
-                    let response = WorkspaceResponse {
-                        id: updated.id.to_string(),
-                        name: updated.name,
-                        display_name: Some(updated.display_name),
-                        description: updated.description,
-                        organization_id: updated.organization_id.to_string(),
-                        created_by_user_id: updated.created_by_user_id.to_string(),
-                        created_at: updated.created_at,
-                        updated_at: updated.updated_at,
-                        is_active: updated.is_active,
-                        settings: updated.settings,
-                    };
-                    Ok(Json(response))
-                }
-                Ok(None) => Err(StatusCode::NOT_FOUND),
-                Err(e) => {
-                    error!("Failed to update workspace: {}", e);
-                    Err(StatusCode::INTERNAL_SERVER_ERROR)
-                }
-            }
+            Ok(Json(response))
         }
-        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
         Err(e) => {
-            error!("Failed to get workspace: {}", e);
+            error!("Failed to update workspace: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -476,55 +431,26 @@ pub async fn delete_workspace(
     );
 
     let user_id = authenticated_user_to_user_id(user);
+    let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
 
-    // Get workspace to check permissions
-    let workspace_repo = Arc::new(DbWorkspaceRepository::new(app_state.db.pool().clone()));
-    match workspace_repo.get_by_id(workspace_id).await {
-        Ok(Some(workspace)) => {
-            let organization_id = OrganizationId(workspace.organization_id);
-
-            // Check if user has permission to delete (must be admin/owner or creator)
-            let can_delete = if workspace.created_by_user_id == user_id.0 {
-                true
-            } else {
-                // Check organization membership and role
-                match app_state
-                    .organization_service
-                    .is_member(organization_id, user_id.clone())
-                    .await
-                {
-                    Ok(true) => {
-                        // For workspace deletes, allow any member to delete
-                        // This could be refined to check specific roles if needed
-                        true
-                    }
-                    _ => false,
-                }
-            };
-
-            if !can_delete {
-                return Err(StatusCode::FORBIDDEN);
-            }
-
-            // Delete the workspace
-            match workspace_repo.delete(workspace_id).await {
-                Ok(true) => {
-                    debug!("Workspace {} deleted successfully", workspace_id);
-                    Ok(Json(serde_json::json!({
-                        "id": workspace_id.to_string(),
-                        "deleted": true
-                    })))
-                }
-                Ok(false) => Err(StatusCode::NOT_FOUND),
-                Err(e) => {
-                    error!("Failed to delete workspace: {}", e);
-                    Err(StatusCode::INTERNAL_SERVER_ERROR)
-                }
-            }
+    // Delete workspace using service (includes permission checking)
+    match app_state
+        .workspace_service
+        .delete_workspace(workspace_id_typed, user_id)
+        .await
+    {
+        Ok(true) => {
+            debug!("Workspace {} deleted successfully", workspace_id);
+            Ok(Json(serde_json::json!({
+                "id": workspace_id.to_string(),
+                "deleted": true
+            })))
         }
-        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
         Err(e) => {
-            error!("Failed to get workspace: {}", e);
+            error!("Failed to delete workspace: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -572,32 +498,35 @@ pub async fn create_workspace_api_key(
     let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
     let name = request.name.clone();
 
-    // Create API key request for services layer
-    let services_request = crate::conversions::api_key_req_to_workspace_services(
-        request,
-        workspace_id_typed.clone(),
-        user_id.clone(),
-    );
-
+    // Check for duplicate API key name using service
     match app_state
-        .db
-        .api_keys
-        .count_duplication(&workspace_id, &name)
+        .workspace_service
+        .check_api_key_name_duplication(workspace_id_typed.clone(), &name, user_id.clone())
         .await
     {
-        Ok(count) => {
-            if count > 0 {
-                return Err((
-                    StatusCode::CONFLICT,
-                    Json(ErrorResponse::new(
-                        "API key with this name already exists in this workspace".to_string(),
-                        "duplicate_api_key_name".to_string(),
-                    )),
-                ));
-            }
+        Ok(true) => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ErrorResponse::new(
+                    "API key with this name already exists in this workspace".to_string(),
+                    "duplicate_api_key_name".to_string(),
+                )),
+            ));
+        }
+        Ok(false) => {
+            // No duplicate, continue
+        }
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse::new(
+                    "Not authorized to create API key in this workspace".to_string(),
+                    "forbidden".to_string(),
+                )),
+            ));
         }
         Err(e) => {
-            error!("Failed to count API key duplication: {}", e);
+            error!("Failed to check API key name duplication: {}", e);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -607,6 +536,13 @@ pub async fn create_workspace_api_key(
             ));
         }
     };
+
+    // Create API key request for services layer
+    let services_request = crate::conversions::api_key_req_to_workspace_services(
+        request,
+        workspace_id_typed.clone(),
+        user_id.clone(),
+    );
 
     // Use the workspace service to create the API key
     match app_state
@@ -693,9 +629,19 @@ pub async fn list_workspace_api_keys(
     let user_id = authenticated_user_to_user_id(user);
     let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
 
-    // Get total count from repository
-    let total = match app_state.db.api_keys.count_by_workspace(workspace_id).await {
+    // Get total count from service
+    let total = match app_state
+        .workspace_service
+        .count_api_keys_by_workspace(workspace_id_typed.clone(), user_id.clone())
+        .await
+    {
         Ok(count) => count,
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        Err(services::workspace::WorkspaceError::NotFound) => {
+            return Err(StatusCode::NOT_FOUND);
+        }
         Err(e) => {
             error!("Failed to count API keys for workspace: {}", e);
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
@@ -768,58 +714,22 @@ pub async fn revoke_workspace_api_key(
     );
 
     let user_id = authenticated_user_to_user_id(user.clone());
+    let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
+    let api_key_id_typed = services::workspace::ApiKeyId(api_key_id.to_string());
 
-    // Get the API key to validate it belongs to the specified workspace
-    match app_state.db.api_keys.get_by_id(api_key_id).await {
-        Ok(Some(api_key)) => {
-            // Validate the API key belongs to the specified workspace
-            if api_key.workspace_id != workspace_id {
-                return Err(StatusCode::NOT_FOUND);
-            }
-
-            // Check if user has permission to revoke this key
-            // Must be the creator or have admin/owner role in the organization
-            if api_key.created_by_user_id != user.0.id {
-                // Get workspace to find organization
-                let workspace_repo =
-                    Arc::new(DbWorkspaceRepository::new(app_state.db.pool().clone()));
-                match workspace_repo.get_by_id(workspace_id).await {
-                    Ok(Some(workspace)) => {
-                        // Check organization membership and role
-                        let organization_id = OrganizationId(workspace.organization_id);
-                        match app_state
-                            .organization_service
-                            .is_member(organization_id, user_id.clone())
-                            .await
-                        {
-                            Ok(true) => {
-                                // For API key revocation, allow any member
-                                // This could be refined to check specific roles if needed
-                            }
-                            _ => return Err(StatusCode::FORBIDDEN),
-                        }
-                    }
-                    Ok(None) => return Err(StatusCode::NOT_FOUND),
-                    Err(e) => {
-                        error!("Failed to get workspace: {}", e);
-                        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-                    }
-                }
-            }
-
-            // Revoke the key
-            match app_state.db.api_keys.revoke(api_key_id).await {
-                Ok(true) => Ok(StatusCode::NO_CONTENT),
-                Ok(false) => Err(StatusCode::NOT_FOUND),
-                Err(e) => {
-                    error!("Failed to revoke API key: {}", e);
-                    Err(StatusCode::INTERNAL_SERVER_ERROR)
-                }
-            }
-        }
-        Ok(None) => Err(StatusCode::NOT_FOUND),
+    // Revoke API key using service (includes permission checking and validation)
+    match app_state
+        .workspace_service
+        .revoke_api_key(workspace_id_typed, api_key_id_typed, user_id)
+        .await
+    {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(services::workspace::WorkspaceError::ApiKeyNotFound) => Err(StatusCode::NOT_FOUND),
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
         Err(e) => {
-            error!("Failed to get API key: {}", e);
+            error!("Failed to revoke API key: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -839,27 +749,23 @@ pub async fn revoke_api_key_with_context(
         api_key_id, api_key_context.workspace.id.0
     );
 
-    // Validate the API key belongs to the same workspace
-    match app_state.db.api_keys.get_by_id(api_key_id).await {
-        Ok(Some(api_key)) => {
-            // Ensure the API key belongs to the authenticated workspace
-            if api_key.workspace_id != api_key_context.workspace.id.0 {
-                return Err(StatusCode::FORBIDDEN);
-            }
+    let workspace_id_typed = api_key_context.workspace.id.clone();
+    let api_key_id_typed = services::workspace::ApiKeyId(api_key_id.to_string());
+    let user_id = api_key_context.api_key.created_by_user_id.clone();
 
-            // Revoke the key
-            match app_state.db.api_keys.revoke(api_key_id).await {
-                Ok(true) => Ok(StatusCode::NO_CONTENT),
-                Ok(false) => Err(StatusCode::NOT_FOUND),
-                Err(e) => {
-                    error!("Failed to revoke API key: {}", e);
-                    Err(StatusCode::INTERNAL_SERVER_ERROR)
-                }
-            }
-        }
-        Ok(None) => Err(StatusCode::NOT_FOUND),
+    // Revoke API key using service (includes permission checking and validation)
+    match app_state
+        .workspace_service
+        .revoke_api_key(workspace_id_typed, api_key_id_typed, user_id)
+        .await
+    {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(services::workspace::WorkspaceError::ApiKeyNotFound) => Err(StatusCode::NOT_FOUND),
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
         Err(e) => {
-            error!("Failed to get API key: {}", e);
+            error!("Failed to revoke API key: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -902,147 +808,59 @@ pub async fn update_api_key_spend_limit(
     );
 
     let user_id = authenticated_user_to_user_id(user.clone());
+    let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
+    let api_key_id_typed = services::workspace::ApiKeyId(api_key_id.to_string());
 
-    // Get the API key to validate it belongs to the specified workspace
-    let api_key = app_state
-        .db
-        .api_keys
-        .get_by_id(api_key_id)
+    // Convert spend limit from API format to nano-dollars (scale 9)
+    let spend_limit_nano = request.spend_limit.map(|limit| limit.amount);
+
+    // Update the spend limit using service (includes permission checking and validation)
+    match app_state
+        .workspace_service
+        .update_api_key_spend_limit(
+            workspace_id_typed,
+            api_key_id_typed,
+            user_id,
+            spend_limit_nano,
+        )
         .await
-        .map_err(|e| {
-            error!("Failed to get API key: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "Failed to get API key".to_string(),
-                    "internal_error".to_string(),
-                )),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new(
-                    "API key not found".to_string(),
-                    "not_found".to_string(),
-                )),
-            )
-        })?;
-
-    // Validate the API key belongs to the specified workspace
-    if api_key.workspace_id != workspace_id {
-        return Err((
+    {
+        Ok(updated_key) => {
+            let response = crate::conversions::workspace_api_key_to_api_response(updated_key);
+            Ok(Json(response))
+        }
+        Err(services::workspace::WorkspaceError::NotFound) => Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse::new(
-                "API key not found in this workspace".to_string(),
+                "Workspace not found".to_string(),
                 "not_found".to_string(),
             )),
-        ));
-    }
-
-    // Get workspace to find organization
-    let workspace_repo = Arc::new(DbWorkspaceRepository::new(app_state.db.pool().clone()));
-    let workspace = workspace_repo
-        .get_by_id(workspace_id)
-        .await
-        .map_err(|e| {
-            error!("Failed to get workspace: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "Failed to get workspace".to_string(),
-                    "internal_error".to_string(),
-                )),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new(
-                    "Workspace not found".to_string(),
-                    "not_found".to_string(),
-                )),
-            )
-        })?;
-
-    // Check organization membership and role
-    let organization_id = OrganizationId(workspace.organization_id);
-    let is_member = app_state
-        .organization_service
-        .is_member(organization_id, user_id.clone())
-        .await
-        .map_err(|e| {
-            error!("Failed to check organization membership: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "Failed to verify permissions".to_string(),
-                    "internal_error".to_string(),
-                )),
-            )
-        })?;
-
-    if !is_member {
-        return Err((
+        )),
+        Err(services::workspace::WorkspaceError::ApiKeyNotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "API key not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse::new(
                 "Not authorized to update API key spend limit".to_string(),
                 "forbidden".to_string(),
             )),
-        ));
-    }
-
-    // Convert spend limit from API format to nano-dollars (scale 9)
-    let spend_limit_nano = request.spend_limit.map(|limit| limit.amount);
-
-    // Update the spend limit
-    let updated_key = app_state
-        .db
-        .api_keys
-        .update_spend_limit(api_key_id, spend_limit_nano)
-        .await
-        .map_err(|e| {
+        )),
+        Err(e) => {
             error!("Failed to update API key spend limit: {}", e);
-            (
+            Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to update spend limit".to_string(),
                     "internal_error".to_string(),
                 )),
-            )
-        })?;
-
-    // Convert to API response
-    let spend_limit_response = updated_key.spend_limit.map(|amount| DecimalPrice {
-        amount,
-        scale: 9,
-        currency: "USD".to_string(),
-    });
-
-    // Format key_prefix with "****" to indicate it's a partial key
-    let formatted_prefix = if updated_key.key_prefix.len() > 6 {
-        format!("{}****", &updated_key.key_prefix[..6])
-    } else {
-        format!("{}****", updated_key.key_prefix)
-    };
-
-    let response = ApiKeyResponse {
-        id: updated_key.id.to_string(),
-        name: Some(updated_key.name),
-        key: None, // Don't return the actual key
-        key_prefix: formatted_prefix,
-        workspace_id: updated_key.workspace_id.to_string(),
-        created_by_user_id: updated_key.created_by_user_id.to_string(),
-        created_at: updated_key.created_at,
-        last_used_at: updated_key.last_used_at,
-        expires_at: updated_key.expires_at,
-        spend_limit: spend_limit_response,
-        is_active: updated_key.is_active,
-        deleted_at: updated_key.deleted_at,
-        usage: None, // Usage not fetched in this endpoint
-    };
-
-    Ok(Json(response))
+            ))
+        }
+    }
 }
 
 /// Update API key

@@ -364,7 +364,6 @@ pub fn build_app_with_config(
 ) -> Router {
     // Create app state for completions and management routes
     let app_state = AppState {
-        db: database.clone(),
         organization_service: domain_services.organization_service.clone(),
         workspace_service: domain_services.workspace_service.clone(),
         mcp_manager: domain_services.mcp_manager.clone(),

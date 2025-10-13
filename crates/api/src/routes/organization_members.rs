@@ -339,9 +339,31 @@ pub async fn list_organization_members(
     let organization_id = OrganizationId(org_id);
     let requester_id = authenticated_user_to_user_id(user);
 
-    // Get total count from repository
-    let total = match app_state.db.organizations.get_member_count(org_id).await {
+    // Get total count from service
+    let total = match app_state
+        .organization_service
+        .get_member_count(organization_id.clone(), requester_id.clone())
+        .await
+    {
         Ok(count) => count,
+        Err(services::organization::OrganizationError::Unauthorized(_)) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                ResponseJson(ErrorResponse::new(
+                    "Not authorized to view organization members".to_string(),
+                    "forbidden".to_string(),
+                )),
+            ));
+        }
+        Err(services::organization::OrganizationError::NotFound) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    "Organization not found".to_string(),
+                    "not_found".to_string(),
+                )),
+            ));
+        }
         Err(e) => {
             error!("Failed to count organization members: {}", e);
             return Err((

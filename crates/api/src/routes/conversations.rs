@@ -54,7 +54,7 @@ fn map_conversation_error_to_status(error: &ConversationError) -> StatusCode {
 )]
 pub async fn create_conversation(
     State(service): State<Arc<services::ConversationService>>,
-    Extension(api_key): Extension<services::auth::ApiKey>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
     Json(request): Json<CreateConversationRequest>,
 ) -> Result<(StatusCode, ResponseJson<ConversationObject>), (StatusCode, ResponseJson<ErrorResponse>)>
 {
@@ -116,7 +116,7 @@ pub async fn create_conversation(
 pub async fn get_conversation(
     Path(conversation_id): Path<String>,
     State(service): State<Arc<services::ConversationService>>,
-    Extension(api_key): Extension<services::auth::ApiKey>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ConversationObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
         "Get conversation {} for user {}",
@@ -183,7 +183,7 @@ pub async fn get_conversation(
 pub async fn update_conversation(
     Path(conversation_id): Path<String>,
     State(service): State<Arc<services::ConversationService>>,
-    Extension(api_key): Extension<services::auth::ApiKey>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
     Json(request): Json<UpdateConversationRequest>,
 ) -> Result<ResponseJson<ConversationObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
@@ -257,7 +257,7 @@ pub async fn update_conversation(
 pub async fn delete_conversation(
     Path(conversation_id): Path<String>,
     State(service): State<Arc<services::ConversationService>>,
-    Extension(api_key): Extension<services::auth::ApiKey>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ConversationDeleteResult>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
         "Delete conversation {} for user {}",
@@ -333,7 +333,7 @@ pub async fn list_conversation_items(
     Path(conversation_id): Path<String>,
     Query(params): Query<ListItemsQuery>,
     State(service): State<Arc<services::ConversationService>>,
-    Extension(api_key): Extension<services::auth::ApiKey>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ConversationItemList>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
         "List items in conversation {} for user {}",

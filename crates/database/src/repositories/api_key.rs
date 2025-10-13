@@ -109,7 +109,10 @@ impl ApiKeyRepository {
             .context("Failed to get database connection")?;
 
         let row = client
-            .query_opt("SELECT * FROM api_keys WHERE id = $1", &[&id])
+            .query_opt(
+                "SELECT * FROM api_keys WHERE id = $1 AND deleted_at IS NULL",
+                &[&id],
+            )
             .await
             .context("Failed to query API key")?;
 

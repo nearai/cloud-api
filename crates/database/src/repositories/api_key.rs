@@ -184,7 +184,7 @@ impl ApiKeyRepository {
 
         let row = client
             .query_opt(
-                "SELECT * FROM api_keys WHERE key_hash = $1 AND is_active = true",
+                "SELECT * FROM api_keys WHERE key_hash = $1",
                 &[&key_hash],
             )
             .await
@@ -321,7 +321,7 @@ impl ApiKeyRepository {
                     COALESCE(SUM(usg.total_cost), 0)::BIGINT as usage
                 FROM api_keys ak
                 LEFT JOIN organization_usage_log usg ON ak.id = usg.api_key_id
-                WHERE ak.workspace_id = $1 AND ak.is_active = true
+                WHERE ak.workspace_id = $1
                 GROUP BY ak.id
                 ORDER BY ak.created_at DESC
                 LIMIT $2 OFFSET $3
@@ -345,7 +345,7 @@ impl ApiKeyRepository {
             .context("Failed to get database connection")?;
 
         let rows = client.query(
-            "SELECT * FROM api_keys WHERE created_by_user_id = $1 AND is_active = true ORDER BY created_at DESC",
+            "SELECT * FROM api_keys WHERE created_by_user_id = $1 ORDER BY created_at DESC",
             &[&user_id],
         ).await.context("Failed to list user's API keys")?;
 
@@ -435,7 +435,7 @@ impl ApiKeyRepository {
 
         let row = client
             .query_one(
-                "UPDATE api_keys SET spend_limit = $1 WHERE id = $2 AND is_active = true RETURNING *",
+                "UPDATE api_keys SET spend_limit = $1 WHERE id = $2 RETURNING *",
                 &[&spend_limit, &id],
             )
             .await

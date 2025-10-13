@@ -1050,6 +1050,8 @@ pub struct ApiKeyResponse {
     pub spend_limit: Option<DecimalPrice>,
     pub is_active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<DecimalPrice>,
 }
 

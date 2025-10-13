@@ -570,6 +570,7 @@ pub async fn create_workspace_api_key(
 
     let user_id = authenticated_user_to_user_id(user.clone());
     let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
+    let name = request.name.clone();
 
     // Create API key request for services layer
     let services_request = crate::conversions::api_key_req_to_workspace_services(
@@ -577,6 +578,23 @@ pub async fn create_workspace_api_key(
         workspace_id_typed.clone(),
         user_id.clone(),
     );
+
+    match app_state
+        .db
+        .api_keys
+        .count_duplication(&workspace_id, &name)
+        .await
+    {
+        Ok(count) => {
+            if count > 0 {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+        Err(e) => {
+            error!("Failed to count API key duplication: {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
 
     // Use the workspace service to create the API key
     match app_state

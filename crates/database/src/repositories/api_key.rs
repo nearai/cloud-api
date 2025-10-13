@@ -50,9 +50,6 @@ impl ApiKeyRepository {
         let key_prefix = Self::extract_key_prefix(&key);
         let now = Utc::now();
 
-        // Use name as Option<String>
-        let name = request.name.clone().unwrap_or_default();
-
         let _row = client
             .query_one(
                 r#"
@@ -67,7 +64,7 @@ impl ApiKeyRepository {
                     &id,
                     &key_hash,
                     &key_prefix,
-                    &name,
+                    &request.name,
                     &request.workspace_id.0,
                     &request.created_by_user_id.0,
                     &now,
@@ -89,7 +86,7 @@ impl ApiKeyRepository {
                 id,
                 key_hash,
                 key_prefix,
-                name,
+                name: request.name,
                 created_at: now,
                 expires_at: request.expires_at,
                 last_used_at: None,
@@ -119,9 +116,6 @@ impl ApiKeyRepository {
         let key_prefix = Self::extract_key_prefix(&key);
         let now = Utc::now();
 
-        // Use name as Option<String>
-        let name = request.name.clone().unwrap_or_default();
-
         let _row = client
             .query_one(
                 r#"
@@ -136,7 +130,7 @@ impl ApiKeyRepository {
                     &id,
                     &key_hash,
                     &key_prefix,
-                    &name,
+                    &request.name,
                     &request.workspace_id.0,
                     &request.created_by_user_id.0,
                     &now,
@@ -155,7 +149,7 @@ impl ApiKeyRepository {
         Ok(crate::models::ApiKeyResponse {
             id,
             key, // Return the raw key for the API response
-            name,
+            name: request.name,
             created_at: now,
             expires_at: request.expires_at,
         })
@@ -257,6 +251,26 @@ impl ApiKeyRepository {
             .context("Failed to update last used timestamp")?;
 
         Ok(())
+    }
+
+    pub async fn count_duplication(&self, workspace_id: &Uuid, name: &String) -> Result<i64> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let row = client
+            .query_one(
+                r#"
+                SELECT COUNT(*) as count FROM api_keys WHERE workspace_id = $1 AND name = $2
+            "#,
+                &[workspace_id, name],
+            )
+            .await
+            .context("Failed to count API key duplication")?;
+
+        Ok(row.get::<_, i64>("count"))
     }
 
     /// Count API keys for a workspace

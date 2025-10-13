@@ -160,7 +160,8 @@ async fn setup_org_with_credits(
 async fn get_api_key_for_org(server: &axum_test::TestServer, org_id: String) -> String {
     let workspaces = list_workspaces(server, org_id).await;
     let workspace = workspaces.first().unwrap();
-    let api_key_resp = create_api_key_in_workspace(server, workspace.id.clone()).await;
+    let api_key_resp =
+        create_api_key_in_workspace(server, workspace.id.clone(), "Test API Key".to_string()).await;
     api_key_resp.key.unwrap()
 }
 
@@ -232,9 +233,10 @@ async fn _create_workspace(
 async fn create_api_key_in_workspace(
     server: &axum_test::TestServer,
     workspace_id: String,
+    name: String,
 ) -> api::models::ApiKeyResponse {
     let request = api::models::CreateApiKeyRequest {
-        name: Some("Test API Key".to_string()),
+        name,
         expires_at: Some(Utc::now() + chrono::Duration::days(90)),
         spend_limit: None,
     };
@@ -270,7 +272,8 @@ async fn create_org_and_api_key(
     let workspace = workspaces.first().unwrap();
     println!("workspace: {:?}", workspace);
 
-    let api_key_resp = create_api_key_in_workspace(server, workspace.id.clone()).await;
+    let api_key_resp =
+        create_api_key_in_workspace(server, workspace.id.clone(), "Test API Key".to_string()).await;
     println!("api_key_resp: {:?}", api_key_resp);
     (api_key_resp.key.clone().unwrap(), api_key_resp)
 }
@@ -1597,7 +1600,9 @@ async fn test_api_key_spend_limit_update() {
     let org = create_org(&server).await;
     let workspaces = list_workspaces(&server, org.id.clone()).await;
     let workspace = workspaces.first().unwrap();
-    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
+    let api_key_resp =
+        create_api_key_in_workspace(&server, workspace.id.clone(), "Test API Key".to_string())
+            .await;
 
     println!("Created API key: {:?}", api_key_resp);
 
@@ -1686,7 +1691,9 @@ async fn test_api_key_spend_limit_enforcement() {
     // Create API key and set a very low limit
     let workspaces = list_workspaces(&server, org.id.clone()).await;
     let workspace = workspaces.first().unwrap();
-    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
+    let api_key_resp =
+        create_api_key_in_workspace(&server, workspace.id.clone(), "Test API Key".to_string())
+            .await;
     let api_key = api_key_resp.key.clone().unwrap();
 
     // Set API key spend limit to a very low amount (1 nano-dollar = $0.000000001)
@@ -1775,7 +1782,9 @@ async fn test_api_key_limit_enforced_before_org_limit() {
     // Create API key with lower limit than org ($2.00)
     let workspaces = list_workspaces(&server, org.id.clone()).await;
     let workspace = workspaces.first().unwrap();
-    let api_key_resp = create_api_key_in_workspace(&server, workspace.id.clone()).await;
+    let api_key_resp =
+        create_api_key_in_workspace(&server, workspace.id.clone(), "Test API Key".to_string())
+            .await;
     let _api_key = api_key_resp.key.clone().unwrap();
 
     let update_request = serde_json::json!({
@@ -1819,7 +1828,9 @@ async fn test_api_key_spend_limit_unauthorized_user() {
     // Get workspace and API key from org1
     let workspaces1 = list_workspaces(&server, org1.id.clone()).await;
     let workspace1 = workspaces1.first().unwrap();
-    let api_key_resp1 = create_api_key_in_workspace(&server, workspace1.id.clone()).await;
+    let api_key_resp1 =
+        create_api_key_in_workspace(&server, workspace1.id.clone(), "Test API Key".to_string())
+            .await;
 
     // Try to update org1's API key limit while authenticated as org1 member
     // This should succeed since we're a member
@@ -1863,12 +1874,16 @@ async fn test_list_workspace_api_keys_with_usage() {
     println!("Using workspace: {}", workspace.id);
 
     // Create first API key (will have usage)
-    let api_key_resp1 = create_api_key_in_workspace(&server, workspace.id.clone()).await;
+    let api_key_resp1 =
+        create_api_key_in_workspace(&server, workspace.id.clone(), "Test API Key 1".to_string())
+            .await;
     let api_key1 = api_key_resp1.key.clone().unwrap();
     println!("Created API key 1: {}", api_key_resp1.id);
 
     // Create second API key (will not have usage)
-    let api_key_resp2 = create_api_key_in_workspace(&server, workspace.id.clone()).await;
+    let api_key_resp2 =
+        create_api_key_in_workspace(&server, workspace.id.clone(), "Test API Key 2".to_string())
+            .await;
     println!("Created API key 2: {}", api_key_resp2.id);
 
     let model_name = setup_test_model(&server).await;

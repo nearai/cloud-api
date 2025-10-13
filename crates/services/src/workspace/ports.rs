@@ -108,6 +108,14 @@ pub trait WorkspaceRepository: Send + Sync {
         organization_id: OrganizationId,
     ) -> anyhow::Result<Vec<Workspace>>;
 
+    /// List workspaces for an organization with pagination
+    async fn list_by_organization_paginated(
+        &self,
+        organization_id: OrganizationId,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<Workspace>>;
+
     /// Create a new workspace
     async fn create(
         &self,
@@ -117,6 +125,21 @@ pub trait WorkspaceRepository: Send + Sync {
         organization_id: OrganizationId,
         created_by_user_id: UserId,
     ) -> anyhow::Result<Workspace>;
+
+    /// Update a workspace
+    async fn update(
+        &self,
+        workspace_id: WorkspaceId,
+        display_name: Option<String>,
+        description: Option<String>,
+        settings: Option<serde_json::Value>,
+    ) -> anyhow::Result<Option<Workspace>>;
+
+    /// Delete (deactivate) a workspace
+    async fn delete(&self, workspace_id: WorkspaceId) -> anyhow::Result<bool>;
+
+    /// Count workspaces for an organization
+    async fn count_by_organization(&self, organization_id: OrganizationId) -> anyhow::Result<i64>;
 }
 
 // Repository trait for API key data access
@@ -153,6 +176,19 @@ pub trait ApiKeyRepository: Send + Sync {
         spend_limit: Option<Option<i64>>,
         is_active: Option<bool>,
     ) -> anyhow::Result<ApiKey>;
+
+    /// Count API keys for a workspace
+    async fn count_by_workspace(&self, workspace_id: WorkspaceId) -> anyhow::Result<i64>;
+
+    /// Check for duplicate API key name in workspace
+    async fn check_name_duplication(
+        &self,
+        workspace_id: WorkspaceId,
+        name: &str,
+    ) -> anyhow::Result<bool>;
+
+    /// Revoke (soft delete) an API key
+    async fn revoke(&self, id: ApiKeyId) -> anyhow::Result<bool>;
 }
 
 // Service trait
@@ -178,6 +214,15 @@ pub trait WorkspaceServiceTrait: Send + Sync {
         &self,
         organization_id: OrganizationId,
         requester_id: UserId,
+    ) -> Result<Vec<Workspace>, WorkspaceError>;
+
+    /// List workspaces for an organization with pagination
+    async fn list_workspaces_for_organization_paginated(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        limit: i64,
+        offset: i64,
     ) -> Result<Vec<Workspace>, WorkspaceError>;
 
     /// Create a new workspace in an organization with permission checking
@@ -244,5 +289,52 @@ pub trait WorkspaceServiceTrait: Send + Sync {
         &self,
         workspace_id: WorkspaceId,
         user_id: UserId,
+    ) -> Result<bool, WorkspaceError>;
+
+    /// Update a workspace with permission checking
+    async fn update_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        requester_id: UserId,
+        display_name: Option<String>,
+        description: Option<String>,
+        settings: Option<serde_json::Value>,
+    ) -> Result<Workspace, WorkspaceError>;
+
+    /// Delete (deactivate) a workspace with permission checking
+    async fn delete_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        requester_id: UserId,
+    ) -> Result<bool, WorkspaceError>;
+
+    /// Count workspaces for an organization with permission checking
+    async fn count_workspaces_by_organization(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+    ) -> Result<i64, WorkspaceError>;
+
+    /// Count API keys for a workspace with permission checking
+    async fn count_api_keys_by_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        requester_id: UserId,
+    ) -> Result<i64, WorkspaceError>;
+
+    /// Check for duplicate API key name in workspace
+    async fn check_api_key_name_duplication(
+        &self,
+        workspace_id: WorkspaceId,
+        name: &str,
+        requester_id: UserId,
+    ) -> Result<bool, WorkspaceError>;
+
+    /// Revoke an API key (alias for delete_api_key with revoke semantics)
+    async fn revoke_api_key(
+        &self,
+        workspace_id: WorkspaceId,
+        api_key_id: ApiKeyId,
+        requester_id: UserId,
     ) -> Result<bool, WorkspaceError>;
 }

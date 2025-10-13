@@ -1,6 +1,6 @@
 use crate::{
     conversions::{current_unix_timestamp, generate_completion_id},
-    middleware::auth::AuthenticatedApiKey,
+    middleware::{auth::AuthenticatedApiKey, RequestBodyHash},
     models::*,
     routes::{api::AppState, common::map_domain_error_to_status},
 };
@@ -29,6 +29,7 @@ fn convert_chat_request_to_service(
     api_key_id: String,
     organization_id: Uuid,
     workspace_id: Uuid,
+    body_hash: RequestBodyHash,
 ) -> ServiceCompletionRequest {
     ServiceCompletionRequest {
         model: request.model.clone(),
@@ -50,6 +51,7 @@ fn convert_chat_request_to_service(
         organization_id,
         workspace_id,
         metadata: None,
+        body_hash: body_hash.hash.clone(),
     }
 }
 
@@ -60,6 +62,7 @@ fn convert_text_request_to_service(
     api_key_id: String,
     organization_id: Uuid,
     workspace_id: Uuid,
+    body_hash: RequestBodyHash,
 ) -> ServiceCompletionRequest {
     ServiceCompletionRequest {
         model: request.model.clone(),
@@ -77,6 +80,7 @@ fn convert_text_request_to_service(
         organization_id,
         workspace_id,
         metadata: None,
+        body_hash: body_hash.hash.clone(),
     }
 }
 
@@ -101,6 +105,7 @@ fn convert_text_request_to_service(
 pub async fn chat_completions(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(body_hash): Extension<RequestBodyHash>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     debug!(
@@ -134,6 +139,7 @@ pub async fn chat_completions(
         api_key.api_key.id.0.clone(),
         api_key.organization.id.0,
         api_key.workspace.id.0,
+        body_hash,
     );
 
     // Call the completion service - it handles usage tracking internally
@@ -275,6 +281,7 @@ pub async fn chat_completions(
 pub async fn completions(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(body_hash): Extension<RequestBodyHash>,
     Json(request): Json<CompletionRequest>,
 ) -> axum::response::Response {
     debug!(
@@ -308,6 +315,7 @@ pub async fn completions(
         api_key.api_key.id.0.clone(),
         api_key.organization.id.0,
         api_key.workspace.id.0,
+        body_hash,
     );
 
     // Call the completion service - it handles usage tracking internally

@@ -348,6 +348,7 @@ impl InferenceProvider for InferenceProviderPool {
     async fn chat_completion_stream(
         &self,
         params: ChatCompletionParams,
+        request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
         let model_id = params.model.clone();
 
@@ -366,7 +367,9 @@ impl InferenceProvider for InferenceProviderPool {
                     model_id = %model_id,
                     "Found provider for model, calling chat_completion_stream"
                 );
-                let stream = provider.chat_completion_stream(params).await?;
+                let stream = provider
+                    .chat_completion_stream(params, request_hash)
+                    .await?;
                 let mut peekable = StreamingResultExt::peekable(stream);
                 if let Some(Ok(StreamChunk::Chat(chat_chunk))) = peekable.peek().await {
                     let chat_id = chat_chunk.id.clone();

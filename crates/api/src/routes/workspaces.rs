@@ -562,7 +562,7 @@ pub async fn create_workspace_api_key(
     Extension(user): Extension<AuthenticatedUser>,
     Path(workspace_id): Path<Uuid>,
     Json(request): Json<CreateApiKeyRequest>,
-) -> Result<(StatusCode, Json<ApiKeyResponse>), StatusCode> {
+) -> Result<(StatusCode, Json<ApiKeyResponse>), (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Creating API key for workspace: {} by user: {}",
         workspace_id, user.0.id
@@ -587,12 +587,24 @@ pub async fn create_workspace_api_key(
     {
         Ok(count) => {
             if count > 0 {
-                return Err(StatusCode::BAD_REQUEST);
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse::new(
+                        "API key with this name already exists in this workspace".to_string(),
+                        "duplicate_api_key_name".to_string(),
+                    )),
+                ));
             }
         }
         Err(e) => {
             error!("Failed to count API key duplication: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to check for duplicate API key names".to_string(),
+                    "internal_error".to_string(),
+                )),
+            ));
         }
     };
 
@@ -610,11 +622,29 @@ pub async fn create_workspace_api_key(
             let response = crate::conversions::workspace_api_key_to_api_response(api_key);
             Ok((StatusCode::CREATED, Json(response)))
         }
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
-        Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "Not authorized to create API key in this workspace".to_string(),
+                "forbidden".to_string(),
+            )),
+        )),
+        Err(services::workspace::WorkspaceError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Workspace not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
         Err(e) => {
             error!("Failed to create API key: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to create API key".to_string(),
+                    "internal_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -1008,6 +1038,7 @@ pub async fn update_api_key_spend_limit(
         expires_at: updated_key.expires_at,
         spend_limit: spend_limit_response,
         is_active: updated_key.is_active,
+        deleted_at: updated_key.deleted_at,
         usage: None, // Usage not fetched in this endpoint
     };
 

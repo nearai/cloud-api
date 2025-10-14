@@ -45,7 +45,7 @@ pub struct ApiKey {
     pub id: ApiKeyId,
     /// Returned only on creation
     pub key: Option<String>,
-    /// First 8-10 characters of the key for display purposes (e.g., "sk_abc123")
+    /// First 8-10 characters of the key for display purposes (e.g., "sk-abc123")
     pub key_prefix: String,
     pub name: String,
     pub workspace_id: WorkspaceId,

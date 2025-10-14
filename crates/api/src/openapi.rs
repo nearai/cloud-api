@@ -7,7 +7,7 @@ use utoipa::{Modify, OpenApi};
 #[openapi(
     info(
         title = "NEAR AI Cloud API",
-        description = "A comprehensive cloud API for AI model inference, conversation management, and organization administration.\n\n## Authentication\n\nThis API supports two authentication methods:\n\n1. **Session Token (User Authentication)**: Use `Authorization: Bearer <session_token>` with a session token obtained from OAuth login\n2. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk_<api_key>` with an API key (prefix: `sk_`)\n\nClick the **Authorize** button above to configure authentication.",
+        description = "A comprehensive cloud API for AI model inference, conversation management, and organization administration.\n\n## Authentication\n\nThis API supports two authentication methods:\n\n1. **Session Token (User Authentication)**: Use `Authorization: Bearer <session_token>` with a session token obtained from OAuth login\n2. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`)\n\nClick the **Authorize** button above to configure authentication.",
         version = "1.0.0",
         contact(
             name = "NEAR AI Team",
@@ -176,7 +176,7 @@ impl Modify for SecurityAddon {
                         .scheme(HttpAuthScheme::Bearer)
                         .bearer_format("api_key")
                         .description(Some(
-                            "API key for programmatic access (Authorization: Bearer sk_<api_key>)",
+                            "API key for programmatic access (Authorization: Bearer sk-<api_key>)",
                         ))
                         .build(),
                 ),

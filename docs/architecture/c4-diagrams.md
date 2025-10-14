@@ -427,7 +427,7 @@ sequenceDiagram
     AuthService->>Database: Verify user can manage API keys
     Database-->>AuthService: Permission granted
     
-    PlatformAPI->>PlatformAPI: Generate random API key<br/>(sk_live_xxx format)
+    PlatformAPI->>PlatformAPI: Generate random API key<br/>(sk-live-xxx format)
     PlatformAPI->>PlatformAPI: Hash with SHA-256
     
     PlatformAPI->>Database: INSERT into api_keys<br/>(key_hash, workspace_id, user_id)
@@ -454,7 +454,7 @@ sequenceDiagram
     participant vLLM as vLLM Provider
     participant Database
     
-    Client->>PlatformAPI: POST /v1/chat/completions<br/>Authorization: Bearer sk_xxx<br/>{ model: "llama-3", stream: true }
+    Client->>PlatformAPI: POST /v1/chat/completions<br/>Authorization: Bearer sk-xxx<br/>{ model: "llama-3", stream: true }
     
     PlatformAPI->>AuthMiddleware: Extract & validate API key
     AuthMiddleware->>Database: Query api_keys (hash lookup)
@@ -649,7 +649,7 @@ sequenceDiagram
     participant vLLM
     participant Client as Client<br/>(Verification)
     
-    Client->>PlatformAPI: GET /v1/attestation/report<br/>Authorization: Bearer sk_xxx
+    Client->>PlatformAPI: GET /v1/attestation/report<br/>Authorization: Bearer sk-xxx
     
     PlatformAPI->>TEE: Request attestation report
     TEE->>TEE: Generate cryptographic proof:<br/>- Code measurements<br/>- Platform state<br/>- Signature
@@ -910,12 +910,12 @@ graph TD
             WS3["📦 Workspace: Staging<br/>Custom settings"]
             
             subgraph APIKeys1["🔑 Production API Keys"]
-                Key1["🔐 sk_live_prod_xxx<br/>Last used: 2h ago<br/>Spend limit: $1000/mo"]
-                Key2["🔐 sk_live_backup_xxx<br/>Last used: 3d ago<br/>Spend limit: $500/mo"]
+                Key1["🔐 sk-live-prod-xxx<br/>Last used: 2h ago<br/>Spend limit: $1000/mo"]
+                Key2["🔐 sk-live-backup-xxx<br/>Last used: 3d ago<br/>Spend limit: $500/mo"]
             end
             
             subgraph APIKeys2["🔑 Development API Keys"]
-                Key3["🔐 sk_test_dev_xxx<br/>Last used: 10m ago<br/>No spend limit"]
+                Key3["🔐 sk-test-dev-xxx<br/>Last used: 10m ago<br/>No spend limit"]
             end
             
             WS1 --> APIKeys1
@@ -1009,7 +1009,7 @@ Database
 
 2. **API Key-Based** - For AI inference operations:
    ```
-   Client → API Key (Header: Authorization: Bearer sk_...) → Workspace → Organization
+   Client → API Key (Header: Authorization: Bearer sk-...) → Workspace → Organization
    ```
    - Keys are workspace-scoped
    - SHA-256 hashed storage

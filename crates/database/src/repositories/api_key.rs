@@ -19,7 +19,7 @@ impl ApiKeyRepository {
 
     /// Generate a new API key
     pub fn generate_api_key() -> String {
-        format!("sk_{}", Uuid::new_v4().to_string().replace("-", ""))
+        format!("sk-{}", Uuid::new_v4().to_string().replace("-", ""))
     }
 
     /// Hash an API key for storage
@@ -31,7 +31,7 @@ impl ApiKeyRepository {
 
     /// Extract key prefix from a generated key for display purposes
     fn extract_key_prefix(key: &str) -> String {
-        // Take first 10 characters (e.g., "sk_abc1234" from "sk_abc1234567890...")
+        // Take first 10 characters (e.g., "sk-abc1234" from "sk-abc1234567890...")
         let prefix_len = 10.min(key.len());
         key[..prefix_len].to_string()
     }

@@ -4,11 +4,22 @@ use futures_util::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+/// Represents a single SSE event with both raw bytes and parsed content
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SSEEvent {
+    /// The raw bytes of this SSE event (including "data: " prefix and newline)
+    #[serde(skip)]
+    pub raw_bytes: Bytes,
+    /// The parsed StreamChunk
+    pub chunk: StreamChunk,
+}
+
 /// SSE (Server-Sent Events) stream parser that properly handles buffering
 /// of incomplete events across HTTP chunks
 pub struct SSEParser<S> {
     inner: S,
     buffer: String,
+    bytes_buffer: Vec<u8>,
     is_chat: bool,
 }
 
@@ -20,6 +31,7 @@ where
         Self {
             inner: stream,
             buffer: String::new(),
+            bytes_buffer: Vec::new(),
             is_chat,
         }
     }
@@ -77,11 +89,18 @@ where
         }
     }
 
-    fn process_buffer(&mut self) -> Vec<Result<StreamChunk, CompletionError>> {
+    fn process_buffer(&mut self) -> Vec<Result<SSEEvent, CompletionError>> {
         let mut results = Vec::new();
 
         // Process complete lines in the buffer
         while let Some(newline_pos) = self.buffer.find('\n') {
+            let line_len = newline_pos + 1; // Include the newline character
+
+            // Extract the raw bytes for this line
+            let raw_bytes = Bytes::copy_from_slice(&self.bytes_buffer[..line_len]);
+            self.bytes_buffer.drain(..line_len);
+
+            // Extract the string line
             let line = self.buffer.drain(..=newline_pos).collect::<String>();
             let line = line.trim();
 
@@ -93,7 +112,9 @@ where
             // Look for data: lines
             if let Some(data) = line.strip_prefix("data: ") {
                 match Self::parse_sse_event(data, self.is_chat) {
-                    Ok(Some(chunk)) => results.push(Ok(chunk)),
+                    Ok(Some(chunk)) => {
+                        results.push(Ok(SSEEvent { raw_bytes, chunk }));
+                    }
                     Ok(None) => {} // [DONE] marker
                     Err(e) => results.push(Err(e)),
                 }
@@ -108,7 +129,7 @@ impl<S> Stream for SSEParser<S>
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
 {
-    type Item = Result<StreamChunk, CompletionError>;
+    type Item = Result<SSEEvent, CompletionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // First, try to process any complete events in the buffer
@@ -125,6 +146,7 @@ where
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => {
                 // Add new data to buffer
+                self.bytes_buffer.extend_from_slice(&bytes);
                 let text = String::from_utf8_lossy(&bytes);
                 self.buffer.push_str(&text);
 

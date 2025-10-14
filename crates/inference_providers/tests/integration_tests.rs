@@ -108,7 +108,7 @@ async fn test_chat_completion_streaming() {
 
     let stream_result = timeout(
         Duration::from_secs(TEST_TIMEOUT_SECS),
-        provider.chat_completion_stream(params),
+        provider.chat_completion_stream(params, "test_request_hash".to_string()),
     )
     .await;
 
@@ -124,40 +124,42 @@ async fn test_chat_completion_streaming() {
                 .unwrap_or(None)
             {
                 match chunk_result {
-                    Ok(StreamChunk::Chat(chat_chunk)) => {
-                        chunks_received += 1;
-                        println!("Received chat chunk #{}: {:?}", chunks_received, chat_chunk);
+                    Ok(sse_event) => match sse_event.chunk {
+                        StreamChunk::Chat(chat_chunk) => {
+                            chunks_received += 1;
+                            println!("Received chat chunk #{}: {:?}", chunks_received, chat_chunk);
 
-                        // Check for token usage in final chunk
-                        if let Some(usage) = &chat_chunk.usage {
-                            usage_found = true;
-                            assert!(
-                                usage.total_tokens > 0,
-                                "Total tokens should be greater than 0"
-                            );
-                            assert!(
-                                usage.prompt_tokens > 0,
-                                "Prompt tokens should be greater than 0"
-                            );
-                            assert!(
-                                usage.completion_tokens > 0,
-                                "Completion tokens should be greater than 0"
-                            );
-                            println!("Token usage: {:?}", usage);
-                        }
+                            // Check for token usage in final chunk
+                            if let Some(usage) = &chat_chunk.usage {
+                                usage_found = true;
+                                assert!(
+                                    usage.total_tokens > 0,
+                                    "Total tokens should be greater than 0"
+                                );
+                                assert!(
+                                    usage.prompt_tokens > 0,
+                                    "Prompt tokens should be greater than 0"
+                                );
+                                assert!(
+                                    usage.completion_tokens > 0,
+                                    "Completion tokens should be greater than 0"
+                                );
+                                println!("Token usage: {:?}", usage);
+                            }
 
-                        // Collect content from deltas
-                        if let Some(choice) = chat_chunk.choices.first() {
-                            if let Some(delta) = &choice.delta {
-                                if let Some(content) = &delta.content {
-                                    content_received.push_str(content);
+                            // Collect content from deltas
+                            if let Some(choice) = chat_chunk.choices.first() {
+                                if let Some(delta) = &choice.delta {
+                                    if let Some(content) = &delta.content {
+                                        content_received.push_str(content);
+                                    }
                                 }
                             }
                         }
-                    }
-                    Ok(StreamChunk::Text(text_chunk)) => {
-                        panic!("CRITICAL ERROR: Received text chunk in chat completion stream! This indicates stream isolation failure. Chunk: {:?}", text_chunk);
-                    }
+                        StreamChunk::Text(text_chunk) => {
+                            panic!("CRITICAL ERROR: Received text chunk in chat completion stream! This indicates stream isolation failure. Chunk: {:?}", text_chunk);
+                        }
+                    },
                     Err(e) => {
                         // Stream errors should be treated as test failures
                         panic!("Stream error in chat completion: {}. This could indicate SSE parsing issues or stream corruption.", e);
@@ -244,36 +246,38 @@ async fn test_text_completion_streaming() {
                 .unwrap_or(None)
             {
                 match chunk_result {
-                    Ok(StreamChunk::Text(text_chunk)) => {
-                        chunks_received += 1;
-                        println!("Received text chunk #{}: {:?}", chunks_received, text_chunk);
+                    Ok(sse_event) => match sse_event.chunk {
+                        StreamChunk::Text(text_chunk) => {
+                            chunks_received += 1;
+                            println!("Received text chunk #{}: {:?}", chunks_received, text_chunk);
 
-                        // Check for token usage in final chunk
-                        if let Some(usage) = &text_chunk.usage {
-                            usage_found = true;
-                            assert!(
-                                usage.total_tokens > 0,
-                                "Total tokens should be greater than 0"
-                            );
-                            assert!(
-                                usage.prompt_tokens > 0,
-                                "Prompt tokens should be greater than 0"
-                            );
-                            assert!(
-                                usage.completion_tokens > 0,
-                                "Completion tokens should be greater than 0"
-                            );
-                            println!("Token usage: {:?}", usage);
-                        }
+                            // Check for token usage in final chunk
+                            if let Some(usage) = &text_chunk.usage {
+                                usage_found = true;
+                                assert!(
+                                    usage.total_tokens > 0,
+                                    "Total tokens should be greater than 0"
+                                );
+                                assert!(
+                                    usage.prompt_tokens > 0,
+                                    "Prompt tokens should be greater than 0"
+                                );
+                                assert!(
+                                    usage.completion_tokens > 0,
+                                    "Completion tokens should be greater than 0"
+                                );
+                                println!("Token usage: {:?}", usage);
+                            }
 
-                        // Collect content from choices
-                        if let Some(choice) = text_chunk.choices.first() {
-                            content_received.push_str(&choice.text);
+                            // Collect content from choices
+                            if let Some(choice) = text_chunk.choices.first() {
+                                content_received.push_str(&choice.text);
+                            }
                         }
-                    }
-                    Ok(StreamChunk::Chat(chat_chunk)) => {
-                        panic!("CRITICAL ERROR: Received chat chunk in text completion stream! This indicates stream isolation failure. Chunk: {:?}", chat_chunk);
-                    }
+                        StreamChunk::Chat(chat_chunk) => {
+                            panic!("CRITICAL ERROR: Received chat chunk in text completion stream! This indicates stream isolation failure. Chunk: {:?}", chat_chunk);
+                        }
+                    },
                     Err(e) => {
                         panic!("Stream error in text completion: {}. This could indicate SSE parsing issues or stream corruption.", e);
                     }
@@ -341,7 +345,9 @@ async fn test_error_handling() {
         stream_options: None,
     };
 
-    let result = provider.chat_completion_stream(params).await;
+    let result = provider
+        .chat_completion_stream(params, "test_request_hash".to_string())
+        .await;
     assert!(result.is_err(), "Should fail with invalid model");
 
     if let Err(e) = result {

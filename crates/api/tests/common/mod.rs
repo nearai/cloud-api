@@ -6,6 +6,7 @@ use api::{
 use chrono::Utc;
 use config::ApiConfig;
 use database::Database;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 
@@ -313,4 +314,11 @@ pub async fn list_models(
         .await;
     assert_eq!(response.status_code(), 200);
     response.json::<api::models::ModelsResponse>()
+}
+
+/// Compute SHA256 hash of a string
+pub fn compute_sha256(data: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data.as_bytes());
+    format!("{:x}", hasher.finalize())
 }

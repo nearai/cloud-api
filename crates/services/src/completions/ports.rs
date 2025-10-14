@@ -54,6 +54,7 @@ pub struct CompletionRequest {
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
     pub metadata: Option<serde_json::Value>,
+    pub body_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,8 +82,13 @@ pub struct ModelCapabilities {
 #[async_trait]
 pub trait CompletionServiceTrait: Send + Sync {
     /// Create a streaming completion
-    async fn create_completion_stream(
+    async fn create_chat_completion_stream(
         &self,
         request: CompletionRequest,
     ) -> Result<StreamingResult, CompletionError>;
+
+    async fn create_chat_completion(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError>;
 }

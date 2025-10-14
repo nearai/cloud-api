@@ -1852,7 +1852,8 @@ async fn test_streaming_chat_completion_signature_verification() {
             }
         ],
         "stream": true,
-        "model": model_name
+        "model": model_name,
+        "nonce": 42
     });
 
     println!("\n=== Request Body ===");
@@ -1881,15 +1882,15 @@ async fn test_streaming_chat_completion_signature_verification() {
     );
 
     // Capture the complete raw response text (SSE format)
-    let response_text = response.text();
-    println!("\n=== Raw Streaming Response ===");
+    let response_text = (response.text().trim().to_string() + "\n\n").to_string();
+    println!("=== Raw Streaming Response ===");
     println!("{}", response_text);
 
     // Step 5: Parse streaming response to extract chat_id and verify structure
     let mut chat_id: Option<String> = None;
     let mut content = String::new();
 
-    println!("\n=== Parsing SSE Stream ===");
+    println!("=== Parsing SSE Stream ===");
     for line in response_text.lines() {
         if let Some(data) = line.strip_prefix("data: ") {
             if data.trim() == "[DONE]" {

@@ -1,5 +1,5 @@
+pub use inference_providers::VllmAttestationReport;
 use serde::{Deserialize, Serialize};
-
 /// Error types for attestation operations
 #[derive(Debug, thiserror::Error)]
 pub enum AttestationError {
@@ -33,18 +33,23 @@ pub struct ChatSignature {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetQuoteResponse {
+pub struct DstackCpuQuote {
     /// The attestation quote in hexadecimal format
     pub quote: String,
     /// The event log associated with the quote
     pub event_log: String,
 }
 
-impl From<dstack_sdk::dstack_client::GetQuoteResponse> for GetQuoteResponse {
+impl From<dstack_sdk::dstack_client::GetQuoteResponse> for DstackCpuQuote {
     fn from(response: dstack_sdk::dstack_client::GetQuoteResponse) -> Self {
         Self {
             quote: response.quote,
             event_log: response.event_log,
         }
     }
+}
+
+pub struct AttestationReport {
+    pub cloud_api_attestation: DstackCpuQuote,
+    pub vllm_proxy_attestations: Vec<VllmAttestationReport>,
 }

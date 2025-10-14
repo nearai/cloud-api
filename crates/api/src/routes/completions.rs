@@ -1,19 +1,15 @@
 use crate::{
-    conversions::{current_unix_timestamp, generate_completion_id},
-    middleware::auth::AuthenticatedApiKey,
+    middleware::{auth::AuthenticatedApiKey, RequestBodyHash},
     models::*,
     routes::{api::AppState, common::map_domain_error_to_status},
 };
 use axum::{
+    body::{Body, Bytes},
     extract::{Extension, Json, State},
-    http::StatusCode,
-    response::{
-        sse::{Event, Sse},
-        IntoResponse, Json as ResponseJson,
-    },
+    http::{header, StatusCode},
+    response::{IntoResponse, Json as ResponseJson, Response},
 };
 use futures::stream::StreamExt;
-use inference_providers::{FinishReason, StreamChunk};
 use services::completions::ports::{
     CompletionMessage, CompletionRequest as ServiceCompletionRequest,
 };
@@ -29,6 +25,7 @@ fn convert_chat_request_to_service(
     api_key_id: String,
     organization_id: Uuid,
     workspace_id: Uuid,
+    body_hash: RequestBodyHash,
 ) -> ServiceCompletionRequest {
     ServiceCompletionRequest {
         model: request.model.clone(),
@@ -37,7 +34,7 @@ fn convert_chat_request_to_service(
             .iter()
             .map(|msg| CompletionMessage {
                 role: msg.role.clone(),
-                content: msg.content.clone(),
+                content: msg.content.clone().unwrap_or_default(),
             })
             .collect(),
         max_tokens: request.max_tokens,
@@ -50,6 +47,7 @@ fn convert_chat_request_to_service(
         organization_id,
         workspace_id,
         metadata: None,
+        body_hash: body_hash.hash.clone(),
     }
 }
 
@@ -60,6 +58,7 @@ fn convert_text_request_to_service(
     api_key_id: String,
     organization_id: Uuid,
     workspace_id: Uuid,
+    body_hash: RequestBodyHash,
 ) -> ServiceCompletionRequest {
     ServiceCompletionRequest {
         model: request.model.clone(),
@@ -77,6 +76,7 @@ fn convert_text_request_to_service(
         organization_id,
         workspace_id,
         metadata: None,
+        body_hash: body_hash.hash.clone(),
     }
 }
 
@@ -101,6 +101,7 @@ fn convert_text_request_to_service(
 pub async fn chat_completions(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(body_hash): Extension<RequestBodyHash>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     debug!(
@@ -134,122 +135,85 @@ pub async fn chat_completions(
         api_key.api_key.id.0.clone(),
         api_key.organization.id.0,
         api_key.workspace.id.0,
+        body_hash,
     );
 
-    // Call the completion service - it handles usage tracking internally
-    match app_state
-        .completion_service
-        .create_completion_stream(service_request)
-        .await
-    {
-        Ok(stream) => {
-            // Check if streaming is requested
-            if request.stream == Some(true) {
-                let sse_stream = stream
-                    .map(|chunk| match chunk {
-                        Ok(chunk) => Ok::<_, Infallible>(
-                            Event::default()
-                                .data(serde_json::to_string(&chunk).unwrap_or_default()),
-                        ),
+    // Check if streaming is requested
+    if request.stream == Some(true) {
+        // Call the streaming completion service
+        match app_state
+            .completion_service
+            .create_chat_completion_stream(service_request)
+            .await
+        {
+            Ok(stream) => {
+                // Convert to raw bytes stream with proper SSE formatting
+                let byte_stream = stream
+                    .map(|result| match result {
+                        Ok(event) => {
+                            // raw_bytes contains "data: {...}\n", extract just the JSON part
+                            let raw_str = String::from_utf8_lossy(&event.raw_bytes);
+                            let json_data = raw_str
+                                .trim()
+                                .strip_prefix("data: ")
+                                .unwrap_or(raw_str.trim())
+                                .to_string();
+                            tracing::info!("Completion stream event: {}", json_data);
+                            // Format as SSE event with proper newlines
+                            Ok::<Bytes, Infallible>(Bytes::from(format!("data: {}\n\n", json_data)))
+                        }
                         Err(e) => {
                             tracing::error!("Completion stream error: {}", e);
-                            Ok::<_, Infallible>(
-                                Event::default()
-                                    .data(serde_json::to_string(&e).unwrap_or_default()),
-                            )
+                            Ok::<Bytes, Infallible>(Bytes::from(format!("data: error: {}\n\n", e)))
                         }
                     })
                     .chain(futures::stream::once(async move {
-                        Ok::<_, Infallible>(Event::default().data("[DONE]"))
+                        // Send [DONE] with 3 newlines total (1 after [DONE], then 2 more for proper SSE termination)
+                        Ok::<Bytes, Infallible>(Bytes::from_static(b"data: [DONE]\n\n"))
                     }));
 
-                // Return SSE response
-                Sse::new(sse_stream)
-                    .keep_alive(
-                        axum::response::sse::KeepAlive::new()
-                            .interval(std::time::Duration::from_secs(30))
-                            .text("keep-alive-text"),
-                    )
+                // Return raw streaming response with SSE headers
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .header(header::CONNECTION, "keep-alive")
+                    .body(Body::from_stream(byte_stream))
+                    .unwrap()
+            }
+            Err(domain_error) => {
+                let status_code = map_domain_error_to_status(&domain_error);
+                (
+                    status_code,
+                    ResponseJson::<ErrorResponse>(domain_error.into()),
+                )
                     .into_response()
-            } else {
-                // Handle non-streaming response - collect the stream
-                let mut content = String::new();
-                let mut usage: Option<Usage> = None;
-
-                // Pin the stream for iteration
-                let mut stream_pin = stream;
-                while let Some(chunk_result) = stream_pin.next().await {
-                    match chunk_result {
-                        Ok(StreamChunk::Chat(chunk)) => {
-                            // Extract content from delta
-                            if let Some(choice) = chunk.choices.first() {
-                                if let Some(delta) = &choice.delta {
-                                    if let Some(delta_content) = &delta.content {
-                                        content.push_str(delta_content);
-                                    }
-                                }
-                            }
-
-                            // Extract usage from final chunk
-                            if let Some(chunk_usage) = chunk.usage {
-                                usage = Some(Usage {
-                                    input_tokens: chunk_usage.prompt_tokens,
-                                    input_tokens_details: Some(InputTokensDetails {
-                                        cached_tokens: 0,
-                                    }),
-                                    output_tokens: chunk_usage.completion_tokens,
-                                    output_tokens_details: Some(OutputTokensDetails {
-                                        reasoning_tokens: 0,
-                                    }),
-                                    total_tokens: chunk_usage.total_tokens,
-                                });
-                            }
-                        }
-                        Ok(StreamChunk::Text(_)) => {
-                            // Handle text completion if needed
-                        }
-                        Err(e) => {
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                ResponseJson(ErrorResponse::new(
-                                    e.to_string(),
-                                    "completion_error".to_string(),
-                                )),
-                            )
-                                .into_response();
-                        }
-                    }
-                }
-
-                // Build the complete response
-                let final_usage = usage.unwrap_or_else(|| Usage::new(0, 0));
-                let response = ChatCompletionResponse {
-                    id: format!("chatcmpl-{}", generate_completion_id()),
-                    object: "chat.completion".to_string(),
-                    created: current_unix_timestamp(),
-                    model: request.model.clone(),
-                    choices: vec![ChatChoice {
-                        index: 0,
-                        message: Message {
-                            role: "assistant".to_string(),
-                            content,
-                            name: None,
-                        },
-                        finish_reason: Some("stop".to_string()),
-                    }],
-                    usage: final_usage,
-                };
-
-                (StatusCode::OK, ResponseJson(response)).into_response()
             }
         }
-        Err(domain_error) => {
-            let status_code = map_domain_error_to_status(&domain_error);
-            (
-                status_code,
-                ResponseJson::<ErrorResponse>(domain_error.into()),
-            )
-                .into_response()
+    } else {
+        // Call the non-streaming completion service
+        match app_state
+            .completion_service
+            .create_chat_completion(service_request)
+            .await
+        {
+            Ok(response_with_bytes) => {
+                // Return the exact bytes from the provider for hash verification
+                // This ensures clients can hash the response and compare with attestation endpoints
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(response_with_bytes.raw_bytes))
+                    .unwrap()
+            }
+            Err(domain_error) => {
+                let status_code = map_domain_error_to_status(&domain_error);
+                (
+                    status_code,
+                    ResponseJson::<ErrorResponse>(domain_error.into()),
+                )
+                    .into_response()
+            }
         }
     }
 }
@@ -275,6 +239,7 @@ pub async fn chat_completions(
 pub async fn completions(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(body_hash): Extension<RequestBodyHash>,
     Json(request): Json<CompletionRequest>,
 ) -> axum::response::Response {
     debug!(
@@ -308,151 +273,17 @@ pub async fn completions(
         api_key.api_key.id.0.clone(),
         api_key.organization.id.0,
         api_key.workspace.id.0,
+        body_hash,
     );
 
     // Call the completion service - it handles usage tracking internally
     match app_state
         .completion_service
-        .create_completion_stream(service_request)
+        .create_chat_completion_stream(service_request)
         .await
     {
-        Ok(stream) => {
-            // Check if streaming is requested
-            if request.stream == Some(true) {
-                // Convert raw StreamChunk to SSE events
-                let sse_stream = stream
-                    .map(move |chunk_result| {
-                        match chunk_result {
-                            Ok(StreamChunk::Text(chunk)) => {
-                                // Convert to OpenAI-compatible SSE format
-                                if let Some(choice) = chunk.choices.first() {
-                                    let response = StreamChunkResponse {
-                                        id: format!("cmpl-{}", generate_completion_id()),
-                                        object: "text_completion".to_string(),
-                                        created: current_unix_timestamp(),
-                                        model: request.model.clone(),
-                                        choices: vec![StreamChoice {
-                                            index: 0,
-                                            delta: Delta {
-                                                role: None,
-                                                content: Some(choice.text.clone()),
-                                            },
-                                            finish_reason: choice.finish_reason.as_ref().map(|f| {
-                                                match f {
-                                                    FinishReason::Stop => "stop".to_string(),
-                                                    FinishReason::Length => "length".to_string(),
-                                                    FinishReason::ContentFilter => {
-                                                        "content_filter".to_string()
-                                                    }
-                                                }
-                                            }),
-                                        }],
-                                        usage: None,
-                                    };
-
-                                    match serde_json::to_string(&response) {
-                                        Ok(json) => {
-                                            Some(Ok::<_, Infallible>(Event::default().data(json)))
-                                        }
-                                        Err(e) => {
-                                            tracing::error!("JSON serialization error: {}", e);
-                                            None
-                                        }
-                                    }
-                                } else {
-                                    None
-                                }
-                            }
-                            Ok(StreamChunk::Chat(_)) => {
-                                tracing::warn!("Received chat chunk in text completion endpoint");
-                                None
-                            }
-                            Err(e) => {
-                                tracing::error!("Completion stream error: {}", e);
-                                None
-                            }
-                        }
-                    })
-                    .filter_map(|result| async move { result })
-                    .chain(futures::stream::once(async move {
-                        Ok::<_, Infallible>(Event::default().data("[DONE]"))
-                    }));
-
-                // Return SSE response
-                Sse::new(sse_stream)
-                    .keep_alive(
-                        axum::response::sse::KeepAlive::new()
-                            .interval(std::time::Duration::from_secs(30))
-                            .text("keep-alive-text"),
-                    )
-                    .into_response()
-            } else {
-                // Handle non-streaming response - collect the stream
-                let mut content = String::new();
-                let mut usage: Option<Usage> = None;
-
-                let mut stream_pin = stream;
-                while let Some(chunk_result) = stream_pin.next().await {
-                    match chunk_result {
-                        Ok(StreamChunk::Chat(chunk)) => {
-                            // Extract content from delta
-                            if let Some(choice) = chunk.choices.first() {
-                                if let Some(delta) = &choice.delta {
-                                    if let Some(delta_content) = &delta.content {
-                                        content.push_str(delta_content);
-                                    }
-                                }
-                            }
-
-                            // Extract usage from final chunk
-                            if let Some(chunk_usage) = chunk.usage {
-                                usage = Some(Usage {
-                                    input_tokens: chunk_usage.prompt_tokens,
-                                    input_tokens_details: Some(InputTokensDetails {
-                                        cached_tokens: 0,
-                                    }),
-                                    output_tokens: chunk_usage.completion_tokens,
-                                    output_tokens_details: Some(OutputTokensDetails {
-                                        reasoning_tokens: 0,
-                                    }),
-                                    total_tokens: chunk_usage.total_tokens,
-                                });
-                            }
-                        }
-                        Ok(StreamChunk::Text(_)) => {
-                            // Handle text completion if needed
-                        }
-                        Err(e) => {
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                ResponseJson(ErrorResponse::new(
-                                    e.to_string(),
-                                    "completion_error".to_string(),
-                                )),
-                            )
-                                .into_response();
-                        }
-                    }
-                }
-
-                // Build the complete response
-                let final_usage = usage.unwrap_or_else(|| Usage::new(0, 0));
-                let response = CompletionResponse {
-                    id: format!("cmpl-{}", generate_completion_id()),
-                    object: "text_completion".to_string(),
-                    created: current_unix_timestamp(),
-                    model: request.model.clone(),
-                    choices: vec![CompletionChoice {
-                        index: 0,
-                        text: content,
-                        logprobs: None,
-                        finish_reason: Some("stop".to_string()),
-                    }],
-                    usage: final_usage,
-                };
-
-                (StatusCode::OK, ResponseJson(response)).into_response()
-            }
+        Ok(_stream) => {
+            unimplemented!()
         }
         Err(domain_error) => {
             let status_code = map_domain_error_to_status(&domain_error);

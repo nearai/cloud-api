@@ -1,6 +1,5 @@
-use crate::attestation::models::{AttestationError, ChatSignature, GetQuoteResponse};
+use crate::attestation::models::{AttestationError, AttestationReport, ChatSignature};
 use async_trait::async_trait;
-use inference_providers::AttestationReport;
 
 #[async_trait]
 pub trait AttestationServiceTrait: Send + Sync {
@@ -16,10 +15,9 @@ pub trait AttestationServiceTrait: Send + Sync {
 
     async fn get_attestation_report(
         &self,
-        model: String,
+        model: Option<String>,
         signing_algo: Option<String>,
     ) -> Result<AttestationReport, AttestationError>;
-    async fn get_quote(&self) -> Result<GetQuoteResponse, AttestationError>;
 }
 
 #[async_trait]

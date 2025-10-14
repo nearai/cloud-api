@@ -39,7 +39,6 @@ use utoipa::{Modify, OpenApi};
         // Attestation endpoints  
         crate::routes::attestation::get_signature,
         crate::routes::attestation::get_attestation_report,
-        crate::routes::attestation::quote,
         // Model endpoints
         crate::routes::models::list_models,
         crate::routes::models::get_model_by_name,

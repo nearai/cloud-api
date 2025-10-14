@@ -5,7 +5,7 @@ use crate::inference_provider_pool::InferenceProviderPool;
 use crate::models::ModelsRepository;
 use crate::usage::{RecordUsageServiceRequest, UsageServiceTrait};
 use inference_providers::{
-    ChatMessage, InferenceProvider, MessageRole, StreamChunk, StreamingResult,
+    ChatMessage, InferenceProvider, MessageRole, SSEEvent, StreamChunk, StreamingResult,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -17,7 +17,7 @@ use std::task::{Context, Poll};
 
 struct InterceptStream<S>
 where
-    S: Stream<Item = Result<StreamChunk, inference_providers::CompletionError>> + Unpin,
+    S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
 {
     inner: S,
     attestation_service: Arc<dyn AttestationServiceTrait>,
@@ -31,14 +31,14 @@ where
 
 impl<S> Stream for InterceptStream<S>
 where
-    S: Stream<Item = Result<StreamChunk, inference_providers::CompletionError>> + Unpin,
+    S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
 {
-    type Item = Result<StreamChunk, inference_providers::CompletionError>;
+    type Item = Result<SSEEvent, inference_providers::CompletionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(ref chunk))) => {
-                if let StreamChunk::Chat(ref chat_chunk) = chunk {
+            Poll::Ready(Some(Ok(ref event))) => {
+                if let StreamChunk::Chat(ref chat_chunk) = event.chunk {
                     if let Some(usage) = &chat_chunk.usage {
                         // Store attestation signature when completion finishes
                         let attestation_service = self.attestation_service.clone();
@@ -94,7 +94,7 @@ where
                         });
                     }
                 }
-                Poll::Ready(Some(Ok(chunk.clone())))
+                Poll::Ready(Some(Ok(event.clone())))
             }
             other => other,
         }
@@ -167,7 +167,7 @@ impl CompletionServiceImpl {
 
 #[async_trait::async_trait]
 impl ports::CompletionServiceTrait for CompletionServiceImpl {
-    async fn create_completion_stream(
+    async fn create_chat_completion_stream(
         &self,
         request: ports::CompletionRequest,
     ) -> Result<StreamingResult, ports::CompletionError> {
@@ -229,7 +229,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // Get the LLM stream
         let llm_stream = self
             .inference_provider_pool
-            .chat_completion_stream(chat_params)
+            .chat_completion_stream(chat_params, request.body_hash.clone())
             .await
             .map_err(|e| {
                 ports::CompletionError::ProviderError(format!("Failed to create LLM stream: {}", e))
@@ -256,6 +256,119 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .await;
 
         Ok(event_stream)
+    }
+
+    async fn create_chat_completion(
+        &self,
+        request: ports::CompletionRequest,
+    ) -> Result<inference_providers::ChatCompletionResponseWithBytes, ports::CompletionError> {
+        let chat_messages = Self::prepare_chat_messages(&request.messages);
+
+        let mut chat_params = inference_providers::ChatCompletionParams {
+            model: request.model.clone(),
+            messages: chat_messages,
+            max_tokens: request.max_tokens,
+            temperature: request.temperature,
+            top_p: request.top_p,
+            stop: request.stop,
+            stream: Some(false),
+            tools: None,
+            max_completion_tokens: None,
+            n: Some(1),
+            frequency_penalty: None,
+            presence_penalty: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            user: Some(request.user_id.to_string()),
+            response_format: None,
+            seed: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            metadata: request.metadata,
+            store: None,
+            stream_options: None,
+        };
+
+        // Resolve model name (could be an alias) to canonical name
+        let canonical_name = self
+            .models_repository
+            .resolve_to_canonical_name(&request.model)
+            .await
+            .map_err(|e| {
+                ports::CompletionError::InvalidModel(format!("Failed to resolve model name: {}", e))
+            })?;
+
+        // Update params with canonical name if it's different
+        if canonical_name != request.model {
+            tracing::debug!(
+                requested_model = %request.model,
+                canonical_model = %canonical_name,
+                "Resolved alias to canonical model name"
+            );
+            chat_params.model = canonical_name.clone();
+        }
+
+        let response_with_bytes = self
+            .inference_provider_pool
+            .chat_completion(chat_params, request.body_hash.clone())
+            .await
+            .map_err(|e| {
+                ports::CompletionError::ProviderError(format!("Failed to create completion: {}", e))
+            })?;
+
+        // Store attestation signature
+        let attestation_service = self.attestation_service.clone();
+        let chat_id = response_with_bytes.response.id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = attestation_service
+                .store_chat_signature_from_provider(chat_id.as_str())
+                .await
+            {
+                tracing::error!("Failed to store chat signature: {:?}", e);
+            } else {
+                tracing::debug!("Stored signature for chat_id: {}", chat_id);
+            }
+        });
+
+        // Record usage
+        let usage_service = self.usage_service.clone();
+        let organization_id = request.organization_id;
+        let workspace_id = request.workspace_id;
+        let api_key_id = uuid::Uuid::parse_str(&request.api_key_id).map_err(|e| {
+            ports::CompletionError::InvalidParams(format!("Invalid API key ID: {}", e))
+        })?;
+        let model_id = response_with_bytes.response.model.clone();
+        let input_tokens = response_with_bytes.response.usage.prompt_tokens;
+        let output_tokens = response_with_bytes.response.usage.completion_tokens;
+
+        tokio::spawn(async move {
+            if let Err(e) = usage_service
+                .record_usage(RecordUsageServiceRequest {
+                    organization_id,
+                    workspace_id,
+                    api_key_id,
+                    response_id: None,
+                    model_id,
+                    input_tokens,
+                    output_tokens,
+                    request_type: "chat_completion".to_string(),
+                })
+                .await
+            {
+                tracing::error!("Failed to record usage in completion service: {}", e);
+            } else {
+                tracing::debug!(
+                    "Recorded usage for org {}: {} input, {} output tokens (api_key: {})",
+                    organization_id,
+                    input_tokens,
+                    output_tokens,
+                    api_key_id
+                );
+            }
+        });
+
+        Ok(response_with_bytes)
     }
 }
 

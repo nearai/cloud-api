@@ -5,7 +5,7 @@ use crate::inference_provider_pool::InferenceProviderPool;
 use crate::models::ModelsRepository;
 use crate::usage::{RecordUsageServiceRequest, UsageServiceTrait};
 use inference_providers::{
-    ChatMessage, InferenceProvider, MessageRole, StreamChunk, StreamingResult,
+    ChatMessage, InferenceProvider, MessageRole, SSEEvent, StreamChunk, StreamingResult,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -17,7 +17,7 @@ use std::task::{Context, Poll};
 
 struct InterceptStream<S>
 where
-    S: Stream<Item = Result<StreamChunk, inference_providers::CompletionError>> + Unpin,
+    S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
 {
     inner: S,
     attestation_service: Arc<dyn AttestationServiceTrait>,
@@ -31,14 +31,14 @@ where
 
 impl<S> Stream for InterceptStream<S>
 where
-    S: Stream<Item = Result<StreamChunk, inference_providers::CompletionError>> + Unpin,
+    S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
 {
-    type Item = Result<StreamChunk, inference_providers::CompletionError>;
+    type Item = Result<SSEEvent, inference_providers::CompletionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(ref chunk))) => {
-                if let StreamChunk::Chat(ref chat_chunk) = chunk {
+            Poll::Ready(Some(Ok(ref event))) => {
+                if let StreamChunk::Chat(ref chat_chunk) = event.chunk {
                     if let Some(usage) = &chat_chunk.usage {
                         // Store attestation signature when completion finishes
                         let attestation_service = self.attestation_service.clone();
@@ -94,7 +94,7 @@ where
                         });
                     }
                 }
-                Poll::Ready(Some(Ok(chunk.clone())))
+                Poll::Ready(Some(Ok(event.clone())))
             }
             other => other,
         }

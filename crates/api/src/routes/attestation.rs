@@ -145,17 +145,17 @@ impl From<services::attestation::models::VllmAttestationReport> for VllmAttestat
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AttestationResponse {
-    pub cloud_api_attestation: DstackCpuQuote,
+    pub gateway_attestation: DstackCpuQuote,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub vllm_proxy_attestations: Vec<VllmAttestationReport>,
+    pub model_attestations: Vec<VllmAttestationReport>,
 }
 
 impl From<services::attestation::models::AttestationReport> for AttestationResponse {
     fn from(report: services::attestation::models::AttestationReport) -> Self {
         Self {
-            cloud_api_attestation: report.cloud_api_attestation.into(),
-            vllm_proxy_attestations: report
-                .vllm_proxy_attestations
+            gateway_attestation: report.gateway_attestation.into(),
+            model_attestations: report
+                .model_attestations
                 .into_iter()
                 .map(VllmAttestationReport::from)
                 .collect(),

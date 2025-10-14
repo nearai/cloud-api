@@ -90,7 +90,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         signing_algo: Option<String>,
     ) -> Result<AttestationReport, AttestationError> {
         // Resolve model name (could be an alias) to canonical name
-        let mut vllm_proxy_attestations = vec![];
+        let mut model_attestations = vec![];
         if let Some(model) = model {
             let canonical_name = self
                 .models_repository
@@ -109,21 +109,21 @@ impl ports::AttestationServiceTrait for AttestationService {
                 );
             }
 
-            vllm_proxy_attestations = self
+            model_attestations = self
                 .inference_provider_pool
                 .get_attestation_report(canonical_name, signing_algo)
                 .await
                 .map_err(|e| AttestationError::ProviderError(e.to_string()))?;
         }
-        let cloud_api_attestation;
+        let gateway_attestation;
         if let Ok(_dev) = std::env::var("DEV") {
-            cloud_api_attestation = DstackCpuQuote {
+            gateway_attestation = DstackCpuQuote {
                 quote: "0x1234567890abcdef".to_string(),
                 event_log: "0x1234567890abcdef".to_string(),
             };
         } else {
             let client = dstack_client::DstackClient::new(None);
-            cloud_api_attestation = client
+            gateway_attestation = client
                 .get_quote(vec![8])
                 .await
                 .map_err(|e| {
@@ -139,8 +139,8 @@ impl ports::AttestationServiceTrait for AttestationService {
         }
 
         Ok(AttestationReport {
-            cloud_api_attestation,
-            vllm_proxy_attestations,
+            gateway_attestation,
+            model_attestations,
         })
     }
 }

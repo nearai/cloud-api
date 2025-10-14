@@ -50,6 +50,6 @@ impl From<dstack_sdk::dstack_client::GetQuoteResponse> for DstackCpuQuote {
 }
 
 pub struct AttestationReport {
-    pub cloud_api_attestation: DstackCpuQuote,
-    pub vllm_proxy_attestations: Vec<VllmAttestationReport>,
+    pub gateway_attestation: DstackCpuQuote,
+    pub model_attestations: Vec<VllmAttestationReport>,
 }

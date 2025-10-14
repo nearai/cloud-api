@@ -34,7 +34,7 @@ fn convert_chat_request_to_service(
             .iter()
             .map(|msg| CompletionMessage {
                 role: msg.role.clone(),
-                content: msg.content.clone(),
+                content: msg.content.clone().unwrap_or_default(),
             })
             .collect(),
         max_tokens: request.max_tokens,

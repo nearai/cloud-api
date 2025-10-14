@@ -75,20 +75,20 @@ impl ClusterManager {
     /// Initialize the cluster manager and create initial pools
     pub async fn initialize(&self) -> Result<()> {
         info!("Initializing cluster manager");
-        
+
         // Perform initial discovery
         self.discovery.update_cluster_state().await?;
-        
+
         // Create write pool for leader
         if let Some(leader) = self.discovery.get_leader().await {
             self.create_write_pool(&leader).await?;
         } else {
             return Err(anyhow!("No leader found during initialization"));
         }
-        
+
         // Create read pools for replicas
         self.update_read_pools().await?;
-        
+
         info!("Cluster manager initialized successfully");
         Ok(())
     }
@@ -109,17 +109,20 @@ impl ClusterManager {
         // Test the connection
         let conn = pool.get().await?;
         conn.simple_query("SELECT 1").await?;
-        
+
         // Verify this is actually the leader
         let rows = conn.query("SELECT pg_is_in_recovery()", &[]).await?;
         let is_replica: bool = rows[0].get(0);
         if is_replica {
-            warn!("Node {} claims to be leader but is in recovery mode", leader.name);
+            warn!(
+                "Node {} claims to be leader but is in recovery mode",
+                leader.name
+            );
         }
 
         let mut write_pool = self.write_pool.write().await;
         *write_pool = Some(pool);
-        
+
         info!("Write pool created successfully for leader {}", leader.name);
         Ok(())
     }
@@ -128,12 +131,10 @@ impl ClusterManager {
     async fn update_read_pools(&self) -> Result<()> {
         let replicas = self.discovery.get_replicas().await;
         let mut read_pools = self.read_pools.write().await;
-        
+
         // Remove pools for replicas that no longer exist
-        read_pools.retain(|host, _| {
-            replicas.iter().any(|r| &r.host == host)
-        });
-        
+        read_pools.retain(|host, _| replicas.iter().any(|r| &r.host == host));
+
         // Add pools for new replicas
         for replica in replicas {
             if !read_pools.contains_key(&replica.host) {
@@ -141,7 +142,7 @@ impl ClusterManager {
                     "Creating read pool for replica: {} ({}:{})",
                     replica.name, replica.host, replica.port
                 );
-                
+
                 match self.create_pool(
                     &replica.host,
                     replica.port,
@@ -157,7 +158,7 @@ impl ClusterManager {
                 }
             }
         }
-        
+
         info!("Read pools updated: {} replicas", read_pools.len());
         Ok(())
     }
@@ -196,7 +197,7 @@ impl ClusterManager {
         let pool = write_pool
             .as_ref()
             .ok_or_else(|| anyhow!("No write pool available"))?;
-        
+
         pool.get()
             .await
             .map_err(|e| anyhow!("Failed to get write connection: {}", e))
@@ -214,26 +215,29 @@ impl ClusterManager {
     /// Get read connection using round-robin selection
     async fn get_read_connection_round_robin(&self) -> Result<PooledConnection> {
         let read_pools = self.read_pools.read().await;
-        
+
         if read_pools.is_empty() {
             debug!("No read replicas available, falling back to leader");
             return self.get_write_connection().await;
         }
-        
+
         let index = self.round_robin_counter.fetch_add(1, Ordering::Relaxed);
         let replicas = self.discovery.get_replicas().await;
-        
+
         if let Some(replica) = replicas.get(index % replicas.len()) {
             if let Some(pool) = read_pools.get(&replica.host) {
                 match pool.get().await {
                     Ok(conn) => return Ok(conn),
                     Err(e) => {
-                        warn!("Failed to get connection from replica {}: {}", replica.name, e);
+                        warn!(
+                            "Failed to get connection from replica {}: {}",
+                            replica.name, e
+                        );
                     }
                 }
             }
         }
-        
+
         // Fallback to leader
         debug!("Round-robin selection failed, falling back to leader");
         self.get_write_connection().await
@@ -242,12 +246,12 @@ impl ClusterManager {
     /// Get read connection from replica with least lag
     async fn get_read_connection_least_lag(&self) -> Result<PooledConnection> {
         let read_pools = self.read_pools.read().await;
-        
+
         if read_pools.is_empty() {
             debug!("No read replicas available, falling back to leader");
             return self.get_write_connection().await;
         }
-        
+
         // Get replica with least lag
         if let Some(replica) = self
             .discovery
@@ -257,16 +261,22 @@ impl ClusterManager {
             if let Some(pool) = read_pools.get(&replica.host) {
                 match pool.get().await {
                     Ok(conn) => {
-                        debug!("Using replica {} with lag {:?}ms", replica.name, replica.lag);
+                        debug!(
+                            "Using replica {} with lag {:?}ms",
+                            replica.name, replica.lag
+                        );
                         return Ok(conn);
                     }
                     Err(e) => {
-                        warn!("Failed to get connection from replica {}: {}", replica.name, e);
+                        warn!(
+                            "Failed to get connection from replica {}: {}",
+                            replica.name, e
+                        );
                     }
                 }
             }
         }
-        
+
         // Fallback to leader
         debug!("No suitable replica found, falling back to leader");
         self.get_write_connection().await
@@ -275,20 +285,20 @@ impl ClusterManager {
     /// Handle leader change event
     pub async fn handle_leader_change(&self) -> Result<()> {
         warn!("Handling leader change");
-        
+
         // Get new leader
         let leader = self
             .discovery
             .get_leader()
             .await
             .ok_or_else(|| anyhow!("No leader available after failover"))?;
-        
+
         // Recreate write pool
         self.create_write_pool(&leader).await?;
-        
+
         // Update read pools
         self.update_read_pools().await?;
-        
+
         info!("Leader change handled successfully");
         Ok(())
     }
@@ -299,10 +309,10 @@ impl ClusterManager {
         tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_secs(30));
             let mut last_leader: Option<String> = None;
-            
+
             loop {
                 interval.tick().await;
-                
+
                 // Check for leader changes
                 if let Some(leader) = manager.discovery.get_leader().await {
                     let current_leader = Some(leader.host.clone());
@@ -317,7 +327,7 @@ impl ClusterManager {
                         last_leader = current_leader;
                     }
                 }
-                
+
                 // Update read pools periodically
                 if let Err(e) = manager.update_read_pools().await {
                     error!("Failed to update read pools: {}", e);
@@ -332,7 +342,7 @@ impl ClusterManager {
         let read_pool_count = self.read_pools.read().await.len();
         let leader = self.discovery.get_leader().await;
         let replicas = self.discovery.get_replicas().await;
-        
+
         ClusterStats {
             write_available,
             read_pool_count,
@@ -340,6 +350,15 @@ impl ClusterManager {
             replica_count: replicas.len(),
             state_age_secs: self.discovery.get_state_age_secs().await,
         }
+    }
+
+    /// Get a clone of the write pool for direct access
+    pub async fn get_write_pool(&self) -> Result<Pool> {
+        let pool_guard = self.write_pool.read().await;
+        pool_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("Write pool not initialized"))
+            .map(|p| p.clone())
     }
 }
 

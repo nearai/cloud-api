@@ -1,0 +1,91 @@
+# Docker Compose configuration for Cloud API in a VPC environment
+# This setup includes the dstack-service for VPC management and an init container
+# to prepare necessary configuration files before starting the Cloud API service.
+
+services:
+  dstack-service:
+    image: endnearai/dstack-service
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    environment:
+      - VPC_NODE_NAME=cloud-api
+      - VPC_SERVER_APP_ID=${VPC_SERVER_APP_ID}
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /var/run/dstack.sock || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # Init container to prepare configuration
+  api-init:
+    image: alpine:latest
+    container_name: api-init
+    restart: "no"
+    volumes:
+      - api_config:/config
+    configs:
+      - source: api_init_script
+        target: /init.sh
+        mode: 0755
+    command: ["/init.sh"]
+    depends_on:
+      dstack-service:
+        condition: service_healthy
+
+  # Cloud API service
+  cloud-api:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - api_config:/config:ro
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_PRIMARY_APP_ID=${POSTGRES_PRIMARY_APP_ID}
+      - VPC_SERVER_APP_ID=${VPC_SERVER_APP_ID}
+    dns:
+      - 100.100.100.100
+    dns_search:
+      - dstack.internal
+    ports:
+      - "0.0.0.0:3000:3000"
+    depends_on:
+      api-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+      start_period: 40s
+
+volumes:
+  api_config:
+
+configs:
+  api_init_script:
+    content: |
+      #!/bin/sh
+      set -e
+
+      echo "Cloud API initialization starting..."
+
+      # Wait for VPC service to be ready
+      echo "Waiting for VPC service..."
+      while ! wget -q -O - http://dstack-service/vpc/0/shared_key >/dev/null 2>&1; do
+        echo "  Waiting for dstack-service..."
+        sleep 2
+      done
+
+      echo "Fetching shared key..."
+      wget -q -O /config/keyfile http://dstack-service/vpc/0/shared_key
+
+      # Derive PostgreSQL password from keyfile (same algorithm as Patroni)
+      POSTGRES_PASSWORD=$$(head -c 32 /config/keyfile | base64 | tr -d "\n")
+      echo "$$POSTGRES_PASSWORD" > /config/postgres-password
+      chmod 644 /config/postgres-password
+
+      echo "Initialization complete"

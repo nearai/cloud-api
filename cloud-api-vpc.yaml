@@ -40,6 +40,7 @@ services:
     image: endnearai/cloud-api
     restart: unless-stopped
     volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
       - api_config:/config:ro
     environment:
       - POSTGRES_PRIMARY_APP_ID=${POSTGRES_PRIMARY_APP_ID}

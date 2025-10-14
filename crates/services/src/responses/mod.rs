@@ -304,7 +304,7 @@ impl ResponseService {
             async move {
                 match chunk_result {
                     Ok(stream_chunk) => {
-                        match stream_chunk {
+                        match stream_chunk.chunk {
                             StreamChunk::Chat(chunk) => {
                                 // Extract delta content
                                 if let Some(choice) = chunk.choices.first() {

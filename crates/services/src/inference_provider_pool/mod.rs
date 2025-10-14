@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use inference_providers::{
-    models::{CompletionError, ListModelsError, ModelsResponse, StreamChunk},
+    models::{CompletionError, ListModelsError, ModelsResponse},
     ChatCompletionParams, ChatSignature, CompletionParams, InferenceProvider, StreamingResult,
     StreamingResultExt, VLlmConfig, VLlmProvider, VllmAttestationReport,
 };
@@ -371,17 +371,19 @@ impl InferenceProvider for InferenceProviderPool {
                     .chat_completion_stream(params, request_hash)
                     .await?;
                 let mut peekable = StreamingResultExt::peekable(stream);
-                if let Some(Ok(StreamChunk::Chat(chat_chunk))) = peekable.peek().await {
-                    let chat_id = chat_chunk.id.clone();
-                    let pool = self.clone();
-                    let provider = provider.clone();
-                    tokio::spawn(async move {
-                        tracing::info!(
-                            chat_id = %chat_id,
-                            "Storing chat_id mapping"
-                        );
-                        pool.store_chat_id_mapping(chat_id, provider).await;
-                    });
+                if let Some(Ok(event)) = peekable.peek().await {
+                    if let inference_providers::StreamChunk::Chat(chat_chunk) = &event.chunk {
+                        let chat_id = chat_chunk.id.clone();
+                        let pool = self.clone();
+                        let provider = provider.clone();
+                        tokio::spawn(async move {
+                            tracing::info!(
+                                chat_id = %chat_id,
+                                "Storing chat_id mapping"
+                            );
+                            pool.store_chat_id_mapping(chat_id, provider).await;
+                        });
+                    }
                 }
                 Ok(Box::pin(peekable))
             }

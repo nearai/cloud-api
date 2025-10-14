@@ -41,8 +41,6 @@ services:
     restart: unless-stopped
     volumes:
       - api_config:/config:ro
-    env_file:
-      - .env
     environment:
       - POSTGRES_PRIMARY_APP_ID=${POSTGRES_PRIMARY_APP_ID}
       - VPC_SERVER_APP_ID=${VPC_SERVER_APP_ID}

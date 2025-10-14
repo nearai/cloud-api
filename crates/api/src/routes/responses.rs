@@ -1,4 +1,4 @@
-use crate::models::*;
+use crate::{middleware::RequestBodyHash, models::*};
 use axum::{
     extract::{Extension, Json, Path, Query, State},
     http::StatusCode,
@@ -90,6 +90,7 @@ fn user_uuid_to_user_id(uuid: Uuid) -> UserId {
 pub async fn create_response(
     State(service): State<Arc<ResponseService>>,
     Extension(api_key): Extension<services::workspace::ApiKey>,
+    Extension(body_hash): Extension<RequestBodyHash>,
     Json(request): Json<CreateResponseRequest>,
 ) -> axum::response::Response {
     debug!("Create response request from key: {:?}", api_key);
@@ -156,6 +157,7 @@ pub async fn create_response(
         top_p: request.top_p,
         user_id: user_uuid_to_user_id(api_key.created_by_user_id.0),
         metadata: request.metadata.clone(),
+        body_hash: body_hash.hash.clone(),
     };
 
     // Check if streaming is requested

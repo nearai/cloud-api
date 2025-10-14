@@ -1,13 +1,24 @@
 use async_trait::async_trait;
 use inference_providers::{
-    models::{CompletionError, ListModelsError, ModelsResponse, StreamChunk},
-    AttestationReport, ChatCompletionParams, ChatSignature, CompletionParams, InferenceProvider,
-    StreamingResult, StreamingResultExt, VLlmConfig, VLlmProvider,
+    models::{CompletionError, ListModelsError, ModelsResponse},
+    ChatCompletionParams, ChatSignature, CompletionParams, InferenceProvider, StreamingResult,
+    StreamingResultExt, VLlmConfig, VLlmProvider, VllmAttestationReport,
 };
+use serde::Deserialize;
 use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 
 type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
+
+/// Discovery entry returned by the discovery layer
+#[derive(Debug, Clone, Deserialize)]
+struct DiscoveryEntry {
+    /// Model identifier (e.g., "deepseek-ai/DeepSeek-V3.1")
+    model: String,
+    /// Tags for filtering/routing (e.g., ["prod", "dev"])
+    #[serde(default)]
+    tags: Vec<String>,
+}
 
 #[derive(Clone)]
 pub struct InferenceProviderPool {
@@ -65,7 +76,9 @@ impl InferenceProviderPool {
     }
 
     /// Fetch and parse models from discovery endpoint
-    async fn fetch_from_discovery(&self) -> Result<HashMap<String, String>, ListModelsError> {
+    async fn fetch_from_discovery(
+        &self,
+    ) -> Result<HashMap<String, DiscoveryEntry>, ListModelsError> {
         tracing::info!(
             url = %self.discovery_url,
             "Fetching models from discovery server"
@@ -84,7 +97,7 @@ impl InferenceProviderPool {
             .await
             .map_err(|e| ListModelsError::FetchError(format!("HTTP request failed: {}", e)))?;
 
-        let discovery_map: HashMap<String, String> = response
+        let discovery_map: HashMap<String, DiscoveryEntry> = response
             .json()
             .await
             .map_err(|e| ListModelsError::FetchError(format!("Failed to parse JSON: {}", e)))?;
@@ -141,25 +154,27 @@ impl InferenceProviderPool {
         // Group by model name
         let mut model_to_endpoints: HashMap<String, Vec<(String, u16)>> = HashMap::new();
 
-        for (key, model_name) in discovery_map {
+        for (key, entry) in discovery_map {
             // Filter out non-IP keys
             if let Some((ip, port)) = Self::parse_ip_port(&key) {
                 tracing::debug!(
                     key = %key,
-                    model = %model_name,
+                    model = %entry.model,
+                    tags = ?entry.tags,
                     ip = %ip,
                     port = port,
                     "Adding IP-based provider"
                 );
 
                 model_to_endpoints
-                    .entry(model_name)
+                    .entry(entry.model)
                     .or_default()
                     .push((ip, port));
             } else {
                 tracing::debug!(
                     key = %key,
-                    model = %model_name,
+                    model = %entry.model,
+                    tags = ?entry.tags,
                     "Skipping non-IP key"
                 );
             }
@@ -216,6 +231,14 @@ impl InferenceProviderPool {
             object: "list".to_string(),
             data: all_models,
         })
+    }
+
+    async fn get_providers_for_model(
+        &self,
+        model_id: &str,
+    ) -> Option<Vec<Arc<InferenceProviderTrait>>> {
+        let model_mapping = self.model_mapping.read().await;
+        model_mapping.get(model_id).cloned()
     }
 
     /// Get the next provider for a model using round-robin load balancing
@@ -312,14 +335,25 @@ impl InferenceProvider for InferenceProviderPool {
         &self,
         model: String,
         signing_algo: Option<String>,
-    ) -> Result<AttestationReport, CompletionError> {
+    ) -> Result<Vec<VllmAttestationReport>, CompletionError> {
         // Get the first provider for this model
-        if let Some(provider) = self.get_next_provider_for_model(&model).await {
-            return provider.get_attestation_report(model, signing_algo).await;
+        let mut attestations = vec![];
+        if let Some(providers) = self.get_providers_for_model(&model).await {
+            for provider in providers {
+                attestations.extend(
+                    provider
+                        .get_attestation_report(model.clone(), signing_algo.clone())
+                        .await?,
+                );
+            }
         }
-        Err(CompletionError::CompletionError(
-            "No provider found that supports attestation reports".to_string(),
-        ))
+        if attestations.is_empty() {
+            return Err(CompletionError::CompletionError(format!(
+                "No provider found that supports attestation reports for model: {}",
+                model
+            )));
+        }
+        Ok(attestations)
     }
 
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
@@ -329,6 +363,7 @@ impl InferenceProvider for InferenceProviderPool {
     async fn chat_completion_stream(
         &self,
         params: ChatCompletionParams,
+        request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
         let model_id = params.model.clone();
 
@@ -347,19 +382,23 @@ impl InferenceProvider for InferenceProviderPool {
                     model_id = %model_id,
                     "Found provider for model, calling chat_completion_stream"
                 );
-                let stream = provider.chat_completion_stream(params).await?;
+                let stream = provider
+                    .chat_completion_stream(params, request_hash)
+                    .await?;
                 let mut peekable = StreamingResultExt::peekable(stream);
-                if let Some(Ok(StreamChunk::Chat(chat_chunk))) = peekable.peek().await {
-                    let chat_id = chat_chunk.id.clone();
-                    let pool = self.clone();
-                    let provider = provider.clone();
-                    tokio::spawn(async move {
-                        tracing::info!(
-                            chat_id = %chat_id,
-                            "Storing chat_id mapping"
-                        );
-                        pool.store_chat_id_mapping(chat_id, provider).await;
-                    });
+                if let Some(Ok(event)) = peekable.peek().await {
+                    if let inference_providers::StreamChunk::Chat(chat_chunk) = &event.chunk {
+                        let chat_id = chat_chunk.id.clone();
+                        let pool = self.clone();
+                        let provider = provider.clone();
+                        tokio::spawn(async move {
+                            tracing::info!(
+                                chat_id = %chat_id,
+                                "Storing chat_id mapping"
+                            );
+                            pool.store_chat_id_mapping(chat_id, provider).await;
+                        });
+                    }
                 }
                 Ok(Box::pin(peekable))
             }
@@ -372,6 +411,47 @@ impl InferenceProvider for InferenceProviderPool {
                     available_models = ?available_models,
                     "Model not found in provider pool"
                 );
+                Err(CompletionError::CompletionError(format!(
+                    "Model '{}' not found in any configured provider. Available models: {:?}",
+                    model_id, available_models
+                )))
+            }
+        }
+    }
+
+    async fn chat_completion(
+        &self,
+        params: ChatCompletionParams,
+        request_hash: String,
+    ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError> {
+        let model_id = params.model.clone();
+        match self.get_next_provider_for_model(&model_id).await {
+            Some(provider) => {
+                tracing::info!(
+                    model_id = %model_id,
+                    "Found provider for model, calling chat_completion"
+                );
+                let response = provider.chat_completion(params, request_hash).await?;
+
+                // Store the chat_id mapping SYNCHRONOUSLY before returning
+                // This ensures the attestation service can find the provider
+                let chat_id = response.response.id.clone();
+                tracing::info!(
+                    chat_id = %chat_id,
+                    "Storing chat_id mapping for non-streaming completion"
+                );
+                self.store_chat_id_mapping(chat_id.clone(), provider.clone())
+                    .await;
+                tracing::debug!(
+                    chat_id = %chat_id,
+                    "Stored chat_id mapping before returning response"
+                );
+
+                Ok(response)
+            }
+            None => {
+                let model_mapping = self.model_mapping.read().await;
+                let available_models: Vec<_> = model_mapping.keys().collect();
                 Err(CompletionError::CompletionError(format!(
                     "Model '{}' not found in any configured provider. Available models: {:?}",
                     model_id, available_models

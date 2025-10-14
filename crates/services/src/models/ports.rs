@@ -20,7 +20,10 @@ pub struct ModelInfo {
 #[derive(Debug, Clone)]
 pub struct ModelWithPricing {
     pub id: Uuid,
+    /// Internal/canonical model name (e.g., "nearai/gpt-oss-120b") used for vLLM
     pub model_name: String,
+    /// Public-facing model name (e.g., "openai/gpt-oss-120b") shown to API consumers
+    pub public_name: String,
     pub model_display_name: String,
     pub model_description: String,
     pub model_icon: Option<String>,

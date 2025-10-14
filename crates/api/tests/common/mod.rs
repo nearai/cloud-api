@@ -264,6 +264,7 @@ pub fn generate_model() -> BatchUpdateModelApiRequest {
     batch.insert(
         "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
         serde_json::from_value(serde_json::json!({
+            "publicName": "qwen/qwen3-30b-instruct",
             "inputCostPerToken": {
                 "amount": 1000000,
                 "currency": "USD"

@@ -299,7 +299,8 @@ pub async fn completions(
 /// List available models
 ///
 /// Lists all available AI models that can be used for completions.
-/// No pagination to follow the OpenAI API spec
+/// Returns models from the database with public-facing names.
+/// No pagination to follow the OpenAI API spec - returns all active models.
 #[utoipa::path(
     get,
     path = "/models",
@@ -319,25 +320,29 @@ pub async fn models(
 ) -> Result<ResponseJson<ModelsResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!("Models list request from key: {:?}", api_key.id);
 
-    let models = app_state.models_service.get_models().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ResponseJson(ErrorResponse::new(
-                e.to_string(),
-                "internal_server_error".to_string(),
-            )),
-        )
-    })?;
+    let (models, _total) = app_state
+        .models_service
+        .get_models_with_pricing(1000, 0)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    e.to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
 
     let response = ModelsResponse {
         object: "list".to_string(),
         data: models
             .into_iter()
             .map(|model| ModelInfo {
-                id: model.id,
-                object: model.object,
-                created: model.created,
-                owned_by: model.owned_by,
+                id: model.public_name,
+                object: "model".to_string(),
+                created: 0,
+                owned_by: "system".to_string(),
             })
             .collect(),
     };

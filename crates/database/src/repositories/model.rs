@@ -46,12 +46,12 @@ impl ModelRepository {
             .query(
                 r#"
                 SELECT 
-                    id, model_name, model_display_name, model_description, model_icon,
+                    id, model_name, public_name, model_display_name, model_description, model_icon,
                     input_cost_per_token, output_cost_per_token,
                     context_length, verifiable, is_active, created_at, updated_at
                 FROM models 
                 WHERE is_active = true
-                ORDER BY model_name ASC
+                ORDER BY public_name ASC
                 LIMIT $1 OFFSET $2
                 "#,
                 &[&limit, &offset],
@@ -78,7 +78,7 @@ impl ModelRepository {
             .query(
                 r#"
                 SELECT 
-                    id, model_name, model_display_name, model_description, model_icon,
+                    id, model_name, public_name, model_display_name, model_description, model_icon,
                     input_cost_per_token, output_cost_per_token,
                     context_length, verifiable, is_active, created_at, updated_at
                 FROM models 
@@ -108,44 +108,100 @@ impl ModelRepository {
             .await
             .context("Failed to get database connection")?;
 
-        // Use INSERT ... ON CONFLICT for upsert behavior
-        let row = client
-            .query_one(
-                r#"
-                INSERT INTO models (
-                    model_name, 
-                    input_cost_per_token, output_cost_per_token,
-                    model_display_name, model_description, model_icon,
-                    context_length, verifiable, is_active
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                ON CONFLICT (model_name) DO UPDATE SET
-                    input_cost_per_token = COALESCE($2, models.input_cost_per_token),
-                    output_cost_per_token = COALESCE($3, models.output_cost_per_token),
-                    model_display_name = COALESCE($4, models.model_display_name),
-                    model_description = COALESCE($5, models.model_description),
-                    model_icon = COALESCE($6, models.model_icon),
-                    context_length = COALESCE($7, models.context_length),
-                    verifiable = COALESCE($8, models.verifiable),
-                    is_active = COALESCE($9, models.is_active),
-                    updated_at = NOW()
-                RETURNING id, model_name, model_display_name, model_description, model_icon,
-                          input_cost_per_token, output_cost_per_token,
-                          context_length, verifiable, is_active, created_at, updated_at
-                "#,
-                &[
-                    &model_name,
-                    &update_request.input_cost_per_token,
-                    &update_request.output_cost_per_token,
-                    &update_request.model_display_name,
-                    &update_request.model_description,
-                    &update_request.model_icon,
-                    &update_request.context_length,
-                    &update_request.verifiable,
-                    &update_request.is_active,
-                ],
-            )
-            .await
-            .context("Failed to upsert model pricing")?;
+        // Check if model exists
+        let existing = self.get_by_name(model_name).await?;
+
+        let row = if existing.is_some() {
+            // Model exists - do UPDATE (partial updates work)
+            client
+                .query_one(
+                    r#"
+                    UPDATE models SET
+                        public_name = COALESCE($2, public_name),
+                        input_cost_per_token = COALESCE($3, input_cost_per_token),
+                        output_cost_per_token = COALESCE($4, output_cost_per_token),
+                        model_display_name = COALESCE($5, model_display_name),
+                        model_description = COALESCE($6, model_description),
+                        model_icon = COALESCE($7, model_icon),
+                        context_length = COALESCE($8, context_length),
+                        verifiable = COALESCE($9, verifiable),
+                        is_active = COALESCE($10, is_active),
+                        updated_at = NOW()
+                    WHERE model_name = $1
+                    RETURNING id, model_name, public_name, model_display_name, model_description, model_icon,
+                              input_cost_per_token, output_cost_per_token,
+                              context_length, verifiable, is_active, created_at, updated_at
+                    "#,
+                    &[
+                        &model_name,
+                        &update_request.public_name,
+                        &update_request.input_cost_per_token,
+                        &update_request.output_cost_per_token,
+                        &update_request.model_display_name,
+                        &update_request.model_description,
+                        &update_request.model_icon,
+                        &update_request.context_length,
+                        &update_request.verifiable,
+                        &update_request.is_active,
+                    ],
+                )
+                .await
+                .context("Failed to update model pricing")?
+        } else {
+            // Model doesn't exist - do INSERT (need required fields)
+            // Use existing values or default to model_name for public_name if not provided
+            let public_name = update_request
+                .public_name
+                .as_ref()
+                .or(Some(&model_name.to_string()))
+                .cloned()
+                .context("public_name is required for new models")?;
+
+            let display_name = update_request
+                .model_display_name
+                .as_ref()
+                .cloned()
+                .context("model_display_name is required for new models")?;
+
+            let description = update_request
+                .model_description
+                .as_ref()
+                .cloned()
+                .context("model_description is required for new models")?;
+
+            let context_length = update_request
+                .context_length
+                .context("context_length is required for new models")?;
+
+            client
+                .query_one(
+                    r#"
+                    INSERT INTO models (
+                        model_name, public_name,
+                        input_cost_per_token, output_cost_per_token,
+                        model_display_name, model_description, model_icon,
+                        context_length, verifiable, is_active
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    RETURNING id, model_name, public_name, model_display_name, model_description, model_icon,
+                              input_cost_per_token, output_cost_per_token,
+                              context_length, verifiable, is_active, created_at, updated_at
+                    "#,
+                    &[
+                        &model_name,
+                        &public_name,
+                        &update_request.input_cost_per_token.unwrap_or(0),
+                        &update_request.output_cost_per_token.unwrap_or(0),
+                        &display_name,
+                        &description,
+                        &update_request.model_icon,
+                        &context_length,
+                        &update_request.verifiable.unwrap_or(true),
+                        &update_request.is_active.unwrap_or(true),
+                    ],
+                )
+                .await
+                .context("Failed to insert new model")?
+        };
 
         Ok(self.row_to_model(&row))
     }
@@ -162,16 +218,17 @@ impl ModelRepository {
             .query_one(
                 r#"
                 INSERT INTO models (
-                    model_name, model_display_name, model_description, model_icon,
+                    model_name, public_name, model_display_name, model_description, model_icon,
                     input_cost_per_token, output_cost_per_token,
                     context_length, verifiable, is_active
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                RETURNING id, model_name, model_display_name, model_description, model_icon,
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                RETURNING id, model_name, public_name, model_display_name, model_description, model_icon,
                           input_cost_per_token, output_cost_per_token,
                           context_length, verifiable, is_active, created_at, updated_at
                 "#,
                 &[
                     &model.model_name,
+                    &model.public_name,
                     &model.model_display_name,
                     &model.model_description,
                     &model.model_icon,
@@ -344,17 +401,68 @@ impl ModelRepository {
         Ok(result > 0)
     }
 
-    /// Resolve a model name (which could be an alias) to the canonical model name
-    /// If the name is already canonical, returns it as-is
-    /// If the name is an alias, resolves to the canonical name
-    pub async fn resolve_to_canonical_name(&self, model_name: &str) -> Result<String> {
+    /// Get model by public name
+    pub async fn get_by_public_name(&self, public_name: &str) -> Result<Option<Model>> {
         let client = self
             .pool
             .get()
             .await
             .context("Failed to get database connection")?;
 
-        // Try to resolve as an alias first
+        let rows = client
+            .query(
+                r#"
+                SELECT 
+                    id, model_name, public_name, model_display_name, model_description, model_icon,
+                    input_cost_per_token, output_cost_per_token,
+                    context_length, verifiable, is_active, created_at, updated_at
+                FROM models 
+                WHERE public_name = $1
+                "#,
+                &[&public_name],
+            )
+            .await
+            .context("Failed to query model by public name")?;
+
+        if let Some(row) = rows.first() {
+            Ok(Some(self.row_to_model(row)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Resolve a model identifier (public name, alias, or canonical name) to the canonical model name
+    /// Resolution order:
+    /// 1. Check if it's a public_name -> return model_name
+    /// 2. Check if it's an alias -> return model_name
+    /// 3. Check if it's already a canonical model_name -> return it
+    /// 4. Otherwise, return the input as-is (will fail later if invalid)
+    pub async fn resolve_to_canonical_name(&self, identifier: &str) -> Result<String> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        // First, try to find by public_name
+        let rows = client
+            .query(
+                r#"
+                SELECT model_name
+                FROM models
+                WHERE public_name = $1 AND is_active = true
+                LIMIT 1
+                "#,
+                &[&identifier],
+            )
+            .await
+            .context("Failed to resolve public name to canonical name")?;
+
+        if let Some(row) = rows.first() {
+            return Ok(row.get::<_, String>("model_name"));
+        }
+
+        // Second, try to resolve as an alias
         let rows = client
             .query(
                 r#"
@@ -364,18 +472,35 @@ impl ModelRepository {
                 WHERE ma.alias_name = $1 AND ma.is_active = true AND m.is_active = true
                 LIMIT 1
                 "#,
-                &[&model_name],
+                &[&identifier],
             )
             .await
             .context("Failed to resolve alias to canonical name")?;
 
         if let Some(row) = rows.first() {
-            // It's an alias, return the canonical name
-            Ok(row.get::<_, String>("model_name"))
-        } else {
-            // Not an alias, assume it's already canonical (or doesn't exist, which will be caught later)
-            Ok(model_name.to_string())
+            return Ok(row.get::<_, String>("model_name"));
         }
+
+        // Third, check if it's already a canonical model_name
+        let rows = client
+            .query(
+                r#"
+                SELECT model_name
+                FROM models
+                WHERE model_name = $1 AND is_active = true
+                LIMIT 1
+                "#,
+                &[&identifier],
+            )
+            .await
+            .context("Failed to check if identifier is canonical name")?;
+
+        if let Some(row) = rows.first() {
+            return Ok(row.get::<_, String>("model_name"));
+        }
+
+        // Not found in any form, return as-is (will be caught as invalid later)
+        Ok(identifier.to_string())
     }
 
     /// Helper method to convert database row to Model
@@ -383,6 +508,7 @@ impl ModelRepository {
         Model {
             id: row.get("id"),
             model_name: row.get("model_name"),
+            public_name: row.get("public_name"),
             model_display_name: row.get("model_display_name"),
             model_description: row.get("model_description"),
             model_icon: row.get("model_icon"),
@@ -433,6 +559,7 @@ impl services::models::ModelsRepository for ModelRepository {
             .map(|m| services::models::ModelWithPricing {
                 id: m.id,
                 model_name: m.model_name,
+                public_name: m.public_name,
                 model_display_name: m.model_display_name,
                 model_description: m.model_description,
                 model_icon: m.model_icon,
@@ -452,6 +579,7 @@ impl services::models::ModelsRepository for ModelRepository {
         Ok(model_opt.map(|m| services::models::ModelWithPricing {
             id: m.id,
             model_name: m.model_name,
+            public_name: m.public_name,
             model_display_name: m.model_display_name,
             model_description: m.model_description,
             model_icon: m.model_icon,

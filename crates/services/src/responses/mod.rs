@@ -239,7 +239,7 @@ impl ResponseService {
         // Get the LLM stream
         let llm_stream = self
             .inference_provider_pool
-            .chat_completion_stream(chat_params)
+            .chat_completion_stream(chat_params, request.body_hash)
             .await
             .map_err(|e| {
                 tracing::error!(
@@ -304,7 +304,7 @@ impl ResponseService {
             async move {
                 match chunk_result {
                     Ok(stream_chunk) => {
-                        match stream_chunk {
+                        match stream_chunk.chunk {
                             StreamChunk::Chat(chunk) => {
                                 // Extract delta content
                                 if let Some(choice) = chunk.choices.first() {

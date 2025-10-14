@@ -54,7 +54,7 @@
 //! ```
 
 pub mod models;
-mod sse_parser;
+pub mod sse_parser;
 pub mod vllm;
 
 use std::pin::Pin;
@@ -66,18 +66,21 @@ use tokio_stream::StreamExt;
 
 // Re-export commonly used types for convenience
 pub use models::{
-    AttestationData, AttestationReport, AttestationReportParams, ChatCompletionParams, ChatDelta,
-    ChatMessage, ChatSignature, CompletionError, CompletionParams, FinishReason, MessageRole,
-    ModelInfo, NvidiaPayload, StreamChunk, StreamOptions, TokenUsage,
+    AttestationReportParams, ChatCompletionParams, ChatCompletionResponse,
+    ChatCompletionResponseChoice, ChatCompletionResponseWithBytes, ChatDelta, ChatMessage,
+    ChatResponseMessage, ChatSignature, CompletionError, CompletionParams, FinishReason,
+    MessageRole, ModelInfo, NvidiaPayload, StreamChunk, StreamOptions, TokenUsage,
+    VllmAttestationReport,
 };
+pub use sse_parser::SSEEvent;
 pub use vllm::{VLlmConfig, VLlmProvider};
 
 /// Type alias for streaming completion results
 ///
-/// This represents a stream of chunks where each chunk can either be:
-/// - `Ok(StreamChunk)` - A successful chunk with partial content
-/// - `Err(CompletionError)` - An error that occurred during streaming
-pub type StreamingResult = Pin<Box<dyn Stream<Item = Result<StreamChunk, CompletionError>> + Send>>;
+/// This represents a stream of SSE events where each event contains:
+/// - `raw_bytes` - The exact bytes received from the source (for forwarding)
+/// - `chunk` - The parsed StreamChunk for processing
+pub type StreamingResult = Pin<Box<dyn Stream<Item = Result<SSEEvent, CompletionError>> + Send>>;
 
 /// Type alias for peekable streaming completion results
 pub type PeekableStreamingResult = tokio_stream::adapters::Peekable<StreamingResult>;
@@ -110,7 +113,14 @@ pub trait InferenceProvider {
     async fn chat_completion_stream(
         &self,
         params: ChatCompletionParams,
+        request_hash: String,
     ) -> Result<StreamingResult, CompletionError>;
+
+    async fn chat_completion(
+        &self,
+        params: ChatCompletionParams,
+        request_hash: String,
+    ) -> Result<ChatCompletionResponseWithBytes, CompletionError>;
 
     /// Performs a streaming text completion request
     ///
@@ -127,5 +137,5 @@ pub trait InferenceProvider {
         &self,
         model: String,
         signing_algo: Option<String>,
-    ) -> Result<AttestationReport, CompletionError>;
+    ) -> Result<Vec<VllmAttestationReport>, CompletionError>;
 }

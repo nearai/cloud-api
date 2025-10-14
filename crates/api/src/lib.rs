@@ -9,7 +9,7 @@ use crate::{
     openapi::ApiDoc,
     routes::{
         api::{build_management_router, AppState},
-        attestation::{get_attestation_report, get_signature, quote},
+        attestation::{get_attestation_report, get_signature},
         auth::{
             current_user, github_login, google_login, login_page, logout, oauth_callback,
             StateStore,
@@ -21,7 +21,7 @@ use crate::{
     },
 };
 use axum::{
-    middleware::from_fn_with_state,
+    middleware::{from_fn, from_fn_with_state},
     response::Html,
     routing::{get, post},
     Router,
@@ -519,7 +519,8 @@ pub fn build_completion_routes(
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
-        ));
+        ))
+        .layer(from_fn(middleware::body_hash_middleware));
 
     // Routes that don't require credits (metadata)
     let metadata_routes = Router::new()
@@ -560,6 +561,7 @@ pub fn build_response_routes(
             auth_state_middleware.clone(),
             auth_middleware_with_api_key,
         ))
+        .layer(from_fn(middleware::body_hash_middleware))
 }
 
 /// Build conversation routes with auth
@@ -597,7 +599,6 @@ pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &Aut
     Router::new()
         .route("/signature/{chat_id}", get(get_signature))
         .route("/attestation/report", get(get_attestation_report))
-        .route("/attestation/quote", get(quote))
         .with_state(app_state)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),

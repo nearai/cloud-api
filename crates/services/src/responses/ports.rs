@@ -94,6 +94,7 @@ pub struct ResponseRequest {
     pub top_p: Option<f32>,
     pub user_id: UserId,
     pub metadata: Option<serde_json::Value>,
+    pub body_hash: String,
 }
 
 /// Input for a response - can be text or messages

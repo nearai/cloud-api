@@ -374,7 +374,10 @@ pub struct Conversation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
     pub id: Uuid,
+    /// Internal/canonical model name (e.g., "nearai/gpt-oss-120b") used for vLLM
     pub model_name: String,
+    /// Public-facing model name (e.g., "openai/gpt-oss-120b") shown to API consumers
+    pub public_name: String,
     pub model_display_name: String,
     pub model_description: String,
     pub model_icon: Option<String>,
@@ -397,6 +400,7 @@ pub struct Model {
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateModelPricingRequest {
+    pub public_name: Option<String>,
     pub input_cost_per_token: Option<i64>,
     pub output_cost_per_token: Option<i64>,
     pub model_display_name: Option<String>,

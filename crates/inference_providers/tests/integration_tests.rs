@@ -5,7 +5,7 @@
 
 use futures_util::StreamExt;
 use inference_providers::{
-    ChatCompletionParams, ChatMessage, CompletionParams, InferenceProvider, MessageRole, SSEEvent,
+    ChatCompletionParams, ChatMessage, CompletionParams, InferenceProvider, MessageRole,
     StreamChunk, VLlmConfig, VLlmProvider,
 };
 use std::time::Duration;

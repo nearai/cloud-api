@@ -4,10 +4,21 @@ use inference_providers::{
     ChatCompletionParams, ChatSignature, CompletionParams, InferenceProvider, StreamingResult,
     StreamingResultExt, VLlmConfig, VLlmProvider, VllmAttestationReport,
 };
+use serde::Deserialize;
 use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 
 type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
+
+/// Discovery entry returned by the discovery layer
+#[derive(Debug, Clone, Deserialize)]
+struct DiscoveryEntry {
+    /// Model identifier (e.g., "deepseek-ai/DeepSeek-V3.1")
+    model: String,
+    /// Tags for filtering/routing (e.g., ["prod", "dev"])
+    #[serde(default)]
+    tags: Vec<String>,
+}
 
 #[derive(Clone)]
 pub struct InferenceProviderPool {
@@ -65,7 +76,9 @@ impl InferenceProviderPool {
     }
 
     /// Fetch and parse models from discovery endpoint
-    async fn fetch_from_discovery(&self) -> Result<HashMap<String, String>, ListModelsError> {
+    async fn fetch_from_discovery(
+        &self,
+    ) -> Result<HashMap<String, DiscoveryEntry>, ListModelsError> {
         tracing::info!(
             url = %self.discovery_url,
             "Fetching models from discovery server"
@@ -84,7 +97,7 @@ impl InferenceProviderPool {
             .await
             .map_err(|e| ListModelsError::FetchError(format!("HTTP request failed: {}", e)))?;
 
-        let discovery_map: HashMap<String, String> = response
+        let discovery_map: HashMap<String, DiscoveryEntry> = response
             .json()
             .await
             .map_err(|e| ListModelsError::FetchError(format!("Failed to parse JSON: {}", e)))?;
@@ -141,25 +154,27 @@ impl InferenceProviderPool {
         // Group by model name
         let mut model_to_endpoints: HashMap<String, Vec<(String, u16)>> = HashMap::new();
 
-        for (key, model_name) in discovery_map {
+        for (key, entry) in discovery_map {
             // Filter out non-IP keys
             if let Some((ip, port)) = Self::parse_ip_port(&key) {
                 tracing::debug!(
                     key = %key,
-                    model = %model_name,
+                    model = %entry.model,
+                    tags = ?entry.tags,
                     ip = %ip,
                     port = port,
                     "Adding IP-based provider"
                 );
 
                 model_to_endpoints
-                    .entry(model_name)
+                    .entry(entry.model)
                     .or_default()
                     .push((ip, port));
             } else {
                 tracing::debug!(
                     key = %key,
-                    model = %model_name,
+                    model = %entry.model,
+                    tags = ?entry.tags,
                     "Skipping non-IP key"
                 );
             }

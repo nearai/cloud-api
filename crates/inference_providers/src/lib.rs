@@ -66,9 +66,11 @@ use tokio_stream::StreamExt;
 
 // Re-export commonly used types for convenience
 pub use models::{
-    AttestationReportParams, ChatCompletionParams, ChatDelta, ChatMessage, ChatSignature,
-    CompletionError, CompletionParams, FinishReason, MessageRole, ModelInfo, NvidiaPayload,
-    StreamChunk, StreamOptions, TokenUsage, VllmAttestationReport,
+    AttestationReportParams, ChatCompletionParams, ChatCompletionResponse,
+    ChatCompletionResponseChoice, ChatCompletionResponseWithBytes, ChatDelta, ChatMessage,
+    ChatResponseMessage, ChatSignature, CompletionError, CompletionParams, FinishReason,
+    MessageRole, ModelInfo, NvidiaPayload, StreamChunk, StreamOptions, TokenUsage,
+    VllmAttestationReport,
 };
 pub use sse_parser::SSEEvent;
 pub use vllm::{VLlmConfig, VLlmProvider};
@@ -113,6 +115,12 @@ pub trait InferenceProvider {
         params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<StreamingResult, CompletionError>;
+
+    async fn chat_completion(
+        &self,
+        params: ChatCompletionParams,
+        request_hash: String,
+    ) -> Result<ChatCompletionResponseWithBytes, CompletionError>;
 
     /// Performs a streaming text completion request
     ///

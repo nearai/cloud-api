@@ -10,7 +10,7 @@ impl From<&crate::models::Message> for services::ChatMessage {
                 "tool" => services::MessageRole::Tool,
                 _ => services::MessageRole::User, // Default to user for unknown roles
             },
-            content: Some(msg.content.clone()),
+            content: msg.content.clone(),
             name: msg.name.clone(),
             tool_call_id: None,
             tool_calls: None,
@@ -82,7 +82,7 @@ impl From<&services::ChatMessage> for crate::models::Message {
                 services::MessageRole::Assistant => "assistant".to_string(),
                 services::MessageRole::Tool => "tool".to_string(),
             },
-            content: msg.content.clone().unwrap_or_default(),
+            content: msg.content.clone(),
             name: msg.name.clone(),
         }
     }
@@ -549,7 +549,7 @@ mod tests {
     fn test_message_conversion() {
         let http_msg = crate::models::Message {
             role: "user".to_string(),
-            content: "Hello".to_string(),
+            content: Some("Hello".to_string()),
             name: None,
         };
 
@@ -559,7 +559,7 @@ mod tests {
 
         let back_to_http: crate::models::Message = (&domain_msg).into();
         assert_eq!(back_to_http.role, "user");
-        assert_eq!(back_to_http.content, "Hello");
+        assert_eq!(back_to_http.content, Some("Hello".to_string()));
     }
 
     #[test]
@@ -568,7 +568,7 @@ mod tests {
             model: "gpt-3.5-turbo".to_string(),
             messages: vec![crate::models::Message {
                 role: "user".to_string(),
-                content: "Test message".to_string(),
+                content: Some("Test message".to_string()),
                 name: None,
             }],
             max_tokens: Some(100),

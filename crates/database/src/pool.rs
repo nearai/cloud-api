@@ -52,7 +52,7 @@ pub async fn create_pool(config: &config::DatabaseConfig) -> anyhow::Result<Pool
 }
 
 /// Create pool using rustls with either custom certificate or platform verifier
-fn create_pool_with_rustls(cfg: Config, cert_path: Option<&str>) -> anyhow::Result<Pool> {
+pub fn create_pool_with_rustls(cfg: Config, cert_path: Option<&str>) -> anyhow::Result<Pool> {
     use tokio_postgres_rustls::MakeRustlsConnect;
 
     // Install the default crypto provider (ring) if not already installed
@@ -111,6 +111,25 @@ fn create_pool_with_rustls(cfg: Config, cert_path: Option<&str>) -> anyhow::Resu
 
     let tls = MakeRustlsConnect::new(client_config);
 
+    cfg.create_pool(Some(Runtime::Tokio1), tls)
+        .map_err(|e| anyhow::anyhow!("Failed to create TLS pool: {}", e))
+}
+
+/// Create pool using native-tls (simpler for accepting self-signed certificates)
+pub fn create_pool_with_native_tls(cfg: Config, accept_invalid_certs: bool) -> anyhow::Result<Pool> {
+    use native_tls::TlsConnector;
+    use postgres_native_tls::MakeTlsConnector;
+    
+    let mut builder = TlsConnector::builder();
+    if accept_invalid_certs {
+        info!("Configuring TLS to accept self-signed certificates");
+        builder.danger_accept_invalid_certs(true);
+    }
+    
+    let connector = builder.build()
+        .map_err(|e| anyhow::anyhow!("Failed to create TLS connector: {}", e))?;
+    let tls = MakeTlsConnector::new(connector);
+    
     cfg.create_pool(Some(Runtime::Tokio1), tls)
         .map_err(|e| anyhow::anyhow!("Failed to create TLS pool: {}", e))
 }

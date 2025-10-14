@@ -52,6 +52,19 @@ impl DatabaseConfig {
 
     /// Load from environment variables
     pub fn from_env() -> Result<Self, String> {
+        // Password is read from a file: DATABASE_PASSWORD_FILE.
+        // This file would be mounted as a secret in production deployments.
+        let password = if let Ok(path) = env::var("DATABASE_PASSWORD_FILE") {
+            std::fs::read_to_string(path)
+                .map_err(|e| format!("Failed to read DATABASE_PASSWORD_FILE: {}", e))?
+                .trim()
+                .to_string()
+        } else {
+            env::var("DATABASE_PASSWORD").map_err(|_| "DATABASE_PASSWORD not set".to_string())?
+        };
+        if password.is_empty() {
+            return Err("Database password cannot be empty".to_string());
+        }
         Ok(Self {
             host: env::var("DATABASE_HOST").map_err(|_| "DATABASE_HOST not set")?,
             port: env::var("DATABASE_PORT")
@@ -60,7 +73,6 @@ impl DatabaseConfig {
                 .map_err(|_| "DATABASE_PORT must be a valid port number")?,
             database: env::var("DATABASE_NAME").map_err(|_| "DATABASE_NAME not set")?,
             username: env::var("DATABASE_USERNAME").map_err(|_| "DATABASE_USERNAME not set")?,
-            password: env::var("DATABASE_PASSWORD").map_err(|_| "DATABASE_PASSWORD not set")?,
             max_connections: env::var("DATABASE_MAX_CONNECTIONS")
                 .unwrap_or_else(|_| "5".to_string())
                 .parse()
@@ -70,6 +82,7 @@ impl DatabaseConfig {
                 .parse()
                 .map_err(|_| "DATABASE_TLS_ENABLED must be true or false")?,
             tls_ca_cert_path: env::var("DATABASE_TLS_CA_CERT_PATH").ok(),
+            password,
         })
     }
 }

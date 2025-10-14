@@ -1,5 +1,7 @@
+pub mod cluster_manager;
 pub mod migrations;
 pub mod models;
+pub mod patroni_discovery;
 pub mod pool;
 pub mod repositories;
 

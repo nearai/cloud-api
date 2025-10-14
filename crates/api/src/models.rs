@@ -51,7 +51,8 @@ pub struct ChatCompletionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Message {
     pub role: String, // "system", "user", "assistant"
-    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
     pub name: Option<String>,
 }
 
@@ -127,9 +128,11 @@ pub struct CompletionChoice {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Usage {
+    #[serde(alias = "prompt_tokens")]
     pub input_tokens: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens_details: Option<InputTokensDetails>,
+    #[serde(alias = "completion_tokens")]
     pub output_tokens: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens_details: Option<OutputTokensDetails>,

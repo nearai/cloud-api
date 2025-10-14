@@ -90,7 +90,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         signing_algo: Option<String>,
     ) -> Result<AttestationReport, AttestationError> {
         // Resolve model name (could be an alias) to canonical name
-        let mut proxy_attestations = vec![];
+        let mut vllm_proxy_attestations = vec![];
         if let Some(model) = model {
             let canonical_name = self
                 .models_repository
@@ -109,7 +109,7 @@ impl ports::AttestationServiceTrait for AttestationService {
                 );
             }
 
-            proxy_attestations = self
+            vllm_proxy_attestations = self
                 .inference_provider_pool
                 .get_attestation_report(canonical_name, signing_algo)
                 .await
@@ -139,8 +139,8 @@ impl ports::AttestationServiceTrait for AttestationService {
         }
 
         Ok(AttestationReport {
-            cloud_api_attestation: cloud_api_attestation.into(),
-            vllm_proxy_attestations: proxy_attestations,
+            cloud_api_attestation,
+            vllm_proxy_attestations,
         })
     }
 }

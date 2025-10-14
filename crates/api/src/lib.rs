@@ -561,6 +561,7 @@ pub fn build_response_routes(
             auth_state_middleware.clone(),
             auth_middleware_with_api_key,
         ))
+        .layer(from_fn(middleware::body_hash_middleware))
 }
 
 /// Build conversation routes with auth

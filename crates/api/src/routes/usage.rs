@@ -107,8 +107,32 @@ pub async fn get_organization_balance(
         )
     })?;
 
-    // TODO: Check if user has access to this organization
-    // For now, we assume the user is authenticated and can access their own orgs
+    // Check if user is a member of this organization
+    let user_id = crate::conversions::authenticated_user_to_user_id(user);
+    let is_member = app_state
+        .organization_service
+        .is_member(services::organization::OrganizationId(organization_id), user_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to check organization membership: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to verify organization access".to_string(),
+                    "internal_error".to_string(),
+                )),
+            )
+        })?;
+
+    if !is_member {
+        return Err((
+            StatusCode::FORBIDDEN,
+            ResponseJson(ErrorResponse::new(
+                "You are not authorized to access this organization's usage balance.".to_string(),
+                "forbidden".to_string(),
+            )),
+        ));
+    }
 
     let balance = app_state
         .usage_service
@@ -249,7 +273,32 @@ pub async fn get_organization_usage_history(
         )
     })?;
 
-    // TODO: Check if user has access to this organization
+    // Check if user is a member of this organization
+    let user_id = crate::conversions::authenticated_user_to_user_id(user);
+    let is_member = app_state
+        .organization_service
+        .is_member(services::organization::OrganizationId(organization_id), user_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to check organization membership: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to verify organization access".to_string(),
+                    "internal_error".to_string(),
+                )),
+            )
+        })?;
+
+    if !is_member {
+        return Err((
+            StatusCode::FORBIDDEN,
+            ResponseJson(ErrorResponse::new(
+                "You are not authorized to access this organization's usage history.".to_string(),
+                "forbidden".to_string(),
+            )),
+        ));
+    }
 
     let (history, total) = app_state
         .usage_service

@@ -34,9 +34,6 @@ WORKDIR /app
 # Copy the built binary
 COPY --from=builder /app/target/release/api /app/api
 
-# Copy configuration directory
-COPY config/ /app/config/
-
 # Change ownership to app user
 RUN chown -R app:app /app
 

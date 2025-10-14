@@ -4,6 +4,7 @@ use async_trait::async_trait;
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
 pub struct UpdateModelAdminRequest {
+    pub public_name: Option<String>,
     pub input_cost_per_token: Option<i64>,
     pub output_cost_per_token: Option<i64>,
     pub model_display_name: Option<String>,
@@ -25,6 +26,7 @@ pub type BatchUpdateModelAdminResponse = std::collections::HashMap<String, Model
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
 pub struct ModelPricing {
+    pub public_name: String,
     pub model_display_name: String,
     pub model_description: String,
     pub model_icon: Option<String>,

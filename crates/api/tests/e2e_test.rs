@@ -464,12 +464,22 @@ async fn test_admin_update_model() {
 
     // Upsert models (using session token with admin domain email)
     let batch = generate_model();
-    let model_name = batch.keys().next().unwrap().clone();
+    let batch_for_comparison = generate_model();
     let updated_models = admin_batch_upsert_models(&server, batch, get_session_id()).await;
     println!("Updated models: {:?}", updated_models);
     assert_eq!(updated_models.len(), 1);
     let updated_model = &updated_models[0];
-    assert_eq!(updated_model.model_id, model_name);
+    // model_id should be the public_name, not the internal model_name
+    assert_eq!(
+        updated_model.model_id,
+        batch_for_comparison
+            .values()
+            .next()
+            .unwrap()
+            .public_name
+            .as_deref()
+            .unwrap()
+    );
     assert_eq!(
         updated_model.metadata.model_display_name,
         "Updated Model Name"
@@ -510,7 +520,11 @@ async fn test_get_model_by_name() {
     println!("Retrieved model: {:?}", model_resp);
 
     // Verify the model details match what we upserted
-    assert_eq!(model_resp.model_id, model_name);
+    // The model_id should be the public_name, not the internal model_name
+    assert_eq!(
+        model_resp.model_id,
+        model_request.public_name.as_deref().unwrap()
+    );
     assert_eq!(
         model_resp.metadata.model_display_name,
         model_request.model_display_name.as_deref().unwrap()

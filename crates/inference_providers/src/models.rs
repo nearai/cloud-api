@@ -300,6 +300,8 @@ pub struct TokenUsage {
     pub prompt_tokens: i32,
     pub completion_tokens: i32,
     pub total_tokens: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<serde_json::Value>,
 }
 
 impl TokenUsage {
@@ -308,6 +310,7 @@ impl TokenUsage {
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens_details: None,
         }
     }
 }
@@ -461,6 +464,124 @@ pub enum StreamChunk {
     Chat(ChatCompletionChunk),
     /// Text completion chunk
     Text(CompletionChunk),
+}
+
+/// Complete (non-streaming) chat completion response (matches OpenAI format)
+///
+/// Represents the full response from a non-streaming chat completion request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionResponse {
+    /// Unique identifier for the completion
+    pub id: String,
+
+    /// Object type - always "chat.completion"
+    pub object: String,
+
+    /// Unix timestamp of when the completion was created
+    pub created: i64,
+
+    /// Model used for the completion
+    pub model: String,
+
+    /// List of completion choices
+    pub choices: Vec<ChatCompletionResponseChoice>,
+
+    /// Service tier used for processing the request
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+
+    /// Backend configuration fingerprint
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_fingerprint: Option<String>,
+
+    /// Usage statistics
+    pub usage: TokenUsage,
+
+    /// Log probabilities for the prompt tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_logprobs: Option<serde_json::Value>,
+
+    /// Token IDs for the prompt
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_token_ids: Option<Vec<i64>>,
+
+    /// KV cache transfer parameters
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_transfer_params: Option<serde_json::Value>,
+}
+
+/// Wrapper for chat completion response that includes raw bytes from provider
+///
+/// This allows returning the exact bytes from the provider for hash verification
+/// while also providing the parsed response for internal processing (usage tracking, etc.)
+#[derive(Debug, Clone)]
+pub struct ChatCompletionResponseWithBytes {
+    /// The parsed response
+    pub response: ChatCompletionResponse,
+
+    /// The raw bytes from the provider response
+    pub raw_bytes: Vec<u8>,
+}
+
+/// Choice in a complete (non-streaming) chat completion response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionResponseChoice {
+    /// Choice index
+    pub index: i64,
+
+    /// Complete message from the assistant
+    pub message: ChatResponseMessage,
+
+    /// Log probabilities for the choice tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<LogProbs>,
+
+    /// Reason why generation finished
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+
+    /// Alternative stop reason (provider-specific)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+
+    /// Token IDs generated for this choice
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ids: Option<Vec<i64>>,
+}
+
+/// Message in a complete chat completion response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatResponseMessage {
+    /// Role of the message sender
+    pub role: MessageRole,
+
+    /// Text content of the message
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+
+    /// Refusal message if the model refused to respond
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+
+    /// Annotations for the message
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<serde_json::Value>,
+
+    /// Audio content (if any)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<serde_json::Value>,
+
+    /// Legacy function call (deprecated, use tool_calls)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_call: Option<serde_json::Value>,
+
+    /// Tool calls made by the model
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+
+    /// Reasoning content for models that support chain-of-thought
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 /// Model object (matches OpenAI API)
@@ -649,6 +770,61 @@ mod tests {
         assert_eq!(nvidia_payload.nonce, "abc123");
         assert_eq!(nvidia_payload.arch, "HOPPER");
         assert!(nvidia_payload.evidence_list.is_empty());
+    }
+
+    #[test]
+    fn test_chat_completion_response_deserialization() {
+        let json_response = r#"{
+            "id":"chatcmpl-047346ea58694a589185856879eef398",
+            "object":"chat.completion",
+            "created":1760402549,
+            "model":"Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "choices":[{
+                "index":0,
+                "message":{
+                    "role":"assistant",
+                    "content":"Hello world",
+                    "refusal":null,
+                    "annotations":null,
+                    "audio":null,
+                    "function_call":null,
+                    "tool_calls":[],
+                    "reasoning_content":null
+                },
+                "logprobs":null,
+                "finish_reason":"stop",
+                "stop_reason":null,
+                "token_ids":null
+            }],
+            "service_tier":null,
+            "system_fingerprint":null,
+            "usage":{
+                "prompt_tokens":14,
+                "total_tokens":17,
+                "completion_tokens":3,
+                "prompt_tokens_details":null
+            },
+            "prompt_logprobs":null,
+            "prompt_token_ids":null,
+            "kv_transfer_params":null
+        }"#;
+
+        let response: ChatCompletionResponse = serde_json::from_str(json_response).unwrap();
+
+        assert_eq!(response.id, "chatcmpl-047346ea58694a589185856879eef398");
+        assert_eq!(response.object, "chat.completion");
+        assert_eq!(response.created, 1760402549);
+        assert_eq!(response.model, "Qwen/Qwen3-30B-A3B-Instruct-2507");
+        assert_eq!(response.choices.len(), 1);
+
+        let choice = &response.choices[0];
+        assert_eq!(choice.index, 0);
+        assert_eq!(choice.finish_reason, Some("stop".to_string()));
+        assert_eq!(choice.message.content, Some("Hello world".to_string()));
+
+        assert_eq!(response.usage.prompt_tokens, 14);
+        assert_eq!(response.usage.completion_tokens, 3);
+        assert_eq!(response.usage.total_tokens, 17);
     }
 }
 

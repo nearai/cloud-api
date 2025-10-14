@@ -404,6 +404,47 @@ impl InferenceProvider for InferenceProviderPool {
         }
     }
 
+    async fn chat_completion(
+        &self,
+        params: ChatCompletionParams,
+        request_hash: String,
+    ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError> {
+        let model_id = params.model.clone();
+        match self.get_next_provider_for_model(&model_id).await {
+            Some(provider) => {
+                tracing::info!(
+                    model_id = %model_id,
+                    "Found provider for model, calling chat_completion"
+                );
+                let response = provider.chat_completion(params, request_hash).await?;
+
+                // Store the chat_id mapping SYNCHRONOUSLY before returning
+                // This ensures the attestation service can find the provider
+                let chat_id = response.response.id.clone();
+                tracing::info!(
+                    chat_id = %chat_id,
+                    "Storing chat_id mapping for non-streaming completion"
+                );
+                self.store_chat_id_mapping(chat_id.clone(), provider.clone())
+                    .await;
+                tracing::debug!(
+                    chat_id = %chat_id,
+                    "Stored chat_id mapping before returning response"
+                );
+
+                Ok(response)
+            }
+            None => {
+                let model_mapping = self.model_mapping.read().await;
+                let available_models: Vec<_> = model_mapping.keys().collect();
+                Err(CompletionError::CompletionError(format!(
+                    "Model '{}' not found in any configured provider. Available models: {:?}",
+                    model_id, available_models
+                )))
+            }
+        }
+    }
+
     async fn text_completion_stream(
         &self,
         params: CompletionParams,

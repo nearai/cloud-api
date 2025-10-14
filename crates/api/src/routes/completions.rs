@@ -138,15 +138,15 @@ pub async fn chat_completions(
         body_hash,
     );
 
-    // Call the completion service - it handles usage tracking internally
-    match app_state
-        .completion_service
-        .create_completion_stream(service_request)
-        .await
-    {
-        Ok(stream) => {
-            // Check if streaming is requested
-            if request.stream == Some(true) {
+    // Check if streaming is requested
+    if request.stream == Some(true) {
+        // Call the streaming completion service
+        match app_state
+            .completion_service
+            .create_chat_completion_stream(service_request)
+            .await
+        {
+            Ok(stream) => {
                 // Convert to raw bytes stream with proper SSE formatting
                 let byte_stream = stream
                     .map(|result| match result {
@@ -169,7 +169,7 @@ pub async fn chat_completions(
                     })
                     .chain(futures::stream::once(async move {
                         // Send [DONE] with 3 newlines total (1 after [DONE], then 2 more for proper SSE termination)
-                        Ok::<Bytes, Infallible>(Bytes::from_static(b"data: [DONE]\n\n\n"))
+                        Ok::<Bytes, Infallible>(Bytes::from_static(b"data: [DONE]\n\n"))
                     }));
 
                 // Return raw streaming response with SSE headers
@@ -180,17 +180,40 @@ pub async fn chat_completions(
                     .header(header::CONNECTION, "keep-alive")
                     .body(Body::from_stream(byte_stream))
                     .unwrap()
-            } else {
-                unimplemented!()
+            }
+            Err(domain_error) => {
+                let status_code = map_domain_error_to_status(&domain_error);
+                (
+                    status_code,
+                    ResponseJson::<ErrorResponse>(domain_error.into()),
+                )
+                    .into_response()
             }
         }
-        Err(domain_error) => {
-            let status_code = map_domain_error_to_status(&domain_error);
-            (
-                status_code,
-                ResponseJson::<ErrorResponse>(domain_error.into()),
-            )
-                .into_response()
+    } else {
+        // Call the non-streaming completion service
+        match app_state
+            .completion_service
+            .create_chat_completion(service_request)
+            .await
+        {
+            Ok(response_with_bytes) => {
+                // Return the exact bytes from the provider for hash verification
+                // This ensures clients can hash the response and compare with attestation endpoints
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(response_with_bytes.raw_bytes))
+                    .unwrap()
+            }
+            Err(domain_error) => {
+                let status_code = map_domain_error_to_status(&domain_error);
+                (
+                    status_code,
+                    ResponseJson::<ErrorResponse>(domain_error.into()),
+                )
+                    .into_response()
+            }
         }
     }
 }
@@ -256,7 +279,7 @@ pub async fn completions(
     // Call the completion service - it handles usage tracking internally
     match app_state
         .completion_service
-        .create_completion_stream(service_request)
+        .create_chat_completion_stream(service_request)
         .await
     {
         Ok(_stream) => {

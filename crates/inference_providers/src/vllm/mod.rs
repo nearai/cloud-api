@@ -169,6 +169,54 @@ impl InferenceProvider for VLlmProvider {
         Ok(Box::pin(sse_stream))
     }
 
+    /// Performs a chat completion request
+    async fn chat_completion(
+        &self,
+        params: ChatCompletionParams,
+        request_hash: String,
+    ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
+        let url = format!("{}/v1/chat/completions", self.config.base_url);
+
+        let mut headers = self.build_headers();
+        headers.insert("X-Request-Hash", request_hash.parse().unwrap());
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&params)
+            .send()
+            .await
+            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(CompletionError::CompletionError(format!(
+                "HTTP {}: {}",
+                status, error_text
+            )));
+        }
+
+        // Get the raw bytes first for exact hash verification
+        let raw_bytes = response
+            .bytes()
+            .await
+            .map_err(|e| CompletionError::CompletionError(e.to_string()))?
+            .to_vec();
+
+        // Parse the response from the raw bytes
+        let chat_completion_response: ChatCompletionResponse = serde_json::from_slice(&raw_bytes)
+            .map_err(|e| {
+            CompletionError::CompletionError(format!("Failed to parse response: {}", e))
+        })?;
+
+        Ok(ChatCompletionResponseWithBytes {
+            response: chat_completion_response,
+            raw_bytes,
+        })
+    }
+
     /// Performs a streaming text completion request
     async fn text_completion_stream(
         &self,

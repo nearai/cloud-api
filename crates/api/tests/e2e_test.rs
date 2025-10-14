@@ -1882,7 +1882,7 @@ async fn test_streaming_chat_completion_signature_verification() {
     );
 
     // Capture the complete raw response text (SSE format)
-    let response_text = (response.text().trim().to_string() + "\n\n").to_string();
+    let response_text = response.text();
     println!("=== Raw Streaming Response ===");
     println!("{}", response_text);
 

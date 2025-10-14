@@ -37,7 +37,7 @@ services:
 
   # Cloud API service
   cloud-api:
-    build: .
+    image: endnearai/cloud-api
     restart: unless-stopped
     volumes:
       - api_config:/config:ro

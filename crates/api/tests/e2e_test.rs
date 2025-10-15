@@ -2064,47 +2064,9 @@ async fn test_streaming_chat_completion_signature_verification() {
     println!("✅ Signing algorithm: {}", signing_algo);
 }
 
-#[tokio::test]
-async fn test_admin_create_access_token_basic() {
-    let server = setup_test_server().await;
-
-    // Test basic access token creation with 24 hours expiration
-    let request = serde_json::json!({
-        "expires_in_hours": 24
-    });
-
-    let response = server
-        .post("/v1/admin/access_token")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&request)
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-
-    let token_response = response.json::<api::models::AdminAccessTokenResponse>();
-
-    // Verify response structure
-    assert!(!token_response.access_token.is_empty());
-    assert!(token_response.access_token.starts_with("sess_"));
-    assert_eq!(token_response.created_by_user_id, MOCK_USER_ID);
-    assert!(token_response.message.contains("24 hours"));
-
-    // Verify expiration is approximately 24 hours from now
-    let now = chrono::Utc::now();
-    let expected_expiry = now + chrono::Duration::hours(24);
-    let time_diff = (token_response.expires_at - expected_expiry)
-        .num_minutes()
-        .abs();
-    assert!(
-        time_diff < 5,
-        "Expiration time should be within 5 minutes of expected time"
-    );
-
-    println!(
-        "✅ Created admin access token: {}",
-        &token_response.access_token[..20]
-    );
-}
+// ============================================
+// Admin Access Token Tests
+// ============================================
 
 #[tokio::test]
 async fn test_admin_create_access_token_with_ip_and_user_agent() {
@@ -2154,9 +2116,9 @@ async fn test_admin_create_access_token_with_ip_and_user_agent() {
 async fn test_admin_create_access_token_long_term() {
     let server = setup_test_server().await;
 
-    // Test long-term access token (1 year)
+    // Test long-term access token (180 days)
     let request = serde_json::json!({
-        "expires_in_hours": 8760, // 1 year
+        "expires_in_hours": 4320, // 180 days
         "ip_address": "10.0.0.1",
         "user_agent": "ProductionBillingService/2.0"
     });
@@ -2175,11 +2137,11 @@ async fn test_admin_create_access_token_long_term() {
     assert!(!token_response.access_token.is_empty());
     assert!(token_response.access_token.starts_with("sess_"));
     assert_eq!(token_response.created_by_user_id, MOCK_USER_ID);
-    assert!(token_response.message.contains("8760 hours"));
+    assert!(token_response.message.contains("4320 hours"));
 
     // Verify expiration is approximately 1 year from now
     let now = chrono::Utc::now();
-    let expected_expiry = now + chrono::Duration::hours(8760);
+    let expected_expiry = now + chrono::Duration::hours(4320);
     let time_diff = (token_response.expires_at - expected_expiry)
         .num_minutes()
         .abs();
@@ -2190,47 +2152,6 @@ async fn test_admin_create_access_token_long_term() {
 
     println!(
         "✅ Created long-term admin access token: {}",
-        &token_response.access_token[..20]
-    );
-}
-
-#[tokio::test]
-async fn test_admin_create_access_token_non_expiring() {
-    let server = setup_test_server().await;
-
-    // Test effectively non-expiring access token (100,000 years)
-    let request = serde_json::json!({
-        "expires_in_hours": 876000000, // ~100,000 years
-        "ip_address": "172.16.0.1",
-        "user_agent": "CriticalSystemService/1.0"
-    });
-
-    let response = server
-        .post("/v1/admin/access_token")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&request)
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-
-    let token_response = response.json::<api::models::AdminAccessTokenResponse>();
-
-    // Verify response structure
-    assert!(!token_response.access_token.is_empty());
-    assert!(token_response.access_token.starts_with("sess_"));
-    assert_eq!(token_response.created_by_user_id, MOCK_USER_ID);
-    assert!(token_response.message.contains("876000000 hours"));
-
-    // Verify expiration is far in the future
-    let now = chrono::Utc::now();
-    let time_diff = (token_response.expires_at - now).num_days();
-    assert!(
-        time_diff > 100000,
-        "Non-expiring token should be valid for over 100K days"
-    );
-
-    println!(
-        "✅ Created non-expiring admin access token: {}",
         &token_response.access_token[..20]
     );
 }

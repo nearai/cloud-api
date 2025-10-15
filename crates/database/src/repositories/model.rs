@@ -431,6 +431,36 @@ impl ModelRepository {
         }
     }
 
+    /// Get list of configured model names (public names)
+    /// Returns only active models that have been configured with pricing
+    pub async fn get_configured_model_names(&self) -> Result<Vec<String>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let rows = client
+            .query(
+                r#"
+                SELECT public_name
+                FROM models
+                WHERE is_active = true
+                ORDER BY public_name ASC
+                "#,
+                &[],
+            )
+            .await
+            .context("Failed to query configured model names")?;
+
+        let names = rows
+            .into_iter()
+            .map(|row| row.get::<_, String>("public_name"))
+            .collect();
+
+        Ok(names)
+    }
+
     /// Resolve a model identifier (public name, alias, or canonical name) to the canonical model name
     /// Resolution order:
     /// 1. Check if it's a public_name -> return model_name
@@ -592,5 +622,9 @@ impl services::models::ModelsRepository for ModelRepository {
 
     async fn resolve_to_canonical_name(&self, model_name: &str) -> Result<String> {
         self.resolve_to_canonical_name(model_name).await
+    }
+
+    async fn get_configured_model_names(&self) -> Result<Vec<String>> {
+        self.get_configured_model_names().await
     }
 }

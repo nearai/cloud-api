@@ -467,10 +467,10 @@ impl ModelRepository {
     /// Returns only active models that have been configured with pricing
     pub async fn get_configured_model_names(&self) -> Result<Vec<String>> {
         let client = self
-          .pool
-          .get()
-          .await
-          .context("Failed to get database connection")?;
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
 
         let rows = client
             .query(
@@ -492,7 +492,7 @@ impl ModelRepository {
 
         Ok(names)
     }
-      
+
     /// Check if a public_name is already used by an active model
     /// Returns true if the public_name is already taken by an active model
     /// If exclude_model_name is provided, excludes that model from the check

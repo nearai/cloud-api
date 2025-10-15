@@ -1,6 +1,6 @@
 use crate::middleware::AdminUser;
 use crate::models::{
-    AdminUserResponse, BatchUpdateModelApiRequest, DecimalPrice, ErrorResponse, ListUsersResponse,
+    AdminAccessTokenResponse, AdminUserResponse, BatchUpdateModelApiRequest, DecimalPrice, ErrorResponse, ListUsersResponse,
     ModelMetadata, ModelPricingHistoryEntry, ModelPricingHistoryResponse, ModelWithPricing,
     OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, SpendLimit, UpdateOrganizationLimitsRequest,
     UpdateOrganizationLimitsResponse,
@@ -12,12 +12,14 @@ use axum::{
     Extension,
 };
 use services::admin::{AdminService, UpdateModelAdminRequest};
+use services::auth::{AuthServiceTrait, UserId};
 use std::sync::Arc;
 use tracing::{debug, error};
 
 #[derive(Clone)]
 pub struct AdminAppState {
     pub admin_service: Arc<dyn AdminService + Send + Sync>,
+    pub auth_service: Arc<dyn AuthServiceTrait>,
 }
 
 /// Batch upsert models metadata (Admin only)
@@ -593,6 +595,73 @@ pub async fn list_users(
 
     Ok(ResponseJson(response))
 }
+
+// TODO
+// 1. Allows set expires_at, IP address and user agent
+// 2. Track access token creation history for auditing purposes
+
+/// Create admin access token (Admin only)
+///
+/// Creates a non-expiring access token for admin users. This is typically used by billing services
+/// and other automated systems that need long-term access to admin endpoints.
+///
+/// **Security Note:** These tokens never expire and should be used with extreme caution.
+/// Store them securely and rotate them regularly.
+#[utoipa::path(
+    post,
+    path = "/admin/access_token",
+    tag = "Admin",
+    responses(
+        (status = 200, description = "Admin access token created successfully", body = AdminAccessTokenResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn create_admin_access_token(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>, // Require admin auth
+) -> Result<ResponseJson<AdminAccessTokenResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    debug!("Creating admin access token for user: {}", admin_user.0.email);
+
+    // Create a non-expiring session for the admin user
+    // Using 1,000,000 years expiration (effectively non-expiring)
+    let user_id = UserId(admin_user.0.id);
+    let expires_in_hours = 8_760_000_000; // ~1,000,000 years in hours
+    let session_result = app_state
+        .auth_service
+        .create_session(user_id, None, None, expires_in_hours)
+        .await;
+
+    match session_result {
+        Ok((session, session_token)) => {
+            debug!("Admin access token created successfully for user: {}", admin_user.0.email);
+
+            let response = AdminAccessTokenResponse {
+                access_token: session_token,
+                expires_at: session.expires_at,
+                created_by_user_id: admin_user.0.id.to_string(),
+                created_at: session.created_at,
+                message: "Admin access token created successfully. This token never expires and should be stored securely.".to_string(),
+            };
+
+            Ok(ResponseJson(response))
+        }
+        Err(e) => {
+            error!("Failed to create admin access token: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to create admin access token: {}", e),
+                    "internal_server_error".to_string(),
+                )),
+            ))
+        }
+    }
+}
+
 
 #[derive(Debug, serde::Deserialize)]
 pub struct ListUsersQueryParams {

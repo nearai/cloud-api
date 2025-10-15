@@ -1037,6 +1037,16 @@ pub struct ListUsersResponse {
     pub offset: i64,
 }
 
+/// Admin access token response model
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminAccessTokenResponse {
+    pub access_token: String,
+    pub expires_at: DateTime<Utc>,
+    pub created_by_user_id: String,
+    pub created_at: DateTime<Utc>,
+    pub message: String,
+}
+
 /// API Key response model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiKeyResponse {

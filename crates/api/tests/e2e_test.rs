@@ -2139,7 +2139,7 @@ async fn test_admin_create_access_token_long_term() {
     assert_eq!(token_response.created_by_user_id, MOCK_USER_ID);
     assert!(token_response.message.contains("4320 hours"));
 
-    // Verify expiration is approximately 1 year from now
+    // Verify expiration is approximately 180 days from now
     let now = chrono::Utc::now();
     let expected_expiry = now + chrono::Duration::hours(4320);
     let time_diff = (token_response.expires_at - expected_expiry)

@@ -72,4 +72,11 @@ impl ModelsServiceTrait for ModelsServiceImpl {
             .map_err(|e| ModelsError::InternalError(e.to_string()))?
             .ok_or_else(|| ModelsError::NotFound(format!("Model '{}' not found", model_name)))
     }
+
+    async fn get_configured_model_names(&self) -> Result<Vec<String>, ModelsError> {
+        self.models_repository
+            .get_configured_model_names()
+            .await
+            .map_err(|e| ModelsError::InternalError(e.to_string()))
+    }
 }

@@ -699,7 +699,10 @@ pub fn build_admin_routes(database: Arc<Database>, auth_state_middleware: &AuthS
             axum::routing::get(get_organization_limits_history),
         )
         .route("/admin/users", axum::routing::get(list_users))
-        .route("/admin/access_token", axum::routing::post(create_admin_access_token))
+        .route(
+            "/admin/access_token",
+            axum::routing::post(create_admin_access_token),
+        )
         .with_state(admin_app_state)
         // Admin middleware handles both authentication and authorization
         .layer(from_fn_with_state(

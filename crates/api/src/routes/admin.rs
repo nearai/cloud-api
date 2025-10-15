@@ -1,8 +1,9 @@
 use crate::middleware::AdminUser;
 use crate::models::{
-    AdminAccessTokenResponse, AdminUserResponse, BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, DecimalPrice, ErrorResponse, ListUsersResponse,
-    ModelMetadata, ModelPricingHistoryEntry, ModelPricingHistoryResponse, ModelWithPricing,
-    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, SpendLimit, UpdateOrganizationLimitsRequest,
+    AdminAccessTokenResponse, AdminUserResponse, BatchUpdateModelApiRequest,
+    CreateAdminAccessTokenRequest, DecimalPrice, ErrorResponse, ListUsersResponse, ModelMetadata,
+    ModelPricingHistoryEntry, ModelPricingHistoryResponse, ModelWithPricing, OrgLimitsHistoryEntry,
+    OrgLimitsHistoryResponse, SpendLimit, UpdateOrganizationLimitsRequest,
     UpdateOrganizationLimitsResponse,
 };
 use axum::{
@@ -114,7 +115,9 @@ pub async fn batch_upsert_models(
         })?;
 
     // Convert to API response - map from HashMap to Vec
-    let api_models: Vec<ModelWithPricing> = updated_models.into_values().map(|updated_model| ModelWithPricing {
+    let api_models: Vec<ModelWithPricing> = updated_models
+        .into_values()
+        .map(|updated_model| ModelWithPricing {
             model_id: updated_model.public_name,
             input_cost_per_token: DecimalPrice {
                 amount: updated_model.input_cost_per_token,
@@ -596,7 +599,6 @@ pub async fn list_users(
     Ok(ResponseJson(response))
 }
 
-
 /// Create admin access token (Admin only)
 ///
 /// Creates an access token for admin users with customizable expiration time, IP address, and user agent.
@@ -624,8 +626,10 @@ pub async fn create_admin_access_token(
     Extension(admin_user): Extension<AdminUser>, // Require admin auth
     Json(request): Json<CreateAdminAccessTokenRequest>,
 ) -> Result<ResponseJson<AdminAccessTokenResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    debug!("Creating admin access token for user: {} with {} hours expiration", 
-           admin_user.0.email, request.expires_in_hours);
+    debug!(
+        "Creating admin access token for user: {} with {} hours expiration",
+        admin_user.0.email, request.expires_in_hours
+    );
 
     // Validate expiration time (must be positive)
     if request.expires_in_hours <= 0 {
@@ -643,16 +647,19 @@ pub async fn create_admin_access_token(
     let session_result = app_state
         .auth_service
         .create_session(
-            user_id, 
-            request.ip_address, 
-            request.user_agent, 
-            request.expires_in_hours
+            user_id,
+            request.ip_address,
+            request.user_agent,
+            request.expires_in_hours,
         )
         .await;
 
     match session_result {
         Ok((session, session_token)) => {
-            debug!("Admin access token created successfully for user: {}", admin_user.0.email);
+            debug!(
+                "Admin access token created successfully for user: {}",
+                admin_user.0.email
+            );
 
             let response = AdminAccessTokenResponse {
                 access_token: session_token,
@@ -679,7 +686,6 @@ pub async fn create_admin_access_token(
         }
     }
 }
-
 
 #[derive(Debug, serde::Deserialize)]
 pub struct ListUsersQueryParams {

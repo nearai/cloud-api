@@ -849,6 +849,64 @@ async fn test_no_credits_denies_request() {
 }
 
 #[tokio::test]
+async fn test_unconfigured_model_rejected() {
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Try to use a model that exists in discovery but is not configured in database
+    // This model is discovered from the endpoint but has no pricing configuration
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .json(&serde_json::json!({
+            "model": "dphn/Dolphin-Mistral-24B-Venice-Edition",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Hello"
+                }
+            ],
+            "stream": false,
+            "max_tokens": 10
+        }))
+        .await;
+
+    println!("Response status: {}", response.status_code());
+    println!("Response body: {}", response.text());
+
+    // Should get 400 Bad Request - model not configured
+    assert_eq!(
+        response.status_code(),
+        400,
+        "Expected 400 Bad Request for unconfigured model"
+    );
+
+    let error = serde_json::from_str::<api::models::ErrorResponse>(&response.text())
+        .expect("Failed to parse error response");
+    println!("Error: {:?}", error);
+
+    // Verify error message mentions the model is not configured
+    assert!(
+        error.error.message.contains("not configured"),
+        "Error message should mention model is not configured. Got: {}",
+        error.error.message
+    );
+
+    // Verify error message includes available models
+    assert!(
+        error.error.message.contains("Available models"),
+        "Error message should list available models. Got: {}",
+        error.error.message
+    );
+
+    assert_eq!(
+        error.error.r#type, "invalid_request_error",
+        "Expected error type 'invalid_request_error'"
+    );
+}
+
+#[tokio::test]
 async fn test_usage_tracking_on_completion() {
     let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 1000000000i64).await; // $1.00 USD

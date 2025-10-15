@@ -1037,6 +1037,19 @@ pub struct ListUsersResponse {
     pub offset: i64,
 }
 
+/// Admin access token request model
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateAdminAccessTokenRequest {
+    /// Number of hours until the token expires (required)
+    pub expires_in_hours: i64,
+    /// IP address where the token will be used (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_address: Option<String>,
+    /// User agent string for the token (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+}
+
 /// Admin access token response model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AdminAccessTokenResponse {

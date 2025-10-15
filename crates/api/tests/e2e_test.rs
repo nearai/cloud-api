@@ -574,6 +574,33 @@ async fn test_get_model_by_name() {
             .currency
     );
 
+    // Test retrieving the same model by public name
+    let public_name = model_request.public_name.as_deref().unwrap();
+    println!("Test: Requesting model by public name: '{}'", public_name);
+    // URL-encode the public name since it may contain special characters
+    let encoded_public_name =
+        url::form_urlencoded::byte_serialize(public_name.as_bytes()).collect::<String>();
+    println!("Test: URL-encoded public name: '{}'", encoded_public_name);
+    let response_by_public_name = server
+        .get(format!("/v1/model/{}", encoded_public_name).as_str())
+        .await;
+
+    println!(
+        "Public name response status: {}",
+        response_by_public_name.status_code()
+    );
+    assert_eq!(response_by_public_name.status_code(), 200);
+
+    let model_resp_by_public_name = response_by_public_name.json::<api::models::ModelWithPricing>();
+    println!(
+        "Retrieved model by public name: {:?}",
+        model_resp_by_public_name
+    );
+
+    // Verify that both queries return the same model (same model_id)
+    assert_eq!(model_resp.model_id, model_resp_by_public_name.model_id);
+    println!("✅ Both internal name and public name queries return the same model!");
+
     // Test retrieving a non-existent model
     // Note: URL-encode the model name even for non-existent models
     let nonexistent_model = "nonexistent/model";
@@ -2069,12 +2096,7 @@ async fn test_public_name_uniqueness_for_active_models() {
     let server = setup_test_server().await;
 
     // Test 1: Create first model with a specific public_name
-    // Generate a unique public_name using timestamp to avoid conflicts
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let public_name = format!("test-model-unique-{}", timestamp);
+    let public_name = "test-model-unique";
     let mut batch1 = BatchUpdateModelApiRequest::new();
     batch1.insert(
         "internal-model-1".to_string(),
@@ -2287,6 +2309,21 @@ async fn test_public_name_uniqueness_for_active_models() {
         "Error message should indicate public_name conflict"
     );
     println!("✅ Correctly rejected duplicate public_name for active model (second attempt)");
+
+    // Test 6: Soft-delete the third model (set is_active = false)
+    let mut batch_deactivate = BatchUpdateModelApiRequest::new();
+    batch_deactivate.insert(
+        "internal-model-3".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "isActive": false
+        }))
+        .unwrap(),
+    );
+
+    let deactivated_models =
+        admin_batch_upsert_models(&server, batch_deactivate, get_session_id()).await;
+    assert_eq!(deactivated_models.len(), 1);
+    println!("✅ Soft-deleted third model");
 
     println!("🎉 All public_name uniqueness tests passed!");
 }

@@ -66,8 +66,40 @@ impl ModelRepository {
         Ok(models)
     }
 
-    /// Get model by model name
-    pub async fn get_by_name(&self, model_name: &str) -> Result<Option<Model>> {
+    /// Get model by internal model name (for upsert logic - includes inactive models)
+    /// Searches model_name only
+    pub async fn get_by_internal_name(&self, model_name: &str) -> Result<Option<Model>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let rows = client
+            .query(
+                r#"
+                SELECT 
+                    id, model_name, public_name, model_display_name, model_description, model_icon,
+                    input_cost_per_token, output_cost_per_token,
+                    context_length, verifiable, is_active, created_at, updated_at
+                FROM models
+                WHERE model_name = $1
+                "#,
+                &[&model_name],
+            )
+            .await
+            .context("Failed to check if model exists")?;
+
+        if let Some(row) = rows.first() {
+            Ok(Some(self.row_to_model(row)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get model by model name or public name (public API - only active models)
+    /// Searches both model_name (internal) and public_name (public-facing) fields
+    pub async fn get_active_model_by_name(&self, model_name: &str) -> Result<Option<Model>> {
         let client = self
             .pool
             .get()
@@ -82,7 +114,7 @@ impl ModelRepository {
                     input_cost_per_token, output_cost_per_token,
                     context_length, verifiable, is_active, created_at, updated_at
                 FROM models 
-                WHERE model_name = $1
+                WHERE (model_name = $1 OR public_name = $1) AND is_active = true
                 "#,
                 &[&model_name],
             )
@@ -109,7 +141,7 @@ impl ModelRepository {
             .context("Failed to get database connection")?;
 
         // Check if model exists
-        let existing = self.get_by_name(model_name).await?;
+        let existing = self.get_by_internal_name(model_name).await?;
 
         let row = if existing.is_some() {
             // Model exists - do UPDATE (partial updates work)
@@ -412,7 +444,7 @@ impl ModelRepository {
         let rows = client
             .query(
                 r#"
-                SELECT 
+                SELECT
                     id, model_name, public_name, model_display_name, model_description, model_icon,
                     input_cost_per_token, output_cost_per_token,
                     context_length, verifiable, is_active, created_at, updated_at
@@ -620,7 +652,7 @@ impl services::models::ModelsRepository for ModelRepository {
         &self,
         model_name: &str,
     ) -> Result<Option<services::models::ModelWithPricing>> {
-        let model_opt = self.get_by_name(model_name).await?;
+        let model_opt = self.get_active_model_by_name(model_name).await?;
         Ok(model_opt.map(|m| services::models::ModelWithPricing {
             id: m.id,
             model_name: m.model_name,

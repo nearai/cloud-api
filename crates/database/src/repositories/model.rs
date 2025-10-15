@@ -431,6 +431,51 @@ impl ModelRepository {
         }
     }
 
+    /// Check if a public_name is already used by an active model
+    /// Returns true if the public_name is already taken by an active model
+    /// If exclude_model_name is provided, excludes that model from the check
+    pub async fn is_public_name_taken_by_active_model(
+        &self,
+        public_name: &str,
+        exclude_model_name: Option<&str>,
+    ) -> Result<bool> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let rows = if let Some(exclude_name) = exclude_model_name {
+            client
+                .query(
+                    r#"
+                    SELECT 1
+                    FROM models 
+                    WHERE public_name = $1 AND is_active = true AND model_name != $2
+                    LIMIT 1
+                    "#,
+                    &[&public_name, &exclude_name],
+                )
+                .await
+                .context("Failed to check if public_name is taken by active model")?
+        } else {
+            client
+                .query(
+                    r#"
+                    SELECT 1
+                    FROM models 
+                    WHERE public_name = $1 AND is_active = true
+                    LIMIT 1
+                    "#,
+                    &[&public_name],
+                )
+                .await
+                .context("Failed to check if public_name is taken by active model")?
+        };
+
+        Ok(!rows.is_empty())
+    }
+
     /// Resolve a model identifier (public name, alias, or canonical name) to the canonical model name
     /// Resolution order:
     /// 1. Check if it's a public_name -> return model_name

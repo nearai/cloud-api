@@ -111,7 +111,10 @@ pub async fn get_organization_balance(
     let user_id = crate::conversions::authenticated_user_to_user_id(user);
     let is_member = app_state
         .organization_service
-        .is_member(services::organization::OrganizationId(organization_id), user_id)
+        .is_member(
+            services::organization::OrganizationId(organization_id),
+            user_id,
+        )
         .await
         .map_err(|e| {
             tracing::error!("Failed to check organization membership: {}", e);
@@ -277,7 +280,10 @@ pub async fn get_organization_usage_history(
     let user_id = crate::conversions::authenticated_user_to_user_id(user);
     let is_member = app_state
         .organization_service
-        .is_member(services::organization::OrganizationId(organization_id), user_id)
+        .is_member(
+            services::organization::OrganizationId(organization_id),
+            user_id,
+        )
         .await
         .map_err(|e| {
             tracing::error!("Failed to check organization membership: {}", e);

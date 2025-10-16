@@ -97,6 +97,10 @@ pub async fn batch_upsert_models(
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(msg, "invalid_pricing".to_string())),
                 ),
+                services::admin::AdminError::PublicNameConflict(msg) => (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(msg, "public_name_conflict".to_string())),
+                ),
                 services::admin::AdminError::Unauthorized(msg) => (
                     StatusCode::UNAUTHORIZED,
                     ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
@@ -112,7 +116,9 @@ pub async fn batch_upsert_models(
         })?;
 
     // Convert to API response - map from HashMap to Vec
-    let api_models: Vec<ModelWithPricing> = updated_models.into_values().map(|updated_model| ModelWithPricing {
+    let api_models: Vec<ModelWithPricing> = updated_models
+        .into_values()
+        .map(|updated_model| ModelWithPricing {
             model_id: updated_model.public_name,
             input_cost_per_token: DecimalPrice {
                 amount: updated_model.input_cost_per_token,

@@ -5,9 +5,9 @@ use crate::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
+use services::workspace::{WorkspaceOrderBy, WorkspaceOrderDirection};
 use tracing::debug;
 use uuid::Uuid;
-use services::workspace::{WorkspaceOrderBy, WorkspaceOrderDirection};
 
 pub struct WorkspaceRepository {
     pool: DbPool,
@@ -423,7 +423,13 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
         order_direction: Option<WorkspaceOrderDirection>,
     ) -> anyhow::Result<Vec<services::workspace::Workspace>> {
         let workspaces = self
-            .list_by_organization_paginated(organization_id.0, limit, offset, order_by, order_direction)
+            .list_by_organization_paginated(
+                organization_id.0,
+                limit,
+                offset,
+                order_by,
+                order_direction,
+            )
             .await?;
         Ok(workspaces
             .into_iter()

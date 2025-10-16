@@ -49,28 +49,17 @@ pub fn test_config() -> ApiConfig {
 
 /// Helper function to create test database configuration
 fn db_config_for_tests() -> config::DatabaseConfig {
-    // Load database config from config file for tests
-    // Falls back to localhost defaults if config file is not available
-    match config::ApiConfig::load() {
-        Ok(mut config) => {
-            // Override max_connections to prevent pool exhaustion when running tests in parallel
-            // Each test creates its own connection pool, so we need to keep this small
-            config.database.max_connections = 2;
-            config.database
-        }
-        Err(_) => {
-            // Fallback to localhost defaults (for running tests without config file)
-            config::DatabaseConfig {
-                host: "localhost".to_string(),
-                port: 5432,
-                database: "platform_api".to_string(),
-                username: "postgres".to_string(),
-                password: "postgres".to_string(),
-                max_connections: 2,
-                tls_enabled: false,
-                tls_ca_cert_path: None,
-            }
-        }
+    config::DatabaseConfig {
+        primary_app_id: "postgres-test".to_string(),
+        port: 5432,
+        database: "platform_api".to_string(),
+        username: "postgres".to_string(),
+        password: "postgres".to_string(),
+        max_connections: 2,
+        tls_enabled: false,
+        tls_ca_cert_path: None,
+        refresh_interval: 30,
+        mock: false,
     }
 }
 
@@ -86,15 +75,17 @@ pub async fn init_test_database(config: &config::DatabaseConfig) -> Arc<Database
             .expect("Failed to connect to database"),
     );
 
-    // Ensure migrations only run once across all parallel tests
-    MIGRATIONS_INITIALIZED
-        .get_or_init(|| async {
-            database
-                .run_migrations()
-                .await
-                .expect("Failed to run database migrations");
-        })
-        .await;
+    // Only run migrations for real database, not mock
+    if !config.mock {
+        MIGRATIONS_INITIALIZED
+            .get_or_init(|| async {
+                database
+                    .run_migrations()
+                    .await
+                    .expect("Failed to run database migrations");
+            })
+            .await;
+    }
 
     database
 }
@@ -127,6 +118,7 @@ pub async fn setup_test_server() -> axum_test::TestServer {
 
 /// Create the mock user in the database to satisfy foreign key constraints
 pub async fn assert_mock_user_in_db(database: &Arc<Database>) {
+    // For real database, create the mock user
     let pool = database.pool();
     let client = pool.get().await.expect("Failed to get database connection");
 

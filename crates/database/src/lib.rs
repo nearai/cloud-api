@@ -1,5 +1,6 @@
 pub mod cluster_manager;
 pub mod migrations;
+pub mod mock;
 pub mod models;
 pub mod patroni_discovery;
 pub mod pool;
@@ -18,6 +19,9 @@ use cluster_manager::{ClusterManager, DatabaseConfig as ClusterDbConfig, ReadPre
 use patroni_discovery::PatroniDiscovery;
 use std::sync::Arc;
 use tracing::info;
+
+// Re-export mock function
+pub use mock::create_mock_database;
 
 /// Database service combining all repositories
 pub struct Database {
@@ -52,6 +56,18 @@ impl Database {
 
     /// Create a new database service from configuration with Patroni discovery
     pub async fn from_config(config: &config::DatabaseConfig) -> Result<Self> {
+        // If mock flag is set, use mock database
+        if config.mock {
+            info!("Using mock database for testing");
+            return create_mock_database().await;
+        }
+        
+        // For tests, use simple postgres connection without Patroni
+        if config.primary_app_id == "postgres-test" {
+            info!("Using simple PostgreSQL connection for testing");
+            return Self::from_simple_postgres_config(config).await;
+        }
+        
         info!("Initializing database with Patroni discovery");
         info!("Primary app ID: {}", config.primary_app_id);
         info!("Refresh interval: {} seconds", config.refresh_interval);
@@ -130,5 +146,30 @@ impl Database {
     /// Get a reference to the cluster manager (if using Patroni)
     pub fn cluster_manager(&self) -> Option<&Arc<ClusterManager>> {
         self.cluster_manager.as_ref()
+    }
+    
+    /// Create database connection for testing without Patroni
+    async fn from_simple_postgres_config(config: &config::DatabaseConfig) -> Result<Self> {
+        use deadpool_postgres::{Manager, ManagerConfig, RecyclingMethod};
+        use tokio_postgres::NoTls;
+        
+        let mut pg_config = tokio_postgres::Config::new();
+        pg_config
+            .host("localhost")
+            .port(config.port)
+            .dbname(&config.database)
+            .user(&config.username)
+            .password(&config.password);
+
+        let mgr_config = ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        };
+        
+        let mgr = Manager::from_config(pg_config, NoTls, mgr_config);
+        let pool = deadpool_postgres::Pool::builder(mgr)
+            .max_size(config.max_connections)
+            .build()?;
+        
+        Ok(Self::new(pool))
     }
 }

@@ -41,6 +41,8 @@ pub struct DatabaseConfig {
     pub tls_ca_cert_path: Option<String>,
     /// Interval in seconds for refreshing cluster state
     pub refresh_interval: u64,
+    /// Use mock database for testing (bypasses Patroni discovery and real database)
+    pub mock: bool,
 }
 
 impl DatabaseConfig {
@@ -82,6 +84,7 @@ impl DatabaseConfig {
                 .parse()
                 .map_err(|_| "DATABASE_REFRESH_INTERVAL must be a valid number")?,
             password,
+            mock: false, // Default to real database in production
         })
     }
 }

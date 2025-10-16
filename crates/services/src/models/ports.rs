@@ -70,6 +70,10 @@ pub trait ModelsRepository: Send + Sync {
     /// If the input is an alias, resolves to the canonical name
     /// If the input is already canonical, returns it as-is
     async fn resolve_to_canonical_name(&self, model_name: &str) -> Result<String, anyhow::Error>;
+
+    /// Get list of configured model names (public names) from database
+    /// Returns only active models that have been configured with pricing
+    async fn get_configured_model_names(&self) -> Result<Vec<String>, anyhow::Error>;
 }
 
 #[async_trait]
@@ -86,4 +90,8 @@ pub trait ModelsServiceTrait: Send + Sync {
 
     /// Get a specific model by name
     async fn get_model_by_name(&self, model_name: &str) -> Result<ModelWithPricing, ModelsError>;
+
+    /// Get list of configured model names (public names) from database
+    /// Returns only active models that have been configured with pricing
+    async fn get_configured_model_names(&self) -> Result<Vec<String>, ModelsError>;
 }

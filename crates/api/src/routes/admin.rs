@@ -100,6 +100,10 @@ pub async fn batch_upsert_models(
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(msg, "invalid_pricing".to_string())),
                 ),
+                services::admin::AdminError::PublicNameConflict(msg) => (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(msg, "public_name_conflict".to_string())),
+                ),
                 services::admin::AdminError::Unauthorized(msg) => (
                     StatusCode::UNAUTHORIZED,
                     ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),

@@ -2149,6 +2149,230 @@ async fn test_streaming_chat_completion_signature_verification() {
     println!("✅ Signing algorithm: {}", signing_algo);
 }
 
+// ============================================
+// Admin Access Token Tests
+// ============================================
+
+#[tokio::test]
+async fn test_admin_create_access_token_with_ip_and_user_agent() {
+    let server = setup_test_server().await;
+
+    // Test access token creation with IP address and user agent
+    let request = serde_json::json!({
+        "expires_in_hours": 168, // 1 week
+        "ip_address": "192.168.1.100",
+        "user_agent": "BillingService/1.0"
+    });
+
+    let response = server
+        .post("/v1/admin/access_token")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&request)
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    let token_response = response.json::<api::models::AdminAccessTokenResponse>();
+
+    // Verify response structure
+    assert!(!token_response.access_token.is_empty());
+    assert!(token_response.access_token.starts_with("sess_"));
+    assert_eq!(token_response.created_by_user_id, MOCK_USER_ID);
+    assert!(token_response.message.contains("168 hours"));
+
+    // Verify expiration is approximately 1 week from now
+    let now = chrono::Utc::now();
+    let expected_expiry = now + chrono::Duration::hours(168);
+    let time_diff = (token_response.expires_at - expected_expiry)
+        .num_minutes()
+        .abs();
+    assert!(
+        time_diff < 5,
+        "Expiration time should be within 5 minutes of expected time"
+    );
+
+    println!(
+        "✅ Created admin access token with IP and user agent: {}",
+        &token_response.access_token[..20]
+    );
+}
+
+#[tokio::test]
+async fn test_admin_create_access_token_long_term() {
+    let server = setup_test_server().await;
+
+    // Test long-term access token (180 days)
+    let request = serde_json::json!({
+        "expires_in_hours": 4320, // 180 days
+        "ip_address": "10.0.0.1",
+        "user_agent": "ProductionBillingService/2.0"
+    });
+
+    let response = server
+        .post("/v1/admin/access_token")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&request)
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    let token_response = response.json::<api::models::AdminAccessTokenResponse>();
+
+    // Verify response structure
+    assert!(!token_response.access_token.is_empty());
+    assert!(token_response.access_token.starts_with("sess_"));
+    assert_eq!(token_response.created_by_user_id, MOCK_USER_ID);
+    assert!(token_response.message.contains("4320 hours"));
+
+    // Verify expiration is approximately 180 days from now
+    let now = chrono::Utc::now();
+    let expected_expiry = now + chrono::Duration::hours(4320);
+    let time_diff = (token_response.expires_at - expected_expiry)
+        .num_minutes()
+        .abs();
+    assert!(
+        time_diff < 5,
+        "Expiration time should be within 5 minutes of expected time"
+    );
+
+    println!(
+        "✅ Created long-term admin access token: {}",
+        &token_response.access_token[..20]
+    );
+}
+
+#[tokio::test]
+async fn test_admin_create_access_token_invalid_expiration() {
+    let server = setup_test_server().await;
+
+    // Test with invalid expiration time (negative)
+    let request = serde_json::json!({
+        "expires_in_hours": -1
+    });
+
+    let response = server
+        .post("/v1/admin/access_token")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&request)
+        .await;
+
+    assert_eq!(response.status_code(), 400);
+
+    let error_response = response.json::<api::models::ErrorResponse>();
+    assert_eq!(error_response.error.r#type, "invalid_request");
+    assert!(error_response.error.message.contains("positive number"));
+
+    println!("✅ Correctly rejected negative expiration time");
+}
+
+#[tokio::test]
+async fn test_admin_create_access_token_zero_expiration() {
+    let server = setup_test_server().await;
+
+    // Test with zero expiration time
+    let request = serde_json::json!({
+        "expires_in_hours": 0
+    });
+
+    let response = server
+        .post("/v1/admin/access_token")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&request)
+        .await;
+
+    assert_eq!(response.status_code(), 400);
+
+    let error_response = response.json::<api::models::ErrorResponse>();
+    assert_eq!(error_response.error.r#type, "invalid_request");
+    assert!(error_response.error.message.contains("positive number"));
+
+    println!("✅ Correctly rejected zero expiration time");
+}
+
+#[tokio::test]
+async fn test_admin_create_access_token_unauthorized() {
+    let server = setup_test_server().await;
+
+    // Test without authorization header
+    let request = serde_json::json!({
+        "expires_in_hours": 24
+    });
+
+    let response = server.post("/v1/admin/access_token").json(&request).await;
+
+    assert_eq!(response.status_code(), 401);
+
+    println!("✅ Correctly rejected request without authorization");
+}
+
+#[tokio::test]
+async fn test_admin_create_access_token_invalid_token() {
+    let server = setup_test_server().await;
+
+    // Test with invalid session token
+    let request = serde_json::json!({
+        "expires_in_hours": 24
+    });
+
+    let response = server
+        .post("/v1/admin/access_token")
+        .add_header("Authorization", "Bearer invalid_token_12345")
+        .json(&request)
+        .await;
+
+    assert_eq!(response.status_code(), 401);
+
+    println!("✅ Correctly rejected request with invalid token");
+}
+
+#[tokio::test]
+async fn test_admin_create_access_token_use_created_token() {
+    let server = setup_test_server().await;
+
+    // First, create an admin access token
+    let create_request = serde_json::json!({
+        "expires_in_hours": 24,
+        "ip_address": "192.168.1.50",
+        "user_agent": "TestClient/1.0"
+    });
+
+    let create_response = server
+        .post("/v1/admin/access_token")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&create_request)
+        .await;
+
+    assert_eq!(create_response.status_code(), 200);
+    let token_response = create_response.json::<api::models::AdminAccessTokenResponse>();
+    let admin_token = token_response.access_token;
+
+    // Now use the created token to access an admin endpoint
+    let org = create_org(&server).await;
+
+    let update_request = serde_json::json!({
+        "spendLimit": {
+            "amount": 50000000000i64, // $50.00 USD
+            "currency": "USD"
+        },
+        "changedBy": "admin@test.com",
+        "changeReason": "Test using created admin token"
+    });
+
+    let update_response = server
+        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", admin_token))
+        .json(&update_request)
+        .await;
+
+    assert_eq!(update_response.status_code(), 200);
+
+    let update_result = update_response.json::<api::models::UpdateOrganizationLimitsResponse>();
+    assert_eq!(update_result.organization_id, org.id);
+    assert_eq!(update_result.spend_limit.amount, 50000000000i64);
+
+    println!("✅ Successfully used created admin token to update organization limits");
+}
+
 #[tokio::test]
 async fn test_public_name_uniqueness_for_active_models() {
     let server = setup_test_server().await;

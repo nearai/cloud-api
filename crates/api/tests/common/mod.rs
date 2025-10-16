@@ -75,7 +75,7 @@ fn db_config_for_tests() -> config::DatabaseConfig {
 }
 
 pub fn get_session_id() -> String {
-    "402af343-70ba-4a8a-b926-012f71e86769".to_string()
+    "sess_402af343-70ba-4a8a-b926-012f71e86769".to_string()
 }
 
 /// Initialize database with migrations running only once

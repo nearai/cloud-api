@@ -661,7 +661,7 @@ pub fn build_model_routes(models_service: Arc<dyn ModelsServiceTrait>) -> Router
 pub fn build_admin_routes(database: Arc<Database>, auth_state_middleware: &AuthState) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
-        batch_upsert_models, delete_model, get_model_pricing_history,
+        batch_upsert_models, create_admin_access_token, delete_model, get_model_pricing_history,
         get_organization_limits_history, list_users, update_organization_limits, AdminAppState,
     };
     use database::repositories::AdminCompositeRepository;
@@ -675,7 +675,10 @@ pub fn build_admin_routes(database: Arc<Database>, auth_state_middleware: &AuthS
         admin_repository as Arc<dyn services::admin::AdminRepository>,
     )) as Arc<dyn services::admin::AdminService + Send + Sync>;
 
-    let admin_app_state = AdminAppState { admin_service };
+    let admin_app_state = AdminAppState {
+        admin_service,
+        auth_service: auth_state_middleware.auth_service.clone(),
+    };
 
     Router::new()
         .route("/admin/models", axum::routing::patch(batch_upsert_models))
@@ -696,6 +699,10 @@ pub fn build_admin_routes(database: Arc<Database>, auth_state_middleware: &AuthS
             axum::routing::get(get_organization_limits_history),
         )
         .route("/admin/users", axum::routing::get(list_users))
+        .route(
+            "/admin/access_token",
+            axum::routing::post(create_admin_access_token),
+        )
         .with_state(admin_app_state)
         // Admin middleware handles both authentication and authorization
         .layer(from_fn_with_state(

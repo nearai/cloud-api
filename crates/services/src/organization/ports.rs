@@ -200,15 +200,15 @@ impl Display for OrganizationOrderBy {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrganizationOrderDirection {
-    ASC,
-    DESC,
+    Asc,
+    Desc,
 }
 
 impl Display for OrganizationOrderDirection {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ASC => f.write_str("ASC"),
-            Self::DESC => f.write_str("DESC"),
+            Self::Asc => f.write_str("asc"),
+            Self::Desc => f.write_str("desc"),
         }
     }
 }

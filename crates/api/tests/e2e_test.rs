@@ -2371,6 +2371,7 @@ async fn test_admin_create_access_token_use_created_token() {
     assert_eq!(update_result.spend_limit.amount, 50000000000i64);
 
     println!("✅ Successfully used created admin token to update organization limits");
+}
 
 #[tokio::test]
 async fn test_public_name_uniqueness_for_active_models() {

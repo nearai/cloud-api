@@ -144,7 +144,13 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
 
         // List workspaces with pagination
         self.workspace_repository
-            .list_by_organization_paginated(organization_id, limit, offset, order_by, order_direction)
+            .list_by_organization_paginated(
+                organization_id,
+                limit,
+                offset,
+                order_by,
+                order_direction,
+            )
             .await
             .map_err(|e| {
                 WorkspaceError::InternalError(format!(

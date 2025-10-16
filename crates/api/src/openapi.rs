@@ -49,6 +49,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::update_organization_limits,
         crate::routes::admin::get_organization_limits_history,
         crate::routes::admin::list_users,
+        crate::routes::admin::create_admin_access_token,
         // Workspace endpoints
         crate::routes::workspaces::create_workspace,
         crate::routes::workspaces::list_organization_workspaces,
@@ -140,6 +141,8 @@ use utoipa::{Modify, OpenApi};
             OrgLimitsHistoryEntry, OrgLimitsHistoryResponse,
             // User models (Admin)
             ListUsersResponse, AdminUserResponse,
+            // Admin access token models
+            CreateAdminAccessTokenRequest, AdminAccessTokenResponse,
             // Usage tracking models
             crate::routes::usage::OrganizationBalanceResponse,
             crate::routes::usage::UsageHistoryResponse,

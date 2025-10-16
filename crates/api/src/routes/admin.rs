@@ -1,23 +1,26 @@
 use crate::middleware::AdminUser;
 use crate::models::{
-    AdminUserResponse, BatchUpdateModelApiRequest, DecimalPrice, ErrorResponse, ListUsersResponse,
-    ModelMetadata, ModelPricingHistoryEntry, ModelPricingHistoryResponse, ModelWithPricing,
-    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, SpendLimit, UpdateOrganizationLimitsRequest,
+    AdminAccessTokenResponse, AdminUserResponse, BatchUpdateModelApiRequest,
+    CreateAdminAccessTokenRequest, DecimalPrice, ErrorResponse, ListUsersResponse, ModelMetadata,
+    ModelPricingHistoryEntry, ModelPricingHistoryResponse, ModelWithPricing, OrgLimitsHistoryEntry,
+    OrgLimitsHistoryResponse, SpendLimit, UpdateOrganizationLimitsRequest,
     UpdateOrganizationLimitsResponse,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Json, Path, State},
     http::StatusCode,
     response::Json as ResponseJson,
     Extension,
 };
 use services::admin::{AdminService, UpdateModelAdminRequest};
+use services::auth::{AuthServiceTrait, UserId};
 use std::sync::Arc;
 use tracing::{debug, error};
 
 #[derive(Clone)]
 pub struct AdminAppState {
     pub admin_service: Arc<dyn AdminService + Send + Sync>,
+    pub auth_service: Arc<dyn AuthServiceTrait>,
 }
 
 /// Batch upsert models metadata (Admin only)
@@ -598,6 +601,94 @@ pub async fn list_users(
     };
 
     Ok(ResponseJson(response))
+}
+
+/// Create admin access token (Admin only)
+///
+/// Creates an access token for admin users with customizable expiration time, IP address, and user agent.
+/// This is typically used by billing services and other automated systems that need access to admin endpoints.
+///
+/// **Security Note:** These tokens can have very long expiration times and should be used with caution.
+/// Store them securely and rotate them regularly.
+#[utoipa::path(
+    post,
+    path = "/admin/access_token",
+    tag = "Admin",
+    request_body = CreateAdminAccessTokenRequest,
+    responses(
+        (status = 200, description = "Admin access token created successfully", body = AdminAccessTokenResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn create_admin_access_token(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>, // Require admin auth
+    Json(request): Json<CreateAdminAccessTokenRequest>,
+) -> Result<ResponseJson<AdminAccessTokenResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    debug!(
+        "Creating admin access token for user: {} with {} hours expiration",
+        admin_user.0.email, request.expires_in_hours
+    );
+
+    // Validate expiration time (must be positive)
+    if request.expires_in_hours <= 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "expires_in_hours must be a positive number".to_string(),
+                "invalid_request".to_string(),
+            )),
+        ));
+    }
+
+    // Create session with the specified parameters
+    let user_id = UserId(admin_user.0.id);
+    let session_result = app_state
+        .auth_service
+        .create_session(
+            user_id,
+            request.ip_address,
+            request.user_agent,
+            request.expires_in_hours,
+        )
+        .await;
+
+    match session_result {
+        Ok((session, session_token)) => {
+            debug!(
+                "Admin access token created successfully for user: {}",
+                admin_user.0.email
+            );
+
+            let response = AdminAccessTokenResponse {
+                access_token: session_token,
+                expires_at: session.expires_at,
+                created_by_user_id: admin_user.0.id.to_string(),
+                created_at: session.created_at,
+                message: format!(
+                    "Admin access token created successfully. Token expires in {} hours and should be stored securely.",
+                    request.expires_in_hours
+                ),
+            };
+
+            Ok(ResponseJson(response))
+        }
+        Err(e) => {
+            error!("Failed to create admin access token: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to create admin access token: {}", e),
+                    "internal_server_error".to_string(),
+                )),
+            ))
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]

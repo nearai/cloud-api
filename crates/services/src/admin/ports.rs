@@ -112,6 +112,8 @@ pub enum AdminError {
     InvalidLimits(String),
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
+    #[error("Public name conflict: {0}")]
+    PublicNameConflict(String),
     #[error("Internal error: {0}")]
     InternalError(String),
 }
@@ -136,6 +138,14 @@ pub trait AdminRepository: Send + Sync {
 
     /// Soft delete a model by setting is_active to false
     async fn soft_delete_model(&self, model_name: &str) -> Result<bool, anyhow::Error>;
+
+    /// Check if a public_name is already used by an active model
+    /// If exclude_model_name is provided, excludes that model from the check
+    async fn is_public_name_taken_by_active_model(
+        &self,
+        public_name: &str,
+        exclude_model_name: Option<&str>,
+    ) -> Result<bool, anyhow::Error>;
 
     /// Update organization limits (creates new history entry, closes previous)
     async fn update_organization_limits(

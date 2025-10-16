@@ -202,4 +202,14 @@ impl AdminRepository for AdminCompositeRepository {
             })
             .collect())
     }
+
+    async fn is_public_name_taken_by_active_model(
+        &self,
+        public_name: &str,
+        exclude_model_name: Option<&str>,
+    ) -> Result<bool> {
+        self.model_repo
+            .is_public_name_taken_by_active_model(public_name, exclude_model_name)
+            .await
+    }
 }

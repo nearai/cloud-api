@@ -283,7 +283,11 @@ pub async fn completions(
         .await
     {
         Ok(_stream) => {
-            unimplemented!()
+            // unimplemented!()
+            (
+                StatusCode::NOT_IMPLEMENTED,
+                ResponseJson(ErrorResponse::new("This endpoint is not implemented".to_string(), "not_implemented".to_string())),
+            ).into_response()
         }
         Err(domain_error) => {
             let status_code = map_domain_error_to_status(&domain_error);

@@ -121,6 +121,8 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         requester_id: UserId,
         limit: i64,
         offset: i64,
+        order_by: Option<WorkspaceOrderBy>,
+        order_direction: Option<WorkspaceOrderDirection>,
     ) -> Result<Vec<Workspace>, WorkspaceError> {
         // Check if user is a member of the organization
         let is_member = self
@@ -142,7 +144,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
 
         // List workspaces with pagination
         self.workspace_repository
-            .list_by_organization_paginated(organization_id, limit, offset)
+            .list_by_organization_paginated(organization_id, limit, offset, order_by, order_direction)
             .await
             .map_err(|e| {
                 WorkspaceError::InternalError(format!(

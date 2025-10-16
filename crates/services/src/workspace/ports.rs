@@ -1,3 +1,4 @@
+use std::fmt::{Display, Formatter};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -93,6 +94,36 @@ pub enum WorkspaceError {
     ApiKeyNotFound,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceOrderBy {
+    CreatedAt,
+}
+
+impl Display for WorkspaceOrderBy {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreatedAt => f.write_str("created_at"),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceOrderDirection {
+    Asc,
+    Desc,
+}
+
+impl Display for WorkspaceOrderDirection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Asc => f.write_str("asc"),
+            Self::Desc => f.write_str("desc"),
+        }
+    }
+}
+
 // Repository trait for workspace data access
 #[async_trait]
 pub trait WorkspaceRepository: Send + Sync {
@@ -114,6 +145,8 @@ pub trait WorkspaceRepository: Send + Sync {
         organization_id: OrganizationId,
         limit: i64,
         offset: i64,
+        order_by: Option<WorkspaceOrderBy>,
+        order_direction: Option<WorkspaceOrderDirection>,
     ) -> anyhow::Result<Vec<Workspace>>;
 
     /// Create a new workspace
@@ -223,6 +256,8 @@ pub trait WorkspaceServiceTrait: Send + Sync {
         requester_id: UserId,
         limit: i64,
         offset: i64,
+        order_by: Option<WorkspaceOrderBy>,
+        order_direction: Option<WorkspaceOrderDirection>,
     ) -> Result<Vec<Workspace>, WorkspaceError>;
 
     /// Create a new workspace in an organization with permission checking

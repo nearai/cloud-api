@@ -3,6 +3,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt::{Display, Formatter};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -182,6 +183,36 @@ pub struct CreateInvitationRequest {
     pub expires_in_hours: i64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrganizationOrderBy {
+    CreatedAt,
+}
+
+impl Display for OrganizationOrderBy {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreatedAt => f.write_str("created_at"),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrganizationOrderDirection {
+    ASC,
+    DESC,
+}
+
+impl Display for OrganizationOrderDirection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ASC => f.write_str("ASC"),
+            Self::DESC => f.write_str("DESC"),
+        }
+    }
+}
+
 #[async_trait]
 pub trait OrganizationRepository: Send + Sync {
     async fn create(
@@ -236,6 +267,8 @@ pub trait OrganizationRepository: Send + Sync {
         user_id: Uuid,
         limit: i64,
         offset: i64,
+        order_by: Option<OrganizationOrderBy>,
+        order_direction: Option<OrganizationOrderDirection>,
     ) -> Result<Vec<Organization>>;
 }
 
@@ -323,6 +356,8 @@ pub trait OrganizationServiceTrait: Send + Sync {
         user_id: UserId,
         limit: i64,
         offset: i64,
+        order_by: Option<OrganizationOrderBy>,
+        order_direction: Option<OrganizationOrderDirection>,
     ) -> Result<Vec<Organization>, OrganizationError>;
 
     /// Count organizations accessible to a user

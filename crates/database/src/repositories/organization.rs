@@ -663,7 +663,7 @@ impl OrganizationRepository for PgOrganizationRepository {
         order_direction: Option<OrganizationOrderDirection>,
     ) -> Result<Vec<Organization>> {
         let order_by = order_by.unwrap_or(OrganizationOrderBy::CreatedAt);
-        let order_direction = order_direction.unwrap_or(OrganizationOrderDirection::ASC);
+        let order_direction = order_direction.unwrap_or(OrganizationOrderDirection::Asc);
 
         let client = self
             .pool

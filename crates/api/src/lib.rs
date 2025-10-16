@@ -889,7 +889,7 @@ mod tests {
 
     /// Example of how to set up the application for E2E testing
     #[tokio::test]
-    #[ignore] // Remove ignore to run with a real database
+    #[ignore] // Remove ignore to run with a real database and Patroni cluster
     async fn test_app_setup() {
         // Create a test configuration
         let config = ApiConfig {
@@ -918,7 +918,7 @@ mod tests {
                 admin_domains: vec![],
             },
             database: config::DatabaseConfig {
-                host: "localhost".to_string(),
+                primary_app_id: "postgres-patroni-1".to_string(),
                 port: 5432,
                 database: "test_db".to_string(),
                 username: "test_user".to_string(),
@@ -926,6 +926,8 @@ mod tests {
                 max_connections: 5,
                 tls_enabled: false,
                 tls_ca_cert_path: None,
+                refresh_interval: 30,
+                mock: false,
             },
         };
 
@@ -950,11 +952,11 @@ mod tests {
 
     /// Example of testing with custom database configuration
     #[tokio::test]
-    #[ignore] // Remove ignore when you have a test database
+    #[ignore] // Remove ignore when you have a test database with Patroni cluster
     async fn test_with_custom_database() {
         // Create custom database config for testing
         let db_config = config::DatabaseConfig {
-            host: "localhost".to_string(),
+            primary_app_id: "postgres-patroni-1".to_string(),
             port: 5432,
             database: "test_db".to_string(),
             username: "test_user".to_string(),
@@ -962,6 +964,8 @@ mod tests {
             max_connections: 5,
             tls_enabled: false,
             tls_ca_cert_path: None,
+            refresh_interval: 30,
+            mock: false,
         };
 
         // Initialize database with custom config
@@ -994,7 +998,7 @@ mod tests {
                 admin_domains: vec![],
             },
             database: config::DatabaseConfig {
-                host: "localhost".to_string(),
+                primary_app_id: "postgres-patroni-1".to_string(),
                 port: 5432,
                 database: "test_db".to_string(),
                 username: "test_user".to_string(),
@@ -1002,6 +1006,8 @@ mod tests {
                 max_connections: 5,
                 tls_enabled: false,
                 tls_ca_cert_path: None,
+                refresh_interval: 30,
+                mock: false,
             },
         };
 

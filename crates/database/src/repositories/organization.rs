@@ -659,7 +659,12 @@ impl OrganizationRepository for PgOrganizationRepository {
         user_id: Uuid,
         limit: i64,
         offset: i64,
+        order_by: Option<OrganizationOrderBy>,
+        order_direction: Option<OrganizationOrderDirection>,
     ) -> Result<Vec<Organization>> {
+        let order_by = order_by.unwrap_or(OrganizationOrderBy::CreatedAt);
+        let order_direction = order_direction.unwrap_or(OrganizationOrderDirection::ASC);
+
         let client = self
             .pool
             .get()
@@ -668,13 +673,15 @@ impl OrganizationRepository for PgOrganizationRepository {
 
         let rows = client
             .query(
-                r#"
-            SELECT DISTINCT o.* FROM organizations o
-            INNER JOIN organization_members om ON o.id = om.organization_id
-            WHERE om.user_id = $1 AND o.is_active = true
-            ORDER BY o.created_at ASC
-            LIMIT $2 OFFSET $3
-            "#,
+                &format!(
+                    "
+                    SELECT DISTINCT o.* FROM organizations o
+                    INNER JOIN organization_members om ON o.id = om.organization_id
+                    WHERE om.user_id = $1 AND o.is_active = true
+                    ORDER BY o.{order_by} {order_direction}
+                    LIMIT $2 OFFSET $3
+                "
+                ),
                 &[&user_id, &limit, &offset],
             )
             .await

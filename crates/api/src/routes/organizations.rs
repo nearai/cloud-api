@@ -8,7 +8,9 @@ use axum::{
     http::StatusCode,
 };
 use serde::Deserialize;
-use services::organization::{OrganizationError, OrganizationId};
+use services::organization::{
+    OrganizationError, OrganizationId, OrganizationOrderBy, OrganizationOrderDirection,
+};
 use tracing::{debug, error};
 use utoipa;
 use uuid::Uuid;
@@ -61,7 +63,13 @@ pub async fn list_organizations(
 
     match app_state
         .organization_service
-        .list_organizations_for_user(user_id, params.limit, params.offset)
+        .list_organizations_for_user(
+            user_id,
+            params.limit,
+            params.offset,
+            params.order_by,
+            params.order_direction,
+        )
         .await
     {
         Ok(organizations) => {
@@ -98,6 +106,8 @@ pub struct ListOrganizationsParams {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+    pub order_by: Option<OrganizationOrderBy>,
+    pub order_direction: Option<OrganizationOrderDirection>,
 }
 
 /// Create a new organization

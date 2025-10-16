@@ -1,7 +1,7 @@
-use std::fmt::{Display, Formatter};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt::{Display, Formatter};
 use uuid::Uuid;
 
 use crate::auth::ports::UserId;

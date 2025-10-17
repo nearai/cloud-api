@@ -42,8 +42,8 @@ impl UsageServiceTrait for UsageServiceImpl {
             .model_repository
             .get_model_by_name(model_id)
             .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get model: {}", e)))?
-            .ok_or_else(|| UsageError::ModelNotFound(format!("Model '{}' not found", model_id)))?;
+            .map_err(|e| UsageError::InternalError(format!("Failed to get model: {e}")))?
+            .ok_or_else(|| UsageError::ModelNotFound(format!("Model '{model_id}' not found")))?;
 
         // Calculate costs: tokens * cost_per_token (all in nano-dollars, scale 9)
         let input_cost = (input_tokens as i64) * model.input_cost_per_token;
@@ -88,7 +88,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             .usage_repository
             .record_usage(db_request)
             .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to record usage: {}", e)))?;
+            .map_err(|e| UsageError::InternalError(format!("Failed to record usage: {e}")))?;
 
         Ok(())
     }
@@ -103,14 +103,14 @@ impl UsageServiceTrait for UsageServiceImpl {
             .usage_repository
             .get_balance(organization_id)
             .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get balance: {}", e)))?;
+            .map_err(|e| UsageError::InternalError(format!("Failed to get balance: {e}")))?;
 
         // Get current limits
         let limit = self
             .limits_repository
             .get_current_limits(organization_id)
             .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get limits: {}", e)))?;
+            .map_err(|e| UsageError::InternalError(format!("Failed to get limits: {e}")))?;
 
         match (balance, limit) {
             (Some(balance), Some(limit)) => {
@@ -160,7 +160,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             .usage_repository
             .get_balance(organization_id)
             .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get balance: {}", e)))?;
+            .map_err(|e| UsageError::InternalError(format!("Failed to get balance: {e}")))?;
 
         Ok(balance.map(|b| OrganizationBalanceInfo {
             organization_id: b.organization_id,
@@ -183,9 +183,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             .usage_repository
             .get_usage_history(organization_id, limit, offset)
             .await
-            .map_err(|e| {
-                UsageError::InternalError(format!("Failed to get usage history: {}", e))
-            })?;
+            .map_err(|e| UsageError::InternalError(format!("Failed to get usage history: {e}")))?;
 
         Ok((logs, total))
     }
@@ -199,7 +197,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             .limits_repository
             .get_current_limits(organization_id)
             .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get limits: {}", e)))?;
+            .map_err(|e| UsageError::InternalError(format!("Failed to get limits: {e}")))?;
 
         Ok(limit)
     }
@@ -216,7 +214,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             .get_usage_history_by_api_key(api_key_id, limit, offset)
             .await
             .map_err(|e| {
-                UsageError::InternalError(format!("Failed to get API key usage history: {}", e))
+                UsageError::InternalError(format!("Failed to get API key usage history: {e}"))
             })?;
 
         Ok((logs, total))
@@ -240,7 +238,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             )
             .await
             .map_err(|e| {
-                UsageError::InternalError(format!("Failed to check workspace permissions: {}", e))
+                UsageError::InternalError(format!("Failed to check workspace permissions: {e}"))
             })?;
 
         if !can_access {
@@ -258,7 +256,7 @@ impl UsageServiceTrait for UsageServiceImpl {
                 crate::auth::UserId(user_id),
             )
             .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get API key: {}", e)))?
+            .map_err(|e| UsageError::InternalError(format!("Failed to get API key: {e}")))?
             .ok_or_else(|| {
                 UsageError::NotFound("API key not found in this workspace".to_string())
             })?;
@@ -268,9 +266,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             .usage_repository
             .get_usage_history_by_api_key(api_key_id, limit, offset)
             .await
-            .map_err(|e| {
-                UsageError::InternalError(format!("Failed to get usage history: {}", e))
-            })?;
+            .map_err(|e| UsageError::InternalError(format!("Failed to get usage history: {e}")))?;
 
         Ok((logs, total))
     }

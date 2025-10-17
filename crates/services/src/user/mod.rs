@@ -32,7 +32,7 @@ impl UserServiceTrait for UserService {
         self.user_repository
             .get_by_id(user_id)
             .await
-            .map_err(|e| UserServiceError::InternalError(format!("Failed to get user: {}", e)))?
+            .map_err(|e| UserServiceError::InternalError(format!("Failed to get user: {e}")))?
             .ok_or(UserServiceError::UserNotFound)
     }
 
@@ -47,9 +47,7 @@ impl UserServiceTrait for UserService {
         self.user_repository
             .update(user_id, display_name, avatar_url)
             .await
-            .map_err(|e| {
-                UserServiceError::InternalError(format!("Failed to update profile: {}", e))
-            })?
+            .map_err(|e| UserServiceError::InternalError(format!("Failed to update profile: {e}")))?
             .ok_or(UserServiceError::UserNotFound)
     }
 
@@ -60,7 +58,7 @@ impl UserServiceTrait for UserService {
             .list_by_user(user_id)
             .await
             .map_err(|e| {
-                UserServiceError::InternalError(format!("Failed to get user sessions: {}", e))
+                UserServiceError::InternalError(format!("Failed to get user sessions: {e}"))
             })
     }
 
@@ -76,7 +74,7 @@ impl UserServiceTrait for UserService {
             .session_repository
             .get_by_id(session_id.clone())
             .await
-            .map_err(|e| UserServiceError::InternalError(format!("Failed to get session: {}", e)))?
+            .map_err(|e| UserServiceError::InternalError(format!("Failed to get session: {e}")))?
             .ok_or(UserServiceError::SessionNotFound)?;
 
         if session.user_id != user_id {
@@ -88,9 +86,7 @@ impl UserServiceTrait for UserService {
         self.session_repository
             .revoke(session_id)
             .await
-            .map_err(|e| {
-                UserServiceError::InternalError(format!("Failed to revoke session: {}", e))
-            })
+            .map_err(|e| UserServiceError::InternalError(format!("Failed to revoke session: {e}")))
     }
 
     async fn revoke_all_sessions(&self, user_id: UserId) -> Result<usize, UserServiceError> {
@@ -100,10 +96,7 @@ impl UserServiceTrait for UserService {
             .revoke_all_for_user(user_id)
             .await
             .map_err(|e| {
-                UserServiceError::InternalError(format!(
-                    "Failed to revoke all user sessions: {}",
-                    e
-                ))
+                UserServiceError::InternalError(format!("Failed to revoke all user sessions: {e}"))
             })
     }
 }

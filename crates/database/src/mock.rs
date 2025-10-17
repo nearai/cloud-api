@@ -14,7 +14,7 @@ pub async fn create_mock_database() -> Result<Database> {
         // Spawn connection handler
         tokio::spawn(async move {
             if let Err(e) = connection.await {
-                eprintln!("connection error: {}", e);
+                eprintln!("connection error: {e}");
             }
         });
 

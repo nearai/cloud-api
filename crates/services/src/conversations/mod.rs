@@ -11,7 +11,7 @@ use uuid::Uuid;
 // Helper functions for ID parsing
 pub fn parse_uuid(id: &str) -> Result<Uuid, ports::ConversationError> {
     Uuid::parse_str(id)
-        .map_err(|_| ports::ConversationError::InvalidParams(format!("Invalid UUID: {}", id)))
+        .map_err(|_| ports::ConversationError::InvalidParams(format!("Invalid UUID: {id}")))
 }
 
 pub fn parse_uuid_from_prefixed(id: &str, prefix: &str) -> Result<Uuid, ports::ConversationError> {
@@ -58,8 +58,7 @@ impl ConversationService {
             .await
             .map_err(|e| {
                 ports::ConversationError::InternalError(format!(
-                    "Failed to create conversation: {}",
-                    e
+                    "Failed to create conversation: {e}"
                 ))
             })?;
 
@@ -87,10 +86,7 @@ impl ConversationService {
             .get_by_id(conversation_id.clone(), user_id.clone())
             .await
             .map_err(|e| {
-                ports::ConversationError::InternalError(format!(
-                    "Failed to get conversation: {}",
-                    e
-                ))
+                ports::ConversationError::InternalError(format!("Failed to get conversation: {e}"))
             })?;
 
         Ok(db_conversation.map(|c| ports::Conversation {
@@ -115,8 +111,7 @@ impl ConversationService {
             .await
             .map_err(|e| {
                 ports::ConversationError::InternalError(format!(
-                    "Failed to update conversation: {}",
-                    e
+                    "Failed to update conversation: {e}"
                 ))
             })?;
 
@@ -140,8 +135,7 @@ impl ConversationService {
             .await
             .map_err(|e| {
                 ports::ConversationError::InternalError(format!(
-                    "Failed to delete conversation: {}",
-                    e
+                    "Failed to delete conversation: {e}"
                 ))
             })
     }
@@ -160,8 +154,7 @@ impl ConversationService {
             .await
             .map_err(|e| {
                 ports::ConversationError::InternalError(format!(
-                    "Failed to get conversation messages: {}",
-                    e
+                    "Failed to get conversation messages: {e}"
                 ))
             })?;
 

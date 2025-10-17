@@ -213,7 +213,7 @@ impl UserRepository {
             .await
             .context("Failed to get database connection")?;
 
-        let pattern = format!("%{}%", query);
+        let pattern = format!("%{query}%");
         let rows = client.query(
             "SELECT * FROM users WHERE is_active = true AND (username ILIKE $1 OR email ILIKE $1) LIMIT $2",
             &[&pattern, &limit],

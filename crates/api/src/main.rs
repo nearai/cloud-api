@@ -28,7 +28,7 @@ async fn main() {
 /// Load and validate configuration
 fn load_configuration() -> ApiConfig {
     ApiConfig::load().unwrap_or_else(|e| {
-        eprintln!("Failed to load configuration: {}", e);
+        eprintln!("Failed to load configuration: {e}");
         eprintln!("Application cannot start without valid configuration.");
         eprintln!("Please ensure environment variables are set or a .env file exists.");
         eprintln!("See env.template for a complete list of required environment variables.");
@@ -63,7 +63,7 @@ fn init_tracing(logging_config: &LoggingConfig) {
     // Build the filter string from the logging configuration
     let mut filter = logging_config.level.clone();
     for (module, level) in &logging_config.modules {
-        filter.push_str(&format!(",{}={}", module, level));
+        filter.push_str(&format!(",{module}={level}"));
     }
 
     // Initialize tracing based on the format specified in config

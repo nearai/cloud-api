@@ -131,11 +131,11 @@ impl From<services::CompletionError> for crate::models::ErrorResponse {
                 "rate_limit_exceeded".to_string(),
             ),
             services::CompletionError::ProviderError(msg) => ErrorResponse::new(
-                format!("Provider error: {}", msg),
+                format!("Provider error: {msg}"),
                 "provider_error".to_string(),
             ),
             services::CompletionError::InternalError(msg) => ErrorResponse::new(
-                format!("Internal server error: {}", msg),
+                format!("Internal server error: {msg}"),
                 "internal_error".to_string(),
             ),
         }

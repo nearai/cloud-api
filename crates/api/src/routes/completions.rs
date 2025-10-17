@@ -160,11 +160,11 @@ pub async fn chat_completions(
                                 .to_string();
                             tracing::info!("Completion stream event: {}", json_data);
                             // Format as SSE event with proper newlines
-                            Ok::<Bytes, Infallible>(Bytes::from(format!("data: {}\n\n", json_data)))
+                            Ok::<Bytes, Infallible>(Bytes::from(format!("data: {json_data}\n\n")))
                         }
                         Err(e) => {
                             tracing::error!("Completion stream error: {}", e);
-                            Ok::<Bytes, Infallible>(Bytes::from(format!("data: error: {}\n\n", e)))
+                            Ok::<Bytes, Infallible>(Bytes::from(format!("data: error: {e}\n\n")))
                         }
                     })
                     .chain(futures::stream::once(async move {

@@ -4,7 +4,7 @@
 
 services:
   dstack-service:
-    image: endnearai/dstack-service
+    image: endnearai/dstack-service@sha256:9f10a9979086e06a99ae2930ac06631a4a7f5cb0eb0290c59b81407b158c2f0b
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -21,7 +21,7 @@ services:
 
   # Init container to prepare configuration
   api-init:
-    image: alpine:latest
+    image: alpine@sha256:4b7ce07002c69e8f3d704a9c5d6fd3053be500b7f1c69fc0d80990c2ad8dd412
     container_name: api-init
     restart: "no"
     volumes:
@@ -37,7 +37,7 @@ services:
 
   # Cloud API service
   cloud-api:
-    image: endnearai/cloud-api
+    image: endnearai/cloud-api@sha256:f18e7d750c324b1d3b4873d7a49d50a41a526235d7f969f7fbc72575707ebd39
     restart: unless-stopped
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
@@ -78,19 +78,45 @@ services:
     dns_search:
       - dstack.internal
     ports:
-      - "0.0.0.0:3000:3000"
+      - "3000:3000"
     depends_on:
       api-init:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"]
+      test:
+        ["CMD-SHELL", "curl -f http://localhost:3000/v1/model/list || exit 1"]
       interval: 30s
       timeout: 3s
       retries: 5
       start_period: 40s
 
+  # Dstack Ingress container for custom domain
+  dstack-ingress:
+    image: robortyan/dstack-ingress@sha256:e46aba89a180c6e2e8a42a5df771dd65a6b73ecb107791e35aa4f3c3a48d896b
+    ports:
+      - "444:444"
+    environment:
+      - PORT=444
+      - DOMAIN=${NEAR_AI_CLOUD_API_DOMAIN}
+      - TARGET_ENDPOINT=http://cloud-api:3000
+      - DNS_PROVIDER=cloudflare
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - GATEWAY_DOMAIN=gateway.cvm1.near.ai
+      - CERTBOT_EMAIL=${CERTBOT_EMAIL}
+      - TXT_PREFIX=_dstack-app-address
+      - SET_CAA=true
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - /var/run/tappd.sock:/var/run/tappd.sock
+      - cert-data:/etc/letsencrypt
+    restart: unless-stopped
+    depends_on:
+      cloud-api:
+        condition: service_started
+
 volumes:
   api_config:
+  cert-data: # Persistent volume for certificates
 
 configs:
   api_init_script:

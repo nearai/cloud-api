@@ -1,10 +1,10 @@
 use crate::models::{OrganizationBalance, OrganizationUsageLog, RecordUsageRequest};
 use crate::pool::DbPool;
+use crate::OrganizationUsageLogWithPublicName;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use tokio_postgres::Row;
 use uuid::Uuid;
-use crate::OrganizationUsageLogWithPublicName;
 
 #[derive(Debug, Clone)]
 pub struct OrganizationUsageRepository {
@@ -208,7 +208,10 @@ impl OrganizationUsageRepository {
             .await
             .context("Failed to query usage history")?;
 
-        Ok(rows.iter().map(|row| self.row_to_usage_log_with_public_name(row)).collect())
+        Ok(rows
+            .iter()
+            .map(|row| self.row_to_usage_log_with_public_name(row))
+            .collect())
     }
 
     /// Count total usage history records for an API key
@@ -268,7 +271,10 @@ impl OrganizationUsageRepository {
             .await
             .context("Failed to query usage history by API key")?;
 
-        Ok(rows.iter().map(|row| self.row_to_usage_log_with_public_name(row)).collect())
+        Ok(rows
+            .iter()
+            .map(|row| self.row_to_usage_log_with_public_name(row))
+            .collect())
     }
 
     /// Get usage statistics for a time period

@@ -9,6 +9,7 @@ use database::Database;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
+use api::models::ModelWithPricing;
 
 // Global once cell to ensure migrations only run once across all tests
 static MIGRATIONS_INITIALIZED: OnceCell<()> = OnceCell::const_new();
@@ -251,11 +252,11 @@ pub async fn create_org_and_api_key(
 
 /// Setup a test model with pricing
 /// Returns the model name
-pub async fn setup_test_model(server: &axum_test::TestServer) -> String {
+pub async fn setup_test_model(server: &axum_test::TestServer) -> (String, ModelWithPricing) {
     let batch = generate_model();
     let model_name = batch.keys().next().unwrap().clone();
-    admin_batch_upsert_models(server, batch, get_session_id()).await;
-    model_name
+    let models = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    (model_name, models.into_iter().next().unwrap())
 }
 
 /// Generate a test model with standard pricing

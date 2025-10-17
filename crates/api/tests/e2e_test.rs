@@ -1078,7 +1078,7 @@ async fn test_completion_cost_calculation() {
     println!("Created organization: {}", org.id);
 
     // Setup test model with known pricing
-    let model_name = setup_test_model(&server).await;
+    let (model_name, model) = setup_test_model(&server).await;
     println!("Setup model: {}", model_name);
 
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
@@ -1253,7 +1253,7 @@ async fn test_completion_cost_calculation() {
 
     println!("Latest usage entry: {:?}", latest_entry);
     assert_eq!(
-        latest_entry.model_id, model_name,
+        latest_entry.model_id, model.model_id,
         "Should record correct model"
     );
     assert_eq!(
@@ -1305,7 +1305,7 @@ async fn test_organization_balance_with_limit_and_usage() {
 
     // Make a completion to record some usage
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
-    let model_name = setup_test_model(&server).await;
+    let (model_name, _) = setup_test_model(&server).await;
 
     let response = server
         .post("/v1/chat/completions")

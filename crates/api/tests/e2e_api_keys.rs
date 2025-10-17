@@ -415,7 +415,7 @@ async fn test_api_key_spend_limit_enforcement() {
 
     assert_eq!(response.status_code(), 200);
 
-    let model_name = setup_test_model(&server).await;
+    let (model_name, _) = setup_test_model(&server).await;
 
     // First request might succeed or fail depending on timing
     let _response1 = server
@@ -533,7 +533,7 @@ async fn test_list_workspace_api_keys_with_usage() {
         create_api_key_in_workspace(&server, workspace.id.clone(), "Test API Key 2".to_string())
             .await;
 
-    let model_name = setup_test_model(&server).await;
+    let (model_name, _) = setup_test_model(&server).await;
 
     // Make a completion request with the first API key to generate usage
     let response = server
@@ -629,7 +629,7 @@ async fn test_api_key_usage_isolated_between_keys() {
         create_api_key_in_workspace(&server, workspace.id.clone(), "Key 2".to_string()).await;
     let api_key2 = api_key_resp2.key.clone().unwrap();
 
-    let model_name = setup_test_model(&server).await;
+    let (model_name, _) = setup_test_model(&server).await;
 
     // Make request with first key
     let response1 = server

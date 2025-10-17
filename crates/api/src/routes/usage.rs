@@ -327,7 +327,7 @@ pub async fn get_organization_usage_history(
             id: entry.id.to_string(),
             workspace_id: entry.workspace_id.to_string(),
             api_key_id: entry.api_key_id.to_string(),
-            model_id: entry.model_id,
+            model_id: entry.public_name.unwrap_or(entry.model_id),
             input_tokens: entry.input_tokens,
             output_tokens: entry.output_tokens,
             total_tokens: entry.total_tokens,

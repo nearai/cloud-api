@@ -508,6 +508,13 @@ pub struct OrganizationUsageLog {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrganizationUsageLogWithPublicName {
+    #[serde(flatten)]
+    pub inner: OrganizationUsageLog,
+    pub public_name: String,
+}
+
 /// Organization balance summary - cached aggregate spending
 /// All amounts use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone, Serialize, Deserialize)]

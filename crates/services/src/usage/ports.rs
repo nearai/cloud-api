@@ -206,6 +206,7 @@ pub struct UsageLogEntry {
     pub api_key_id: Uuid,
     pub response_id: Option<Uuid>,
     pub model_id: String,
+    pub public_name: Option<String>,
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub total_tokens: i32,

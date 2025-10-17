@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tokio_postgres::Row;
 use uuid::Uuid;
+use crate::OrganizationUsageLogWithPublicName;
 
 #[derive(Debug, Clone)]
 pub struct OrganizationUsageRepository {
@@ -179,7 +180,7 @@ impl OrganizationUsageRepository {
         organization_id: Uuid,
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> Result<Vec<OrganizationUsageLog>> {
+    ) -> Result<Vec<OrganizationUsageLogWithPublicName>> {
         let client = self
             .pool
             .get()
@@ -192,13 +193,14 @@ impl OrganizationUsageRepository {
         let rows = client
             .query(
                 r#"
-                SELECT id, organization_id, workspace_id, api_key_id, response_id,
-                       model_id, input_tokens, output_tokens, total_tokens,
-                       input_cost, output_cost, total_cost,
-                       request_type, created_at
-                FROM organization_usage_log
-                WHERE organization_id = $1
-                ORDER BY created_at DESC
+                SELECT log.id, log.organization_id, log.workspace_id, log.api_key_id, log.response_id,
+                       log.model_id, log.input_tokens, log.output_tokens, log.total_tokens,
+                       log.input_cost, log.output_cost, log.total_cost,
+                       log.request_type, log.created_at,
+                       m.public_name
+                FROM organization_usage_log log LEFT JOIN models m on log.model_id = m.model_name
+                WHERE log.organization_id = $1
+                ORDER BY log.created_at DESC
                 LIMIT $2 OFFSET $3
                 "#,
                 &[&organization_id, &limit, &offset],
@@ -206,7 +208,7 @@ impl OrganizationUsageRepository {
             .await
             .context("Failed to query usage history")?;
 
-        Ok(rows.iter().map(|row| self.row_to_usage_log(row)).collect())
+        Ok(rows.iter().map(|row| self.row_to_usage_log_with_public_name(row)).collect())
     }
 
     /// Count total usage history records for an API key
@@ -238,7 +240,7 @@ impl OrganizationUsageRepository {
         api_key_id: Uuid,
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> Result<Vec<OrganizationUsageLog>> {
+    ) -> Result<Vec<OrganizationUsageLogWithPublicName>> {
         let client = self
             .pool
             .get()
@@ -251,13 +253,14 @@ impl OrganizationUsageRepository {
         let rows = client
             .query(
                 r#"
-                SELECT id, organization_id, workspace_id, api_key_id, response_id,
-                       model_id, input_tokens, output_tokens, total_tokens,
-                       input_cost, output_cost, total_cost,
-                       request_type, created_at
-                FROM organization_usage_log
-                WHERE api_key_id = $1
-                ORDER BY created_at DESC
+                SELECT log.id, log.organization_id, log.workspace_id, log.api_key_id, log.response_id,
+                       log.model_id, log.input_tokens, log.output_tokens, log.total_tokens,
+                       log.input_cost, log.output_cost, log.total_cost,
+                       log.request_type, log.created_at,
+                       m.public_name
+                FROM organization_usage_log log LEFT JOIN models m on log.model_id = m.model_name
+                WHERE log.api_key_id = $1
+                ORDER BY log.created_at DESC
                 LIMIT $2 OFFSET $3
                 "#,
                 &[&api_key_id, &limit, &offset],
@@ -265,7 +268,7 @@ impl OrganizationUsageRepository {
             .await
             .context("Failed to query usage history by API key")?;
 
-        Ok(rows.iter().map(|row| self.row_to_usage_log(row)).collect())
+        Ok(rows.iter().map(|row| self.row_to_usage_log_with_public_name(row)).collect())
     }
 
     /// Get usage statistics for a time period
@@ -321,6 +324,13 @@ impl OrganizationUsageRepository {
             total_cost: row.get("total_cost"),
             request_type: row.get("request_type"),
             created_at: row.get("created_at"),
+        }
+    }
+
+    fn row_to_usage_log_with_public_name(&self, row: &Row) -> OrganizationUsageLogWithPublicName {
+        OrganizationUsageLogWithPublicName {
+            inner: self.row_to_usage_log(row),
+            public_name: row.get("public_name"),
         }
     }
 

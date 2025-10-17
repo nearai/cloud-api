@@ -596,14 +596,21 @@ pub fn build_conversation_routes(
 
 /// Build attestation routes with auth
 pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
-    Router::new()
+    let authenticated_routes = Router::new()
         .route("/signature/{chat_id}", get(get_signature))
-        .route("/attestation/report", get(get_attestation_report))
-        .with_state(app_state)
+        .with_state(app_state.clone())
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware_with_api_key,
-        ))
+        ));
+
+    let public_routes = Router::new()
+        .route("/attestation/report", get(get_attestation_report))
+        .with_state(app_state);
+
+    Router::new()
+        .merge(authenticated_routes)
+        .merge(public_routes)
 }
 
 /// Build workspace routes with auth

@@ -175,7 +175,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let organization_id = request.organization_id;
         let workspace_id = request.workspace_id;
         let api_key_id = uuid::Uuid::parse_str(&request.api_key_id).map_err(|e| {
-            ports::CompletionError::InvalidParams(format!("Invalid API key ID: {}", e))
+            ports::CompletionError::InvalidParams(format!("Invalid API key ID: {e}"))
         })?;
         let is_streaming = request.stream.unwrap_or(false);
 
@@ -213,7 +213,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .resolve_to_canonical_name(&request.model)
             .await
             .map_err(|e| {
-                ports::CompletionError::InvalidModel(format!("Failed to resolve model name: {}", e))
+                ports::CompletionError::InvalidModel(format!("Failed to resolve model name: {e}"))
             })?;
 
         // Verify model exists in database (has pricing configured)
@@ -224,8 +224,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .await
             .map_err(|e| {
                 ports::CompletionError::InvalidModel(format!(
-                    "Failed to validate model configuration: {}",
-                    e
+                    "Failed to validate model configuration: {e}"
                 ))
             })?
             .is_none()
@@ -259,7 +258,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .chat_completion_stream(chat_params, request.body_hash.clone())
             .await
             .map_err(|e| {
-                ports::CompletionError::ProviderError(format!("Failed to create LLM stream: {}", e))
+                ports::CompletionError::ProviderError(format!("Failed to create LLM stream: {e}"))
             })?;
 
         // Determine request type
@@ -323,7 +322,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .resolve_to_canonical_name(&request.model)
             .await
             .map_err(|e| {
-                ports::CompletionError::InvalidModel(format!("Failed to resolve model name: {}", e))
+                ports::CompletionError::InvalidModel(format!("Failed to resolve model name: {e}"))
             })?;
 
         // Verify model exists in database (has pricing configured)
@@ -334,8 +333,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .await
             .map_err(|e| {
                 ports::CompletionError::InvalidModel(format!(
-                    "Failed to validate model configuration: {}",
-                    e
+                    "Failed to validate model configuration: {e}"
                 ))
             })?
             .is_none()
@@ -368,7 +366,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .chat_completion(chat_params, request.body_hash.clone())
             .await
             .map_err(|e| {
-                ports::CompletionError::ProviderError(format!("Failed to create completion: {}", e))
+                ports::CompletionError::ProviderError(format!("Failed to create completion: {e}"))
             })?;
 
         // Store attestation signature
@@ -390,7 +388,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let organization_id = request.organization_id;
         let workspace_id = request.workspace_id;
         let api_key_id = uuid::Uuid::parse_str(&request.api_key_id).map_err(|e| {
-            ports::CompletionError::InvalidParams(format!("Invalid API key ID: {}", e))
+            ports::CompletionError::InvalidParams(format!("Invalid API key ID: {e}"))
         })?;
         let model_id = response_with_bytes.response.model.clone();
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;

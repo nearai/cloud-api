@@ -67,7 +67,7 @@ jobs:
         DATABASE_TLS_ENABLED: "false"
 
     - name: Run integration tests
-      run: cargo test --test e2e_test
+      run: cargo test --test e2e_test --test e2e_api_keys
       env:
         DATABASE_HOST: localhost
         DATABASE_PORT: 5432

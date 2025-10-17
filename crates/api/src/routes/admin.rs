@@ -194,7 +194,7 @@ pub async fn get_model_pricing_history(
                 services::admin::AdminError::ModelNotFound(_) => (
                     StatusCode::NOT_FOUND,
                     ResponseJson(ErrorResponse::new(
-                        format!("Model '{}' not found", model_name),
+                        format!("Model '{model_name}' not found"),
                         "model_not_found".to_string(),
                     )),
                 ),
@@ -501,7 +501,7 @@ pub async fn delete_model(
                 services::admin::AdminError::ModelNotFound(_) => (
                     StatusCode::NOT_FOUND,
                     ResponseJson(ErrorResponse::new(
-                        format!("Model '{}' not found", model_name),
+                        format!("Model '{model_name}' not found"),
                         "model_not_found".to_string(),
                     )),
                 ),
@@ -683,7 +683,7 @@ pub async fn create_admin_access_token(
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
-                    format!("Failed to create admin access token: {}", e),
+                    format!("Failed to create admin access token: {e}"),
                     "internal_server_error".to_string(),
                 )),
             ))

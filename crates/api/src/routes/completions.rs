@@ -254,6 +254,16 @@ pub async fn completions(
         api_key.organization.id,
         api_key.workspace.id.0
     );
+
+    return (
+        StatusCode::NOT_IMPLEMENTED,
+        ResponseJson(ErrorResponse::new(
+            "This endpoint is not implemented".to_string(),
+            "not_implemented".to_string(),
+        )),
+    )
+        .into_response();
+
     // Validate the request
     if let Err(error) = request.validate() {
         return (
@@ -283,15 +293,7 @@ pub async fn completions(
         .await
     {
         Ok(_stream) => {
-            // unimplemented!()
-            (
-                StatusCode::NOT_IMPLEMENTED,
-                ResponseJson(ErrorResponse::new(
-                    "This endpoint is not implemented".to_string(),
-                    "not_implemented".to_string(),
-                )),
-            )
-                .into_response()
+            unimplemented!();
         }
         Err(domain_error) => {
             let status_code = map_domain_error_to_status(&domain_error);

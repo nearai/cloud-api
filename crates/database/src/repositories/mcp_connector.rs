@@ -170,19 +170,19 @@ impl McpConnectorRepository {
         let mut param_idx = 2;
 
         if let Some(ref name) = request.name {
-            query.push_str(&format!(", name = ${}", param_idx));
+            query.push_str(&format!(", name = ${param_idx}"));
             params.push(name);
             param_idx += 1;
         }
 
         if let Some(ref description) = request.description {
-            query.push_str(&format!(", description = ${}", param_idx));
+            query.push_str(&format!(", description = ${param_idx}"));
             params.push(description);
             param_idx += 1;
         }
 
         if let Some(ref url) = request.mcp_server_url {
-            query.push_str(&format!(", mcp_server_url = ${}", param_idx));
+            query.push_str(&format!(", mcp_server_url = ${param_idx}"));
             params.push(url);
             param_idx += 1;
         }
@@ -190,7 +190,7 @@ impl McpConnectorRepository {
         let auth_type_str;
         if let Some(ref auth_type) = request.auth_type {
             auth_type_str = auth_type.to_string();
-            query.push_str(&format!(", auth_type = ${}", param_idx));
+            query.push_str(&format!(", auth_type = ${param_idx}"));
             params.push(&auth_type_str);
             param_idx += 1;
         }
@@ -201,18 +201,18 @@ impl McpConnectorRepository {
                 token: bearer_token.clone(),
             })
             .unwrap();
-            query.push_str(&format!(", auth_config = ${}", param_idx));
+            query.push_str(&format!(", auth_config = ${param_idx}"));
             params.push(&auth_config);
             param_idx += 1;
         }
 
         if let Some(ref is_active) = request.is_active {
-            query.push_str(&format!(", is_active = ${}", param_idx));
+            query.push_str(&format!(", is_active = ${param_idx}"));
             params.push(is_active);
             param_idx += 1;
         }
 
-        query.push_str(&format!(" WHERE id = ${} RETURNING *", param_idx));
+        query.push_str(&format!(" WHERE id = ${param_idx} RETURNING *"));
         params.push(&id);
 
         let row = client

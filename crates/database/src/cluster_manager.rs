@@ -358,7 +358,7 @@ impl ClusterManager {
         pool_guard
             .as_ref()
             .ok_or_else(|| anyhow!("Write pool not initialized"))
-            .map(|p| p.clone())
+            .cloned()
     }
 }
 

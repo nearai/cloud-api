@@ -190,7 +190,7 @@ pub async fn list_workspaces(
     org_id: String,
 ) -> Vec<api::routes::workspaces::WorkspaceResponse> {
     let response = server
-        .get(format!("/v1/organizations/{}/workspaces", org_id).as_str())
+        .get(format!("/v1/organizations/{org_id}/workspaces").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .await;
     assert_eq!(response.status_code(), 200);
@@ -210,7 +210,7 @@ pub async fn create_api_key_in_workspace(
         spend_limit: None,
     };
     let response = server
-        .post(format!("/v1/workspaces/{}/api-keys", workspace_id).as_str())
+        .post(format!("/v1/workspaces/{workspace_id}/api-keys").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .json(&serde_json::json!(request))
         .await;
@@ -284,7 +284,7 @@ pub async fn admin_batch_upsert_models(
 ) -> Vec<api::models::ModelWithPricing> {
     let response = server
         .patch("/v1/admin/models")
-        .add_header("Authorization", format!("Bearer {}", session_id))
+        .add_header("Authorization", format!("Bearer {session_id}"))
         .json(&models)
         .await;
 
@@ -303,7 +303,7 @@ pub async fn list_models(
 ) -> api::models::ModelsResponse {
     let response = server
         .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
     assert_eq!(response.status_code(), 200);
     response.json::<api::models::ModelsResponse>()

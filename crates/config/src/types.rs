@@ -52,7 +52,7 @@ impl DatabaseConfig {
         // This file would be mounted as a secret in production deployments.
         let password = if let Ok(path) = env::var("DATABASE_PASSWORD_FILE") {
             std::fs::read_to_string(path)
-                .map_err(|e| format!("Failed to read DATABASE_PASSWORD_FILE: {}", e))?
+                .map_err(|e| format!("Failed to read DATABASE_PASSWORD_FILE: {e}"))?
                 .trim()
                 .to_string()
         } else {

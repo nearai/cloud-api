@@ -46,11 +46,8 @@ async fn test_models_endpoint() {
                 assert!(model.created > 0, "Model created should be greater than 0");
             }
         }
-        Ok(Err(e)) => panic!("Models request failed: {}", e),
-        Err(_) => panic!(
-            "Models request timed out after {} seconds",
-            TEST_TIMEOUT_SECS
-        ),
+        Ok(Err(e)) => panic!("Models request failed: {e}"),
+        Err(_) => panic!("Models request timed out after {TEST_TIMEOUT_SECS} seconds"),
     }
 }
 
@@ -63,7 +60,7 @@ async fn test_chat_completion_streaming() {
     assert!(!models.data.is_empty(), "No models available for testing");
 
     let model_id = &models.data[0].id;
-    println!("Testing with model: {}", model_id);
+    println!("Testing with model: {model_id}");
 
     let params = ChatCompletionParams {
         model: model_id.clone(),
@@ -127,7 +124,7 @@ async fn test_chat_completion_streaming() {
                     Ok(sse_event) => match sse_event.chunk {
                         StreamChunk::Chat(chat_chunk) => {
                             chunks_received += 1;
-                            println!("Received chat chunk #{}: {:?}", chunks_received, chat_chunk);
+                            println!("Received chat chunk #{chunks_received}: {chat_chunk:?}");
 
                             // Check for token usage in final chunk
                             if let Some(usage) = &chat_chunk.usage {
@@ -144,7 +141,7 @@ async fn test_chat_completion_streaming() {
                                     usage.completion_tokens > 0,
                                     "Completion tokens should be greater than 0"
                                 );
-                                println!("Token usage: {:?}", usage);
+                                println!("Token usage: {usage:?}");
                             }
 
                             // Collect content from deltas
@@ -157,12 +154,12 @@ async fn test_chat_completion_streaming() {
                             }
                         }
                         StreamChunk::Text(text_chunk) => {
-                            panic!("CRITICAL ERROR: Received text chunk in chat completion stream! This indicates stream isolation failure. Chunk: {:?}", text_chunk);
+                            panic!("CRITICAL ERROR: Received text chunk in chat completion stream! This indicates stream isolation failure. Chunk: {text_chunk:?}");
                         }
                     },
                     Err(e) => {
                         // Stream errors should be treated as test failures
-                        panic!("Stream error in chat completion: {}. This could indicate SSE parsing issues or stream corruption.", e);
+                        panic!("Stream error in chat completion: {e}. This could indicate SSE parsing issues or stream corruption.");
                     }
                 }
 
@@ -177,22 +174,15 @@ async fn test_chat_completion_streaming() {
                 "Should have received at least one chunk"
             );
             assert!(usage_found, "Should have received token usage information");
-            println!("Total content received: '{}'", content_received);
-            println!(
-                "Successfully processed {} chunks with token usage enabled",
-                chunks_received
-            );
+            println!("Total content received: '{content_received}'");
+            println!("Successfully processed {chunks_received} chunks with token usage enabled");
 
             // Verify we received meaningful content
             assert!(!content_received.is_empty() || chunks_received >= 2,
-                    "Should receive content or at least 2 chunks (initial + usage). Got {} chunks with content: '{}'",
-                    chunks_received, content_received);
+                    "Should receive content or at least 2 chunks (initial + usage). Got {chunks_received} chunks with content: '{content_received}'");
         }
-        Ok(Err(e)) => panic!("Chat completion failed: {}", e),
-        Err(_) => panic!(
-            "Chat completion timed out after {} seconds",
-            TEST_TIMEOUT_SECS
-        ),
+        Ok(Err(e)) => panic!("Chat completion failed: {e}"),
+        Err(_) => panic!("Chat completion timed out after {TEST_TIMEOUT_SECS} seconds"),
     }
 }
 
@@ -205,7 +195,7 @@ async fn test_text_completion_streaming() {
     assert!(!models.data.is_empty(), "No models available for testing");
 
     let model_id = &models.data[0].id;
-    println!("Testing text completion with model: {}", model_id);
+    println!("Testing text completion with model: {model_id}");
 
     let params = CompletionParams {
         model: model_id.clone(),
@@ -249,7 +239,7 @@ async fn test_text_completion_streaming() {
                     Ok(sse_event) => match sse_event.chunk {
                         StreamChunk::Text(text_chunk) => {
                             chunks_received += 1;
-                            println!("Received text chunk #{}: {:?}", chunks_received, text_chunk);
+                            println!("Received text chunk #{chunks_received}: {text_chunk:?}");
 
                             // Check for token usage in final chunk
                             if let Some(usage) = &text_chunk.usage {
@@ -266,7 +256,7 @@ async fn test_text_completion_streaming() {
                                     usage.completion_tokens > 0,
                                     "Completion tokens should be greater than 0"
                                 );
-                                println!("Token usage: {:?}", usage);
+                                println!("Token usage: {usage:?}");
                             }
 
                             // Collect content from choices
@@ -275,11 +265,11 @@ async fn test_text_completion_streaming() {
                             }
                         }
                         StreamChunk::Chat(chat_chunk) => {
-                            panic!("CRITICAL ERROR: Received chat chunk in text completion stream! This indicates stream isolation failure. Chunk: {:?}", chat_chunk);
+                            panic!("CRITICAL ERROR: Received chat chunk in text completion stream! This indicates stream isolation failure. Chunk: {chat_chunk:?}");
                         }
                     },
                     Err(e) => {
-                        panic!("Stream error in text completion: {}. This could indicate SSE parsing issues or stream corruption.", e);
+                        panic!("Stream error in text completion: {e}. This could indicate SSE parsing issues or stream corruption.");
                     }
                 }
 
@@ -298,13 +288,10 @@ async fn test_text_completion_streaming() {
                 !content_received.is_empty(),
                 "Should have received some content"
             );
-            println!("Total content received: '{}'", content_received);
+            println!("Total content received: '{content_received}'");
         }
-        Ok(Err(e)) => panic!("Text completion failed: {}", e),
-        Err(_) => panic!(
-            "Text completion timed out after {} seconds",
-            TEST_TIMEOUT_SECS
-        ),
+        Ok(Err(e)) => panic!("Text completion failed: {e}"),
+        Err(_) => panic!("Text completion timed out after {TEST_TIMEOUT_SECS} seconds"),
     }
 }
 
@@ -351,7 +338,7 @@ async fn test_error_handling() {
     assert!(result.is_err(), "Should fail with invalid model");
 
     if let Err(e) = result {
-        println!("Expected error for invalid model: {}", e);
+        println!("Expected error for invalid model: {e}");
     }
 }
 

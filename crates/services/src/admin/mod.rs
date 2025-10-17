@@ -86,8 +86,7 @@ impl AdminService for AdminServiceImpl {
 
         if !deleted {
             return Err(AdminError::ModelNotFound(format!(
-                "Model '{}' not found",
-                model_name
+                "Model '{model_name}' not found"
             )));
         }
 
@@ -110,8 +109,7 @@ impl AdminService for AdminServiceImpl {
                 let error_msg = e.to_string();
                 if error_msg.contains("Organization not found") {
                     AdminError::OrganizationNotFound(format!(
-                        "Organization '{}' not found",
-                        organization_id
+                        "Organization '{organization_id}' not found"
                     ))
                 } else {
                     AdminError::InternalError(error_msg)
@@ -203,8 +201,7 @@ impl AdminServiceImpl {
 
                 if is_taken {
                     return Err(AdminError::PublicNameConflict(format!(
-                        "Public name '{}' is already used by an active model",
-                        public_name
+                        "Public name '{public_name}' is already used by an active model"
                     )));
                 }
             }

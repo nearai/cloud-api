@@ -50,7 +50,7 @@ impl VLlmProvider {
         if let Some(ref api_key) = self.config.api_key {
             headers.insert(
                 "Authorization",
-                format!("Bearer {}", api_key).parse().unwrap(),
+                format!("Bearer {api_key}").parse().unwrap(),
             );
         }
 
@@ -159,8 +159,7 @@ impl InferenceProvider for VLlmProvider {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             return Err(CompletionError::CompletionError(format!(
-                "HTTP {}: {}",
-                status, error_text
+                "HTTP {status}: {error_text}",
             )));
         }
 
@@ -193,8 +192,7 @@ impl InferenceProvider for VLlmProvider {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             return Err(CompletionError::CompletionError(format!(
-                "HTTP {}: {}",
-                status, error_text
+                "HTTP {status}: {error_text}",
             )));
         }
 
@@ -208,7 +206,7 @@ impl InferenceProvider for VLlmProvider {
         // Parse the response from the raw bytes
         let chat_completion_response: ChatCompletionResponse = serde_json::from_slice(&raw_bytes)
             .map_err(|e| {
-            CompletionError::CompletionError(format!("Failed to parse response: {}", e))
+            CompletionError::CompletionError(format!("Failed to parse response: {e}"))
         })?;
 
         Ok(ChatCompletionResponseWithBytes {
@@ -244,8 +242,7 @@ impl InferenceProvider for VLlmProvider {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             return Err(CompletionError::CompletionError(format!(
-                "HTTP {}: {}",
-                status, error_text
+                "HTTP {status}: {error_text}"
             )));
         }
 

@@ -108,7 +108,7 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
 
     let auth_service: Arc<dyn AuthServiceTrait> = if config.auth.mock {
         // TODO: fix this, it should not use the database pool
-        println!("config: {:?}", config);
+        println!("config: {config:?}");
         Arc::new(MockAuthService {
             apikey_repository: Arc::new(ApiKeyRepository::new(database.pool().clone())),
         })
@@ -596,14 +596,21 @@ pub fn build_conversation_routes(
 
 /// Build attestation routes with auth
 pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
-    Router::new()
+    let authenticated_routes = Router::new()
         .route("/signature/{chat_id}", get(get_signature))
-        .route("/attestation/report", get(get_attestation_report))
-        .with_state(app_state)
+        .with_state(app_state.clone())
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware_with_api_key,
-        ))
+        ));
+
+    let public_routes = Router::new()
+        .route("/attestation/report", get(get_attestation_report))
+        .with_state(app_state);
+
+    Router::new()
+        .merge(authenticated_routes)
+        .merge(public_routes)
 }
 
 /// Build workspace routes with auth
@@ -889,7 +896,7 @@ mod tests {
 
     /// Example of how to set up the application for E2E testing
     #[tokio::test]
-    #[ignore] // Remove ignore to run with a real database
+    #[ignore] // Remove ignore to run with a real database and Patroni cluster
     async fn test_app_setup() {
         // Create a test configuration
         let config = ApiConfig {
@@ -918,7 +925,7 @@ mod tests {
                 admin_domains: vec![],
             },
             database: config::DatabaseConfig {
-                host: "localhost".to_string(),
+                primary_app_id: "postgres-patroni-1".to_string(),
                 port: 5432,
                 database: "test_db".to_string(),
                 username: "test_user".to_string(),
@@ -926,6 +933,8 @@ mod tests {
                 max_connections: 5,
                 tls_enabled: false,
                 tls_ca_cert_path: None,
+                refresh_interval: 30,
+                mock: false,
             },
         };
 
@@ -950,11 +959,11 @@ mod tests {
 
     /// Example of testing with custom database configuration
     #[tokio::test]
-    #[ignore] // Remove ignore when you have a test database
+    #[ignore] // Remove ignore when you have a test database with Patroni cluster
     async fn test_with_custom_database() {
         // Create custom database config for testing
         let db_config = config::DatabaseConfig {
-            host: "localhost".to_string(),
+            primary_app_id: "postgres-patroni-1".to_string(),
             port: 5432,
             database: "test_db".to_string(),
             username: "test_user".to_string(),
@@ -962,6 +971,8 @@ mod tests {
             max_connections: 5,
             tls_enabled: false,
             tls_ca_cert_path: None,
+            refresh_interval: 30,
+            mock: false,
         };
 
         // Initialize database with custom config
@@ -994,7 +1005,7 @@ mod tests {
                 admin_domains: vec![],
             },
             database: config::DatabaseConfig {
-                host: "localhost".to_string(),
+                primary_app_id: "postgres-patroni-1".to_string(),
                 port: 5432,
                 database: "test_db".to_string(),
                 username: "test_user".to_string(),
@@ -1002,6 +1013,8 @@ mod tests {
                 max_connections: 5,
                 tls_enabled: false,
                 tls_ca_cert_path: None,
+                refresh_interval: 30,
+                mock: false,
             },
         };
 

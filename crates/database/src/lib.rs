@@ -61,13 +61,13 @@ impl Database {
             info!("Using mock database for testing");
             return create_mock_database().await;
         }
-        
+
         // For tests, use simple postgres connection without Patroni
         if config.primary_app_id == "postgres-test" {
             info!("Using simple PostgreSQL connection for testing");
             return Self::from_simple_postgres_config(config).await;
         }
-        
+
         info!("Initializing database with Patroni discovery");
         info!("Primary app ID: {}", config.primary_app_id);
         info!("Refresh interval: {} seconds", config.refresh_interval);
@@ -147,12 +147,12 @@ impl Database {
     pub fn cluster_manager(&self) -> Option<&Arc<ClusterManager>> {
         self.cluster_manager.as_ref()
     }
-    
+
     /// Create database connection for testing without Patroni
     async fn from_simple_postgres_config(config: &config::DatabaseConfig) -> Result<Self> {
         use deadpool_postgres::{Manager, ManagerConfig, RecyclingMethod};
         use tokio_postgres::NoTls;
-        
+
         let mut pg_config = tokio_postgres::Config::new();
         pg_config
             .host("localhost")
@@ -164,12 +164,12 @@ impl Database {
         let mgr_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         };
-        
+
         let mgr = Manager::from_config(pg_config, NoTls, mgr_config);
         let pool = deadpool_postgres::Pool::builder(mgr)
             .max_size(config.max_connections)
             .build()?;
-        
+
         Ok(Self::new(pool))
     }
 }

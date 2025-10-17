@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use api::models::ModelWithPricing;
 use api::{
     build_app, init_auth_services, init_domain_services, models::BatchUpdateModelApiRequest,
 };
@@ -9,7 +10,6 @@ use database::Database;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
-use api::models::ModelWithPricing;
 
 // Global once cell to ensure migrations only run once across all tests
 static MIGRATIONS_INITIALIZED: OnceCell<()> = OnceCell::const_new();

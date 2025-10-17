@@ -237,9 +237,9 @@ pub async fn chat_completions(
     )
 )]
 pub async fn completions(
-    State(app_state): State<AppState>,
+    #[allow(unused)] State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
-    Extension(body_hash): Extension<RequestBodyHash>,
+    #[allow(unused)] Extension(body_hash): Extension<RequestBodyHash>,
     Json(request): Json<CompletionRequest>,
 ) -> axum::response::Response {
     debug!(
@@ -264,6 +264,7 @@ pub async fn completions(
     )
         .into_response();
 
+    #[allow(unreachable_code)]
     // Validate the request
     if let Err(error) = request.validate() {
         return (

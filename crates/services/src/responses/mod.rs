@@ -137,7 +137,7 @@ impl ResponseService {
     ) -> Result<ResponseId, ResponseError> {
         // Prepare input messages as JSON for database
         let input_messages_json = serde_json::to_value(input_messages).map_err(|e| {
-            ResponseError::InternalError(format!("Failed to serialize messages: {}", e))
+            ResponseError::InternalError(format!("Failed to serialize messages: {e}"))
         })?;
 
         let db_response = self
@@ -152,9 +152,7 @@ impl ResponseService {
                 request.metadata.clone(),
             )
             .await
-            .map_err(|e| {
-                ResponseError::InternalError(format!("Failed to create response: {}", e))
-            })?;
+            .map_err(|e| ResponseError::InternalError(format!("Failed to create response: {e}")))?;
 
         Ok(db_response.id)
     }
@@ -247,7 +245,7 @@ impl ResponseService {
                     error = %e,
                     "Failed to create LLM stream from inference provider"
                 );
-                ResponseError::InternalError(format!("Failed to create LLM stream: {}", e))
+                ResponseError::InternalError(format!("Failed to create LLM stream: {e}"))
             })?;
 
         tracing::info!(
@@ -379,7 +377,7 @@ impl ResponseService {
                         None
                     }
                     Err(e) => {
-                        let error_msg = format!("LLM stream error: {}", e);
+                        let error_msg = format!("LLM stream error: {e}");
 
                         // Update database with error asynchronously
                         let db_id = response_id.clone();

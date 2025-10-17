@@ -35,7 +35,7 @@ impl McpServiceImpl {
         self.mcp_repository
             .get_by_id(connector_id.clone(), organization_id.clone())
             .await
-            .map_err(|e| McpError::InternalError(format!("Repository error: {}", e)))?
+            .map_err(|e| McpError::InternalError(format!("Repository error: {e}")))?
             .ok_or(McpError::ConnectorNotFound)
     }
 }
@@ -235,7 +235,7 @@ impl McpService for McpServiceImpl {
                 settings,
             )
             .await
-            .map_err(|e| McpError::InternalError(format!("Failed to create connector: {}", e)))?;
+            .map_err(|e| McpError::InternalError(format!("Failed to create connector: {e}")))?;
 
         tracing::info!("Created new MCP connector: {}", connector.name);
         Ok(connector)
@@ -266,7 +266,7 @@ impl McpService for McpServiceImpl {
                 is_active,
             )
             .await
-            .map_err(|e| McpError::InternalError(format!("Failed to update connector: {}", e)))?;
+            .map_err(|e| McpError::InternalError(format!("Failed to update connector: {e}")))?;
 
         if connector.is_some() {
             tracing::info!("Updated MCP connector: {}", connector_id);
@@ -290,7 +290,7 @@ impl McpService for McpServiceImpl {
             .mcp_repository
             .delete(connector_id.clone(), organization_id)
             .await
-            .map_err(|e| McpError::InternalError(format!("Failed to delete connector: {}", e)))?;
+            .map_err(|e| McpError::InternalError(format!("Failed to delete connector: {e}")))?;
 
         if deleted {
             tracing::info!("Deleted MCP connector: {}", connector_id);
@@ -308,7 +308,7 @@ impl McpService for McpServiceImpl {
         self.mcp_repository
             .list_by_organization(organization_id, include_inactive)
             .await
-            .map_err(|e| McpError::InternalError(format!("Failed to list connectors: {}", e)))
+            .map_err(|e| McpError::InternalError(format!("Failed to list connectors: {e}")))
     }
 
     /// Get a connector by ID
@@ -320,6 +320,6 @@ impl McpService for McpServiceImpl {
         self.mcp_repository
             .get_by_id(connector_id, organization_id)
             .await
-            .map_err(|e| McpError::InternalError(format!("Failed to get connector: {}", e)))
+            .map_err(|e| McpError::InternalError(format!("Failed to get connector: {e}")))
     }
 }

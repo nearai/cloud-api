@@ -39,7 +39,7 @@ async fn test_create_api_key_in_workspace() {
         "New key should not have spend limit"
     );
 
-    println!("Created API key: {:?}", api_key_resp);
+    println!("Created API key: {api_key_resp:?}");
 }
 
 #[tokio::test]
@@ -117,7 +117,7 @@ async fn test_api_key_prevents_duplicate_names_in_workspace() {
 
     println!("Duplicate name response status: {}", response.status_code());
     let response_text = response.text();
-    println!("Duplicate name response body: {}", response_text);
+    println!("Duplicate name response body: {response_text}");
 
     // Should get 409 Conflict for duplicate name
     assert_eq!(
@@ -244,7 +244,7 @@ async fn test_deleted_api_key_cannot_be_used() {
     // Verify key works before deletion
     let response = server
         .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
 
     assert_eq!(
@@ -270,7 +270,7 @@ async fn test_deleted_api_key_cannot_be_used() {
     // Try to use the deleted API key - should fail
     let response = server
         .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
 
     println!(
@@ -278,7 +278,7 @@ async fn test_deleted_api_key_cannot_be_used() {
         response.status_code()
     );
     let response_text = response.text();
-    println!("Response body: {}", response_text);
+    println!("Response body: {response_text}");
 
     assert_eq!(
         response.status_code(),
@@ -420,7 +420,7 @@ async fn test_api_key_spend_limit_enforcement() {
     // First request might succeed or fail depending on timing
     let _response1 = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "model": model_name,
             "messages": [{"role": "user", "content": "Hi"}],
@@ -435,7 +435,7 @@ async fn test_api_key_spend_limit_enforcement() {
     // Second request should fail with API key limit exceeded
     let response2 = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "model": model_name,
             "messages": [{"role": "user", "content": "Hi again"}],
@@ -538,7 +538,7 @@ async fn test_list_workspace_api_keys_with_usage() {
     // Make a completion request with the first API key to generate usage
     let response = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key1))
+        .add_header("Authorization", format!("Bearer {api_key1}"))
         .json(&serde_json::json!({
             "model": model_name,
             "messages": [{"role": "user", "content": "Hello world"}],
@@ -634,7 +634,7 @@ async fn test_api_key_usage_isolated_between_keys() {
     // Make request with first key
     let response1 = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key1))
+        .add_header("Authorization", format!("Bearer {api_key1}"))
         .json(&serde_json::json!({
             "model": model_name,
             "messages": [{"role": "user", "content": "First key request"}],
@@ -648,7 +648,7 @@ async fn test_api_key_usage_isolated_between_keys() {
     // Make request with second key
     let response2 = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key2))
+        .add_header("Authorization", format!("Bearer {api_key2}"))
         .json(&serde_json::json!({
             "model": model_name,
             "messages": [{"role": "user", "content": "Second key request with more tokens"}],
@@ -749,7 +749,7 @@ async fn test_api_key_authentication() {
     // Test valid API key
     let response = server
         .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
 
     assert_eq!(

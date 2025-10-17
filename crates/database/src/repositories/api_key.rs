@@ -398,25 +398,25 @@ impl ApiKeyRepository {
         let mut param_idx = 1;
 
         if let Some(ref n) = name {
-            updates.push(format!("name = ${}", param_idx));
+            updates.push(format!("name = ${param_idx}"));
             params.push(n);
             param_idx += 1;
         }
 
         if let Some(ref exp) = expires_at {
-            updates.push(format!("expires_at = ${}", param_idx));
+            updates.push(format!("expires_at = ${param_idx}"));
             params.push(exp);
             param_idx += 1;
         }
 
         if let Some(ref spend) = spend_limit {
-            updates.push(format!("spend_limit = ${}", param_idx));
+            updates.push(format!("spend_limit = ${param_idx}"));
             params.push(spend);
             param_idx += 1;
         }
 
         if let Some(ref is_active) = is_active {
-            updates.push(format!("is_active = ${}", param_idx));
+            updates.push(format!("is_active = ${param_idx}"));
             params.push(is_active);
             param_idx += 1;
         }

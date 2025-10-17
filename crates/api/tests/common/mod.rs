@@ -50,28 +50,17 @@ pub fn test_config() -> ApiConfig {
 
 /// Helper function to create test database configuration
 fn db_config_for_tests() -> config::DatabaseConfig {
-    // Load database config from config file for tests
-    // Falls back to localhost defaults if config file is not available
-    match config::ApiConfig::load() {
-        Ok(mut config) => {
-            // Override max_connections to prevent pool exhaustion when running tests in parallel
-            // Each test creates its own connection pool, so we need to keep this small
-            config.database.max_connections = 2;
-            config.database
-        }
-        Err(_) => {
-            // Fallback to localhost defaults (for running tests without config file)
-            config::DatabaseConfig {
-                host: "localhost".to_string(),
-                port: 5432,
-                database: "platform_api".to_string(),
-                username: "postgres".to_string(),
-                password: "postgres".to_string(),
-                max_connections: 2,
-                tls_enabled: false,
-                tls_ca_cert_path: None,
-            }
-        }
+    config::DatabaseConfig {
+        primary_app_id: "postgres-test".to_string(),
+        port: 5432,
+        database: "platform_api".to_string(),
+        username: "postgres".to_string(),
+        password: "postgres".to_string(),
+        max_connections: 2,
+        tls_enabled: false,
+        tls_ca_cert_path: None,
+        refresh_interval: 30,
+        mock: false,
     }
 }
 
@@ -87,15 +76,17 @@ pub async fn init_test_database(config: &config::DatabaseConfig) -> Arc<Database
             .expect("Failed to connect to database"),
     );
 
-    // Ensure migrations only run once across all parallel tests
-    MIGRATIONS_INITIALIZED
-        .get_or_init(|| async {
-            database
-                .run_migrations()
-                .await
-                .expect("Failed to run database migrations");
-        })
-        .await;
+    // Only run migrations for real database, not mock
+    if !config.mock {
+        MIGRATIONS_INITIALIZED
+            .get_or_init(|| async {
+                database
+                    .run_migrations()
+                    .await
+                    .expect("Failed to run database migrations");
+            })
+            .await;
+    }
 
     database
 }
@@ -128,6 +119,7 @@ pub async fn setup_test_server() -> axum_test::TestServer {
 
 /// Create the mock user in the database to satisfy foreign key constraints
 pub async fn assert_mock_user_in_db(database: &Arc<Database>) {
+    // For real database, create the mock user
     let pool = database.pool();
     let client = pool.get().await.expect("Failed to get database connection");
 
@@ -199,7 +191,7 @@ pub async fn list_workspaces(
     org_id: String,
 ) -> Vec<api::routes::workspaces::WorkspaceResponse> {
     let response = server
-        .get(format!("/v1/organizations/{}/workspaces", org_id).as_str())
+        .get(format!("/v1/organizations/{org_id}/workspaces").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .await;
     assert_eq!(response.status_code(), 200);
@@ -219,7 +211,7 @@ pub async fn create_api_key_in_workspace(
         spend_limit: None,
     };
     let response = server
-        .post(format!("/v1/workspaces/{}/api-keys", workspace_id).as_str())
+        .post(format!("/v1/workspaces/{workspace_id}/api-keys").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .json(&serde_json::json!(request))
         .await;
@@ -293,7 +285,7 @@ pub async fn admin_batch_upsert_models(
 ) -> Vec<api::models::ModelWithPricing> {
     let response = server
         .patch("/v1/admin/models")
-        .add_header("Authorization", format!("Bearer {}", session_id))
+        .add_header("Authorization", format!("Bearer {session_id}"))
         .json(&models)
         .await;
 
@@ -312,7 +304,7 @@ pub async fn list_models(
 ) -> api::models::ModelsResponse {
     let response = server
         .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
     assert_eq!(response.status_code(), 200);
     response.json::<api::models::ModelsResponse>()

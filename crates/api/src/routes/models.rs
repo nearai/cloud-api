@@ -140,7 +140,7 @@ pub async fn get_model_by_name(
                 (
                     StatusCode::NOT_FOUND,
                     ResponseJson(ErrorResponse::new(
-                        format!("Model '{}' not found", model_name),
+                        format!("Model '{model_name}' not found"),
                         "model_not_found".to_string(),
                     )),
                 )

@@ -19,9 +19,7 @@ fn parse_conversation_id(id_str: &str) -> Result<ConversationId, ConversationErr
     } else {
         Uuid::parse_str(id_str)
     }
-    .map_err(|_| {
-        ConversationError::InvalidParams(format!("Invalid conversation ID: {}", id_str))
-    })?;
+    .map_err(|_| ConversationError::InvalidParams(format!("Invalid conversation ID: {id_str}")))?;
 
     Ok(ConversationId::from(uuid))
 }
@@ -418,7 +416,7 @@ impl From<ConversationError> for ErrorResponse {
                 ErrorResponse::new(msg, "invalid_request_error".to_string())
             }
             ConversationError::InternalError(msg) => ErrorResponse::new(
-                format!("Internal server error: {}", msg),
+                format!("Internal server error: {msg}"),
                 "internal_error".to_string(),
             ),
         }

@@ -198,7 +198,7 @@ impl OrganizationUsageRepository {
                        log.input_cost, log.output_cost, log.total_cost,
                        log.request_type, log.created_at,
                        m.public_name
-                FROM organization_usage_log log LEFT JOIN models m on log.model_id = m.model_name
+                FROM organization_usage_log log LEFT JOIN models m ON log.model_id = m.model_name
                 WHERE log.organization_id = $1
                 ORDER BY log.created_at DESC
                 LIMIT $2 OFFSET $3
@@ -261,7 +261,7 @@ impl OrganizationUsageRepository {
                        log.input_cost, log.output_cost, log.total_cost,
                        log.request_type, log.created_at,
                        m.public_name
-                FROM organization_usage_log log LEFT JOIN models m on log.model_id = m.model_name
+                FROM organization_usage_log log LEFT JOIN models m ON log.model_id = m.model_name
                 WHERE log.api_key_id = $1
                 ORDER BY log.created_at DESC
                 LIMIT $2 OFFSET $3

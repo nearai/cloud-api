@@ -34,7 +34,6 @@ pub struct Delta {
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<Message>,
-    #[serde(default = "default_max_tokens")]
     pub max_tokens: Option<i64>,
     #[serde(default = "default_temperature")]
     pub temperature: Option<f32>,
@@ -77,7 +76,6 @@ pub struct ChatChoice {
 pub struct CompletionRequest {
     pub model: String,
     pub prompt: String,
-    #[serde(default = "default_max_tokens")]
     pub max_tokens: Option<i64>,
     #[serde(default = "default_temperature")]
     pub temperature: Option<f32>,
@@ -160,10 +158,6 @@ pub struct ErrorDetail {
     pub r#type: String,
     pub param: Option<String>,
     pub code: Option<String>,
-}
-
-fn default_max_tokens() -> Option<i64> {
-    Some(100)
 }
 
 fn default_temperature() -> Option<f32> {

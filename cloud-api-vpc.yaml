@@ -37,7 +37,7 @@ services:
 
   # Cloud API service
   cloud-api:
-    image: endnearai/cloud-api@sha256:f18e7d750c324b1d3b4873d7a49d50a41a526235d7f969f7fbc72575707ebd39
+    image: endnearai/cloud-api@sha256:28da372f21d27d3105936f966d0b1f03431eb714c021b12affed96be19f6a778
     restart: unless-stopped
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock

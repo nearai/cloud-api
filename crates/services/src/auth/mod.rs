@@ -5,12 +5,11 @@ pub use oauth::OAuthManager;
 pub use ports::*;
 use tracing::debug;
 
-use chrono::Utc;
-use std::sync::Arc;
-
 use crate::organization::OrganizationRepository;
 use crate::workspace::{ApiKey, ApiKeyRepository, WorkspaceId, WorkspaceRepository};
 use async_trait::async_trait;
+use chrono::Utc;
+use std::sync::Arc;
 
 #[async_trait]
 impl AuthServiceTrait for AuthService {
@@ -19,27 +18,95 @@ impl AuthServiceTrait for AuthService {
         user_id: UserId,
         ip_address: Option<String>,
         user_agent: Option<String>,
+        encoding_key: String,
         expires_in_hours: i64,
-    ) -> Result<(Session, String), AuthError> {
-        self.session_repository
-            .create(user_id, ip_address, user_agent, expires_in_hours)
+        refresh_expires_in_hours: i64,
+    ) -> Result<(String, Session, String), AuthError> {
+        let access_token =
+            self.create_session_access_token(user_id.clone(), encoding_key, expires_in_hours)?;
+
+        let (refresh_session, refresh_token) = self
+            .session_repository
+            .create(user_id, ip_address, user_agent, refresh_expires_in_hours)
             .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to create session: {}", e)))
+            .map_err(|e| AuthError::InternalError(format!("Failed to create session: {}", e)))?;
+
+        Ok((access_token, refresh_session, refresh_token))
     }
 
-    async fn validate_session_token(
+    fn create_session_access_token(
         &self,
-        session_token: SessionToken,
+        user_id: UserId,
+        encoding_key: String,
+        expires_in_hours: i64,
+    ) -> Result<String, AuthError> {
+        let expiration = chrono::Utc::now() + chrono::Duration::hours(expires_in_hours);
+
+        let claims = AccessTokenClaims {
+            sub: user_id,
+            exp: expiration.timestamp(),
+        };
+
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(encoding_key.as_bytes()),
+        )
+        .map_err(|e| AuthError::InternalError(format!("Failed to create jwt: {}", e)))
+    }
+
+    fn validate_session_access_token(
+        &self,
+        access_token: String,
+        encoding_key: String,
+    ) -> Result<AccessTokenClaims, AuthError> {
+        let claims = jsonwebtoken::decode::<AccessTokenClaims>(
+            access_token,
+            &jsonwebtoken::DecodingKey::from_secret(encoding_key.as_bytes()),
+            &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256),
+        )
+        .map_err(|_| AuthError::SessionNotFound)?;
+
+        if claims.claims.exp < Utc::now().timestamp() {
+            return Err(AuthError::SessionNotFound);
+        }
+
+        Ok(claims.claims)
+    }
+
+    async fn validate_session_access(
+        &self,
+        access_token: String,
+        encoding_key: String,
+    ) -> Result<User, AuthError> {
+        let claims = self.validate_session_access_token(access_token, encoding_key)?;
+
+        debug!("Claims: {:?}", claims);
+
+        // Get the user
+        self.user_repository
+            .get_by_id(claims.sub)
+            .await
+            .map_err(|e| AuthError::InternalError(format!("Failed to get user: {}", e)))?
+            .ok_or(AuthError::UserNotFound)
+    }
+
+    async fn validate_session_refresh_token(
+        &self,
+        refresh_token: SessionToken,
     ) -> Result<Option<Session>, AuthError> {
         self.session_repository
-            .validate(session_token)
+            .validate(refresh_token)
             .await
             .map_err(|e| AuthError::InternalError(format!("Failed to validate session: {}", e)))
     }
 
-    async fn validate_session(&self, session_token: SessionToken) -> Result<User, AuthError> {
+    async fn validate_session_refresh(
+        &self,
+        refresh_token: SessionToken,
+    ) -> Result<User, AuthError> {
         let session = self
-            .validate_session_token(session_token)
+            .validate_session_refresh_token(refresh_token)
             .await?
             .ok_or(AuthError::SessionNotFound)?;
 

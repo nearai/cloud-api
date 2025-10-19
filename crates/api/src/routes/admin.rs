@@ -12,6 +12,7 @@ use axum::{
     response::Json as ResponseJson,
     Extension,
 };
+use config::ApiConfig;
 use services::admin::{AdminService, UpdateModelAdminRequest};
 use services::auth::{AuthServiceTrait, UserId};
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use tracing::{debug, error};
 pub struct AdminAppState {
     pub admin_service: Arc<dyn AdminService + Send + Sync>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
+    pub config: Arc<ApiConfig>,
 }
 
 /// Batch upsert models metadata (Admin only)
@@ -654,22 +656,23 @@ pub async fn create_admin_access_token(
             user_id,
             request.ip_address,
             request.user_agent,
+            app_state.config.auth.encoding_key.to_string(),
             request.expires_in_hours,
+            0,
         )
         .await;
 
     match session_result {
-        Ok((session, session_token)) => {
+        Ok((access_token, refresh_session, _refresh_token)) => {
             debug!(
                 "Admin access token created successfully for user: {}",
                 admin_user.0.email
             );
 
             let response = AdminAccessTokenResponse {
-                access_token: session_token,
-                expires_at: session.expires_at,
+                access_token,
                 created_by_user_id: admin_user.0.id.to_string(),
-                created_at: session.created_at,
+                created_at: refresh_session.created_at,
                 message: format!(
                     "Admin access token created successfully. Token expires in {} hours and should be stored securely.",
                     request.expires_in_hours

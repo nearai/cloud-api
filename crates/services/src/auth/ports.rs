@@ -17,6 +17,12 @@ pub struct SessionId(pub Uuid);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SessionToken(pub String);
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessTokenClaims {
+    pub sub: UserId,
+    pub exp: i64,
+}
+
 impl From<Uuid> for UserId {
     fn from(uuid: Uuid) -> Self {
         UserId(uuid)
@@ -207,17 +213,41 @@ pub trait AuthServiceTrait: Send + Sync {
         user_id: UserId,
         ip_address: Option<String>,
         user_agent: Option<String>,
+        encoding_key: String,
         expires_in_hours: i64,
-    ) -> Result<(Session, String), AuthError>;
+        refresh_expires_in_hours: i64,
+    ) -> Result<(String, Session, String), AuthError>;
+
+    fn create_session_access_token(
+        &self,
+        user_id: UserId,
+        encoding_key: String,
+        expires_in_hours: i64,
+    ) -> Result<String, AuthError>;
+
+    fn validate_session_access_token(
+        &self,
+        access_token: String,
+        encoding_key: String,
+    ) -> Result<AccessTokenClaims, AuthError>;
+
+    async fn validate_session_access(
+        &self,
+        access_token: String,
+        encoding_key: String,
+    ) -> Result<User, AuthError>;
 
     /// Validate a session token and return the session
-    async fn validate_session_token(
+    async fn validate_session_refresh_token(
         &self,
         session_token: SessionToken,
     ) -> Result<Option<Session>, AuthError>;
 
     /// Validate a session token and return the associated user
-    async fn validate_session(&self, session_token: SessionToken) -> Result<User, AuthError>;
+    async fn validate_session_refresh(
+        &self,
+        session_token: SessionToken,
+    ) -> Result<User, AuthError>;
 
     /// Get a user by their ID
     async fn get_user_by_id(&self, user_id: UserId) -> Result<User, AuthError>;
@@ -281,8 +311,15 @@ impl MockAuthService {
         }
     }
 
-    fn create_mock_session(&self, user_id: UserId) -> (Session, String) {
-        self.create_mock_session_with_params(user_id, None, None, 24)
+    fn create_mock_session(&self, user_id: UserId) -> (String, Session, String) {
+        self.create_mock_session_with_params(
+            user_id,
+            None,
+            None,
+            "mock_encoding_key".to_string(),
+            1,
+            7 * 24,
+        )
     }
 
     fn create_mock_session_with_params(
@@ -290,12 +327,28 @@ impl MockAuthService {
         user_id: UserId,
         ip_address: Option<String>,
         user_agent: Option<String>,
+        encoding_key: String,
         expires_in_hours: i64,
-    ) -> (Session, String) {
+        refresh_expires_in_hours: i64,
+    ) -> (String, Session, String) {
+        let expiration = chrono::Utc::now() + chrono::Duration::hours(expires_in_hours);
+
+        let claims = AccessTokenClaims {
+            sub: user_id.clone(),
+            exp: expiration.timestamp(),
+        };
+
+        let access_token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(encoding_key.as_bytes()),
+        )
+        .unwrap();
+
         let session_id = SessionId(uuid::Uuid::new_v4());
         // Generate token with same format as real session repository
         let session_token = format!("sess_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
-        let expires_at = chrono::Utc::now() + chrono::Duration::hours(expires_in_hours);
+        let expires_at = chrono::Utc::now() + chrono::Duration::hours(refresh_expires_in_hours);
 
         let session = Session {
             id: session_id,
@@ -307,7 +360,7 @@ impl MockAuthService {
             user_agent: user_agent.or(Some("Mock User Agent".to_string())),
         };
 
-        (session, session_token)
+        (access_token, session, session_token)
     }
 }
 
@@ -318,26 +371,64 @@ impl AuthServiceTrait for MockAuthService {
         user_id: UserId,
         ip_address: Option<String>,
         user_agent: Option<String>,
+        encoding_key: String,
         expires_in_hours: i64,
-    ) -> Result<(Session, String), AuthError> {
-        Ok(self.create_mock_session_with_params(user_id, ip_address, user_agent, expires_in_hours))
+        refresh_expires_in_hours: i64,
+    ) -> Result<(String, Session, String), AuthError> {
+        Ok(self.create_mock_session_with_params(
+            user_id,
+            ip_address,
+            user_agent,
+            encoding_key,
+            expires_in_hours,
+            refresh_expires_in_hours,
+        ))
     }
 
-    async fn validate_session_token(
+    fn create_session_access_token(
+        &self,
+        _user_id: UserId,
+        _encoding_key: String,
+        _expires_in_hours: i64,
+    ) -> Result<String, AuthError> {
+        todo!()
+    }
+
+    fn validate_session_access_token(
+        &self,
+        _access_token: String,
+        _encoding_key: String,
+    ) -> Result<AccessTokenClaims, AuthError> {
+        todo!()
+    }
+
+    async fn validate_session_access(
+        &self,
+        _access_token: String,
+        _encoding_key: String,
+    ) -> Result<User, AuthError> {
+        todo!()
+    }
+
+    async fn validate_session_refresh_token(
         &self,
         session_token: SessionToken,
     ) -> Result<Option<Session>, AuthError> {
         // Accept the known test session token or any token that starts with "sess_"
         if session_token.0.starts_with("sess_") {
             let mock_user = Self::create_mock_user();
-            let (session, _) = self.create_mock_session(mock_user.id);
-            Ok(Some(session))
+            let (_access_token, refresh_session, _refresh_token) =
+                self.create_mock_session(mock_user.id);
+            Ok(Some(refresh_session))
         } else {
             Ok(None)
         }
     }
 
-    async fn validate_session(&self, session_token: SessionToken) -> Result<User, AuthError> {
+    async fn validate_session_refresh(
+        &self,
+        session_token: SessionToken,
+    ) -> Result<User, AuthError> {
         tracing::debug!(
             "MockAuthService::validate_session called with token: {}",
             session_token

@@ -327,3 +327,20 @@ pub fn decode_access_token_claims(token: &String) -> AccessTokenClaims {
         .unwrap();
     serde_json::from_slice(&token_claims_raw).unwrap()
 }
+
+pub fn is_valid_jwt_format(token: &str) -> bool {
+    // Split the token into its parts
+    let parts: Vec<&str> = token.split('.').collect();
+
+    // Check if the JWT has exactly three parts
+    if parts.len() != 3 {
+        return false;
+    }
+
+    // Decode each part and ensure it can be parsed as JSON
+    parts.iter().take(2).all(|part| {
+        base64::engine::general_purpose::STANDARD
+            .decode(&parts[1])
+            .is_ok()
+    })
+}

@@ -59,7 +59,7 @@ impl AuthServiceTrait for AuthService {
         &self,
         access_token: String,
         encoding_key: String,
-    ) -> Result<AccessTokenClaims, AuthError> {
+    ) -> Result<Option<AccessTokenClaims>, AuthError> {
         let claims = jsonwebtoken::decode::<AccessTokenClaims>(
             access_token,
             &jsonwebtoken::DecodingKey::from_secret(encoding_key.as_bytes()),
@@ -71,7 +71,7 @@ impl AuthServiceTrait for AuthService {
             return Err(AuthError::SessionNotFound);
         }
 
-        Ok(claims.claims)
+        Ok(Some(claims.claims))
     }
 
     async fn validate_session_access(
@@ -79,7 +79,9 @@ impl AuthServiceTrait for AuthService {
         access_token: String,
         encoding_key: String,
     ) -> Result<User, AuthError> {
-        let claims = self.validate_session_access_token(access_token, encoding_key)?;
+        let claims = self
+            .validate_session_access_token(access_token, encoding_key)?
+            .ok_or(AuthError::SessionNotFound)?;
 
         debug!("Claims: {:?}", claims);
 

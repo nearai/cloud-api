@@ -56,16 +56,16 @@ impl OrganizationUsageRepository {
         let now = Utc::now();
         let total_tokens = request.input_tokens + request.output_tokens;
 
-        // Insert usage log entry
+        // Insert usage log entry (model_name is denormalized for performance)
         let row = transaction
             .query_one(
                 r#"
                 INSERT INTO organization_usage_log (
                     id, organization_id, workspace_id, api_key_id, response_id,
-                    model_id, input_tokens, output_tokens, total_tokens,
+                    model_id, model_name, input_tokens, output_tokens, total_tokens,
                     input_cost, output_cost, total_cost,
                     request_type, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                 RETURNING *
                 "#,
                 &[
@@ -75,6 +75,7 @@ impl OrganizationUsageRepository {
                     &request.api_key_id,
                     &request.response_id,
                     &request.model_id,
+                    &request.model_name,
                     &request.input_tokens,
                     &request.output_tokens,
                     &total_tokens,
@@ -192,10 +193,11 @@ impl OrganizationUsageRepository {
         let rows = client
             .query(
                 r#"
-                SELECT id, organization_id, workspace_id, api_key_id, response_id,
-                       model_id, input_tokens, output_tokens, total_tokens,
-                       input_cost, output_cost, total_cost,
-                       request_type, created_at
+                SELECT 
+                    id, organization_id, workspace_id, api_key_id, response_id,
+                    model_id, model_name, input_tokens, output_tokens, total_tokens,
+                    input_cost, output_cost, total_cost,
+                    request_type, created_at
                 FROM organization_usage_log
                 WHERE organization_id = $1
                 ORDER BY created_at DESC
@@ -251,10 +253,11 @@ impl OrganizationUsageRepository {
         let rows = client
             .query(
                 r#"
-                SELECT id, organization_id, workspace_id, api_key_id, response_id,
-                       model_id, input_tokens, output_tokens, total_tokens,
-                       input_cost, output_cost, total_cost,
-                       request_type, created_at
+                SELECT 
+                    id, organization_id, workspace_id, api_key_id, response_id,
+                    model_id, model_name, input_tokens, output_tokens, total_tokens,
+                    input_cost, output_cost, total_cost,
+                    request_type, created_at
                 FROM organization_usage_log
                 WHERE api_key_id = $1
                 ORDER BY created_at DESC
@@ -313,6 +316,7 @@ impl OrganizationUsageRepository {
             api_key_id: row.get("api_key_id"),
             response_id: row.get("response_id"),
             model_id: row.get("model_id"),
+            model: row.get("model_name"),
             input_tokens: row.get("input_tokens"),
             output_tokens: row.get("output_tokens"),
             total_tokens: row.get("total_tokens"),

@@ -97,6 +97,36 @@ impl ModelRepository {
         }
     }
 
+    /// Get model by UUID (includes inactive models)
+    pub async fn get_by_id(&self, model_id: &uuid::Uuid) -> Result<Option<Model>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let rows = client
+            .query(
+                r#"
+                SELECT 
+                    id, model_name, public_name, model_display_name, model_description, model_icon,
+                    input_cost_per_token, output_cost_per_token,
+                    context_length, verifiable, is_active, created_at, updated_at
+                FROM models
+                WHERE id = $1
+                "#,
+                &[&model_id],
+            )
+            .await
+            .context("Failed to get model by id")?;
+
+        if let Some(row) = rows.first() {
+            Ok(Some(self.row_to_model(row)))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Get model by model name or public name (public API - only active models)
     /// Searches both model_name (internal) and public_name (public-facing) fields
     pub async fn get_active_model_by_name(&self, model_name: &str) -> Result<Option<Model>> {
@@ -140,7 +170,9 @@ impl ModelRepository {
             .await
             .context("Failed to get database connection")?;
 
-        // Check if model exists
+        // For updates, we can do partial updates with COALESCE
+        // For inserts, we need all required fields
+        // Check if model exists first to determine which code path to take
         let existing = self.get_by_internal_name(model_name).await?;
 
         let row = if existing.is_some() {
@@ -180,7 +212,7 @@ impl ModelRepository {
                 .await
                 .context("Failed to update model pricing")?
         } else {
-            // Model doesn't exist - do INSERT (need required fields)
+            // Model doesn't exist - do INSERT with ON CONFLICT to handle race conditions
             // Use existing values or default to model_name for public_name if not provided
             let public_name = update_request
                 .public_name
@@ -205,6 +237,8 @@ impl ModelRepository {
                 .context_length
                 .context("context_length is required for new models")?;
 
+            // Use INSERT ... ON CONFLICT to handle race conditions where another
+            // transaction inserts the same model between our check and insert
             client
                 .query_one(
                     r#"
@@ -214,6 +248,17 @@ impl ModelRepository {
                         model_display_name, model_description, model_icon,
                         context_length, verifiable, is_active
                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    ON CONFLICT (model_name) DO UPDATE SET
+                        public_name = EXCLUDED.public_name,
+                        input_cost_per_token = EXCLUDED.input_cost_per_token,
+                        output_cost_per_token = EXCLUDED.output_cost_per_token,
+                        model_display_name = EXCLUDED.model_display_name,
+                        model_description = EXCLUDED.model_description,
+                        model_icon = EXCLUDED.model_icon,
+                        context_length = EXCLUDED.context_length,
+                        verifiable = EXCLUDED.verifiable,
+                        is_active = EXCLUDED.is_active,
+                        updated_at = NOW()
                     RETURNING id, model_name, public_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token,
                               context_length, verifiable, is_active, created_at, updated_at

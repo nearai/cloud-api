@@ -498,7 +498,7 @@ pub struct OrganizationUsageLog {
     pub api_key_id: Uuid,
     pub response_id: Option<Uuid>,
     pub model_id: Uuid,
-    pub model: String,  // Canonical model name from models table
+    pub model: String, // Canonical model name from models table
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub total_tokens: i32,
@@ -530,7 +530,7 @@ pub struct RecordUsageRequest {
     pub api_key_id: Uuid,
     pub response_id: Option<Uuid>,
     pub model_id: Uuid,
-    pub model_name: String,  // Denormalized for performance
+    pub model_name: String, // Denormalized for performance
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub input_cost: i64,

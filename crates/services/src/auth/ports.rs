@@ -229,7 +229,7 @@ pub trait AuthServiceTrait: Send + Sync {
         &self,
         access_token: String,
         encoding_key: String,
-    ) -> Result<AccessTokenClaims, AuthError>;
+    ) -> Result<Option<AccessTokenClaims>, AuthError>;
 
     async fn validate_session_access(
         &self,
@@ -296,8 +296,15 @@ pub struct MockAuthService {
 
 impl MockAuthService {
     fn create_mock_user() -> User {
+        let id = UserId(
+            uuid::Uuid::parse_str(crate::auth::ports::MOCK_USER_ID).expect("Invalid mock user ID"),
+        );
+        Self::create_mock_user_with_id(id)
+    }
+
+    fn create_mock_user_with_id(id: UserId) -> User {
         User {
-            id: UserId(uuid::Uuid::parse_str(MOCK_USER_ID).expect("Invalid mock user ID")),
+            id,
             email: "admin@test.com".to_string(),
             username: "testuser".to_string(),
             display_name: Some("Test User".to_string()),
@@ -387,27 +394,62 @@ impl AuthServiceTrait for MockAuthService {
 
     fn create_session_access_token(
         &self,
-        _user_id: UserId,
-        _encoding_key: String,
-        _expires_in_hours: i64,
+        user_id: UserId,
+        encoding_key: String,
+        expires_in_hours: i64,
     ) -> Result<String, AuthError> {
-        todo!()
+        let expiration = chrono::Utc::now() + chrono::Duration::hours(expires_in_hours);
+
+        let claims = AccessTokenClaims {
+            sub: user_id,
+            exp: expiration.timestamp(),
+        };
+
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(encoding_key.as_bytes()),
+        )
+        .map_err(|e| AuthError::InternalError(format!("Failed to create jwt: {}", e)))
     }
 
     fn validate_session_access_token(
         &self,
-        _access_token: String,
-        _encoding_key: String,
-    ) -> Result<AccessTokenClaims, AuthError> {
-        todo!()
+        access_token: String,
+        encoding_key: String,
+    ) -> Result<Option<AccessTokenClaims>, AuthError> {
+        // Allow any string, no exp checking
+        let claims = if let Ok(claims) = jsonwebtoken::decode::<AccessTokenClaims>(
+            access_token,
+            &jsonwebtoken::DecodingKey::from_secret(encoding_key.as_bytes()),
+            &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256),
+        ) {
+            claims
+        } else {
+            return Ok(None);
+        };
+
+        Ok(Some(claims.claims))
     }
 
     async fn validate_session_access(
         &self,
-        _access_token: String,
-        _encoding_key: String,
+        access_token: String,
+        encoding_key: String,
     ) -> Result<User, AuthError> {
-        todo!()
+        match self.validate_session_access_token(access_token, encoding_key) {
+            Ok(Some(claims)) => {
+                let user = Self::create_mock_user_with_id(claims.sub);
+                tracing::debug!("MockAuthService returning mock user: {}", user.email);
+                Ok(user)
+            }
+            Ok(None) => {
+                let user = Self::create_mock_user();
+                tracing::debug!("MockAuthService returning mock user: {}", user.email);
+                Ok(user)
+            }
+            Err(_) => Err(AuthError::SessionNotFound),
+        }
     }
 
     async fn validate_session_refresh_token(

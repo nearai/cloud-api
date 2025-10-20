@@ -27,7 +27,7 @@ impl ApiConfig {
 /// Database configuration
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
-    pub host: String,
+    pub primary_app_id: String,
     pub port: u16,
     pub database: String,
     pub username: String,
@@ -39,37 +39,52 @@ pub struct DatabaseConfig {
     /// Path to a custom CA certificate file (optional)
     /// If provided, this certificate will be added to the trust store
     pub tls_ca_cert_path: Option<String>,
+    /// Interval in seconds for refreshing cluster state
+    pub refresh_interval: u64,
+    /// Use mock database for testing (bypasses Patroni discovery and real database)
+    pub mock: bool,
 }
 
 impl DatabaseConfig {
-    /// Create a connection URL for this database configuration
-    pub fn connection_url(&self) -> String {
-        format!(
-            "postgres://{}:{}@{}:{}/{}",
-            self.username, self.password, self.host, self.port, self.database
-        )
-    }
-
     /// Load from environment variables
     pub fn from_env() -> Result<Self, String> {
+        // Password is read from a file: DATABASE_PASSWORD_FILE.
+        // This file would be mounted as a secret in production deployments.
+        let password = if let Ok(path) = env::var("DATABASE_PASSWORD_FILE") {
+            std::fs::read_to_string(path)
+                .map_err(|e| format!("Failed to read DATABASE_PASSWORD_FILE: {e}"))?
+                .trim()
+                .to_string()
+        } else {
+            env::var("DATABASE_PASSWORD").map_err(|_| "DATABASE_PASSWORD not set".to_string())?
+        };
+        if password.is_empty() {
+            return Err("Database password cannot be empty".to_string());
+        }
         Ok(Self {
-            host: env::var("DATABASE_HOST").map_err(|_| "DATABASE_HOST not set")?,
+            primary_app_id: env::var("POSTGRES_PRIMARY_APP_ID")
+                .map_err(|_| "POSTGRES_PRIMARY_APP_ID not set".to_string())?,
             port: env::var("DATABASE_PORT")
-                .map_err(|_| "DATABASE_PORT not set")?
+                .unwrap_or_else(|_| "5432".to_string())
                 .parse()
                 .map_err(|_| "DATABASE_PORT must be a valid port number")?,
             database: env::var("DATABASE_NAME").map_err(|_| "DATABASE_NAME not set")?,
             username: env::var("DATABASE_USERNAME").map_err(|_| "DATABASE_USERNAME not set")?,
-            password: env::var("DATABASE_PASSWORD").map_err(|_| "DATABASE_PASSWORD not set")?,
             max_connections: env::var("DATABASE_MAX_CONNECTIONS")
-                .unwrap_or_else(|_| "5".to_string())
+                .unwrap_or_else(|_| "16".to_string())
                 .parse()
                 .map_err(|_| "DATABASE_MAX_CONNECTIONS must be a valid number")?,
             tls_enabled: env::var("DATABASE_TLS_ENABLED")
-                .unwrap_or_else(|_| "false".to_string())
+                .unwrap_or_else(|_| "true".to_string())
                 .parse()
                 .map_err(|_| "DATABASE_TLS_ENABLED must be true or false")?,
             tls_ca_cert_path: env::var("DATABASE_TLS_CA_CERT_PATH").ok(),
+            refresh_interval: env::var("DATABASE_REFRESH_INTERVAL")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()
+                .map_err(|_| "DATABASE_REFRESH_INTERVAL must be a valid number")?,
+            password,
+            mock: false, // Default to real database in production
         })
     }
 }
@@ -381,57 +396,5 @@ mod tests {
 
         // Should return false when no admin domains configured
         assert!(!config.is_admin_email("admin@near.ai"));
-    }
-
-    #[test]
-    fn test_tls_disabled_by_default() {
-        let db_config = DatabaseConfig {
-            host: "localhost".to_string(),
-            port: 5432,
-            database: "test_db".to_string(),
-            username: "user".to_string(),
-            password: "pass".to_string(),
-            max_connections: 5,
-            tls_enabled: false,
-            tls_ca_cert_path: None,
-        };
-
-        assert_eq!(db_config.host, "localhost");
-        assert_eq!(db_config.port, 5432);
-        assert!(!db_config.tls_enabled);
-    }
-
-    #[test]
-    fn test_database_config_with_tls_enabled() {
-        let db_config = DatabaseConfig {
-            host: "remote.example.com".to_string(),
-            port: 5432,
-            database: "prod_db".to_string(),
-            username: "user".to_string(),
-            password: "pass".to_string(),
-            max_connections: 10,
-            tls_enabled: true,
-            tls_ca_cert_path: None,
-        };
-
-        assert_eq!(db_config.host, "remote.example.com");
-        assert!(db_config.tls_enabled);
-    }
-
-    #[test]
-    fn test_database_config_connection_url() {
-        let db_config = DatabaseConfig {
-            host: "localhost".to_string(),
-            port: 5432,
-            database: "mydb".to_string(),
-            username: "admin".to_string(),
-            password: "secret".to_string(),
-            max_connections: 5,
-            tls_enabled: false,
-            tls_ca_cert_path: None,
-        };
-
-        let url = db_config.connection_url();
-        assert_eq!(url, "postgres://admin:secret@localhost:5432/mydb");
     }
 }

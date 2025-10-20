@@ -186,12 +186,12 @@ fn format_amount(amount: i64) -> String {
     let fraction = amount % divisor;
 
     if fraction == 0 {
-        format!("${}.00", whole)
+        format!("${whole}.00")
     } else {
         // Format with leading zeros, then trim trailing zeros
-        let fraction_str = format!("{:09}", fraction);
+        let fraction_str = format!("{fraction:09}");
         let trimmed = fraction_str.trim_end_matches('0');
-        format!("${}.{}", whole, trimmed)
+        format!("${whole}.{trimmed}")
     }
 }
 

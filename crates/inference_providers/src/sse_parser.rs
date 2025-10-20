@@ -50,10 +50,7 @@ where
                         Ok(chunk) => StreamChunk::Chat(chunk),
                         Err(e) => {
                             // Log but don't fail - might be a partial chunk
-                            eprintln!(
-                                "Warning: Failed to parse chat chunk: {} for json: {}",
-                                e, json
-                            );
+                            eprintln!("Warning: Failed to parse chat chunk: {e} for json: {json}");
                             return Err(CompletionError::InvalidResponse(
                                 "Invalid response format".to_string(),
                             ));
@@ -64,10 +61,7 @@ where
                         Ok(chunk) => StreamChunk::Text(chunk),
                         Err(e) => {
                             // Log but don't fail - might be a partial chunk
-                            eprintln!(
-                                "Warning: Failed to parse text chunk: {} for json: {}",
-                                e, json
-                            );
+                            eprintln!("Warning: Failed to parse text chunk: {e} for json: {json}");
                             return Err(CompletionError::InvalidResponse(
                                 "Invalid response format".to_string(),
                             ));
@@ -78,10 +72,7 @@ where
             }
             Err(e) => {
                 // Skip malformed JSON rather than failing the entire stream
-                eprintln!(
-                    "Warning: Failed to parse SSE JSON: {} for data: '{}'",
-                    e, data
-                );
+                eprintln!("Warning: Failed to parse SSE JSON: {e} for data: '{data}'");
                 Err(CompletionError::InvalidResponse(
                     "Invalid JSON in SSE event".to_string(),
                 ))

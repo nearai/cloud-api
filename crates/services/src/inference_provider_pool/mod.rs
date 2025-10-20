@@ -88,19 +88,19 @@ impl InferenceProviderPool {
             .timeout(self.discovery_timeout)
             .build()
             .map_err(|e| {
-                ListModelsError::FetchError(format!("Failed to create HTTP client: {}", e))
+                ListModelsError::FetchError(format!("Failed to create HTTP client: {e}"))
             })?;
 
         let response = client
             .get(&self.discovery_url)
             .send()
             .await
-            .map_err(|e| ListModelsError::FetchError(format!("HTTP request failed: {}", e)))?;
+            .map_err(|e| ListModelsError::FetchError(format!("HTTP request failed: {e}")))?;
 
         let discovery_map: HashMap<String, DiscoveryEntry> = response
             .json()
             .await
-            .map_err(|e| ListModelsError::FetchError(format!("Failed to parse JSON: {}", e)))?;
+            .map_err(|e| ListModelsError::FetchError(format!("Failed to parse JSON: {e}")))?;
 
         tracing::debug!(entries = discovery_map.len(), "Received discovery response");
 
@@ -135,7 +135,7 @@ impl InferenceProviderPool {
             drop(model_mapping); // Release read lock
             tracing::warn!("Model mapping is empty, triggering model discovery");
             self.discover_models().await.map_err(|e| {
-                CompletionError::CompletionError(format!("Failed to discover models: {}", e))
+                CompletionError::CompletionError(format!("Failed to discover models: {e}"))
             })?;
         }
 
@@ -194,7 +194,7 @@ impl InferenceProviderPool {
             let mut providers_for_model = Vec::new();
 
             for (ip, port) in endpoints {
-                let url = format!("http://{}:{}", ip, port);
+                let url = format!("http://{ip}:{port}");
                 tracing::debug!(
                     model = %model_name,
                     url = %url,
@@ -326,8 +326,7 @@ impl InferenceProvider for InferenceProviderPool {
         }
 
         Err(CompletionError::CompletionError(format!(
-            "No provider found with signature for chat_id: {}",
-            chat_id
+            "No provider found with signature for chat_id: {chat_id}"
         )))
     }
 
@@ -349,8 +348,7 @@ impl InferenceProvider for InferenceProviderPool {
         }
         if attestations.is_empty() {
             return Err(CompletionError::CompletionError(format!(
-                "No provider found that supports attestation reports for model: {}",
-                model
+                "No provider found that supports attestation reports for model: {model}"
             )));
         }
         Ok(attestations)
@@ -412,8 +410,7 @@ impl InferenceProvider for InferenceProviderPool {
                     "Model not found in provider pool"
                 );
                 Err(CompletionError::CompletionError(format!(
-                    "Model '{}' not found in any configured provider. Available models: {:?}",
-                    model_id, available_models
+                    "Model '{model_id}' not found in any configured provider. Available models: {available_models:?}"
                 )))
             }
         }
@@ -453,8 +450,7 @@ impl InferenceProvider for InferenceProviderPool {
                 let model_mapping = self.model_mapping.read().await;
                 let available_models: Vec<_> = model_mapping.keys().collect();
                 Err(CompletionError::CompletionError(format!(
-                    "Model '{}' not found in any configured provider. Available models: {:?}",
-                    model_id, available_models
+                    "Model '{model_id}' not found in any configured provider. Available models: {available_models:?}"
                 )))
             }
         }
@@ -483,8 +479,7 @@ impl InferenceProvider for InferenceProviderPool {
                     available_models
                 );
                 Err(CompletionError::CompletionError(format!(
-                    "Model '{}' not found in any configured provider. Available models: {:?}",
-                    model_id, available_models
+                    "Model '{model_id}' not found in any configured provider. Available models: {available_models:?}"
                 )))
             }
         }

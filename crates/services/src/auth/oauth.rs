@@ -47,10 +47,10 @@ impl OAuthManager {
 
     fn create_github_client(config: OAuthProviderConfig) -> Result<ConfiguredClient, AuthError> {
         let auth_url = AuthUrl::new("https://github.com/login/oauth/authorize".to_string())
-            .map_err(|e| AuthError::ConfigError(format!("Invalid GitHub auth URL: {}", e)))?;
+            .map_err(|e| AuthError::ConfigError(format!("Invalid GitHub auth URL: {e}")))?;
 
         let token_url = TokenUrl::new("https://github.com/login/oauth/access_token".to_string())
-            .map_err(|e| AuthError::ConfigError(format!("Invalid GitHub token URL: {}", e)))?;
+            .map_err(|e| AuthError::ConfigError(format!("Invalid GitHub token URL: {e}")))?;
 
         let client = BasicClient::new(ClientId::new(config.client_id))
             .set_client_secret(ClientSecret::new(config.client_secret))
@@ -58,7 +58,7 @@ impl OAuthManager {
             .set_token_uri(token_url)
             .set_redirect_uri(
                 RedirectUrl::new(config.redirect_uri)
-                    .map_err(|e| AuthError::ConfigError(format!("Invalid redirect URL: {}", e)))?,
+                    .map_err(|e| AuthError::ConfigError(format!("Invalid redirect URL: {e}")))?,
             );
 
         Ok(client)
@@ -66,10 +66,10 @@ impl OAuthManager {
 
     fn create_google_client(config: OAuthProviderConfig) -> Result<ConfiguredClient, AuthError> {
         let auth_url = AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string())
-            .map_err(|e| AuthError::ConfigError(format!("Invalid Google auth URL: {}", e)))?;
+            .map_err(|e| AuthError::ConfigError(format!("Invalid Google auth URL: {e}")))?;
 
         let token_url = TokenUrl::new("https://www.googleapis.com/oauth2/v3/token".to_string())
-            .map_err(|e| AuthError::ConfigError(format!("Invalid Google token URL: {}", e)))?;
+            .map_err(|e| AuthError::ConfigError(format!("Invalid Google token URL: {e}")))?;
 
         let client = BasicClient::new(ClientId::new(config.client_id))
             .set_client_secret(ClientSecret::new(config.client_secret))
@@ -77,7 +77,7 @@ impl OAuthManager {
             .set_token_uri(token_url)
             .set_redirect_uri(
                 RedirectUrl::new(config.redirect_uri)
-                    .map_err(|e| AuthError::ConfigError(format!("Invalid redirect URL: {}", e)))?,
+                    .map_err(|e| AuthError::ConfigError(format!("Invalid redirect URL: {e}")))?,
             );
 
         Ok(client)
@@ -139,7 +139,7 @@ impl OAuthManager {
             .exchange_code(AuthorizationCode::new(code))
             .request_async(&self.http_client)
             .await
-            .map_err(|e| AuthError::OAuthError(format!("Token exchange failed: {}", e)))?;
+            .map_err(|e| AuthError::OAuthError(format!("Token exchange failed: {e}")))?;
 
         let access_token = token.access_token().secret();
 
@@ -184,7 +184,7 @@ impl OAuthManager {
             .set_pkce_verifier(pkce_verifier)
             .request_async(&self.http_client)
             .await
-            .map_err(|e| AuthError::OAuthError(format!("Token exchange failed: {}", e)))?;
+            .map_err(|e| AuthError::OAuthError(format!("Token exchange failed: {e}")))?;
 
         let access_token = token.access_token().secret();
 
@@ -214,11 +214,11 @@ impl OAuthManager {
         let response = self
             .http_client
             .get("https://api.github.com/user")
-            .header("Authorization", format!("Bearer {}", access_token))
+            .header("Authorization", format!("Bearer {access_token}"))
             .header("User-Agent", "cloud-api")
             .send()
             .await
-            .map_err(|e| AuthError::NetworkError(format!("Failed to fetch GitHub user: {}", e)))?;
+            .map_err(|e| AuthError::NetworkError(format!("Failed to fetch GitHub user: {e}")))?;
 
         if !response.status().is_success() {
             return Err(AuthError::AuthFailed(format!(
@@ -230,24 +230,24 @@ impl OAuthManager {
         let mut user: GitHubUser = response
             .json()
             .await
-            .map_err(|e| AuthError::AuthFailed(format!("Failed to parse GitHub user: {}", e)))?;
+            .map_err(|e| AuthError::AuthFailed(format!("Failed to parse GitHub user: {e}")))?;
 
         // If no public email, fetch from emails endpoint
         if user.email.is_none() {
             let emails_response = self
                 .http_client
                 .get("https://api.github.com/user/emails")
-                .header("Authorization", format!("Bearer {}", access_token))
+                .header("Authorization", format!("Bearer {access_token}"))
                 .header("User-Agent", "cloud-api")
                 .send()
                 .await
                 .map_err(|e| {
-                    AuthError::NetworkError(format!("Failed to fetch GitHub emails: {}", e))
+                    AuthError::NetworkError(format!("Failed to fetch GitHub emails: {e}"))
                 })?;
 
             if emails_response.status().is_success() {
                 let emails: Vec<GitHubEmail> = emails_response.json().await.map_err(|e| {
-                    AuthError::AuthFailed(format!("Failed to parse GitHub emails: {}", e))
+                    AuthError::AuthFailed(format!("Failed to parse GitHub emails: {e}"))
                 })?;
 
                 // Get primary email
@@ -269,10 +269,10 @@ impl OAuthManager {
         let response = self
             .http_client
             .get("https://www.googleapis.com/oauth2/v2/userinfo")
-            .header("Authorization", format!("Bearer {}", access_token))
+            .header("Authorization", format!("Bearer {access_token}"))
             .send()
             .await
-            .map_err(|e| AuthError::NetworkError(format!("Failed to fetch Google user: {}", e)))?;
+            .map_err(|e| AuthError::NetworkError(format!("Failed to fetch Google user: {e}")))?;
 
         let status = response.status();
         debug!("Google API response status: {}", status);
@@ -283,15 +283,14 @@ impl OAuthManager {
                 .await
                 .unwrap_or_else(|_| "Unable to read response".to_string());
             return Err(AuthError::AuthFailed(format!(
-                "Google API returned status: {}, body: {}",
-                status, response_text
+                "Google API returned status: {status}, body: {response_text}"
             )));
         }
 
         response
             .json()
             .await
-            .map_err(|e| AuthError::AuthFailed(format!("Failed to parse Google user: {}", e)))
+            .map_err(|e| AuthError::AuthFailed(format!("Failed to parse Google user: {e}")))
     }
 }
 

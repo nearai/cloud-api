@@ -27,7 +27,7 @@ async fn test_chat_completions_api() {
 
     let response = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "messages": [
@@ -51,7 +51,7 @@ async fn test_chat_completions_api() {
 
     // Parse standard OpenAI streaming format: "data: <json>"
     for line in response_text.lines() {
-        println!("Line: {}", line);
+        println!("Line: {line}");
 
         if let Some(data) = line.strip_prefix("data: ") {
             // Handle the [DONE] marker
@@ -69,11 +69,11 @@ async fn test_chat_completions_api() {
 
                 let chat_chunk = match chunk {
                     StreamChunk::Chat(chat_chunk) => {
-                        println!("Chat chunk: {:?}", chat_chunk);
+                        println!("Chat chunk: {chat_chunk:?}");
                         Some(chat_chunk)
                     }
                     _ => {
-                        println!("Unknown chunk: {:?}", chunk);
+                        println!("Unknown chunk: {chunk:?}");
                         None
                     }
                 }
@@ -84,7 +84,7 @@ async fn test_chat_completions_api() {
                     if let Some(delta) = &choice.delta {
                         if let Some(delta_content) = &delta.content {
                             content.push_str(delta_content.as_str());
-                            println!("Delta content: '{}'", delta_content);
+                            println!("Delta content: '{delta_content}'");
                         }
 
                         // Check if this is the final chunk (has usage or finish_reason)
@@ -95,7 +95,7 @@ async fn test_chat_completions_api() {
                     }
                 }
             } else {
-                println!("Failed to parse JSON: {}", data);
+                println!("Failed to parse JSON: {data}");
             }
         }
     }
@@ -103,18 +103,17 @@ async fn test_chat_completions_api() {
     // Verify we got content from the stream
     assert!(!content.is_empty(), "Expected non-empty streamed content");
 
-    println!("Streamed Content: {}", content);
+    println!("Streamed Content: {content}");
 
     // Verify we got a meaningful response
     assert!(
         content.len() > 10,
-        "Expected substantial content from stream, got: '{}'",
-        content
+        "Expected substantial content from stream, got: '{content}'"
     );
 
     // If we have a final response, verify its structure
     if let Some(final_resp) = final_response {
-        println!("Final Response: {:?}", final_resp);
+        println!("Final Response: {final_resp:?}");
         assert!(
             !final_resp.choices.is_empty(),
             "Final response should have choices"
@@ -137,14 +136,14 @@ async fn test_responses_api() {
 
     let response = server
         .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
 
     let models = response.json::<api::models::ModelsResponse>();
     assert!(!models.data.is_empty());
 
     let conversation = create_conversation(&server, api_key.clone()).await;
-    println!("Conversation: {:?}", conversation);
+    println!("Conversation: {conversation:?}");
 
     let message = "Hello, how are you?".to_string();
     let max_tokens = 10;
@@ -157,7 +156,7 @@ async fn test_responses_api() {
         api_key.clone(),
     )
     .await;
-    println!("Response: {:?}", response);
+    println!("Response: {response:?}");
 
     // Check that response completed successfully
     assert_eq!(response.status, api::models::ResponseStatus::Completed);
@@ -210,7 +209,7 @@ async fn create_conversation(
 ) -> api::models::ConversationObject {
     let response = server
         .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "name": "Test Conversation",
             "description": "A test conversation"
@@ -228,7 +227,7 @@ async fn get_conversation(
 ) -> api::models::ConversationObject {
     let response = server
         .get(format!("/v1/conversations/{conversation_id}").as_str())
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
     assert_eq!(response.status_code(), 200);
     response.json::<api::models::ConversationObject>()
@@ -241,7 +240,7 @@ async fn list_conversation_items(
 ) -> api::models::ConversationItemList {
     let response = server
         .get(format!("/v1/conversations/{conversation_id}/items").as_str())
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
     assert_eq!(response.status_code(), 200);
     response.json::<api::models::ConversationItemList>()
@@ -257,7 +256,7 @@ async fn create_response(
 ) -> api::models::ResponseObject {
     let response = server
         .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "conversation": {
                 "id": conversation_id,
@@ -283,7 +282,7 @@ async fn create_response_stream(
 ) -> (String, api::models::ResponseObject) {
     let response = server
         .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "conversation": {
                 "id": conversation_id,
@@ -328,7 +327,7 @@ async fn create_response_stream(
                         // Accumulate content deltas as they arrive
                         if let Some(delta) = event_json.get("delta").and_then(|v| v.as_str()) {
                             content.push_str(delta);
-                            println!("Delta: {}", delta);
+                            println!("Delta: {delta}");
                         }
                     }
                     "response.completed" => {
@@ -350,7 +349,7 @@ async fn create_response_stream(
                         println!("Response in progress");
                     }
                     _ => {
-                        println!("Event: {}", event_type);
+                        println!("Event: {event_type}");
                     }
                 }
             }
@@ -370,7 +369,7 @@ async fn test_conversations_api() {
     // Test creating a conversation
     let create_response = server
         .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "name": "Test Conversation",
             "description": "A test conversation"
@@ -387,7 +386,7 @@ async fn test_streaming_responses_api() {
     // Get available models
     let response = server
         .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
 
     let models = response.json::<api::models::ModelsResponse>();
@@ -395,7 +394,7 @@ async fn test_streaming_responses_api() {
 
     // Create a conversation
     let conversation = create_conversation(&server, api_key.clone()).await;
-    println!("Conversation: {:?}", conversation);
+    println!("Conversation: {conversation:?}");
 
     // Test streaming response
     let message = "Hello, how are you?".to_string();
@@ -409,8 +408,8 @@ async fn test_streaming_responses_api() {
     )
     .await;
 
-    println!("Streamed Content: {}", streamed_content);
-    println!("Final Response: {:?}", streaming_response);
+    println!("Streamed Content: {streamed_content}");
+    println!("Final Response: {streaming_response:?}");
 
     // Verify we got content from the stream
     assert!(
@@ -423,7 +422,7 @@ async fn test_streaming_responses_api() {
         if let ResponseOutputItem::Message { content, .. } = o {
             content.iter().any(|c| {
                 if let ResponseOutputContent::OutputText { text, .. } = c {
-                    println!("Final Response Text: {}", text);
+                    println!("Final Response Text: {text}");
                     !text.is_empty()
                 } else {
                     false
@@ -468,7 +467,7 @@ async fn test_admin_update_model() {
     let batch = generate_model();
     let batch_for_comparison = generate_model();
     let updated_models = admin_batch_upsert_models(&server, batch, get_session_id()).await;
-    println!("Updated models: {:?}", updated_models);
+    println!("Updated models: {updated_models:?}");
     assert_eq!(updated_models.len(), 1);
     let updated_model = &updated_models[0];
     // model_id should be the public_name, not the internal model_name
@@ -500,26 +499,26 @@ async fn test_get_model_by_name() {
 
     let upserted_models = admin_batch_upsert_models(&server, batch, get_session_id()).await;
 
-    println!("Upserted models: {:?}", upserted_models);
+    println!("Upserted models: {upserted_models:?}");
     assert_eq!(upserted_models.len(), 1);
 
     // Test retrieving the model by name (public endpoint - no auth required)
     // Model names may contain forward slashes (e.g., "Qwen/Qwen3-30B-A3B-Instruct-2507")
     // which must be URL-encoded when used in the path
-    println!("Test: Requesting model by name: '{}'", model_name);
+    println!("Test: Requesting model by name: '{model_name}'");
     let encoded_model_name =
         url::form_urlencoded::byte_serialize(model_name.as_bytes()).collect::<String>();
-    println!("Test: URL-encoded for path: '{}'", encoded_model_name);
+    println!("Test: URL-encoded for path: '{encoded_model_name}'");
 
     let response = server
-        .get(format!("/v1/model/{}", encoded_model_name).as_str())
+        .get(format!("/v1/model/{encoded_model_name}").as_str())
         .await;
 
     println!("Response status: {}", response.status_code());
     assert_eq!(response.status_code(), 200);
 
     let model_resp = response.json::<api::models::ModelWithPricing>();
-    println!("Retrieved model: {:?}", model_resp);
+    println!("Retrieved model: {model_resp:?}");
 
     // Verify the model details match what we upserted
     // The model_id should be the public_name, not the internal model_name
@@ -578,13 +577,13 @@ async fn test_get_model_by_name() {
 
     // Test retrieving the same model by public name
     let public_name = model_request.public_name.as_deref().unwrap();
-    println!("Test: Requesting model by public name: '{}'", public_name);
+    println!("Test: Requesting model by public name: '{public_name}'");
     // URL-encode the public name since it may contain special characters
     let encoded_public_name =
         url::form_urlencoded::byte_serialize(public_name.as_bytes()).collect::<String>();
-    println!("Test: URL-encoded public name: '{}'", encoded_public_name);
+    println!("Test: URL-encoded public name: '{encoded_public_name}'");
     let response_by_public_name = server
-        .get(format!("/v1/model/{}", encoded_public_name).as_str())
+        .get(format!("/v1/model/{encoded_public_name}").as_str())
         .await;
 
     println!(
@@ -594,10 +593,7 @@ async fn test_get_model_by_name() {
     assert_eq!(response_by_public_name.status_code(), 200);
 
     let model_resp_by_public_name = response_by_public_name.json::<api::models::ModelWithPricing>();
-    println!(
-        "Retrieved model by public name: {:?}",
-        model_resp_by_public_name
-    );
+    println!("Retrieved model by public name: {model_resp_by_public_name:?}");
 
     // Verify that both queries return the same model (same model_id)
     assert_eq!(model_resp.model_id, model_resp_by_public_name.model_id);
@@ -609,7 +605,7 @@ async fn test_get_model_by_name() {
     let encoded_nonexistent =
         url::form_urlencoded::byte_serialize(nonexistent_model.as_bytes()).collect::<String>();
     let response = server
-        .get(format!("/v1/model/{}", encoded_nonexistent).as_str())
+        .get(format!("/v1/model/{encoded_nonexistent}").as_str())
         .await;
 
     println!(
@@ -623,7 +619,7 @@ async fn test_get_model_by_name() {
     if !response_text.is_empty() {
         let error: api::models::ErrorResponse =
             serde_json::from_str(&response_text).expect("Failed to parse error response");
-        println!("Error response: {:?}", error);
+        println!("Error response: {error:?}");
         assert_eq!(error.error.r#type, "model_not_found");
         assert!(error
             .error
@@ -640,7 +636,7 @@ async fn test_admin_update_organization_limits() {
 
     // Create an organization
     let org = create_org(&server).await;
-    println!("Created organization: {:?}", org);
+    println!("Created organization: {org:?}");
 
     // Update organization limits (amount is in nano-dollars, scale 9 is implicit)
     let update_request = serde_json::json!({
@@ -671,7 +667,7 @@ async fn test_admin_update_organization_limits() {
         serde_json::from_str::<api::models::UpdateOrganizationLimitsResponse>(&response.text())
             .expect("Failed to parse response");
 
-    println!("Update response: {:?}", update_response);
+    println!("Update response: {update_response:?}");
 
     // Verify the response
     assert_eq!(update_response.organization_id, org.id);
@@ -695,7 +691,7 @@ async fn test_admin_update_organization_limits_invalid_org() {
     });
 
     let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", fake_org_id).as_str())
+        .patch(format!("/v1/admin/organizations/{fake_org_id}/limits").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .json(&update_request)
         .await;
@@ -708,7 +704,7 @@ async fn test_admin_update_organization_limits_invalid_org() {
     );
 
     let error = response.json::<api::models::ErrorResponse>();
-    println!("Error response: {:?}", error);
+    println!("Error response: {error:?}");
     assert_eq!(error.error.r#type, "organization_not_found");
 }
 
@@ -817,7 +813,7 @@ async fn test_no_credits_denies_request() {
     // Try to make a chat completion request - should be denied (402 Payment Required)
     let response = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "messages": [
@@ -843,7 +839,7 @@ async fn test_no_credits_denies_request() {
 
     let error = serde_json::from_str::<api::models::ErrorResponse>(&response.text())
         .expect("Failed to parse error response");
-    println!("Error: {:?}", error);
+    println!("Error: {error:?}");
     assert!(
         error.error.r#type == "no_credits" || error.error.r#type == "no_limit_configured",
         "Expected error type 'no_credits' or 'no_limit_configured'"
@@ -860,7 +856,7 @@ async fn test_unconfigured_model_rejected() {
     // This model is discovered from the endpoint but has no pricing configuration
     let response = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "model": "dphn/Dolphin-Mistral-24B-Venice-Edition",
             "messages": [
@@ -886,7 +882,7 @@ async fn test_unconfigured_model_rejected() {
 
     let error = serde_json::from_str::<api::models::ErrorResponse>(&response.text())
         .expect("Failed to parse error response");
-    println!("Error: {:?}", error);
+    println!("Error: {error:?}");
 
     // Verify error message mentions the model is not configured
     assert!(
@@ -917,7 +913,7 @@ async fn test_usage_tracking_on_completion() {
     // Make a chat completion request
     let response = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "messages": [
@@ -949,13 +945,13 @@ async fn test_usage_tracking_on_completion() {
 async fn test_usage_limit_enforcement() {
     let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 1).await; // 1 nano-dollar (minimal)
-    println!("Created organization: {:?}", org);
+    println!("Created organization: {org:?}");
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     // First request should succeed (no usage yet)
     let response1 = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "messages": [{"role": "user", "content": "Hi"}],
@@ -973,7 +969,7 @@ async fn test_usage_limit_enforcement() {
     // Second request should fail with payment required
     let response2 = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "messages": [{"role": "user", "content": "Hi again"}],
@@ -1013,7 +1009,7 @@ async fn test_get_organization_balance() {
         serde_json::from_str::<api::routes::usage::OrganizationBalanceResponse>(&response.text())
             .expect("Failed to parse balance response");
 
-    println!("Balance: {:?}", balance);
+    println!("Balance: {balance:?}");
 
     // Verify limit is included
     assert!(balance.spend_limit.is_some(), "Should have spend_limit");
@@ -1067,7 +1063,7 @@ async fn test_get_organization_usage_history() {
     assert_eq!(response.status_code(), 200);
 
     let history_response = response.json::<serde_json::Value>();
-    println!("Usage history: {:?}", history_response);
+    println!("Usage history: {history_response:?}");
 
     // Should have data array (empty is fine)
     assert!(history_response.get("data").is_some());
@@ -1081,7 +1077,7 @@ async fn test_completion_cost_calculation() {
 
     // Setup test model with known pricing
     let model_name = setup_test_model(&server).await;
-    println!("Setup model: {}", model_name);
+    println!("Setup model: {model_name}");
 
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
@@ -1098,12 +1094,12 @@ async fn test_completion_cost_calculation() {
     } else {
         0i64
     };
-    println!("Initial spent amount (nano-dollars): {}", initial_spent);
+    println!("Initial spent amount (nano-dollars): {initial_spent}");
 
     // Make a chat completion request with controlled parameters
     let response = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "model": model_name,
             "messages": [
@@ -1146,20 +1142,13 @@ async fn test_completion_cost_calculation() {
     let expected_output_cost = (output_tokens as i64) * output_cost_per_token;
     let expected_total_cost = expected_input_cost + expected_output_cost;
 
+    println!("Input tokens: {input_tokens}, cost per token: {input_cost_per_token} nano-dollars");
     println!(
-        "Input tokens: {}, cost per token: {} nano-dollars",
-        input_tokens, input_cost_per_token
+        "Output tokens: {output_tokens}, cost per token: {output_cost_per_token} nano-dollars"
     );
-    println!(
-        "Output tokens: {}, cost per token: {} nano-dollars",
-        output_tokens, output_cost_per_token
-    );
-    println!("Expected input cost: {} nano-dollars", expected_input_cost);
-    println!(
-        "Expected output cost: {} nano-dollars",
-        expected_output_cost
-    );
-    println!("Expected total cost: {} nano-dollars", expected_total_cost);
+    println!("Expected input cost: {expected_input_cost} nano-dollars");
+    println!("Expected output cost: {expected_output_cost} nano-dollars");
+    println!("Expected total cost: {expected_total_cost} nano-dollars");
 
     // Wait for async usage recording to complete (increased to 3s for reliability with remote DB)
     tokio::time::sleep(tokio::time::Duration::from_millis(3000)).await;
@@ -1176,7 +1165,7 @@ async fn test_completion_cost_calculation() {
         "Should be able to get balance"
     );
     let balance = balance_response.json::<api::routes::usage::OrganizationBalanceResponse>();
-    println!("Balance: {:?}", balance);
+    println!("Balance: {balance:?}");
     println!("Total spent: {} nano-dollars", balance.total_spent);
 
     // Verify limit information is included
@@ -1206,23 +1195,16 @@ async fn test_completion_cost_calculation() {
     // The recorded cost should match our expected calculation (all at scale 9)
     let actual_spent = balance.total_spent - initial_spent;
 
-    println!("Actual spent: {} nano-dollars", actual_spent);
-    println!("Expected spent: {} nano-dollars", expected_total_cost);
+    println!("Actual spent: {actual_spent} nano-dollars");
+    println!("Expected spent: {expected_total_cost} nano-dollars");
 
     // Verify the cost calculation is correct (with small tolerance for rounding)
     let tolerance = 10; // Allow small rounding differences
     assert!(
         (actual_spent - expected_total_cost).abs() <= tolerance,
-        "Cost calculation mismatch: expected {} (±{}), got {}. \
-         Input tokens: {}, Output tokens: {}, \
-         Input cost per token: {}, Output cost per token: {}",
-        expected_total_cost,
-        tolerance,
-        actual_spent,
-        input_tokens,
-        output_tokens,
-        input_cost_per_token,
-        output_cost_per_token
+        "Cost calculation mismatch: expected {expected_total_cost} (±{tolerance}), got {actual_spent}. \
+         Input tokens: {input_tokens}, Output tokens: {output_tokens}, \
+         Input cost per token: {input_cost_per_token}, Output cost per token: {output_cost_per_token}"
     );
 
     // Verify the display format is reasonable
@@ -1244,7 +1226,7 @@ async fn test_completion_cost_calculation() {
 
     assert_eq!(history_response.status_code(), 200);
     let history = history_response.json::<api::routes::usage::UsageHistoryResponse>();
-    println!("Usage history: {:?}", history);
+    println!("Usage history: {history:?}");
 
     // Find the most recent entry (should be our completion)
     assert!(
@@ -1253,7 +1235,7 @@ async fn test_completion_cost_calculation() {
     );
     let latest_entry = &history.data[0];
 
-    println!("Latest usage entry: {:?}", latest_entry);
+    println!("Latest usage entry: {latest_entry:?}");
     assert_eq!(
         latest_entry.model_id, model_name,
         "Should record correct model"
@@ -1296,7 +1278,7 @@ async fn test_organization_balance_with_limit_and_usage() {
         serde_json::from_str::<api::routes::usage::OrganizationBalanceResponse>(&response.text())
             .expect("Failed to parse balance");
 
-    println!("Initial balance: {:?}", initial_balance);
+    println!("Initial balance: {initial_balance:?}");
 
     // Verify initial state
     assert_eq!(initial_balance.total_spent, 0);
@@ -1311,7 +1293,7 @@ async fn test_organization_balance_with_limit_and_usage() {
 
     let response = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "model": model_name,
             "messages": [{"role": "user", "content": "Hi"}],
@@ -1336,7 +1318,7 @@ async fn test_organization_balance_with_limit_and_usage() {
         serde_json::from_str::<api::routes::usage::OrganizationBalanceResponse>(&response.text())
             .expect("Failed to parse balance");
 
-    println!("Final balance: {:?}", final_balance);
+    println!("Final balance: {final_balance:?}");
 
     // Verify spending was recorded
     assert!(final_balance.total_spent > 0, "Should have recorded spend");
@@ -1418,7 +1400,7 @@ async fn test_high_context_length_completion() {
     // Make a chat completion request with very high context
     let response = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "messages": [
@@ -1465,7 +1447,7 @@ async fn test_high_context_length_completion() {
     } else {
         // If the model isn't available, that's acceptable for this test
         let response_text = response.text();
-        println!("Response (model may not be available): {}", response_text);
+        println!("Response (model may not be available): {response_text}");
 
         // Common acceptable errors:
         // - Model not found (404)
@@ -1526,7 +1508,7 @@ async fn test_high_context_streaming() {
     // Make a streaming request with high context
     let response = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "messages": [
@@ -1580,7 +1562,7 @@ async fn test_high_context_streaming() {
 
         if let Some(final_resp) = final_chunk {
             if let Some(usage) = final_resp.usage {
-                println!("High context streaming usage: {:?}", usage);
+                println!("High context streaming usage: {usage:?}");
                 assert!(
                     usage.prompt_tokens > 30000,
                     "Expected high input token count, got: {}",
@@ -1674,7 +1656,7 @@ async fn test_model_aliases() {
     println!("\n=== Test 1: Request with alias 'openai/gpt-oss-120b' ===");
     let response = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "model": "openai/gpt-oss-120b",  // Using ALIAS
             "messages": [
@@ -1710,7 +1692,7 @@ async fn test_model_aliases() {
     println!("\n=== Test 2: Request with canonical name 'nearai/gpt-oss-120b' ===");
     let response = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "model": "nearai/gpt-oss-120b",  // Using CANONICAL name
             "messages": [
@@ -1740,7 +1722,7 @@ async fn test_model_aliases() {
     println!("\n=== Test 3: Request with clean alias 'deepseek/deepseek-v3.1' ===");
     let response = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "model": "deepseek/deepseek-v3.1",  // Clean alias
             "messages": [
@@ -1769,7 +1751,7 @@ async fn test_model_aliases() {
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
     let history_response = server
-        .get(format!("/v1/organizations/{}/usage/history?limit=50", org_id).as_str())
+        .get(format!("/v1/organizations/{org_id}/usage/history?limit=50").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .await;
 
@@ -1845,7 +1827,7 @@ async fn test_model_alias_consistency() {
     println!("\n=== Request 1: Using first alias 'qwen/qwen3-30b-a3b-instruct-2507' ===");
     let response1 = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "model": "qwen/qwen3-30b-a3b-instruct-2507",  // First alias
             "messages": [{"role": "user", "content": "Hi"}],
@@ -1859,7 +1841,7 @@ async fn test_model_alias_consistency() {
         let input_cost = (completion1.usage.input_tokens as i64) * 800000;
         let output_cost = (completion1.usage.output_tokens as i64) * 1600000;
         let total_cost = input_cost + output_cost;
-        println!("Request 1 cost: {} nano-dollars", total_cost);
+        println!("Request 1 cost: {total_cost} nano-dollars");
         Some(total_cost)
     } else {
         println!("Model may not be available");
@@ -1870,7 +1852,7 @@ async fn test_model_alias_consistency() {
     println!("\n=== Request 2: Using second alias 'qwen3-30b' ===");
     let response2 = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "model": "qwen3-30b",  // Second alias
             "messages": [{"role": "user", "content": "Hi"}],
@@ -1884,7 +1866,7 @@ async fn test_model_alias_consistency() {
         let input_cost = (completion2.usage.input_tokens as i64) * 800000;
         let output_cost = (completion2.usage.output_tokens as i64) * 1600000;
         let total_cost = input_cost + output_cost;
-        println!("Request 2 cost: {} nano-dollars", total_cost);
+        println!("Request 2 cost: {total_cost} nano-dollars");
 
         // Verify both use the same pricing (from canonical model)
         if let Some(cost1) = cost1 {
@@ -1893,10 +1875,7 @@ async fn test_model_alias_consistency() {
             let tolerance_percent = 0.5; // 50% tolerance for token variation
             let max_diff = ((cost1 as f64) * tolerance_percent) as i64;
 
-            println!(
-                "Cost comparison: {} vs {}, diff: {}",
-                cost1, total_cost, cost_diff
-            );
+            println!("Cost comparison: {cost1} vs {total_cost}, diff: {cost_diff}");
             assert!(
                 cost_diff <= max_diff || cost_diff.abs() < 100000000, // Allow some variation
                 "Both aliases should use same pricing model"
@@ -1909,7 +1888,7 @@ async fn test_model_alias_consistency() {
     println!("\n=== Request 3: Using canonical name 'Qwen/Qwen3-30B-A3B-Instruct-2507' ===");
     let response3 = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",  // Canonical name
             "messages": [{"role": "user", "content": "Hello"}],
@@ -1964,13 +1943,13 @@ async fn test_streaming_chat_completion_signature_verification() {
     let request_json = serde_json::to_string(&request_body).expect("Failed to serialize request");
     let expected_request_hash = compute_sha256(&request_json);
     println!("\n=== Expected Request Hash ===");
-    println!("Request JSON: {}", request_json);
-    println!("Expected hash: {}", expected_request_hash);
+    println!("Request JSON: {request_json}");
+    println!("Expected hash: {expected_request_hash}");
 
     // Step 4: Make streaming request and capture raw response
     let response = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&request_body)
         .await;
 
@@ -1985,7 +1964,7 @@ async fn test_streaming_chat_completion_signature_verification() {
     // Capture the complete raw response text (SSE format)
     let response_text = response.text();
     println!("=== Raw Streaming Response ===");
-    println!("{}", response_text);
+    println!("{response_text}");
 
     // Step 5: Parse streaming response to extract chat_id and verify structure
     let mut chat_id: Option<String> = None;
@@ -2019,13 +1998,13 @@ async fn test_streaming_chat_completion_signature_verification() {
     }
 
     let chat_id = chat_id.expect("Should have extracted chat_id from stream");
-    println!("Accumulated content: '{}'", content);
+    println!("Accumulated content: '{content}'");
     assert!(!content.is_empty(), "Should have received some content");
 
     // Step 6: Compute expected response hash from the complete raw response
     let expected_response_hash = compute_sha256(&response_text);
     println!("\n=== Expected Response Hash ===");
-    println!("Expected hash: {}", expected_response_hash);
+    println!("Expected hash: {expected_response_hash}");
 
     // Wait for signature to be stored asynchronously
     println!("\n=== Waiting for Signature Storage ===");
@@ -2034,14 +2013,8 @@ async fn test_streaming_chat_completion_signature_verification() {
     // Step 7: Query signature API
     println!("\n=== Querying Signature API ===");
     let signature_response = server
-        .get(
-            format!(
-                "/v1/signature/{}?model={}&signing_algo=ecdsa",
-                chat_id, model_name
-            )
-            .as_str(),
-        )
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .get(format!("/v1/signature/{chat_id}?model={model_name}&signing_algo=ecdsa").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
 
     println!("Signature API status: {}", signature_response.status_code());
@@ -2064,7 +2037,7 @@ async fn test_streaming_chat_completion_signature_verification() {
         .expect("Signature response should have 'text' field");
 
     println!("\n=== Parsing Signature Text ===");
-    println!("Signature text: {}", signature_text);
+    println!("Signature text: {signature_text}");
 
     let hash_parts: Vec<&str> = signature_text.split(':').collect();
     assert_eq!(
@@ -2076,38 +2049,36 @@ async fn test_streaming_chat_completion_signature_verification() {
     let actual_request_hash = hash_parts[0];
     let actual_response_hash = hash_parts[1];
 
-    println!("Actual request hash:  {}", actual_request_hash);
-    println!("Actual response hash: {}", actual_response_hash);
+    println!("Actual request hash:  {actual_request_hash}");
+    println!("Actual response hash: {actual_response_hash}");
 
     // Step 9: Critical Assertions - These will FAIL with the current bug
     println!("\n=== Hash Verification ===");
 
     println!("\nRequest Hash Comparison:");
-    println!("  Expected: {}", expected_request_hash);
-    println!("  Actual:   {}", actual_request_hash);
+    println!("  Expected: {expected_request_hash}");
+    println!("  Actual:   {actual_request_hash}");
 
     assert_eq!(
         expected_request_hash, actual_request_hash,
         "\n\n❌ REQUEST HASH MISMATCH!\n\
-         Expected: {}\n\
-         Actual:   {}\n\n\
+         Expected: {expected_request_hash}\n\
+         Actual:   {actual_request_hash}\n\n\
          This means the signature API is not using the correct request body for hashing.\n\
-         The signature cannot be verified correctly.\n",
-        expected_request_hash, actual_request_hash
+         The signature cannot be verified correctly.\n"
     );
 
     println!("\nResponse Hash Comparison:");
-    println!("  Expected: {}", expected_response_hash);
-    println!("  Actual:   {}", actual_response_hash);
+    println!("  Expected: {expected_response_hash}");
+    println!("  Actual:   {actual_response_hash}");
 
     assert_eq!(
         expected_response_hash, actual_response_hash,
         "\n\n❌ RESPONSE HASH MISMATCH!\n\
-         Expected: {}\n\
-         Actual:   {}\n\n\
+         Expected: {expected_response_hash}\n\
+         Actual:   {actual_response_hash}\n\n\
          This means the signature API is not using the correct streaming response body for hashing.\n\
-         The signature cannot be verified correctly.\n",
-        expected_response_hash, actual_response_hash
+         The signature cannot be verified correctly.\n"
     );
 
     println!("\n✅ All hash verifications passed!");
@@ -2141,14 +2112,14 @@ async fn test_streaming_chat_completion_signature_verification() {
 
     println!("\n=== Test Summary ===");
     println!("✅ Streaming request succeeded");
-    println!("✅ Chat completion ID extracted: {}", chat_id);
+    println!("✅ Chat completion ID extracted: {chat_id}");
     println!("✅ Content received: {} chars", content.len());
     println!("✅ Signature stored and retrieved");
-    println!("✅ Request hash matches: {}", expected_request_hash);
-    println!("✅ Response hash matches: {}", expected_response_hash);
+    println!("✅ Request hash matches: {expected_request_hash}");
+    println!("✅ Response hash matches: {expected_response_hash}");
     println!("✅ Signature is present: {}", &signature[..20]);
-    println!("✅ Signing address: {}", signing_address);
-    println!("✅ Signing algorithm: {}", signing_algo);
+    println!("✅ Signing address: {signing_address}");
+    println!("✅ Signing algorithm: {signing_algo}");
 }
 
 // ============================================
@@ -2366,7 +2337,7 @@ async fn test_admin_create_access_token_use_created_token() {
 
     let update_response = server
         .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", admin_token))
+        .add_header("Authorization", format!("Bearer {admin_token}"))
         .json(&update_request)
         .await;
 
@@ -2410,7 +2381,7 @@ async fn test_public_name_uniqueness_for_active_models() {
     let models1 = admin_batch_upsert_models(&server, batch1, get_session_id()).await;
     assert_eq!(models1.len(), 1);
     assert_eq!(models1[0].model_id, public_name);
-    println!("✅ Created first model with public_name: {}", public_name);
+    println!("✅ Created first model with public_name: {public_name}");
 
     // Test 2: Try to create another active model with the same public_name - should fail
     let mut batch2 = BatchUpdateModelApiRequest::new();
@@ -2446,7 +2417,7 @@ async fn test_public_name_uniqueness_for_active_models() {
         response.status_code()
     );
     let response_text = response.text();
-    println!("Duplicate public_name response body: {}", response_text);
+    println!("Duplicate public_name response body: {response_text}");
 
     // Should get 400 Bad Request for duplicate public_name
     assert_eq!(
@@ -2461,8 +2432,7 @@ async fn test_public_name_uniqueness_for_active_models() {
     assert_eq!(error.error.r#type, "public_name_conflict");
     assert!(
         error.error.message.contains(&format!(
-            "Public name '{}' is already used by an active model",
-            public_name
+            "Public name '{public_name}' is already used by an active model"
         )),
         "Error message should indicate public_name conflict"
     );
@@ -2573,10 +2543,7 @@ async fn test_public_name_uniqueness_for_active_models() {
         response2.status_code()
     );
     let response_text2 = response2.text();
-    println!(
-        "Second duplicate public_name response body: {}",
-        response_text2
-    );
+    println!("Second duplicate public_name response body: {response_text2}");
 
     // Should get 400 Bad Request for duplicate public_name
     assert_eq!(
@@ -2591,8 +2558,7 @@ async fn test_public_name_uniqueness_for_active_models() {
     assert_eq!(error2.error.r#type, "public_name_conflict");
     assert!(
         error2.error.message.contains(&format!(
-            "Public name '{}' is already used by an active model",
-            public_name
+            "Public name '{public_name}' is already used by an active model"
         )),
         "Error message should indicate public_name conflict"
     );

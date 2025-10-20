@@ -320,7 +320,7 @@ pub fn compute_sha256(data: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-pub fn decode_access_token_claims(token: &String) -> AccessTokenClaims {
+pub fn decode_access_token_claims(token: &str) -> AccessTokenClaims {
     let token_parts: Vec<&str> = token.split(".").collect();
     let token_claims_raw = base64::engine::general_purpose::STANDARD
         .decode(&token_parts[1])

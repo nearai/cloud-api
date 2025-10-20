@@ -11,7 +11,7 @@ use inference_providers::{
 use std::time::Duration;
 use tokio::time::timeout;
 
-const VLLM_BASE_URL: &str = "http://REDACTED_IP2:8000";
+const VLLM_BASE_URL: &str = "http://REDACTED_IP:8002";
 const VLLM_API_KEY: &str = "REDACTED";
 const TEST_TIMEOUT_SECS: u64 = 30;
 

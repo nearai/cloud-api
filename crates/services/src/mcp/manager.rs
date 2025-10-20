@@ -162,7 +162,7 @@ impl McpClientManager {
                     connector.name, e
                 );
                 error!("Connection error details: {:#}", e);
-                McpError::NetworkError(format!("Failed to connect: {}", e))
+                McpError::NetworkError(format!("Failed to connect: {e}"))
             })?;
 
         info!(
@@ -198,7 +198,7 @@ impl McpClientManager {
         let client = self
             .create_client(connector)
             .await
-            .map_err(|e| McpError::NetworkError(format!("Failed to create client: {}", e)))?;
+            .map_err(|e| McpError::NetworkError(format!("Failed to create client: {e}")))?;
         let client_arc = Arc::new(Mutex::new(client));
 
         // Store the client with server info
@@ -272,7 +272,7 @@ impl McpClientManager {
             timeout(Duration::from_secs(30), client.list_all_tools())
                 .await
                 .map_err(|_| McpError::ConnectionTimeout { seconds: 30 })?
-                .map_err(|e| McpError::NetworkError(format!("Failed to list tools: {}", e)))?
+                .map_err(|e| McpError::NetworkError(format!("Failed to list tools: {e}")))?
         };
 
         info!(
@@ -334,7 +334,7 @@ impl McpClientManager {
             )
             .await
             .map_err(|_| McpError::ConnectionTimeout { seconds: 60 })?
-            .map_err(|e| McpError::NetworkError(format!("Failed to call tool '{}': {}", name, e)))?
+            .map_err(|e| McpError::NetworkError(format!("Failed to call tool '{name}': {e}")))?
         };
 
         debug!("Called tool '{}' on connector {}", name, connector_id);
@@ -407,7 +407,7 @@ impl McpClientManager {
             timeout(Duration::from_secs(30), client.list_all_resources())
                 .await
                 .map_err(|_| McpError::ConnectionTimeout { seconds: 30 })?
-                .map_err(|e| McpError::NetworkError(format!("Failed to list resources: {}", e)))?
+                .map_err(|e| McpError::NetworkError(format!("Failed to list resources: {e}")))?
         };
 
         debug!(
@@ -437,9 +437,7 @@ impl McpClientManager {
             )
             .await
             .map_err(|_| McpError::ConnectionTimeout { seconds: 30 })?
-            .map_err(|e| {
-                McpError::NetworkError(format!("Failed to read resource '{}': {}", uri, e))
-            })?
+            .map_err(|e| McpError::NetworkError(format!("Failed to read resource '{uri}': {e}")))?
         };
 
         debug!("Read resource '{}' from connector {}", uri, connector_id);
@@ -459,7 +457,7 @@ impl McpClientManager {
             timeout(Duration::from_secs(30), client.list_all_prompts())
                 .await
                 .map_err(|_| McpError::ConnectionTimeout { seconds: 30 })?
-                .map_err(|e| McpError::NetworkError(format!("Failed to list prompts: {}", e)))?
+                .map_err(|e| McpError::NetworkError(format!("Failed to list prompts: {e}")))?
         };
 
         debug!(
@@ -494,7 +492,7 @@ impl McpClientManager {
                 .await
                 .map_err(|_| McpError::ConnectionTimeout { seconds: 30 })?
                 .map_err(|e| {
-                    McpError::NetworkError(format!("Failed to get prompt '{}': {}", name, e))
+                    McpError::NetworkError(format!("Failed to get prompt '{name}': {e}"))
                 })?
         };
 

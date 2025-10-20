@@ -111,7 +111,7 @@ pub async fn batch_upsert_models(
                 _ => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(
-                        "Failed to upsert models".to_string(),
+                        format!("Failed to upsert models, error: {:?}", e),
                         "internal_server_error".to_string(),
                     )),
                 ),

@@ -35,7 +35,7 @@ impl From<ResponseError> for ErrorResponse {
                 ErrorResponse::new(msg, "invalid_request_error".to_string())
             }
             ResponseError::InternalError(msg) => ErrorResponse::new(
-                format!("Internal server error: {}", msg),
+                format!("Internal server error: {msg}"),
                 "internal_error".to_string(),
             ),
         }
@@ -49,7 +49,7 @@ fn parse_response_id(id_str: &str) -> Result<ResponseId, ResponseError> {
     } else {
         Uuid::parse_str(id_str)
     }
-    .map_err(|_| ResponseError::InvalidParams(format!("Invalid response ID: {}", id_str)))?;
+    .map_err(|_| ResponseError::InvalidParams(format!("Invalid response ID: {id_str}")))?;
 
     Ok(ResponseId::from(uuid))
 }
@@ -60,7 +60,7 @@ fn parse_conversation_id_from_string(id_str: &str) -> Result<ConversationId, Res
     } else {
         Uuid::parse_str(id_str)
     }
-    .map_err(|_| ResponseError::InvalidParams(format!("Invalid conversation ID: {}", id_str)))?;
+    .map_err(|_| ResponseError::InvalidParams(format!("Invalid conversation ID: {id_str}")))?;
 
     Ok(ConversationId::from(uuid))
 }

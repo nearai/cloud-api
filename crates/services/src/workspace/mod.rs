@@ -38,7 +38,7 @@ impl WorkspaceServiceImpl {
             .workspace_repository
             .get_workspace_with_organization(workspace_id)
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get workspace: {}", e)))?
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get workspace: {e}")))?
             .ok_or(WorkspaceError::NotFound)?;
 
         // Check if user is a member of the organization
@@ -48,8 +48,7 @@ impl WorkspaceServiceImpl {
             .await
             .map_err(|e| {
                 WorkspaceError::InternalError(format!(
-                    "Failed to check organization membership: {}",
-                    e
+                    "Failed to check organization membership: {e}"
                 ))
             })?;
 
@@ -97,8 +96,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .await
             .map_err(|e| {
                 WorkspaceError::InternalError(format!(
-                    "Failed to check organization membership: {}",
-                    e
+                    "Failed to check organization membership: {e}"
                 ))
             })?;
 
@@ -112,7 +110,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         self.workspace_repository
             .list_by_organization(organization_id)
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to list workspaces: {}", e)))
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to list workspaces: {e}")))
     }
 
     async fn list_workspaces_for_organization_paginated(
@@ -129,8 +127,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .await
             .map_err(|e| {
                 WorkspaceError::InternalError(format!(
-                    "Failed to check organization membership: {}",
-                    e
+                    "Failed to check organization membership: {e}"
                 ))
             })?;
 
@@ -146,8 +143,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .await
             .map_err(|e| {
                 WorkspaceError::InternalError(format!(
-                    "Failed to list workspaces with pagination: {}",
-                    e
+                    "Failed to list workspaces with pagination: {e}"
                 ))
             })
     }
@@ -167,8 +163,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .await
             .map_err(|e| {
                 WorkspaceError::InternalError(format!(
-                    "Failed to check organization membership: {}",
-                    e
+                    "Failed to check organization membership: {e}"
                 ))
             })?;
 
@@ -193,7 +188,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
                 if error_msg.contains("duplicate key") || error_msg.contains("already exists") {
                     WorkspaceError::AlreadyExists
                 } else {
-                    WorkspaceError::InternalError(format!("Failed to create workspace: {}", e))
+                    WorkspaceError::InternalError(format!("Failed to create workspace: {e}"))
                 }
             })
     }
@@ -218,7 +213,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         self.api_key_repository
             .create(request)
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to create API key: {}", e)))
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to create API key: {e}")))
     }
 
     async fn list_api_keys_paginated(
@@ -238,8 +233,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .await
             .map_err(|e| {
                 WorkspaceError::InternalError(format!(
-                    "Failed to list API keys with pagination: {}",
-                    e
+                    "Failed to list API keys with pagination: {e}"
                 ))
             })
     }
@@ -259,7 +253,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .api_key_repository
             .get_by_id(api_key_id)
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get API key: {}", e)))?;
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get API key: {e}")))?;
 
         // Verify it belongs to this workspace
         if let Some(ref key) = api_key {
@@ -286,7 +280,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .api_key_repository
             .get_by_id(api_key_id.clone())
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get API key: {}", e)))?
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get API key: {e}")))?
             .ok_or(WorkspaceError::ApiKeyNotFound)?;
 
         if api_key.workspace_id.0 != workspace_id.0 {
@@ -297,7 +291,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         self.api_key_repository
             .delete(api_key_id)
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to delete API key: {}", e)))
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to delete API key: {e}")))
     }
 
     async fn update_api_key_spend_limit(
@@ -316,7 +310,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .api_key_repository
             .get_by_id(api_key_id.clone())
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get API key: {}", e)))?
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get API key: {e}")))?
             .ok_or(WorkspaceError::ApiKeyNotFound)?;
 
         if api_key.workspace_id.0 != workspace_id.0 {
@@ -328,10 +322,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .update_spend_limit(api_key_id, spend_limit)
             .await
             .map_err(|e| {
-                WorkspaceError::InternalError(format!(
-                    "Failed to update API key spend limit: {}",
-                    e
-                ))
+                WorkspaceError::InternalError(format!("Failed to update API key spend limit: {e}"))
             })
     }
 
@@ -354,7 +345,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .api_key_repository
             .get_by_id(api_key_id.clone())
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get API key: {}", e)))?
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get API key: {e}")))?
             .ok_or(WorkspaceError::ApiKeyNotFound)?;
 
         if api_key.workspace_id.0 != workspace_id.0 {
@@ -365,7 +356,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         self.api_key_repository
             .update(api_key_id, name, expires_at, spend_limit, is_active)
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to update API key: {}", e)))
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to update API key: {e}")))
     }
 
     async fn can_manage_api_keys(
@@ -398,9 +389,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         self.workspace_repository
             .update(workspace_id, display_name, description, settings)
             .await
-            .map_err(|e| {
-                WorkspaceError::InternalError(format!("Failed to update workspace: {}", e))
-            })?
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to update workspace: {e}")))?
             .ok_or(WorkspaceError::NotFound)
     }
 
@@ -417,9 +406,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         self.workspace_repository
             .delete(workspace_id)
             .await
-            .map_err(|e| {
-                WorkspaceError::InternalError(format!("Failed to delete workspace: {}", e))
-            })
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to delete workspace: {e}")))
     }
 
     async fn count_workspaces_by_organization(
@@ -434,8 +421,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .await
             .map_err(|e| {
                 WorkspaceError::InternalError(format!(
-                    "Failed to check organization membership: {}",
-                    e
+                    "Failed to check organization membership: {e}"
                 ))
             })?;
 
@@ -449,9 +435,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         self.workspace_repository
             .count_by_organization(organization_id)
             .await
-            .map_err(|e| {
-                WorkspaceError::InternalError(format!("Failed to count workspaces: {}", e))
-            })
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to count workspaces: {e}")))
     }
 
     async fn count_api_keys_by_workspace(
@@ -467,7 +451,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         self.api_key_repository
             .count_by_workspace(workspace_id)
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to count API keys: {}", e)))
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to count API keys: {e}")))
     }
 
     async fn check_api_key_name_duplication(
@@ -486,8 +470,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .await
             .map_err(|e| {
                 WorkspaceError::InternalError(format!(
-                    "Failed to check API key name duplication: {}",
-                    e
+                    "Failed to check API key name duplication: {e}"
                 ))
             })
     }
@@ -507,7 +490,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .api_key_repository
             .get_by_id(api_key_id.clone())
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get API key: {}", e)))?
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get API key: {e}")))?
             .ok_or(WorkspaceError::ApiKeyNotFound)?;
 
         if api_key.workspace_id.0 != workspace_id.0 {
@@ -518,6 +501,6 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         self.api_key_repository
             .revoke(api_key_id)
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to revoke API key: {}", e)))
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to revoke API key: {e}")))
     }
 }

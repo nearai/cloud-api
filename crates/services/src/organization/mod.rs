@@ -52,10 +52,7 @@ impl OrganizationServiceImpl {
                 if error_msg.contains("duplicate key") || error_msg.contains("already exists") {
                     OrganizationError::AlreadyExists
                 } else {
-                    OrganizationError::InternalError(format!(
-                        "Failed to create organization: {}",
-                        e
-                    ))
+                    OrganizationError::InternalError(format!("Failed to create organization: {e}"))
                 }
             })
     }
@@ -69,7 +66,7 @@ impl OrganizationServiceImpl {
             .get_by_id(id.0)
             .await
             .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to get organization: {}", e))
+                OrganizationError::InternalError(format!("Failed to get organization: {e}"))
             })?
             .ok_or(OrganizationError::NotFound)
     }
@@ -118,7 +115,7 @@ impl OrganizationServiceImpl {
         };
 
         self.repository.update(id.0, request).await.map_err(|e| {
-            OrganizationError::InternalError(format!("Failed to update organization: {}", e))
+            OrganizationError::InternalError(format!("Failed to update organization: {e}"))
         })
     }
 
@@ -137,7 +134,7 @@ impl OrganizationServiceImpl {
         }
 
         self.repository.delete(id.0).await.map_err(|e| {
-            OrganizationError::InternalError(format!("Failed to delete organization: {}", e))
+            OrganizationError::InternalError(format!("Failed to delete organization: {e}"))
         })
     }
 
@@ -153,8 +150,7 @@ impl OrganizationServiceImpl {
             .await
             .map_err(|e| {
                 OrganizationError::InternalError(format!(
-                    "Failed to list organizations for user: {}",
-                    e
+                    "Failed to list organizations for user: {e}"
                 ))
             })
     }
@@ -203,7 +199,7 @@ impl OrganizationServiceImpl {
         self.repository
             .add_member(organization_id.0, request, requester_id.0)
             .await
-            .map_err(|e| OrganizationError::InternalError(format!("Failed to add member: {}", e)))
+            .map_err(|e| OrganizationError::InternalError(format!("Failed to add member: {e}")))
     }
 
     /// Remove a member from an organization (private helper)
@@ -245,9 +241,7 @@ impl OrganizationServiceImpl {
         self.repository
             .remove_member(organization_id.0, member_id.0)
             .await
-            .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to remove member: {}", e))
-            })
+            .map_err(|e| OrganizationError::InternalError(format!("Failed to remove member: {e}")))
     }
 
     /// Update a member's role (private helper)
@@ -288,7 +282,7 @@ impl OrganizationServiceImpl {
             .update_member(organization_id.0, member_id.0, request)
             .await
             .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to update member role: {}", e))
+                OrganizationError::InternalError(format!("Failed to update member role: {e}"))
             })
     }
 
@@ -310,7 +304,7 @@ impl OrganizationServiceImpl {
             .get_member(organization_id.0, user_id.0)
             .await
             .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to check membership: {}", e))
+                OrganizationError::InternalError(format!("Failed to check membership: {e}"))
             })?;
 
         Ok(member.is_some())
@@ -334,7 +328,7 @@ impl OrganizationServiceImpl {
             .get_member(organization_id.0, user_id.0)
             .await
             .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to get member role: {}", e))
+                OrganizationError::InternalError(format!("Failed to get member role: {e}"))
             })?;
 
         Ok(member.map(|m| m.role))
@@ -366,7 +360,7 @@ impl OrganizationServiceImpl {
             .get_member_count(organization_id.0)
             .await
             .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to get member count: {}", e))
+                OrganizationError::InternalError(format!("Failed to get member count: {e}"))
             })
     }
 
@@ -376,7 +370,7 @@ impl OrganizationServiceImpl {
         name: &str,
     ) -> Result<Option<Organization>, OrganizationError> {
         self.repository.get_by_name(name).await.map_err(|e| {
-            OrganizationError::InternalError(format!("Failed to get organization by name: {}", e))
+            OrganizationError::InternalError(format!("Failed to get organization by name: {e}"))
         })
     }
 
@@ -409,9 +403,7 @@ impl OrganizationServiceImpl {
             .repository
             .list_members_paginated(organization_id.0, limit, offset)
             .await
-            .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to get members: {}", e))
-            })?;
+            .map_err(|e| OrganizationError::InternalError(format!("Failed to get members: {e}")))?;
 
         // Fetch user info for each member
         let mut members_with_users = Vec::new();
@@ -519,7 +511,7 @@ impl OrganizationServiceImpl {
                         email,
                         success: false,
                         member: None,
-                        error: Some(format!("Failed to lookup user: {}", e)),
+                        error: Some(format!("Failed to lookup user: {e}")),
                     });
                 }
             }
@@ -547,7 +539,7 @@ impl OrganizationServiceImpl {
             .user_repository
             .get_by_id(new_member_id.clone())
             .await
-            .map_err(|e| OrganizationError::InternalError(format!("Failed to verify user: {}", e)))?
+            .map_err(|e| OrganizationError::InternalError(format!("Failed to verify user: {e}")))?
             .ok_or(OrganizationError::UserNotFound)?;
 
         // Use existing add_member logic
@@ -574,7 +566,7 @@ impl OrganizationServiceImpl {
                 .get_member(organization_id.0, requester_id.0)
                 .await
                 .map_err(|e| {
-                    OrganizationError::InternalError(format!("Failed to check membership: {}", e))
+                    OrganizationError::InternalError(format!("Failed to check membership: {e}"))
                 })?
                 .map(|m| m.role)
         };
@@ -613,7 +605,7 @@ impl OrganizationServiceImpl {
             .list_members_paginated(organization_id.0, 1, 0)
             .await
             .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to list members: {}", e))
+                OrganizationError::InternalError(format!("Failed to list members: {e}"))
             })?;
 
         let owner_count = members
@@ -660,9 +652,7 @@ impl OrganizationServiceImpl {
         self.repository
             .remove_member(organization_id.0, member_id.0)
             .await
-            .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to remove member: {}", e))
-            })
+            .map_err(|e| OrganizationError::InternalError(format!("Failed to remove member: {e}")))
     }
 
     /// Create invitations for users (supports unregistered users, private helper)
@@ -743,7 +733,7 @@ impl OrganizationServiceImpl {
                         email,
                         success: false,
                         member: None,
-                        error: Some(format!("Failed to create invitation: {}", e)),
+                        error: Some(format!("Failed to create invitation: {e}")),
                     });
                 }
             }
@@ -767,7 +757,7 @@ impl OrganizationServiceImpl {
             .list_by_email(email, Some(ports::InvitationStatus::Pending))
             .await
             .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to list invitations: {}", e))
+                OrganizationError::InternalError(format!("Failed to list invitations: {e}"))
             })
     }
 
@@ -781,7 +771,7 @@ impl OrganizationServiceImpl {
             .get_by_token(token)
             .await
             .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to get invitation: {}", e))
+                OrganizationError::InternalError(format!("Failed to get invitation: {e}"))
             })?
             .ok_or(OrganizationError::NotFound)?;
 
@@ -820,7 +810,7 @@ impl OrganizationServiceImpl {
             .get_by_token(token)
             .await
             .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to get invitation: {}", e))
+                OrganizationError::InternalError(format!("Failed to get invitation: {e}"))
             })?
             .ok_or(OrganizationError::NotFound)?;
 
@@ -842,7 +832,7 @@ impl OrganizationServiceImpl {
             .get_by_id(invitation_id)
             .await
             .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to get invitation: {}", e))
+                OrganizationError::InternalError(format!("Failed to get invitation: {e}"))
             })?
             .ok_or(OrganizationError::NotFound)?;
 
@@ -899,16 +889,14 @@ impl OrganizationServiceImpl {
                 invitation.invited_by_user_id.0,
             )
             .await
-            .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to add member: {}", e))
-            })?;
+            .map_err(|e| OrganizationError::InternalError(format!("Failed to add member: {e}")))?;
 
         // Mark invitation as accepted
         self.invitation_repository
             .update_status(invitation_id, ports::InvitationStatus::Accepted)
             .await
             .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to update invitation: {}", e))
+                OrganizationError::InternalError(format!("Failed to update invitation: {e}"))
             })?;
 
         Ok(member)
@@ -926,7 +914,7 @@ impl OrganizationServiceImpl {
             .get_by_id(invitation_id)
             .await
             .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to get invitation: {}", e))
+                OrganizationError::InternalError(format!("Failed to get invitation: {e}"))
             })?
             .ok_or(OrganizationError::NotFound)?;
 
@@ -949,7 +937,7 @@ impl OrganizationServiceImpl {
             .update_status(invitation_id, ports::InvitationStatus::Declined)
             .await
             .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to update invitation: {}", e))
+                OrganizationError::InternalError(format!("Failed to update invitation: {e}"))
             })?;
 
         Ok(())
@@ -986,7 +974,7 @@ impl OrganizationServiceImpl {
             .list_by_organization(organization_id.0, status)
             .await
             .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to list invitations: {}", e))
+                OrganizationError::InternalError(format!("Failed to list invitations: {e}"))
             })
     }
 }
@@ -1051,8 +1039,7 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
             .await
             .map_err(|e| {
                 OrganizationError::InternalError(format!(
-                    "Failed to count organizations for user: {}",
-                    e
+                    "Failed to count organizations for user: {e}"
                 ))
             })
     }

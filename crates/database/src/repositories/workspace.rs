@@ -218,19 +218,19 @@ impl WorkspaceRepository {
         let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&id];
 
         if let Some(ref display_name) = request.display_name {
-            query.push_str(&format!(", display_name = ${}", param_index));
+            query.push_str(&format!(", display_name = ${param_index}"));
             params.push(display_name);
             param_index += 1;
         }
 
         if let Some(ref description) = request.description {
-            query.push_str(&format!(", description = ${}", param_index));
+            query.push_str(&format!(", description = ${param_index}"));
             params.push(description);
             param_index += 1;
         }
 
         if let Some(ref settings) = request.settings {
-            query.push_str(&format!(", settings = ${}", param_index));
+            query.push_str(&format!(", settings = ${param_index}"));
             params.push(settings);
         }
 

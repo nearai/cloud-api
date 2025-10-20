@@ -1,5 +1,5 @@
-# Build stage  
-FROM rust:latest as builder
+# Build stage
+FROM rust:1.88-bookworm as builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -23,6 +23,7 @@ FROM debian:bookworm-slim
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Create app user

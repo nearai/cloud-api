@@ -53,10 +53,7 @@ impl ports::AttestationServiceTrait for AttestationService {
             .get_provider_by_chat_id(chat_id)
             .await
             .ok_or_else(|| {
-                AttestationError::ProviderError(format!(
-                    "No provider found for chat_id: {}",
-                    chat_id
-                ))
+                AttestationError::ProviderError(format!("No provider found for chat_id: {chat_id}"))
             })?;
 
         // Fetch signature from provider
@@ -97,7 +94,7 @@ impl ports::AttestationServiceTrait for AttestationService {
                 .resolve_to_canonical_name(&model)
                 .await
                 .map_err(|e| {
-                    AttestationError::ProviderError(format!("Failed to resolve model name: {}", e))
+                    AttestationError::ProviderError(format!("Failed to resolve model name: {e}"))
                 })?;
 
             // Log if we resolved an alias

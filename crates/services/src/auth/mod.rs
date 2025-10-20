@@ -87,7 +87,7 @@ impl AuthServiceTrait for AuthService {
         self.user_repository
             .get_by_id(claims.sub)
             .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to get user: {}", e)))?
+            .map_err(|e| AuthError::InternalError(format!("Failed to get user: {e}")))?
             .ok_or(AuthError::UserNotFound)
     }
 
@@ -98,7 +98,7 @@ impl AuthServiceTrait for AuthService {
         self.session_repository
             .validate(refresh_token)
             .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to validate session: {}", e)))
+            .map_err(|e| AuthError::InternalError(format!("Failed to validate session: {e}")))
     }
 
     async fn validate_session_refresh(
@@ -120,7 +120,7 @@ impl AuthServiceTrait for AuthService {
         self.user_repository
             .get_by_id(session.user_id)
             .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to get user: {}", e)))?
+            .map_err(|e| AuthError::InternalError(format!("Failed to get user: {e}")))?
             .ok_or(AuthError::UserNotFound)
     }
 
@@ -128,7 +128,7 @@ impl AuthServiceTrait for AuthService {
         self.user_repository
             .get_by_id(user_id)
             .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to get user: {}", e)))?
+            .map_err(|e| AuthError::InternalError(format!("Failed to get user: {e}")))?
             .ok_or(AuthError::UserNotFound)
     }
 
@@ -136,7 +136,7 @@ impl AuthServiceTrait for AuthService {
         self.session_repository
             .revoke(session_id)
             .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to revoke session: {}", e)))
+            .map_err(|e| AuthError::InternalError(format!("Failed to revoke session: {e}")))
     }
 
     async fn get_or_create_oauth_user(&self, oauth_info: OAuthUserInfo) -> Result<User, AuthError> {
@@ -148,9 +148,7 @@ impl AuthServiceTrait for AuthService {
             .user_repository
             .get_by_email(&oauth_info.email)
             .await
-            .map_err(|e| {
-                AuthError::InternalError(format!("Failed to check existing user: {}", e))
-            })?;
+            .map_err(|e| AuthError::InternalError(format!("Failed to check existing user: {e}")))?;
 
         if let Some(user) = existing_user {
             // Update last login
@@ -158,7 +156,7 @@ impl AuthServiceTrait for AuthService {
                 .update_last_login(user.id.clone())
                 .await
                 .map_err(|e| {
-                    AuthError::InternalError(format!("Failed to update last login: {}", e))
+                    AuthError::InternalError(format!("Failed to update last login: {e}"))
                 })?;
 
             // Update user info if changed
@@ -172,9 +170,7 @@ impl AuthServiceTrait for AuthService {
                         oauth_info.avatar_url,
                     )
                     .await
-                    .map_err(|e| {
-                        AuthError::InternalError(format!("Failed to update user: {}", e))
-                    })?;
+                    .map_err(|e| AuthError::InternalError(format!("Failed to update user: {e}")))?;
             }
 
             return Ok(user);
@@ -192,7 +188,7 @@ impl AuthServiceTrait for AuthService {
                 oauth_info.provider_user_id.clone(),
             )
             .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to create user: {}", e)))?;
+            .map_err(|e| AuthError::InternalError(format!("Failed to create user: {e}")))?;
 
         // Create default organization and workspace for new user
         debug!(
@@ -211,7 +207,7 @@ impl AuthServiceTrait for AuthService {
                     CHARSET[idx] as char
                 })
                 .collect();
-            format!("{}-org-{}", username, suffix)
+            format!("{username}-org-{suffix}")
         }; // rng is dropped here
 
         // Create organization
@@ -232,7 +228,7 @@ impl AuthServiceTrait for AuthService {
                     .create(
                         "default".to_string(),
                         "default".to_string(),
-                        Some(format!("Default workspace for {}", org_name)),
+                        Some(format!("Default workspace for {org_name}")),
                         OrganizationId(organization.id.0),
                         new_user.id.clone(),
                     )
@@ -272,7 +268,7 @@ impl AuthServiceTrait for AuthService {
         self.session_repository
             .cleanup_expired()
             .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to cleanup sessions: {}", e)))
+            .map_err(|e| AuthError::InternalError(format!("Failed to cleanup sessions: {e}")))
     }
 
     async fn validate_api_key(&self, api_key: String) -> Result<ApiKey, AuthError> {
@@ -280,7 +276,7 @@ impl AuthServiceTrait for AuthService {
         self.api_key_repository
             .validate(api_key)
             .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to validate API key: {}", e)))?
+            .map_err(|e| AuthError::InternalError(format!("Failed to validate API key: {e}")))?
             .ok_or(AuthError::Unauthorized)
     }
 
@@ -294,7 +290,7 @@ impl AuthServiceTrait for AuthService {
             .workspace_repository
             .get_by_id(workspace_id)
             .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to get workspace: {}", e)))?
+            .map_err(|e| AuthError::InternalError(format!("Failed to get workspace: {e}")))?
             .ok_or(AuthError::Unauthorized)?;
 
         // Check if user has permission to create API keys for this workspace's organization
@@ -303,7 +299,7 @@ impl AuthServiceTrait for AuthService {
             .get_member(workspace.organization_id.0, user_id.0)
             .await
             .map_err(|e| {
-                AuthError::InternalError(format!("Failed to check organization membership: {}", e))
+                AuthError::InternalError(format!("Failed to check organization membership: {e}"))
             })?;
 
         Ok(member.is_some_and(|m| m.role.can_manage_api_keys()))
@@ -334,6 +330,6 @@ impl AuthService {
         self.session_repository
             .cleanup_expired()
             .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to cleanup sessions: {}", e)))
+            .map_err(|e| AuthError::InternalError(format!("Failed to cleanup sessions: {e}")))
     }
 }

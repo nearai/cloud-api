@@ -117,6 +117,8 @@ impl ports::AttestationServiceTrait for AttestationService {
             gateway_attestation = DstackCpuQuote {
                 quote: "0x1234567890abcdef".to_string(),
                 event_log: "0x1234567890abcdef".to_string(),
+                vm_config: "0x1234567890abcdef".to_string(),
+                report_data: "0x1234567890abcdef".to_string(),
             };
         } else {
             let client = dstack_client::DstackClient::new(None);

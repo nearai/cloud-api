@@ -34,7 +34,8 @@ rmcp = { version = "0.6", features = [
     "transport-sse-client-reqwest",
 ] }
 hex = "0.4"
-dstack-sdk = "0.1"
+dstack-sdk = "0.1.2"
+dstack-sdk-types = "0.1.2"
 
 [dev-dependencies]
 tokio-test = "0.4"

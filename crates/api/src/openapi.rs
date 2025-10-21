@@ -45,7 +45,7 @@ use utoipa::{Modify, OpenApi};
         // Admin endpoints
         crate::routes::admin::batch_upsert_models,
         crate::routes::admin::delete_model,
-        crate::routes::admin::get_model_pricing_history,
+        crate::routes::admin::get_model_history,
         crate::routes::admin::update_organization_limits,
         crate::routes::admin::get_organization_limits_history,
         crate::routes::admin::list_users,
@@ -135,7 +135,7 @@ use utoipa::{Modify, OpenApi};
             crate::routes::attestation::ErrorResponse,
             // Model pricing models
             ModelListResponse, ModelWithPricing, DecimalPrice, DecimalPriceRequest, ModelMetadata,
-            UpdateModelApiRequest, ModelPricingHistoryEntry, ModelPricingHistoryResponse,
+            UpdateModelApiRequest, ModelHistoryEntry, ModelHistoryResponse,
             // Organization limits models (Admin)
             UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, SpendLimit, SpendLimitRequest,
             OrgLimitsHistoryEntry, OrgLimitsHistoryResponse,

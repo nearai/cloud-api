@@ -6,7 +6,7 @@ use crate::repositories::{
 use anyhow::Result;
 use async_trait::async_trait;
 use services::admin::{
-    AdminRepository, ModelPricing, ModelPricingHistoryEntry, OrganizationLimits,
+    AdminRepository, ModelHistoryEntry, ModelPricing, OrganizationLimits,
     OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate, UpdateModelAdminRequest, UserInfo,
 };
 use std::sync::Arc;
@@ -78,25 +78,25 @@ impl AdminRepository for AdminCompositeRepository {
         })
     }
 
-    async fn get_pricing_history(
+    async fn get_model_history(
         &self,
         model_name: &str,
         limit: i64,
         offset: i64,
-    ) -> Result<(Vec<ModelPricingHistoryEntry>, i64)> {
+    ) -> Result<(Vec<ModelHistoryEntry>, i64)> {
         let total = self
             .model_repo
-            .count_pricing_history_by_name(model_name)
+            .count_model_history_by_name(model_name)
             .await?;
 
         let history = self
             .model_repo
-            .get_pricing_history_by_name(model_name, limit, offset)
+            .get_model_history_by_name(model_name, limit, offset)
             .await?;
 
         let entries = history
             .into_iter()
-            .map(|h| ModelPricingHistoryEntry {
+            .map(|h| ModelHistoryEntry {
                 id: h.id,
                 model_id: h.model_id,
                 input_cost_per_token: h.input_cost_per_token,

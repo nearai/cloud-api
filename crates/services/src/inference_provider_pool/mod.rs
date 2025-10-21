@@ -347,6 +347,9 @@ impl InferenceProviderPool {
             providers.len()
         );
 
+        // Collect errors from all providers to surface to user
+        let mut provider_errors = Vec::new();
+
         // Try each provider in order until one succeeds
         for (attempt, provider) in providers.iter().enumerate() {
             tracing::debug!(
@@ -377,23 +380,27 @@ impl InferenceProviderPool {
                         operation = operation_name,
                         "Provider failed, will try next provider if available"
                     );
+                    provider_errors.push(format!("Provider {}: {}", attempt + 1, e));
                 }
             }
         }
 
-        // All providers failed
+        // All providers failed - include error details
+        let error_details = provider_errors.join("; ");
         tracing::error!(
             model_id = %model_id,
             providers_tried = providers.len(),
             operation = operation_name,
+            errors = %error_details,
             "All providers failed for model"
         );
 
         Err(CompletionError::CompletionError(format!(
-            "All {} provider(s) failed for model '{}' during {}",
+            "All {} provider(s) failed for model '{}' during {}: {}",
             providers.len(),
             model_id,
-            operation_name
+            operation_name,
+            error_details
         )))
     }
 }

@@ -226,6 +226,7 @@ pub struct DomainConfig {
 #[derive(Debug, Clone, Default)]
 pub struct AuthConfig {
     pub mock: bool,
+    pub encoding_key: String,
     pub github: Option<GitHubOAuthConfig>,
     pub google: Option<GoogleOAuthConfig>,
     /// Email domains that are granted platform admin access
@@ -280,6 +281,8 @@ impl AuthConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(false),
+            encoding_key: env::var("AUTH_ENCODING_KEY")
+                .expect("AUTH_ENCODING_KEY environment variable is required"),
             github,
             google,
             admin_domains,
@@ -363,6 +366,7 @@ mod tests {
     fn test_is_admin_email() {
         let config = AuthConfig {
             mock: false,
+            encoding_key: "mock_encoding_key".to_string(),
             github: None,
             google: None,
             admin_domains: vec!["near.ai".to_string(), "near.org".to_string()],
@@ -384,6 +388,7 @@ mod tests {
     fn test_is_admin_email_empty_config() {
         let config = AuthConfig {
             mock: false,
+            encoding_key: "mock_encoding_key".to_string(),
             github: None,
             google: None,
             admin_domains: vec![],

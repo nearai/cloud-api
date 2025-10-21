@@ -133,15 +133,16 @@ pub async fn auth_middleware(
         .get("authorization")
         .and_then(|h| h.to_str().ok());
 
-    tracing::debug!("Auth middleware (session token only): {:?}", auth_header);
+    tracing::debug!(
+        "Auth middleware (session access token only): {:?}",
+        auth_header
+    );
 
     let auth_result = if let Some(auth_value) = auth_header {
         debug!("Found Authorization header: {}", auth_value);
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
             debug!("Extracted Bearer token: {}", token);
-            // Pass the token directly as SessionToken
-            let session_token = SessionToken(token.to_string());
-            authenticate_session(&state, session_token).await
+            authenticate_session_access(&state, token.to_string()).await
         } else {
             debug!("Authorization header does not start with 'Bearer '");
             Err(StatusCode::UNAUTHORIZED)
@@ -179,9 +180,7 @@ pub async fn admin_middleware(
         debug!("Found Authorization header: {}", auth_value);
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
             debug!("Extracted Bearer token for admin auth: {}", token);
-            // Pass the token directly as SessionToken
-            let session_token = SessionToken(token.to_string());
-            authenticate_session(&state, session_token).await
+            authenticate_session_access(&state, token.to_string()).await
         } else {
             debug!("Authorization header does not start with 'Bearer '");
             Err(StatusCode::UNAUTHORIZED)
@@ -237,17 +236,20 @@ fn check_admin_access(state: &AuthState, user: &DbUser) -> bool {
     }
 }
 
-/// Authenticate using session token
-async fn authenticate_session(
+async fn authenticate_session_access(
     state: &AuthState,
-    token: SessionToken,
+    token: String, // jwt
 ) -> Result<DbUser, StatusCode> {
-    debug!("Authenticating session token: {}", token);
+    debug!("Authenticating session access token: {}", token);
     // Use auth service
+
+    let auth_service = &state.auth_service;
+    debug!("Validating session via auth service with token");
     {
-        let auth_service = &state.auth_service;
-        debug!("Validating session via auth service with token");
-        match auth_service.validate_session(token).await {
+        match auth_service
+            .validate_session_access(token, state.encoding_key.clone())
+            .await
+        {
             Ok(user) => {
                 debug!("Authenticated user {} via session", user.email);
                 return Ok(convert_user_to_db_user(user));
@@ -264,7 +266,78 @@ async fn authenticate_session(
     }
 
     // No fallback available, session is invalid
-    debug!("Invalid or expired session token");
+    debug!("Invalid or expired session access token");
+    Err(StatusCode::UNAUTHORIZED)
+}
+
+pub async fn refresh_middleware(
+    State(state): State<AuthState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    // Try to extract authentication from various sources
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|h| h.to_str().ok());
+
+    tracing::debug!(
+        "Auth middleware (session refresh token only): {:?}",
+        auth_header
+    );
+
+    let auth_result = if let Some(auth_value) = auth_header {
+        debug!("Found Authorization header: {}", auth_value);
+        if let Some(token) = auth_value.strip_prefix("Bearer ") {
+            debug!("Extracted Bearer token: {}", token);
+            authenticate_session_refresh(&state, SessionToken(token.to_string())).await
+        } else {
+            debug!("Authorization header does not start with 'Bearer '");
+            Err(StatusCode::UNAUTHORIZED)
+        }
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    };
+
+    match auth_result {
+        Ok(user) => {
+            // Clone request to add extension
+            let mut request = request;
+            request.extensions_mut().insert(AuthenticatedUser(user));
+            Ok(next.run(request).await)
+        }
+        Err(status) => Err(status),
+    }
+}
+
+/// Authenticate using session token
+async fn authenticate_session_refresh(
+    state: &AuthState,
+    token: SessionToken,
+) -> Result<DbUser, StatusCode> {
+    debug!("Authenticating session refresh token: {}", token);
+    // Use auth service
+    {
+        let auth_service = &state.auth_service;
+        debug!("Validating session via auth service with token");
+        match auth_service.validate_session_refresh(token).await {
+            Ok(user) => {
+                debug!("Authenticated user {} via session", user.email);
+                return Ok(convert_user_to_db_user(user));
+            }
+            Err(AuthError::SessionNotFound) | Err(AuthError::UserNotFound) => {
+                debug!("Session not found in auth service, trying OAuth manager");
+                // Fall through to OAuth manager
+            }
+            Err(e) => {
+                error!("Failed to validate session via auth service: {}", e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    }
+
+    // No fallback available, session is invalid
+    debug!("Invalid or expired session refresh token");
     Err(StatusCode::UNAUTHORIZED)
 }
 
@@ -377,6 +450,7 @@ pub struct AuthState {
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub workspace_repository: Arc<dyn services::workspace::WorkspaceRepository>,
     pub admin_domains: Vec<String>,
+    pub encoding_key: String,
 }
 
 impl AuthState {
@@ -385,12 +459,14 @@ impl AuthState {
         auth_service: Arc<dyn AuthServiceTrait>,
         workspace_repository: Arc<dyn services::workspace::WorkspaceRepository>,
         admin_domains: Vec<String>,
+        encoding_key: String,
     ) -> Self {
         Self {
             oauth_manager,
             auth_service,
             workspace_repository,
             admin_domains,
+            encoding_key,
         }
     }
 }

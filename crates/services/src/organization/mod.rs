@@ -144,9 +144,11 @@ impl OrganizationServiceImpl {
         user_id: UserId,
         limit: i64,
         offset: i64,
+        order_by: Option<OrganizationOrderBy>,
+        order_direction: Option<OrganizationOrderDirection>,
     ) -> Result<Vec<Organization>, OrganizationError> {
         self.repository
-            .list_organizations_by_user(user_id.0, limit, offset)
+            .list_organizations_by_user(user_id.0, limit, offset, order_by, order_direction)
             .await
             .map_err(|e| {
                 OrganizationError::InternalError(format!(
@@ -1025,8 +1027,10 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
         user_id: UserId,
         limit: i64,
         offset: i64,
+        order_by: Option<OrganizationOrderBy>,
+        order_direction: Option<OrganizationOrderDirection>,
     ) -> Result<Vec<Organization>, OrganizationError> {
-        self.list_organizations_for_user_impl(user_id, limit, offset)
+        self.list_organizations_for_user_impl(user_id, limit, offset, order_by, order_direction)
             .await
     }
 

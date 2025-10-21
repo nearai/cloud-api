@@ -76,7 +76,7 @@ pub async fn get_current_user(
     // Get user's organizations with roles
     let organizations = match app_state
         .organization_service
-        .list_organizations_for_user(user_id.clone(), 100, 0)
+        .list_organizations_for_user(user_id.clone(), 100, 0, None, None)
         .await
     {
         Ok(orgs) => {

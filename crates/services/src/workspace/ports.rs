@@ -93,6 +93,19 @@ pub enum WorkspaceError {
     ApiKeyNotFound,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceOrderBy {
+    CreatedAt,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceOrderDirection {
+    Asc,
+    Desc,
+}
+
 // Repository trait for workspace data access
 #[async_trait]
 pub trait WorkspaceRepository: Send + Sync {
@@ -114,6 +127,8 @@ pub trait WorkspaceRepository: Send + Sync {
         organization_id: OrganizationId,
         limit: i64,
         offset: i64,
+        order_by: Option<WorkspaceOrderBy>,
+        order_direction: Option<WorkspaceOrderDirection>,
     ) -> anyhow::Result<Vec<Workspace>>;
 
     /// Create a new workspace
@@ -223,6 +238,8 @@ pub trait WorkspaceServiceTrait: Send + Sync {
         requester_id: UserId,
         limit: i64,
         offset: i64,
+        order_by: Option<WorkspaceOrderBy>,
+        order_direction: Option<WorkspaceOrderDirection>,
     ) -> Result<Vec<Workspace>, WorkspaceError>;
 
     /// Create a new workspace in an organization with permission checking

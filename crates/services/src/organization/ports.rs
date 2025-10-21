@@ -182,6 +182,19 @@ pub struct CreateInvitationRequest {
     pub expires_in_hours: i64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrganizationOrderBy {
+    CreatedAt,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrganizationOrderDirection {
+    Asc,
+    Desc,
+}
+
 #[async_trait]
 pub trait OrganizationRepository: Send + Sync {
     async fn create(
@@ -236,6 +249,8 @@ pub trait OrganizationRepository: Send + Sync {
         user_id: Uuid,
         limit: i64,
         offset: i64,
+        order_by: Option<OrganizationOrderBy>,
+        order_direction: Option<OrganizationOrderDirection>,
     ) -> Result<Vec<Organization>>;
 }
 
@@ -323,6 +338,8 @@ pub trait OrganizationServiceTrait: Send + Sync {
         user_id: UserId,
         limit: i64,
         offset: i64,
+        order_by: Option<OrganizationOrderBy>,
+        order_direction: Option<OrganizationOrderDirection>,
     ) -> Result<Vec<Organization>, OrganizationError>;
 
     /// Count organizations accessible to a user

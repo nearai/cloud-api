@@ -5,8 +5,11 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     Extension, Json,
 };
+use chrono::Utc;
+use config::ApiConfig;
 use serde::{Deserialize, Serialize};
 use services::auth::{AuthServiceTrait, OAuthManager};
+use services::UserId;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -15,6 +18,13 @@ use tracing::{debug, error, info};
 /// Temporary storage for OAuth state and PKCE verifiers
 /// In production, use Redis or similar
 pub type StateStore = Arc<RwLock<HashMap<String, OAuthState>>>;
+
+pub type AuthState = (
+    Arc<OAuthManager>,
+    StateStore,
+    Arc<dyn AuthServiceTrait>,
+    Arc<ApiConfig>,
+);
 
 #[derive(Clone)]
 pub struct OAuthState {
@@ -31,7 +41,14 @@ pub struct OAuthCallback {
 #[derive(Serialize)]
 pub struct TokenExchangeResponse {
     access_token: String,
+    refresh_token: String,
+    refresh_token_expiration: chrono::DateTime<Utc>,
     user: AuthResponse,
+}
+
+#[derive(Serialize)]
+pub struct TokenRefreshResponse {
+    access_token: String,
 }
 
 #[derive(Serialize)]
@@ -43,11 +60,7 @@ pub struct AuthResponse {
 
 /// Initiate GitHub OAuth flow - redirects to GitHub
 pub async fn github_login(
-    State((oauth, state_store, _auth_service)): State<(
-        Arc<OAuthManager>,
-        StateStore,
-        Arc<dyn AuthServiceTrait>,
-    )>,
+    State((oauth, state_store, _auth_service, _config)): State<AuthState>,
 ) -> Result<Redirect, StatusCode> {
     debug!("Initiating GitHub OAuth flow");
 
@@ -72,11 +85,7 @@ pub async fn github_login(
 
 /// Initiate Google OAuth flow - redirects to Google
 pub async fn google_login(
-    State((oauth, state_store, _auth_service)): State<(
-        Arc<OAuthManager>,
-        StateStore,
-        Arc<dyn AuthServiceTrait>,
-    )>,
+    State((oauth, state_store, _auth_service, _config)): State<AuthState>,
 ) -> Result<Redirect, StatusCode> {
     debug!("Initiating Google OAuth flow");
 
@@ -107,11 +116,7 @@ pub async fn google_login(
 /// - POST /v1/auth/callback with JSON body (explicit token exchange)
 pub async fn oauth_callback(
     Query(params): Query<OAuthCallback>,
-    State((oauth, state_store, auth_service)): State<(
-        Arc<OAuthManager>,
-        StateStore,
-        Arc<dyn AuthServiceTrait>,
-    )>,
+    State((oauth, state_store, auth_service, config)): State<AuthState>,
 ) -> Response {
     debug!("OAuth callback received with state: {}", params.state);
 
@@ -209,14 +214,25 @@ pub async fn oauth_callback(
     };
 
     // Create session for the user (24 hours)
-    let session_result = auth_service.create_session(user.id, None, None, 24).await;
+    let session_result = auth_service
+        .create_session(
+            user.id,
+            None,
+            None,
+            config.auth.encoding_key.to_string(),
+            1,
+            7 * 24,
+        )
+        .await;
 
     match session_result {
-        Ok((_session, session_token)) => {
+        Ok((access_token, refresh_session, refresh_token)) => {
             info!("Session created successfully for user: {}", user.email);
 
             let response = TokenExchangeResponse {
-                access_token: session_token,
+                access_token,
+                refresh_token,
+                refresh_token_expiration: refresh_session.expires_at,
                 user: AuthResponse {
                     message: "Authenticated".to_string(),
                     email: user.email.clone(),
@@ -237,6 +253,27 @@ pub async fn oauth_callback(
             )
                 .into_response()
         }
+    }
+}
+
+pub async fn refresh_access_token(
+    State((_oauth, _state_store, auth_service, config)): State<AuthState>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Response {
+    match auth_service.create_session_access_token(
+        UserId(user.0.id),
+        config.auth.encoding_key.to_string(),
+        1,
+    ) {
+        Ok(access_token) => Json(TokenRefreshResponse { access_token }).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "server_error",
+                "error_description": format!("Access token creation failed: {}", e)
+            })),
+        )
+            .into_response(),
     }
 }
 

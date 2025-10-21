@@ -4,6 +4,8 @@ pub mod models;
 pub mod openapi;
 pub mod routes;
 
+use crate::middleware::auth::refresh_middleware;
+use crate::routes::auth::refresh_access_token;
 use crate::{
     middleware::{auth::auth_middleware_with_api_key, auth_middleware, AuthState},
     openapi::ApiDoc,
@@ -150,6 +152,7 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
         auth_service.clone(),
         workspace_repository.clone(),
         config.auth.admin_domains.clone(),
+        config.auth.encoding_key.clone(),
     );
 
     AuthComponents {
@@ -346,21 +349,12 @@ pub async fn init_inference_providers(
     pool
 }
 
-/// Build the complete application router
-pub fn build_app(
-    database: Arc<Database>,
-    auth_components: AuthComponents,
-    domain_services: DomainServices,
-) -> Router {
-    build_app_with_config(database, auth_components, domain_services, None)
-}
-
 /// Build the complete application router with config
 pub fn build_app_with_config(
     database: Arc<Database>,
     auth_components: AuthComponents,
     domain_services: DomainServices,
-    _config: Option<&ApiConfig>,
+    config: Arc<ApiConfig>,
 ) -> Router {
     // Create app state for completions and management routes
     let app_state = AppState {
@@ -395,6 +389,7 @@ pub fn build_app_with_config(
         auth_components.state_store,
         auth_components.auth_service.clone(),
         &auth_components.auth_state_middleware,
+        config.clone(),
     );
 
     let completion_routes = build_completion_routes(
@@ -426,7 +421,11 @@ pub fn build_app_with_config(
 
     let model_routes = build_model_routes(domain_services.models_service.clone());
 
-    let admin_routes = build_admin_routes(database.clone(), &auth_components.auth_state_middleware);
+    let admin_routes = build_admin_routes(
+        database.clone(),
+        &auth_components.auth_state_middleware,
+        config.clone(),
+    );
 
     let invitation_routes =
         build_invitation_routes(app_state.clone(), &auth_components.auth_state_middleware);
@@ -480,8 +479,9 @@ pub fn build_auth_routes(
     state_store: StateStore,
     auth_service: Arc<dyn AuthServiceTrait>,
     auth_state_middleware: &AuthState,
+    config: Arc<ApiConfig>,
 ) -> Router {
-    let auth_state = (oauth_manager, state_store, auth_service);
+    let auth_state = (oauth_manager, state_store, auth_service, config);
 
     Router::new()
         .route("/login", get(login_page))
@@ -496,6 +496,13 @@ pub fn build_auth_routes(
             )),
         )
         .route("/logout", post(logout))
+        .route(
+            "/refresh",
+            post(refresh_access_token).layer(from_fn_with_state(
+                auth_state_middleware.clone(),
+                refresh_middleware,
+            )),
+        )
         .with_state(auth_state)
 }
 
@@ -665,7 +672,11 @@ pub fn build_model_routes(models_service: Arc<dyn ModelsServiceTrait>) -> Router
 }
 
 /// Build admin routes (authenticated endpoints)
-pub fn build_admin_routes(database: Arc<Database>, auth_state_middleware: &AuthState) -> Router {
+pub fn build_admin_routes(
+    database: Arc<Database>,
+    auth_state_middleware: &AuthState,
+    config: Arc<ApiConfig>,
+) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
         batch_upsert_models, create_admin_access_token, delete_model, get_model_pricing_history,
@@ -685,6 +696,7 @@ pub fn build_admin_routes(database: Arc<Database>, auth_state_middleware: &AuthS
     let admin_app_state = AdminAppState {
         admin_service,
         auth_service: auth_state_middleware.auth_service.clone(),
+        config,
     };
 
     Router::new()
@@ -920,6 +932,7 @@ mod tests {
             },
             auth: config::AuthConfig {
                 mock: true,
+                encoding_key: "mock_encoding_key".to_string(),
                 github: None,
                 google: None,
                 admin_domains: vec![],
@@ -949,7 +962,8 @@ mod tests {
         .await;
 
         // Build the application
-        let _app = build_app(database, auth_components, domain_services);
+        let _app =
+            build_app_with_config(database, auth_components, domain_services, Arc::new(config));
 
         // You can now use `app` with a test server like:
         // let server = axum_test::TestServer::new(app).unwrap();
@@ -1000,6 +1014,7 @@ mod tests {
             },
             auth: config::AuthConfig {
                 mock: true,
+                encoding_key: "mock_encoding_key".to_string(),
                 github: None,
                 google: None,
                 admin_domains: vec![],
@@ -1026,7 +1041,8 @@ mod tests {
         )
         .await;
 
-        let _app = build_app(database, auth_components, domain_services);
+        let _app =
+            build_app_with_config(database, auth_components, domain_services, Arc::new(config));
 
         // Test the app...
     }

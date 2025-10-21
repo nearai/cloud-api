@@ -1,5 +1,6 @@
 use api::{build_app_with_config, init_auth_services, init_database, init_domain_services};
 use config::{ApiConfig, LoggingConfig};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
@@ -18,11 +19,13 @@ async fn main() {
     )
     .await;
 
+    let config = Arc::new(config);
+
     // Build application router with config
-    let app = build_app_with_config(database, auth_components, domain_services, Some(&config));
+    let app = build_app_with_config(database, auth_components, domain_services, config.clone());
 
     // Start server
-    start_server(app, &config).await;
+    start_server(app, config).await;
 }
 
 /// Load and validate configuration
@@ -37,7 +40,7 @@ fn load_configuration() -> ApiConfig {
 }
 
 /// Start the HTTP server
-async fn start_server(app: axum::Router, config: &ApiConfig) {
+async fn start_server(app: axum::Router, config: Arc<ApiConfig>) {
     let bind_address = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&bind_address)
         .await

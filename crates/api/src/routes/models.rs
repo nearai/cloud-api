@@ -72,7 +72,7 @@ pub async fn list_models(
     let api_models: Vec<ModelWithPricing> = models
         .iter()
         .map(|model| ModelWithPricing {
-            model_id: model.public_name.clone(),
+            model_id: model.model_name.clone(),
             input_cost_per_token: DecimalPrice {
                 amount: model.input_cost_per_token,
                 scale: 9,
@@ -159,7 +159,7 @@ pub async fn get_model_by_name(
 
     // Convert to API model
     let api_model = ModelWithPricing {
-        model_id: model.public_name,
+        model_id: model.model_name,
         input_cost_per_token: DecimalPrice {
             amount: model.input_cost_per_token,
             scale: 9,

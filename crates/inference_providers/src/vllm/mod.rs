@@ -84,7 +84,10 @@ impl InferenceProvider for VLlmProvider {
         signing_address: Option<String>,
     ) -> Result<Vec<VllmAttestationReport>, CompletionError> {
         // Build URL with optional query parameters
-        let mut url = format!("{}/v1/attestation/report?model={}", self.config.base_url, model);
+        let mut url = format!(
+            "{}/v1/attestation/report?model={}",
+            self.config.base_url, model
+        );
 
         if let Some(nonce) = nonce {
             url.push_str(&format!("&nonce={}", nonce));

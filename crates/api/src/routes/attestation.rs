@@ -219,7 +219,12 @@ pub async fn get_attestation_report(
 
     let report = app_state
         .attestation_service
-        .get_attestation_report(params.model, params.signing_algo, params.nonce, params.signing_address)
+        .get_attestation_report(
+            params.model,
+            params.signing_algo,
+            params.nonce,
+            params.signing_address,
+        )
         .await
         .map_err(|e| {
             (

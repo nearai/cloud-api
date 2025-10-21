@@ -237,9 +237,9 @@ pub async fn chat_completions(
     )
 )]
 pub async fn completions(
-    State(app_state): State<AppState>,
+    #[allow(unused)] State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
-    Extension(body_hash): Extension<RequestBodyHash>,
+    #[allow(unused)] Extension(body_hash): Extension<RequestBodyHash>,
     Json(request): Json<CompletionRequest>,
 ) -> axum::response::Response {
     debug!(
@@ -254,6 +254,17 @@ pub async fn completions(
         api_key.organization.id,
         api_key.workspace.id.0
     );
+
+    return (
+        StatusCode::NOT_IMPLEMENTED,
+        ResponseJson(ErrorResponse::new(
+            "This endpoint is not implemented".to_string(),
+            "not_implemented".to_string(),
+        )),
+    )
+        .into_response();
+
+    #[allow(unreachable_code)]
     // Validate the request
     if let Err(error) = request.validate() {
         return (
@@ -283,7 +294,7 @@ pub async fn completions(
         .await
     {
         Ok(_stream) => {
-            unimplemented!()
+            unimplemented!();
         }
         Err(domain_error) => {
             let status_code = map_domain_error_to_status(&domain_error);

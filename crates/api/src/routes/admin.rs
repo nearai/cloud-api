@@ -75,7 +75,6 @@ pub async fn batch_upsert_models(
             (
                 model_name.clone(),
                 UpdateModelAdminRequest {
-                    public_name: request.public_name.clone(),
                     input_cost_per_token: request.input_cost_per_token.as_ref().map(|p| p.amount),
                     output_cost_per_token: request.output_cost_per_token.as_ref().map(|p| p.amount),
                     model_display_name: request.model_display_name.clone(),
@@ -105,10 +104,6 @@ pub async fn batch_upsert_models(
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(msg, "invalid_pricing".to_string())),
                 ),
-                services::admin::AdminError::PublicNameConflict(msg) => (
-                    StatusCode::BAD_REQUEST,
-                    ResponseJson(ErrorResponse::new(msg, "public_name_conflict".to_string())),
-                ),
                 services::admin::AdminError::Unauthorized(msg) => (
                     StatusCode::UNAUTHORIZED,
                     ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
@@ -124,10 +119,11 @@ pub async fn batch_upsert_models(
         })?;
 
     // Convert to API response - map from HashMap to Vec
+    // The key in the HashMap is the canonical model_name
     let api_models: Vec<ModelWithPricing> = updated_models
-        .into_values()
-        .map(|updated_model| ModelWithPricing {
-            model_id: updated_model.public_name,
+        .into_iter()
+        .map(|(model_name, updated_model)| ModelWithPricing {
+            model_id: model_name,
             input_cost_per_token: DecimalPrice {
                 amount: updated_model.input_cost_per_token,
                 scale: 9,

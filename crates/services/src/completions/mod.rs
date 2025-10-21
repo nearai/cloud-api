@@ -207,46 +207,26 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             stream_options: None,
         };
 
-        // Resolve model name (could be an alias) to canonical name
-        let canonical_name = self
-            .models_repository
-            .resolve_to_canonical_name(&request.model)
-            .await
-            .map_err(|e| {
-                ports::CompletionError::InvalidModel(format!("Failed to resolve model name: {e}"))
-            })?;
-
-        // Verify model exists in database (has pricing configured)
-        // This prevents execution of unconfigured models and ensures billing can occur
+        // Resolve model name (could be an alias) and get model details in a single DB call
+        // This also validates that the model exists and is active
         let model = self
             .models_repository
-            .get_model_by_name(&canonical_name)
+            .resolve_and_get_model(&request.model)
             .await
             .map_err(|e| {
+                ports::CompletionError::InternalError(format!("Failed to resolve model: {e}"))
+            })?
+            .ok_or_else(|| {
                 ports::CompletionError::InvalidModel(format!(
-                    "Failed to validate model configuration: {e}"
+                    "Model '{}' not found. It's not a valid model name or alias.",
+                    request.model
                 ))
             })?;
 
-        let model = match model {
-            Some(m) => m,
-            None => {
-                // Model not found in database - get list of configured models for error message
-                let configured_models = self
-                    .models_repository
-                    .get_configured_model_names()
-                    .await
-                    .unwrap_or_else(|_| vec!["Unable to fetch configured models".to_string()]);
-
-                return Err(ports::CompletionError::InvalidModel(format!(
-                    "Model '{}' is not configured. Available models: {:?}",
-                    request.model, configured_models
-                )));
-            }
-        };
+        let canonical_name = &model.model_name;
 
         // Update params with canonical name if it's different
-        if canonical_name != request.model {
+        if canonical_name != &request.model {
             tracing::debug!(
                 requested_model = %request.model,
                 canonical_model = %canonical_name,
@@ -319,46 +299,26 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             stream_options: None,
         };
 
-        // Resolve model name (could be an alias) to canonical name
-        let canonical_name = self
-            .models_repository
-            .resolve_to_canonical_name(&request.model)
-            .await
-            .map_err(|e| {
-                ports::CompletionError::InvalidModel(format!("Failed to resolve model name: {e}"))
-            })?;
-
-        // Verify model exists in database (has pricing configured)
-        // This prevents execution of unconfigured models and ensures billing can occur
+        // Resolve model name (could be an alias) and get model details in a single DB call
+        // This also validates that the model exists and is active
         let model = self
             .models_repository
-            .get_model_by_name(&canonical_name)
+            .resolve_and_get_model(&request.model)
             .await
             .map_err(|e| {
+                ports::CompletionError::InternalError(format!("Failed to resolve model: {e}"))
+            })?
+            .ok_or_else(|| {
                 ports::CompletionError::InvalidModel(format!(
-                    "Failed to validate model configuration: {e}"
+                    "Model '{}' not found. It's not a valid model name or alias.",
+                    request.model
                 ))
             })?;
 
-        let model = match model {
-            Some(m) => m,
-            None => {
-                // Model not found in database - get list of configured models for error message
-                let configured_models = self
-                    .models_repository
-                    .get_configured_model_names()
-                    .await
-                    .unwrap_or_else(|_| vec!["Unable to fetch configured models".to_string()]);
-
-                return Err(ports::CompletionError::InvalidModel(format!(
-                    "Model '{}' is not configured. Available models: {:?}",
-                    request.model, configured_models
-                )));
-            }
-        };
+        let canonical_name = &model.model_name;
 
         // Update params with canonical name if it's different
-        if canonical_name != request.model {
+        if canonical_name != &request.model {
             tracing::debug!(
                 requested_model = %request.model,
                 canonical_model = %canonical_name,

@@ -868,17 +868,20 @@ async fn test_unconfigured_model_rejected() {
         .expect("Failed to parse error response");
     println!("Error: {error:?}");
 
-    // Verify error message mentions the model is not configured
+    // Verify error message indicates model is not found
     assert!(
-        error.error.message.contains("not configured"),
-        "Error message should mention model is not configured. Got: {}",
+        error.error.message.contains("not found"),
+        "Error message should indicate model not found. Got: {}",
         error.error.message
     );
 
-    // Verify error message includes available models
+    // Verify error message mentions it's not a valid model name or alias
     assert!(
-        error.error.message.contains("Available models"),
-        "Error message should list available models. Got: {}",
+        error
+            .error
+            .message
+            .contains("not a valid model name or alias"),
+        "Error message should mention it's not a valid model name or alias. Got: {}",
         error.error.message
     );
 
@@ -1599,7 +1602,7 @@ async fn test_model_aliases() {
             "verifiable": true,
             "isActive": true,
             "aliases": [
-                "openai/gpt-oss-120b"  // Friendly alias
+                "gpt-oss-120b",  // Friendly alias
             ]
         }))
         .unwrap(),
@@ -1642,7 +1645,7 @@ async fn test_model_aliases() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "openai/gpt-oss-120b",  // Using ALIAS
+            "model": "gpt-oss-120b",  // Using ALIAS
             "messages": [
                 {
                     "role": "user",

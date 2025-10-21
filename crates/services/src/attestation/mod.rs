@@ -86,19 +86,27 @@ impl ports::AttestationServiceTrait for AttestationService {
         model: Option<String>,
         signing_algo: Option<String>,
     ) -> Result<AttestationReport, AttestationError> {
-        // Resolve model name (could be an alias) to canonical name
+        // Resolve model name (could be an alias) and get model details
         let mut model_attestations = vec![];
         if let Some(model) = model {
-            let canonical_name = self
+            let resolved_model = self
                 .models_repository
-                .resolve_to_canonical_name(&model)
+                .resolve_and_get_model(&model)
                 .await
                 .map_err(|e| {
-                    AttestationError::ProviderError(format!("Failed to resolve model name: {e}"))
+                    AttestationError::ProviderError(format!("Failed to resolve model: {e}"))
+                })?
+                .ok_or_else(|| {
+                    AttestationError::ProviderError(format!(
+                        "Model '{}' not found. It's not a valid model name or alias.",
+                        model
+                    ))
                 })?;
 
+            let canonical_name = &resolved_model.model_name;
+
             // Log if we resolved an alias
-            if canonical_name != model {
+            if canonical_name != &model {
                 tracing::debug!(
                     requested_model = %model,
                     canonical_model = %canonical_name,
@@ -108,7 +116,7 @@ impl ports::AttestationServiceTrait for AttestationService {
 
             model_attestations = self
                 .inference_provider_pool
-                .get_attestation_report(canonical_name, signing_algo)
+                .get_attestation_report(canonical_name.clone(), signing_algo)
                 .await
                 .map_err(|e| AttestationError::ProviderError(e.to_string()))?;
         }

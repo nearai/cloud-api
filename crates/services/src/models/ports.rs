@@ -64,10 +64,14 @@ pub trait ModelsRepository: Send + Sync {
         model_name: &str,
     ) -> Result<Option<ModelWithPricing>, anyhow::Error>;
 
-    /// Resolve a model name (which could be an alias) to its canonical name
-    /// If the input is an alias, resolves to the canonical name
-    /// If the input is already canonical, returns it as-is
-    async fn resolve_to_canonical_name(&self, model_name: &str) -> Result<String, anyhow::Error>;
+    /// Resolve a model identifier (alias or canonical name) and return the full model details
+    /// This replaces the old pattern of resolve_to_canonical_name + get_model_by_name
+    /// by combining both operations into a single database query, reducing DB round trips
+    /// Returns None if the model is not found or not active
+    async fn resolve_and_get_model(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<ModelWithPricing>, anyhow::Error>;
 
     /// Get list of configured model names (canonical names) from database
     /// Returns only active models that have been configured with pricing

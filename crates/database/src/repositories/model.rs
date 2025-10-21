@@ -495,57 +495,38 @@ impl ModelRepository {
         Ok(names)
     }
 
-    /// Resolve a model identifier (alias or canonical name) to the canonical model name
-    /// Resolution order:
-    /// 1. Check if it's an alias -> return model_name
-    /// 2. Check if it's already a canonical model_name -> return it
-    /// 3. Otherwise, return the input as-is (will fail later if invalid)
-    pub async fn resolve_to_canonical_name(&self, identifier: &str) -> Result<String> {
+    /// Resolve a model identifier (alias or canonical name) and return the full model details
+    /// Returns None if the model is not found or not active
+    pub async fn resolve_and_get_model(&self, identifier: &str) -> Result<Option<Model>> {
         let client = self
             .pool
             .get()
             .await
             .context("Failed to get database connection")?;
 
-        // First, try to resolve as an alias
-        let rows = client
-            .query(
+        let row = client
+            .query_opt(
                 r#"
-                SELECT m.model_name
-                FROM model_aliases ma
-                JOIN models m ON ma.canonical_model_id = m.id
-                WHERE ma.alias_name = $1 AND ma.is_active = true AND m.is_active = true
+                SELECT 
+                    m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
+                    m.input_cost_per_token, m.output_cost_per_token,
+                    m.context_length, m.verifiable, m.is_active, m.created_at, m.updated_at
+                FROM models m
+                LEFT JOIN model_aliases ma
+                  ON ma.canonical_model_id = m.id
+                  AND ma.is_active = true
+                  AND ma.alias_name = $1
+                WHERE m.is_active = true
+                  AND (ma.alias_name IS NOT NULL OR m.model_name = $1)
+                ORDER BY (ma.alias_name IS NOT NULL) DESC
                 LIMIT 1
                 "#,
                 &[&identifier],
             )
             .await
-            .context("Failed to resolve alias to canonical name")?;
+            .context("Failed to resolve and fetch model")?;
 
-        if let Some(row) = rows.first() {
-            return Ok(row.get::<_, String>("model_name"));
-        }
-
-        // Second, check if it's already a canonical model_name
-        let rows = client
-            .query(
-                r#"
-                SELECT model_name
-                FROM models
-                WHERE model_name = $1 AND is_active = true
-                LIMIT 1
-                "#,
-                &[&identifier],
-            )
-            .await
-            .context("Failed to check if identifier is canonical name")?;
-
-        if let Some(row) = rows.first() {
-            return Ok(row.get::<_, String>("model_name"));
-        }
-
-        // Not found in any form, return as-is (will be caught as invalid later)
-        Ok(identifier.to_string())
+        Ok(row.map(|r| self.row_to_model(&r)))
     }
 
     /// Helper method to convert database row to Model
@@ -632,8 +613,22 @@ impl services::models::ModelsRepository for ModelRepository {
         }))
     }
 
-    async fn resolve_to_canonical_name(&self, model_name: &str) -> Result<String> {
-        self.resolve_to_canonical_name(model_name).await
+    async fn resolve_and_get_model(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<services::models::ModelWithPricing>> {
+        let model_opt = self.resolve_and_get_model(identifier).await?;
+        Ok(model_opt.map(|m| services::models::ModelWithPricing {
+            id: m.id,
+            model_name: m.model_name,
+            model_display_name: m.model_display_name,
+            model_description: m.model_description,
+            model_icon: m.model_icon,
+            input_cost_per_token: m.input_cost_per_token,
+            output_cost_per_token: m.output_cost_per_token,
+            context_length: m.context_length,
+            verifiable: m.verifiable,
+        }))
     }
 
     async fn get_configured_model_names(&self) -> Result<Vec<String>> {

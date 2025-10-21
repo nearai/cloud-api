@@ -241,41 +241,6 @@ impl InferenceProviderPool {
         model_mapping.get(model_id).cloned()
     }
 
-    /// Get the next provider for a model using round-robin load balancing
-    async fn get_next_provider_for_model(
-        &self,
-        model_id: &str,
-    ) -> Option<Arc<dyn InferenceProvider + Send + Sync>> {
-        let model_mapping = self.model_mapping.read().await;
-        let providers = model_mapping.get(model_id)?;
-
-        if providers.is_empty() {
-            return None;
-        }
-
-        if providers.len() == 1 {
-            return Some(providers[0].clone());
-        }
-
-        // Get current index for this model
-        let mut indices = self.load_balancer_index.write().await;
-        let index = indices.entry(model_id.to_string()).or_insert(0);
-        let selected_index = *index % providers.len();
-        let provider = providers[selected_index].clone();
-
-        // Increment for next request
-        *index = (*index + 1) % providers.len();
-
-        tracing::debug!(
-            model = %model_id,
-            providers_count = providers.len(),
-            selected_index = selected_index,
-            "Selected provider using round-robin load balancing"
-        );
-
-        Some(provider)
-    }
-
     /// Store a mapping of chat_id to provider
     async fn store_chat_id_mapping(
         &self,
@@ -294,6 +259,148 @@ impl InferenceProviderPool {
     ) -> Option<Arc<dyn InferenceProvider + Send + Sync>> {
         let mapping = self.chat_id_mapping.read().await;
         mapping.get(chat_id).cloned()
+    }
+
+    /// Get providers for a model in priority order for fallback
+    /// Returns providers with the round-robin selected one first, followed by others
+    async fn get_providers_with_fallback(
+        &self,
+        model_id: &str,
+    ) -> Option<Vec<Arc<InferenceProviderTrait>>> {
+        let model_mapping = self.model_mapping.read().await;
+        let providers = model_mapping.get(model_id)?;
+
+        if providers.is_empty() {
+            return None;
+        }
+
+        if providers.len() == 1 {
+            return Some(vec![providers[0].clone()]);
+        }
+
+        // Get current index for round-robin
+        let mut indices = self.load_balancer_index.write().await;
+        let index = indices.entry(model_id.to_string()).or_insert(0);
+        let selected_index = *index % providers.len();
+
+        // Increment for next request
+        *index = (*index + 1) % providers.len();
+
+        // Build ordered list: selected provider first, then others
+        let mut ordered_providers = Vec::with_capacity(providers.len());
+        ordered_providers.push(providers[selected_index].clone());
+
+        for (i, provider) in providers.iter().enumerate() {
+            if i != selected_index {
+                ordered_providers.push(provider.clone());
+            }
+        }
+
+        tracing::debug!(
+            model = %model_id,
+            providers_count = providers.len(),
+            selected_index = selected_index,
+            "Prepared providers for fallback with round-robin priority"
+        );
+
+        Some(ordered_providers)
+    }
+
+    /// Generic retry helper that tries each provider in order with automatic fallback
+    /// Returns both the result and the provider that succeeded (for chat_id mapping)
+    async fn retry_with_fallback<T, F, Fut>(
+        &self,
+        model_id: &str,
+        operation_name: &str,
+        provider_fn: F,
+    ) -> Result<(T, Arc<InferenceProviderTrait>), CompletionError>
+    where
+        F: Fn(Arc<InferenceProviderTrait>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, CompletionError>>,
+    {
+        // Ensure models are discovered first
+        self.ensure_models_discovered().await?;
+
+        // Get all providers with fallback priority
+        let providers = match self.get_providers_with_fallback(model_id).await {
+            Some(p) => p,
+            None => {
+                let model_mapping = self.model_mapping.read().await;
+                let available_models: Vec<_> = model_mapping.keys().collect();
+
+                tracing::error!(
+                    model_id = %model_id,
+                    available_models = ?available_models,
+                    operation = operation_name,
+                    "Model not found in provider pool"
+                );
+                return Err(CompletionError::CompletionError(format!(
+                    "Model '{model_id}' not found in any configured provider. Available models: {available_models:?}"
+                )));
+            }
+        };
+
+        tracing::info!(
+            model_id = %model_id,
+            providers_count = providers.len(),
+            operation = operation_name,
+            "Attempting {} with {} provider(s)",
+            operation_name,
+            providers.len()
+        );
+
+        // Try each provider in order until one succeeds
+        let mut last_error = None;
+        for (attempt, provider) in providers.iter().enumerate() {
+            tracing::debug!(
+                model_id = %model_id,
+                attempt = attempt + 1,
+                total_providers = providers.len(),
+                operation = operation_name,
+                "Trying provider {} of {}",
+                attempt + 1,
+                providers.len()
+            );
+
+            match provider_fn(provider.clone()).await {
+                Ok(result) => {
+                    tracing::info!(
+                        model_id = %model_id,
+                        attempt = attempt + 1,
+                        operation = operation_name,
+                        "Successfully completed request with provider"
+                    );
+                    return Ok((result, provider.clone()));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        model_id = %model_id,
+                        attempt = attempt + 1,
+                        error = %e,
+                        operation = operation_name,
+                        "Provider failed, will try next provider if available"
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // All providers failed
+        tracing::error!(
+            model_id = %model_id,
+            providers_tried = providers.len(),
+            operation = operation_name,
+            "All providers failed for model"
+        );
+
+        Err(last_error.unwrap_or_else(|| {
+            CompletionError::CompletionError(format!(
+                "All {} provider(s) failed for model '{}' during {}",
+                providers.len(),
+                model_id,
+                operation_name
+            ))
+        }))
     }
 }
 
@@ -370,50 +477,30 @@ impl InferenceProvider for InferenceProviderPool {
             "Starting chat completion stream request"
         );
 
-        // Ensure models are discovered first
-        self.ensure_models_discovered().await?;
+        let (stream, provider) = self
+            .retry_with_fallback(&model_id, "chat_completion_stream", |provider| {
+                let params = params.clone();
+                let request_hash = request_hash.clone();
+                async move { provider.chat_completion_stream(params, request_hash).await }
+            })
+            .await?;
 
-        // Use load balancing to get the next provider
-        match self.get_next_provider_for_model(&model_id).await {
-            Some(provider) => {
-                tracing::info!(
-                    model_id = %model_id,
-                    "Found provider for model, calling chat_completion_stream"
-                );
-                let stream = provider
-                    .chat_completion_stream(params, request_hash)
-                    .await?;
-                let mut peekable = StreamingResultExt::peekable(stream);
-                if let Some(Ok(event)) = peekable.peek().await {
-                    if let inference_providers::StreamChunk::Chat(chat_chunk) = &event.chunk {
-                        let chat_id = chat_chunk.id.clone();
-                        let pool = self.clone();
-                        let provider = provider.clone();
-                        tokio::spawn(async move {
-                            tracing::info!(
-                                chat_id = %chat_id,
-                                "Storing chat_id mapping"
-                            );
-                            pool.store_chat_id_mapping(chat_id, provider).await;
-                        });
-                    }
-                }
-                Ok(Box::pin(peekable))
-            }
-            None => {
-                let model_mapping = self.model_mapping.read().await;
-                let available_models: Vec<_> = model_mapping.keys().collect();
-
-                tracing::error!(
-                    model_id = %model_id,
-                    available_models = ?available_models,
-                    "Model not found in provider pool"
-                );
-                Err(CompletionError::CompletionError(format!(
-                    "Model '{model_id}' not found in any configured provider. Available models: {available_models:?}"
-                )))
+        // Store chat_id mapping for sticky routing by peeking at the first event
+        let mut peekable = StreamingResultExt::peekable(stream);
+        if let Some(Ok(event)) = peekable.peek().await {
+            if let inference_providers::StreamChunk::Chat(chat_chunk) = &event.chunk {
+                let chat_id = chat_chunk.id.clone();
+                let pool = self.clone();
+                tokio::spawn(async move {
+                    tracing::info!(
+                        chat_id = %chat_id,
+                        "Storing chat_id mapping"
+                    );
+                    pool.store_chat_id_mapping(chat_id, provider).await;
+                });
             }
         }
+        Ok(Box::pin(peekable))
     }
 
     async fn chat_completion(
@@ -422,38 +509,29 @@ impl InferenceProvider for InferenceProviderPool {
         request_hash: String,
     ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError> {
         let model_id = params.model.clone();
-        match self.get_next_provider_for_model(&model_id).await {
-            Some(provider) => {
-                tracing::info!(
-                    model_id = %model_id,
-                    "Found provider for model, calling chat_completion"
-                );
-                let response = provider.chat_completion(params, request_hash).await?;
 
-                // Store the chat_id mapping SYNCHRONOUSLY before returning
-                // This ensures the attestation service can find the provider
-                let chat_id = response.response.id.clone();
-                tracing::info!(
-                    chat_id = %chat_id,
-                    "Storing chat_id mapping for non-streaming completion"
-                );
-                self.store_chat_id_mapping(chat_id.clone(), provider.clone())
-                    .await;
-                tracing::debug!(
-                    chat_id = %chat_id,
-                    "Stored chat_id mapping before returning response"
-                );
+        let (response, provider) = self
+            .retry_with_fallback(&model_id, "chat_completion", |provider| {
+                let params = params.clone();
+                let request_hash = request_hash.clone();
+                async move { provider.chat_completion(params, request_hash).await }
+            })
+            .await?;
 
-                Ok(response)
-            }
-            None => {
-                let model_mapping = self.model_mapping.read().await;
-                let available_models: Vec<_> = model_mapping.keys().collect();
-                Err(CompletionError::CompletionError(format!(
-                    "Model '{model_id}' not found in any configured provider. Available models: {available_models:?}"
-                )))
-            }
-        }
+        // Store the chat_id mapping SYNCHRONOUSLY before returning
+        // This ensures the attestation service can find the provider
+        let chat_id = response.response.id.clone();
+        tracing::info!(
+            chat_id = %chat_id,
+            "Storing chat_id mapping for non-streaming completion"
+        );
+        self.store_chat_id_mapping(chat_id.clone(), provider).await;
+        tracing::debug!(
+            chat_id = %chat_id,
+            "Stored chat_id mapping before returning response"
+        );
+
+        Ok(response)
     }
 
     async fn text_completion_stream(
@@ -462,27 +540,14 @@ impl InferenceProvider for InferenceProviderPool {
     ) -> Result<StreamingResult, CompletionError> {
         let model_id = params.model.clone();
 
-        // Ensure models are discovered first
-        self.ensure_models_discovered().await?;
+        let (stream, _provider) = self
+            .retry_with_fallback(&model_id, "text_completion_stream", |provider| {
+                let params = params.clone();
+                async move { provider.text_completion_stream(params).await }
+            })
+            .await?;
 
-        // Use load balancing to get the next provider
-        match self.get_next_provider_for_model(&model_id).await {
-            Some(provider) => provider.text_completion_stream(params).await,
-            None => {
-                let model_mapping = self.model_mapping.read().await;
-                let available_models: Vec<_> = model_mapping.keys().collect();
-
-                tracing::error!(
-                    model_id = %model_id,
-                    available_models = ?available_models,
-                    "Model not found in provider pool. Available models: {:?}",
-                    available_models
-                );
-                Err(CompletionError::CompletionError(format!(
-                    "Model '{model_id}' not found in any configured provider. Available models: {available_models:?}"
-                )))
-            }
-        }
+        Ok(stream)
     }
 }
 

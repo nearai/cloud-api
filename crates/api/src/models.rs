@@ -1240,9 +1240,9 @@ pub struct UpdateModelApiRequest {
 /// Batch update request format - Array of model name to update data
 pub type BatchUpdateModelApiRequest = std::collections::HashMap<String, UpdateModelApiRequest>;
 
-/// Model pricing history entry
+/// Model history entry - includes pricing, context length, and other model attributes
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ModelPricingHistoryEntry {
+pub struct ModelHistoryEntry {
     pub id: String,
     #[serde(rename = "modelId")]
     pub model_id: String,
@@ -1268,12 +1268,12 @@ pub struct ModelPricingHistoryEntry {
     pub created_at: String,
 }
 
-/// Model pricing history response
+/// Model history response - complete history of model changes
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ModelPricingHistoryResponse {
+pub struct ModelHistoryResponse {
     #[serde(rename = "modelName")]
     pub model_name: String,
-    pub history: Vec<ModelPricingHistoryEntry>,
+    pub history: Vec<ModelHistoryEntry>,
     pub total: i64,
     pub limit: i64,
     pub offset: i64,

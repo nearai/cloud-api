@@ -224,6 +224,7 @@ impl ResponseService {
             metadata: request.metadata.clone(),
             store: None,
             stream_options: None,
+            extra: std::collections::HashMap::new(),
         };
 
         tracing::debug!(

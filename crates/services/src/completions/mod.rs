@@ -205,6 +205,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             metadata: request.metadata,
             store: None,
             stream_options: None,
+            extra: request.extra.clone(),
         };
 
         // Resolve model name (could be an alias) and get model details in a single DB call
@@ -297,6 +298,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             metadata: request.metadata,
             store: None,
             stream_options: None,
+            extra: request.extra.clone(),
         };
 
         // Resolve model name (could be an alias) and get model details in a single DB call

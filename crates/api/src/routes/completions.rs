@@ -48,6 +48,7 @@ fn convert_chat_request_to_service(
         workspace_id,
         metadata: None,
         body_hash: body_hash.hash.clone(),
+        extra: request.extra.clone(),
     }
 }
 
@@ -77,6 +78,7 @@ fn convert_text_request_to_service(
         workspace_id,
         metadata: None,
         body_hash: body_hash.hash.clone(),
+        extra: request.extra.clone(),
     }
 }
 

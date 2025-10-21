@@ -17,6 +17,7 @@ pub trait AttestationServiceTrait: Send + Sync {
         &self,
         model: Option<String>,
         signing_algo: Option<String>,
+        nonce: Option<String>,
     ) -> Result<AttestationReport, AttestationError>;
 }
 

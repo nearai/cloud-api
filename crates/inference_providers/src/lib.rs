@@ -137,5 +137,6 @@ pub trait InferenceProvider {
         &self,
         model: String,
         signing_algo: Option<String>,
+        nonce: Option<String>,
     ) -> Result<Vec<VllmAttestationReport>, CompletionError>;
 }

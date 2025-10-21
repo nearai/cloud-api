@@ -442,6 +442,7 @@ impl InferenceProvider for InferenceProviderPool {
         &self,
         model: String,
         signing_algo: Option<String>,
+        nonce: Option<String>,
     ) -> Result<Vec<VllmAttestationReport>, CompletionError> {
         // Get the first provider for this model
         let mut attestations = vec![];
@@ -449,7 +450,7 @@ impl InferenceProvider for InferenceProviderPool {
             for provider in providers {
                 attestations.extend(
                     provider
-                        .get_attestation_report(model.clone(), signing_algo.clone())
+                        .get_attestation_report(model.clone(), signing_algo.clone(), nonce.clone())
                         .await?,
                 );
             }

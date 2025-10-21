@@ -75,6 +75,30 @@ pub async fn get_signature(
 pub struct AttestationQuery {
     pub model: Option<String>,
     pub signing_algo: Option<String>,
+    pub nonce: Option<String>,
+}
+
+/// Validate nonce format: must be 0x + 64 hex chars (32 bytes)
+fn validate_nonce(nonce: &str) -> Result<(), String> {
+    // Must start with 0x
+    if !nonce.starts_with("0x") {
+        return Err("Nonce must be hex-encoded with '0x' prefix".to_string());
+    }
+
+    // Must be exactly 66 chars (0x + 64 hex chars = 32 bytes)
+    if nonce.len() != 66 {
+        return Err(format!(
+            "Nonce must be 32 bytes (66 hex chars with 0x), got {} chars",
+            nonce.len()
+        ));
+    }
+
+    // Check all chars after 0x are valid hex
+    if !nonce[2..].chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Nonce contains invalid hex characters".to_string());
+    }
+
+    Ok(())
 }
 
 /// Evidence item in NVIDIA payload
@@ -171,6 +195,7 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
     ),
     responses(
         (status = 200, description = "Attestation report retrieved successfully", body = AttestationResponse),
+        (status = 400, description = "Invalid nonce format"),
         (status = 503, description = "Attestation service unavailable")
     ),
     security(
@@ -181,9 +206,19 @@ pub async fn get_attestation_report(
     Query(params): Query<AttestationQuery>,
     State(app_state): State<AppState>,
 ) -> Result<ResponseJson<AttestationResponse>, (StatusCode, ResponseJson<serde_json::Value>)> {
+    // Validate nonce if provided
+    if let Some(ref nonce) = params.nonce {
+        if let Err(e) = validate_nonce(nonce) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                ResponseJson(serde_json::json!({ "error": e })),
+            ));
+        }
+    }
+
     let report = app_state
         .attestation_service
-        .get_attestation_report(params.model, params.signing_algo)
+        .get_attestation_report(params.model, params.signing_algo, params.nonce)
         .await
         .map_err(|e| {
             (

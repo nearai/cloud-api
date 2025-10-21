@@ -80,11 +80,19 @@ impl InferenceProvider for VLlmProvider {
         &self,
         model: String,
         _signing_algo: Option<String>,
+        nonce: Option<String>,
     ) -> Result<Vec<VllmAttestationReport>, CompletionError> {
-        let url = format!(
-            "{}/v1/attestation/report?model={}",
-            self.config.base_url, model
-        );
+        let url = if let Some(nonce) = nonce {
+            format!(
+                "{}/v1/attestation/report?model={}&nonce={}",
+                self.config.base_url, model, nonce
+            )
+        } else {
+            format!(
+                "{}/v1/attestation/report?model={}",
+                self.config.base_url, model
+            )
+        };
         let response = self
             .client
             .get(&url)

@@ -20,7 +20,7 @@ use utoipa::{Modify, OpenApi};
     paths(
         // Chat completion endpoints
         crate::routes::completions::chat_completions,
-        crate::routes::completions::completions,
+        // crate::routes::completions::completions,
         crate::routes::completions::models,
         // Organization endpoints  
         crate::routes::organizations::list_organizations,

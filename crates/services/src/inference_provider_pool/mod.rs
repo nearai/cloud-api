@@ -286,14 +286,12 @@ impl InferenceProviderPool {
         // Increment for next request
         *index = (*index + 1) % providers.len();
 
-        // Build ordered list: selected provider first, then others
+        // Build ordered list following round-robin pattern:
+        // selected provider first, then continue round-robin (selected+1, selected+2, ...)
         let mut ordered_providers = Vec::with_capacity(providers.len());
-        ordered_providers.push(providers[selected_index].clone());
-
-        for (i, provider) in providers.iter().enumerate() {
-            if i != selected_index {
-                ordered_providers.push(provider.clone());
-            }
+        for i in 0..providers.len() {
+            let provider_index = (selected_index + i) % providers.len();
+            ordered_providers.push(providers[provider_index].clone());
         }
 
         tracing::debug!(

@@ -323,7 +323,7 @@ pub fn compute_sha256(data: &str) -> String {
 pub fn decode_access_token_claims(token: &str) -> AccessTokenClaims {
     let token_parts: Vec<&str> = token.split(".").collect();
     let token_claims_raw = base64::engine::general_purpose::STANDARD
-        .decode(&token_parts[1])
+        .decode(token_parts[1])
         .unwrap();
     serde_json::from_slice(&token_claims_raw).unwrap()
 }
@@ -337,10 +337,10 @@ pub fn is_valid_jwt_format(token: &str) -> bool {
         return false;
     }
 
-    // Decode each part and ensure it can be parsed as JSON
+    // Decode each part and ensure it is base64 encoded
     parts.iter().take(2).all(|part| {
         base64::engine::general_purpose::STANDARD
-            .decode(&parts[1])
+            .decode(part)
             .is_ok()
     })
 }

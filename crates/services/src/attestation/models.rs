@@ -38,6 +38,8 @@ pub struct DstackCpuQuote {
     pub quote: String,
     /// The event log associated with the quote
     pub event_log: String,
+    pub vm_config: String,
+    pub report_data: String,
 }
 
 impl From<dstack_sdk::dstack_client::GetQuoteResponse> for DstackCpuQuote {
@@ -45,6 +47,8 @@ impl From<dstack_sdk::dstack_client::GetQuoteResponse> for DstackCpuQuote {
         Self {
             quote: response.quote,
             event_log: response.event_log,
+            vm_config: response.vm_config,
+            report_data: response.report_data,
         }
     }
 }

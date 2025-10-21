@@ -18,6 +18,9 @@ use services::auth::{AuthServiceTrait, UserId};
 use std::sync::Arc;
 use tracing::{debug, error};
 
+/// Admin tokens do not require refresh tokens, so refresh expiry is set to 0
+const NO_REFRESH_TOKEN_EXPIRY: i64 = 0;
+
 #[derive(Clone)]
 pub struct AdminAppState {
     pub admin_service: Arc<dyn AdminService + Send + Sync>,
@@ -658,7 +661,7 @@ pub async fn create_admin_access_token(
             request.user_agent,
             app_state.config.auth.encoding_key.to_string(),
             request.expires_in_hours,
-            0,
+            NO_REFRESH_TOKEN_EXPIRY,
         )
         .await;
 

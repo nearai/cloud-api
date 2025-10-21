@@ -1,7 +1,6 @@
 use crate::{models::StreamOptions, sse_parser::SSEParser, *};
 use async_trait::async_trait;
 use reqwest::Client;
-use tracing::debug;
 
 /// Configuration for vLLM provider
 #[derive(Debug, Clone)]
@@ -176,10 +175,6 @@ impl InferenceProvider for VLlmProvider {
         request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
         let url = format!("{}/v1/chat/completions", self.config.base_url);
-        debug!(
-            "====================={}===================",
-            self.config.base_url
-        );
 
         let mut headers = self.build_headers();
         headers.insert("X-Request-Hash", request_hash.parse().unwrap());

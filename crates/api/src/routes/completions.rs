@@ -350,7 +350,7 @@ pub async fn models(
         data: models
             .into_iter()
             .map(|model| ModelInfo {
-                id: model.public_name,
+                id: model.model_name,
                 object: "model".to_string(),
                 created: 0,
                 owned_by: "system".to_string(),

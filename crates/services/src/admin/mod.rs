@@ -169,7 +169,7 @@ impl AdminServiceImpl {
     async fn validate_model_request(
         model_name: &str,
         request: &UpdateModelAdminRequest,
-        repository: Arc<dyn AdminRepository>,
+        _repository: Arc<dyn AdminRepository>,
     ) -> Result<(), AdminError> {
         // All costs use fixed scale 9 (nano-dollars) and USD - no scale/currency validation needed
 
@@ -178,33 +178,6 @@ impl AdminServiceImpl {
             return Err(AdminError::InvalidPricing(
                 "Model name cannot be empty".to_string(),
             ));
-        }
-
-        // Validate public_name if provided
-        if let Some(ref public_name) = request.public_name {
-            if public_name.trim().is_empty() {
-                return Err(AdminError::InvalidPricing(
-                    "Public name cannot be empty".to_string(),
-                ));
-            }
-
-            // Only check for conflicts if the model being created is active
-            // Inactive models can have the same public_name as other inactive models
-            let is_creating_active_model = request.is_active.unwrap_or(true);
-            if is_creating_active_model {
-                // Check if public_name is already taken by an active model
-                // Exclude the current model being updated to avoid false conflicts
-                let is_taken = repository
-                    .is_public_name_taken_by_active_model(public_name, Some(model_name))
-                    .await
-                    .map_err(|e| AdminError::InternalError(e.to_string()))?;
-
-                if is_taken {
-                    return Err(AdminError::PublicNameConflict(format!(
-                        "Public name '{public_name}' is already used by an active model"
-                    )));
-                }
-            }
         }
 
         // Validate display name if provided

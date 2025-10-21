@@ -469,16 +469,10 @@ async fn test_admin_update_model() {
     println!("Updated models: {updated_models:?}");
     assert_eq!(updated_models.len(), 1);
     let updated_model = &updated_models[0];
-    // model_id should be the public_name, not the internal model_name
+    // model_id should be the canonical model_name (the key in the batch HashMap)
     assert_eq!(
         updated_model.model_id,
-        batch_for_comparison
-            .values()
-            .next()
-            .unwrap()
-            .public_name
-            .as_deref()
-            .unwrap()
+        *batch_for_comparison.keys().next().unwrap()
     );
     assert_eq!(
         updated_model.metadata.model_display_name,
@@ -520,11 +514,8 @@ async fn test_get_model_by_name() {
     println!("Retrieved model: {model_resp:?}");
 
     // Verify the model details match what we upserted
-    // The model_id should be the public_name, not the internal model_name
-    assert_eq!(
-        model_resp.model_id,
-        model_request.public_name.as_deref().unwrap()
-    );
+    // The model_id should be the canonical model_name
+    assert_eq!(model_resp.model_id, model_name);
     assert_eq!(
         model_resp.metadata.model_display_name,
         model_request.model_display_name.as_deref().unwrap()
@@ -574,29 +565,23 @@ async fn test_get_model_by_name() {
             .currency
     );
 
-    // Test retrieving the same model by public name
-    let public_name = model_request.public_name.as_deref().unwrap();
-    println!("Test: Requesting model by public name: '{public_name}'");
-    // URL-encode the public name since it may contain special characters
-    let encoded_public_name =
-        url::form_urlencoded::byte_serialize(public_name.as_bytes()).collect::<String>();
-    println!("Test: URL-encoded public name: '{encoded_public_name}'");
-    let response_by_public_name = server
-        .get(format!("/v1/model/{encoded_public_name}").as_str())
+    // Test retrieving the same model again by canonical name to verify consistency
+    let response_by_name_again = server
+        .get(format!("/v1/model/{encoded_model_name}").as_str())
         .await;
 
     println!(
-        "Public name response status: {}",
-        response_by_public_name.status_code()
+        "Second canonical name response status: {}",
+        response_by_name_again.status_code()
     );
-    assert_eq!(response_by_public_name.status_code(), 200);
+    assert_eq!(response_by_name_again.status_code(), 200);
 
-    let model_resp_by_public_name = response_by_public_name.json::<api::models::ModelWithPricing>();
-    println!("Retrieved model by public name: {model_resp_by_public_name:?}");
+    let model_resp_by_name_again = response_by_name_again.json::<api::models::ModelWithPricing>();
+    println!("Retrieved model again by canonical name: {model_resp_by_name_again:?}");
 
     // Verify that both queries return the same model (same model_id)
-    assert_eq!(model_resp.model_id, model_resp_by_public_name.model_id);
-    println!("✅ Both internal name and public name queries return the same model!");
+    assert_eq!(model_resp.model_id, model_resp_by_name_again.model_id);
+    println!("✅ Both queries return the same model with consistent model_id!");
 
     // Test retrieving a non-existent model
     // Note: URL-encode the model name even for non-existent models
@@ -2348,236 +2333,4 @@ async fn test_admin_create_access_token_use_created_token() {
     assert_eq!(update_result.spend_limit.amount, 50000000000i64);
 
     println!("✅ Successfully used created admin token to update organization limits");
-}
-
-#[tokio::test]
-async fn test_public_name_uniqueness_for_active_models() {
-    let server = setup_test_server().await;
-
-    // Test 1: Create first model with a specific public_name
-    let public_name = "test-model-unique";
-    let mut batch1 = BatchUpdateModelApiRequest::new();
-    batch1.insert(
-        "internal-model-1".to_string(),
-        serde_json::from_value(serde_json::json!({
-            "publicName": public_name,
-            "inputCostPerToken": {
-                "amount": 1000000,
-                "currency": "USD"
-            },
-            "outputCostPerToken": {
-                "amount": 2000000,
-                "currency": "USD"
-            },
-            "modelDisplayName": "Test Model 1",
-            "modelDescription": "First test model",
-            "contextLength": 128000,
-            "verifiable": true,
-            "isActive": true
-        }))
-        .unwrap(),
-    );
-
-    let models1 = admin_batch_upsert_models(&server, batch1, get_session_id()).await;
-    assert_eq!(models1.len(), 1);
-    assert_eq!(models1[0].model_id, public_name);
-    println!("✅ Created first model with public_name: {public_name}");
-
-    // Test 2: Try to create another active model with the same public_name - should fail
-    let mut batch2 = BatchUpdateModelApiRequest::new();
-    batch2.insert(
-        "internal-model-2".to_string(),
-        serde_json::from_value(serde_json::json!({
-            "publicName": public_name, // Same public_name
-            "inputCostPerToken": {
-                "amount": 1500000,
-                "currency": "USD"
-            },
-            "outputCostPerToken": {
-                "amount": 2500000,
-                "currency": "USD"
-            },
-            "modelDisplayName": "Test Model 2",
-            "modelDescription": "Second test model",
-            "contextLength": 128000,
-            "verifiable": true,
-            "isActive": true
-        }))
-        .unwrap(),
-    );
-
-    let response = server
-        .patch("/v1/admin/models")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&batch2)
-        .await;
-
-    println!(
-        "Duplicate public_name response status: {}",
-        response.status_code()
-    );
-    let response_text = response.text();
-    println!("Duplicate public_name response body: {response_text}");
-
-    // Should get 400 Bad Request for duplicate public_name
-    assert_eq!(
-        response.status_code(),
-        400,
-        "Creating model with duplicate public_name should fail with 400 Bad Request"
-    );
-
-    let error = serde_json::from_str::<api::models::ErrorResponse>(&response_text)
-        .expect("Failed to parse error response");
-
-    assert_eq!(error.error.r#type, "public_name_conflict");
-    assert!(
-        error.error.message.contains(&format!(
-            "Public name '{public_name}' is already used by an active model"
-        )),
-        "Error message should indicate public_name conflict"
-    );
-    println!("✅ Correctly rejected duplicate public_name for active model");
-
-    // Test 3: Soft-delete the first model (set is_active = false)
-    let mut batch_deactivate = BatchUpdateModelApiRequest::new();
-    batch_deactivate.insert(
-        "internal-model-1".to_string(),
-        serde_json::from_value(serde_json::json!({
-            "isActive": false
-        }))
-        .unwrap(),
-    );
-
-    let deactivated_models =
-        admin_batch_upsert_models(&server, batch_deactivate, get_session_id()).await;
-    assert_eq!(deactivated_models.len(), 1);
-    println!("✅ Soft-deleted first model");
-
-    // Test 4: Now create a new active model with the same public_name - should succeed
-    let mut batch3 = BatchUpdateModelApiRequest::new();
-    batch3.insert(
-        "internal-model-3".to_string(),
-        serde_json::from_value(serde_json::json!({
-            "publicName": public_name, // Same public_name as deactivated model
-            "inputCostPerToken": {
-                "amount": 2000000,
-                "currency": "USD"
-            },
-            "outputCostPerToken": {
-                "amount": 3000000,
-                "currency": "USD"
-            },
-            "modelDisplayName": "Test Model 3",
-            "modelDescription": "Third test model (reusing public_name)",
-            "contextLength": 128000,
-            "verifiable": true,
-            "isActive": true
-        }))
-        .unwrap(),
-    );
-
-    let models3 = admin_batch_upsert_models(&server, batch3, get_session_id()).await;
-    assert_eq!(models3.len(), 1);
-    assert_eq!(models3[0].model_id, public_name);
-    println!("✅ Successfully created new active model with reused public_name");
-
-    // Test 5: Create another inactive model with the same public_name - should succeed
-    let mut batch4 = BatchUpdateModelApiRequest::new();
-    batch4.insert(
-        "internal-model-4".to_string(),
-        serde_json::from_value(serde_json::json!({
-            "publicName": public_name, // Same public_name
-            "inputCostPerToken": {
-                "amount": 1000000,
-                "currency": "USD"
-            },
-            "outputCostPerToken": {
-                "amount": 2000000,
-                "currency": "USD"
-            },
-            "modelDisplayName": "Test Model 4",
-            "modelDescription": "Fourth test model (inactive)",
-            "contextLength": 128000,
-            "verifiable": true,
-            "isActive": false // Inactive model
-        }))
-        .unwrap(),
-    );
-
-    let models4 = admin_batch_upsert_models(&server, batch4, get_session_id()).await;
-    assert_eq!(models4.len(), 1);
-    assert_eq!(models4[0].model_id, public_name);
-    println!("✅ Successfully created inactive model with same public_name");
-
-    // Test 6: Try to create another active model with the same public_name - should fail again
-    let mut batch5 = BatchUpdateModelApiRequest::new();
-    batch5.insert(
-        "internal-model-5".to_string(),
-        serde_json::from_value(serde_json::json!({
-            "publicName": public_name, // Same public_name
-            "inputCostPerToken": {
-                "amount": 1000000,
-                "currency": "USD"
-            },
-            "outputCostPerToken": {
-                "amount": 2000000,
-                "currency": "USD"
-            },
-            "modelDisplayName": "Test Model 5",
-            "modelDescription": "Fifth test model",
-            "contextLength": 128000,
-            "verifiable": true,
-            "isActive": true // Active model - should fail
-        }))
-        .unwrap(),
-    );
-
-    let response2 = server
-        .patch("/v1/admin/models")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&batch5)
-        .await;
-
-    println!(
-        "Second duplicate public_name response status: {}",
-        response2.status_code()
-    );
-    let response_text2 = response2.text();
-    println!("Second duplicate public_name response body: {response_text2}");
-
-    // Should get 400 Bad Request for duplicate public_name
-    assert_eq!(
-        response2.status_code(),
-        400,
-        "Creating another active model with duplicate public_name should fail with 400 Bad Request"
-    );
-
-    let error2 = serde_json::from_str::<api::models::ErrorResponse>(&response_text2)
-        .expect("Failed to parse error response");
-
-    assert_eq!(error2.error.r#type, "public_name_conflict");
-    assert!(
-        error2.error.message.contains(&format!(
-            "Public name '{public_name}' is already used by an active model"
-        )),
-        "Error message should indicate public_name conflict"
-    );
-    println!("✅ Correctly rejected duplicate public_name for active model (second attempt)");
-
-    // Test 6: Soft-delete the third model (set is_active = false)
-    let mut batch_deactivate = BatchUpdateModelApiRequest::new();
-    batch_deactivate.insert(
-        "internal-model-3".to_string(),
-        serde_json::from_value(serde_json::json!({
-            "isActive": false
-        }))
-        .unwrap(),
-    );
-
-    let deactivated_models =
-        admin_batch_upsert_models(&server, batch_deactivate, get_session_id()).await;
-    assert_eq!(deactivated_models.len(), 1);
-    println!("✅ Soft-deleted third model");
-
-    println!("🎉 All public_name uniqueness tests passed!");
 }

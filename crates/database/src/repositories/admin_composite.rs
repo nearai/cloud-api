@@ -41,7 +41,6 @@ impl AdminRepository for AdminCompositeRepository {
     ) -> Result<ModelPricing> {
         // Convert service request to database request
         let db_request = UpdateModelPricingRequest {
-            public_name: request.public_name,
             input_cost_per_token: request.input_cost_per_token,
             output_cost_per_token: request.output_cost_per_token,
             model_display_name: request.model_display_name,
@@ -66,7 +65,6 @@ impl AdminRepository for AdminCompositeRepository {
         }
 
         Ok(ModelPricing {
-            public_name: model.public_name,
             model_display_name: model.model_display_name,
             model_description: model.model_description,
             model_icon: model.model_icon,
@@ -201,15 +199,5 @@ impl AdminRepository for AdminCompositeRepository {
                 is_active: u.is_active,
             })
             .collect())
-    }
-
-    async fn is_public_name_taken_by_active_model(
-        &self,
-        public_name: &str,
-        exclude_model_name: Option<&str>,
-    ) -> Result<bool> {
-        self.model_repo
-            .is_public_name_taken_by_active_model(public_name, exclude_model_name)
-            .await
     }
 }

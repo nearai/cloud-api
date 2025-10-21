@@ -1217,8 +1217,6 @@ pub struct ModelMetadata {
 /// Request to update model pricing (admin endpoint)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UpdateModelApiRequest {
-    #[serde(rename = "publicName")]
-    pub public_name: Option<String>,
     #[serde(rename = "inputCostPerToken")]
     pub input_cost_per_token: Option<DecimalPriceRequest>,
     #[serde(rename = "outputCostPerToken")]

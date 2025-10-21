@@ -46,12 +46,12 @@ impl ModelRepository {
             .query(
                 r#"
                 SELECT 
-                    id, model_name, public_name, model_display_name, model_description, model_icon,
+                    id, model_name, model_display_name, model_description, model_icon,
                     input_cost_per_token, output_cost_per_token,
                     context_length, verifiable, is_active, created_at, updated_at
                 FROM models 
                 WHERE is_active = true
-                ORDER BY public_name ASC
+                ORDER BY model_name ASC
                 LIMIT $1 OFFSET $2
                 "#,
                 &[&limit, &offset],
@@ -79,7 +79,7 @@ impl ModelRepository {
             .query(
                 r#"
                 SELECT 
-                    id, model_name, public_name, model_display_name, model_description, model_icon,
+                    id, model_name, model_display_name, model_description, model_icon,
                     input_cost_per_token, output_cost_per_token,
                     context_length, verifiable, is_active, created_at, updated_at
                 FROM models
@@ -109,7 +109,7 @@ impl ModelRepository {
             .query(
                 r#"
                 SELECT 
-                    id, model_name, public_name, model_display_name, model_description, model_icon,
+                    id, model_name, model_display_name, model_description, model_icon,
                     input_cost_per_token, output_cost_per_token,
                     context_length, verifiable, is_active, created_at, updated_at
                 FROM models
@@ -127,8 +127,8 @@ impl ModelRepository {
         }
     }
 
-    /// Get model by model name or public name (public API - only active models)
-    /// Searches both model_name (internal) and public_name (public-facing) fields
+    /// Get model by model name (public API - only active models)
+    /// Searches model_name (canonical name) field only
     pub async fn get_active_model_by_name(&self, model_name: &str) -> Result<Option<Model>> {
         let client = self
             .pool
@@ -140,11 +140,11 @@ impl ModelRepository {
             .query(
                 r#"
                 SELECT 
-                    id, model_name, public_name, model_display_name, model_description, model_icon,
+                    id, model_name, model_display_name, model_description, model_icon,
                     input_cost_per_token, output_cost_per_token,
                     context_length, verifiable, is_active, created_at, updated_at
                 FROM models 
-                WHERE (model_name = $1 OR public_name = $1) AND is_active = true
+                WHERE model_name = $1 AND is_active = true
                 "#,
                 &[&model_name],
             )
@@ -181,24 +181,22 @@ impl ModelRepository {
                 .query_one(
                     r#"
                     UPDATE models SET
-                        public_name = COALESCE($2, public_name),
-                        input_cost_per_token = COALESCE($3, input_cost_per_token),
-                        output_cost_per_token = COALESCE($4, output_cost_per_token),
-                        model_display_name = COALESCE($5, model_display_name),
-                        model_description = COALESCE($6, model_description),
-                        model_icon = COALESCE($7, model_icon),
-                        context_length = COALESCE($8, context_length),
-                        verifiable = COALESCE($9, verifiable),
-                        is_active = COALESCE($10, is_active),
+                        input_cost_per_token = COALESCE($2, input_cost_per_token),
+                        output_cost_per_token = COALESCE($3, output_cost_per_token),
+                        model_display_name = COALESCE($4, model_display_name),
+                        model_description = COALESCE($5, model_description),
+                        model_icon = COALESCE($6, model_icon),
+                        context_length = COALESCE($7, context_length),
+                        verifiable = COALESCE($8, verifiable),
+                        is_active = COALESCE($9, is_active),
                         updated_at = NOW()
                     WHERE model_name = $1
-                    RETURNING id, model_name, public_name, model_display_name, model_description, model_icon,
+                    RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token,
                               context_length, verifiable, is_active, created_at, updated_at
                     "#,
                     &[
                         &model_name,
-                        &update_request.public_name,
                         &update_request.input_cost_per_token,
                         &update_request.output_cost_per_token,
                         &update_request.model_display_name,
@@ -213,14 +211,6 @@ impl ModelRepository {
                 .context("Failed to update model pricing")?
         } else {
             // Model doesn't exist - do INSERT with ON CONFLICT to handle race conditions
-            // Use existing values or default to model_name for public_name if not provided
-            let public_name = update_request
-                .public_name
-                .as_ref()
-                .or(Some(&model_name.to_string()))
-                .cloned()
-                .context("public_name is required for new models")?;
-
             let display_name = update_request
                 .model_display_name
                 .as_ref()
@@ -243,13 +233,12 @@ impl ModelRepository {
                 .query_one(
                     r#"
                     INSERT INTO models (
-                        model_name, public_name,
+                        model_name,
                         input_cost_per_token, output_cost_per_token,
                         model_display_name, model_description, model_icon,
                         context_length, verifiable, is_active
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                     ON CONFLICT (model_name) DO UPDATE SET
-                        public_name = EXCLUDED.public_name,
                         input_cost_per_token = EXCLUDED.input_cost_per_token,
                         output_cost_per_token = EXCLUDED.output_cost_per_token,
                         model_display_name = EXCLUDED.model_display_name,
@@ -259,13 +248,12 @@ impl ModelRepository {
                         verifiable = EXCLUDED.verifiable,
                         is_active = EXCLUDED.is_active,
                         updated_at = NOW()
-                    RETURNING id, model_name, public_name, model_display_name, model_description, model_icon,
+                    RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token,
                               context_length, verifiable, is_active, created_at, updated_at
                     "#,
                     &[
                         &model_name,
-                        &public_name,
                         &update_request.input_cost_per_token.unwrap_or(0),
                         &update_request.output_cost_per_token.unwrap_or(0),
                         &display_name,
@@ -295,17 +283,16 @@ impl ModelRepository {
             .query_one(
                 r#"
                 INSERT INTO models (
-                    model_name, public_name, model_display_name, model_description, model_icon,
+                    model_name, model_display_name, model_description, model_icon,
                     input_cost_per_token, output_cost_per_token,
                     context_length, verifiable, is_active
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                RETURNING id, model_name, public_name, model_display_name, model_description, model_icon,
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                RETURNING id, model_name, model_display_name, model_description, model_icon,
                           input_cost_per_token, output_cost_per_token,
                           context_length, verifiable, is_active, created_at, updated_at
                 "#,
                 &[
                     &model.model_name,
-                    &model.public_name,
                     &model.model_display_name,
                     &model.model_description,
                     &model.model_icon,
@@ -478,37 +465,7 @@ impl ModelRepository {
         Ok(result > 0)
     }
 
-    /// Get model by public name
-    pub async fn get_by_public_name(&self, public_name: &str) -> Result<Option<Model>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
-        let rows = client
-            .query(
-                r#"
-                SELECT
-                    id, model_name, public_name, model_display_name, model_description, model_icon,
-                    input_cost_per_token, output_cost_per_token,
-                    context_length, verifiable, is_active, created_at, updated_at
-                FROM models 
-                WHERE public_name = $1
-                "#,
-                &[&public_name],
-            )
-            .await
-            .context("Failed to query model by public name")?;
-
-        if let Some(row) = rows.first() {
-            Ok(Some(self.row_to_model(row)))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Get list of configured model names (public names)
+    /// Get list of configured model names (canonical names)
     /// Returns only active models that have been configured with pricing
     pub async fn get_configured_model_names(&self) -> Result<Vec<String>> {
         let client = self
@@ -520,10 +477,10 @@ impl ModelRepository {
         let rows = client
             .query(
                 r#"
-                SELECT public_name
+                SELECT model_name
                 FROM models
                 WHERE is_active = true
-                ORDER BY public_name ASC
+                ORDER BY model_name ASC
                 "#,
                 &[],
             )
@@ -532,63 +489,17 @@ impl ModelRepository {
 
         let names = rows
             .into_iter()
-            .map(|row| row.get::<_, String>("public_name"))
+            .map(|row| row.get::<_, String>("model_name"))
             .collect();
 
         Ok(names)
     }
 
-    /// Check if a public_name is already used by an active model
-    /// Returns true if the public_name is already taken by an active model
-    /// If exclude_model_name is provided, excludes that model from the check
-    pub async fn is_public_name_taken_by_active_model(
-        &self,
-        public_name: &str,
-        exclude_model_name: Option<&str>,
-    ) -> Result<bool> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
-        let rows = if let Some(exclude_name) = exclude_model_name {
-            client
-                .query(
-                    r#"
-                    SELECT 1
-                    FROM models 
-                    WHERE public_name = $1 AND is_active = true AND model_name != $2
-                    LIMIT 1
-                    "#,
-                    &[&public_name, &exclude_name],
-                )
-                .await
-                .context("Failed to check if public_name is taken by active model")?
-        } else {
-            client
-                .query(
-                    r#"
-                    SELECT 1
-                    FROM models 
-                    WHERE public_name = $1 AND is_active = true
-                    LIMIT 1
-                    "#,
-                    &[&public_name],
-                )
-                .await
-                .context("Failed to check if public_name is taken by active model")?
-        };
-
-        Ok(!rows.is_empty())
-    }
-
-    /// Resolve a model identifier (public name, alias, or canonical name) to the canonical model name
+    /// Resolve a model identifier (alias or canonical name) to the canonical model name
     /// Resolution order:
-    /// 1. Check if it's a public_name -> return model_name
-    /// 2. Check if it's an alias -> return model_name
-    /// 3. Check if it's already a canonical model_name -> return it
-    /// 4. Otherwise, return the input as-is (will fail later if invalid)
+    /// 1. Check if it's an alias -> return model_name
+    /// 2. Check if it's already a canonical model_name -> return it
+    /// 3. Otherwise, return the input as-is (will fail later if invalid)
     pub async fn resolve_to_canonical_name(&self, identifier: &str) -> Result<String> {
         let client = self
             .pool
@@ -596,25 +507,7 @@ impl ModelRepository {
             .await
             .context("Failed to get database connection")?;
 
-        // First, try to find by public_name
-        let rows = client
-            .query(
-                r#"
-                SELECT model_name
-                FROM models
-                WHERE public_name = $1 AND is_active = true
-                LIMIT 1
-                "#,
-                &[&identifier],
-            )
-            .await
-            .context("Failed to resolve public name to canonical name")?;
-
-        if let Some(row) = rows.first() {
-            return Ok(row.get::<_, String>("model_name"));
-        }
-
-        // Second, try to resolve as an alias
+        // First, try to resolve as an alias
         let rows = client
             .query(
                 r#"
@@ -633,7 +526,7 @@ impl ModelRepository {
             return Ok(row.get::<_, String>("model_name"));
         }
 
-        // Third, check if it's already a canonical model_name
+        // Second, check if it's already a canonical model_name
         let rows = client
             .query(
                 r#"
@@ -660,7 +553,6 @@ impl ModelRepository {
         Model {
             id: row.get("id"),
             model_name: row.get("model_name"),
-            public_name: row.get("public_name"),
             model_display_name: row.get("model_display_name"),
             model_description: row.get("model_description"),
             model_icon: row.get("model_icon"),
@@ -711,7 +603,6 @@ impl services::models::ModelsRepository for ModelRepository {
             .map(|m| services::models::ModelWithPricing {
                 id: m.id,
                 model_name: m.model_name,
-                public_name: m.public_name,
                 model_display_name: m.model_display_name,
                 model_description: m.model_description,
                 model_icon: m.model_icon,
@@ -731,7 +622,6 @@ impl services::models::ModelsRepository for ModelRepository {
         Ok(model_opt.map(|m| services::models::ModelWithPricing {
             id: m.id,
             model_name: m.model_name,
-            public_name: m.public_name,
             model_display_name: m.model_display_name,
             model_description: m.model_description,
             model_icon: m.model_icon,

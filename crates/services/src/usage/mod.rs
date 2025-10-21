@@ -59,27 +59,34 @@ impl UsageServiceTrait for UsageServiceImpl {
 
     /// Record usage after an API call completes
     async fn record_usage(&self, request: RecordUsageServiceRequest) -> Result<(), UsageError> {
-        // Calculate costs
-        let cost = self
-            .calculate_cost(
-                &request.model_id,
-                request.input_tokens,
-                request.output_tokens,
-            )
-            .await?;
+        // Look up the model to get pricing (model_id is already a UUID)
+        let model = self
+            .model_repository
+            .get_model_by_id(request.model_id)
+            .await
+            .map_err(|e| UsageError::InternalError(format!("Failed to get model: {e}")))?
+            .ok_or_else(|| {
+                UsageError::ModelNotFound(format!("Model with ID '{}' not found", request.model_id))
+            })?;
 
-        // Create database request
+        // Calculate costs using the model's pricing
+        let input_cost = (request.input_tokens as i64) * model.input_cost_per_token;
+        let output_cost = (request.output_tokens as i64) * model.output_cost_per_token;
+        let total_cost = input_cost + output_cost;
+
+        // Create database request with model UUID and name (denormalized)
         let db_request = RecordUsageDbRequest {
             organization_id: request.organization_id,
             workspace_id: request.workspace_id,
             api_key_id: request.api_key_id,
             response_id: request.response_id,
             model_id: request.model_id,
+            model_name: model.model_name,
             input_tokens: request.input_tokens,
             output_tokens: request.output_tokens,
-            input_cost: cost.input_cost,
-            output_cost: cost.output_cost,
-            total_cost: cost.total_cost,
+            input_cost,
+            output_cost,
+            total_cost,
             request_type: request.request_type,
         };
 

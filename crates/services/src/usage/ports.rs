@@ -105,6 +105,9 @@ pub trait UsageRepository: Send + Sync {
 pub trait ModelRepository: Send + Sync {
     /// Get model by name
     async fn get_model_by_name(&self, model_name: &str) -> anyhow::Result<Option<ModelPricing>>;
+
+    /// Get model by UUID
+    async fn get_model_by_id(&self, model_id: Uuid) -> anyhow::Result<Option<ModelPricing>>;
 }
 
 #[async_trait::async_trait]
@@ -127,7 +130,7 @@ pub struct RecordUsageServiceRequest {
     pub workspace_id: Uuid,
     pub api_key_id: Uuid,
     pub response_id: Option<Uuid>,
-    pub model_id: String,
+    pub model_id: Uuid,
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub request_type: String, // 'chat_completion', 'text_completion', 'response'
@@ -141,7 +144,8 @@ pub struct RecordUsageDbRequest {
     pub workspace_id: Uuid,
     pub api_key_id: Uuid,
     pub response_id: Option<Uuid>,
-    pub model_id: String,
+    pub model_id: Uuid,
+    pub model_name: String, // Denormalized canonical model name
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub input_cost: i64,
@@ -154,6 +158,8 @@ pub struct RecordUsageDbRequest {
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
 pub struct ModelPricing {
+    pub id: Uuid,
+    pub model_name: String, // Canonical model name
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
 }
@@ -205,7 +211,8 @@ pub struct UsageLogEntry {
     pub workspace_id: Uuid,
     pub api_key_id: Uuid,
     pub response_id: Option<Uuid>,
-    pub model_id: String,
+    pub model_id: Uuid,
+    pub model: String, // Canonical model name from models table
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub total_tokens: i32,

@@ -25,7 +25,7 @@ where
     organization_id: Uuid,
     workspace_id: Uuid,
     api_key_id: Uuid,
-    model_id: String,
+    model_id: Uuid,
     request_type: String,
 }
 
@@ -59,7 +59,7 @@ where
                         let organization_id = self.organization_id;
                         let workspace_id = self.workspace_id;
                         let api_key_id = self.api_key_id;
-                        let model_id = self.model_id.clone();
+                        let model_id = self.model_id;
                         let request_type = self.request_type.clone();
                         let input_tokens = usage.prompt_tokens;
                         let output_tokens = usage.completion_tokens;
@@ -148,7 +148,7 @@ impl CompletionServiceImpl {
         organization_id: Uuid,
         workspace_id: Uuid,
         api_key_id: Uuid,
-        model_id: String,
+        model_id: Uuid,
         request_type: &str,
     ) -> StreamingResult {
         let intercepted_stream = InterceptStream {
@@ -218,7 +218,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // Verify model exists in database (has pricing configured)
         // This prevents execution of unconfigured models and ensures billing can occur
-        if self
+        let model = self
             .models_repository
             .get_model_by_name(&canonical_name)
             .await
@@ -226,21 +226,24 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 ports::CompletionError::InvalidModel(format!(
                     "Failed to validate model configuration: {e}"
                 ))
-            })?
-            .is_none()
-        {
-            // Model not found in database - get list of configured models for error message
-            let configured_models = self
-                .models_repository
-                .get_configured_model_names()
-                .await
-                .unwrap_or_else(|_| vec!["Unable to fetch configured models".to_string()]);
+            })?;
 
-            return Err(ports::CompletionError::InvalidModel(format!(
-                "Model '{}' is not configured. Available models: {:?}",
-                request.model, configured_models
-            )));
-        }
+        let model = match model {
+            Some(m) => m,
+            None => {
+                // Model not found in database - get list of configured models for error message
+                let configured_models = self
+                    .models_repository
+                    .get_configured_model_names()
+                    .await
+                    .unwrap_or_else(|_| vec!["Unable to fetch configured models".to_string()]);
+
+                return Err(ports::CompletionError::InvalidModel(format!(
+                    "Model '{}' is not configured. Available models: {:?}",
+                    request.model, configured_models
+                )));
+            }
+        };
 
         // Update params with canonical name if it's different
         if canonical_name != request.model {
@@ -269,14 +272,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         };
 
         // Create the completion event stream with usage tracking
-        // Use canonical_name for usage tracking to ensure pricing lookup works
+        // Use model UUID for usage tracking
         let event_stream = self
             .handle_stream_with_context(
                 llm_stream,
                 organization_id,
                 workspace_id,
                 api_key_id,
-                canonical_name,
+                model.id,
                 request_type,
             )
             .await;
@@ -327,7 +330,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // Verify model exists in database (has pricing configured)
         // This prevents execution of unconfigured models and ensures billing can occur
-        if self
+        let model = self
             .models_repository
             .get_model_by_name(&canonical_name)
             .await
@@ -335,21 +338,24 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 ports::CompletionError::InvalidModel(format!(
                     "Failed to validate model configuration: {e}"
                 ))
-            })?
-            .is_none()
-        {
-            // Model not found in database - get list of configured models for error message
-            let configured_models = self
-                .models_repository
-                .get_configured_model_names()
-                .await
-                .unwrap_or_else(|_| vec!["Unable to fetch configured models".to_string()]);
+            })?;
 
-            return Err(ports::CompletionError::InvalidModel(format!(
-                "Model '{}' is not configured. Available models: {:?}",
-                request.model, configured_models
-            )));
-        }
+        let model = match model {
+            Some(m) => m,
+            None => {
+                // Model not found in database - get list of configured models for error message
+                let configured_models = self
+                    .models_repository
+                    .get_configured_model_names()
+                    .await
+                    .unwrap_or_else(|_| vec!["Unable to fetch configured models".to_string()]);
+
+                return Err(ports::CompletionError::InvalidModel(format!(
+                    "Model '{}' is not configured. Available models: {:?}",
+                    request.model, configured_models
+                )));
+            }
+        };
 
         // Update params with canonical name if it's different
         if canonical_name != request.model {
@@ -383,14 +389,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             }
         });
 
-        // Record usage
+        // Record usage with model UUID
         let usage_service = self.usage_service.clone();
         let organization_id = request.organization_id;
         let workspace_id = request.workspace_id;
         let api_key_id = uuid::Uuid::parse_str(&request.api_key_id).map_err(|e| {
             ports::CompletionError::InvalidParams(format!("Invalid API key ID: {e}"))
         })?;
-        let model_id = response_with_bytes.response.model.clone();
+        let model_id = model.id;
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
         let output_tokens = response_with_bytes.response.usage.completion_tokens;
 

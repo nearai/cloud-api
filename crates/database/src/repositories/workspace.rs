@@ -5,6 +5,7 @@ use crate::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
+use services::workspace::{WorkspaceOrderBy, WorkspaceOrderDirection};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -159,7 +160,21 @@ impl WorkspaceRepository {
         organization_id: Uuid,
         limit: i64,
         offset: i64,
+        order_by: Option<WorkspaceOrderBy>,
+        order_direction: Option<WorkspaceOrderDirection>,
     ) -> Result<Vec<Workspace>> {
+        let order_by = order_by.unwrap_or(WorkspaceOrderBy::CreatedAt);
+        let order_direction = order_direction.unwrap_or(WorkspaceOrderDirection::Asc);
+
+        let order_by_column = match order_by {
+            WorkspaceOrderBy::CreatedAt => "created_at",
+        };
+
+        let order_dir = match order_direction {
+            WorkspaceOrderDirection::Asc => "ASC",
+            WorkspaceOrderDirection::Desc => "DESC",
+        };
+
         let client = self
             .pool
             .get()
@@ -168,7 +183,7 @@ impl WorkspaceRepository {
 
         let rows = client
             .query(
-                "SELECT * FROM workspaces WHERE organization_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3",
+                &format!("SELECT * FROM workspaces WHERE organization_id = $1 ORDER BY {} {} LIMIT $2 OFFSET $3", order_by_column, order_dir),
                 &[&organization_id, &limit, &offset],
             )
             .await
@@ -413,9 +428,17 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
         organization_id: services::organization::OrganizationId,
         limit: i64,
         offset: i64,
+        order_by: Option<WorkspaceOrderBy>,
+        order_direction: Option<WorkspaceOrderDirection>,
     ) -> anyhow::Result<Vec<services::workspace::Workspace>> {
         let workspaces = self
-            .list_by_organization_paginated(organization_id.0, limit, offset)
+            .list_by_organization_paginated(
+                organization_id.0,
+                limit,
+                offset,
+                order_by,
+                order_direction,
+            )
             .await?;
         Ok(workspaces
             .into_iter()

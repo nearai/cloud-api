@@ -13,10 +13,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use services::organization::OrganizationId;
+use services::workspace::{WorkspaceOrderBy, WorkspaceOrderDirection};
 use tracing::{debug, error};
 use utoipa::ToSchema;
 use uuid::Uuid;
-
 // ============================================
 // Workspace Models
 // ============================================
@@ -68,6 +68,8 @@ pub struct ListParams {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+    pub order_by: Option<WorkspaceOrderBy>,
+    pub order_direction: Option<WorkspaceOrderDirection>,
 }
 
 // ============================================
@@ -230,6 +232,8 @@ pub async fn list_organization_workspaces(
             user_id,
             params.limit,
             params.offset,
+            params.order_by,
+            params.order_direction,
         )
         .await
     {

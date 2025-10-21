@@ -211,6 +211,9 @@ pub struct ChatCompletionParams {
     /// Streaming options
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
+
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Parameters for text completion requests (legacy OpenAI API)

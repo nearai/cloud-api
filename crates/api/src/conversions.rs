@@ -44,6 +44,7 @@ impl From<&ChatCompletionRequest> for services::ChatCompletionParams {
             metadata: None,
             store: None,
             stream_options: None,
+            extra: req.extra.clone(),
         }
     }
 }
@@ -543,6 +544,8 @@ pub fn db_user_to_admin_user(user: &database::User) -> AdminUserResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     #[test]
@@ -579,6 +582,8 @@ mod tests {
             stop: Some(vec!["\\n".to_string()]),
             presence_penalty: None,
             frequency_penalty: None,
+
+            extra: HashMap::new(),
         };
 
         let domain_params: services::ChatCompletionParams = (&http_req).into();

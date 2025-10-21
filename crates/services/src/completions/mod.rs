@@ -242,7 +242,24 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .chat_completion_stream(chat_params, request.body_hash.clone())
             .await
             .map_err(|e| {
-                ports::CompletionError::ProviderError(format!("Failed to create LLM stream: {e}"))
+                // Check if this is a client error (HTTP 4xx) from the provider
+                let error_str = e.to_string();
+                if error_str.contains("HTTP 4") || error_str.contains("Bad Request") {
+                    // For client errors (4xx), return detailed message to help user fix their request
+                    ports::CompletionError::InvalidParams(format!(
+                        "Invalid request parameters: {e}"
+                    ))
+                } else {
+                    // For server errors (5xx), log details but return generic message to user
+                    tracing::error!(
+                        model = %request.model,
+                        error = %e,
+                        "Provider error during chat completion stream"
+                    );
+                    ports::CompletionError::ProviderError(
+                        "The model is currently unavailable. Please try again later.".to_string(),
+                    )
+                }
             })?;
 
         // Determine request type
@@ -334,7 +351,24 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .chat_completion(chat_params, request.body_hash.clone())
             .await
             .map_err(|e| {
-                ports::CompletionError::ProviderError(format!("Failed to create completion: {e}"))
+                // Check if this is a client error (HTTP 4xx) from the provider
+                let error_str = e.to_string();
+                if error_str.contains("HTTP 4") || error_str.contains("Bad Request") {
+                    // For client errors (4xx), return detailed message to help user fix their request
+                    ports::CompletionError::InvalidParams(format!(
+                        "Invalid request parameters: {e}"
+                    ))
+                } else {
+                    // For server errors (5xx), log details but return generic message to user
+                    tracing::error!(
+                        model = %request.model,
+                        error = %e,
+                        "Provider error during chat completion"
+                    );
+                    ports::CompletionError::ProviderError(
+                        "The model is currently unavailable. Please try again later.".to_string(),
+                    )
+                }
             })?;
 
         // Store attestation signature

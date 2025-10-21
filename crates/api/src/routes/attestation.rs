@@ -135,7 +135,11 @@ impl From<inference_providers::VllmAttestationReport> for Attestation {
             nvidia_payload: report.nvidia_payload,
             event_log: report.event_log,
             info: report.info,
-            all_attestations: report.all_attestations.into_iter().map(Self::from).collect(),
+            all_attestations: report
+                .all_attestations
+                .into_iter()
+                .map(Self::from)
+                .collect(),
         }
     }
 }
@@ -177,7 +181,11 @@ impl From<services::attestation::models::VllmAttestationReport> for VllmAttestat
             nvidia_payload: report.nvidia_payload,
             event_log: report.event_log,
             info: report.info,
-            all_attestations: report.all_attestations.into_iter().map(Self::from).collect(),
+            all_attestations: report
+                .all_attestations
+                .into_iter()
+                .map(Self::from)
+                .collect(),
         }
     }
 }

@@ -20,10 +20,8 @@ pub struct ModelInfo {
 #[derive(Debug, Clone)]
 pub struct ModelWithPricing {
     pub id: Uuid,
-    /// Internal/canonical model name (e.g., "nearai/gpt-oss-120b") used for vLLM
+    /// Canonical model name (e.g., "nearai/gpt-oss-120b") used for vLLM
     pub model_name: String,
-    /// Public-facing model name (e.g., "openai/gpt-oss-120b") shown to API consumers
-    pub public_name: String,
     pub model_display_name: String,
     pub model_description: String,
     pub model_icon: Option<String>,
@@ -66,12 +64,14 @@ pub trait ModelsRepository: Send + Sync {
         model_name: &str,
     ) -> Result<Option<ModelWithPricing>, anyhow::Error>;
 
-    /// Resolve a model name (which could be an alias) to its canonical name
-    /// If the input is an alias, resolves to the canonical name
-    /// If the input is already canonical, returns it as-is
-    async fn resolve_to_canonical_name(&self, model_name: &str) -> Result<String, anyhow::Error>;
+    /// Resolve a model identifier (alias or canonical name) and return the full model details
+    /// Returns None if the model is not found or not active
+    async fn resolve_and_get_model(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<ModelWithPricing>, anyhow::Error>;
 
-    /// Get list of configured model names (public names) from database
+    /// Get list of configured model names (canonical names) from database
     /// Returns only active models that have been configured with pricing
     async fn get_configured_model_names(&self) -> Result<Vec<String>, anyhow::Error>;
 }
@@ -91,7 +91,7 @@ pub trait ModelsServiceTrait: Send + Sync {
     /// Get a specific model by name
     async fn get_model_by_name(&self, model_name: &str) -> Result<ModelWithPricing, ModelsError>;
 
-    /// Get list of configured model names (public names) from database
+    /// Get list of configured model names (canonical names) from database
     /// Returns only active models that have been configured with pricing
     async fn get_configured_model_names(&self) -> Result<Vec<String>, ModelsError>;
 }

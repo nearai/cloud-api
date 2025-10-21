@@ -418,11 +418,14 @@ impl AuthServiceTrait for MockAuthService {
         access_token: String,
         encoding_key: String,
     ) -> Result<Option<AccessTokenClaims>, AuthError> {
-        // Allow any string, no exp checking
+        // Allow any string, no exp checking (useful for testing)
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+        validation.validate_exp = false;
+
         let claims = if let Ok(claims) = jsonwebtoken::decode::<AccessTokenClaims>(
             access_token,
             &jsonwebtoken::DecodingKey::from_secret(encoding_key.as_bytes()),
-            &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256),
+            &validation,
         ) {
             claims
         } else {

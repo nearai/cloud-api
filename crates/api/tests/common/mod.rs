@@ -322,7 +322,13 @@ pub fn compute_sha256(data: &str) -> String {
 
 pub fn decode_access_token_claims(token: &str) -> AccessTokenClaims {
     let token_parts: Vec<&str> = token.split(".").collect();
-    let token_claims_raw = base64::engine::general_purpose::STANDARD
+    assert!(
+        token_parts.len() >= 2,
+        "Invalid JWT format: expected at least 2 parts (header.payload), got {} parts",
+        token_parts.len()
+    );
+    // JWTs use base64url encoding without padding per RFC 7515
+    let token_claims_raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(token_parts[1])
         .unwrap();
     serde_json::from_slice(&token_claims_raw).unwrap()

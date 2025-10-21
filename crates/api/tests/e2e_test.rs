@@ -2282,7 +2282,7 @@ async fn test_admin_create_access_token_unauthorized() {
 }
 
 #[tokio::test]
-#[ignore] // the implementation of MockAuthService accept any string as valid token, so this test won't pass
+#[ignore] // the implementation of MockAuthService accepts any string as valid token, so this test won't pass
 async fn test_admin_create_access_token_invalid_token() {
     let server = setup_test_server().await;
 

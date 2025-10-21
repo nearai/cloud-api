@@ -14,7 +14,7 @@ pub use repositories::{
     SessionRepository, UserRepository,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result};
 use cluster_manager::{ClusterManager, DatabaseConfig as ClusterDbConfig, ReadPreference};
 use deadpool::Runtime;
 use patroni_discovery::PatroniDiscovery;
@@ -155,20 +155,19 @@ impl Database {
         use tokio_postgres::NoTls;
 
         let mut pg_config = deadpool_postgres::Config::new();
-        pg_config.host = Some(config.host.clone().expect("DATABASE_HOST is not set"));
+        pg_config.host = Some(config.host.clone().unwrap_or_else(|| "localhost".to_string()));
         pg_config.port = Some(config.port);
         pg_config.dbname = Some(config.database.clone());
         pg_config.user = Some(config.username.clone());
         pg_config.password = Some(config.password.clone());
 
         let pool = if config.tls_enabled {
-            create_pool_with_native_tls(pg_config, true)
+            create_pool_with_native_tls(pg_config, true)?
         } else {
             pg_config
-                .create_pool(Some(Runtime::Tokio1), NoTls)
-                .map_err(|e| anyhow!("Failed to create pool: {}", e))
+                .create_pool(Some(Runtime::Tokio1), NoTls)?
         };
 
-        Ok(Self::new(pool.expect("Failed to create database pool")))
+        Ok(Self::new(pool))
     }
 }

@@ -121,6 +121,10 @@ pub struct Attestation {
     pub signing_address: String,
     pub intel_quote: String,
     pub nvidia_payload: String, // Stored as JSON string
+    pub event_log: serde_json::Value,
+    pub info: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub all_attestations: Vec<Attestation>,
 }
 
 impl From<inference_providers::VllmAttestationReport> for Attestation {
@@ -129,6 +133,9 @@ impl From<inference_providers::VllmAttestationReport> for Attestation {
             signing_address: report.signing_address,
             intel_quote: report.intel_quote,
             nvidia_payload: report.nvidia_payload,
+            event_log: report.event_log,
+            info: report.info,
+            all_attestations: report.all_attestations.into_iter().map(Self::from).collect(),
         }
     }
 }
@@ -156,6 +163,10 @@ pub struct VllmAttestationReport {
     pub signing_address: String,
     pub intel_quote: String,
     pub nvidia_payload: String,
+    pub event_log: serde_json::Value,
+    pub info: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub all_attestations: Vec<VllmAttestationReport>,
 }
 
 impl From<services::attestation::models::VllmAttestationReport> for VllmAttestationReport {
@@ -164,6 +175,9 @@ impl From<services::attestation::models::VllmAttestationReport> for VllmAttestat
             signing_address: report.signing_address,
             intel_quote: report.intel_quote,
             nvidia_payload: report.nvidia_payload,
+            event_log: report.event_log,
+            info: report.info,
+            all_attestations: report.all_attestations.into_iter().map(Self::from).collect(),
         }
     }
 }

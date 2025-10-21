@@ -115,41 +115,14 @@ pub struct NvidiaPayload {
     pub evidence_list: Vec<Evidence>,
 }
 
-/// Individual attestation entry
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct Attestation {
-    pub signing_address: String,
-    pub intel_quote: String,
-    pub nvidia_payload: String, // Stored as JSON string
-    pub event_log: serde_json::Value,
-    pub info: serde_json::Value,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub all_attestations: Vec<Attestation>,
-}
-
-impl From<inference_providers::VllmAttestationReport> for Attestation {
-    fn from(report: inference_providers::VllmAttestationReport) -> Self {
-        Self {
-            signing_address: report.signing_address,
-            intel_quote: report.intel_quote,
-            nvidia_payload: report.nvidia_payload,
-            event_log: report.event_log,
-            info: report.info,
-            all_attestations: report
-                .all_attestations
-                .into_iter()
-                .map(Self::from)
-                .collect(),
-        }
-    }
-}
-
 /// Response for attestation report endpoint
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
-
 pub struct DstackCpuQuote {
     pub quote: String,
     pub event_log: String,
+    pub report_data: String,
+    pub request_nonce: String,
+    pub info: serde_json::Value,
 }
 
 impl From<services::attestation::models::DstackCpuQuote> for DstackCpuQuote {
@@ -157,35 +130,9 @@ impl From<services::attestation::models::DstackCpuQuote> for DstackCpuQuote {
         Self {
             quote: quote.quote,
             event_log: quote.event_log,
-        }
-    }
-}
-
-/// VLLM attestation report
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct VllmAttestationReport {
-    pub signing_address: String,
-    pub intel_quote: String,
-    pub nvidia_payload: String,
-    pub event_log: serde_json::Value,
-    pub info: serde_json::Value,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub all_attestations: Vec<VllmAttestationReport>,
-}
-
-impl From<services::attestation::models::VllmAttestationReport> for VllmAttestationReport {
-    fn from(report: services::attestation::models::VllmAttestationReport) -> Self {
-        Self {
-            signing_address: report.signing_address,
-            intel_quote: report.intel_quote,
-            nvidia_payload: report.nvidia_payload,
-            event_log: report.event_log,
-            info: report.info,
-            all_attestations: report
-                .all_attestations
-                .into_iter()
-                .map(Self::from)
-                .collect(),
+            report_data: quote.report_data,
+            request_nonce: quote.request_nonce,
+            info: quote.info,
         }
     }
 }
@@ -194,18 +141,14 @@ impl From<services::attestation::models::VllmAttestationReport> for VllmAttestat
 pub struct AttestationResponse {
     pub gateway_attestation: DstackCpuQuote,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub model_attestations: Vec<VllmAttestationReport>,
+    pub all_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl From<services::attestation::models::AttestationReport> for AttestationResponse {
     fn from(report: services::attestation::models::AttestationReport) -> Self {
         Self {
             gateway_attestation: report.gateway_attestation.into(),
-            model_attestations: report
-                .model_attestations
-                .into_iter()
-                .map(VllmAttestationReport::from)
-                .collect(),
+            all_attestations: report.all_attestations,
         }
     }
 }

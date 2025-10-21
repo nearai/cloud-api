@@ -66,11 +66,10 @@ use tokio_stream::StreamExt;
 
 // Re-export commonly used types for convenience
 pub use models::{
-    AttestationReportParams, ChatCompletionParams, ChatCompletionResponse,
-    ChatCompletionResponseChoice, ChatCompletionResponseWithBytes, ChatDelta, ChatMessage,
-    ChatResponseMessage, ChatSignature, CompletionError, CompletionParams, FinishReason,
-    MessageRole, ModelInfo, NvidiaPayload, StreamChunk, StreamOptions, TokenUsage,
-    VllmAttestationReport,
+    ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
+    ChatCompletionResponseWithBytes, ChatDelta, ChatMessage, ChatResponseMessage, ChatSignature,
+    CompletionError, CompletionParams, FinishReason, MessageRole, ModelInfo, StreamChunk,
+    StreamOptions, TokenUsage,
 };
 pub use sse_parser::SSEEvent;
 pub use vllm::{VLlmConfig, VLlmProvider};
@@ -139,5 +138,5 @@ pub trait InferenceProvider {
         signing_algo: Option<String>,
         nonce: Option<String>,
         signing_address: Option<String>,
-    ) -> Result<Vec<VllmAttestationReport>, CompletionError>;
+    ) -> Result<serde_json::Map<String, serde_json::Value>, CompletionError>;
 }

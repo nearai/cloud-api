@@ -82,7 +82,7 @@ impl InferenceProvider for VLlmProvider {
         _signing_algo: Option<String>,
         nonce: Option<String>,
         signing_address: Option<String>,
-    ) -> Result<Vec<VllmAttestationReport>, CompletionError> {
+    ) -> Result<serde_json::Map<String, serde_json::Value>, CompletionError> {
         // Build URL with optional query parameters
         let mut url = format!(
             "{}/v1/attestation/report?model={}",
@@ -117,7 +117,7 @@ impl InferenceProvider for VLlmProvider {
             .json()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
-        Ok(vec![attestation_report])
+        Ok(attestation_report)
     }
 
     /// Lists all available models from the vLLM server

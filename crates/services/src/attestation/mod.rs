@@ -4,7 +4,7 @@ pub use models::{AttestationError, ChatSignature};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use inference_providers::InferenceProvider;
+use rand::RngCore;
 
 use crate::{
     attestation::{
@@ -89,7 +89,24 @@ impl ports::AttestationServiceTrait for AttestationService {
         signing_address: Option<String>,
     ) -> Result<AttestationReport, AttestationError> {
         // Resolve model name (could be an alias) and get model details
-        let mut model_attestations = vec![];
+        let mut all_attestations = vec![];
+        // Create a nonce if none was provided
+        let nonce = match nonce {
+            Some(n) => n,
+            None => {
+                let mut nonce_bytes = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+                let generated_nonce = nonce_bytes
+                    .into_iter()
+                    .map(|byte| format!("{:02x}", byte))
+                    .collect::<String>();
+                tracing::debug!(
+                    "No nonce provided for attestation report, generated nonce: {}",
+                    generated_nonce
+                );
+                generated_nonce
+            }
+        };
         if let Some(model) = model {
             let resolved_model = self
                 .models_repository
@@ -116,45 +133,65 @@ impl ports::AttestationServiceTrait for AttestationService {
                 );
             }
 
-            model_attestations = self
+            all_attestations = self
                 .inference_provider_pool
                 .get_attestation_report(
                     canonical_name.clone(),
                     signing_algo,
-                    nonce,
+                    Some(nonce.clone()),
                     signing_address,
                 )
                 .await
                 .map_err(|e| AttestationError::ProviderError(e.to_string()))?;
         }
+
         let gateway_attestation;
         if let Ok(_dev) = std::env::var("DEV") {
             gateway_attestation = DstackCpuQuote {
                 quote: "0x1234567890abcdef".to_string(),
                 event_log: "0x1234567890abcdef".to_string(),
-                vm_config: "0x1234567890abcdef".to_string(),
                 report_data: "0x1234567890abcdef".to_string(),
+                request_nonce: nonce.clone(),
+                info: serde_json::json!({
+                "app_id": "dev-app-id",
+                "instance_id": "dev-instance-id",
+                "app_cert": "dev-app-cert",
+                "tcb_info": {},
+                "app_name": "dev-app-name",
+                "device_id": "dev-device-id",
+                "mr_aggregated": "dev-mr-aggregated",
+                "os_image_hash": "dev-os-image-hash",
+                "key_provider_info": "dev-key-provider-info",
+                "compose_hash": "dev-compose-hash",
+                "vm_config": {},
+                }),
             };
         } else {
             let client = dstack_client::DstackClient::new(None);
-            gateway_attestation = client
-                .get_quote(vec![8])
-                .await
-                .map_err(|e| {
-                    tracing::error!(
-                        "Failed to get cloud API attestation, are you running in a CVM? {:?}",
-                        e
-                    );
-                    AttestationError::InternalError(
-                        "failed to get cloud API attestation".to_string(),
-                    )
-                })?
-                .into();
+            // nonce has 32 bytes, dstack pads to 64
+            let report_data = (&nonce).as_bytes().to_vec();
+
+            let info = client.info().await.map_err(|e| {
+                tracing::error!(
+                    "Failed to get cloud API attestation info, are you running in a CVM? {e:?}"
+                );
+                AttestationError::InternalError(
+                    "failed to get cloud API attestation info".to_string(),
+                )
+            })?;
+
+            let cpu_quote = client.get_quote(report_data).await.map_err(|e| {
+                tracing::error!(
+                    "Failed to get cloud API attestation, are you running in a CVM? {e:?}"
+                );
+                AttestationError::InternalError("failed to get cloud API attestation".to_string())
+            })?;
+            gateway_attestation = DstackCpuQuote::from_quote_and_nonce(info, cpu_quote, nonce);
         }
 
         Ok(AttestationReport {
             gateway_attestation,
-            model_attestations,
+            all_attestations,
         })
     }
 }

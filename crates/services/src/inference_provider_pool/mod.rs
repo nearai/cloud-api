@@ -1,8 +1,7 @@
-use async_trait::async_trait;
 use inference_providers::{
     models::{CompletionError, ListModelsError, ModelsResponse},
-    ChatCompletionParams, ChatSignature, CompletionParams, InferenceProvider, StreamingResult,
-    StreamingResultExt, VLlmConfig, VLlmProvider, VllmAttestationReport,
+    ChatCompletionParams, CompletionParams, InferenceProvider, StreamingResult, StreamingResultExt,
+    VLlmConfig, VLlmProvider,
 };
 use serde::Deserialize;
 use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
@@ -403,53 +402,19 @@ impl InferenceProviderPool {
             error_details
         )))
     }
-}
 
-#[async_trait]
-impl InferenceProvider for InferenceProviderPool {
-    async fn get_signature(&self, chat_id: &str) -> Result<ChatSignature, CompletionError> {
-        // First try to get the specific provider for this chat_id
-        if let Some(provider) = self.get_provider_by_chat_id(chat_id).await {
-            tracing::info!(
-                chat_id = %chat_id,
-                "Found mapped provider for chat_id, calling get_signature"
-            );
-            return provider.get_signature(chat_id).await;
-        }
-
-        // Fallback to trying all discovered providers if chat_id mapping not found
-        tracing::warn!(
-            chat_id = %chat_id,
-            "No provider mapping found for chat_id, trying all discovered providers"
-        );
-
-        let model_mapping = self.model_mapping.read().await;
-        for providers in model_mapping.values() {
-            for provider in providers {
-                match provider.get_signature(chat_id).await {
-                    Ok(signature) => return Ok(signature),
-                    Err(_) => continue, // Try next provider
-                }
-            }
-        }
-
-        Err(CompletionError::CompletionError(format!(
-            "No provider found with signature for chat_id: {chat_id}"
-        )))
-    }
-
-    async fn get_attestation_report(
+    pub async fn get_attestation_report(
         &self,
         model: String,
         signing_algo: Option<String>,
         nonce: Option<String>,
         signing_address: Option<String>,
-    ) -> Result<Vec<VllmAttestationReport>, CompletionError> {
+    ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, CompletionError> {
         // Get all providers for this model
         let mut all_attestations = vec![];
 
         if let Some(providers) = self.get_providers_for_model(&model).await {
-            // Broadcast to all providers (load balancer behavior)
+            // Broadcast to all providers
             for provider in providers {
                 match provider
                     .get_attestation_report(
@@ -460,18 +425,10 @@ impl InferenceProvider for InferenceProviderPool {
                     )
                     .await
                 {
-                    Ok(attestations) => {
-                        // When signing_address is specified, merge all_attestations arrays
-                        // from each provider's response
-                        for attestation in attestations {
-                            if !attestation.all_attestations.is_empty() {
-                                // Provider returned all_attestations, merge them
-                                all_attestations.extend(attestation.all_attestations);
-                            } else {
-                                // Provider returned single attestation, add it
-                                all_attestations.push(attestation);
-                            }
-                        }
+                    Ok(mut attestation) => {
+                        // Remove 'all_attestations' field if present
+                        attestation.remove("all_attestations");
+                        all_attestations.push(attestation);
                     }
                     Err(e) => {
                         // Log and continue to next provider (404 is expected when
@@ -495,11 +452,11 @@ impl InferenceProvider for InferenceProviderPool {
         Ok(all_attestations)
     }
 
-    async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
+    pub async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
         self.discover_models().await
     }
 
-    async fn chat_completion_stream(
+    pub async fn chat_completion_stream(
         &self,
         params: ChatCompletionParams,
         request_hash: String,
@@ -537,7 +494,7 @@ impl InferenceProvider for InferenceProviderPool {
         Ok(Box::pin(peekable))
     }
 
-    async fn chat_completion(
+    pub async fn chat_completion(
         &self,
         params: ChatCompletionParams,
         request_hash: String,

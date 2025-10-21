@@ -4,9 +4,7 @@ use crate::attestation::ports::AttestationServiceTrait;
 use crate::inference_provider_pool::InferenceProviderPool;
 use crate::models::ModelsRepository;
 use crate::usage::{RecordUsageServiceRequest, UsageServiceTrait};
-use inference_providers::{
-    ChatMessage, InferenceProvider, MessageRole, SSEEvent, StreamChunk, StreamingResult,
-};
+use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, StreamingResult};
 use std::sync::Arc;
 use uuid::Uuid;
 

@@ -14,7 +14,7 @@ use crate::{
             current_user, github_login, google_login, login_page, logout, oauth_callback,
             StateStore,
         },
-        completions::{chat_completions, completions, models},
+        completions::{chat_completions, models},
         conversations,
         models::{get_model_by_name, list_models, ModelsAppState},
         responses,
@@ -508,7 +508,7 @@ pub fn build_completion_routes(
     // Routes that require credits (actual inference)
     let inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
-        .route("/completions", post(completions))
+        // .route("/completions", post(completions))
         .with_state(app_state.clone())
         // First check usage limits for inference endpoints
         .layer(from_fn_with_state(

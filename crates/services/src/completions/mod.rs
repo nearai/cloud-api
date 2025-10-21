@@ -59,7 +59,7 @@ where
                         let organization_id = self.organization_id;
                         let workspace_id = self.workspace_id;
                         let api_key_id = self.api_key_id;
-                        let model_id = self.model_id.clone();
+                        let model_id = self.model_id;
                         let request_type = self.request_type.clone();
                         let input_tokens = usage.prompt_tokens;
                         let output_tokens = usage.completion_tokens;

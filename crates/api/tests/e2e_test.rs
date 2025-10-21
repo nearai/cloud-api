@@ -1236,7 +1236,7 @@ async fn test_completion_cost_calculation() {
 
     println!("Latest usage entry: {latest_entry:?}");
     assert_eq!(
-        latest_entry.model_id, model_name,
+        latest_entry.model, model_name,
         "Should record correct model"
     );
     assert_eq!(
@@ -1758,20 +1758,20 @@ async fn test_model_aliases() {
     let history = history_response.json::<api::routes::usage::UsageHistoryResponse>();
     println!("Usage history entries: {}", history.data.len());
 
-    // Check that usage is recorded with canonical model names, not aliases
+    // Check that usage is recorded with canonical model names
     for entry in &history.data {
         println!(
             "Usage entry: model={}, input_tokens={}, output_tokens={}, cost={}",
-            entry.model_id, entry.input_tokens, entry.output_tokens, entry.total_cost
+            entry.model, entry.input_tokens, entry.output_tokens, entry.total_cost
         );
 
-        // Model IDs in usage should be canonical names
+        // Verify model is a canonical model name
         assert!(
-            entry.model_id == "nearai/gpt-oss-120b"
-                || entry.model_id == "deepseek-ai/DeepSeek-V3.1"
-                || entry.model_id == "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            entry.model == "nearai/gpt-oss-120b"
+                || entry.model == "deepseek-ai/DeepSeek-V3.1"
+                || entry.model == "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "Usage should be tracked with canonical model name, got: {}",
-            entry.model_id
+            entry.model
         );
     }
 

@@ -443,24 +443,56 @@ impl InferenceProvider for InferenceProviderPool {
         model: String,
         signing_algo: Option<String>,
         nonce: Option<String>,
+        signing_address: Option<String>,
     ) -> Result<Vec<VllmAttestationReport>, CompletionError> {
-        // Get the first provider for this model
-        let mut attestations = vec![];
+        // Get all providers for this model
+        let mut all_attestations = vec![];
+
         if let Some(providers) = self.get_providers_for_model(&model).await {
+            // Broadcast to all providers (load balancer behavior)
             for provider in providers {
-                attestations.extend(
-                    provider
-                        .get_attestation_report(model.clone(), signing_algo.clone(), nonce.clone())
-                        .await?,
-                );
+                match provider
+                    .get_attestation_report(
+                        model.clone(),
+                        signing_algo.clone(),
+                        nonce.clone(),
+                        signing_address.clone(),
+                    )
+                    .await
+                {
+                    Ok(attestations) => {
+                        // When signing_address is specified, merge all_attestations arrays
+                        // from each provider's response
+                        for attestation in attestations {
+                            if !attestation.all_attestations.is_empty() {
+                                // Provider returned all_attestations, merge them
+                                all_attestations.extend(attestation.all_attestations);
+                            } else {
+                                // Provider returned single attestation, add it
+                                all_attestations.push(attestation);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Log and continue to next provider (404 is expected when
+                        // signing_address doesn't match)
+                        tracing::debug!(
+                            model = %model,
+                            error = %e,
+                            "Provider returned error for attestation request, continuing to next provider"
+                        );
+                    }
+                }
             }
         }
-        if attestations.is_empty() {
+
+        if all_attestations.is_empty() {
             return Err(CompletionError::CompletionError(format!(
                 "No provider found that supports attestation reports for model: {model}"
             )));
         }
-        Ok(attestations)
+
+        Ok(all_attestations)
     }
 
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {

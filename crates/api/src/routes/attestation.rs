@@ -76,6 +76,7 @@ pub struct AttestationQuery {
     pub model: Option<String>,
     pub signing_algo: Option<String>,
     pub nonce: Option<String>,
+    pub signing_address: Option<String>,
 }
 
 /// Validate nonce format: must be 0x + 64 hex chars (32 bytes)
@@ -218,7 +219,7 @@ pub async fn get_attestation_report(
 
     let report = app_state
         .attestation_service
-        .get_attestation_report(params.model, params.signing_algo, params.nonce)
+        .get_attestation_report(params.model, params.signing_algo, params.nonce, params.signing_address)
         .await
         .map_err(|e| {
             (

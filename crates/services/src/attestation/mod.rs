@@ -86,6 +86,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         model: Option<String>,
         signing_algo: Option<String>,
         nonce: Option<String>,
+        signing_address: Option<String>,
     ) -> Result<AttestationReport, AttestationError> {
         // Resolve model name (could be an alias) and get model details
         let mut model_attestations = vec![];
@@ -117,7 +118,12 @@ impl ports::AttestationServiceTrait for AttestationService {
 
             model_attestations = self
                 .inference_provider_pool
-                .get_attestation_report(canonical_name.clone(), signing_algo, nonce)
+                .get_attestation_report(
+                    canonical_name.clone(),
+                    signing_algo,
+                    nonce,
+                    signing_address,
+                )
                 .await
                 .map_err(|e| AttestationError::ProviderError(e.to_string()))?;
         }

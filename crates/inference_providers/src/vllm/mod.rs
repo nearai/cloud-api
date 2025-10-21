@@ -81,18 +81,19 @@ impl InferenceProvider for VLlmProvider {
         model: String,
         _signing_algo: Option<String>,
         nonce: Option<String>,
+        signing_address: Option<String>,
     ) -> Result<Vec<VllmAttestationReport>, CompletionError> {
-        let url = if let Some(nonce) = nonce {
-            format!(
-                "{}/v1/attestation/report?model={}&nonce={}",
-                self.config.base_url, model, nonce
-            )
-        } else {
-            format!(
-                "{}/v1/attestation/report?model={}",
-                self.config.base_url, model
-            )
-        };
+        // Build URL with optional query parameters
+        let mut url = format!("{}/v1/attestation/report?model={}", self.config.base_url, model);
+
+        if let Some(nonce) = nonce {
+            url.push_str(&format!("&nonce={}", nonce));
+        }
+
+        if let Some(signing_address) = signing_address {
+            url.push_str(&format!("&signing_address={}", signing_address));
+        }
+
         let response = self
             .client
             .get(&url)
@@ -100,6 +101,15 @@ impl InferenceProvider for VLlmProvider {
             .send()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+
+        // Handle 404 responses (expected when signing_address doesn't match)
+        if response.status() == 404 {
+            return Err(CompletionError::CompletionError(format!(
+                "Signing address not found on this provider: {}",
+                response.status()
+            )));
+        }
+
         let attestation_report = response
             .json()
             .await

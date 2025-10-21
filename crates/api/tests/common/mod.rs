@@ -1,11 +1,14 @@
 #![allow(dead_code)]
 
 use api::{
-    build_app, init_auth_services, init_domain_services, models::BatchUpdateModelApiRequest,
+    build_app_with_config, init_auth_services, init_domain_services,
+    models::BatchUpdateModelApiRequest,
 };
+use base64::Engine;
 use chrono::Utc;
 use config::ApiConfig;
 use database::Database;
+use services::auth::AccessTokenClaims;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -39,6 +42,7 @@ pub fn test_config() -> ApiConfig {
         },
         auth: config::AuthConfig {
             mock: true,
+            encoding_key: "mock_encoding_key".to_string(),
             github: None,
             google: None,
             admin_domains: vec!["test.com".to_string()],
@@ -112,7 +116,7 @@ pub async fn setup_test_server() -> axum_test::TestServer {
     )
     .await;
 
-    let app = build_app(database, auth_components, domain_services);
+    let app = build_app_with_config(database, auth_components, domain_services, Arc::new(config));
     axum_test::TestServer::new(app).unwrap()
 }
 
@@ -314,4 +318,35 @@ pub fn compute_sha256(data: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+pub fn decode_access_token_claims(token: &str) -> AccessTokenClaims {
+    let token_parts: Vec<&str> = token.split(".").collect();
+    assert!(
+        token_parts.len() >= 2,
+        "Invalid JWT format: expected at least 2 parts (header.payload), got {} parts",
+        token_parts.len()
+    );
+    // JWTs use base64url encoding without padding per RFC 7515
+    let token_claims_raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token_parts[1])
+        .unwrap();
+    serde_json::from_slice(&token_claims_raw).unwrap()
+}
+
+pub fn is_valid_jwt_format(token: &str) -> bool {
+    // Split the token into its parts
+    let parts: Vec<&str> = token.split('.').collect();
+
+    // Check if the JWT has exactly three parts
+    if parts.len() != 3 {
+        return false;
+    }
+
+    // Decode each part and ensure it is base64 encoded
+    parts.iter().take(2).all(|part| {
+        base64::engine::general_purpose::STANDARD
+            .decode(part)
+            .is_ok()
+    })
 }

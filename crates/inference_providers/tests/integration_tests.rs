@@ -101,6 +101,7 @@ async fn test_chat_completion_streaming() {
         metadata: None,
         store: None,
         stream_options: None,
+        extra: std::collections::HashMap::new(),
     };
 
     let stream_result = timeout(
@@ -330,6 +331,7 @@ async fn test_error_handling() {
         metadata: None,
         store: None,
         stream_options: None,
+        extra: std::collections::HashMap::new(),
     };
 
     let result = provider

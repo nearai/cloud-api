@@ -1,9 +1,9 @@
 use crate::middleware::AdminUser;
 use crate::models::{
     AdminAccessTokenResponse, AdminUserResponse, BatchUpdateModelApiRequest,
-    CreateAdminAccessTokenRequest, DecimalPrice, ErrorResponse, ListUsersResponse, ModelMetadata,
-    ModelPricingHistoryEntry, ModelPricingHistoryResponse, ModelWithPricing, OrgLimitsHistoryEntry,
-    OrgLimitsHistoryResponse, SpendLimit, UpdateOrganizationLimitsRequest,
+    CreateAdminAccessTokenRequest, DecimalPrice, ErrorResponse, ListUsersResponse,
+    ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
+    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, SpendLimit, UpdateOrganizationLimitsRequest,
     UpdateOrganizationLimitsResponse,
 };
 use axum::{
@@ -151,23 +151,24 @@ pub async fn batch_upsert_models(
     Ok(ResponseJson(api_models))
 }
 
-/// Get pricing history for a model (Admin only)
+/// Get complete history for a model (Admin only)
 ///
-/// Returns the complete pricing history for a specific model, showing all pricing changes over time.
+/// Returns the complete history for a specific model, showing all changes over time including pricing,
+/// context length, display name, and description.
 ///
 /// **Note:** Model names containing forward slashes (e.g., "Qwen/Qwen3-30B-A3B-Instruct-2507") must be URL-encoded.
 /// For example, use "Qwen%2FQwen3-30B-A3B-Instruct-2507" in the URL path.
 #[utoipa::path(
     get,
-    path = "/admin/models/{model_name}/pricing-history",
+    path = "/admin/models/{model_name}/history",
     tag = "Admin",
     params(
-        ("model_name" = String, Path, description = "Model name to get pricing history for (URL-encode if it contains slashes)"),
+        ("model_name" = String, Path, description = "Model name to get complete history for (URL-encode if it contains slashes)"),
         ("limit" = i64, Query, description = "Maximum number of history entries to return (default: 50)"),
         ("offset" = i64, Query, description = "Number of history entries to skip (default: 0)")
     ),
     responses(
-        (status = 200, description = "Pricing history retrieved successfully", body = ModelPricingHistoryResponse),
+        (status = 200, description = "Model history retrieved successfully", body = ModelHistoryResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
@@ -176,25 +177,25 @@ pub async fn batch_upsert_models(
         ("session_token" = [])
     )
 )]
-pub async fn get_model_pricing_history(
+pub async fn get_model_history(
     State(app_state): State<AdminAppState>,
     Path(model_name): Path<String>,
     Extension(_admin_user): Extension<AdminUser>, // Require admin auth
-    axum::extract::Query(params): axum::extract::Query<PricingHistoryQueryParams>,
-) -> Result<ResponseJson<ModelPricingHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    axum::extract::Query(params): axum::extract::Query<ModelHistoryQueryParams>,
+) -> Result<ResponseJson<ModelHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     debug!(
-        "Get pricing history request for model: {}, limit={}, offset={}",
+        "Get model history request for model: {}, limit={}, offset={}",
         model_name, params.limit, params.offset
     );
 
     let (history, total) = app_state
         .admin_service
-        .get_pricing_history(&model_name, params.limit, params.offset)
+        .get_model_history(&model_name, params.limit, params.offset)
         .await
         .map_err(|e| {
-            error!("Failed to get pricing history: {}", e);
+            error!("Failed to get model history: {}", e);
             match e {
                 services::admin::AdminError::ModelNotFound(_) => (
                     StatusCode::NOT_FOUND,
@@ -214,16 +215,16 @@ pub async fn get_model_pricing_history(
                 _ => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(
-                        "Failed to retrieve pricing history".to_string(),
+                        "Failed to retrieve model history".to_string(),
                         "internal_server_error".to_string(),
                     )),
                 ),
             }
         })?;
 
-    let history_entries: Vec<ModelPricingHistoryEntry> = history
+    let history_entries: Vec<ModelHistoryEntry> = history
         .into_iter()
-        .map(|h| ModelPricingHistoryEntry {
+        .map(|h| ModelHistoryEntry {
             id: h.id.to_string(),
             model_id: h.model_id.to_string(),
             input_cost_per_token: DecimalPrice {
@@ -247,7 +248,7 @@ pub async fn get_model_pricing_history(
         })
         .collect();
 
-    let response = ModelPricingHistoryResponse {
+    let response = ModelHistoryResponse {
         model_name,
         history: history_entries,
         total,
@@ -706,7 +707,7 @@ pub struct ListUsersQueryParams {
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub struct PricingHistoryQueryParams {
+pub struct ModelHistoryQueryParams {
     #[serde(default = "crate::routes::common::default_limit")]
     pub limit: i64,
     #[serde(default)]

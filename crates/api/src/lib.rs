@@ -679,7 +679,7 @@ pub fn build_admin_routes(
 ) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
-        batch_upsert_models, create_admin_access_token, delete_model, get_model_pricing_history,
+        batch_upsert_models, create_admin_access_token, delete_model, get_model_history,
         get_organization_limits_history, list_users, update_organization_limits, AdminAppState,
     };
     use database::repositories::AdminCompositeRepository;
@@ -706,8 +706,8 @@ pub fn build_admin_routes(
             axum::routing::delete(delete_model),
         )
         .route(
-            "/admin/models/{model_name}/pricing-history",
-            axum::routing::get(get_model_pricing_history),
+            "/admin/models/{model_name}/history",
+            axum::routing::get(get_model_history),
         )
         .route(
             "/admin/organizations/{org_id}/limits",

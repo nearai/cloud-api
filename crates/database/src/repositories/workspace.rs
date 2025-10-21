@@ -166,6 +166,15 @@ impl WorkspaceRepository {
         let order_by = order_by.unwrap_or(WorkspaceOrderBy::CreatedAt);
         let order_direction = order_direction.unwrap_or(WorkspaceOrderDirection::Asc);
 
+        let order_by_column = match order_by {
+            WorkspaceOrderBy::CreatedAt => "created_at",
+        };
+
+        let order_dir = match order_direction {
+            WorkspaceOrderDirection::Asc => "ASC",
+            WorkspaceOrderDirection::Desc => "DESC",
+        };
+
         let client = self
             .pool
             .get()
@@ -174,7 +183,7 @@ impl WorkspaceRepository {
 
         let rows = client
             .query(
-                &format!("SELECT * FROM workspaces WHERE organization_id = $1 ORDER BY {order_by} {order_direction} LIMIT $2 OFFSET $3"),
+                &format!("SELECT * FROM workspaces WHERE organization_id = $1 ORDER BY {} {} LIMIT $2 OFFSET $3", order_by_column, order_dir),
                 &[&organization_id, &limit, &offset],
             )
             .await

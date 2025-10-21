@@ -348,7 +348,6 @@ impl InferenceProviderPool {
         );
 
         // Try each provider in order until one succeeds
-        let mut last_error = None;
         for (attempt, provider) in providers.iter().enumerate() {
             tracing::debug!(
                 model_id = %model_id,
@@ -378,7 +377,6 @@ impl InferenceProviderPool {
                         operation = operation_name,
                         "Provider failed, will try next provider if available"
                     );
-                    last_error = Some(e);
                 }
             }
         }
@@ -391,14 +389,12 @@ impl InferenceProviderPool {
             "All providers failed for model"
         );
 
-        Err(last_error.unwrap_or_else(|| {
-            CompletionError::CompletionError(format!(
-                "All {} provider(s) failed for model '{}' during {}",
-                providers.len(),
-                model_id,
-                operation_name
-            ))
-        }))
+        Err(CompletionError::CompletionError(format!(
+            "All {} provider(s) failed for model '{}' during {}",
+            providers.len(),
+            model_id,
+            operation_name
+        )))
     }
 }
 

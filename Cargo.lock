@@ -1012,6 +1012,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "borsh"
+version = "1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad8646f98db542e39fc66e68a20b2144f6a732636df7c2354e74645faaa433ce"
+dependencies = [
+ "borsh-derive",
+ "cfg_aliases",
+]
+
+[[package]]
+name = "borsh-derive"
+version = "1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd1d3c0c2f5833f22386f252fe8ed005c7f59fdcddeef025c01b4c3b9fd9ac3"
+dependencies = [
+ "once_cell",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1603,9 +1626,9 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "dstack-sdk"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d1054906db933d763116630878db9657175a376021e364da3c32eefee1f4bfc"
+checksum = "6f21263be8034d895a3bef0deb4e786a8a401acdcfc49c742b385c1f17508ad4"
 dependencies = [
  "alloy",
  "anyhow",
@@ -1623,12 +1646,13 @@ dependencies = [
 
 [[package]]
 name = "dstack-sdk-types"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fa865c85b0b0c3cb614d9d7d058371c98f786de59c09ae90a4049474598154a"
+checksum = "92088a95c64c01d235c6592a7dd892ab6c7198b371b3a8c15d4cf62566d82138"
 dependencies = [
  "anyhow",
  "bon",
+ "borsh",
  "hex",
  "pkcs8",
  "serde",
@@ -2653,6 +2677,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "dstack-sdk",
+ "dstack-sdk-types",
  "futures-core",
  "futures-util",
  "reqwest 0.12.23",
@@ -4607,6 +4632,7 @@ dependencies = [
  "chrono",
  "config",
  "dstack-sdk",
+ "dstack-sdk-types",
  "futures",
  "futures-util",
  "hex",

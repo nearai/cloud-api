@@ -37,10 +37,10 @@ pub struct ModelPricing {
     pub is_active: bool,
 }
 
-/// Model pricing history entry
+/// Model history entry - includes pricing, context length, and other model attributes
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
-pub struct ModelPricingHistoryEntry {
+pub struct ModelHistoryEntry {
     pub id: uuid::Uuid,
     pub model_id: uuid::Uuid,
     pub input_cost_per_token: i64,
@@ -128,13 +128,13 @@ pub trait AdminRepository: Send + Sync {
         request: UpdateModelAdminRequest,
     ) -> Result<ModelPricing, anyhow::Error>;
 
-    /// Get pricing history for a model with pagination
-    async fn get_pricing_history(
+    /// Get complete history for a model with pagination (includes pricing and other attributes)
+    async fn get_model_history(
         &self,
         model_name: &str,
         limit: i64,
         offset: i64,
-    ) -> Result<(Vec<ModelPricingHistoryEntry>, i64), anyhow::Error>;
+    ) -> Result<(Vec<ModelHistoryEntry>, i64), anyhow::Error>;
 
     /// Soft delete a model by setting is_active to false
     async fn soft_delete_model(&self, model_name: &str) -> Result<bool, anyhow::Error>;
@@ -187,13 +187,13 @@ pub trait AdminService: Send + Sync {
         models: BatchUpdateModelAdminRequest,
     ) -> Result<BatchUpdateModelAdminResponse, AdminError>;
 
-    /// Get pricing history for a model with pagination (admin only)
-    async fn get_pricing_history(
+    /// Get complete history for a model with pagination (admin only) - includes pricing and other attributes
+    async fn get_model_history(
         &self,
         model_name: &str,
         limit: i64,
         offset: i64,
-    ) -> Result<(Vec<ModelPricingHistoryEntry>, i64), AdminError>;
+    ) -> Result<(Vec<ModelHistoryEntry>, i64), AdminError>;
 
     /// Soft delete a model by setting is_active to false (admin only)
     async fn delete_model(&self, model_name: &str) -> Result<(), AdminError>;

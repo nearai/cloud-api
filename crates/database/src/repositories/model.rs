@@ -394,8 +394,8 @@ impl ModelRepository {
         }
     }
 
-    /// Get count of pricing history entries for a model by model name
-    pub async fn count_pricing_history_by_name(&self, model_name: &str) -> Result<i64> {
+    /// Get count of history entries for a model by model name
+    pub async fn count_model_history_by_name(&self, model_name: &str) -> Result<i64> {
         let client = self
             .pool
             .get()
@@ -413,12 +413,12 @@ impl ModelRepository {
                 &[&model_name],
             )
             .await
-            .context("Failed to count pricing history")?;
+            .context("Failed to count model history")?;
         Ok(row.get::<_, i64>("count"))
     }
 
-    /// Get pricing history for a model by model name with pagination
-    pub async fn get_pricing_history_by_name(
+    /// Get complete history for a model by model name with pagination (includes pricing and other attributes)
+    pub async fn get_model_history_by_name(
         &self,
         model_name: &str,
         limit: i64,
@@ -446,7 +446,7 @@ impl ModelRepository {
                 &[&model_name, &limit, &offset],
             )
             .await
-            .context("Failed to query pricing history by name")?;
+            .context("Failed to query model history by name")?;
 
         let history = rows
             .into_iter()

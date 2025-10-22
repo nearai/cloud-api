@@ -6,6 +6,8 @@ rustflags = [
     "--remap-path-prefix", "/usr/local/cargo=/cargo",
     # Disable incremental compilation for reproducibility
     "-C", "incremental=false",
+    # Disable debug info for reproducibility
+    "-C", "debuginfo=0",
 ]
 
 [profile.release]

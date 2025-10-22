@@ -11,8 +11,8 @@ COPY pinned-packages.txt /tmp/
 
 RUN set -e; \
     # Create a sources.list file pointing to a specific snapshot
-    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20251022T143047Z bookworm main' > /etc/apt/sources.list && \
-    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20251022T143047Z bookworm-security main' >> /etc/apt/sources.list && \
+    echo 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20251022T143047Z bookworm main' > /etc/apt/sources.list && \
+    echo 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/20251022T143047Z bookworm-security main' >> /etc/apt/sources.list && \
     echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/10no-check-valid-until && \
     # Create preferences file to pin all packages
     rm -rf /etc/apt/sources.list.d/debian.sources && \
@@ -52,10 +52,12 @@ RUN cargo build --release --bin api
 # Runtime stage
 FROM debian:bookworm@sha256:26f2a7cab45014541c65f9d140ccfa6aaefbb49686c6759bea9c6f7f5bb3d72f
 
+COPY pinned-packages.txt /tmp/
+
 RUN set -e; \
     # Create a sources.list file pointing to a specific snapshot
-    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20251022T143047Z bookworm main' > /etc/apt/sources.list && \
-    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20251022T143047Z bookworm-security main' >> /etc/apt/sources.list && \
+    echo 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20251022T143047Z bookworm main' > /etc/apt/sources.list && \
+    echo 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/20251022T143047Z bookworm-security main' >> /etc/apt/sources.list && \
     echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/10no-check-valid-until && \
     # Create preferences file to pin all packages
     rm -rf /etc/apt/sources.list.d/debian.sources && \

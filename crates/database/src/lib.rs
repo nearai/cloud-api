@@ -16,11 +16,13 @@ pub use repositories::{
 
 use anyhow::Result;
 use cluster_manager::{ClusterManager, DatabaseConfig as ClusterDbConfig, ReadPreference};
+use deadpool::Runtime;
 use patroni_discovery::PatroniDiscovery;
 use std::sync::Arc;
 use tracing::info;
 
 // Re-export mock function
+use crate::pool::create_pool_with_native_tls;
 pub use mock::create_mock_database;
 
 /// Database service combining all repositories
@@ -150,25 +152,25 @@ impl Database {
 
     /// Create database connection for testing without Patroni
     async fn from_simple_postgres_config(config: &config::DatabaseConfig) -> Result<Self> {
-        use deadpool_postgres::{Manager, ManagerConfig, RecyclingMethod};
         use tokio_postgres::NoTls;
 
-        let mut pg_config = tokio_postgres::Config::new();
-        pg_config
-            .host("localhost")
-            .port(config.port)
-            .dbname(&config.database)
-            .user(&config.username)
-            .password(&config.password);
+        let mut pg_config = deadpool_postgres::Config::new();
+        pg_config.host = Some(
+            config
+                .host
+                .clone()
+                .unwrap_or_else(|| "localhost".to_string()),
+        );
+        pg_config.port = Some(config.port);
+        pg_config.dbname = Some(config.database.clone());
+        pg_config.user = Some(config.username.clone());
+        pg_config.password = Some(config.password.clone());
 
-        let mgr_config = ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
+        let pool = if config.tls_enabled {
+            create_pool_with_native_tls(pg_config, true)?
+        } else {
+            pg_config.create_pool(Some(Runtime::Tokio1), NoTls)?
         };
-
-        let mgr = Manager::from_config(pg_config, NoTls, mgr_config);
-        let pool = deadpool_postgres::Pool::builder(mgr)
-            .max_size(config.max_connections)
-            .build()?;
 
         Ok(Self::new(pool))
     }

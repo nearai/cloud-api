@@ -939,6 +939,7 @@ mod tests {
             },
             database: config::DatabaseConfig {
                 primary_app_id: "postgres-patroni-1".to_string(),
+                host: None,
                 port: 5432,
                 database: "test_db".to_string(),
                 username: "test_user".to_string(),
@@ -979,6 +980,7 @@ mod tests {
         let db_config = config::DatabaseConfig {
             primary_app_id: "postgres-patroni-1".to_string(),
             port: 5432,
+            host: None,
             database: "test_db".to_string(),
             username: "test_user".to_string(),
             password: "test_pass".to_string(),
@@ -1021,6 +1023,7 @@ mod tests {
             },
             database: config::DatabaseConfig {
                 primary_app_id: "postgres-patroni-1".to_string(),
+                host: None,
                 port: 5432,
                 database: "test_db".to_string(),
                 username: "test_user".to_string(),

@@ -8,9 +8,7 @@ use crate::{
     inference_provider_pool::InferenceProviderPool, responses::ports::ResponseError, UserId,
 };
 use futures::Stream;
-use inference_providers::{
-    ChatCompletionParams, ChatMessage, InferenceProvider, MessageRole, StreamChunk,
-};
+use inference_providers::{ChatCompletionParams, ChatMessage, MessageRole, StreamChunk};
 use std::{pin::Pin, sync::Arc};
 use uuid::Uuid;
 

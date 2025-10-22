@@ -410,7 +410,7 @@ impl AuthServiceTrait for MockAuthService {
             &claims,
             &jsonwebtoken::EncodingKey::from_secret(encoding_key.as_bytes()),
         )
-        .map_err(|e| AuthError::InternalError(format!("Failed to create jwt: {}", e)))
+        .map_err(|e| AuthError::InternalError(format!("Failed to create jwt: {e}")))
     }
 
     fn validate_session_access_token(

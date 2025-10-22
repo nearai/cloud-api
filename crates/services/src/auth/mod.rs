@@ -29,7 +29,7 @@ impl AuthServiceTrait for AuthService {
             .session_repository
             .create(user_id, ip_address, user_agent, refresh_expires_in_hours)
             .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to create session: {}", e)))?;
+            .map_err(|e| AuthError::InternalError(format!("Failed to create session: {e}")))?;
 
         Ok((access_token, refresh_session, refresh_token))
     }
@@ -52,7 +52,7 @@ impl AuthServiceTrait for AuthService {
             &claims,
             &jsonwebtoken::EncodingKey::from_secret(encoding_key.as_bytes()),
         )
-        .map_err(|e| AuthError::InternalError(format!("Failed to create jwt: {}", e)))
+        .map_err(|e| AuthError::InternalError(format!("Failed to create jwt: {e}")))
     }
 
     fn validate_session_access_token(

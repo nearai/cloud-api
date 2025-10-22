@@ -71,7 +71,7 @@ impl PatroniDiscovery {
             .header("Host", "vpc-server")
             .send()
             .await
-            .map_err(|e| anyhow!("Failed to connect to Patroni API: {}", e))?;
+            .map_err(|e| anyhow!("Failed to connect to Patroni API: {e}"))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -80,13 +80,13 @@ impl PatroniDiscovery {
                 .await
                 .unwrap_or_else(|_| "No body".to_string());
             error!("Failed to get cluster info: {} - {}", status, body);
-            return Err(anyhow!("HTTP {}: {}", status, body));
+            return Err(anyhow!("HTTP {status}: {body}"));
         }
 
         let cluster_info: ClusterInfo = response
             .json()
             .await
-            .map_err(|e| anyhow!("Failed to parse cluster info: {}", e))?;
+            .map_err(|e| anyhow!("Failed to parse cluster info: {e}"))?;
 
         info!("Discovered {} nodes in cluster", cluster_info.members.len());
 

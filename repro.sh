@@ -30,6 +30,7 @@ touch pinned-packages.txt
 git rev-parse HEAD > .GIT_REV
 TEMP_TAG="dstack-ingress-temp:$(date +%s)"
 docker buildx build --builder buildkit_20 --no-cache --build-arg SOURCE_DATE_EPOCH="0" \
+    --build-arg RUST_IMAGE_SHA="sha256:8192a1c210289f3ebb95c62f0cd526427e9e28a5840d6362e95abe5a2e6831a5" \
     --output type=oci,dest=./oci.tar,rewrite-timestamp=true \
     --output type=docker,name="$TEMP_TAG" .
 

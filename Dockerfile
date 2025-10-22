@@ -37,6 +37,7 @@ RUN set -e; \
         libssl3 \
         curl \
         coreutils \
+        llvm \
         && rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache /tmp/pinned-packages.txt
 
 # Set the working directory
@@ -51,7 +52,8 @@ COPY .cargo/ ./.cargo/
 RUN find /app -exec touch -t 197001010000.00 {} +
 
 # Build the application in release mode
-RUN cargo build --release --bin api
+RUN cargo build --release --bin api && \
+    llvm-strip --strip-all /app/target/release/api
 
 # Runtime stage
 FROM debian:bookworm@sha256:26f2a7cab45014541c65f9d140ccfa6aaefbb49686c6759bea9c6f7f5bb3d72f

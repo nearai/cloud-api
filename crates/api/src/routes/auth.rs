@@ -1,4 +1,5 @@
 use crate::middleware::AuthenticatedUser;
+use crate::models::ErrorResponse;
 use axum::{
     extract::{Query, State},
     http::{header::SET_COOKIE, StatusCode},
@@ -15,7 +16,6 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 use utoipa::ToSchema;
-use crate::models::ErrorResponse;
 
 /// Temporary storage for OAuth state and PKCE verifiers
 /// In production, use Redis or similar
@@ -283,7 +283,10 @@ pub async fn refresh_access_token(
         Ok(access_token) => Json(TokenRefreshResponse { access_token }).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse::new(format!("Failed to refresh token: {e}"), "server_error".to_string())),
+            Json(ErrorResponse::new(
+                format!("Failed to refresh token: {e}"),
+                "server_error".to_string(),
+            )),
         )
             .into_response(),
     }

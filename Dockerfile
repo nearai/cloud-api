@@ -45,6 +45,10 @@ WORKDIR /app
 # Copy workspace files
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
+COPY .cargo/ ./.cargo/
+
+# Normalize timestamps on all copied files for reproducibility
+RUN find /app -exec touch -t 197001010000.00 {} +
 
 # Build the application in release mode
 RUN cargo build --release --bin api
@@ -76,8 +80,9 @@ RUN set -e; \
         curl \
         && rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache /tmp/pinned-packages.txt
 
-# Create app user
-RUN useradd -m -u 1000 app
+# Create app user with non-conflicting UID/GID
+RUN groupadd -g 10000 app && \
+    useradd -m -u 10000 -g 10000 -s /bin/bash app
 
 # Create app directory
 WORKDIR /app
@@ -87,8 +92,10 @@ COPY --from=builder /app/target/release/api /app/api
 
 COPY .GIT_REV /etc/
 
-# Change ownership to app user
-RUN chown -R app:app /app
+# Normalize timestamps on copied files
+RUN find /app /etc/.GIT_REV -exec touch -t 197001010000.00 {} + && \
+    chmod 755 /app/api && \
+    chown -R 10000:10000 /app
 
 # Switch to app user
 USER app

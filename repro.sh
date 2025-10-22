@@ -42,7 +42,7 @@ fi
 
 echo "Build completed, manifest digest:"
 echo ""
-docker image inspect "$TEMP_TAG" --format='{{index .RepoDigests 0}}'
+docker image inspect "$TEMP_TAG" --format='{{ .Id }}'
 echo ""
 
 # Extract package information from the built image

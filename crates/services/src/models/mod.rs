@@ -3,7 +3,6 @@ pub mod ports;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use inference_providers::InferenceProvider;
 pub use ports::{ModelInfo, ModelWithPricing, ModelsError, ModelsRepository, ModelsServiceTrait};
 
 use crate::inference_provider_pool::InferenceProviderPool;

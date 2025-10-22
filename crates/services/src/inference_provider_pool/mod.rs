@@ -55,7 +55,7 @@ impl InferenceProviderPool {
 
     /// Initialize model discovery - should be called during application startup
     pub async fn initialize(&self) -> Result<(), ListModelsError> {
-        tracing::info!(
+        tracing::debug!(
             url = %self.discovery_url,
             "Initializing model discovery from discovery server"
         );
@@ -79,7 +79,7 @@ impl InferenceProviderPool {
     async fn fetch_from_discovery(
         &self,
     ) -> Result<HashMap<String, DiscoveryEntry>, ListModelsError> {
-        tracing::info!(
+        tracing::debug!(
             url = %self.discovery_url,
             "Fetching models from discovery server"
         );
@@ -410,7 +410,7 @@ impl InferenceProvider for InferenceProviderPool {
     async fn get_signature(&self, chat_id: &str) -> Result<ChatSignature, CompletionError> {
         // First try to get the specific provider for this chat_id
         if let Some(provider) = self.get_provider_by_chat_id(chat_id).await {
-            tracing::info!(
+            tracing::debug!(
                 chat_id = %chat_id,
                 "Found mapped provider for chat_id, calling get_signature"
             );
@@ -493,7 +493,7 @@ impl InferenceProvider for InferenceProviderPool {
                 let chat_id = chat_chunk.id.clone();
                 let pool = self.clone();
                 tokio::spawn(async move {
-                    tracing::info!(
+                    tracing::debug!(
                         chat_id = %chat_id,
                         "Storing chat_id mapping"
                     );
@@ -522,7 +522,7 @@ impl InferenceProvider for InferenceProviderPool {
         // Store the chat_id mapping SYNCHRONOUSLY before returning
         // This ensures the attestation service can find the provider
         let chat_id = response.response.id.clone();
-        tracing::info!(
+        tracing::debug!(
             chat_id = %chat_id,
             "Storing chat_id mapping for non-streaming completion"
         );

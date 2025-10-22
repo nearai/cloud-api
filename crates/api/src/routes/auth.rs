@@ -79,7 +79,7 @@ pub async fn github_login(
         },
     );
 
-    info!("Redirecting to GitHub with state: {}", state);
+    debug!("Redirecting to GitHub with state: {}", state);
     Ok(Redirect::to(&auth_url))
 }
 
@@ -104,7 +104,7 @@ pub async fn google_login(
         },
     );
 
-    info!("Redirecting to Google with state: {}", state);
+    debug!("Redirecting to Google with state: {}", state);
     Ok(Redirect::to(&auth_url))
 }
 
@@ -227,7 +227,7 @@ pub async fn oauth_callback(
 
     match session_result {
         Ok((access_token, refresh_session, refresh_token)) => {
-            info!("Session created successfully for user: {}", user.email);
+            debug!("Session created successfully for user: {}", user.email);
 
             let response = TokenExchangeResponse {
                 access_token,

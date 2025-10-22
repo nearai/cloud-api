@@ -6,7 +6,7 @@ use oauth2::{
 };
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::{debug, info};
+use tracing::{debug};
 
 // Type alias for a fully configured OAuth client
 type ConfiguredClient = oauth2::Client<
@@ -157,7 +157,7 @@ impl OAuthManager {
             avatar_url: user_info.avatar_url,
         };
 
-        info!("GitHub user authenticated: {}", oauth_info.email);
+        debug!("GitHub user authenticated: {}", oauth_info.email);
         Ok((oauth_info, access_token.to_string()))
     }
 
@@ -205,7 +205,7 @@ impl OAuthManager {
             avatar_url: user_info.picture,
         };
 
-        info!("Google user authenticated: {}", oauth_info.email);
+        debug!("Google user authenticated: {}", oauth_info.email);
         Ok((oauth_info, access_token.to_string()))
     }
 

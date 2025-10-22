@@ -20,7 +20,7 @@ use deadpool::Runtime;
 use patroni_discovery::PatroniDiscovery;
 use std::sync::Arc;
 use tracing::info;
-
+use tracing::log::debug;
 // Re-export mock function
 use crate::pool::create_pool_with_native_tls;
 pub use mock::create_mock_database;
@@ -71,7 +71,7 @@ impl Database {
         }
 
         info!("Initializing database with Patroni discovery");
-        info!("Primary app ID: {}", config.primary_app_id);
+        debug!("Primary app ID: {}", config.primary_app_id);
         info!("Refresh interval: {} seconds", config.refresh_interval);
 
         // Create Patroni discovery
@@ -85,7 +85,7 @@ impl Database {
         discovery.update_cluster_state().await?;
 
         if let Some(leader) = discovery.get_leader().await {
-            info!("Found leader: {} at {}", leader.name, leader.host);
+            debug!("Found leader: {} at {}", leader.name, leader.host);
         } else {
             return Err(anyhow::anyhow!(
                 "No leader found in cluster during initialization"

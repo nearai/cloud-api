@@ -16,7 +16,7 @@ use services::{
 };
 use std::convert::Infallible;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug};
 use uuid::Uuid;
 
 // Helper function to map ResponseError to HTTP status code
@@ -162,7 +162,7 @@ pub async fn create_response(
 
     // Check if streaming is requested
     if request.stream.unwrap_or(false) {
-        tracing::info!(
+        tracing::debug!(
             user_id = %api_key.created_by_user_id.0,
             model = %request.model,
             "Processing streaming response request"
@@ -171,7 +171,7 @@ pub async fn create_response(
         // Create streaming response
         match service.create_response_stream(domain_request).await {
             Ok(stream) => {
-                tracing::info!(
+                tracing::debug!(
                     user_id = %api_key.created_by_user_id.0,
                     "Successfully created streaming response, returning SSE stream"
                 );
@@ -201,7 +201,7 @@ pub async fn create_response(
             }
         }
     } else {
-        tracing::info!(
+        tracing::debug!(
             user_id = %api_key.created_by_user_id.0,
             model = %request.model,
             "Processing non-streaming response request"
@@ -210,7 +210,7 @@ pub async fn create_response(
         // Service only supports streaming - collect stream for non-streaming response
         match service.create_response_stream(domain_request).await {
             Ok(stream) => {
-                tracing::info!(
+                tracing::debug!(
                     user_id = %api_key.created_by_user_id.0,
                     "Successfully created stream, collecting events for non-streaming response"
                 );
@@ -363,7 +363,7 @@ pub async fn create_response(
                     }
                 };
 
-                info!(
+                debug!(
                     "Created response {} for key {}",
                     response.id, api_key.created_by_user_id.0
                 );

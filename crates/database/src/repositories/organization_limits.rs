@@ -43,8 +43,7 @@ impl OrganizationLimitsRepository {
 
         if org_exists.is_none() {
             return Err(anyhow::anyhow!(
-                "Organization not found: {}",
-                organization_id
+                "Organization not found: {organization_id}"
             ));
         }
 

@@ -90,11 +90,11 @@ impl InferenceProvider for VLlmProvider {
         );
 
         if let Some(nonce) = nonce {
-            url.push_str(&format!("&nonce={}", nonce));
+            url.push_str(&format!("&nonce={nonce}"));
         }
 
         if let Some(signing_address) = signing_address {
-            url.push_str(&format!("&signing_address={}", signing_address));
+            url.push_str(&format!("&signing_address={signing_address}"));
         }
 
         let response = self

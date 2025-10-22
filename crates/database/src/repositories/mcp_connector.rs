@@ -423,7 +423,7 @@ impl McpConnectorRepository {
         let auth_type = match auth_type_str.as_str() {
             "none" => McpAuthType::None,
             "bearer" => McpAuthType::Bearer,
-            _ => bail!("Invalid auth type: {}", auth_type_str),
+            _ => bail!("Invalid auth type: {auth_type_str}"),
         };
 
         let status_str: String = row.get("connection_status");

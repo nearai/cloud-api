@@ -98,7 +98,7 @@ impl ports::AttestationServiceTrait for AttestationService {
                 rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
                 let generated_nonce = nonce_bytes
                     .into_iter()
-                    .map(|byte| format!("{:02x}", byte))
+                    .map(|byte| format!("{byte:02x}"))
                     .collect::<String>();
                 tracing::debug!(
                     "No nonce provided for attestation report, generated nonce: {}",
@@ -117,8 +117,7 @@ impl ports::AttestationServiceTrait for AttestationService {
                 })?
                 .ok_or_else(|| {
                     AttestationError::ProviderError(format!(
-                        "Model '{}' not found. It's not a valid model name or alias.",
-                        model
+                        "Model '{model}' not found. It's not a valid model name or alias."
                     ))
                 })?;
 
@@ -169,7 +168,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         } else {
             let client = dstack_client::DstackClient::new(None);
             // nonce has 32 bytes, dstack pads to 64
-            let report_data = (&nonce).as_bytes().to_vec();
+            let report_data = nonce.as_bytes().to_vec();
 
             let info = client.info().await.map_err(|e| {
                 tracing::error!(

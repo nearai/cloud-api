@@ -1,7 +1,7 @@
 use inference_providers::{
     models::{CompletionError, ListModelsError, ModelsResponse},
-    ChatCompletionParams, CompletionParams, InferenceProvider, StreamingResult, StreamingResultExt,
-    VLlmConfig, VLlmProvider,
+    ChatCompletionParams, InferenceProvider, StreamingResult, StreamingResultExt, VLlmConfig,
+    VLlmProvider,
 };
 use serde::Deserialize;
 use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
@@ -523,22 +523,6 @@ impl InferenceProviderPool {
         );
 
         Ok(response)
-    }
-
-    async fn text_completion_stream(
-        &self,
-        params: CompletionParams,
-    ) -> Result<StreamingResult, CompletionError> {
-        let model_id = params.model.clone();
-
-        let (stream, _provider) = self
-            .retry_with_fallback(&model_id, "text_completion_stream", |provider| {
-                let params = params.clone();
-                async move { provider.text_completion_stream(params).await }
-            })
-            .await?;
-
-        Ok(stream)
     }
 }
 

@@ -23,7 +23,7 @@ impl PgResponseRepository {
             "completed" => ResponseStatus::Completed,
             "failed" => ResponseStatus::Failed,
             "cancelled" => ResponseStatus::Cancelled,
-            _ => bail!("Unknown response status: {}", status_str),
+            _ => bail!("Unknown response status: {status_str}"),
         };
 
         let id: Uuid = row.try_get("id")?;

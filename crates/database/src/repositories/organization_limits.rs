@@ -42,9 +42,7 @@ impl OrganizationLimitsRepository {
             .context("Failed to check if organization exists")?;
 
         if org_exists.is_none() {
-            return Err(anyhow::anyhow!(
-                "Organization not found: {organization_id}"
-            ));
+            return Err(anyhow::anyhow!("Organization not found: {organization_id}"));
         }
 
         let now = Utc::now();

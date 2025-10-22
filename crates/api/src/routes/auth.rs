@@ -259,7 +259,7 @@ pub async fn oauth_callback(
 }
 
 #[utoipa::path(
-    patch,
+    post,
     path = "/auth/refresh",
     tag = "Auth",
     responses(

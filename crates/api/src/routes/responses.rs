@@ -113,26 +113,24 @@ pub async fn create_response(
         ResponseInput::Items(items) => {
             let messages = items
                 .into_iter()
-                .map(|item| match item {
-                    ResponseInputItem::Message { role, content } => {
-                        let text = match content {
-                            ResponseContent::Text(t) => t,
-                            ResponseContent::Parts(parts) => {
-                                // Extract text from parts
-                                parts
-                                    .into_iter()
-                                    .filter_map(|part| match part {
-                                        ResponseContentPart::InputText { text } => Some(text),
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                            }
-                        };
-                        ResponseMessage {
-                            role,
-                            content: text,
+                .map(|ResponseInputItem { role, content }| {
+                    let text = match content {
+                        ResponseContent::Text(t) => t,
+                        ResponseContent::Parts(parts) => {
+                            // Extract text from parts
+                            parts
+                                .into_iter()
+                                .filter_map(|part| match part {
+                                    ResponseContentPart::InputText { text } => Some(text),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ")
                         }
+                    };
+                    ResponseMessage {
+                        role,
+                        content: text,
                     }
                 })
                 .collect();

@@ -50,7 +50,7 @@ impl PgResponseRepository {
 }
 
 #[async_trait]
-impl ResponseRepository for PgResponseRepository {
+impl ResponseRepositoryTrait for PgResponseRepository {
     /// Create a new response
     async fn create(
         &self,

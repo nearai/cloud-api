@@ -42,7 +42,7 @@ fi
 
 echo "Build completed, manifest digest:"
 echo ""
-skopeo inspect oci-archive:./oci.tar | jq .Digest
+docker image inspect "$TEMP_TAG" --format='{{index .RepoDigests 0}}'
 echo ""
 
 # Extract package information from the built image

@@ -1,4 +1,4 @@
-use crate::pool::DbPool;
+use crate::{pool::DbPool, Response, ResponseStatus};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -238,10 +238,10 @@ impl ResponseRepositoryTrait for PgResponseRepository {
     /// List responses for a conversation
     async fn list_by_conversation(
         &self,
-        conversation_id: ConversationId,
+        conversation_id: services::conversations::models::ConversationId,
         user_id: UserId,
         limit: i64,
-    ) -> Result<Vec<Response>> {
+    ) -> Result<Vec<services::responses::models::ResponseObject>> {
         let client = self
             .pool
             .get()

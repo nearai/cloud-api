@@ -158,87 +158,88 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
         user_id: UserId,
         limit: i64,
     ) -> Result<Vec<models::ConversationMessage>, errors::ConversationError> {
+        unimplemented!()
         // Get responses for this conversation
-        let responses = self
-            .resp_repo
-            .list_by_conversation(conversation_id, user_id, limit)
-            .await
-            .map_err(|e| {
-                errors::ConversationError::InternalError(format!(
-                    "Failed to get conversation messages: {e}"
-                ))
-            })?;
+        // let responses = self
+        //     .resp_repo
+        //     .list_by_conversation(conversation_id, user_id, limit)
+        //     .await
+        //     .map_err(|e| {
+        //         errors::ConversationError::InternalError(format!(
+        //             "Failed to get conversation messages: {e}"
+        //         ))
+        //     })?;
 
-        // Extract messages from responses with deduplication
-        let mut messages = Vec::new();
-        let mut seen_content = std::collections::HashSet::new();
+        // // Extract messages from responses with deduplication
+        // let mut messages = Vec::new();
+        // let mut seen_content = std::collections::HashSet::new();
 
-        for response in responses {
-            // Parse input_messages JSONB to extract individual messages
-            if let Some(input_array) = response.input_messages.as_array() {
-                for msg_value in input_array.iter() {
-                    if let Some(msg_obj) = msg_value.as_object() {
-                        let role = msg_obj
-                            .get("role")
-                            .and_then(|r| r.as_str())
-                            .unwrap_or("user")
-                            .to_string();
+        // for response in responses {
+        //     // Parse input_messages JSONB to extract individual messages
+        //     if let Some(input_array) = response.input_messages.as_array() {
+        //         for msg_value in input_array.iter() {
+        //             if let Some(msg_obj) = msg_value.as_object() {
+        //                 let role = msg_obj
+        //                     .get("role")
+        //                     .and_then(|r| r.as_str())
+        //                     .unwrap_or("user")
+        //                     .to_string();
 
-                        let content = msg_obj
-                            .get("content")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("")
-                            .to_string();
+        //                 let content = msg_obj
+        //                     .get("content")
+        //                     .and_then(|c| c.as_str())
+        //                     .unwrap_or("")
+        //                     .to_string();
 
-                        let metadata = msg_obj.get("metadata").cloned();
+        //                 let metadata = msg_obj.get("metadata").cloned();
 
-                        // Create a deduplication key based on role + content + rough timestamp
-                        let dedup_key = format!(
-                            "{}:{}:{}",
-                            role,
-                            content,
-                            response.created_at.timestamp() / 60
-                        ); // Group by minute
+        //                 // Create a deduplication key based on role + content + rough timestamp
+        //                 let dedup_key = format!(
+        //                     "{}:{}:{}",
+        //                     role,
+        //                     content,
+        //                     response.created_at.timestamp() / 60
+        //                 ); // Group by minute
 
-                        // Only add if we haven't seen this content recently
-                        if !seen_content.contains(&dedup_key) {
-                            seen_content.insert(dedup_key);
-                            messages.push(models::ConversationMessage {
-                                id: response.id.clone(),
-                                role,
-                                content,
-                                metadata,
-                                created_at: response.created_at,
-                            });
-                        }
-                    }
-                }
-            }
+        //                 // Only add if we haven't seen this content recently
+        //                 if !seen_content.contains(&dedup_key) {
+        //                     seen_content.insert(dedup_key);
+        //                     messages.push(models::ConversationMessage {
+        //                         id: response.id.clone(),
+        //                         role,
+        //                         content,
+        //                         metadata,
+        //                         created_at: response.created_at,
+        //                     });
+        //                 }
+        //             }
+        //         }
+        //     }
 
-            // Add the output message if present (these are usually unique)
-            if let Some(output) = response.output_message {
-                let dedup_key = format!(
-                    "assistant:{}:{}",
-                    output,
-                    response.updated_at.timestamp() / 60
-                );
+        //     // Add the output message if present (these are usually unique)
+        //     if let Some(output) = response.output_message {
+        //         let dedup_key = format!(
+        //             "assistant:{}:{}",
+        //             output,
+        //             response.updated_at.timestamp() / 60
+        //         );
 
-                if !seen_content.contains(&dedup_key) {
-                    seen_content.insert(dedup_key);
-                    messages.push(models::ConversationMessage {
-                        id: response.id.clone(),
-                        role: "assistant".to_string(),
-                        content: output,
-                        metadata: None,
-                        created_at: response.updated_at,
-                    });
-                }
-            }
-        }
+        //         if !seen_content.contains(&dedup_key) {
+        //             seen_content.insert(dedup_key);
+        //             messages.push(models::ConversationMessage {
+        //                 id: response.id.clone(),
+        //                 role: "assistant".to_string(),
+        //                 content: output,
+        //                 metadata: None,
+        //                 created_at: response.updated_at,
+        //             });
+        //         }
+        //     }
+        // }
 
-        // Sort by creation time to maintain conversation flow
-        messages.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        // // Sort by creation time to maintain conversation flow
+        // messages.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
-        Ok(messages)
+        // Ok(messages)
     }
 }

@@ -3,7 +3,9 @@ use async_trait::async_trait;
 use futures::Stream;
 use std::pin::Pin;
 
+use crate::conversations::models::ConversationId;
 use crate::UserId;
+
 #[async_trait]
 pub trait ResponseRepositoryTrait: Send + Sync {
     #[allow(clippy::too_many_arguments)]
@@ -19,7 +21,42 @@ pub trait ResponseRepositoryTrait: Send + Sync {
         user_id: UserId,
     ) -> anyhow::Result<Option<models::ResponseObject>>;
 
+    async fn update(
+        &self,
+        id: models::ResponseId,
+        user_id: UserId,
+        output_message: Option<String>,
+        status: models::ResponseStatus,
+        usage: Option<serde_json::Value>,
+    ) -> anyhow::Result<Option<models::ResponseObject>>;
+
     async fn delete(&self, id: models::ResponseId, user_id: UserId) -> anyhow::Result<bool>;
+
+    async fn cancel(
+        &self,
+        id: models::ResponseId,
+        user_id: UserId,
+    ) -> anyhow::Result<Option<models::ResponseObject>>;
+
+    async fn list_by_user(
+        &self,
+        user_id: UserId,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<models::ResponseObject>>;
+
+    async fn list_by_conversation(
+        &self,
+        conversation_id: ConversationId,
+        user_id: UserId,
+        limit: i64,
+    ) -> anyhow::Result<Vec<models::ResponseObject>>;
+
+    async fn get_previous(
+        &self,
+        response_id: models::ResponseId,
+        user_id: UserId,
+    ) -> anyhow::Result<Option<models::ResponseObject>>;
 }
 
 #[async_trait]

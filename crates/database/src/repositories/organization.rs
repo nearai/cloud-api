@@ -455,7 +455,7 @@ impl PgOrganizationRepository {
             "owner" => DbOrganizationRole::Owner,
             "admin" => DbOrganizationRole::Admin,
             "member" => DbOrganizationRole::Member,
-            _ => bail!("Invalid role: {}", role_str),
+            _ => bail!("Invalid role: {role_str}"),
         };
 
         Ok(DbOrganizationMember {
@@ -687,10 +687,9 @@ impl OrganizationRepository for PgOrganizationRepository {
                     SELECT DISTINCT o.* FROM organizations o
                     INNER JOIN organization_members om ON o.id = om.organization_id
                     WHERE om.user_id = $1 AND o.is_active = true
-                    ORDER BY o.{} {}
+                    ORDER BY o.{order_by_column} {order_dir}
                     LIMIT $2 OFFSET $3
-                ",
-                    order_by_column, order_dir
+                "
                 ),
                 &[&user_id, &limit, &offset],
             )

@@ -56,6 +56,7 @@ fn db_config_for_tests() -> config::DatabaseConfig {
     config::DatabaseConfig {
         primary_app_id: "postgres-test".to_string(),
         port: 5432,
+        host: None,
         database: "platform_api".to_string(),
         username: "postgres".to_string(),
         password: "postgres".to_string(),

@@ -26,8 +26,21 @@ done
 if ! docker buildx inspect buildkit_20 &>/dev/null; then
     docker buildx create --use --driver-opt image=moby/buildkit:v0.20.2 --name buildkit_20
 fi
-touch pinned-packages.txt
+
+# Create pinned-packages.txt if it doesn't exist (empty for first build)
+if [ ! -f pinned-packages.txt ]; then
+    touch pinned-packages.txt
+fi
+
+# Normalize timestamps on all source files before build
+echo "Normalizing file timestamps for reproducibility..."
+find . -type f \( -name "*.rs" -o -name "*.toml" -o -name "*.lock" -o -name "*.txt" -o -name "*.md" \) \
+    -not -path "./target/*" -not -path "./.git/*" \
+    -exec touch -t 197001010000.00 {} +
+
 git rev-parse HEAD > .GIT_REV
+touch -t 197001010000.00 .GIT_REV
+
 TEMP_TAG="cloud-api:$(date +%s)"
 docker buildx build --builder buildkit_20 --no-cache --build-arg SOURCE_DATE_EPOCH="0" \
     --build-arg RUST_IMAGE_SHA="sha256:8192a1c210289f3ebb95c62f0cd526427e9e28a5840d6362e95abe5a2e6831a5" \

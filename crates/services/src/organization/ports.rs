@@ -1,4 +1,5 @@
 use super::super::auth::ports::{User, UserId};
+use super::super::common::RepositoryError;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -201,48 +202,52 @@ pub trait OrganizationRepository: Send + Sync {
         &self,
         request: CreateOrganizationRequest,
         creator_user_id: Uuid,
-    ) -> Result<Organization>;
+    ) -> Result<Organization, RepositoryError>;
 
-    async fn get_by_id(&self, id: Uuid) -> Result<Option<Organization>>;
+    async fn get_by_id(&self, id: Uuid) -> Result<Option<Organization>, RepositoryError>;
 
-    async fn get_by_name(&self, name: &str) -> Result<Option<Organization>>;
+    async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError>;
 
     async fn get_member(
         &self,
         organization_id: Uuid,
         user_id: Uuid,
-    ) -> Result<Option<OrganizationMember>>;
+    ) -> Result<Option<OrganizationMember>, RepositoryError>;
 
-    async fn update(&self, id: Uuid, request: UpdateOrganizationRequest) -> Result<Organization>;
+    async fn update(
+        &self,
+        id: Uuid,
+        request: UpdateOrganizationRequest,
+    ) -> Result<Organization, RepositoryError>;
 
-    async fn delete(&self, id: Uuid) -> Result<bool>;
+    async fn delete(&self, id: Uuid) -> Result<bool, RepositoryError>;
 
     async fn add_member(
         &self,
         org_id: Uuid,
         request: AddOrganizationMemberRequest,
         invited_by: Uuid,
-    ) -> Result<OrganizationMember>;
+    ) -> Result<OrganizationMember, RepositoryError>;
 
     async fn update_member(
         &self,
         org_id: Uuid,
         user_id: Uuid,
         request: UpdateOrganizationMemberRequest,
-    ) -> Result<OrganizationMember>;
+    ) -> Result<OrganizationMember, RepositoryError>;
 
-    async fn remove_member(&self, org_id: Uuid, user_id: Uuid) -> Result<bool>;
+    async fn remove_member(&self, org_id: Uuid, user_id: Uuid) -> Result<bool, RepositoryError>;
 
     async fn list_members_paginated(
         &self,
         org_id: Uuid,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<OrganizationMember>>;
+    ) -> Result<Vec<OrganizationMember>, RepositoryError>;
 
-    async fn get_member_count(&self, org_id: Uuid) -> Result<i64>;
+    async fn get_member_count(&self, org_id: Uuid) -> Result<i64, RepositoryError>;
 
-    async fn count_organizations_by_user(&self, user_id: Uuid) -> Result<i64>;
+    async fn count_organizations_by_user(&self, user_id: Uuid) -> Result<i64, RepositoryError>;
 
     async fn list_organizations_by_user(
         &self,
@@ -251,7 +256,7 @@ pub trait OrganizationRepository: Send + Sync {
         offset: i64,
         order_by: Option<OrganizationOrderBy>,
         order_direction: Option<OrganizationOrderDirection>,
-    ) -> Result<Vec<Organization>>;
+    ) -> Result<Vec<Organization>, RepositoryError>;
 }
 
 /// Repository trait for organization invitations

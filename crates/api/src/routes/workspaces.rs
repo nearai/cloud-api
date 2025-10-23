@@ -886,6 +886,7 @@ pub async fn update_api_key_spend_limit(
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden - not authorized to update this key", body = ErrorResponse),
         (status = 404, description = "API key or workspace not found", body = ErrorResponse),
+        (status = 409, description = "Conflict - API key with this name already exists", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -934,6 +935,13 @@ pub async fn update_workspace_api_key(
             let response = crate::conversions::workspace_api_key_to_api_response(updated_key);
             Ok(Json(response))
         }
+        Err(services::workspace::WorkspaceError::AlreadyExists) => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse::new(
+                "API key with this name already exists in this workspace".to_string(),
+                "duplicate_api_key_name".to_string(),
+            )),
+        )),
         Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse::new(

@@ -31,8 +31,8 @@ use axum::{
 use config::ApiConfig;
 use database::{
     repositories::{
-        ApiKeyRepository, PgOrganizationRepository, SessionRepository, UserRepository,
-        WorkspaceRepository,
+        AdminAccessTokenRepository, ApiKeyRepository, PgOrganizationRepository, SessionRepository,
+        UserRepository, WorkspaceRepository,
     },
     Database,
 };
@@ -145,12 +145,17 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
     let oauth_manager = create_oauth_manager(config);
     let state_store: StateStore = Arc::new(RwLock::new(HashMap::new()));
 
+    // Create admin access token repository
+    let admin_access_token_repository =
+        Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
+
     // Create AuthState for middleware
     let oauth_manager_arc = Arc::new(oauth_manager);
     let auth_state_middleware = AuthState::new(
         oauth_manager_arc.clone(),
         auth_service.clone(),
         workspace_repository.clone(),
+        admin_access_token_repository,
         config.auth.admin_domains.clone(),
         config.auth.encoding_key.clone(),
     );

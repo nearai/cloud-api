@@ -17,6 +17,29 @@ pub struct AuthenticatedUser(pub DbUser);
 #[derive(Clone)]
 pub struct AdminUser(pub DbUser);
 
+/// Get admin user by ID from database
+async fn get_admin_user_by_id(
+    state: &AuthState,
+    user_id: uuid::Uuid,
+) -> Result<DbUser, StatusCode> {
+    debug!("Querying admin user by ID: {}", user_id);
+
+    match state
+        .auth_service
+        .get_user_by_id(services::auth::UserId(user_id))
+        .await
+    {
+        Ok(user) => {
+            debug!("Found admin user: {}", user.email);
+            Ok(convert_user_to_db_user(user))
+        }
+        Err(e) => {
+            error!("Failed to get admin user by ID: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 /// Authenticated API key with workspace and organization context
 #[derive(Clone, Debug)]
 pub struct AuthenticatedApiKey {
@@ -163,6 +186,7 @@ pub async fn auth_middleware(
 }
 
 /// Admin authentication middleware - verifies user is authenticated AND has admin access
+/// Supports both access tokens (with admin domain check) and admin access tokens
 pub async fn admin_middleware(
     State(state): State<AuthState>,
     request: Request,
@@ -180,7 +204,32 @@ pub async fn admin_middleware(
         debug!("Found Authorization header: {}", auth_value);
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
             debug!("Extracted Bearer token for admin auth: {}", token);
-            authenticate_session_access(&state, token.to_string()).await
+
+            // Try admin access token first
+            match authenticate_admin_access_token(&state, token.to_string()).await {
+                Ok(admin_token) => {
+                    debug!("Authenticated via admin access token: {}", admin_token.name);
+                    // Query the actual admin user from database
+                    match get_admin_user_by_id(&state, admin_token.created_by_user_id).await {
+                        Ok(admin_user) => {
+                            debug!(
+                                "Retrieved admin user: {} for access token: {}",
+                                admin_user.email, admin_token.name
+                            );
+                            Ok(admin_user)
+                        }
+                        Err(e) => {
+                            error!("Failed to get admin user for access token: {}", e);
+                            Err(StatusCode::INTERNAL_SERVER_ERROR)
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Fall back to session token authentication
+                    debug!("Admin access token validation failed, trying session token");
+                    authenticate_session_access(&state, token.to_string()).await
+                }
+            }
         } else {
             debug!("Authorization header does not start with 'Bearer '");
             Err(StatusCode::UNAUTHORIZED)
@@ -233,6 +282,32 @@ fn check_admin_access(state: &AuthState, user: &DbUser) -> bool {
             .any(|admin_domain| domain.eq_ignore_ascii_case(admin_domain))
     } else {
         false
+    }
+}
+
+/// Authenticate admin access token
+async fn authenticate_admin_access_token(
+    state: &AuthState,
+    token: String,
+) -> Result<database::models::AdminAccessToken, StatusCode> {
+    debug!("Authenticating admin access token: {}", token);
+
+    match state.admin_access_token_repository.validate(&token).await {
+        Ok(Some(admin_token)) => {
+            debug!(
+                "Admin access token validated successfully: {}",
+                admin_token.name
+            );
+            Ok(admin_token)
+        }
+        Ok(None) => {
+            debug!("Admin access token not found or inactive");
+            Err(StatusCode::UNAUTHORIZED)
+        }
+        Err(e) => {
+            error!("Failed to validate admin access token: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
 }
 
@@ -449,6 +524,7 @@ pub struct AuthState {
     pub oauth_manager: Arc<OAuthManager>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub workspace_repository: Arc<dyn services::workspace::WorkspaceRepository>,
+    pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
     pub admin_domains: Vec<String>,
     pub encoding_key: String,
 }
@@ -458,6 +534,7 @@ impl AuthState {
         oauth_manager: Arc<OAuthManager>,
         auth_service: Arc<dyn AuthServiceTrait>,
         workspace_repository: Arc<dyn services::workspace::WorkspaceRepository>,
+        admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
         admin_domains: Vec<String>,
         encoding_key: String,
     ) -> Self {
@@ -465,6 +542,7 @@ impl AuthState {
             oauth_manager,
             auth_service,
             workspace_repository,
+            admin_access_token_repository,
             admin_domains,
             encoding_key,
         }

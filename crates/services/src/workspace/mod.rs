@@ -79,7 +79,7 @@ impl WorkspaceServiceImpl {
             .workspace_repository
             .get_workspace_with_organization(workspace_id)
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get workspace: {e}")))?
+            .map_err(Self::map_repository_error)?
             .ok_or(WorkspaceError::NotFound)?;
 
         // Check if user is a member of the organization
@@ -114,17 +114,6 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .check_workspace_permission(workspace_id, requester_id)
             .await?;
         Ok(workspace)
-    }
-
-    async fn get_workspace_by_name(
-        &self,
-        organization_id: OrganizationId,
-        workspace_name: &str,
-    ) -> Result<Option<Workspace>, WorkspaceError> {
-        self.workspace_repository
-            .get_by_name(organization_id.0, workspace_name)
-            .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get workspace: {e}")))
     }
 
     async fn get_workspace_with_organization(
@@ -162,7 +151,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         self.workspace_repository
             .list_by_organization(organization_id)
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to list workspaces: {e}")))
+            .map_err(Self::map_repository_error)
     }
 
     async fn list_workspaces_for_organization_paginated(
@@ -201,11 +190,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
                 order_direction,
             )
             .await
-            .map_err(|e| {
-                WorkspaceError::InternalError(format!(
-                    "Failed to list workspaces with pagination: {e}"
-                ))
-            })
+            .map_err(Self::map_repository_error)
     }
 
     async fn create_workspace(
@@ -442,7 +427,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         self.workspace_repository
             .update(workspace_id, display_name, description, settings)
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to update workspace: {e}")))?
+            .map_err(Self::map_repository_error)?
             .ok_or(WorkspaceError::NotFound)
     }
 
@@ -459,7 +444,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         self.workspace_repository
             .delete(workspace_id)
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to delete workspace: {e}")))
+            .map_err(Self::map_repository_error)
     }
 
     async fn count_workspaces_by_organization(
@@ -488,7 +473,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         self.workspace_repository
             .count_by_organization(organization_id)
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to count workspaces: {e}")))
+            .map_err(Self::map_repository_error)
     }
 
     async fn count_api_keys_by_workspace(

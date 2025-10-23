@@ -230,12 +230,6 @@ pub trait WorkspaceServiceTrait: Send + Sync {
         requester_id: UserId,
     ) -> Result<Workspace, WorkspaceError>;
 
-    async fn get_workspace_by_name(
-        &self,
-        organization_id: OrganizationId,
-        workspace_name: &str,
-    ) -> Result<Option<Workspace>, WorkspaceError>;
-
     /// Get a workspace with its organization
     async fn get_workspace_with_organization(
         &self,

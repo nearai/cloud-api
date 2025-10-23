@@ -160,7 +160,7 @@ pub async fn chat_completions(
                                 .strip_prefix("data: ")
                                 .unwrap_or(raw_str.trim())
                                 .to_string();
-                            tracing::info!("Completion stream event: {}", json_data);
+                            tracing::debug!("Completion stream event: {}", json_data);
                             // Format as SSE event with proper newlines
                             Ok::<Bytes, Infallible>(Bytes::from(format!("data: {json_data}\n\n")))
                         }

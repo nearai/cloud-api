@@ -159,7 +159,7 @@ impl ResponseService {
         &self,
         request: ResponseRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = ResponseStreamEvent> + Send>>, ResponseError> {
-        tracing::info!(
+        tracing::debug!(
             user_id = %request.user_id,
             model = %request.model,
             "Starting response stream creation"
@@ -186,7 +186,7 @@ impl ResponseService {
                 tracing::error!("Failed to create database response: {}", e);
                 e
             })?;
-        tracing::info!(
+        tracing::debug!(
             response_id = %response_id,
             "Successfully created response record in database"
         );
@@ -196,7 +196,7 @@ impl ResponseService {
         let chat_messages = self.prepare_chat_messages(&request, &llm_context_messages);
         tracing::debug!("Prepared {} chat messages for LLM", chat_messages.len());
 
-        tracing::info!("Starting streaming response for {}", response_id);
+        tracing::debug!("Starting streaming response for {}", response_id);
 
         let chat_params = ChatCompletionParams {
             model: request.model.clone(),
@@ -247,7 +247,7 @@ impl ResponseService {
                 ResponseError::InternalError(format!("Failed to create LLM stream: {e}"))
             })?;
 
-        tracing::info!(
+        tracing::debug!(
             response_id = %response_id,
             "Successfully created LLM stream, creating event stream"
         );
@@ -260,7 +260,7 @@ impl ResponseService {
             request.user_id.clone(),
         );
 
-        tracing::info!(
+        tracing::debug!(
             response_id = %response_id,
             "Successfully created response event stream"
         );

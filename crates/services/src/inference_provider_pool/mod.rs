@@ -54,7 +54,7 @@ impl InferenceProviderPool {
 
     /// Initialize model discovery - should be called during application startup
     pub async fn initialize(&self) -> Result<(), ListModelsError> {
-        tracing::info!(
+        tracing::debug!(
             url = %self.discovery_url,
             "Initializing model discovery from discovery server"
         );
@@ -78,7 +78,7 @@ impl InferenceProviderPool {
     async fn fetch_from_discovery(
         &self,
     ) -> Result<HashMap<String, DiscoveryEntry>, ListModelsError> {
-        tracing::info!(
+        tracing::debug!(
             url = %self.discovery_url,
             "Fetching models from discovery server"
         );

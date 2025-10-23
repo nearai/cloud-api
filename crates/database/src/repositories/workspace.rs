@@ -122,7 +122,7 @@ impl WorkspaceRepository {
         );
 
         self.row_to_workspace(row)
-            .map_err(|e| RepositoryError::DataConversionError(e))
+            .map_err(RepositoryError::DataConversionError)
     }
 
     /// Get a workspace by ID
@@ -145,7 +145,7 @@ impl WorkspaceRepository {
         match row {
             Some(row) => Ok(Some(
                 self.row_to_workspace(row)
-                    .map_err(|e| RepositoryError::DataConversionError(e))?,
+                    .map_err(RepositoryError::DataConversionError)?,
             )),
             None => Ok(None),
         }
@@ -175,7 +175,7 @@ impl WorkspaceRepository {
         match row {
             Some(row) => Ok(Some(
                 self.row_to_workspace(row)
-                    .map_err(|e| RepositoryError::DataConversionError(e))?,
+                    .map_err(RepositoryError::DataConversionError)?,
             )),
             None => Ok(None),
         }
@@ -227,7 +227,7 @@ impl WorkspaceRepository {
         rows.into_iter()
             .map(|row| {
                 self.row_to_workspace(row)
-                    .map_err(|e| RepositoryError::DataConversionError(e))
+                    .map_err(RepositoryError::DataConversionError)
             })
             .collect()
     }
@@ -271,7 +271,7 @@ impl WorkspaceRepository {
         rows.into_iter()
             .map(|row| {
                 self.row_to_workspace(row)
-                    .map_err(|e| RepositoryError::DataConversionError(e))
+                    .map_err(RepositoryError::DataConversionError)
             })
             .collect()
     }
@@ -342,7 +342,7 @@ impl WorkspaceRepository {
         match row {
             Some(row) => Ok(Some(
                 self.row_to_workspace(row)
-                    .map_err(|e| RepositoryError::DataConversionError(e))?,
+                    .map_err(RepositoryError::DataConversionError)?,
             )),
             None => Ok(None),
         }

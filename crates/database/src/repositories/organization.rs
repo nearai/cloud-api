@@ -206,9 +206,8 @@ impl PgOrganizationRepository {
             "Created organization: {} with owner: {}",
             id, creator_user_id
         );
-        Ok(self
-            .row_to_db_organization(row)
-            .map_err(|e| RepositoryError::DataConversionError(e))?)
+        self.row_to_db_organization(row)
+            .map_err(RepositoryError::DataConversionError)
     }
 
     /// Get an organization by ID - internal method
@@ -234,7 +233,7 @@ impl PgOrganizationRepository {
         match row {
             Some(row) => Ok(Some(
                 self.row_to_db_organization(row)
-                    .map_err(|e| RepositoryError::DataConversionError(e))?,
+                    .map_err(RepositoryError::DataConversionError)?,
             )),
             None => Ok(None),
         }
@@ -263,7 +262,7 @@ impl PgOrganizationRepository {
         match row {
             Some(row) => Ok(Some(
                 self.row_to_db_organization(row)
-                    .map_err(|e| RepositoryError::DataConversionError(e))?,
+                    .map_err(RepositoryError::DataConversionError)?,
             )),
             None => Ok(None),
         }
@@ -296,7 +295,7 @@ impl PgOrganizationRepository {
         match row {
             Some(row) => Ok(Some(
                 self.row_to_db_org_member(row)
-                    .map_err(|e| RepositoryError::DataConversionError(e))?,
+                    .map_err(RepositoryError::DataConversionError)?,
             )),
             None => Ok(None),
         }
@@ -340,7 +339,7 @@ impl PgOrganizationRepository {
 
         debug!("Updated organization: {}", id);
         self.row_to_db_organization(row)
-            .map_err(|e| RepositoryError::DataConversionError(e))
+            .map_err(RepositoryError::DataConversionError)
     }
 
     /// Delete an organization (soft delete)
@@ -413,7 +412,7 @@ impl PgOrganizationRepository {
             request.user_id, org_id, request.role
         );
         self.row_to_db_org_member(row)
-            .map_err(|e| RepositoryError::DataConversionError(e))
+            .map_err(RepositoryError::DataConversionError)
     }
 
     /// Update a member's role in an organization - internal method
@@ -448,7 +447,7 @@ impl PgOrganizationRepository {
             user_id, org_id, request.role
         );
         self.row_to_db_org_member(row)
-            .map_err(|e| RepositoryError::DataConversionError(e))
+            .map_err(RepositoryError::DataConversionError)
     }
 
     /// Remove a member from an organization
@@ -495,7 +494,7 @@ impl PgOrganizationRepository {
         rows.into_iter()
             .map(|row| {
                 self.row_to_db_org_member(row)
-                    .map_err(|e| RepositoryError::DataConversionError(e))
+                    .map_err(RepositoryError::DataConversionError)
             })
             .collect()
     }
@@ -603,7 +602,7 @@ impl OrganizationRepository for PgOrganizationRepository {
             Some(db_org) => Ok(Some(
                 self.db_to_domain_organization(db_org)
                     .await
-                    .map_err(|e| RepositoryError::DataConversionError(e))?,
+                    .map_err(RepositoryError::DataConversionError)?,
             )),
             None => Ok(None),
         }
@@ -614,7 +613,7 @@ impl OrganizationRepository for PgOrganizationRepository {
             Some(db_org) => Ok(Some(
                 self.db_to_domain_organization(db_org)
                     .await
-                    .map_err(|e| RepositoryError::DataConversionError(e))?,
+                    .map_err(RepositoryError::DataConversionError)?,
             )),
             None => Ok(None),
         }
@@ -628,7 +627,7 @@ impl OrganizationRepository for PgOrganizationRepository {
         match self.get_member_internal(organization_id, user_id).await? {
             Some(db_member) => Ok(Some(
                 self.db_to_domain_member(db_member)
-                    .map_err(|e| RepositoryError::DataConversionError(e))?,
+                    .map_err(RepositoryError::DataConversionError)?,
             )),
             None => Ok(None),
         }
@@ -649,7 +648,7 @@ impl OrganizationRepository for PgOrganizationRepository {
         let db_org = self.update_internal(id, db_request).await?;
         self.db_to_domain_organization(db_org)
             .await
-            .map_err(|e| RepositoryError::DataConversionError(e))
+            .map_err(RepositoryError::DataConversionError)
     }
 
     async fn delete(&self, id: Uuid) -> Result<bool, RepositoryError> {
@@ -686,7 +685,7 @@ impl OrganizationRepository for PgOrganizationRepository {
             .add_member_internal(org_id, db_request, invited_by)
             .await?;
         self.db_to_domain_member(db_member)
-            .map_err(|e| RepositoryError::DataConversionError(e))
+            .map_err(RepositoryError::DataConversionError)
     }
 
     async fn update_member(
@@ -703,7 +702,7 @@ impl OrganizationRepository for PgOrganizationRepository {
             .update_member_internal(org_id, user_id, db_request)
             .await?;
         self.db_to_domain_member(db_member)
-            .map_err(|e| RepositoryError::DataConversionError(e))
+            .map_err(RepositoryError::DataConversionError)
     }
 
     async fn remove_member(&self, org_id: Uuid, user_id: Uuid) -> Result<bool, RepositoryError> {
@@ -738,7 +737,7 @@ impl OrganizationRepository for PgOrganizationRepository {
             .into_iter()
             .map(|db_member| {
                 self.db_to_domain_member(db_member)
-                    .map_err(|e| RepositoryError::DataConversionError(e))
+                    .map_err(RepositoryError::DataConversionError)
             })
             .collect()
     }
@@ -833,11 +832,11 @@ impl OrganizationRepository for PgOrganizationRepository {
         for row in rows {
             let db_org = self
                 .row_to_db_organization(row)
-                .map_err(|e| RepositoryError::DataConversionError(e))?;
+                .map_err(RepositoryError::DataConversionError)?;
             let domain_org = self
                 .db_to_domain_organization(db_org)
                 .await
-                .map_err(|e| RepositoryError::DataConversionError(e))?;
+                .map_err(RepositoryError::DataConversionError)?;
             organizations.push(domain_org);
         }
 

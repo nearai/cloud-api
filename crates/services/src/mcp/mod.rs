@@ -53,7 +53,7 @@ impl McpService for McpServiceImpl {
         // Connect using the client manager
         self.client_manager.connect(connector).await?;
 
-        tracing::info!(
+        tracing::debug!(
             "Successfully connected to MCP connector: {}",
             connector.name
         );
@@ -63,7 +63,7 @@ impl McpService for McpServiceImpl {
     async fn disconnect_connector(&self, connector_id: &McpConnectorId) -> Result<(), McpError> {
         self.client_manager.disconnect(connector_id).await?;
 
-        tracing::info!(
+        tracing::debug!(
             "Successfully disconnected from MCP connector: {}",
             connector_id
         );
@@ -105,7 +105,7 @@ impl McpService for McpServiceImpl {
             .call_tool(connector_id, tool_name.clone(), arguments)
             .await?;
 
-        tracing::info!(
+        tracing::debug!(
             "Successfully called tool {} on connector {}",
             tool_name,
             connector_id
@@ -237,7 +237,7 @@ impl McpService for McpServiceImpl {
             .await
             .map_err(|e| McpError::InternalError(format!("Failed to create connector: {e}")))?;
 
-        tracing::info!("Created new MCP connector: {}", connector.name);
+        tracing::debug!("Created new MCP connector: {}", connector.name);
         Ok(connector)
     }
 
@@ -269,7 +269,7 @@ impl McpService for McpServiceImpl {
             .map_err(|e| McpError::InternalError(format!("Failed to update connector: {e}")))?;
 
         if connector.is_some() {
-            tracing::info!("Updated MCP connector: {}", connector_id);
+            tracing::debug!("Updated MCP connector: {}", connector_id);
         }
 
         Ok(connector)
@@ -293,7 +293,7 @@ impl McpService for McpServiceImpl {
             .map_err(|e| McpError::InternalError(format!("Failed to delete connector: {e}")))?;
 
         if deleted {
-            tracing::info!("Deleted MCP connector: {}", connector_id);
+            tracing::debug!("Deleted MCP connector: {}", connector_id);
         }
 
         Ok(deleted)

@@ -50,7 +50,7 @@ impl ConversationService {
     ) -> Result<ports::Conversation, ConversationError> {
         let metadata = request.metadata.unwrap_or_else(|| serde_json::json!({}));
 
-        tracing::info!("Creating conversation for user: {}", request.user_id.0);
+        tracing::debug!("Creating conversation for user: {}", request.user_id.0);
 
         let db_conversation = self
             .conv_repo
@@ -62,7 +62,7 @@ impl ConversationService {
                 ))
             })?;
 
-        tracing::info!("Created conversation: {}", db_conversation.id);
+        tracing::debug!("Created conversation: {}", db_conversation.id);
 
         let conversation = ports::Conversation {
             id: db_conversation.id,

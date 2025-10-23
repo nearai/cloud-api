@@ -8,7 +8,7 @@ use serde::Deserialize;
 use services::conversations::ports::ConversationRequest;
 use services::{ConversationError, ConversationId};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
 use uuid::Uuid;
 
 // Helper functions for ID conversion
@@ -77,7 +77,7 @@ pub async fn create_conversation(
     match service.create_conversation(domain_request.clone()).await {
         Ok(domain_conversation) => {
             let http_conversation = convert_domain_conversation_to_http(domain_conversation);
-            info!(
+            debug!(
                 "Created conversation {} for user {}",
                 http_conversation.id, api_key.created_by_user_id.0
             );
@@ -211,7 +211,7 @@ pub async fn update_conversation(
     {
         Ok(Some(domain_conversation)) => {
             let http_conversation = convert_domain_conversation_to_http(domain_conversation);
-            info!(
+            debug!(
                 "Updated conversation {} for user {}",
                 conversation_id, api_key.created_by_user_id.0
             );
@@ -280,7 +280,7 @@ pub async fn delete_conversation(
         .await
     {
         Ok(true) => {
-            info!(
+            debug!(
                 "Deleted conversation {} for user {}",
                 conversation_id, api_key.created_by_user_id.0
             );

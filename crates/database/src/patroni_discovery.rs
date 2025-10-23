@@ -142,7 +142,7 @@ impl PatroniDiscovery {
 
         if leader_changed {
             if let Some(ref leader) = leader {
-                info!("Leader changed to: {} ({})", leader.name, leader.host);
+                debug!("Leader changed to: {} ({})", leader.name, leader.host);
             } else {
                 warn!("No leader found in cluster!");
             }

@@ -1,3 +1,4 @@
+pub mod admin_access_token;
 pub mod admin_composite;
 pub mod api_key;
 pub mod attestation;
@@ -17,6 +18,7 @@ pub mod usage_repository_impl;
 pub mod user;
 pub mod workspace;
 
+pub use admin_access_token::AdminAccessTokenRepository;
 pub use admin_composite::AdminCompositeRepository;
 pub use api_key::ApiKeyRepository;
 pub use attestation::PgAttestationRepository;

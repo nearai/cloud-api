@@ -682,11 +682,15 @@ pub fn build_admin_routes(
         batch_upsert_models, create_admin_access_token, delete_model, get_model_history,
         get_organization_limits_history, list_users, update_organization_limits, AdminAppState,
     };
-    use database::repositories::AdminCompositeRepository;
+    use database::repositories::{AdminAccessTokenRepository, AdminCompositeRepository};
     use services::admin::AdminServiceImpl;
 
     // Create composite admin repository (handles models, organization limits, and users)
     let admin_repository = Arc::new(AdminCompositeRepository::new(database.pool().clone()));
+
+    // Create admin access token repository
+    let admin_access_token_repository =
+        Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
 
     // Create admin service with composite repository
     let admin_service = Arc::new(AdminServiceImpl::new(
@@ -697,6 +701,7 @@ pub fn build_admin_routes(
         admin_service,
         auth_service: auth_state_middleware.auth_service.clone(),
         config,
+        admin_access_token_repository,
     };
 
     Router::new()

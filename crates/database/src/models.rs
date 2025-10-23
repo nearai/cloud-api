@@ -149,6 +149,23 @@ pub struct Session {
     pub user_agent: Option<String>,
 }
 
+/// Admin access token for tracking and managing admin access tokens
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminAccessToken {
+    pub id: Uuid,
+    pub token_hash: String,
+    pub created_by_user_id: Uuid,
+    pub name: String,
+    pub creation_reason: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub is_active: bool,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_by_user_id: Option<Uuid>,
+    pub revocation_reason: String,
+}
+
 /// Request/Response DTOs
 
 #[derive(Debug, Serialize, Deserialize)]

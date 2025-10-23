@@ -2337,3 +2337,157 @@ async fn test_admin_create_access_token_use_created_token() {
 
     println!("✅ Successfully used created admin token to update organization limits");
 }
+
+#[tokio::test]
+async fn test_admin_access_token_history_basic() {
+    let server = setup_test_server().await;
+
+    // First, create an admin access token to generate history
+    let create_request = serde_json::json!({
+        "expires_in_hours": 24
+    });
+
+    let create_response = server
+        .post("/v1/admin/access_token")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&create_request)
+        .await;
+
+    assert_eq!(create_response.status_code(), 200);
+    let token_response = create_response.json::<api::models::AdminAccessTokenResponse>();
+    assert!(!token_response.access_token.is_empty());
+
+    // Now test the history endpoint
+    let history_response = server
+        .get("/v1/admin/access_token/history")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(history_response.status_code(), 200);
+
+    let history_data = history_response.json::<serde_json::Value>();
+    assert!(history_data["data"].is_array());
+    assert!(history_data["total"].is_number());
+    assert!(history_data["limit"].is_number());
+    assert!(history_data["offset"].is_number());
+
+    // Verify we have at least one history record
+    let history_records = history_data["data"].as_array().unwrap();
+    assert!(!history_records.is_empty());
+
+    // Check the structure of the first record
+    let first_record = &history_records[0];
+    assert!(first_record["id"].is_string());
+    assert!(first_record["token_id"].is_string());
+    assert!(first_record["created_by_user_id"].is_string());
+    assert!(first_record["expires_at"].is_string());
+    assert!(first_record["created_at"].is_string());
+
+    println!("✅ Admin access token history retrieved successfully");
+}
+
+#[tokio::test]
+async fn test_admin_access_token_history_pagination() {
+    let server = setup_test_server().await;
+
+    // Create multiple admin access tokens to test pagination
+    for i in 0..3 {
+        let create_request = serde_json::json!({
+            "expires_in_hours": 24
+        });
+
+        let create_response = server
+            .post("/v1/admin/access_token")
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .json(&create_request)
+            .await;
+
+        assert_eq!(create_response.status_code(), 200);
+    }
+
+    // Test pagination with limit and offset
+    let history_response = server
+        .get("/v1/admin/access_token/history?limit=2&offset=0")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(history_response.status_code(), 200);
+
+    let history_data = history_response.json::<serde_json::Value>();
+    let history_records = history_data["data"].as_array().unwrap();
+
+    // Should have at most 2 records due to limit
+    assert!(history_records.len() <= 2);
+    assert_eq!(history_data["limit"], 2);
+    assert_eq!(history_data["offset"], 0);
+
+    // Test second page
+    let history_response2 = server
+        .get("/v1/admin/access_token/history?limit=2&offset=2")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(history_response2.status_code(), 200);
+
+    let history_data2 = history_response2.json::<serde_json::Value>();
+    let history_records2 = history_data2["data"].as_array().unwrap();
+
+    assert_eq!(history_data2["limit"], 2);
+    assert_eq!(history_data2["offset"], 2);
+
+    println!("✅ Admin access token history pagination works correctly");
+}
+
+#[tokio::test]
+async fn test_admin_access_token_history_unauthorized() {
+    let server = setup_test_server().await;
+
+    // Test without authentication
+    let history_response = server.get("/v1/admin/access_token/history").await;
+
+    assert_eq!(history_response.status_code(), 401);
+
+    println!("✅ Admin access token history correctly requires authentication");
+}
+
+#[tokio::test]
+async fn test_admin_access_token_history_with_created_token() {
+    let server = setup_test_server().await;
+
+    // Create an admin access token
+    let create_request = serde_json::json!({
+        "expires_in_hours": 24
+    });
+
+    let create_response = server
+        .post("/v1/admin/access_token")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&create_request)
+        .await;
+
+    assert_eq!(create_response.status_code(), 200);
+    let token_response = create_response.json::<api::models::AdminAccessTokenResponse>();
+    let admin_token = token_response.access_token;
+
+    // Use the created admin token to access the history endpoint
+    let history_response = server
+        .get("/v1/admin/access_token/history")
+        .add_header("Authorization", format!("Bearer {admin_token}"))
+        .await;
+
+    assert_eq!(history_response.status_code(), 200);
+
+    let history_data = history_response.json::<serde_json::Value>();
+    let history_records = history_data["data"].as_array().unwrap();
+
+    // Should have at least one record (the one we just created)
+    assert!(!history_records.is_empty());
+
+    // Find the record we just created (should be the most recent one)
+    let our_record = &history_records[0]; // Most recent record
+
+    assert!(our_record["token_prefix"].is_string());
+    assert!(!our_record["token_prefix"].as_str().unwrap().is_empty());
+
+    println!("✅ Admin access token history works with created admin tokens");
+}

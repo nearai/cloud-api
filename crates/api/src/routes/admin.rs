@@ -12,20 +12,19 @@ use axum::{
     response::Json as ResponseJson,
     Extension,
 };
+use chrono::Utc;
 use config::ApiConfig;
 use services::admin::{AdminService, UpdateModelAdminRequest};
-use services::auth::{AuthServiceTrait, UserId};
+use services::auth::AuthServiceTrait;
 use std::sync::Arc;
 use tracing::{debug, error};
-
-/// Admin tokens do not require refresh tokens, so refresh expiry is set to 0
-const NO_REFRESH_TOKEN_EXPIRY: i64 = 0;
 
 #[derive(Clone)]
 pub struct AdminAppState {
     pub admin_service: Arc<dyn AdminService + Send + Sync>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub config: Arc<ApiConfig>,
+    pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
 }
 
 /// Batch upsert models metadata (Admin only)
@@ -648,22 +647,15 @@ pub async fn create_admin_access_token(
         ));
     }
 
-    // Create session with the specified parameters
-    let user_id = UserId(admin_user.0.id);
-    let session_result = app_state
-        .auth_service
-        .create_session(
-            user_id,
-            request.ip_address,
-            request.user_agent,
-            app_state.config.auth.encoding_key.to_string(),
-            request.expires_in_hours,
-            NO_REFRESH_TOKEN_EXPIRY,
-        )
-        .await;
+    // Create admin access token directly in database
+    let expires_at = Utc::now() + chrono::Duration::hours(request.expires_in_hours);
 
-    match session_result {
-        Ok((access_token, refresh_session, _refresh_token)) => {
+    match app_state
+        .admin_access_token_repository
+        .create(admin_user.0.id, request.name, request.reason, expires_at)
+        .await
+    {
+        Ok((admin_token, access_token)) => {
             debug!(
                 "Admin access token created successfully for user: {}",
                 admin_user.0.email
@@ -672,7 +664,7 @@ pub async fn create_admin_access_token(
             let response = AdminAccessTokenResponse {
                 access_token,
                 created_by_user_id: admin_user.0.id.to_string(),
-                created_at: refresh_session.created_at,
+                created_at: admin_token.created_at,
                 message: format!(
                     "Admin access token created successfully. Token expires in {} hours and should be stored securely.",
                     request.expires_in_hours

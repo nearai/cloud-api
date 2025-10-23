@@ -34,6 +34,8 @@ pub struct User {
     pub auth_provider: String,
     /// OAuth provider user ID
     pub provider_user_id: String,
+    /// Timestamp when all tokens were revoked (for invalidating access tokens)
+    pub tokens_revoked_at: Option<DateTime<Utc>>,
 }
 
 /// Organization membership - many-to-many relationship between users and organizations

@@ -684,8 +684,9 @@ pub fn build_admin_routes(
 ) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
-        batch_upsert_models, create_admin_access_token, delete_model, get_model_history,
-        get_organization_limits_history, list_users, update_organization_limits, AdminAppState,
+        batch_upsert_models, create_admin_access_token, delete_admin_access_token, delete_model,
+        get_model_history, get_organization_limits_history, list_admin_access_tokens, list_users,
+        update_organization_limits, AdminAppState,
     };
     use database::repositories::{AdminAccessTokenRepository, AdminCompositeRepository};
     use services::admin::AdminServiceImpl;
@@ -731,6 +732,14 @@ pub fn build_admin_routes(
         .route(
             "/admin/access_token",
             axum::routing::post(create_admin_access_token),
+        )
+        .route(
+            "/admin/access_token",
+            axum::routing::get(list_admin_access_tokens),
+        )
+        .route(
+            "/admin/access_token/{token_id}",
+            axum::routing::delete(delete_admin_access_token),
         )
         .with_state(admin_app_state)
         // Admin middleware handles both authentication and authorization

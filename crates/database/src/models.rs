@@ -163,7 +163,7 @@ pub struct AdminAccessToken {
     pub is_active: bool,
     pub revoked_at: Option<DateTime<Utc>>,
     pub revoked_by_user_id: Option<Uuid>,
-    pub revocation_reason: String,
+    pub revocation_reason: Option<String>,
 }
 
 /// Request/Response DTOs

@@ -2114,65 +2114,26 @@ async fn test_streaming_chat_completion_signature_verification() {
 // ============================================
 
 #[tokio::test]
-async fn test_admin_create_access_token_with_ip_and_user_agent() {
+async fn test_admin_access_token_create_long_term() {
     let server = setup_test_server().await;
 
-    // Test access token creation with IP address and user agent
-    let request = serde_json::json!({
-        "expires_in_hours": 168, // 1 week
-        "ip_address": "192.168.1.100",
-        "user_agent": "BillingService/1.0"
-    });
-
-    let response = server
-        .post("/v1/admin/access_token")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&request)
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-
-    let token_response = response.json::<api::models::AdminAccessTokenResponse>();
-
-    // Verify response structure
-    assert!(!token_response.access_token.is_empty());
-    assert!(is_valid_jwt_format(&token_response.access_token));
-    assert_eq!(token_response.created_by_user_id, MOCK_USER_ID);
-    assert!(token_response.message.contains("168 hours"));
-
-    // Verify expiration is approximately 1 week from now
-    let now = chrono::Utc::now();
-    let expected_expiry = now + chrono::Duration::hours(168);
-    let token_claims = decode_access_token_claims(&token_response.access_token);
-    let time_diff = (chrono::DateTime::from_timestamp(token_claims.exp, 0).unwrap()
-        - expected_expiry)
-        .num_minutes()
-        .abs();
-    assert!(
-        time_diff < 5,
-        "Expiration time should be within 5 minutes of expected time"
-    );
-
-    println!(
-        "✅ Created admin access token with IP and user agent: {}",
-        &token_response.access_token
-    );
-}
-
-#[tokio::test]
-async fn test_admin_create_access_token_long_term() {
-    let server = setup_test_server().await;
+    let expires_in_hours = 4320; // 180 days
+    let name = "Production Billing Service Token";
+    let reason = "This is a production billing service token";
 
     // Test long-term access token (180 days)
     let request = serde_json::json!({
-        "expires_in_hours": 4320, // 180 days
-        "ip_address": "10.0.0.1",
-        "user_agent": "ProductionBillingService/2.0"
+        "expires_in_hours": expires_in_hours,
+        "name": name,
+        "reason": reason,
     });
+
+    // Get access token from refresh token
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
     let response = server
         .post("/v1/admin/access_token")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", access_token))
         .json(&request)
         .await;
 
@@ -2182,16 +2143,14 @@ async fn test_admin_create_access_token_long_term() {
 
     // Verify response structure
     assert!(!token_response.access_token.is_empty());
-    assert!(is_valid_jwt_format(&token_response.access_token));
     assert_eq!(token_response.created_by_user_id, MOCK_USER_ID);
-    assert!(token_response.message.contains("4320 hours"));
+    assert_eq!(token_response.name, name);
+    assert_eq!(token_response.reason, reason);
 
     // Verify expiration is approximately 180 days from now
     let now = chrono::Utc::now();
-    let expected_expiry = now + chrono::Duration::hours(4320);
-    let token_claims = decode_access_token_claims(&token_response.access_token);
-    let time_diff = (chrono::DateTime::from_timestamp(token_claims.exp, 0).unwrap()
-        - expected_expiry)
+    let expected_expiry = now + chrono::Duration::hours(expires_in_hours);
+    let time_diff = (token_response.expires_at - expected_expiry)
         .num_minutes()
         .abs();
     assert!(
@@ -2206,55 +2165,65 @@ async fn test_admin_create_access_token_long_term() {
 }
 
 #[tokio::test]
-async fn test_admin_create_access_token_invalid_expiration() {
+async fn test_admin_access_token_create_invalid_expiration() {
     let server = setup_test_server().await;
 
     // Test with invalid expiration time (negative)
     let request = serde_json::json!({
-        "expires_in_hours": -1
+        "expires_in_hours": -1,
+        "name": "Invalid Token",
+        "reason": "Testing invalid expiration"
     });
+
+    // Get access token from refresh token
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
     let response = server
         .post("/v1/admin/access_token")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", access_token))
         .json(&request)
         .await;
 
     assert_eq!(response.status_code(), 400);
 
-    let error_response = response.json::<api::models::ErrorResponse>();
-    assert_eq!(error_response.error.r#type, "invalid_request");
-    assert!(error_response.error.message.contains("positive number"));
+    // Check the response body for validation error
+    let response_text = response.text();
+    assert!(response_text.contains("must be a positive number"));
 
     println!("✅ Correctly rejected negative expiration time");
 }
 
 #[tokio::test]
-async fn test_admin_create_access_token_zero_expiration() {
+async fn test_admin_access_token_create_zero_expiration() {
     let server = setup_test_server().await;
 
     // Test with zero expiration time
     let request = serde_json::json!({
-        "expires_in_hours": 0
+        "expires_in_hours": 0,
+        "name": "Zero Expiration Token",
+        "reason": "Testing zero expiration"
     });
+
+    // Get access token from refresh token
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
     let response = server
         .post("/v1/admin/access_token")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", access_token))
         .json(&request)
         .await;
 
     assert_eq!(response.status_code(), 400);
 
-    let error_response = response.json::<api::models::ErrorResponse>();
-    assert_eq!(error_response.error.r#type, "invalid_request");
-    assert!(error_response.error.message.contains("positive number"));
+    // Check the response body for validation error
+    let response_text = response.text();
+    assert!(response_text.contains("must be a positive number"));
 
     println!("✅ Correctly rejected zero expiration time");
 }
 
 #[tokio::test]
-async fn test_admin_create_access_token_unauthorized() {
+async fn test_admin_access_token_create_unauthorized() {
     let server = setup_test_server().await;
 
     // Test without authorization header
@@ -2271,7 +2240,7 @@ async fn test_admin_create_access_token_unauthorized() {
 
 #[tokio::test]
 #[ignore] // the implementation of MockAuthService accepts any string as valid token, so this test won't pass
-async fn test_admin_create_access_token_invalid_token() {
+async fn test_admin_access_token_create_invalid_token() {
     let server = setup_test_server().await;
 
     // Test with invalid session token
@@ -2291,14 +2260,14 @@ async fn test_admin_create_access_token_invalid_token() {
 }
 
 #[tokio::test]
-async fn test_admin_create_access_token_use_created_token() {
+async fn test_admin_access_token_use_created_token() {
     let server = setup_test_server().await;
 
     // First, create an admin access token
     let create_request = serde_json::json!({
         "expires_in_hours": 24,
-        "ip_address": "192.168.1.50",
-        "user_agent": "TestClient/1.0"
+        "name": "Test Token",
+        "reason": "Testing admin access token functionality",
     });
 
     let create_response = server
@@ -2339,66 +2308,79 @@ async fn test_admin_create_access_token_use_created_token() {
 }
 
 #[tokio::test]
-async fn test_admin_access_token_history_basic() {
+async fn test_admin_access_token_create_and_list() {
     let server = setup_test_server().await;
 
-    // First, create an admin access token to generate history
+    // Get access token from refresh token
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+
+    // Create an admin access token
     let create_request = serde_json::json!({
-        "expires_in_hours": 24
+        "expires_in_hours": 24,
+        "name": "Test Token",
+        "reason": "Testing admin access token functionality"
     });
 
     let create_response = server
         .post("/v1/admin/access_token")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", access_token))
         .json(&create_request)
         .await;
 
     assert_eq!(create_response.status_code(), 200);
     let token_response = create_response.json::<api::models::AdminAccessTokenResponse>();
     assert!(!token_response.access_token.is_empty());
+    assert_eq!(token_response.name, "Test Token");
 
-    // Now test the history endpoint
-    let history_response = server
-        .get("/v1/admin/access_token/history")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+    // List admin access tokens
+    let list_response = server
+        .get("/v1/admin/access_token")
+        .add_header("Authorization", format!("Bearer {}", access_token))
         .await;
 
-    assert_eq!(history_response.status_code(), 200);
+    assert_eq!(list_response.status_code(), 200);
 
-    let history_data = history_response.json::<serde_json::Value>();
-    assert!(history_data["data"].is_array());
-    assert!(history_data["total"].is_number());
-    assert!(history_data["limit"].is_number());
-    assert!(history_data["offset"].is_number());
+    let list_data = list_response.json::<serde_json::Value>();
+    assert!(list_data["data"].is_array());
+    assert!(list_data["total"].is_number());
+    assert!(list_data["limit"].is_number());
+    assert!(list_data["offset"].is_number());
 
-    // Verify we have at least one history record
-    let history_records = history_data["data"].as_array().unwrap();
-    assert!(!history_records.is_empty());
+    // Verify we have at least one token
+    let tokens = list_data["data"].as_array().unwrap();
+    assert!(!tokens.is_empty());
 
-    // Check the structure of the first record
-    let first_record = &history_records[0];
-    assert!(first_record["id"].is_string());
-    assert!(first_record["token_id"].is_string());
-    assert!(first_record["created_by_user_id"].is_string());
-    assert!(first_record["expires_at"].is_string());
-    assert!(first_record["created_at"].is_string());
+    // Check the structure of the first token
+    let first_token = &tokens[0];
+    assert!(first_token["id"].is_string());
+    assert!(first_token["name"].is_string());
+    assert!(first_token["created_by_user_id"].is_string());
+    assert!(first_token["creation_reason"].is_string());
+    assert!(first_token["expires_at"].is_string());
+    assert!(first_token["created_at"].is_string());
+    assert!(first_token["is_active"].is_boolean());
 
-    println!("✅ Admin access token history retrieved successfully");
+    println!("✅ Admin access token create and list works correctly");
 }
 
 #[tokio::test]
-async fn test_admin_access_token_history_pagination() {
+async fn test_admin_access_token_list_pagination() {
     let server = setup_test_server().await;
+
+    // Get access token from refresh token
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
     // Create multiple admin access tokens to test pagination
     for i in 0..3 {
         let create_request = serde_json::json!({
-            "expires_in_hours": 24
+            "expires_in_hours": 24,
+            "name": format!("Test Token {}", i),
+            "reason": format!("Testing pagination {}", i)
         });
 
         let create_response = server
             .post("/v1/admin/access_token")
-            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .add_header("Authorization", format!("Bearer {}", access_token))
             .json(&create_request)
             .await;
 
@@ -2406,88 +2388,177 @@ async fn test_admin_access_token_history_pagination() {
     }
 
     // Test pagination with limit and offset
-    let history_response = server
-        .get("/v1/admin/access_token/history?limit=2&offset=0")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+    let list_response = server
+        .get("/v1/admin/access_token?limit=2&offset=0")
+        .add_header("Authorization", format!("Bearer {}", access_token))
         .await;
 
-    assert_eq!(history_response.status_code(), 200);
+    assert_eq!(list_response.status_code(), 200);
 
-    let history_data = history_response.json::<serde_json::Value>();
-    let history_records = history_data["data"].as_array().unwrap();
+    let list_data = list_response.json::<serde_json::Value>();
+    let tokens = list_data["data"].as_array().unwrap();
 
     // Should have at most 2 records due to limit
-    assert!(history_records.len() <= 2);
-    assert_eq!(history_data["limit"], 2);
-    assert_eq!(history_data["offset"], 0);
+    assert!(tokens.len() <= 2);
+    assert_eq!(list_data["limit"], 2);
+    assert_eq!(list_data["offset"], 0);
 
     // Test second page
-    let history_response2 = server
-        .get("/v1/admin/access_token/history?limit=2&offset=2")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+    let list_response2 = server
+        .get("/v1/admin/access_token?limit=2&offset=2")
+        .add_header("Authorization", format!("Bearer {}", access_token))
         .await;
 
-    assert_eq!(history_response2.status_code(), 200);
+    assert_eq!(list_response2.status_code(), 200);
 
-    let history_data2 = history_response2.json::<serde_json::Value>();
-    let history_records2 = history_data2["data"].as_array().unwrap();
+    let list_data2 = list_response2.json::<serde_json::Value>();
 
-    assert_eq!(history_data2["limit"], 2);
-    assert_eq!(history_data2["offset"], 2);
+    assert_eq!(list_data2["limit"], 2);
+    assert_eq!(list_data2["offset"], 2);
 
-    println!("✅ Admin access token history pagination works correctly");
+    println!("✅ Admin access token list pagination works correctly");
 }
 
 #[tokio::test]
-async fn test_admin_access_token_history_unauthorized() {
+async fn test_admin_access_token_create_and_delete() {
     let server = setup_test_server().await;
 
-    // Test without authentication
-    let history_response = server.get("/v1/admin/access_token/history").await;
-
-    assert_eq!(history_response.status_code(), 401);
-
-    println!("✅ Admin access token history correctly requires authentication");
-}
-
-#[tokio::test]
-async fn test_admin_access_token_history_with_created_token() {
-    let server = setup_test_server().await;
+    // Get access token from refresh token
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
     // Create an admin access token
     let create_request = serde_json::json!({
-        "expires_in_hours": 24
+        "expires_in_hours": 24,
+        "name": "Token to Delete",
+        "reason": "Testing delete functionality"
     });
 
     let create_response = server
         .post("/v1/admin/access_token")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {}", access_token))
         .json(&create_request)
         .await;
 
     assert_eq!(create_response.status_code(), 200);
     let token_response = create_response.json::<api::models::AdminAccessTokenResponse>();
-    let admin_token = token_response.access_token;
+    let token_id = token_response.id;
 
-    // Use the created admin token to access the history endpoint
-    let history_response = server
-        .get("/v1/admin/access_token/history")
-        .add_header("Authorization", format!("Bearer {admin_token}"))
+    // Delete the admin access token
+    let delete_request = serde_json::json!({
+        "reason": "Testing delete functionality"
+    });
+
+    let delete_response = server
+        .delete(&format!("/v1/admin/access_token/{}", token_id))
+        .add_header("Authorization", format!("Bearer {}", access_token))
+        .json(&delete_request)
         .await;
 
-    assert_eq!(history_response.status_code(), 200);
+    assert_eq!(delete_response.status_code(), 200);
 
-    let history_data = history_response.json::<serde_json::Value>();
-    let history_records = history_data["data"].as_array().unwrap();
+    let delete_data = delete_response.json::<serde_json::Value>();
+    assert_eq!(
+        delete_data["message"],
+        "Admin access token revoked successfully"
+    );
+    assert_eq!(delete_data["token_id"], token_id);
+    assert!(delete_data["revoked_by"].is_string());
+    assert!(delete_data["revoked_at"].is_string());
 
-    // Should have at least one record (the one we just created)
-    assert!(!history_records.is_empty());
+    println!("✅ Admin access token delete works correctly");
+}
 
-    // Find the record we just created (should be the most recent one)
-    let our_record = &history_records[0]; // Most recent record
+#[tokio::test]
+async fn test_admin_access_token_delete_not_found() {
+    let server = setup_test_server().await;
 
-    assert!(our_record["token_prefix"].is_string());
-    assert!(!our_record["token_prefix"].as_str().unwrap().is_empty());
+    // Get access token from refresh token
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
-    println!("✅ Admin access token history works with created admin tokens");
+    // Try to delete a non-existent token
+    let fake_token_id = "00000000-0000-0000-0000-000000000000";
+    let delete_request = serde_json::json!({
+        "reason": "Testing not found scenario"
+    });
+
+    let delete_response = server
+        .delete(&format!("/v1/admin/access_token/{}", fake_token_id))
+        .add_header("Authorization", format!("Bearer {}", access_token))
+        .json(&delete_request)
+        .await;
+
+    assert_eq!(delete_response.status_code(), 404);
+
+    let delete_data = delete_response.json::<serde_json::Value>();
+    assert!(delete_data["error"]["message"].is_string());
+    assert!(delete_data["error"]["message"].as_str().unwrap().contains("not found"));
+
+    println!("✅ Admin access token delete correctly handles not found");
+}
+
+#[tokio::test]
+async fn test_admin_access_token_delete_invalid_id() {
+    let server = setup_test_server().await;
+
+    // Get access token from refresh token
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+
+    // Try to delete with invalid token ID format
+    let invalid_token_id = "invalid-id";
+    let delete_request = serde_json::json!({
+        "reason": "Testing invalid ID format"
+    });
+
+    let delete_response = server
+        .delete(&format!("/v1/admin/access_token/{}", invalid_token_id))
+        .add_header("Authorization", format!("Bearer {}", access_token))
+        .json(&delete_request)
+        .await;
+
+    assert_eq!(delete_response.status_code(), 400);
+
+    let delete_data = delete_response.json::<serde_json::Value>();
+    assert!(delete_data["error"]["message"].is_string());
+    assert!(delete_data["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Invalid token ID format"));
+
+    println!("✅ Admin access token delete correctly handles invalid ID format");
+}
+
+#[tokio::test]
+async fn test_admin_access_token_unauthorized() {
+    let server = setup_test_server().await;
+
+    // Test create without authentication
+    let create_request = serde_json::json!({
+        "expires_in_hours": 24,
+        "name": "Unauthorized Test",
+        "reason": "Testing unauthorized access"
+    });
+
+    let create_response = server
+        .post("/v1/admin/access_token")
+        .json(&create_request)
+        .await;
+
+    assert_eq!(create_response.status_code(), 401);
+
+    // Test list without authentication
+    let list_response = server.get("/v1/admin/access_token").await;
+    assert_eq!(list_response.status_code(), 401);
+
+    // Test delete without authentication
+    let delete_request = serde_json::json!({
+        "reason": "Testing unauthorized access"
+    });
+
+    let delete_response = server
+        .delete("/v1/admin/access_token/00000000-0000-0000-0000-000000000000")
+        .json(&delete_request)
+        .await;
+    assert_eq!(delete_response.status_code(), 401);
+
+    println!("✅ Admin access token endpoints correctly require authentication");
 }

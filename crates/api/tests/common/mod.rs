@@ -72,6 +72,23 @@ pub fn get_session_id() -> String {
     "sess_402af343-70ba-4a8a-b926-012f71e86769".to_string()
 }
 
+/// Get an access token from a refresh token (session token)
+/// This function calls the /auth/refresh endpoint to exchange a refresh token for an access token
+pub async fn get_access_token_from_refresh_token(
+    server: &axum_test::TestServer,
+    refresh_token: String,
+) -> String {
+    let response = server
+        .post("/v1/auth/refresh")
+        .add_header("Authorization", format!("Bearer {}", refresh_token))
+        .await;
+
+    assert_eq!(response.status_code(), 200, "Failed to refresh access token");
+    
+    let refresh_response = response.json::<api::routes::auth::TokenRefreshResponse>();
+    refresh_response.access_token
+}
+
 /// Initialize database with migrations running only once
 pub async fn init_test_database(config: &config::DatabaseConfig) -> Arc<Database> {
     let database = Arc::new(

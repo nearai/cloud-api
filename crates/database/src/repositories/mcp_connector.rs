@@ -5,7 +5,7 @@ use crate::models::{
 use crate::pool::DbPool;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 pub struct McpConnectorRepository {
@@ -322,7 +322,7 @@ impl McpConnectorRepository {
         })
         .context("Failed to update connection status")?;
 
-        info!(
+        debug!(
             "Updated connection status for MCP connector {}: {} (rows affected: {})",
             id, status_str, rows_affected
         );

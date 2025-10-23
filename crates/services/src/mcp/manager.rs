@@ -80,7 +80,7 @@ impl McpClientManager {
         &self,
         connector: &McpConnector,
     ) -> Result<RunningService<RoleClient, ()>> {
-        info!(
+        debug!(
             "Creating MCP client for connector: {} ({})",
             connector.name, connector.id
         );
@@ -93,7 +93,7 @@ impl McpClientManager {
         // Add authentication if configured
         match &connector.auth {
             McpAuthConfig::Bearer(bearer_config) => {
-                info!(
+                debug!(
                     "Using Bearer authentication for connector {}",
                     connector.name
                 );
@@ -110,7 +110,7 @@ impl McpClientManager {
                 debug!("Bearer token configured for connector {}", connector.name);
             }
             McpAuthConfig::ApiKey(api_key_config) => {
-                info!(
+                debug!(
                     "Using API Key authentication for connector {}",
                     connector.name
                 );
@@ -127,7 +127,7 @@ impl McpClientManager {
                 // TODO: Handle custom authentication
             }
             McpAuthConfig::None => {
-                info!(
+                debug!(
                     "No authentication configured for connector {}",
                     connector.name
                 );
@@ -135,11 +135,11 @@ impl McpClientManager {
         }
 
         // Create the transport and connect
-        info!("Creating transport for MCP connector {}", connector.name);
+        debug!("Creating transport for MCP connector {}", connector.name);
         let transport = StreamableHttpClientTransport::from_config(config);
 
         // Connect with timeout
-        info!(
+        debug!(
             "Attempting to connect to MCP server {} with {}s timeout...",
             connector.name,
             self.connection_timeout.as_secs()
@@ -165,7 +165,7 @@ impl McpClientManager {
                 McpError::NetworkError(format!("Failed to connect: {e}"))
             })?;
 
-        info!(
+        debug!(
             "Successfully connected to MCP server: {} ({})",
             connector.name, connector.id
         );
@@ -194,7 +194,7 @@ impl McpClientManager {
         }
 
         // Create new client
-        info!("Creating new MCP client for connector {}", connector.name);
+        debug!("Creating new MCP client for connector {}", connector.name);
         let client = self
             .create_client(connector)
             .await
@@ -219,7 +219,7 @@ impl McpClientManager {
         let mut clients = self.clients.write().await;
         clients.insert(connector_id, client_info);
 
-        info!("Successfully connected to MCP server: {}", connector.name);
+        debug!("Successfully connected to MCP server: {}", connector.name);
         Ok(())
     }
 
@@ -243,7 +243,7 @@ impl McpClientManager {
         if let Some(_info) = clients.remove(connector_id) {
             // The client will be dropped when it goes out of scope
             // We can't call cancel() directly as it would move the value
-            info!("Disconnected from MCP connector: {}", connector_id);
+            debug!("Disconnected from MCP connector: {}", connector_id);
         }
 
         Ok(())
@@ -264,7 +264,7 @@ impl McpClientManager {
             }
         }
 
-        info!("Listing tools from MCP connector {}", connector_id);
+        debug!("Listing tools from MCP connector {}", connector_id);
         let client_arc = self.get_or_create_client_arc(connector_id).await?;
 
         let tools = {
@@ -275,7 +275,7 @@ impl McpClientManager {
                 .map_err(|e| McpError::NetworkError(format!("Failed to list tools: {e}")))?
         };
 
-        info!(
+        debug!(
             "Successfully listed {} tools from connector {}",
             tools.len(),
             connector_id
@@ -506,7 +506,7 @@ impl McpClientManager {
         &self,
         connector: &McpConnector,
     ) -> Result<(McpServerInfo, Vec<Tool>), McpError> {
-        info!(
+        debug!(
             "Starting connection test for MCP connector {} ({})",
             connector.name, connector.id
         );
@@ -514,7 +514,7 @@ impl McpClientManager {
         // This will create and cache the client
         self.connect(connector).await?;
 
-        info!(
+        debug!(
             "Client created successfully, attempting to list tools for {}",
             connector.name
         );
@@ -522,7 +522,7 @@ impl McpClientManager {
         // Try to list tools to verify connection works
         let tools = self.get_tools(&connector.id).await?;
 
-        info!(
+        debug!(
             "Connection test successful for {} - found {} tools",
             connector.name,
             tools.len()

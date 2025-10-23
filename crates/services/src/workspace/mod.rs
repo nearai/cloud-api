@@ -75,6 +75,17 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         Ok(workspace)
     }
 
+    async fn get_workspace_by_name(
+        &self,
+        organization_id: OrganizationId,
+        workspace_name: &str,
+    ) -> Result<Option<Workspace>, WorkspaceError> {
+        self.workspace_repository
+            .get_by_name(organization_id.0, workspace_name)
+            .await
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get workspace: {e}")))
+    }
+
     async fn get_workspace_with_organization(
         &self,
         workspace_id: WorkspaceId,

@@ -111,6 +111,12 @@ pub enum WorkspaceOrderDirection {
 pub trait WorkspaceRepository: Send + Sync {
     async fn get_by_id(&self, workspace_id: WorkspaceId) -> anyhow::Result<Option<Workspace>>;
 
+    async fn get_by_name(
+        &self,
+        organization_id: Uuid,
+        workspace_name: &str,
+    ) -> anyhow::Result<Option<Workspace>>;
+
     async fn get_workspace_with_organization(
         &self,
         workspace_id: WorkspaceId,
@@ -216,6 +222,12 @@ pub trait WorkspaceServiceTrait: Send + Sync {
         workspace_id: WorkspaceId,
         requester_id: UserId,
     ) -> Result<Workspace, WorkspaceError>;
+
+    async fn get_workspace_by_name(
+        &self,
+        organization_id: OrganizationId,
+        workspace_name: &str,
+    ) -> Result<Option<Workspace>, WorkspaceError>;
 
     /// Get a workspace with its organization
     async fn get_workspace_with_organization(

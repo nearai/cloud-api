@@ -394,6 +394,17 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
         }
     }
 
+    async fn get_by_name(
+        &self,
+        organization_id: Uuid,
+        workspace_name: &str,
+    ) -> anyhow::Result<Option<services::workspace::Workspace>> {
+        match self.get_by_name(organization_id, workspace_name).await? {
+            Some(db_workspace) => Ok(Some(db_workspace_to_workspace_service(db_workspace))),
+            None => Ok(None),
+        }
+    }
+
     async fn get_workspace_with_organization(
         &self,
         workspace_id: services::workspace::WorkspaceId,

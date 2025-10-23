@@ -21,6 +21,7 @@ pub struct SessionToken(pub String);
 pub struct AccessTokenClaims {
     pub sub: UserId,
     pub exp: i64,
+    pub iat: i64,
 }
 
 impl From<Uuid> for UserId {
@@ -67,6 +68,7 @@ pub struct User {
     pub last_login: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub tokens_revoked_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -161,6 +163,8 @@ pub trait UserRepository: Send + Sync {
     ) -> anyhow::Result<Option<User>>;
 
     async fn update_last_login(&self, id: UserId) -> anyhow::Result<()>;
+
+    async fn update_tokens_revoked_at(&self, id: UserId) -> anyhow::Result<()>;
 
     async fn delete(&self, id: UserId) -> anyhow::Result<bool>;
 
@@ -315,6 +319,7 @@ impl MockAuthService {
             last_login: Some(chrono::Utc::now()),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            tokens_revoked_at: None,
         }
     }
 
@@ -343,6 +348,7 @@ impl MockAuthService {
         let claims = AccessTokenClaims {
             sub: user_id.clone(),
             exp: expiration.timestamp(),
+            iat: chrono::Utc::now().timestamp(),
         };
 
         let access_token = jsonwebtoken::encode(
@@ -403,6 +409,7 @@ impl AuthServiceTrait for MockAuthService {
         let claims = AccessTokenClaims {
             sub: user_id,
             exp: expiration.timestamp(),
+            iat: chrono::Utc::now().timestamp(),
         };
 
         jsonwebtoken::encode(

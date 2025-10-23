@@ -114,23 +114,7 @@ pub async fn create_workspace(
     let user_id = authenticated_user_to_user_id(user);
     let organization_id = OrganizationId(org_id);
 
-    match app_state
-        .workspace_service
-        .get_workspace_by_name(organization_id.clone(), &request.name)
-        .await
-    {
-        Ok(workspace) => {
-            if workspace.is_some() {
-                return Err(StatusCode::BAD_REQUEST);
-            }
-        }
-        Err(e) => {
-            error!("Failed to get workspace: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
-
-    // Use the workspace service to create the workspace (it handles permission checking)
+    // Use the workspace service to create the workspace (it handles permission checking and duplicate detection)
     match app_state
         .workspace_service
         .create_workspace(

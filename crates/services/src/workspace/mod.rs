@@ -4,6 +4,7 @@ pub use ports::*;
 use std::sync::Arc;
 
 use crate::auth::ports::UserId;
+use crate::common::RepositoryError;
 use crate::organization::{OrganizationId, OrganizationServiceTrait};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -24,6 +25,46 @@ impl WorkspaceServiceImpl {
             workspace_repository,
             api_key_repository,
             organization_service,
+        }
+    }
+
+    /// Convert RepositoryError to WorkspaceError
+    fn map_repository_error(err: RepositoryError) -> WorkspaceError {
+        match err {
+            RepositoryError::AlreadyExists => WorkspaceError::AlreadyExists,
+            RepositoryError::NotFound(msg) => {
+                WorkspaceError::InternalError(format!("Resource not found: {}", msg))
+            }
+            RepositoryError::RequiredFieldMissing(field) => {
+                WorkspaceError::InvalidParams(format!("Required field is missing: {}", field))
+            }
+            RepositoryError::ForeignKeyViolation(msg) => {
+                WorkspaceError::InvalidParams(format!("Referenced entity does not exist: {}", msg))
+            }
+            RepositoryError::ValidationFailed(msg) => {
+                WorkspaceError::InvalidParams(format!("Validation failed: {}", msg))
+            }
+            RepositoryError::DependencyExists(msg) => {
+                WorkspaceError::InvalidParams(format!("Cannot delete due to dependencies: {}", msg))
+            }
+            RepositoryError::TransactionConflict => {
+                WorkspaceError::InternalError("Transaction conflict, please retry".to_string())
+            }
+            RepositoryError::ConnectionFailed(msg) => {
+                WorkspaceError::InternalError(format!("Database connection failed: {}", msg))
+            }
+            RepositoryError::AuthenticationFailed => {
+                WorkspaceError::InternalError("Database authentication failed".to_string())
+            }
+            RepositoryError::PoolError(err) => {
+                WorkspaceError::InternalError(format!("Database connection pool error: {}", err))
+            }
+            RepositoryError::DatabaseError(err) => {
+                WorkspaceError::InternalError(format!("Database operation failed: {}", err))
+            }
+            RepositoryError::DataConversionError(err) => {
+                WorkspaceError::InternalError(format!("Data conversion error: {}", err))
+            }
         }
     }
 
@@ -202,14 +243,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
                 requester_id,
             )
             .await
-            .map_err(|e| {
-                let error_msg = e.to_string();
-                if error_msg.contains("duplicate key") || error_msg.contains("already exists") {
-                    WorkspaceError::AlreadyExists
-                } else {
-                    WorkspaceError::InternalError(format!("Failed to create workspace: {e}"))
-                }
-            })
+            .map_err(Self::map_repository_error)
     }
 
     async fn create_api_key(&self, request: CreateApiKeyRequest) -> Result<ApiKey, WorkspaceError> {

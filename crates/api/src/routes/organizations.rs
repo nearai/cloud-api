@@ -139,19 +139,6 @@ pub async fn create_organization(
         request.name, user.0.id
     );
 
-    match app_state
-        .organization_service
-        .get_organization_by_name(&request.name)
-        .await
-    {
-        Ok(org) => {
-            if org.is_some() {
-                return Err(StatusCode::BAD_REQUEST);
-            }
-        }
-        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
-    }
-
     // Convert API request to services request
     let user_id = crate::conversions::authenticated_user_to_user_id(user);
 

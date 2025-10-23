@@ -22,16 +22,16 @@ pub fn create_pool_with_rustls(cfg: Config, cert_path: Option<&str>) -> anyhow::
         debug!("Loading CA certificate from: {}", cert_path);
 
         let cert_file = File::open(cert_path)
-            .map_err(|e| anyhow::anyhow!("Failed to open certificate file {}: {}", cert_path, e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to open certificate file {cert_path}: {e}"))?;
         let mut reader = BufReader::new(cert_file);
 
         // Parse the PEM certificates
         let certs = rustls_pemfile::certs(&mut reader)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| anyhow::anyhow!("Failed to parse certificate: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to parse certificate: {e}"))?;
 
         if certs.is_empty() {
-            return Err(anyhow::anyhow!("No certificates found in {}", cert_path));
+            return Err(anyhow::anyhow!("No certificates found in {cert_path}"));
         }
 
         debug!("Found {} certificate(s) in {}", certs.len(), cert_path);
@@ -41,7 +41,7 @@ pub fn create_pool_with_rustls(cfg: Config, cert_path: Option<&str>) -> anyhow::
         for cert in certs {
             root_store
                 .add(cert)
-                .map_err(|e| anyhow::anyhow!("Failed to add certificate to root store: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to add certificate to root store: {e}"))?;
         }
 
         debug!(
@@ -61,13 +61,13 @@ pub fn create_pool_with_rustls(cfg: Config, cert_path: Option<&str>) -> anyhow::
 
         use rustls_platform_verifier::ConfigVerifierExt;
         rustls::ClientConfig::with_platform_verifier()
-            .map_err(|e| anyhow::anyhow!("Failed to create platform verifier: {}", e))?
+            .map_err(|e| anyhow::anyhow!("Failed to create platform verifier: {e}"))?
     };
 
     let tls = MakeRustlsConnect::new(client_config);
 
     cfg.create_pool(Some(Runtime::Tokio1), tls)
-        .map_err(|e| anyhow::anyhow!("Failed to create TLS pool: {}", e))
+        .map_err(|e| anyhow::anyhow!("Failed to create TLS pool: {e}"))
 }
 
 /// Create pool using native-tls (simpler for accepting self-signed certificates)
@@ -86,11 +86,11 @@ pub fn create_pool_with_native_tls(
 
     let connector = builder
         .build()
-        .map_err(|e| anyhow::anyhow!("Failed to create TLS connector: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to create TLS connector: {e}"))?;
     let tls = MakeTlsConnector::new(connector);
 
     cfg.create_pool(Some(Runtime::Tokio1), tls)
-        .map_err(|e| anyhow::anyhow!("Failed to create TLS pool: {}", e))
+        .map_err(|e| anyhow::anyhow!("Failed to create TLS pool: {e}"))
 }
 
 /// Connection pool type alias

@@ -1,4 +1,5 @@
 use crate::middleware::AuthenticatedUser;
+use crate::models::ErrorResponse;
 use axum::{
     extract::{Query, State},
     http::{header::SET_COOKIE, StatusCode},
@@ -14,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
+use utoipa::ToSchema;
 
 /// Temporary storage for OAuth state and PKCE verifiers
 /// In production, use Redis or similar
@@ -46,7 +48,7 @@ pub struct TokenExchangeResponse {
     user: AuthResponse,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct TokenRefreshResponse {
     access_token: String,
 }
@@ -256,6 +258,19 @@ pub async fn oauth_callback(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/auth/refresh",
+    tag = "Auth",
+    responses(
+        (status = 200, description = "Models upserted successfully", body = TokenRefreshResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
 pub async fn refresh_access_token(
     State((_oauth, _state_store, auth_service, config)): State<AuthState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -268,10 +283,10 @@ pub async fn refresh_access_token(
         Ok(access_token) => Json(TokenRefreshResponse { access_token }).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "server_error",
-                "error_description": format!("Access token creation failed: {}", e)
-            })),
+            Json(ErrorResponse::new(
+                format!("Failed to refresh token: {e}"),
+                "server_error".to_string(),
+            )),
         )
             .into_response(),
     }

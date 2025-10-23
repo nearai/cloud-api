@@ -1,4 +1,3 @@
-pub use inference_providers::VllmAttestationReport;
 use serde::{Deserialize, Serialize};
 /// Error types for attestation operations
 #[derive(Debug, thiserror::Error)]
@@ -38,22 +37,34 @@ pub struct DstackCpuQuote {
     pub quote: String,
     /// The event log associated with the quote
     pub event_log: String,
-    pub vm_config: String,
+    /// The report data
+    #[serde(default)]
     pub report_data: String,
+    /// The nonce used in the attestation request
+    pub request_nonce: String,
+    /// Application info from Dstack
+    pub info: serde_json::Value,
 }
 
-impl From<dstack_sdk::dstack_client::GetQuoteResponse> for DstackCpuQuote {
-    fn from(response: dstack_sdk::dstack_client::GetQuoteResponse) -> Self {
+impl DstackCpuQuote {
+    pub fn from_quote_and_nonce(
+        info: dstack_sdk::dstack_client::InfoResponse,
+        quote: dstack_sdk::dstack_client::GetQuoteResponse,
+        nonce: String,
+    ) -> Self {
         Self {
-            quote: response.quote,
-            event_log: response.event_log,
-            vm_config: response.vm_config,
-            report_data: response.report_data,
+            quote: quote.quote,
+            event_log: quote.event_log,
+            report_data: quote.report_data,
+            request_nonce: nonce,
+            info: serde_json::to_value(info).unwrap_or_default(),
         }
     }
 }
 
 pub struct AttestationReport {
     pub gateway_attestation: DstackCpuQuote,
-    pub model_attestations: Vec<VllmAttestationReport>,
+    pub all_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
 }
+
+pub type DstackAppInfo = dstack_sdk::dstack_client::InfoResponse;

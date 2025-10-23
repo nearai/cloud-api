@@ -187,7 +187,7 @@ impl ClusterManager {
         } else {
             use tokio_postgres::NoTls;
             cfg.create_pool(Some(Runtime::Tokio1), NoTls)
-                .map_err(|e| anyhow!("Failed to create pool: {}", e))
+                .map_err(|e| anyhow!("Failed to create pool: {e}"))
         }
     }
 
@@ -200,7 +200,7 @@ impl ClusterManager {
 
         pool.get()
             .await
-            .map_err(|e| anyhow!("Failed to get write connection: {}", e))
+            .map_err(|e| anyhow!("Failed to get write connection: {e}"))
     }
 
     /// Get a connection for read operations (uses replicas if available)

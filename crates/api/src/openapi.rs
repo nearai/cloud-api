@@ -83,6 +83,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::usage::get_organization_balance,
         crate::routes::usage::get_organization_usage_history,
         crate::routes::usage::get_api_key_usage_history,
+        // Auth endpoints
+        crate::routes::auth::refresh_access_token,
     ),
     components(
         schemas(
@@ -130,7 +132,6 @@ use utoipa::{Modify, OpenApi};
             crate::routes::attestation::VerifyRequest,
             crate::routes::attestation::Evidence,
             crate::routes::attestation::NvidiaPayload,
-            crate::routes::attestation::Attestation,
             crate::routes::attestation::QuoteResponse,
             crate::routes::attestation::ErrorResponse,
             // Model pricing models
@@ -147,6 +148,8 @@ use utoipa::{Modify, OpenApi};
             crate::routes::usage::OrganizationBalanceResponse,
             crate::routes::usage::UsageHistoryResponse,
             crate::routes::usage::UsageHistoryEntryResponse,
+            // Auth models
+            crate::routes::auth::TokenRefreshResponse,
         ),
     ),
     modifiers(&SecurityAddon)

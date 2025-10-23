@@ -75,6 +75,8 @@ pub async fn get_signature(
 pub struct AttestationQuery {
     pub model: Option<String>,
     pub signing_algo: Option<String>,
+    pub nonce: Option<String>,
+    pub signing_address: Option<String>,
 }
 
 /// Evidence item in NVIDIA payload
@@ -90,30 +92,14 @@ pub struct NvidiaPayload {
     pub evidence_list: Vec<Evidence>,
 }
 
-/// Individual attestation entry
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct Attestation {
-    pub signing_address: String,
-    pub intel_quote: String,
-    pub nvidia_payload: String, // Stored as JSON string
-}
-
-impl From<inference_providers::VllmAttestationReport> for Attestation {
-    fn from(report: inference_providers::VllmAttestationReport) -> Self {
-        Self {
-            signing_address: report.signing_address,
-            intel_quote: report.intel_quote,
-            nvidia_payload: report.nvidia_payload,
-        }
-    }
-}
-
 /// Response for attestation report endpoint
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
-
 pub struct DstackCpuQuote {
     pub quote: String,
     pub event_log: String,
+    pub report_data: String,
+    pub request_nonce: String,
+    pub info: serde_json::Value,
 }
 
 impl From<services::attestation::models::DstackCpuQuote> for DstackCpuQuote {
@@ -121,24 +107,9 @@ impl From<services::attestation::models::DstackCpuQuote> for DstackCpuQuote {
         Self {
             quote: quote.quote,
             event_log: quote.event_log,
-        }
-    }
-}
-
-/// VLLM attestation report
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct VllmAttestationReport {
-    pub signing_address: String,
-    pub intel_quote: String,
-    pub nvidia_payload: String,
-}
-
-impl From<services::attestation::models::VllmAttestationReport> for VllmAttestationReport {
-    fn from(report: services::attestation::models::VllmAttestationReport) -> Self {
-        Self {
-            signing_address: report.signing_address,
-            intel_quote: report.intel_quote,
-            nvidia_payload: report.nvidia_payload,
+            report_data: quote.report_data,
+            request_nonce: quote.request_nonce,
+            info: quote.info,
         }
     }
 }
@@ -147,18 +118,18 @@ impl From<services::attestation::models::VllmAttestationReport> for VllmAttestat
 pub struct AttestationResponse {
     pub gateway_attestation: DstackCpuQuote,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub model_attestations: Vec<VllmAttestationReport>,
+    pub all_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
+    /// Deprecated: use `all_attestations` instead
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub model_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl From<services::attestation::models::AttestationReport> for AttestationResponse {
     fn from(report: services::attestation::models::AttestationReport) -> Self {
         Self {
             gateway_attestation: report.gateway_attestation.into(),
-            model_attestations: report
-                .model_attestations
-                .into_iter()
-                .map(VllmAttestationReport::from)
-                .collect(),
+            all_attestations: report.all_attestations.clone(),
+            model_attestations: report.all_attestations,
         }
     }
 }
@@ -171,6 +142,7 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
     ),
     responses(
         (status = 200, description = "Attestation report retrieved successfully", body = AttestationResponse),
+        (status = 400, description = "Invalid nonce format"),
         (status = 503, description = "Attestation service unavailable")
     ),
     security(
@@ -183,7 +155,12 @@ pub async fn get_attestation_report(
 ) -> Result<ResponseJson<AttestationResponse>, (StatusCode, ResponseJson<serde_json::Value>)> {
     let report = app_state
         .attestation_service
-        .get_attestation_report(params.model, params.signing_algo)
+        .get_attestation_report(
+            params.model,
+            params.signing_algo,
+            params.nonce,
+            params.signing_address,
+        )
         .await
         .map_err(|e| {
             (

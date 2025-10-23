@@ -383,18 +383,34 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .api_key_repository
             .get_by_id(api_key_id.clone())
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get API key: {e}")))?
+            .map_err(Self::map_repository_error)?
             .ok_or(WorkspaceError::ApiKeyNotFound)?;
 
         if api_key.workspace_id.0 != workspace_id.0 {
             return Err(WorkspaceError::ApiKeyNotFound);
         }
 
+        // If updating the name, check for duplicates
+        if let Some(ref new_name) = name {
+            // Only check for duplicates if the name is actually changing
+            if new_name != &api_key.name {
+                let is_duplicate = self
+                    .api_key_repository
+                    .check_name_duplication(workspace_id.clone(), new_name)
+                    .await
+                    .map_err(Self::map_repository_error)?;
+
+                if is_duplicate {
+                    return Err(WorkspaceError::AlreadyExists);
+                }
+            }
+        }
+
         // Update the API key
         self.api_key_repository
             .update(api_key_id, name, expires_at, spend_limit, is_active)
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to update API key: {e}")))
+            .map_err(Self::map_repository_error)
     }
 
     async fn can_manage_api_keys(

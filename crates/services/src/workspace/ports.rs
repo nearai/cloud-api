@@ -173,28 +173,28 @@ pub trait WorkspaceRepository: Send + Sync {
 // Repository trait for API key data access
 #[async_trait]
 pub trait ApiKeyRepository: Send + Sync {
-    async fn validate(&self, api_key: String) -> anyhow::Result<Option<ApiKey>>;
+    async fn validate(&self, api_key: String) -> Result<Option<ApiKey>, RepositoryError>;
 
-    async fn create(&self, request: CreateApiKeyRequest) -> anyhow::Result<ApiKey>;
+    async fn create(&self, request: CreateApiKeyRequest) -> Result<ApiKey, RepositoryError>;
 
-    async fn get_by_id(&self, id: ApiKeyId) -> anyhow::Result<Option<ApiKey>>;
+    async fn get_by_id(&self, id: ApiKeyId) -> Result<Option<ApiKey>, RepositoryError>;
 
     async fn list_by_workspace_paginated(
         &self,
         workspace_id: WorkspaceId,
         limit: i64,
         offset: i64,
-    ) -> anyhow::Result<Vec<ApiKey>>;
+    ) -> Result<Vec<ApiKey>, RepositoryError>;
 
-    async fn delete(&self, id: ApiKeyId) -> anyhow::Result<bool>;
+    async fn delete(&self, id: ApiKeyId) -> Result<bool, RepositoryError>;
 
-    async fn update_last_used(&self, id: ApiKeyId) -> anyhow::Result<()>;
+    async fn update_last_used(&self, id: ApiKeyId) -> Result<(), RepositoryError>;
 
     async fn update_spend_limit(
         &self,
         id: ApiKeyId,
         spend_limit: Option<i64>,
-    ) -> anyhow::Result<ApiKey>;
+    ) -> Result<ApiKey, RepositoryError>;
 
     async fn update(
         &self,
@@ -203,20 +203,20 @@ pub trait ApiKeyRepository: Send + Sync {
         expires_at: Option<Option<DateTime<Utc>>>,
         spend_limit: Option<Option<i64>>,
         is_active: Option<bool>,
-    ) -> anyhow::Result<ApiKey>;
+    ) -> Result<ApiKey, RepositoryError>;
 
     /// Count API keys for a workspace
-    async fn count_by_workspace(&self, workspace_id: WorkspaceId) -> anyhow::Result<i64>;
+    async fn count_by_workspace(&self, workspace_id: WorkspaceId) -> Result<i64, RepositoryError>;
 
     /// Check for duplicate API key name in workspace
     async fn check_name_duplication(
         &self,
         workspace_id: WorkspaceId,
         name: &str,
-    ) -> anyhow::Result<bool>;
+    ) -> Result<bool, RepositoryError>;
 
     /// Revoke (soft delete) an API key
-    async fn revoke(&self, id: ApiKeyId) -> anyhow::Result<bool>;
+    async fn revoke(&self, id: ApiKeyId) -> Result<bool, RepositoryError>;
 }
 
 // Service trait

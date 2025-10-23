@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod attestation;
 pub mod auth;
+pub mod common;
 pub mod completions;
 pub mod conversations;
 pub mod inference_provider_pool;

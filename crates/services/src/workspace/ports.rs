@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::ports::UserId;
+use crate::common::RepositoryError;
 use crate::organization::OrganizationId;
 
 // Domain ID types
@@ -109,17 +110,26 @@ pub enum WorkspaceOrderDirection {
 // Repository trait for workspace data access
 #[async_trait]
 pub trait WorkspaceRepository: Send + Sync {
-    async fn get_by_id(&self, workspace_id: WorkspaceId) -> anyhow::Result<Option<Workspace>>;
+    async fn get_by_id(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<Workspace>, RepositoryError>;
+
+    async fn get_by_name(
+        &self,
+        organization_id: Uuid,
+        workspace_name: &str,
+    ) -> Result<Option<Workspace>, RepositoryError>;
 
     async fn get_workspace_with_organization(
         &self,
         workspace_id: WorkspaceId,
-    ) -> anyhow::Result<Option<(Workspace, crate::organization::Organization)>>;
+    ) -> Result<Option<(Workspace, crate::organization::Organization)>, RepositoryError>;
 
     async fn list_by_organization(
         &self,
         organization_id: OrganizationId,
-    ) -> anyhow::Result<Vec<Workspace>>;
+    ) -> Result<Vec<Workspace>, RepositoryError>;
 
     /// List workspaces for an organization with pagination
     async fn list_by_organization_paginated(
@@ -129,7 +139,7 @@ pub trait WorkspaceRepository: Send + Sync {
         offset: i64,
         order_by: Option<WorkspaceOrderBy>,
         order_direction: Option<WorkspaceOrderDirection>,
-    ) -> anyhow::Result<Vec<Workspace>>;
+    ) -> Result<Vec<Workspace>, RepositoryError>;
 
     /// Create a new workspace
     async fn create(
@@ -139,7 +149,7 @@ pub trait WorkspaceRepository: Send + Sync {
         description: Option<String>,
         organization_id: OrganizationId,
         created_by_user_id: UserId,
-    ) -> anyhow::Result<Workspace>;
+    ) -> Result<Workspace, RepositoryError>;
 
     /// Update a workspace
     async fn update(
@@ -148,13 +158,16 @@ pub trait WorkspaceRepository: Send + Sync {
         display_name: Option<String>,
         description: Option<String>,
         settings: Option<serde_json::Value>,
-    ) -> anyhow::Result<Option<Workspace>>;
+    ) -> Result<Option<Workspace>, RepositoryError>;
 
     /// Delete (deactivate) a workspace
-    async fn delete(&self, workspace_id: WorkspaceId) -> anyhow::Result<bool>;
+    async fn delete(&self, workspace_id: WorkspaceId) -> Result<bool, RepositoryError>;
 
     /// Count workspaces for an organization
-    async fn count_by_organization(&self, organization_id: OrganizationId) -> anyhow::Result<i64>;
+    async fn count_by_organization(
+        &self,
+        organization_id: OrganizationId,
+    ) -> Result<i64, RepositoryError>;
 }
 
 // Repository trait for API key data access

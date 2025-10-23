@@ -6,7 +6,7 @@ use oauth2::{
 };
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::{debug};
+use tracing::debug;
 
 // Type alias for a fully configured OAuth client
 type ConfiguredClient = oauth2::Client<

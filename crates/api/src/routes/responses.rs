@@ -16,7 +16,7 @@ use services::{
 };
 use std::convert::Infallible;
 use std::sync::Arc;
-use tracing::{debug};
+use tracing::debug;
 use uuid::Uuid;
 
 // Helper function to map ResponseError to HTTP status code

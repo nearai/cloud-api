@@ -8,7 +8,7 @@ use serde::Deserialize;
 use services::conversations::ports::ConversationRequest;
 use services::{ConversationError, ConversationId};
 use std::sync::Arc;
-use tracing::{debug};
+use tracing::debug;
 use uuid::Uuid;
 
 // Helper functions for ID conversion

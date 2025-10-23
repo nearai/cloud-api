@@ -1,8 +1,10 @@
 use crate::models::ApiKey;
 use crate::pool::DbPool;
+use crate::repositories::utils::map_db_error;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use services::common::RepositoryError;
 use services::workspace::ports::CreateApiKeyRequest;
 use sha2::{Digest, Sha256};
 use tracing::debug;
@@ -37,12 +39,16 @@ impl ApiKeyRepository {
     }
 
     /// Create a new API key
-    pub async fn create(&self, request: CreateApiKeyRequest) -> Result<(String, ApiKey)> {
+    pub async fn create(
+        &self,
+        request: CreateApiKeyRequest,
+    ) -> Result<(String, ApiKey), RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let id = Uuid::new_v4();
         let key = Self::generate_api_key();
@@ -73,7 +79,7 @@ impl ApiKeyRepository {
                 ],
             )
             .await
-            .context("Failed to create API key")?;
+            .map_err(map_db_error)?;
 
         debug!(
             "Created API key: {} for workspace: {} by user: {}",
@@ -101,12 +107,13 @@ impl ApiKeyRepository {
     }
 
     /// Get an API key by ID
-    pub async fn get_by_id(&self, id: Uuid) -> Result<Option<ApiKey>> {
+    pub async fn get_by_id(&self, id: Uuid) -> Result<Option<ApiKey>, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let row = client
             .query_opt(
@@ -114,24 +121,28 @@ impl ApiKeyRepository {
                 &[&id],
             )
             .await
-            .context("Failed to query API key")?;
+            .map_err(map_db_error)?;
 
         match row {
-            Some(row) => Ok(Some(self.row_to_api_key(row)?)),
+            Some(row) => Ok(Some(
+                self.row_to_api_key(row)
+                    .map_err(RepositoryError::DataConversionError)?,
+            )),
             None => Ok(None),
         }
     }
 
     /// Validate an API key globally and return it if valid
     /// API keys are globally unique across all workspaces
-    pub async fn validate(&self, key: &str) -> Result<Option<ApiKey>> {
+    pub async fn validate(&self, key: &str) -> Result<Option<ApiKey>, RepositoryError> {
         let key_hash = Self::hash_api_key(key);
 
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let row = client
             .query_opt(
@@ -145,11 +156,13 @@ impl ApiKeyRepository {
                 &[&key_hash],
             )
             .await
-            .context("Failed to validate API key")?;
+            .map_err(map_db_error)?;
 
         match row {
             Some(row) => {
-                let api_key = self.row_to_api_key(row)?;
+                let api_key = self
+                    .row_to_api_key(row)
+                    .map_err(RepositoryError::DataConversionError)?;
                 // Update last used timestamp
                 let _ = self.update_last_used(api_key.id).await;
                 Ok(Some(api_key))
@@ -159,12 +172,13 @@ impl ApiKeyRepository {
     }
 
     /// Update the last used timestamp for an API key
-    async fn update_last_used(&self, id: Uuid) -> Result<()> {
+    async fn update_last_used(&self, id: Uuid) -> Result<(), RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         client
             .execute(
@@ -172,17 +186,22 @@ impl ApiKeyRepository {
                 &[&id],
             )
             .await
-            .context("Failed to update last used timestamp")?;
+            .map_err(map_db_error)?;
 
         Ok(())
     }
 
-    pub async fn count_duplication(&self, workspace_id: &Uuid, name: &String) -> Result<i64> {
+    pub async fn count_duplication(
+        &self,
+        workspace_id: &Uuid,
+        name: &String,
+    ) -> Result<i64, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let row = client
             .query_one(
@@ -193,18 +212,19 @@ impl ApiKeyRepository {
                 &[workspace_id, name],
             )
             .await
-            .context("Failed to count API key duplication")?;
+            .map_err(map_db_error)?;
 
         Ok(row.get::<_, i64>("count"))
     }
 
     /// Count API keys for a workspace
-    pub async fn count_by_workspace(&self, workspace_id: Uuid) -> Result<i64> {
+    pub async fn count_by_workspace(&self, workspace_id: Uuid) -> Result<i64, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let row = client
             .query_one(
@@ -212,7 +232,7 @@ impl ApiKeyRepository {
                 &[&workspace_id],
             )
             .await
-            .context("Failed to count API keys")?;
+            .map_err(map_db_error)?;
 
         Ok(row.get::<_, i64>("count"))
     }
@@ -224,12 +244,13 @@ impl ApiKeyRepository {
         workspace_id: Uuid,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<ApiKey>> {
+    ) -> Result<Vec<ApiKey>, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let rows = client
             .query(
@@ -258,10 +279,13 @@ impl ApiKeyRepository {
                 &[&workspace_id, &limit, &offset],
             )
             .await
-            .context("Failed to list API keys with usage")?;
+            .map_err(map_db_error)?;
 
         rows.into_iter()
-            .map(|row| self.row_to_api_key_with_usage(row))
+            .map(|row| {
+                self.row_to_api_key_with_usage(row)
+                    .map_err(RepositoryError::DataConversionError)
+            })
             .collect()
     }
 
@@ -287,12 +311,13 @@ impl ApiKeyRepository {
     }
 
     /// Soft delete an API key (sets deleted_at timestamp)
-    pub async fn revoke(&self, id: Uuid) -> Result<bool> {
+    pub async fn revoke(&self, id: Uuid) -> Result<bool, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let rows_affected = client
             .execute(
@@ -300,7 +325,7 @@ impl ApiKeyRepository {
                 &[&id],
             )
             .await
-            .context("Failed to soft delete API key")?;
+            .map_err(map_db_error)?;
 
         Ok(rows_affected > 0)
     }
@@ -358,12 +383,17 @@ impl ApiKeyRepository {
     }
 
     /// Update spend limit for an API key
-    pub async fn update_spend_limit(&self, id: Uuid, spend_limit: Option<i64>) -> Result<ApiKey> {
+    pub async fn update_spend_limit(
+        &self,
+        id: Uuid,
+        spend_limit: Option<i64>,
+    ) -> Result<ApiKey, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let row = client
             .query_one(
@@ -371,10 +401,11 @@ impl ApiKeyRepository {
                 &[&spend_limit, &id],
             )
             .await
-            .context("Failed to update API key spend limit")?;
+            .map_err(map_db_error)?;
 
         debug!("Updated spend limit for API key: {}", id);
         self.row_to_api_key(row)
+            .map_err(RepositoryError::DataConversionError)
     }
 
     /// Update an API key (name, expires_at, and/or spend_limit)
@@ -385,12 +416,13 @@ impl ApiKeyRepository {
         expires_at: Option<Option<DateTime<Utc>>>,
         spend_limit: Option<Option<i64>>,
         is_active: Option<bool>,
-    ) -> Result<ApiKey> {
+    ) -> Result<ApiKey, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         // Build dynamic UPDATE query based on provided fields
         let mut updates = Vec::new();
@@ -423,7 +455,10 @@ impl ApiKeyRepository {
 
         if updates.is_empty() {
             // No fields to update, just return the existing key
-            return self.get_by_id(id).await?.context("API key not found");
+            return self
+                .get_by_id(id)
+                .await?
+                .ok_or_else(|| RepositoryError::NotFound("API key".to_string()));
         }
 
         let query = format!(
@@ -437,10 +472,11 @@ impl ApiKeyRepository {
         let row = client
             .query_one(&query, &params[..])
             .await
-            .context("Failed to update API key")?;
+            .map_err(map_db_error)?;
 
         debug!("Updated API key: {}", id);
         self.row_to_api_key(row)
+            .map_err(RepositoryError::DataConversionError)
     }
 
     // Helper function to convert database row to ApiKey (without usage data)
@@ -488,7 +524,7 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
     async fn validate(
         &self,
         api_key: String,
-    ) -> anyhow::Result<Option<services::workspace::ApiKey>> {
+    ) -> Result<Option<services::workspace::ApiKey>, RepositoryError> {
         let maybe_api_key = self.validate(&api_key).await?;
         Ok(maybe_api_key.map(|db_api_key| db_apikey_to_workspace_service(None, db_api_key)))
     }
@@ -496,7 +532,7 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
     async fn create(
         &self,
         request: services::workspace::CreateApiKeyRequest,
-    ) -> anyhow::Result<services::workspace::ApiKey> {
+    ) -> Result<services::workspace::ApiKey, RepositoryError> {
         let (key, db_api_key) = self.create(request).await?;
         Ok(db_apikey_to_workspace_service(Some(key), db_api_key))
     }
@@ -504,8 +540,10 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
     async fn get_by_id(
         &self,
         id: services::workspace::ApiKeyId,
-    ) -> anyhow::Result<Option<services::workspace::ApiKey>> {
-        let uuid = Uuid::parse_str(&id.0)?;
+    ) -> Result<Option<services::workspace::ApiKey>, RepositoryError> {
+        let uuid = Uuid::parse_str(&id.0)
+            .context("Invalid UUID format")
+            .map_err(RepositoryError::DataConversionError)?;
         let maybe_api_key = self.get_by_id(uuid).await?;
         Ok(maybe_api_key.map(|db_api_key| db_apikey_to_workspace_service(None, db_api_key)))
     }
@@ -515,7 +553,7 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
         workspace_id: services::workspace::WorkspaceId,
         limit: i64,
         offset: i64,
-    ) -> anyhow::Result<Vec<services::workspace::ApiKey>> {
+    ) -> Result<Vec<services::workspace::ApiKey>, RepositoryError> {
         let api_keys = self
             .list_by_workspace_paginated(workspace_id.0, limit, offset)
             .await?;
@@ -525,22 +563,32 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
             .collect())
     }
 
-    async fn delete(&self, id: services::workspace::ApiKeyId) -> anyhow::Result<bool> {
-        self.revoke(Uuid::parse_str(&id.0)?).await
+    async fn delete(&self, id: services::workspace::ApiKeyId) -> Result<bool, RepositoryError> {
+        let uuid = Uuid::parse_str(&id.0)
+            .context("Invalid UUID format")
+            .map_err(RepositoryError::DataConversionError)?;
+        self.revoke(uuid).await
     }
 
-    async fn update_last_used(&self, id: services::workspace::ApiKeyId) -> anyhow::Result<()> {
-        self.update_last_used(Uuid::parse_str(&id.0)?).await
+    async fn update_last_used(
+        &self,
+        id: services::workspace::ApiKeyId,
+    ) -> Result<(), RepositoryError> {
+        let uuid = Uuid::parse_str(&id.0)
+            .context("Invalid UUID format")
+            .map_err(RepositoryError::DataConversionError)?;
+        self.update_last_used(uuid).await
     }
 
     async fn update_spend_limit(
         &self,
         id: services::workspace::ApiKeyId,
         spend_limit: Option<i64>,
-    ) -> anyhow::Result<services::workspace::ApiKey> {
-        let db_api_key = self
-            .update_spend_limit(Uuid::parse_str(&id.0)?, spend_limit)
-            .await?;
+    ) -> Result<services::workspace::ApiKey, RepositoryError> {
+        let uuid = Uuid::parse_str(&id.0)
+            .context("Invalid UUID format")
+            .map_err(RepositoryError::DataConversionError)?;
+        let db_api_key = self.update_spend_limit(uuid, spend_limit).await?;
         Ok(db_apikey_to_workspace_service(None, db_api_key))
     }
 
@@ -551,15 +599,12 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
         expires_at: Option<Option<DateTime<Utc>>>,
         spend_limit: Option<Option<i64>>,
         is_active: Option<bool>,
-    ) -> anyhow::Result<services::workspace::ApiKey> {
+    ) -> Result<services::workspace::ApiKey, RepositoryError> {
+        let uuid = Uuid::parse_str(&id.0)
+            .context("Invalid UUID format")
+            .map_err(RepositoryError::DataConversionError)?;
         let db_api_key = self
-            .update(
-                Uuid::parse_str(&id.0)?,
-                name,
-                expires_at,
-                spend_limit,
-                is_active,
-            )
+            .update(uuid, name, expires_at, spend_limit, is_active)
             .await?;
         Ok(db_apikey_to_workspace_service(None, db_api_key))
     }
@@ -567,7 +612,7 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
     async fn count_by_workspace(
         &self,
         workspace_id: services::workspace::WorkspaceId,
-    ) -> anyhow::Result<i64> {
+    ) -> Result<i64, RepositoryError> {
         self.count_by_workspace(workspace_id.0).await
     }
 
@@ -575,15 +620,18 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
         &self,
         workspace_id: services::workspace::WorkspaceId,
         name: &str,
-    ) -> anyhow::Result<bool> {
+    ) -> Result<bool, RepositoryError> {
         let count = self
             .count_duplication(&workspace_id.0, &name.to_string())
             .await?;
         Ok(count > 0)
     }
 
-    async fn revoke(&self, id: services::workspace::ApiKeyId) -> anyhow::Result<bool> {
-        self.revoke(Uuid::parse_str(&id.0)?).await
+    async fn revoke(&self, id: services::workspace::ApiKeyId) -> Result<bool, RepositoryError> {
+        let uuid = Uuid::parse_str(&id.0)
+            .context("Invalid UUID format")
+            .map_err(RepositoryError::DataConversionError)?;
+        self.revoke(uuid).await
     }
 }
 

@@ -15,6 +15,7 @@ pub mod response;
 pub mod session;
 pub mod usage_repository_impl;
 pub mod user;
+pub mod utils;
 pub mod workspace;
 
 pub use admin_composite::AdminCompositeRepository;

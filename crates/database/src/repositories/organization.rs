@@ -6,13 +6,13 @@ use crate::models::{
     UpdateOrganizationRequest as DbUpdateOrganizationRequest,
 };
 use crate::pool::DbPool;
+use crate::repositories::utils::map_db_error;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use services::auth::ports::UserId;
 use services::common::RepositoryError;
 use services::organization::ports::*;
-use tokio_postgres::error::SqlState;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -23,61 +23,6 @@ pub struct PgOrganizationRepository {
 impl PgOrganizationRepository {
     pub fn new(pool: DbPool) -> Self {
         Self { pool }
-    }
-
-    /// Convert tokio_postgres::Error to RepositoryError
-    fn map_db_error(err: tokio_postgres::Error) -> RepositoryError {
-        // Handle database-level errors (connection, auth, etc.)
-        if err.is_closed() {
-            return RepositoryError::ConnectionFailed("Connection closed".to_string());
-        }
-
-        // Handle SQL state errors
-        if let Some(db_err) = err.as_db_error() {
-            let message = db_err.message();
-
-            match db_err.code() {
-                // Integrity constraint violations
-                &SqlState::UNIQUE_VIOLATION => RepositoryError::AlreadyExists,
-                &SqlState::FOREIGN_KEY_VIOLATION => {
-                    RepositoryError::ForeignKeyViolation(message.to_string())
-                }
-                &SqlState::NOT_NULL_VIOLATION => {
-                    RepositoryError::RequiredFieldMissing(message.to_string())
-                }
-                &SqlState::CHECK_VIOLATION => {
-                    RepositoryError::ValidationFailed(message.to_string())
-                }
-                &SqlState::RESTRICT_VIOLATION => {
-                    RepositoryError::DependencyExists(message.to_string())
-                }
-
-                // Transaction errors
-                &SqlState::T_R_SERIALIZATION_FAILURE | &SqlState::T_R_DEADLOCK_DETECTED => {
-                    RepositoryError::TransactionConflict
-                }
-
-                // Connection/auth errors
-                &SqlState::INVALID_PASSWORD | &SqlState::INVALID_AUTHORIZATION_SPECIFICATION => {
-                    RepositoryError::AuthenticationFailed
-                }
-                &SqlState::CONNECTION_EXCEPTION
-                | &SqlState::CONNECTION_DOES_NOT_EXIST
-                | &SqlState::CONNECTION_FAILURE => {
-                    RepositoryError::ConnectionFailed(message.to_string())
-                }
-
-                // Default case - wrap in generic database error
-                _ => RepositoryError::DatabaseError(anyhow::anyhow!(
-                    "Database error ({}): {}",
-                    db_err.code().code(),
-                    message
-                )),
-            }
-        } else {
-            // Non-SQL errors (connection issues, etc.)
-            RepositoryError::DatabaseError(err.into())
-        }
     }
 
     /// Get the owner of an organization by looking up the owner role in organization_members
@@ -186,7 +131,7 @@ impl PgOrganizationRepository {
                 ],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         // Add creator as owner
         transaction
@@ -198,9 +143,9 @@ impl PgOrganizationRepository {
                 &[&id, &creator_user_id, &now],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
-        transaction.commit().await.map_err(Self::map_db_error)?;
+        transaction.commit().await.map_err(map_db_error)?;
 
         debug!(
             "Created organization: {} with owner: {}",
@@ -228,7 +173,7 @@ impl PgOrganizationRepository {
                 &[&id],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         match row {
             Some(row) => Ok(Some(
@@ -257,7 +202,7 @@ impl PgOrganizationRepository {
                 &[&name],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         match row {
             Some(row) => Ok(Some(
@@ -290,7 +235,7 @@ impl PgOrganizationRepository {
                 &[&organization_id, &user_id],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         match row {
             Some(row) => Ok(Some(
@@ -335,7 +280,7 @@ impl PgOrganizationRepository {
                 ],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         debug!("Updated organization: {}", id);
         self.row_to_db_organization(row)
@@ -382,7 +327,7 @@ impl PgOrganizationRepository {
                 &[&org_id, &request.user_id],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         if existing.is_some() {
             return Err(RepositoryError::AlreadyExists);
@@ -405,7 +350,7 @@ impl PgOrganizationRepository {
                 &now,
                 &invited_by,
             ],
-        ).await.map_err(Self::map_db_error)?;
+        ).await.map_err(map_db_error)?;
 
         debug!(
             "Added member {} to organization {} with role {:?}",
@@ -440,7 +385,7 @@ impl PgOrganizationRepository {
                 &[&org_id, &user_id, &request.role.to_string().to_lowercase()],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         debug!(
             "Updated member {} in organization {} to role {:?}",
@@ -489,7 +434,7 @@ impl PgOrganizationRepository {
                 &[&org_id, &limit, &offset],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         rows.into_iter()
             .map(|row| {
@@ -665,7 +610,7 @@ impl OrganizationRepository for PgOrganizationRepository {
                 &[&id],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         Ok(rows_affected > 0)
     }
@@ -719,7 +664,7 @@ impl OrganizationRepository for PgOrganizationRepository {
                 &[&org_id, &user_id],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         Ok(rows_affected > 0)
     }
@@ -756,7 +701,7 @@ impl OrganizationRepository for PgOrganizationRepository {
                 &[&org_id],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         Ok(row.get("count"))
     }
@@ -780,7 +725,7 @@ impl OrganizationRepository for PgOrganizationRepository {
                 &[&user_id],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         Ok(row.get::<_, i64>("count"))
     }
@@ -826,7 +771,7 @@ impl OrganizationRepository for PgOrganizationRepository {
                 &[&user_id, &limit, &offset],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         let mut organizations = Vec::new();
         for row in rows {

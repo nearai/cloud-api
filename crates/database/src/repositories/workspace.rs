@@ -1,13 +1,13 @@
 use crate::{
     models::{CreateWorkspaceRequest, UpdateWorkspaceRequest, Workspace},
     pool::DbPool,
+    repositories::utils::map_db_error,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use services::common::RepositoryError;
 use services::workspace::{WorkspaceOrderBy, WorkspaceOrderDirection};
-use tokio_postgres::error::SqlState;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -18,61 +18,6 @@ pub struct WorkspaceRepository {
 impl WorkspaceRepository {
     pub fn new(pool: DbPool) -> Self {
         Self { pool }
-    }
-
-    /// Convert tokio_postgres::Error to RepositoryError
-    fn map_db_error(err: tokio_postgres::Error) -> RepositoryError {
-        // Handle database-level errors (connection, auth, etc.)
-        if err.is_closed() {
-            return RepositoryError::ConnectionFailed("Connection closed".to_string());
-        }
-
-        // Handle SQL state errors
-        if let Some(db_err) = err.as_db_error() {
-            let message = db_err.message();
-
-            match db_err.code() {
-                // Integrity constraint violations
-                &SqlState::UNIQUE_VIOLATION => RepositoryError::AlreadyExists,
-                &SqlState::FOREIGN_KEY_VIOLATION => {
-                    RepositoryError::ForeignKeyViolation(message.to_string())
-                }
-                &SqlState::NOT_NULL_VIOLATION => {
-                    RepositoryError::RequiredFieldMissing(message.to_string())
-                }
-                &SqlState::CHECK_VIOLATION => {
-                    RepositoryError::ValidationFailed(message.to_string())
-                }
-                &SqlState::RESTRICT_VIOLATION => {
-                    RepositoryError::DependencyExists(message.to_string())
-                }
-
-                // Transaction errors
-                &SqlState::T_R_SERIALIZATION_FAILURE | &SqlState::T_R_DEADLOCK_DETECTED => {
-                    RepositoryError::TransactionConflict
-                }
-
-                // Connection/auth errors
-                &SqlState::INVALID_PASSWORD | &SqlState::INVALID_AUTHORIZATION_SPECIFICATION => {
-                    RepositoryError::AuthenticationFailed
-                }
-                &SqlState::CONNECTION_EXCEPTION
-                | &SqlState::CONNECTION_DOES_NOT_EXIST
-                | &SqlState::CONNECTION_FAILURE => {
-                    RepositoryError::ConnectionFailed(message.to_string())
-                }
-
-                // Default case - wrap in generic database error
-                _ => RepositoryError::DatabaseError(anyhow::anyhow!(
-                    "Database error ({}): {}",
-                    db_err.code().code(),
-                    message
-                )),
-            }
-        } else {
-            // Non-SQL errors (connection issues, etc.)
-            RepositoryError::DatabaseError(err.into())
-        }
     }
 
     /// Create a new workspace
@@ -114,7 +59,7 @@ impl WorkspaceRepository {
                 ],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         debug!(
             "Created workspace: {} for org: {} by user: {}",
@@ -140,7 +85,7 @@ impl WorkspaceRepository {
                 &[&id],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         match row {
             Some(row) => Ok(Some(
@@ -170,7 +115,7 @@ impl WorkspaceRepository {
                 &[&organization_id, &name],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         match row {
             Some(row) => Ok(Some(
@@ -199,7 +144,7 @@ impl WorkspaceRepository {
                 &[&organization_id],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         Ok(row.get::<_, i64>("count"))
     }
@@ -222,7 +167,7 @@ impl WorkspaceRepository {
                 &[&organization_id],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         rows.into_iter()
             .map(|row| {
@@ -266,7 +211,7 @@ impl WorkspaceRepository {
                 &[&organization_id, &limit, &offset],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         rows.into_iter()
             .map(|row| {
@@ -337,7 +282,7 @@ impl WorkspaceRepository {
         let row = client
             .query_opt(&query, &params)
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         match row {
             Some(row) => Ok(Some(
@@ -363,7 +308,7 @@ impl WorkspaceRepository {
                 &[&id],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         Ok(rows_affected > 0)
     }
@@ -413,7 +358,7 @@ impl WorkspaceRepository {
                 &[&workspace_id],
             )
             .await
-            .map_err(Self::map_db_error)?;
+            .map_err(map_db_error)?;
 
         match row {
             Some(row) => {

@@ -255,6 +255,303 @@ async fn test_duplicate_workspace_default_workspace() {
 }
 
 // ============================================
+// API Key Duplicate Name Tests
+// ============================================
+
+#[tokio::test]
+async fn test_duplicate_api_key_name_on_create_returns_409() {
+    let server = setup_test_server().await;
+    let org = create_org(&server).await;
+
+    // Get the default workspace
+    let workspaces_response = server
+        .get(format!("/v1/organizations/{}/workspaces", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(workspaces_response.status_code(), 200);
+    let workspaces = workspaces_response.json::<api::routes::workspaces::ListWorkspacesResponse>();
+    let workspace = &workspaces.workspaces[0];
+
+    let api_key_name = format!("test-key-{}", uuid::Uuid::new_v4());
+
+    // Create first API key
+    let request = api::models::CreateApiKeyRequest {
+        name: api_key_name.clone(),
+        expires_at: None,
+        spend_limit: None,
+    };
+
+    let response = server
+        .post(format!("/v1/workspaces/{}/api-keys", workspace.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&request)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        201,
+        "First API key creation should succeed with 201 CREATED"
+    );
+
+    let first_key = response.json::<api::models::ApiKeyResponse>();
+    assert_eq!(first_key.name, Some(api_key_name.clone()));
+
+    // Try to create second API key with the same name in the same workspace
+    let duplicate_request = api::models::CreateApiKeyRequest {
+        name: api_key_name.clone(),
+        expires_at: None,
+        spend_limit: None,
+    };
+
+    let duplicate_response = server
+        .post(format!("/v1/workspaces/{}/api-keys", workspace.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&duplicate_request)
+        .await;
+
+    // Should return 409 CONFLICT
+    assert_eq!(
+        duplicate_response.status_code(),
+        409,
+        "Duplicate API key name should return 409 CONFLICT"
+    );
+
+    let error_response = duplicate_response.json::<api::models::ErrorResponse>();
+    assert_eq!(error_response.error.r#type, "duplicate_api_key_name");
+    assert!(error_response
+        .error
+        .message
+        .contains("API key with this name already exists"));
+
+    println!("✓ Duplicate API key name on create correctly returns 409 CONFLICT");
+}
+
+#[tokio::test]
+async fn test_duplicate_api_key_name_on_update_returns_409() {
+    let server = setup_test_server().await;
+    let org = create_org(&server).await;
+
+    // Get the default workspace
+    let workspaces_response = server
+        .get(format!("/v1/organizations/{}/workspaces", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(workspaces_response.status_code(), 200);
+    let workspaces = workspaces_response.json::<api::routes::workspaces::ListWorkspacesResponse>();
+    let workspace = &workspaces.workspaces[0];
+
+    let first_key_name = format!("first-key-{}", uuid::Uuid::new_v4());
+    let second_key_name = format!("second-key-{}", uuid::Uuid::new_v4());
+
+    // Create first API key
+    let request1 = api::models::CreateApiKeyRequest {
+        name: first_key_name.clone(),
+        expires_at: None,
+        spend_limit: None,
+    };
+
+    let response1 = server
+        .post(format!("/v1/workspaces/{}/api-keys", workspace.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&request1)
+        .await;
+
+    assert_eq!(response1.status_code(), 201);
+    let _first_key = response1.json::<api::models::ApiKeyResponse>();
+
+    // Create second API key with different name
+    let request2 = api::models::CreateApiKeyRequest {
+        name: second_key_name.clone(),
+        expires_at: None,
+        spend_limit: None,
+    };
+
+    let response2 = server
+        .post(format!("/v1/workspaces/{}/api-keys", workspace.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&request2)
+        .await;
+
+    assert_eq!(response2.status_code(), 201);
+    let second_key = response2.json::<api::models::ApiKeyResponse>();
+
+    // Try to rename second key to the first key's name (should fail with 409)
+    let update_request = api::models::UpdateApiKeyRequest {
+        name: Some(first_key_name.clone()),
+        expires_at: None,
+        spend_limit: None,
+        is_active: None,
+    };
+
+    let update_response = server
+        .patch(format!("/v1/workspaces/{}/api-keys/{}", workspace.id, second_key.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&update_request)
+        .await;
+
+    // Should return 409 CONFLICT
+    assert_eq!(
+        update_response.status_code(),
+        409,
+        "Renaming API key to duplicate name should return 409 CONFLICT"
+    );
+
+    let error_response = update_response.json::<api::models::ErrorResponse>();
+    assert_eq!(error_response.error.r#type, "duplicate_api_key_name");
+    assert!(error_response
+        .error
+        .message
+        .contains("API key with this name already exists"));
+
+    println!("✓ Duplicate API key name on update correctly returns 409 CONFLICT");
+}
+
+#[tokio::test]
+async fn test_api_key_update_with_same_name_succeeds() {
+    let server = setup_test_server().await;
+    let org = create_org(&server).await;
+
+    // Get the default workspace
+    let workspaces_response = server
+        .get(format!("/v1/organizations/{}/workspaces", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(workspaces_response.status_code(), 200);
+    let workspaces = workspaces_response.json::<api::routes::workspaces::ListWorkspacesResponse>();
+    let workspace = &workspaces.workspaces[0];
+
+    let api_key_name = format!("test-key-{}", uuid::Uuid::new_v4());
+
+    // Create API key
+    let request = api::models::CreateApiKeyRequest {
+        name: api_key_name.clone(),
+        expires_at: None,
+        spend_limit: None,
+    };
+
+    let response = server
+        .post(format!("/v1/workspaces/{}/api-keys", workspace.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&request)
+        .await;
+
+    assert_eq!(response.status_code(), 201);
+    let api_key = response.json::<api::models::ApiKeyResponse>();
+
+    // Update the API key with the same name (should succeed - not changing the name)
+    let update_request = api::models::UpdateApiKeyRequest {
+        name: Some(api_key_name.clone()),
+        expires_at: None,
+        spend_limit: Some(api::models::DecimalPriceRequest {
+            amount: 1000000000, // 1 dollar in nano-dollars
+            currency: "USD".to_string(),
+        }),
+        is_active: None,
+    };
+
+    let update_response = server
+        .patch(format!("/v1/workspaces/{}/api-keys/{}", workspace.id, api_key.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&update_request)
+        .await;
+
+    // Should succeed (200 OK) since we're not actually changing the name
+    assert_eq!(
+        update_response.status_code(),
+        200,
+        "Updating API key with same name should succeed"
+    );
+
+    let updated_key = update_response.json::<api::models::ApiKeyResponse>();
+    assert_eq!(updated_key.name, Some(api_key_name));
+    assert_eq!(updated_key.spend_limit.as_ref().unwrap().amount, 1000000000);
+
+    println!("✓ Updating API key with its own name succeeds (no duplicate conflict)");
+}
+
+#[tokio::test]
+async fn test_same_api_key_name_different_workspaces_allowed() {
+    let server = setup_test_server().await;
+    let org = create_org(&server).await;
+
+    // Get the default workspace
+    let workspaces_response = server
+        .get(format!("/v1/organizations/{}/workspaces", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    let workspaces = workspaces_response.json::<api::routes::workspaces::ListWorkspacesResponse>();
+    let workspace1 = &workspaces.workspaces[0];
+
+    // Create a second workspace
+    let workspace2_request = api::routes::workspaces::CreateWorkspaceRequest {
+        name: format!("second-workspace-{}", uuid::Uuid::new_v4()),
+        display_name: Some("Second Workspace".to_string()),
+        description: Some("Second workspace for testing".to_string()),
+    };
+
+    let workspace2_response = server
+        .post(format!("/v1/organizations/{}/workspaces", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&workspace2_request)
+        .await;
+
+    assert_eq!(workspace2_response.status_code(), 201);
+    let workspace2 = workspace2_response.json::<api::routes::workspaces::WorkspaceResponse>();
+
+    let api_key_name = format!("shared-key-name-{}", uuid::Uuid::new_v4());
+
+    // Create API key in first workspace
+    let request1 = api::models::CreateApiKeyRequest {
+        name: api_key_name.clone(),
+        expires_at: None,
+        spend_limit: None,
+    };
+
+    let response1 = server
+        .post(format!("/v1/workspaces/{}/api-keys", workspace1.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&request1)
+        .await;
+
+    assert_eq!(response1.status_code(), 201);
+    let key1 = response1.json::<api::models::ApiKeyResponse>();
+
+    // Create API key with same name in second workspace (should succeed)
+    let request2 = api::models::CreateApiKeyRequest {
+        name: api_key_name.clone(),
+        expires_at: None,
+        spend_limit: None,
+    };
+
+    let response2 = server
+        .post(format!("/v1/workspaces/{}/api-keys", workspace2.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&request2)
+        .await;
+
+    assert_eq!(
+        response2.status_code(),
+        201,
+        "API key with same name in different workspace should succeed"
+    );
+
+    let key2 = response2.json::<api::models::ApiKeyResponse>();
+
+    // Verify both keys exist with same name but in different workspaces
+    assert_eq!(key1.name.as_ref().unwrap(), &api_key_name);
+    assert_eq!(key2.name.as_ref().unwrap(), &api_key_name);
+    assert_eq!(key1.workspace_id, workspace1.id);
+    assert_eq!(key2.workspace_id, workspace2.id);
+    assert_ne!(key1.id, key2.id);
+
+    println!("✓ API key names are correctly scoped per workspace");
+}
+
+// ============================================
 // Error Message Format Tests
 // ============================================
 

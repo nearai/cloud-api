@@ -17,7 +17,7 @@ impl AdminAccessTokenRepository {
 
     /// Generate a new admin access token
     fn generate_admin_access_token() -> String {
-        format!("aat_{}", Uuid::new_v4().to_string().replace("-", ""))
+        format!("adm_{}", Uuid::new_v4().to_string().replace("-", ""))
     }
 
     /// Hash an admin access token for storage

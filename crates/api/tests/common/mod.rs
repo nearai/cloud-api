@@ -83,8 +83,12 @@ pub async fn get_access_token_from_refresh_token(
         .add_header("Authorization", format!("Bearer {}", refresh_token))
         .await;
 
-    assert_eq!(response.status_code(), 200, "Failed to refresh access token");
-    
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Failed to refresh access token"
+    );
+
     let refresh_response = response.json::<api::routes::auth::TokenRefreshResponse>();
     refresh_response.access_token
 }

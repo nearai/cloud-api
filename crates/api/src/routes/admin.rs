@@ -1,8 +1,8 @@
 use crate::middleware::AdminUser;
 use crate::models::{
     AdminAccessTokenResponse, AdminUserResponse, BatchUpdateModelApiRequest,
-    CreateAdminAccessTokenRequest, DeleteAdminAccessTokenRequest, DecimalPrice, ErrorResponse, ListUsersResponse,
-    ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
+    CreateAdminAccessTokenRequest, DecimalPrice, DeleteAdminAccessTokenRequest, ErrorResponse,
+    ListUsersResponse, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
     OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, SpendLimit, UpdateOrganizationLimitsRequest,
     UpdateOrganizationLimitsResponse,
 };
@@ -800,11 +800,7 @@ pub async fn delete_admin_access_token(
     // Revoke the token
     match app_state
         .admin_access_token_repository
-        .revoke(
-            token_uuid,
-            admin_user.0.id,
-            request.reason,
-        )
+        .revoke(token_uuid, admin_user.0.id, request.reason)
         .await
     {
         Ok(true) => {

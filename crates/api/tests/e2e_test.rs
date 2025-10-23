@@ -2491,7 +2491,10 @@ async fn test_admin_access_token_delete_not_found() {
 
     let delete_data = delete_response.json::<serde_json::Value>();
     assert!(delete_data["error"]["message"].is_string());
-    assert!(delete_data["error"]["message"].as_str().unwrap().contains("not found"));
+    assert!(delete_data["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("not found"));
 
     println!("✅ Admin access token delete correctly handles not found");
 }

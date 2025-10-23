@@ -5,7 +5,9 @@ use crate::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
+use services::common::RepositoryError;
 use services::workspace::{WorkspaceOrderBy, WorkspaceOrderDirection};
+use tokio_postgres::error::SqlState;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -18,18 +20,74 @@ impl WorkspaceRepository {
         Self { pool }
     }
 
+    /// Convert tokio_postgres::Error to RepositoryError
+    fn map_db_error(err: tokio_postgres::Error) -> RepositoryError {
+        // Handle database-level errors (connection, auth, etc.)
+        if err.is_closed() {
+            return RepositoryError::ConnectionFailed("Connection closed".to_string());
+        }
+
+        // Handle SQL state errors
+        if let Some(db_err) = err.as_db_error() {
+            let message = db_err.message();
+
+            match db_err.code() {
+                // Integrity constraint violations
+                &SqlState::UNIQUE_VIOLATION => RepositoryError::AlreadyExists,
+                &SqlState::FOREIGN_KEY_VIOLATION => {
+                    RepositoryError::ForeignKeyViolation(message.to_string())
+                }
+                &SqlState::NOT_NULL_VIOLATION => {
+                    RepositoryError::RequiredFieldMissing(message.to_string())
+                }
+                &SqlState::CHECK_VIOLATION => {
+                    RepositoryError::ValidationFailed(message.to_string())
+                }
+                &SqlState::RESTRICT_VIOLATION => {
+                    RepositoryError::DependencyExists(message.to_string())
+                }
+
+                // Transaction errors
+                &SqlState::T_R_SERIALIZATION_FAILURE | &SqlState::T_R_DEADLOCK_DETECTED => {
+                    RepositoryError::TransactionConflict
+                }
+
+                // Connection/auth errors
+                &SqlState::INVALID_PASSWORD | &SqlState::INVALID_AUTHORIZATION_SPECIFICATION => {
+                    RepositoryError::AuthenticationFailed
+                }
+                &SqlState::CONNECTION_EXCEPTION
+                | &SqlState::CONNECTION_DOES_NOT_EXIST
+                | &SqlState::CONNECTION_FAILURE => {
+                    RepositoryError::ConnectionFailed(message.to_string())
+                }
+
+                // Default case - wrap in generic database error
+                _ => RepositoryError::DatabaseError(anyhow::anyhow!(
+                    "Database error ({}): {}",
+                    db_err.code().code(),
+                    message
+                )),
+            }
+        } else {
+            // Non-SQL errors (connection issues, etc.)
+            RepositoryError::DatabaseError(err.into())
+        }
+    }
+
     /// Create a new workspace
     pub async fn create(
         &self,
         request: CreateWorkspaceRequest,
         organization_id: Uuid,
         created_by_user_id: Uuid,
-    ) -> Result<Workspace> {
+    ) -> Result<Workspace, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let id = Uuid::new_v4();
         let now = Utc::now();
@@ -56,7 +114,7 @@ impl WorkspaceRepository {
                 ],
             )
             .await
-            .context("Failed to create workspace")?;
+            .map_err(Self::map_db_error)?;
 
         debug!(
             "Created workspace: {} for org: {} by user: {}",
@@ -64,15 +122,17 @@ impl WorkspaceRepository {
         );
 
         self.row_to_workspace(row)
+            .map_err(RepositoryError::DataConversionError)
     }
 
     /// Get a workspace by ID
-    pub async fn get_by_id(&self, id: Uuid) -> Result<Option<Workspace>> {
+    pub async fn get_by_id(&self, id: Uuid) -> Result<Option<Workspace>, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let row = client
             .query_opt(
@@ -80,10 +140,13 @@ impl WorkspaceRepository {
                 &[&id],
             )
             .await
-            .context("Failed to query workspace")?;
+            .map_err(Self::map_db_error)?;
 
         match row {
-            Some(row) => Ok(Some(self.row_to_workspace(row)?)),
+            Some(row) => Ok(Some(
+                self.row_to_workspace(row)
+                    .map_err(RepositoryError::DataConversionError)?,
+            )),
             None => Ok(None),
         }
     }
@@ -93,12 +156,13 @@ impl WorkspaceRepository {
         &self,
         organization_id: Uuid,
         name: &str,
-    ) -> Result<Option<Workspace>> {
+    ) -> Result<Option<Workspace>, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let row = client
             .query_opt(
@@ -106,21 +170,28 @@ impl WorkspaceRepository {
                 &[&organization_id, &name],
             )
             .await
-            .context("Failed to query workspace by name")?;
+            .map_err(Self::map_db_error)?;
 
         match row {
-            Some(row) => Ok(Some(self.row_to_workspace(row)?)),
+            Some(row) => Ok(Some(
+                self.row_to_workspace(row)
+                    .map_err(RepositoryError::DataConversionError)?,
+            )),
             None => Ok(None),
         }
     }
 
     /// Count workspaces for an organization
-    pub async fn count_by_organization(&self, organization_id: Uuid) -> Result<i64> {
+    pub async fn count_by_organization(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<i64, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let row = client
             .query_one(
@@ -128,18 +199,22 @@ impl WorkspaceRepository {
                 &[&organization_id],
             )
             .await
-            .context("Failed to count workspaces")?;
+            .map_err(Self::map_db_error)?;
 
         Ok(row.get::<_, i64>("count"))
     }
 
     /// List workspaces for an organization
-    pub async fn list_by_organization(&self, organization_id: Uuid) -> Result<Vec<Workspace>> {
+    pub async fn list_by_organization(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<Vec<Workspace>, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let rows = client
             .query(
@@ -147,10 +222,13 @@ impl WorkspaceRepository {
                 &[&organization_id],
             )
             .await
-            .context("Failed to list workspaces")?;
+            .map_err(Self::map_db_error)?;
 
         rows.into_iter()
-            .map(|row| self.row_to_workspace(row))
+            .map(|row| {
+                self.row_to_workspace(row)
+                    .map_err(RepositoryError::DataConversionError)
+            })
             .collect()
     }
 
@@ -162,7 +240,7 @@ impl WorkspaceRepository {
         offset: i64,
         order_by: Option<WorkspaceOrderBy>,
         order_direction: Option<WorkspaceOrderDirection>,
-    ) -> Result<Vec<Workspace>> {
+    ) -> Result<Vec<Workspace>, RepositoryError> {
         let order_by = order_by.unwrap_or(WorkspaceOrderBy::CreatedAt);
         let order_direction = order_direction.unwrap_or(WorkspaceOrderDirection::Asc);
 
@@ -179,7 +257,8 @@ impl WorkspaceRepository {
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let rows = client
             .query(
@@ -187,10 +266,13 @@ impl WorkspaceRepository {
                 &[&organization_id, &limit, &offset],
             )
             .await
-            .context("Failed to list workspaces")?;
+            .map_err(Self::map_db_error)?;
 
         rows.into_iter()
-            .map(|row| self.row_to_workspace(row))
+            .map(|row| {
+                self.row_to_workspace(row)
+                    .map_err(RepositoryError::DataConversionError)
+            })
             .collect()
     }
 
@@ -220,12 +302,13 @@ impl WorkspaceRepository {
         &self,
         id: Uuid,
         request: UpdateWorkspaceRequest,
-    ) -> Result<Option<Workspace>> {
+    ) -> Result<Option<Workspace>, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         // Build dynamic update query
         let mut query = String::from("UPDATE workspaces SET updated_at = NOW()");
@@ -254,21 +337,25 @@ impl WorkspaceRepository {
         let row = client
             .query_opt(&query, &params)
             .await
-            .context("Failed to update workspace")?;
+            .map_err(Self::map_db_error)?;
 
         match row {
-            Some(row) => Ok(Some(self.row_to_workspace(row)?)),
+            Some(row) => Ok(Some(
+                self.row_to_workspace(row)
+                    .map_err(RepositoryError::DataConversionError)?,
+            )),
             None => Ok(None),
         }
     }
 
     /// Delete (deactivate) a workspace
-    pub async fn delete(&self, id: Uuid) -> Result<bool> {
+    pub async fn delete(&self, id: Uuid) -> Result<bool, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let rows_affected = client
             .execute(
@@ -276,7 +363,7 @@ impl WorkspaceRepository {
                 &[&id],
             )
             .await
-            .context("Failed to delete workspace")?;
+            .map_err(Self::map_db_error)?;
 
         Ok(rows_affected > 0)
     }
@@ -302,12 +389,13 @@ impl WorkspaceRepository {
     pub async fn get_workspace_with_organization(
         &self,
         workspace_id: Uuid,
-    ) -> Result<Option<(Workspace, crate::models::Organization)>> {
+    ) -> Result<Option<(Workspace, crate::models::Organization)>, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let row = client
             .query_opt(
@@ -325,7 +413,7 @@ impl WorkspaceRepository {
                 &[&workspace_id],
             )
             .await
-            .context("Failed to query workspace with organization")?;
+            .map_err(Self::map_db_error)?;
 
         match row {
             Some(row) => {
@@ -387,8 +475,19 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
     async fn get_by_id(
         &self,
         workspace_id: services::workspace::WorkspaceId,
-    ) -> anyhow::Result<Option<services::workspace::Workspace>> {
+    ) -> Result<Option<services::workspace::Workspace>, RepositoryError> {
         match self.get_by_id(workspace_id.0).await? {
+            Some(db_workspace) => Ok(Some(db_workspace_to_workspace_service(db_workspace))),
+            None => Ok(None),
+        }
+    }
+
+    async fn get_by_name(
+        &self,
+        organization_id: Uuid,
+        workspace_name: &str,
+    ) -> Result<Option<services::workspace::Workspace>, RepositoryError> {
+        match self.get_by_name(organization_id, workspace_name).await? {
             Some(db_workspace) => Ok(Some(db_workspace_to_workspace_service(db_workspace))),
             None => Ok(None),
         }
@@ -397,11 +496,12 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
     async fn get_workspace_with_organization(
         &self,
         workspace_id: services::workspace::WorkspaceId,
-    ) -> anyhow::Result<
+    ) -> Result<
         Option<(
             services::workspace::Workspace,
             services::organization::Organization,
         )>,
+        RepositoryError,
     > {
         match self.get_workspace_with_organization(workspace_id.0).await? {
             Some((db_workspace, db_organization)) => Ok(Some((
@@ -415,7 +515,7 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
     async fn list_by_organization(
         &self,
         organization_id: services::organization::OrganizationId,
-    ) -> anyhow::Result<Vec<services::workspace::Workspace>> {
+    ) -> Result<Vec<services::workspace::Workspace>, RepositoryError> {
         let workspaces = self.list_by_organization(organization_id.0).await?;
         Ok(workspaces
             .into_iter()
@@ -430,7 +530,7 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
         offset: i64,
         order_by: Option<WorkspaceOrderBy>,
         order_direction: Option<WorkspaceOrderDirection>,
-    ) -> anyhow::Result<Vec<services::workspace::Workspace>> {
+    ) -> Result<Vec<services::workspace::Workspace>, RepositoryError> {
         let workspaces = self
             .list_by_organization_paginated(
                 organization_id.0,
@@ -453,7 +553,7 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
         description: Option<String>,
         organization_id: services::organization::OrganizationId,
         created_by_user_id: services::auth::ports::UserId,
-    ) -> anyhow::Result<services::workspace::Workspace> {
+    ) -> Result<services::workspace::Workspace, RepositoryError> {
         let request = crate::models::CreateWorkspaceRequest {
             name,
             display_name,
@@ -471,7 +571,7 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
         display_name: Option<String>,
         description: Option<String>,
         settings: Option<serde_json::Value>,
-    ) -> anyhow::Result<Option<services::workspace::Workspace>> {
+    ) -> Result<Option<services::workspace::Workspace>, RepositoryError> {
         let request = crate::models::UpdateWorkspaceRequest {
             display_name,
             description,
@@ -483,14 +583,17 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
         }
     }
 
-    async fn delete(&self, workspace_id: services::workspace::WorkspaceId) -> anyhow::Result<bool> {
+    async fn delete(
+        &self,
+        workspace_id: services::workspace::WorkspaceId,
+    ) -> Result<bool, RepositoryError> {
         self.delete(workspace_id.0).await
     }
 
     async fn count_by_organization(
         &self,
         organization_id: services::organization::OrganizationId,
-    ) -> anyhow::Result<i64> {
+    ) -> Result<i64, RepositoryError> {
         self.count_by_organization(organization_id.0).await
     }
 }

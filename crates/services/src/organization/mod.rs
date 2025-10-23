@@ -1,5 +1,6 @@
 pub mod ports;
 use super::auth::ports::{UserId, UserRepository};
+use super::common::RepositoryError;
 use anyhow::Result;
 use async_trait::async_trait;
 pub use ports::*;
@@ -21,6 +22,48 @@ impl OrganizationServiceImpl {
             repository,
             user_repository,
             invitation_repository,
+        }
+    }
+
+    /// Convert RepositoryError to OrganizationError
+    fn map_repository_error(err: crate::common::RepositoryError) -> OrganizationError {
+        match err {
+            RepositoryError::AlreadyExists => OrganizationError::AlreadyExists,
+            RepositoryError::NotFound(msg) => {
+                OrganizationError::InternalError(format!("Resource not found: {}", msg))
+            }
+            RepositoryError::RequiredFieldMissing(field) => {
+                OrganizationError::InvalidParams(format!("Required field is missing: {}", field))
+            }
+            RepositoryError::ForeignKeyViolation(msg) => OrganizationError::InvalidParams(format!(
+                "Referenced entity does not exist: {}",
+                msg
+            )),
+            RepositoryError::ValidationFailed(msg) => {
+                OrganizationError::InvalidParams(format!("Validation failed: {}", msg))
+            }
+            RepositoryError::DependencyExists(msg) => OrganizationError::InvalidParams(format!(
+                "Cannot delete due to dependencies: {}",
+                msg
+            )),
+            RepositoryError::TransactionConflict => {
+                OrganizationError::InternalError("Transaction conflict, please retry".to_string())
+            }
+            RepositoryError::ConnectionFailed(msg) => {
+                OrganizationError::InternalError(format!("Database connection failed: {}", msg))
+            }
+            RepositoryError::AuthenticationFailed => {
+                OrganizationError::InternalError("Database authentication failed".to_string())
+            }
+            RepositoryError::PoolError(err) => {
+                OrganizationError::InternalError(format!("Database connection pool error: {}", err))
+            }
+            RepositoryError::DatabaseError(err) => {
+                OrganizationError::InternalError(format!("Database operation failed: {}", err))
+            }
+            RepositoryError::DataConversionError(err) => {
+                OrganizationError::InternalError(format!("Data conversion error: {}", err))
+            }
         }
     }
 
@@ -47,14 +90,7 @@ impl OrganizationServiceImpl {
         self.repository
             .create(request, owner_id.0)
             .await
-            .map_err(|e| {
-                let error_msg = e.to_string();
-                if error_msg.contains("duplicate key") || error_msg.contains("already exists") {
-                    OrganizationError::AlreadyExists
-                } else {
-                    OrganizationError::InternalError(format!("Failed to create organization: {e}"))
-                }
-            })
+            .map_err(Self::map_repository_error)
     }
 
     /// Get an organization by ID (private helper)
@@ -65,9 +101,7 @@ impl OrganizationServiceImpl {
         self.repository
             .get_by_id(id.0)
             .await
-            .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to get organization: {e}"))
-            })?
+            .map_err(Self::map_repository_error)?
             .ok_or(OrganizationError::NotFound)
     }
 
@@ -114,9 +148,10 @@ impl OrganizationServiceImpl {
             settings,
         };
 
-        self.repository.update(id.0, request).await.map_err(|e| {
-            OrganizationError::InternalError(format!("Failed to update organization: {e}"))
-        })
+        self.repository
+            .update(id.0, request)
+            .await
+            .map_err(Self::map_repository_error)
     }
 
     /// Delete an organization (owner only, private helper)
@@ -133,9 +168,10 @@ impl OrganizationServiceImpl {
             ));
         }
 
-        self.repository.delete(id.0).await.map_err(|e| {
-            OrganizationError::InternalError(format!("Failed to delete organization: {e}"))
-        })
+        self.repository
+            .delete(id.0)
+            .await
+            .map_err(Self::map_repository_error)
     }
 
     /// List organizations accessible to a user (where they are a member, private helper)
@@ -150,11 +186,7 @@ impl OrganizationServiceImpl {
         self.repository
             .list_organizations_by_user(user_id.0, limit, offset, order_by, order_direction)
             .await
-            .map_err(|e| {
-                OrganizationError::InternalError(format!(
-                    "Failed to list organizations for user: {e}"
-                ))
-            })
+            .map_err(Self::map_repository_error)
     }
 
     /// Add a member to an organization (private helper)
@@ -201,7 +233,10 @@ impl OrganizationServiceImpl {
         self.repository
             .add_member(organization_id.0, request, requester_id.0)
             .await
-            .map_err(|e| OrganizationError::InternalError(format!("Failed to add member: {e}")))
+            .map_err(|e| match e {
+                RepositoryError::AlreadyExists => OrganizationError::AlreadyMember,
+                _ => Self::map_repository_error(e),
+            })
     }
 
     /// Remove a member from an organization (private helper)
@@ -243,7 +278,7 @@ impl OrganizationServiceImpl {
         self.repository
             .remove_member(organization_id.0, member_id.0)
             .await
-            .map_err(|e| OrganizationError::InternalError(format!("Failed to remove member: {e}")))
+            .map_err(Self::map_repository_error)
     }
 
     /// Update a member's role (private helper)
@@ -283,9 +318,7 @@ impl OrganizationServiceImpl {
         self.repository
             .update_member(organization_id.0, member_id.0, request)
             .await
-            .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to update member role: {e}"))
-            })
+            .map_err(Self::map_repository_error)
     }
 
     /// Check if a user is a member of an organization (private helper)
@@ -305,9 +338,7 @@ impl OrganizationServiceImpl {
             .repository
             .get_member(organization_id.0, user_id.0)
             .await
-            .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to check membership: {e}"))
-            })?;
+            .map_err(Self::map_repository_error)?;
 
         Ok(member.is_some())
     }
@@ -329,9 +360,7 @@ impl OrganizationServiceImpl {
             .repository
             .get_member(organization_id.0, user_id.0)
             .await
-            .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to get member role: {e}"))
-            })?;
+            .map_err(Self::map_repository_error)?;
 
         Ok(member.map(|m| m.role))
     }
@@ -361,9 +390,7 @@ impl OrganizationServiceImpl {
         self.repository
             .get_member_count(organization_id.0)
             .await
-            .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to get member count: {e}"))
-            })
+            .map_err(Self::map_repository_error)
     }
 
     /// Get organization by name (private helper)
@@ -371,9 +398,10 @@ impl OrganizationServiceImpl {
         &self,
         name: &str,
     ) -> Result<Option<Organization>, OrganizationError> {
-        self.repository.get_by_name(name).await.map_err(|e| {
-            OrganizationError::InternalError(format!("Failed to get organization by name: {e}"))
-        })
+        self.repository
+            .get_by_name(name)
+            .await
+            .map_err(Self::map_repository_error)
     }
 
     /// List organization members with full user information (paginated, private helper)
@@ -405,7 +433,7 @@ impl OrganizationServiceImpl {
             .repository
             .list_members_paginated(organization_id.0, limit, offset)
             .await
-            .map_err(|e| OrganizationError::InternalError(format!("Failed to get members: {e}")))?;
+            .map_err(Self::map_repository_error)?;
 
         // Fetch user info for each member
         let mut members_with_users = Vec::new();
@@ -606,9 +634,7 @@ impl OrganizationServiceImpl {
             .repository
             .list_members_paginated(organization_id.0, 1, 0)
             .await
-            .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to list members: {e}"))
-            })?;
+            .map_err(Self::map_repository_error)?;
 
         let owner_count = members
             .iter()
@@ -654,7 +680,7 @@ impl OrganizationServiceImpl {
         self.repository
             .remove_member(organization_id.0, member_id.0)
             .await
-            .map_err(|e| OrganizationError::InternalError(format!("Failed to remove member: {e}")))
+            .map_err(Self::map_repository_error)
     }
 
     /// Create invitations for users (supports unregistered users, private helper)
@@ -1041,11 +1067,7 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
         self.repository
             .count_organizations_by_user(user_id.0)
             .await
-            .map_err(|e| {
-                OrganizationError::InternalError(format!(
-                    "Failed to count organizations for user: {e}"
-                ))
-            })
+            .map_err(Self::map_repository_error)
     }
 
     async fn add_member(

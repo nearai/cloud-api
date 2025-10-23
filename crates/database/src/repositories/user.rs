@@ -238,6 +238,25 @@ impl UserRepository {
         Ok(rows_affected > 0)
     }
 
+    /// Update user's tokens_revoked_at timestamp
+    pub async fn update_tokens_revoked_at(&self, id: Uuid) -> Result<()> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        client
+            .execute(
+                "UPDATE users SET tokens_revoked_at = NOW() WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .context("Failed to update tokens_revoked_at")?;
+
+        Ok(())
+    }
+
     // Helper function to convert database row to User
     fn row_to_user(&self, row: tokio_postgres::Row) -> Result<User> {
         Ok(User {
@@ -252,6 +271,7 @@ impl UserRepository {
             is_active: row.get("is_active"),
             auth_provider: row.get("auth_provider"),
             provider_user_id: row.get("provider_user_id"),
+            tokens_revoked_at: row.get("tokens_revoked_at"),
         })
     }
 }
@@ -270,6 +290,7 @@ fn db_user_to_service_user(db_user: User) -> services::auth::User {
         last_login: db_user.last_login_at,
         created_at: db_user.created_at,
         updated_at: db_user.updated_at,
+        tokens_revoked_at: db_user.tokens_revoked_at,
     }
 }
 
@@ -355,6 +376,10 @@ impl services::auth::UserRepository for UserRepository {
 
     async fn update_last_login(&self, id: services::auth::UserId) -> anyhow::Result<()> {
         self.update_last_login(id.0).await
+    }
+
+    async fn update_tokens_revoked_at(&self, id: services::auth::UserId) -> anyhow::Result<()> {
+        self.update_tokens_revoked_at(id.0).await
     }
 
     async fn delete(&self, id: services::auth::UserId) -> anyhow::Result<bool> {

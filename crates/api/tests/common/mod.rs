@@ -343,9 +343,9 @@ pub fn is_valid_jwt_format(token: &str) -> bool {
         return false;
     }
 
-    // Decode each part and ensure it is base64 encoded
+    // Decode each part and ensure it is base64url encoded (JWTs use URL_SAFE_NO_PAD per RFC 7515)
     parts.iter().take(2).all(|part| {
-        base64::engine::general_purpose::STANDARD
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(part)
             .is_ok()
     })

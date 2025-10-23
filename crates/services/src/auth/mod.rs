@@ -45,6 +45,7 @@ impl AuthServiceTrait for AuthService {
         let claims = AccessTokenClaims {
             sub: user_id,
             exp: expiration.timestamp(),
+            iat: chrono::Utc::now().timestamp(),
         };
 
         jsonwebtoken::encode(
@@ -86,11 +87,28 @@ impl AuthServiceTrait for AuthService {
         debug!("Claims: {:?}", claims);
 
         // Get the user
-        self.user_repository
+        let user = self
+            .user_repository
             .get_by_id(claims.sub)
             .await
             .map_err(|e| AuthError::InternalError(format!("Failed to get user: {e}")))?
-            .ok_or(AuthError::UserNotFound)
+            .ok_or(AuthError::UserNotFound)?;
+
+        // Check if token was issued before tokens_revoked_at
+        if let Some(revoked_at) = user.tokens_revoked_at {
+            let token_issued_at = chrono::DateTime::from_timestamp(claims.iat, 0)
+                .ok_or(AuthError::SessionNotFound)?;
+
+            if token_issued_at < revoked_at {
+                debug!(
+                    "Token issued at {} is before revocation time {}",
+                    token_issued_at, revoked_at
+                );
+                return Err(AuthError::SessionNotFound);
+            }
+        }
+
+        Ok(user)
     }
 
     async fn validate_session_refresh_token(

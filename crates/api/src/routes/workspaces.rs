@@ -114,7 +114,7 @@ pub async fn create_workspace(
     let user_id = authenticated_user_to_user_id(user);
     let organization_id = OrganizationId(org_id);
 
-    // Use the workspace service to create the workspace (it handles permission checking)
+    // Use the workspace service to create the workspace (it handles permission checking and duplicate detection)
     match app_state
         .workspace_service
         .create_workspace(

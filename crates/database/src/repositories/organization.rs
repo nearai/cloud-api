@@ -10,7 +10,9 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use services::auth::ports::UserId;
+use services::common::RepositoryError;
 use services::organization::ports::*;
+use tokio_postgres::error::SqlState;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -21,6 +23,61 @@ pub struct PgOrganizationRepository {
 impl PgOrganizationRepository {
     pub fn new(pool: DbPool) -> Self {
         Self { pool }
+    }
+
+    /// Convert tokio_postgres::Error to RepositoryError
+    fn map_db_error(err: tokio_postgres::Error) -> RepositoryError {
+        // Handle database-level errors (connection, auth, etc.)
+        if err.is_closed() {
+            return RepositoryError::ConnectionFailed("Connection closed".to_string());
+        }
+
+        // Handle SQL state errors
+        if let Some(db_err) = err.as_db_error() {
+            let message = db_err.message();
+
+            match db_err.code() {
+                // Integrity constraint violations
+                &SqlState::UNIQUE_VIOLATION => RepositoryError::AlreadyExists,
+                &SqlState::FOREIGN_KEY_VIOLATION => {
+                    RepositoryError::ForeignKeyViolation(message.to_string())
+                }
+                &SqlState::NOT_NULL_VIOLATION => {
+                    RepositoryError::RequiredFieldMissing(message.to_string())
+                }
+                &SqlState::CHECK_VIOLATION => {
+                    RepositoryError::ValidationFailed(message.to_string())
+                }
+                &SqlState::RESTRICT_VIOLATION => {
+                    RepositoryError::DependencyExists(message.to_string())
+                }
+
+                // Transaction errors
+                &SqlState::T_R_SERIALIZATION_FAILURE | &SqlState::T_R_DEADLOCK_DETECTED => {
+                    RepositoryError::TransactionConflict
+                }
+
+                // Connection/auth errors
+                &SqlState::INVALID_PASSWORD | &SqlState::INVALID_AUTHORIZATION_SPECIFICATION => {
+                    RepositoryError::AuthenticationFailed
+                }
+                &SqlState::CONNECTION_EXCEPTION
+                | &SqlState::CONNECTION_DOES_NOT_EXIST
+                | &SqlState::CONNECTION_FAILURE => {
+                    RepositoryError::ConnectionFailed(message.to_string())
+                }
+
+                // Default case - wrap in generic database error
+                _ => RepositoryError::DatabaseError(anyhow::anyhow!(
+                    "Database error ({}): {}",
+                    db_err.code().code(),
+                    message
+                )),
+            }
+        } else {
+            // Non-SQL errors (connection issues, etc.)
+            RepositoryError::DatabaseError(err.into())
+        }
     }
 
     /// Get the owner of an organization by looking up the owner role in organization_members
@@ -91,17 +148,19 @@ impl PgOrganizationRepository {
         &self,
         request: DbCreateOrganizationRequest,
         creator_user_id: Uuid,
-    ) -> Result<DbOrganization> {
+    ) -> Result<DbOrganization, RepositoryError> {
         let mut client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let transaction = client
             .transaction()
             .await
-            .context("Failed to start transaction")?;
+            .context("Failed to start transaction")
+            .map_err(RepositoryError::DatabaseError)?;
 
         let id = Uuid::new_v4();
         let now = Utc::now();
@@ -127,7 +186,7 @@ impl PgOrganizationRepository {
                 ],
             )
             .await
-            .context("Failed to create organization")?;
+            .map_err(Self::map_db_error)?;
 
         // Add creator as owner
         transaction
@@ -139,27 +198,29 @@ impl PgOrganizationRepository {
                 &[&id, &creator_user_id, &now],
             )
             .await
-            .context("Failed to add creator as owner")?;
+            .map_err(Self::map_db_error)?;
 
-        transaction
-            .commit()
-            .await
-            .context("Failed to commit transaction")?;
+        transaction.commit().await.map_err(Self::map_db_error)?;
 
         debug!(
             "Created organization: {} with owner: {}",
             id, creator_user_id
         );
         self.row_to_db_organization(row)
+            .map_err(RepositoryError::DataConversionError)
     }
 
     /// Get an organization by ID - internal method
-    async fn get_by_id_internal(&self, id: Uuid) -> Result<Option<DbOrganization>> {
+    async fn get_by_id_internal(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<DbOrganization>, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let row = client
             .query_opt(
@@ -167,21 +228,28 @@ impl PgOrganizationRepository {
                 &[&id],
             )
             .await
-            .context("Failed to query organization")?;
+            .map_err(Self::map_db_error)?;
 
         match row {
-            Some(row) => Ok(Some(self.row_to_db_organization(row)?)),
+            Some(row) => Ok(Some(
+                self.row_to_db_organization(row)
+                    .map_err(RepositoryError::DataConversionError)?,
+            )),
             None => Ok(None),
         }
     }
 
     /// Get an organization by name - internal method
-    async fn get_by_name_internal(&self, name: &str) -> Result<Option<DbOrganization>> {
+    async fn get_by_name_internal(
+        &self,
+        name: &str,
+    ) -> Result<Option<DbOrganization>, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let row = client
             .query_opt(
@@ -189,10 +257,13 @@ impl PgOrganizationRepository {
                 &[&name],
             )
             .await
-            .context("Failed to query organization by name")?;
+            .map_err(Self::map_db_error)?;
 
         match row {
-            Some(row) => Ok(Some(self.row_to_db_organization(row)?)),
+            Some(row) => Ok(Some(
+                self.row_to_db_organization(row)
+                    .map_err(RepositoryError::DataConversionError)?,
+            )),
             None => Ok(None),
         }
     }
@@ -202,12 +273,13 @@ impl PgOrganizationRepository {
         &self,
         organization_id: Uuid,
         user_id: Uuid,
-    ) -> Result<Option<DbOrganizationMember>> {
+    ) -> Result<Option<DbOrganizationMember>, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let row = client
             .query_opt(
@@ -218,10 +290,13 @@ impl PgOrganizationRepository {
                 &[&organization_id, &user_id],
             )
             .await
-            .context("Failed to query organization member")?;
+            .map_err(Self::map_db_error)?;
 
         match row {
-            Some(row) => Ok(Some(self.row_to_db_org_member(row)?)),
+            Some(row) => Ok(Some(
+                self.row_to_db_org_member(row)
+                    .map_err(RepositoryError::DataConversionError)?,
+            )),
             None => Ok(None),
         }
     }
@@ -231,12 +306,13 @@ impl PgOrganizationRepository {
         &self,
         id: Uuid,
         request: DbUpdateOrganizationRequest,
-    ) -> Result<DbOrganization> {
+    ) -> Result<DbOrganization, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let row = client
             .query_one(
@@ -259,10 +335,11 @@ impl PgOrganizationRepository {
                 ],
             )
             .await
-            .context("Failed to update organization")?;
+            .map_err(Self::map_db_error)?;
 
         debug!("Updated organization: {}", id);
         self.row_to_db_organization(row)
+            .map_err(RepositoryError::DataConversionError)
     }
 
     /// Delete an organization (soft delete)
@@ -290,12 +367,13 @@ impl PgOrganizationRepository {
         org_id: Uuid,
         request: DbAddOrganizationMemberRequest,
         invited_by: Uuid,
-    ) -> Result<DbOrganizationMember> {
+    ) -> Result<DbOrganizationMember, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         // Check if user is already a member
         let existing = client
@@ -304,10 +382,10 @@ impl PgOrganizationRepository {
                 &[&org_id, &request.user_id],
             )
             .await
-            .context("Failed to check existing membership")?;
+            .map_err(Self::map_db_error)?;
 
         if existing.is_some() {
-            bail!("User is already a member of this organization");
+            return Err(RepositoryError::AlreadyExists);
         }
 
         let id = Uuid::new_v4();
@@ -327,13 +405,14 @@ impl PgOrganizationRepository {
                 &now,
                 &invited_by,
             ],
-        ).await.context("Failed to add organization member")?;
+        ).await.map_err(Self::map_db_error)?;
 
         debug!(
             "Added member {} to organization {} with role {:?}",
             request.user_id, org_id, request.role
         );
         self.row_to_db_org_member(row)
+            .map_err(RepositoryError::DataConversionError)
     }
 
     /// Update a member's role in an organization - internal method
@@ -342,12 +421,13 @@ impl PgOrganizationRepository {
         org_id: Uuid,
         user_id: Uuid,
         request: DbUpdateOrganizationMemberRequest,
-    ) -> Result<DbOrganizationMember> {
+    ) -> Result<DbOrganizationMember, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let row = client
             .query_one(
@@ -360,13 +440,14 @@ impl PgOrganizationRepository {
                 &[&org_id, &user_id, &request.role.to_string().to_lowercase()],
             )
             .await
-            .context("Failed to update organization member")?;
+            .map_err(Self::map_db_error)?;
 
         debug!(
             "Updated member {} in organization {} to role {:?}",
             user_id, org_id, request.role
         );
         self.row_to_db_org_member(row)
+            .map_err(RepositoryError::DataConversionError)
     }
 
     /// Remove a member from an organization
@@ -394,12 +475,13 @@ impl PgOrganizationRepository {
         org_id: Uuid,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<DbOrganizationMember>> {
+    ) -> Result<Vec<DbOrganizationMember>, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let rows = client
             .query(
@@ -407,10 +489,13 @@ impl PgOrganizationRepository {
                 &[&org_id, &limit, &offset],
             )
             .await
-            .context("Failed to list organization members")?;
+            .map_err(Self::map_db_error)?;
 
         rows.into_iter()
-            .map(|row| self.row_to_db_org_member(row))
+            .map(|row| {
+                self.row_to_db_org_member(row)
+                    .map_err(RepositoryError::DataConversionError)
+            })
             .collect()
     }
 
@@ -434,17 +519,17 @@ impl PgOrganizationRepository {
     }
 
     // Helper function to convert database row to Organization
-    fn row_to_db_organization(&self, row: tokio_postgres::Row) -> Result<DbOrganization> {
+    fn row_to_db_organization(&self, row: tokio_postgres::Row) -> anyhow::Result<DbOrganization> {
         Ok(DbOrganization {
-            id: row.get("id"),
-            name: row.get("name"),
-            display_name: row.get("display_name"),
-            description: row.get("description"),
-            created_at: row.get("created_at"),
-            updated_at: row.get("updated_at"),
-            is_active: row.get("is_active"),
-            rate_limit: row.get("rate_limit"),
-            settings: row.get("settings"),
+            id: row.try_get("id")?,
+            name: row.try_get("name")?,
+            display_name: row.try_get("display_name")?,
+            description: row.try_get("description")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+            is_active: row.try_get("is_active")?,
+            rate_limit: row.try_get("rate_limit")?,
+            settings: row.try_get("settings")?,
         })
     }
 
@@ -499,7 +584,7 @@ impl OrganizationRepository for PgOrganizationRepository {
         &self,
         request: CreateOrganizationRequest,
         creator_user_id: Uuid,
-    ) -> Result<Organization> {
+    ) -> Result<Organization, RepositoryError> {
         let db_request = DbCreateOrganizationRequest {
             name: request.name.clone(),
             display_name: request.display_name.unwrap_or(request.name),
@@ -507,19 +592,29 @@ impl OrganizationRepository for PgOrganizationRepository {
         };
 
         let db_org = self.create_internal(db_request, creator_user_id).await?;
-        self.db_to_domain_organization(db_org).await
+        self.db_to_domain_organization(db_org)
+            .await
+            .map_err(RepositoryError::DataConversionError)
     }
 
-    async fn get_by_id(&self, id: Uuid) -> Result<Option<Organization>> {
+    async fn get_by_id(&self, id: Uuid) -> Result<Option<Organization>, RepositoryError> {
         match self.get_by_id_internal(id).await? {
-            Some(db_org) => Ok(Some(self.db_to_domain_organization(db_org).await?)),
+            Some(db_org) => Ok(Some(
+                self.db_to_domain_organization(db_org)
+                    .await
+                    .map_err(RepositoryError::DataConversionError)?,
+            )),
             None => Ok(None),
         }
     }
 
-    async fn get_by_name(&self, name: &str) -> Result<Option<Organization>> {
+    async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError> {
         match self.get_by_name_internal(name).await? {
-            Some(db_org) => Ok(Some(self.db_to_domain_organization(db_org).await?)),
+            Some(db_org) => Ok(Some(
+                self.db_to_domain_organization(db_org)
+                    .await
+                    .map_err(RepositoryError::DataConversionError)?,
+            )),
             None => Ok(None),
         }
     }
@@ -528,14 +623,21 @@ impl OrganizationRepository for PgOrganizationRepository {
         &self,
         organization_id: Uuid,
         user_id: Uuid,
-    ) -> Result<Option<OrganizationMember>> {
+    ) -> Result<Option<OrganizationMember>, RepositoryError> {
         match self.get_member_internal(organization_id, user_id).await? {
-            Some(db_member) => Ok(Some(self.db_to_domain_member(db_member)?)),
+            Some(db_member) => Ok(Some(
+                self.db_to_domain_member(db_member)
+                    .map_err(RepositoryError::DataConversionError)?,
+            )),
             None => Ok(None),
         }
     }
 
-    async fn update(&self, id: Uuid, request: UpdateOrganizationRequest) -> Result<Organization> {
+    async fn update(
+        &self,
+        id: Uuid,
+        request: UpdateOrganizationRequest,
+    ) -> Result<Organization, RepositoryError> {
         let db_request = DbUpdateOrganizationRequest {
             display_name: request.display_name,
             description: request.description,
@@ -544,15 +646,18 @@ impl OrganizationRepository for PgOrganizationRepository {
         };
 
         let db_org = self.update_internal(id, db_request).await?;
-        self.db_to_domain_organization(db_org).await
+        self.db_to_domain_organization(db_org)
+            .await
+            .map_err(RepositoryError::DataConversionError)
     }
 
-    async fn delete(&self, id: Uuid) -> Result<bool> {
+    async fn delete(&self, id: Uuid) -> Result<bool, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let rows_affected = client
             .execute(
@@ -560,7 +665,7 @@ impl OrganizationRepository for PgOrganizationRepository {
                 &[&id],
             )
             .await
-            .context("Failed to delete organization")?;
+            .map_err(Self::map_db_error)?;
 
         Ok(rows_affected > 0)
     }
@@ -570,7 +675,7 @@ impl OrganizationRepository for PgOrganizationRepository {
         org_id: Uuid,
         request: AddOrganizationMemberRequest,
         invited_by: Uuid,
-    ) -> Result<OrganizationMember> {
+    ) -> Result<OrganizationMember, RepositoryError> {
         let db_request = DbAddOrganizationMemberRequest {
             user_id: request.user_id,
             role: self.domain_to_db_role(request.role),
@@ -580,6 +685,7 @@ impl OrganizationRepository for PgOrganizationRepository {
             .add_member_internal(org_id, db_request, invited_by)
             .await?;
         self.db_to_domain_member(db_member)
+            .map_err(RepositoryError::DataConversionError)
     }
 
     async fn update_member(
@@ -587,7 +693,7 @@ impl OrganizationRepository for PgOrganizationRepository {
         org_id: Uuid,
         user_id: Uuid,
         request: UpdateOrganizationMemberRequest,
-    ) -> Result<OrganizationMember> {
+    ) -> Result<OrganizationMember, RepositoryError> {
         let db_request = DbUpdateOrganizationMemberRequest {
             role: self.domain_to_db_role(request.role),
         };
@@ -596,14 +702,16 @@ impl OrganizationRepository for PgOrganizationRepository {
             .update_member_internal(org_id, user_id, db_request)
             .await?;
         self.db_to_domain_member(db_member)
+            .map_err(RepositoryError::DataConversionError)
     }
 
-    async fn remove_member(&self, org_id: Uuid, user_id: Uuid) -> Result<bool> {
+    async fn remove_member(&self, org_id: Uuid, user_id: Uuid) -> Result<bool, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let rows_affected = client
             .execute(
@@ -611,7 +719,7 @@ impl OrganizationRepository for PgOrganizationRepository {
                 &[&org_id, &user_id],
             )
             .await
-            .context("Failed to remove organization member")?;
+            .map_err(Self::map_db_error)?;
 
         Ok(rows_affected > 0)
     }
@@ -621,22 +729,26 @@ impl OrganizationRepository for PgOrganizationRepository {
         org_id: Uuid,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<OrganizationMember>> {
+    ) -> Result<Vec<OrganizationMember>, RepositoryError> {
         let db_members = self
             .list_members_paginated_internal(org_id, limit, offset)
             .await?;
         db_members
             .into_iter()
-            .map(|db_member| self.db_to_domain_member(db_member))
+            .map(|db_member| {
+                self.db_to_domain_member(db_member)
+                    .map_err(RepositoryError::DataConversionError)
+            })
             .collect()
     }
 
-    async fn get_member_count(&self, org_id: Uuid) -> Result<i64> {
+    async fn get_member_count(&self, org_id: Uuid) -> Result<i64, RepositoryError> {
         let client = self
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let row = client
             .query_one(
@@ -644,14 +756,33 @@ impl OrganizationRepository for PgOrganizationRepository {
                 &[&org_id],
             )
             .await
-            .context("Failed to count organization members")?;
+            .map_err(Self::map_db_error)?;
 
         Ok(row.get("count"))
     }
 
-    async fn count_organizations_by_user(&self, user_id: Uuid) -> Result<i64> {
-        // Delegate to the inherent method
-        self.count_organizations_by_user(user_id).await
+    async fn count_organizations_by_user(&self, user_id: Uuid) -> Result<i64, RepositoryError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
+
+        let row = client
+            .query_one(
+                r#"
+                SELECT COUNT(DISTINCT o.id) as count
+                FROM organizations o
+                INNER JOIN organization_members om ON o.id = om.organization_id
+                WHERE om.user_id = $1 AND o.is_active = true
+                "#,
+                &[&user_id],
+            )
+            .await
+            .map_err(Self::map_db_error)?;
+
+        Ok(row.get::<_, i64>("count"))
     }
 
     async fn list_organizations_by_user(
@@ -661,7 +792,7 @@ impl OrganizationRepository for PgOrganizationRepository {
         offset: i64,
         order_by: Option<OrganizationOrderBy>,
         order_direction: Option<OrganizationOrderDirection>,
-    ) -> Result<Vec<Organization>> {
+    ) -> Result<Vec<Organization>, RepositoryError> {
         let order_by = order_by.unwrap_or(OrganizationOrderBy::CreatedAt);
         let order_direction = order_direction.unwrap_or(OrganizationOrderDirection::Asc);
 
@@ -678,7 +809,8 @@ impl OrganizationRepository for PgOrganizationRepository {
             .pool
             .get()
             .await
-            .context("Failed to get database connection")?;
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
 
         let rows = client
             .query(
@@ -694,12 +826,17 @@ impl OrganizationRepository for PgOrganizationRepository {
                 &[&user_id, &limit, &offset],
             )
             .await
-            .context("Failed to list organizations by user")?;
+            .map_err(Self::map_db_error)?;
 
         let mut organizations = Vec::new();
         for row in rows {
-            let db_org = self.row_to_db_organization(row)?;
-            let domain_org = self.db_to_domain_organization(db_org).await?;
+            let db_org = self
+                .row_to_db_organization(row)
+                .map_err(RepositoryError::DataConversionError)?;
+            let domain_org = self
+                .db_to_domain_organization(db_org)
+                .await
+                .map_err(RepositoryError::DataConversionError)?;
             organizations.push(domain_org);
         }
 

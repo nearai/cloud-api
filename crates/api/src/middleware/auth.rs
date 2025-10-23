@@ -209,6 +209,16 @@ pub async fn admin_middleware(
             match authenticate_admin_access_token(&state, token.to_string()).await {
                 Ok(admin_token) => {
                     debug!("Authenticated via admin access token: {}", admin_token.name);
+
+                    // Check if this is an admin access token management endpoint
+                    let path = request.uri().path();
+                    let is_access_token_management = path.starts_with("/admin/access_token");
+                    // For access token management endpoints, only allow session-based authentication
+                    if is_access_token_management {
+                        debug!("Access token management endpoint detected. Forbidden.");
+                        return Err(StatusCode::FORBIDDEN);
+                    }
+
                     // Query the actual admin user from database
                     match get_admin_user_by_id(&state, admin_token.created_by_user_id).await {
                         Ok(admin_user) => {

@@ -2565,3 +2565,63 @@ async fn test_admin_access_token_unauthorized() {
 
     println!("✅ Admin access token endpoints correctly require authentication");
 }
+
+#[tokio::test]
+async fn test_admin_access_token_cannot_manage_tokens() {
+    let server = setup_test_server().await;
+
+    // Get access token from refresh token
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+
+    // Create an admin access token
+    let create_request = serde_json::json!({
+        "expires_in_hours": 24,
+        "name": "Test Admin Token",
+        "reason": "Testing token management restriction"
+    });
+
+    let create_response = server
+        .post("/v1/admin/access_token")
+        .add_header("Authorization", format!("Bearer {}", access_token))
+        .json(&create_request)
+        .await;
+
+    assert_eq!(create_response.status_code(), 200);
+    let token_response = create_response.json::<api::models::AdminAccessTokenResponse>();
+    let admin_token = token_response.access_token;
+
+    // Try to use the admin access token to create another admin access token (should fail)
+    let create_request2 = serde_json::json!({
+        "expires_in_hours": 24,
+        "name": "Nested Admin Token",
+        "reason": "This should fail"
+    });
+
+    let create_response2 = server
+        .post("/v1/admin/access_token")
+        .add_header("Authorization", format!("Bearer {}", admin_token))
+        .json(&create_request2)
+        .await;
+
+    // Should fail because admin access tokens cannot be used for token management
+    assert_eq!(create_response2.status_code(), 403);
+
+    // Try to use the admin access token to list admin access tokens (should fail)
+    let list_response = server
+        .get("/v1/admin/access_token")
+        .add_header("Authorization", format!("Bearer {}", admin_token))
+        .await;
+
+    assert_eq!(list_response.status_code(), 403);
+
+    // Try to use the admin access token to delete an admin access token (should fail)
+    let delete_response = server
+        .delete("/v1/admin/access_token/00000000-0000-0000-0000-000000000000")
+        .add_header("Authorization", format!("Bearer {}", admin_token))
+        .json(&serde_json::json!({"reason": "This should fail"}))
+        .await;
+
+    assert_eq!(delete_response.status_code(), 403);
+
+    println!("✅ Admin access tokens correctly restricted from token management endpoints");
+}

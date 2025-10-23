@@ -5,8 +5,7 @@ use axum::{
     response::Json as ResponseJson,
 };
 use serde::Deserialize;
-use services::conversations::ports::ConversationRequest;
-use services::{ConversationError, ConversationId};
+use services::conversations::{errors::ConversationError, models::ConversationId};
 use std::sync::Arc;
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -51,7 +50,7 @@ fn map_conversation_error_to_status(error: &ConversationError) -> StatusCode {
     )
 )]
 pub async fn create_conversation(
-    State(service): State<Arc<services::ConversationService>>,
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
     Extension(api_key): Extension<services::workspace::ApiKey>,
     Json(request): Json<CreateConversationRequest>,
 ) -> Result<(StatusCode, ResponseJson<ConversationObject>), (StatusCode, ResponseJson<ErrorResponse>)>
@@ -69,7 +68,7 @@ pub async fn create_conversation(
         ));
     }
 
-    let domain_request = ConversationRequest {
+    let domain_request = services::conversations::models::ConversationRequest {
         user_id: api_key.created_by_user_id.0.into(),
         metadata: request.metadata,
     };
@@ -113,7 +112,7 @@ pub async fn create_conversation(
 )]
 pub async fn get_conversation(
     Path(conversation_id): Path<String>,
-    State(service): State<Arc<services::ConversationService>>,
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
     Extension(api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ConversationObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
@@ -132,10 +131,7 @@ pub async fn get_conversation(
     };
 
     match service
-        .get_conversation(
-            &parsed_conversation_id,
-            &api_key.created_by_user_id.0.into(),
-        )
+        .get_conversation(parsed_conversation_id, api_key.created_by_user_id.clone())
         .await
     {
         Ok(Some(domain_conversation)) => {
@@ -180,7 +176,7 @@ pub async fn get_conversation(
 )]
 pub async fn update_conversation(
     Path(conversation_id): Path<String>,
-    State(service): State<Arc<services::ConversationService>>,
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
     Extension(api_key): Extension<services::workspace::ApiKey>,
     Json(request): Json<UpdateConversationRequest>,
 ) -> Result<ResponseJson<ConversationObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
@@ -203,8 +199,8 @@ pub async fn update_conversation(
 
     match service
         .update_conversation(
-            &parsed_conversation_id,
-            &api_key.created_by_user_id.0.into(),
+            parsed_conversation_id,
+            api_key.created_by_user_id.clone(),
             metadata,
         )
         .await
@@ -254,7 +250,7 @@ pub async fn update_conversation(
 )]
 pub async fn delete_conversation(
     Path(conversation_id): Path<String>,
-    State(service): State<Arc<services::ConversationService>>,
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
     Extension(api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ConversationDeleteResult>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
@@ -273,16 +269,13 @@ pub async fn delete_conversation(
     };
 
     match service
-        .delete_conversation(
-            &parsed_conversation_id,
-            &api_key.created_by_user_id.0.into(),
-        )
+        .delete_conversation(parsed_conversation_id, api_key.created_by_user_id.clone())
         .await
     {
         Ok(true) => {
             info!(
                 "Deleted conversation {} for user {}",
-                conversation_id, api_key.created_by_user_id.0
+                conversation_id, api_key.created_by_user_id
             );
             Ok(ResponseJson(ConversationDeleteResult {
                 id: conversation_id,
@@ -330,7 +323,7 @@ pub async fn delete_conversation(
 pub async fn list_conversation_items(
     Path(conversation_id): Path<String>,
     Query(params): Query<ListItemsQuery>,
-    State(service): State<Arc<services::ConversationService>>,
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
     Extension(api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ConversationItemList>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
@@ -353,8 +346,8 @@ pub async fn list_conversation_items(
 
     match service
         .get_conversation_messages(
-            &parsed_conversation_id,
-            &api_key.created_by_user_id.0.into(),
+            parsed_conversation_id,
+            api_key.created_by_user_id.clone(),
             params.limit,
         )
         .await
@@ -392,7 +385,7 @@ pub async fn list_conversation_items(
 // Helper functions
 
 fn convert_domain_conversation_to_http(
-    domain_conversation: services::conversations::ports::Conversation,
+    domain_conversation: services::conversations::models::Conversation,
 ) -> ConversationObject {
     ConversationObject {
         id: domain_conversation.id.to_string(),

@@ -154,9 +154,9 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
     /// Get conversation messages by extracting from responses
     async fn get_conversation_messages(
         &self,
-        conversation_id: models::ConversationId,
-        user_id: UserId,
-        limit: i64,
+        _conversation_id: models::ConversationId,
+        _user_id: UserId,
+        _limit: i64,
     ) -> Result<Vec<models::ConversationMessage>, errors::ConversationError> {
         unimplemented!()
         // Get responses for this conversation

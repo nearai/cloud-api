@@ -69,8 +69,8 @@ pub use models::{
     AttestationReportParams, ChatCompletionParams, ChatCompletionResponse,
     ChatCompletionResponseChoice, ChatCompletionResponseWithBytes, ChatDelta, ChatMessage,
     ChatResponseMessage, ChatSignature, CompletionError, CompletionParams, FinishReason,
-    MessageRole, ModelInfo, NvidiaPayload, StreamChunk, StreamOptions, TokenUsage,
-    VllmAttestationReport,
+    FunctionChoice, FunctionDefinition, MessageRole, ModelInfo, NvidiaPayload, StreamChunk,
+    StreamOptions, TokenUsage, ToolChoice, ToolDefinition, VllmAttestationReport,
 };
 pub use sse_parser::SSEEvent;
 pub use vllm::{VLlmConfig, VLlmProvider};

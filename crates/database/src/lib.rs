@@ -19,8 +19,7 @@ use cluster_manager::{ClusterManager, DatabaseConfig as ClusterDbConfig, ReadPre
 use deadpool::Runtime;
 use patroni_discovery::PatroniDiscovery;
 use std::sync::Arc;
-use tracing::info;
-use tracing::log::debug;
+use tracing::{debug, info};
 // Re-export mock function
 use crate::pool::create_pool_with_native_tls;
 pub use mock::create_mock_database;

@@ -1098,7 +1098,7 @@ pub struct UpdateApiKeySpendLimitRequest {
 }
 
 /// Request to update API key (general update for name, expires_at, and/or spend_limit)
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateApiKeyRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,

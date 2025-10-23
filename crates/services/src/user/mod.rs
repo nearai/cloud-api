@@ -97,9 +97,7 @@ impl UserServiceTrait for UserService {
             .update_tokens_revoked_at(user_id.clone())
             .await
             .map_err(|e| {
-                UserServiceError::InternalError(format!(
-                    "Failed to update tokens_revoked_at: {e}"
-                ))
+                UserServiceError::InternalError(format!("Failed to update tokens_revoked_at: {e}"))
             })?;
 
         // Revoke all refresh tokens (sessions)

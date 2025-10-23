@@ -119,12 +119,21 @@ impl AdminAccessTokenRepository {
         match row {
             Some(row) => {
                 // Update last_used_at
-                let _ = client
+                if let Err(e) = client
                     .execute(
                         "UPDATE admin_access_token SET last_used_at = $1 WHERE id = $2",
                         &[&now, &row.get::<_, Uuid>("id")],
                     )
-                    .await;
+                    .await
+                {
+                    // Log the error but don't fail the validation
+                    // This is non-critical for token validation
+                    tracing::warn!(
+                        "Failed to update last_used_at for admin access token {}: {}",
+                        row.get::<_, Uuid>("id"),
+                        e
+                    );
+                }
 
                 let admin_token = AdminAccessToken {
                     id: row.get("id"),

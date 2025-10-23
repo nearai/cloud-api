@@ -19,7 +19,6 @@ CREATE TABLE admin_access_token (
 );
 
 -- Add indexes for efficient querying
-CREATE INDEX idx_admin_access_token_hash ON admin_access_token(token_hash);
 CREATE INDEX idx_admin_access_token_created_by ON admin_access_token(created_by_user_id);
 CREATE INDEX idx_admin_access_token_active ON admin_access_token(is_active);
 CREATE INDEX idx_admin_access_token_expires ON admin_access_token(expires_at);

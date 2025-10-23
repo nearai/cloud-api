@@ -95,7 +95,7 @@ impl ClusterManager {
 
     /// Create a connection pool for the leader
     async fn create_write_pool(&self, leader: &ClusterMember) -> Result<()> {
-        info!(
+        debug!(
             "Creating write pool for leader: {} ({}:{})",
             leader.name, leader.host, leader.port
         );
@@ -123,7 +123,7 @@ impl ClusterManager {
         let mut write_pool = self.write_pool.write().await;
         *write_pool = Some(pool);
 
-        info!("Write pool created successfully for leader {}", leader.name);
+        debug!("Write pool created successfully for leader {}", leader.name);
         Ok(())
     }
 
@@ -138,7 +138,7 @@ impl ClusterManager {
         // Add pools for new replicas
         for replica in replicas {
             if !read_pools.contains_key(&replica.host) {
-                info!(
+                debug!(
                     "Creating read pool for replica: {} ({}:{})",
                     replica.name, replica.host, replica.port
                 );
@@ -150,7 +150,7 @@ impl ClusterManager {
                 ) {
                     Ok(pool) => {
                         read_pools.insert(replica.host.clone(), pool);
-                        info!("Read pool created for replica {}", replica.name);
+                        debug!("Read pool created for replica {}", replica.name);
                     }
                     Err(e) => {
                         error!("Failed to create pool for replica {}: {}", replica.name, e);

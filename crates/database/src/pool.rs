@@ -15,7 +15,7 @@ pub fn create_pool_with_rustls(cfg: Config, cert_path: Option<&str>) -> anyhow::
 
     let client_config = if let Some(cert_path) = cert_path {
         // Load custom certificate from file
-        info!(
+        debug!(
             "Using rustls with custom CA certificate from: {}",
             cert_path
         );
@@ -34,7 +34,7 @@ pub fn create_pool_with_rustls(cfg: Config, cert_path: Option<&str>) -> anyhow::
             return Err(anyhow::anyhow!("No certificates found in {cert_path}"));
         }
 
-        info!("Found {} certificate(s) in {}", certs.len(), cert_path);
+        debug!("Found {} certificate(s) in {}", certs.len(), cert_path);
 
         // Create root certificate store and add custom certificates
         let mut root_store = rustls::RootCertStore::empty();
@@ -44,7 +44,7 @@ pub fn create_pool_with_rustls(cfg: Config, cert_path: Option<&str>) -> anyhow::
                 .map_err(|e| anyhow::anyhow!("Failed to add certificate to root store: {e}"))?;
         }
 
-        info!(
+        debug!(
             "Successfully loaded custom CA certificate from {}",
             cert_path
         );

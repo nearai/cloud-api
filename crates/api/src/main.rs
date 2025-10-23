@@ -46,7 +46,7 @@ async fn start_server(app: axum::Router, config: Arc<ApiConfig>) {
         .await
         .expect("Failed to bind to address");
 
-    tracing::info!(address = %bind_address, "Server started successfully");
+    tracing::debug!(address = %bind_address, "Server started successfully");
     tracing::info!(
         "Authentication: {}",
         if config.auth.mock {

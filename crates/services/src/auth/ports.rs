@@ -360,7 +360,7 @@ impl MockAuthService {
 
         let session_id = SessionId(uuid::Uuid::new_v4());
         // Generate token with same format as real session repository
-        let session_token = format!("sess_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
+        let session_token = format!("rt_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
         let expires_at = chrono::Utc::now() + chrono::Duration::hours(refresh_expires_in_hours);
 
         let session = Session {
@@ -466,8 +466,8 @@ impl AuthServiceTrait for MockAuthService {
         &self,
         session_token: SessionToken,
     ) -> Result<Option<Session>, AuthError> {
-        // Accept the known test session token or any token that starts with "sess_"
-        if session_token.0.starts_with("sess_") {
+        // Accept the known test session token or any token that starts with "rt_"
+        if session_token.0.starts_with("rt_") {
             let mock_user = Self::create_mock_user();
             let (_access_token, refresh_session, _refresh_token) =
                 self.create_mock_session(mock_user.id);
@@ -485,8 +485,8 @@ impl AuthServiceTrait for MockAuthService {
             "MockAuthService::validate_session called with token: {}",
             session_token
         );
-        // Accept the known test session token or any token that starts with "sess_"
-        if session_token.0.starts_with("sess_") {
+        // Accept the known test session token or any token that starts with "rt_"
+        if session_token.0.starts_with("rt_") {
             let user = Self::create_mock_user();
             tracing::debug!("MockAuthService returning mock user: {}", user.email);
             Ok(user)

@@ -49,6 +49,7 @@ pub struct CompletionRequest {
     pub top_p: Option<f32>,
     pub stop: Option<Vec<String>>,
     pub stream: Option<bool>,
+    pub n: Option<i64>,
     pub user_id: UserId,    // For provider user field
     pub api_key_id: String, // For usage tracking
     pub organization_id: Uuid,

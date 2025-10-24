@@ -67,6 +67,6 @@ docker run --rm --entrypoint bash "$TEMP_TAG" -c "dpkg -l | grep '^ii' | awk '{p
 echo "Package information extracted to pinned-packages.txt ($(wc -l < pinned-packages.txt) packages)"
 
 # Clean up the temporary image from Docker daemon
-# docker rmi "$TEMP_TAG" 2>/dev/null || true
+docker rmi "$TEMP_TAG" 2>/dev/null || true
 
 rm .GIT_REV

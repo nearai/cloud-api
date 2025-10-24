@@ -250,7 +250,6 @@ pub async fn oauth_callback(
     }
 }
 
-
 /// Get current user information
 pub async fn current_user(Extension(user): Extension<AuthenticatedUser>) -> Json<AuthResponse> {
     Json(AuthResponse {

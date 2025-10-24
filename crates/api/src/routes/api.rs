@@ -30,9 +30,9 @@ use crate::routes::{
     organization_members::*,
     organizations::*,
     users::{
-        accept_invitation, decline_invitation, get_current_user, get_user_sessions,
-        list_user_invitations, revoke_all_user_sessions, revoke_user_session,
-        update_current_user_profile,
+        accept_invitation, create_access_token, decline_invitation, get_current_user,
+        get_user_refresh_tokens, list_user_invitations, revoke_all_user_tokens,
+        revoke_user_refresh_token, update_current_user_profile,
     },
 };
 
@@ -110,11 +110,16 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
             "/me/invitations/{invitation_id}/decline",
             axum::routing::post(decline_invitation),
         )
+        .route("/me/refresh_tokens", get(get_user_refresh_tokens))
         .route(
-            "/me/sessions",
-            get(get_user_sessions).delete(revoke_all_user_sessions),
+            "/me/refresh_tokens/{refresh_token_id}",
+            delete(revoke_user_refresh_token),
         )
-        .route("/me/sessions/{session_id}", delete(revoke_user_session));
+        .route(
+            "/me/access_tokens",
+            axum::routing::post(create_access_token),
+        )
+        .route("/me/tokens", delete(revoke_all_user_tokens));
 
     // Combine all routes with auth middleware
     Router::new()

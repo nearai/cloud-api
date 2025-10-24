@@ -17,11 +17,11 @@ use tracing::{debug, error};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-/// Convert service Session to API SessionResponse
-fn services_session_to_api_session(
+/// Convert service Session (refresh token) to API RefreshTokenResponse
+fn services_session_to_api_refresh_token(
     session: &services::auth::Session,
-) -> crate::models::SessionResponse {
-    crate::models::SessionResponse {
+) -> crate::models::RefreshTokenResponse {
+    crate::models::RefreshTokenResponse {
         id: session.id.0.to_string(), // SessionId is now Uuid
         user_id: session.user_id.0.to_string(),
         created_at: session.created_at,
@@ -182,15 +182,15 @@ pub async fn update_current_user_profile(
     }
 }
 
-/// Get user's sessions
+/// Get user's refresh tokens
 ///
-/// Returns all active sessions for the currently authenticated user.
+/// Returns all active refresh tokens for the currently authenticated user.
 #[utoipa::path(
     get,
-    path = "/users/me/sessions",
+    path = "/users/me/refresh_tokens",
     tag = "Users",
     responses(
-        (status = 200, description = "List of user sessions", body = Vec<crate::models::SessionResponse>),
+        (status = 200, description = "List of user refresh tokens", body = Vec<crate::models::RefreshTokenResponse>),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -198,61 +198,61 @@ pub async fn update_current_user_profile(
         ("session_token" = [])
     )
 )]
-pub async fn get_user_sessions(
+pub async fn get_user_refresh_tokens(
     State(app_state): State<AppState>,
     Extension(current_user): Extension<AuthenticatedUser>,
-) -> Result<Json<Vec<crate::models::SessionResponse>>, StatusCode> {
-    debug!("Getting sessions for user: {}", current_user.0.id);
+) -> Result<Json<Vec<crate::models::RefreshTokenResponse>>, StatusCode> {
+    debug!("Getting refresh tokens for user: {}", current_user.0.id);
 
     let user_id = services::auth::UserId(current_user.0.id);
 
     match app_state.user_service.get_user_sessions(user_id).await {
         Ok(sessions) => {
-            let api_sessions = sessions
+            let api_refresh_tokens = sessions
                 .iter()
-                .map(services_session_to_api_session)
+                .map(services_session_to_api_refresh_token)
                 .collect();
-            Ok(Json(api_sessions))
+            Ok(Json(api_refresh_tokens))
         }
         Err(e) => {
-            error!("Failed to get user sessions: {}", e);
+            error!("Failed to get user refresh tokens: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
 
-/// Revoke a user session
+/// Revoke a user refresh token
 ///
-/// Revokes a specific session for the currently authenticated user.
+/// Revokes a specific refresh token for the currently authenticated user.
 #[utoipa::path(
     delete,
-    path = "/users/me/sessions/{session_id}",
+    path = "/users/me/refresh_tokens/{refresh_token_id}",
     tag = "Users",
     params(
-        ("session_id" = Uuid, Path, description = "Session ID to revoke")
+        ("refresh_token_id" = Uuid, Path, description = "Refresh token ID to revoke")
     ),
     responses(
-        (status = 204, description = "Session revoked successfully"),
+        (status = 204, description = "Refresh token revoked successfully"),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 404, description = "Session not found", body = ErrorResponse),
+        (status = 404, description = "Refresh token not found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
         ("session_token" = [])
     )
 )]
-pub async fn revoke_user_session(
+pub async fn revoke_user_refresh_token(
     State(app_state): State<AppState>,
     Extension(current_user): Extension<AuthenticatedUser>,
-    Path(session_id): Path<Uuid>,
+    Path(refresh_token_id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
     debug!(
-        "Revoking session: {} for user: {}",
-        session_id, current_user.0.id
+        "Revoking refresh token: {} for user: {}",
+        refresh_token_id, current_user.0.id
     );
 
     let user_id = services::auth::UserId(current_user.0.id);
-    let session_id = services::auth::SessionId(session_id);
+    let session_id = services::auth::SessionId(refresh_token_id);
 
     match app_state
         .user_service
@@ -262,23 +262,25 @@ pub async fn revoke_user_session(
         Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err(StatusCode::NOT_FOUND),
         Err(UserServiceError::SessionNotFound) => Err(StatusCode::NOT_FOUND),
-        Err(UserServiceError::Unauthorized(_)) => Err(StatusCode::NOT_FOUND), // Don't leak that the session exists
+        Err(UserServiceError::Unauthorized(_)) => Err(StatusCode::NOT_FOUND), // Don't leak that the refresh token exists
         Err(e) => {
-            error!("Failed to revoke session: {}", e);
+            error!("Failed to revoke refresh token: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
 
-/// Revoke all sessions for a user
+/// Revoke all tokens for a user
 ///
-/// Revokes all active sessions for the currently authenticated user.
+/// Revokes all tokens (both refresh tokens and access tokens) for the currently authenticated user.
+/// This deletes all refresh tokens from the database and invalidates all JWT access tokens
+/// by updating the user's tokens_revoked_at timestamp.
 #[utoipa::path(
     delete,
-    path = "/users/me/sessions",
+    path = "/users/me/tokens",
     tag = "Users",
     responses(
-        (status = 200, description = "All sessions revoked successfully", body = serde_json::Value),
+        (status = 200, description = "All tokens revoked successfully", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -286,21 +288,63 @@ pub async fn revoke_user_session(
         ("session_token" = [])
     )
 )]
-pub async fn revoke_all_user_sessions(
+pub async fn revoke_all_user_tokens(
     State(app_state): State<AppState>,
     Extension(current_user): Extension<AuthenticatedUser>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    debug!("Revoking all sessions for user: {}", current_user.0.id);
+    debug!("Revoking all tokens for user: {}", current_user.0.id);
 
     let user_id = services::auth::UserId(current_user.0.id);
 
     match app_state.user_service.revoke_all_sessions(user_id).await {
         Ok(count) => Ok(Json(serde_json::json!({
-            "message": format!("Revoked {} sessions", count),
+            "message": format!("Revoked {} refresh tokens and invalidated all access tokens", count),
             "count": count
         }))),
         Err(e) => {
-            error!("Failed to revoke all user sessions: {}", e);
+            error!("Failed to revoke all user tokens: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Create a new access token
+///
+/// Creates a new short-lived access token using the current refresh token.
+#[utoipa::path(
+    post,
+    path = "/users/me/access_tokens",
+    tag = "Users",
+    responses(
+        (status = 200, description = "Access token created successfully", body = crate::models::AccessTokenResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("refresh_token" = [])
+    )
+)]
+pub async fn create_access_token(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Result<Json<crate::models::AccessTokenResponse>, StatusCode> {
+    debug!("Creating access token for user: {}", user.0.id);
+
+    // Get the encoding key from somewhere - we need to add this to AppState
+    // For now, we'll need to get it from the config
+    let config = config::ApiConfig::from_env().map_err(|e| {
+        error!("Failed to load config: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    match app_state.auth_service.create_session_access_token(
+        services::auth::UserId(user.0.id),
+        config.auth.encoding_key.to_string(),
+        1, // 1 hour expiration
+    ) {
+        Ok(access_token) => Ok(Json(crate::models::AccessTokenResponse { access_token })),
+        Err(e) => {
+            error!("Failed to create access token: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }

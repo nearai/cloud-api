@@ -7,7 +7,7 @@ use utoipa::{Modify, OpenApi};
 #[openapi(
     info(
         title = "NEAR AI Cloud API",
-        description = "A comprehensive cloud API for AI model inference, conversation management, and organization administration.\n\n## Authentication\n\nThis API supports two authentication methods:\n\n1. **Session Token (User Authentication)**: Use `Authorization: Bearer <session_token>` with a session token obtained from OAuth login\n2. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`)\n\nClick the **Authorize** button above to configure authentication.",
+        description = "A comprehensive cloud API for AI model inference, conversation management, and organization administration.\n\n## Authentication\n\nThis API supports three authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`)\n\nClick the **Authorize** button above to configure authentication.",
         version = "1.0.0",
         contact(
             name = "NEAR AI Team",
@@ -72,9 +72,10 @@ use utoipa::{Modify, OpenApi};
         // Users endpoints
         crate::routes::users::get_current_user,
         crate::routes::users::update_current_user_profile,
-        crate::routes::users::get_user_sessions,
-        crate::routes::users::revoke_user_session,
-        crate::routes::users::revoke_all_user_sessions,
+        crate::routes::users::get_user_refresh_tokens,
+        crate::routes::users::revoke_user_refresh_token,
+        crate::routes::users::revoke_all_user_tokens,
+        crate::routes::users::create_access_token,
         crate::routes::users::list_user_invitations,
         crate::routes::users::accept_invitation,
         crate::routes::users::decline_invitation,
@@ -85,8 +86,6 @@ use utoipa::{Modify, OpenApi};
         crate::routes::usage::get_organization_balance,
         crate::routes::usage::get_organization_usage_history,
         crate::routes::usage::get_api_key_usage_history,
-        // Auth endpoints
-        crate::routes::auth::refresh_access_token,
     ),
     components(
         schemas(
@@ -119,7 +118,8 @@ use utoipa::{Modify, OpenApi};
             AcceptInvitationResponse,
             // Users models
             UserResponse,
-            SessionResponse,
+            RefreshTokenResponse,
+            AccessTokenResponse,
             PublicUserResponse,
             AdminUserResponse,
             crate::routes::users::UpdateUserProfileRequest,
@@ -150,8 +150,6 @@ use utoipa::{Modify, OpenApi};
             crate::routes::usage::OrganizationBalanceResponse,
             crate::routes::usage::UsageHistoryResponse,
             crate::routes::usage::UsageHistoryEntryResponse,
-            // Auth models
-            crate::routes::auth::TokenRefreshResponse,
         ),
     ),
     modifiers(&SecurityAddon)
@@ -165,14 +163,25 @@ pub struct SecurityAddon;
 impl Modify for SecurityAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         if let Some(components) = openapi.components.as_mut() {
-            // Session Token authentication (User authentication via OAuth)
+            // Access Token (JWT) authentication - primary method for user authentication
             components.add_security_scheme(
                 "session_token",
                 SecurityScheme::Http(
                     HttpBuilder::new()
                         .scheme(HttpAuthScheme::Bearer)
-                        .bearer_format("session_token")
-                        .description(Some("Session token obtained from OAuth login (Authorization: Bearer <session_token>)"))
+                        .bearer_format("JWT")
+                        .description(Some("JWT access token for user authentication (Authorization: Bearer <jwt_token>). Create via POST /users/me/access_tokens."))
+                        .build(),
+                ),
+            );
+            // Refresh Token authentication - only for creating access tokens
+            components.add_security_scheme(
+                "refresh_token",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("refresh_token")
+                        .description(Some("Long-lived refresh token from OAuth login (Authorization: Bearer rt_<token>). Use only with POST /users/me/access_tokens."))
                         .build(),
                 ),
             );
@@ -193,7 +202,7 @@ impl Modify for SecurityAddon {
 
         // Set global security requirement - endpoints need at least one of these
         openapi.security = Some(vec![
-            // Allow Session Token
+            // Allow JWT Access Token (primary for users)
             utoipa::openapi::security::SecurityRequirement::new(
                 "session_token",
                 Vec::<String>::new(),

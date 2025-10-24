@@ -883,6 +883,7 @@ mod tests {
 
         // Check that security schemes are configured
         assert!(components.security_schemes.contains_key("session_token"));
+        assert!(components.security_schemes.contains_key("refresh_token"));
         assert!(components.security_schemes.contains_key("api_key"));
 
         // Verify servers are not hardcoded (will be set dynamically on client)

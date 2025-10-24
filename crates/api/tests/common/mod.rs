@@ -69,7 +69,7 @@ fn db_config_for_tests() -> config::DatabaseConfig {
 }
 
 pub fn get_session_id() -> String {
-    "sess_402af343-70ba-4a8a-b926-012f71e86769".to_string()
+    "rt_402af343-70ba-4a8a-b926-012f71e86769".to_string()
 }
 
 /// Get an access token from a refresh token (session token)

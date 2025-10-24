@@ -330,16 +330,9 @@ pub async fn create_access_token(
 ) -> Result<Json<crate::models::AccessTokenResponse>, StatusCode> {
     debug!("Creating access token for user: {}", user.0.id);
 
-    // Get the encoding key from somewhere - we need to add this to AppState
-    // For now, we'll need to get it from the config
-    let config = config::ApiConfig::from_env().map_err(|e| {
-        error!("Failed to load config: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
     match app_state.auth_service.create_session_access_token(
         services::auth::UserId(user.0.id),
-        config.auth.encoding_key.to_string(),
+        app_state.config.auth.encoding_key.to_string(),
         1, // 1 hour expiration
     ) {
         Ok(access_token) => Ok(Json(crate::models::AccessTokenResponse { access_token })),

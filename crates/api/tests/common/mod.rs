@@ -73,13 +73,13 @@ pub fn get_session_id() -> String {
 }
 
 /// Get an access token from a refresh token (session token)
-/// This function calls the /auth/refresh endpoint to exchange a refresh token for an access token
+/// This function calls the /users/me/access_tokens endpoint to exchange a refresh token for an access token
 pub async fn get_access_token_from_refresh_token(
     server: &axum_test::TestServer,
     refresh_token: String,
 ) -> String {
     let response = server
-        .post("/v1/auth/refresh")
+        .post("/v1/users/me/access_tokens")
         .add_header("Authorization", format!("Bearer {}", refresh_token))
         .await;
 
@@ -89,7 +89,7 @@ pub async fn get_access_token_from_refresh_token(
         "Failed to refresh access token"
     );
 
-    let refresh_response = response.json::<api::routes::auth::TokenRefreshResponse>();
+    let refresh_response = response.json::<api::models::AccessTokenResponse>();
     refresh_response.access_token
 }
 

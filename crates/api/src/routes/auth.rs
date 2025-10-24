@@ -1,5 +1,4 @@
 use crate::middleware::AuthenticatedUser;
-use crate::models::ErrorResponse;
 use axum::{
     extract::{Query, State},
     http::{header::SET_COOKIE, StatusCode},
@@ -10,12 +9,10 @@ use chrono::Utc;
 use config::ApiConfig;
 use serde::{Deserialize, Serialize};
 use services::auth::{AuthServiceTrait, OAuthManager};
-use services::UserId;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
-use utoipa::ToSchema;
 
 /// Temporary storage for OAuth state and PKCE verifiers
 /// In production, use Redis or similar
@@ -46,11 +43,6 @@ pub struct TokenExchangeResponse {
     refresh_token: String,
     refresh_token_expiration: chrono::DateTime<Utc>,
     user: AuthResponse,
-}
-
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct TokenRefreshResponse {
-    pub access_token: String,
 }
 
 #[derive(Serialize)]
@@ -258,39 +250,6 @@ pub async fn oauth_callback(
     }
 }
 
-#[utoipa::path(
-    post,
-    path = "/auth/refresh",
-    tag = "Auth",
-    responses(
-        (status = 200, description = "Models upserted successfully", body = TokenRefreshResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    ),
-    security(
-        ("session_token" = [])
-    )
-)]
-pub async fn refresh_access_token(
-    State((_oauth, _state_store, auth_service, config)): State<AuthState>,
-    Extension(user): Extension<AuthenticatedUser>,
-) -> Response {
-    match auth_service.create_session_access_token(
-        UserId(user.0.id),
-        config.auth.encoding_key.to_string(),
-        1,
-    ) {
-        Ok(access_token) => Json(TokenRefreshResponse { access_token }).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse::new(
-                format!("Failed to refresh token: {e}"),
-                "server_error".to_string(),
-            )),
-        )
-            .into_response(),
-    }
-}
 
 /// Get current user information
 pub async fn current_user(Extension(user): Extension<AuthenticatedUser>) -> Json<AuthResponse> {

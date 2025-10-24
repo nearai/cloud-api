@@ -23,6 +23,7 @@ pub struct AppState {
     pub attestation_service: Arc<dyn AttestationServiceTrait>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
+    pub config: Arc<config::ApiConfig>,
 }
 
 // Import route handlers
@@ -117,7 +118,10 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
         )
         .route(
             "/me/access_tokens",
-            axum::routing::post(create_access_token),
+            axum::routing::post(create_access_token).layer(from_fn_with_state(
+                auth_state.clone(),
+                crate::middleware::auth::refresh_middleware,
+            )),
         )
         .route("/me/tokens", delete(revoke_all_user_tokens));
 

@@ -4,8 +4,6 @@ pub mod models;
 pub mod openapi;
 pub mod routes;
 
-use crate::middleware::auth::refresh_middleware;
-use crate::routes::auth::refresh_access_token;
 use crate::{
     middleware::{auth::auth_middleware_with_api_key, auth_middleware, AuthState},
     openapi::ApiDoc,
@@ -372,6 +370,7 @@ pub fn build_app_with_config(
         attestation_service: domain_services.attestation_service.clone(),
         usage_service: domain_services.usage_service.clone(),
         user_service: domain_services.user_service.clone(),
+        config: config.clone(),
     };
 
     // Create usage state for middleware
@@ -501,13 +500,6 @@ pub fn build_auth_routes(
             )),
         )
         .route("/logout", post(logout))
-        .route(
-            "/refresh",
-            post(refresh_access_token).layer(from_fn_with_state(
-                auth_state_middleware.clone(),
-                refresh_middleware,
-            )),
-        )
         .with_state(auth_state)
 }
 

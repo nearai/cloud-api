@@ -18,6 +18,8 @@ use utoipa::{Modify, OpenApi};
         )
     ),
     paths(
+        // Health check endpoint
+        crate::routes::health::health_check,
         // Chat completion endpoints
         crate::routes::completions::chat_completions,
         // crate::routes::completions::completions,
@@ -90,6 +92,8 @@ use utoipa::{Modify, OpenApi};
     ),
     components(
         schemas(
+            // Health check models
+            crate::routes::health::HealthResponse,
             // Core API models
             ChatCompletionRequest, ChatCompletionResponse, Message,
             CompletionRequest, ModelsResponse, ModelInfo, ErrorResponse,

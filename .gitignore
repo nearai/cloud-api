@@ -5,3 +5,6 @@ config/examples/production.yaml
 .cursor
 *.crt
 .env
+
+.GIT_REV
+oci.tar

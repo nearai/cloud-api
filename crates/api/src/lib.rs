@@ -31,8 +31,8 @@ use axum::{
 use config::ApiConfig;
 use database::{
     repositories::{
-        ApiKeyRepository, PgOrganizationRepository, SessionRepository, UserRepository,
-        WorkspaceRepository,
+        AdminAccessTokenRepository, ApiKeyRepository, PgOrganizationRepository, SessionRepository,
+        UserRepository, WorkspaceRepository,
     },
     Database,
 };
@@ -145,12 +145,17 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
     let oauth_manager = create_oauth_manager(config);
     let state_store: StateStore = Arc::new(RwLock::new(HashMap::new()));
 
+    // Create admin access token repository
+    let admin_access_token_repository =
+        Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
+
     // Create AuthState for middleware
     let oauth_manager_arc = Arc::new(oauth_manager);
     let auth_state_middleware = AuthState::new(
         oauth_manager_arc.clone(),
         auth_service.clone(),
         workspace_repository.clone(),
+        admin_access_token_repository,
         config.auth.admin_domains.clone(),
         config.auth.encoding_key.clone(),
     );
@@ -679,14 +684,19 @@ pub fn build_admin_routes(
 ) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
-        batch_upsert_models, create_admin_access_token, delete_model, get_model_history,
-        get_organization_limits_history, list_users, update_organization_limits, AdminAppState,
+        batch_upsert_models, create_admin_access_token, delete_admin_access_token, delete_model,
+        get_model_history, get_organization_limits_history, list_admin_access_tokens, list_users,
+        update_organization_limits, AdminAppState,
     };
-    use database::repositories::AdminCompositeRepository;
+    use database::repositories::{AdminAccessTokenRepository, AdminCompositeRepository};
     use services::admin::AdminServiceImpl;
 
     // Create composite admin repository (handles models, organization limits, and users)
     let admin_repository = Arc::new(AdminCompositeRepository::new(database.pool().clone()));
+
+    // Create admin access token repository
+    let admin_access_token_repository =
+        Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
 
     // Create admin service with composite repository
     let admin_service = Arc::new(AdminServiceImpl::new(
@@ -697,6 +707,7 @@ pub fn build_admin_routes(
         admin_service,
         auth_service: auth_state_middleware.auth_service.clone(),
         config,
+        admin_access_token_repository,
     };
 
     Router::new()
@@ -721,6 +732,14 @@ pub fn build_admin_routes(
         .route(
             "/admin/access_token",
             axum::routing::post(create_admin_access_token),
+        )
+        .route(
+            "/admin/access_token",
+            axum::routing::get(list_admin_access_tokens),
+        )
+        .route(
+            "/admin/access_token/{token_id}",
+            axum::routing::delete(delete_admin_access_token),
         )
         .with_state(admin_app_state)
         // Admin middleware handles both authentication and authorization

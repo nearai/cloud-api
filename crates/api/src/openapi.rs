@@ -50,6 +50,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::get_organization_limits_history,
         crate::routes::admin::list_users,
         crate::routes::admin::create_admin_access_token,
+        crate::routes::admin::list_admin_access_tokens,
+        crate::routes::admin::delete_admin_access_token,
         // Workspace endpoints
         crate::routes::workspaces::create_workspace,
         crate::routes::workspaces::list_organization_workspaces,

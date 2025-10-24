@@ -48,9 +48,9 @@ pub struct TokenExchangeResponse {
     user: AuthResponse,
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct TokenRefreshResponse {
-    access_token: String,
+    pub access_token: String,
 }
 
 #[derive(Serialize)]

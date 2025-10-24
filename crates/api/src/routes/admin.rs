@@ -1,8 +1,8 @@
 use crate::middleware::AdminUser;
 use crate::models::{
     AdminAccessTokenResponse, AdminUserResponse, BatchUpdateModelApiRequest,
-    CreateAdminAccessTokenRequest, DecimalPrice, ErrorResponse, ListUsersResponse,
-    ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
+    CreateAdminAccessTokenRequest, DecimalPrice, DeleteAdminAccessTokenRequest, ErrorResponse,
+    ListUsersResponse, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
     OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, SpendLimit, UpdateOrganizationLimitsRequest,
     UpdateOrganizationLimitsResponse,
 };
@@ -12,20 +12,19 @@ use axum::{
     response::Json as ResponseJson,
     Extension,
 };
+use chrono::Utc;
 use config::ApiConfig;
 use services::admin::{AdminService, UpdateModelAdminRequest};
-use services::auth::{AuthServiceTrait, UserId};
+use services::auth::AuthServiceTrait;
 use std::sync::Arc;
 use tracing::{debug, error};
-
-/// Admin tokens do not require refresh tokens, so refresh expiry is set to 0
-const NO_REFRESH_TOKEN_EXPIRY: i64 = 0;
 
 #[derive(Clone)]
 pub struct AdminAppState {
     pub admin_service: Arc<dyn AdminService + Send + Sync>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub config: Arc<ApiConfig>,
+    pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
 }
 
 /// Batch upsert models metadata (Admin only)
@@ -648,35 +647,28 @@ pub async fn create_admin_access_token(
         ));
     }
 
-    // Create session with the specified parameters
-    let user_id = UserId(admin_user.0.id);
-    let session_result = app_state
-        .auth_service
-        .create_session(
-            user_id,
-            request.ip_address,
-            request.user_agent,
-            app_state.config.auth.encoding_key.to_string(),
-            request.expires_in_hours,
-            NO_REFRESH_TOKEN_EXPIRY,
-        )
-        .await;
+    // Create admin access token directly in database
+    let expires_at = Utc::now() + chrono::Duration::hours(request.expires_in_hours);
 
-    match session_result {
-        Ok((access_token, refresh_session, _refresh_token)) => {
+    match app_state
+        .admin_access_token_repository
+        .create(admin_user.0.id, request.name, request.reason, expires_at)
+        .await
+    {
+        Ok((admin_token, access_token)) => {
             debug!(
                 "Admin access token created successfully for user: {}",
                 admin_user.0.email
             );
 
             let response = AdminAccessTokenResponse {
+                id: admin_token.id.to_string(),
                 access_token,
                 created_by_user_id: admin_user.0.id.to_string(),
-                created_at: refresh_session.created_at,
-                message: format!(
-                    "Admin access token created successfully. Token expires in {} hours and should be stored securely.",
-                    request.expires_in_hours
-                ),
+                created_at: admin_token.created_at,
+                expires_at: admin_token.expires_at,
+                name: admin_token.name,
+                reason: admin_token.creation_reason,
             };
 
             Ok(ResponseJson(response))
@@ -687,6 +679,164 @@ pub async fn create_admin_access_token(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
                     format!("Failed to create admin access token: {e}"),
+                    "internal_server_error".to_string(),
+                )),
+            ))
+        }
+    }
+}
+
+/// List admin access tokens (Admin only)
+///
+/// Retrieves a paginated list of all admin access tokens in the system.
+/// Only authenticated admins can access this endpoint.
+#[utoipa::path(
+    get,
+    path = "/admin/access_token",
+    tag = "Admin",
+    params(
+        ("limit" = Option<i64>, Query, description = "Number of records to return (default: 50)"),
+        ("offset" = Option<i64>, Query, description = "Number of records to skip (default: 0)")
+    ),
+    responses(
+        (status = 200, description = "Admin access tokens retrieved successfully"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_admin_access_tokens(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>, // Require admin auth
+    axum::extract::Query(params): axum::extract::Query<ListUsersQueryParams>,
+) -> Result<ResponseJson<serde_json::Value>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+
+    debug!(
+        "List admin access tokens request with limit={}, offset={} by admin: {}",
+        params.limit, params.offset, admin_user.0.email
+    );
+
+    match app_state
+        .admin_access_token_repository
+        .list(params.limit, params.offset)
+        .await
+    {
+        Ok(tokens) => {
+            let total = app_state
+                .admin_access_token_repository
+                .count()
+                .await
+                .unwrap_or(0);
+
+            let response = serde_json::json!({
+                "data": tokens,
+                "limit": params.limit,
+                "offset": params.offset,
+                "total": total
+            });
+
+            Ok(ResponseJson(response))
+        }
+        Err(e) => {
+            error!("Failed to list admin access tokens: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to list admin access tokens: {e}"),
+                    "internal_server_error".to_string(),
+                )),
+            ))
+        }
+    }
+}
+
+/// Delete admin access token (Admin only)
+///
+/// Revokes an admin access token by setting it as inactive.
+/// Only authenticated admins can perform this operation.
+#[utoipa::path(
+    delete,
+    path = "/admin/access_token/{token_id}",
+    tag = "Admin",
+    request_body = DeleteAdminAccessTokenRequest,
+    params(
+        ("token_id" = String, Path, description = "ID of the admin access token to revoke")
+    ),
+    responses(
+        (status = 200, description = "Admin access token revoked successfully"),
+        (status = 404, description = "Admin access token not found", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn delete_admin_access_token(
+    State(app_state): State<AdminAppState>,
+    Path(token_id): Path<String>,
+    Extension(admin_user): Extension<AdminUser>, // Require admin auth
+    Json(request): Json<DeleteAdminAccessTokenRequest>,
+) -> Result<ResponseJson<serde_json::Value>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    debug!(
+        "Delete admin access token request for token_id: {} by admin: {}",
+        token_id, admin_user.0.email
+    );
+
+    // Parse token ID
+    let token_uuid = uuid::Uuid::parse_str(&token_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Invalid token ID format".to_string(),
+                "invalid_id".to_string(),
+            )),
+        )
+    })?;
+
+    // Revoke the token
+    match app_state
+        .admin_access_token_repository
+        .revoke(token_uuid, admin_user.0.id, request.reason)
+        .await
+    {
+        Ok(true) => {
+            debug!(
+                "Admin access token {} revoked successfully by admin: {}",
+                token_id, admin_user.0.email
+            );
+
+            let response = serde_json::json!({
+                "message": "Admin access token revoked successfully",
+                "token_id": token_id,
+                "revoked_by": admin_user.0.email,
+                "revoked_at": chrono::Utc::now().to_rfc3339()
+            });
+
+            Ok(ResponseJson(response))
+        }
+        Ok(false) => {
+            debug!(
+                "Admin access token {} not found or already revoked",
+                token_id
+            );
+            Err((
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    "Admin access token not found or already revoked".to_string(),
+                    "token_not_found".to_string(),
+                )),
+            ))
+        }
+        Err(e) => {
+            error!("Failed to revoke admin access token: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to revoke admin access token: {e}"),
                     "internal_server_error".to_string(),
                 )),
             ))

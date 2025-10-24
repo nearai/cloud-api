@@ -1043,21 +1043,29 @@ pub struct ListUsersResponse {
 pub struct CreateAdminAccessTokenRequest {
     /// Number of hours until the token expires (required)
     pub expires_in_hours: i64,
-    /// IP address where the token will be used (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ip_address: Option<String>,
-    /// User agent string for the token (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user_agent: Option<String>,
+    /// Name for the token (required)
+    pub name: String,
+    /// Reason for creating the token (required)
+    pub reason: String,
 }
 
 /// Admin access token response model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AdminAccessTokenResponse {
+    pub id: String,
     pub access_token: String,
     pub created_by_user_id: String,
     pub created_at: DateTime<Utc>,
-    pub message: String,
+    pub expires_at: DateTime<Utc>,
+    pub name: String,
+    pub reason: String,
+}
+
+/// Delete admin access token request model
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeleteAdminAccessTokenRequest {
+    /// Reason for revoking the token (required)
+    pub reason: String,
 }
 
 /// API Key response model

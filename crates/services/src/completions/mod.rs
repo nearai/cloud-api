@@ -189,7 +189,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             stream: Some(true),
             tools: None,
             max_completion_tokens: None,
-            n: Some(1),
+            n: request.n,
             frequency_penalty: None,
             presence_penalty: None,
             logit_bias: None,

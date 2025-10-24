@@ -1024,10 +1024,6 @@ pub struct AccessTokenResponse {
     pub access_token: String,
 }
 
-/// Legacy alias for RefreshTokenResponse (deprecated, use RefreshTokenResponse)
-#[deprecated(note = "Use RefreshTokenResponse instead")]
-pub type SessionResponse = RefreshTokenResponse;
-
 /// Organization member response model (non-sensitive)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationMemberResponse {

@@ -18,6 +18,7 @@ use crate::{
         },
         completions::{chat_completions, models},
         conversations,
+        health::health_check,
         models::{get_model_by_name, list_models, ModelsAppState},
         responses,
     },
@@ -438,6 +439,9 @@ pub fn build_app_with_config(
     // Build OpenAPI and documentation routes
     let openapi_routes = build_openapi_routes();
 
+    // Build health check route (public, no auth required)
+    let health_routes = Router::new().route("/health", get(health_check));
+
     Router::new()
         .nest(
             "/v1",
@@ -451,7 +455,8 @@ pub fn build_app_with_config(
                 .merge(attestation_routes.clone())
                 .merge(model_routes)
                 .merge(admin_routes)
-                .merge(invitation_routes),
+                .merge(invitation_routes)
+                .merge(health_routes),
         )
         .merge(openapi_routes)
 }

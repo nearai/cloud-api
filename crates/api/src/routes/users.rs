@@ -81,7 +81,7 @@ pub async fn get_current_user(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to get current user".to_string(),
-                    "server_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ));
         }
@@ -201,7 +201,7 @@ pub async fn update_current_user_profile(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to update current user".to_string(),
-                    "server_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }
@@ -246,7 +246,7 @@ pub async fn get_user_refresh_tokens(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to get user refresh tokens".to_string(),
-                    "server_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }
@@ -307,7 +307,7 @@ pub async fn revoke_user_refresh_token(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to revoke refresh tokens".to_string(),
-                    "server_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }
@@ -351,7 +351,7 @@ pub async fn revoke_all_user_tokens(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to revoke all user tokens".to_string(),
-                    "server_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }
@@ -392,7 +392,7 @@ pub async fn create_access_token(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to create access token".to_string(),
-                    "server_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }
@@ -442,7 +442,7 @@ pub async fn list_user_invitations(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to list user invitations".to_string(),
-                    "server_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }
@@ -530,7 +530,7 @@ pub async fn accept_invitation(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to accept invitation".to_string(),
-                    "server_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }
@@ -602,7 +602,7 @@ pub async fn decline_invitation(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to decline invitation".to_string(),
-                    "server_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }
@@ -666,7 +666,7 @@ pub async fn get_invitation_by_token(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to get invitation".to_string(),
-                    "server_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }
@@ -752,7 +752,7 @@ pub async fn accept_invitation_by_token(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to accept invitation".to_string(),
-                    "server_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }

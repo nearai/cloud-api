@@ -134,7 +134,7 @@ pub async fn create_workspace(
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
     Json(request): Json<CreateWorkspaceRequest>,
-) -> Result<(StatusCode, Json<WorkspaceResponse>), StatusCode> {
+) -> Result<(StatusCode, Json<WorkspaceResponse>), (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Creating workspace: {} in organization: {} by user: {}",
         request.name, org_id, user.0.id
@@ -176,19 +176,43 @@ pub async fn create_workspace(
         }
         Err(services::workspace::WorkspaceError::Unauthorized(msg)) => {
             debug!("User is not authorized to create workspace: {}", msg);
-            Err(StatusCode::FORBIDDEN)
+            Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse::new(
+                    "Workspace forbidden".to_string(),
+                    "forbidden".to_string(),
+                )),
+            ))
         }
         Err(services::workspace::WorkspaceError::AlreadyExists) => {
             debug!("Workspace name already exists in organization");
-            Err(StatusCode::CONFLICT)
+            Err((
+                StatusCode::CONFLICT,
+                Json(ErrorResponse::new(
+                    "Workspace name already exists in organization".to_string(),
+                    "conflict".to_string(),
+                )),
+            ))
         }
         Err(services::workspace::WorkspaceError::InvalidParams(msg)) => {
             debug!("Invalid workspace parameters: {}", msg);
-            Err(StatusCode::BAD_REQUEST)
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    format!("Invalid workspace parameters: {}", msg),
+                    "bad_request".to_string(),
+                )),
+            ))
         }
         Err(e) => {
             error!("Failed to create workspace: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "Failed to create workspace".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -223,18 +247,14 @@ pub async fn list_organization_workspaces(
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
     Query(params): Query<ListParams>,
-) -> Result<Json<ListWorkspacesResponse>, StatusCode> {
+) -> Result<Json<ListWorkspacesResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Listing workspaces for organization: {} by user: {}",
         org_id, user.0.id
     );
 
     // Validate pagination parameters
-    if let Err((status, _)) =
-        crate::routes::common::validate_limit_offset(params.limit, params.offset)
-    {
-        return Err(status);
-    }
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     let user_id = authenticated_user_to_user_id(user);
     let organization_id = OrganizationId(org_id);
@@ -247,11 +267,23 @@ pub async fn list_organization_workspaces(
     {
         Ok(count) => count,
         Err(services::workspace::WorkspaceError::Unauthorized(_)) => {
-            return Err(StatusCode::FORBIDDEN);
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse::new(
+                    "Workspace forbidden".to_string(),
+                    "forbidden".to_string(),
+                )),
+            ));
         }
         Err(e) => {
             error!("Failed to count workspaces: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to list workspaces".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ));
         }
     };
 
@@ -292,10 +324,22 @@ pub async fn list_organization_workspaces(
                 offset: params.offset,
             }))
         }
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "Workspace forbidden".to_string(),
+                "forbidden".to_string(),
+            )),
+        )),
         Err(e) => {
             error!("Failed to list workspaces: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to list workspaces".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -325,7 +369,7 @@ pub async fn get_workspace(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(workspace_id): Path<Uuid>,
-) -> Result<Json<WorkspaceResponse>, StatusCode> {
+) -> Result<Json<WorkspaceResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Getting workspace: {} by user: {}", workspace_id, user.0.id);
 
     let user_id = authenticated_user_to_user_id(user);
@@ -352,11 +396,29 @@ pub async fn get_workspace(
             };
             Ok(Json(response))
         }
-        Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
+        Err(services::workspace::WorkspaceError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Workspace not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "Workspace forbidden".to_string(),
+                "forbidden".to_string(),
+            )),
+        )),
         Err(e) => {
             error!("Failed to get workspace: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to list workspaces".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -389,7 +451,7 @@ pub async fn update_workspace(
     Extension(user): Extension<AuthenticatedUser>,
     Path(workspace_id): Path<Uuid>,
     Json(request): Json<UpdateWorkspaceRequest>,
-) -> Result<Json<WorkspaceResponse>, StatusCode> {
+) -> Result<Json<WorkspaceResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Updating workspace: {} by user: {}",
         workspace_id, user.0.id
@@ -425,11 +487,29 @@ pub async fn update_workspace(
             };
             Ok(Json(response))
         }
-        Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
+        Err(services::workspace::WorkspaceError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Workspace not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "Workspace forbidden".to_string(),
+                "forbidden".to_string(),
+            )),
+        )),
         Err(e) => {
             error!("Failed to update workspace: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to update workspace".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -459,7 +539,7 @@ pub async fn delete_workspace(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(workspace_id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Deleting workspace: {} by user: {}",
         workspace_id, user.0.id
@@ -481,12 +561,29 @@ pub async fn delete_workspace(
                 "deleted": true
             })))
         }
-        Ok(false) => Err(StatusCode::NOT_FOUND),
-        Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
+        Ok(false) | Err(services::workspace::WorkspaceError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Workspace not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "Workspace forbidden".to_string(),
+                "forbidden".to_string(),
+            )),
+        )),
         Err(e) => {
             error!("Failed to delete workspace: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to delete workspace".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -566,7 +663,7 @@ pub async fn create_workspace_api_key(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to check for duplicate API key names".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ));
         }
@@ -613,7 +710,7 @@ pub async fn create_workspace_api_key(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to create API key".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }
@@ -648,18 +745,14 @@ pub async fn list_workspace_api_keys(
     Extension(user): Extension<AuthenticatedUser>,
     Path(workspace_id): Path<Uuid>,
     Query(params): Query<ListParams>,
-) -> Result<Json<ListApiKeysResponse>, StatusCode> {
+) -> Result<Json<ListApiKeysResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Listing API keys for workspace: {} by user: {} (limit: {}, offset: {})",
         workspace_id, user.0.id, params.limit, params.offset
     );
 
     // Validate pagination parameters
-    if let Err((status, _)) =
-        crate::routes::common::validate_limit_offset(params.limit, params.offset)
-    {
-        return Err(status);
-    }
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     let user_id = authenticated_user_to_user_id(user);
     let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
@@ -671,15 +764,33 @@ pub async fn list_workspace_api_keys(
         .await
     {
         Ok(count) => count,
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => {
-            return Err(StatusCode::FORBIDDEN);
-        }
         Err(services::workspace::WorkspaceError::NotFound) => {
-            return Err(StatusCode::NOT_FOUND);
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse::new(
+                    "Workspace not found".to_string(),
+                    "not_found".to_string(),
+                )),
+            ));
+        }
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse::new(
+                    "Workspace forbidden".to_string(),
+                    "forbidden".to_string(),
+                )),
+            ));
         }
         Err(e) => {
             error!("Failed to count API keys for workspace: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to list API keys".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ));
         }
     };
 
@@ -707,11 +818,29 @@ pub async fn list_workspace_api_keys(
                 offset: params.offset,
             }))
         }
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
-        Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "Not authorized to list API keys in this workspace".to_string(),
+                "forbidden".to_string(),
+            )),
+        )),
+        Err(services::workspace::WorkspaceError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Workspace not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
         Err(e) => {
             error!("Failed to list API keys: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to list API keys".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -742,7 +871,7 @@ pub async fn revoke_workspace_api_key(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path((workspace_id, api_key_id)): Path<(Uuid, Uuid)>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Revoking API key: {} in workspace: {} by user: {}",
         api_key_id, workspace_id, user.0.id
@@ -759,13 +888,36 @@ pub async fn revoke_workspace_api_key(
         .await
     {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
-        Ok(false) => Err(StatusCode::NOT_FOUND),
-        Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
-        Err(services::workspace::WorkspaceError::ApiKeyNotFound) => Err(StatusCode::NOT_FOUND),
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
+        Ok(false) | Err(services::workspace::WorkspaceError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Workspace not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
+        Err(services::workspace::WorkspaceError::ApiKeyNotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "API key not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "Not authorized to revoke API key in this workspace".to_string(),
+                "forbidden".to_string(),
+            )),
+        )),
         Err(e) => {
             error!("Failed to revoke API key: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to revoke API key".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -778,7 +930,7 @@ pub async fn revoke_api_key_with_context(
     State(app_state): State<AppState>,
     Extension(api_key_context): Extension<AuthenticatedApiKey>,
     Path(api_key_id): Path<Uuid>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Revoking API key: {} with workspace context: {}",
         api_key_id, api_key_context.workspace.id.0
@@ -795,13 +947,36 @@ pub async fn revoke_api_key_with_context(
         .await
     {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
-        Ok(false) => Err(StatusCode::NOT_FOUND),
-        Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
-        Err(services::workspace::WorkspaceError::ApiKeyNotFound) => Err(StatusCode::NOT_FOUND),
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
+        Ok(false) | Err(services::workspace::WorkspaceError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Workspace not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
+        Err(services::workspace::WorkspaceError::ApiKeyNotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "API key not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
+        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "Not authorized to revoke API key in this workspace".to_string(),
+                "forbidden".to_string(),
+            )),
+        )),
         Err(e) => {
             error!("Failed to revoke API key: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to revoke API key".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -891,7 +1066,7 @@ pub async fn update_api_key_spend_limit(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to update spend limit".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }
@@ -1000,7 +1175,7 @@ pub async fn update_workspace_api_key(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to update API key".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }

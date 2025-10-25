@@ -111,7 +111,7 @@ pub async fn add_organization_member(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to add organization member".to_string(),
-                    "server_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }
@@ -224,7 +224,7 @@ pub async fn invite_organization_member_by_email(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to invite organization members".to_string(),
-                    "server_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }
@@ -299,7 +299,7 @@ pub async fn update_organization_member(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to update organization member".to_string(),
-                    "server_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }
@@ -380,7 +380,7 @@ pub async fn remove_organization_member(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to remove organization member".to_string(),
-                    "server_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }

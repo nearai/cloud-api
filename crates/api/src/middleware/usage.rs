@@ -55,7 +55,7 @@ pub async fn usage_check_middleware(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(ErrorResponse::new(
                     "Internal error".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             )
         })?;
@@ -70,7 +70,7 @@ pub async fn usage_check_middleware(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     axum::Json(ErrorResponse::new(
                         "Failed to check API key spend".to_string(),
-                        "internal_error".to_string(),
+                        "internal_server_error".to_string(),
                     )),
                 )
             })?;
@@ -115,7 +115,7 @@ pub async fn usage_check_middleware(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(ErrorResponse::new(
                     "Failed to check usage limits".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             )
         })?;

@@ -252,7 +252,7 @@ pub async fn admin_middleware(
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 axum::Json(crate::models::ErrorResponse::new(
                                     "Failed to get admin user for access token".to_string(),
-                                    "server_error".to_string(),
+                                    "internal_server_error".to_string(),
                                 )),
                             ))
                         }
@@ -371,7 +371,7 @@ async fn authenticate_admin_access_token(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(crate::models::ErrorResponse::new(
                     "Failed to validate admin access token".to_string(),
-                    "server_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }
@@ -406,7 +406,7 @@ async fn authenticate_session_access(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     axum::Json(crate::models::ErrorResponse::new(
                         format!("Failed to validate session via auth service: {}", e),
-                        "server_error".to_string(),
+                        "internal_server_error".to_string(),
                     )),
                 ));
             }
@@ -419,7 +419,7 @@ async fn authenticate_session_access(
         StatusCode::UNAUTHORIZED,
         axum::Json(crate::models::ErrorResponse::new(
             "Invalid or expired access token".to_string(),
-            "server_error".to_string(),
+            "internal_server_error".to_string(),
         )),
     ))
 }
@@ -534,7 +534,7 @@ async fn authenticate_api_key(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(crate::models::ErrorResponse::new(
                     "Failed to validate API key".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }
@@ -590,7 +590,7 @@ async fn authenticate_api_key_with_context(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(crate::models::ErrorResponse::new(
                     "Failed to resolve workspace/organization".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }

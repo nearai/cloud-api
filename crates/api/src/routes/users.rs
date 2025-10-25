@@ -58,7 +58,7 @@ pub struct UpdateUserProfileRequest {
 pub async fn get_current_user(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
-) -> Result<Json<crate::models::UserResponse>, StatusCode> {
+) -> Result<Json<crate::models::UserResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Getting current user: {}", user.0.id);
 
     let user_id = services::auth::UserId(user.0.id);
@@ -66,10 +66,24 @@ pub async fn get_current_user(
     // Get user information
     let user_data = match app_state.user_service.get_user(user_id.clone()).await {
         Ok(user) => user,
-        Err(UserServiceError::UserNotFound) => return Err(StatusCode::NOT_FOUND),
+        Err(UserServiceError::UserNotFound) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse::new(
+                    "User not found".to_string(),
+                    "not_found".to_string(),
+                )),
+            ))
+        }
         Err(e) => {
             error!("Failed to get current user: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to get current user".to_string(),
+                    "server_error".to_string(),
+                )),
+            ));
         }
     };
 
@@ -163,7 +177,7 @@ pub async fn update_current_user_profile(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Json(request): Json<UpdateUserProfileRequest>,
-) -> Result<Json<crate::models::UserResponse>, StatusCode> {
+) -> Result<Json<crate::models::UserResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Updating profile for user: {}", user.0.id);
 
     let user_id = services::auth::UserId(user.0.id);
@@ -174,10 +188,22 @@ pub async fn update_current_user_profile(
         .await
     {
         Ok(updated_user) => Ok(Json(services_user_to_api_user(&updated_user))),
-        Err(UserServiceError::UserNotFound) => Err(StatusCode::NOT_FOUND),
+        Err(UserServiceError::UserNotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "User not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
         Err(e) => {
             error!("Failed to update user profile: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to update current user".to_string(),
+                    "server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -201,7 +227,7 @@ pub async fn update_current_user_profile(
 pub async fn get_user_refresh_tokens(
     State(app_state): State<AppState>,
     Extension(current_user): Extension<AuthenticatedUser>,
-) -> Result<Json<Vec<crate::models::RefreshTokenResponse>>, StatusCode> {
+) -> Result<Json<Vec<crate::models::RefreshTokenResponse>>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Getting refresh tokens for user: {}", current_user.0.id);
 
     let user_id = services::auth::UserId(current_user.0.id);
@@ -216,7 +242,13 @@ pub async fn get_user_refresh_tokens(
         }
         Err(e) => {
             error!("Failed to get user refresh tokens: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to get user refresh tokens".to_string(),
+                    "server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -245,7 +277,7 @@ pub async fn revoke_user_refresh_token(
     State(app_state): State<AppState>,
     Extension(current_user): Extension<AuthenticatedUser>,
     Path(refresh_token_id): Path<Uuid>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Revoking refresh token: {} for user: {}",
         refresh_token_id, current_user.0.id
@@ -260,12 +292,24 @@ pub async fn revoke_user_refresh_token(
         .await
     {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
-        Ok(false) => Err(StatusCode::NOT_FOUND),
-        Err(UserServiceError::SessionNotFound) => Err(StatusCode::NOT_FOUND),
-        Err(UserServiceError::Unauthorized(_)) => Err(StatusCode::NOT_FOUND), // Don't leak that the refresh token exists
+        Ok(false)
+        | Err(UserServiceError::SessionNotFound)
+        | Err(UserServiceError::Unauthorized(_)) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "User refresh token not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
         Err(e) => {
             error!("Failed to revoke refresh token: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to revoke refresh tokens".to_string(),
+                    "server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -291,7 +335,7 @@ pub async fn revoke_user_refresh_token(
 pub async fn revoke_all_user_tokens(
     State(app_state): State<AppState>,
     Extension(current_user): Extension<AuthenticatedUser>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Revoking all tokens for user: {}", current_user.0.id);
 
     let user_id = services::auth::UserId(current_user.0.id);
@@ -303,7 +347,13 @@ pub async fn revoke_all_user_tokens(
         }))),
         Err(e) => {
             error!("Failed to revoke all user tokens: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to revoke all user tokens".to_string(),
+                    "server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -327,7 +377,7 @@ pub async fn revoke_all_user_tokens(
 pub async fn create_access_token(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
-) -> Result<Json<crate::models::AccessTokenResponse>, StatusCode> {
+) -> Result<Json<crate::models::AccessTokenResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Creating access token for user: {}", user.0.id);
 
     match app_state.auth_service.create_session_access_token(
@@ -338,7 +388,13 @@ pub async fn create_access_token(
         Ok(access_token) => Ok(Json(crate::models::AccessTokenResponse { access_token })),
         Err(e) => {
             error!("Failed to create access token: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to create access token".to_string(),
+                    "server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -362,7 +418,10 @@ pub async fn create_access_token(
 pub async fn list_user_invitations(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
-) -> Result<Json<Vec<crate::models::OrganizationInvitationResponse>>, StatusCode> {
+) -> Result<
+    Json<Vec<crate::models::OrganizationInvitationResponse>>,
+    (StatusCode, Json<ErrorResponse>),
+> {
     debug!("Listing invitations for user: {}", user.0.email);
 
     match app_state
@@ -379,7 +438,13 @@ pub async fn list_user_invitations(
         }
         Err(e) => {
             error!("Failed to list user invitations: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to list user invitations".to_string(),
+                    "server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -411,7 +476,7 @@ pub async fn accept_invitation(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(invitation_id): Path<Uuid>,
-) -> Result<Json<crate::models::AcceptInvitationResponse>, StatusCode> {
+) -> Result<Json<crate::models::AcceptInvitationResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "User {} accepting invitation {}",
         user.0.email, invitation_id
@@ -431,13 +496,43 @@ pub async fn accept_invitation(
             };
             Ok(Json(response))
         }
-        Err(OrganizationError::NotFound) => Err(StatusCode::NOT_FOUND),
-        Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
-        Err(OrganizationError::InvalidParams(_)) => Err(StatusCode::BAD_REQUEST),
-        Err(OrganizationError::AlreadyMember) => Err(StatusCode::CONFLICT),
+        Err(OrganizationError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Organization not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
+        Err(OrganizationError::Unauthorized(_)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "Organization forbidden".to_string(),
+                "forbidden".to_string(),
+            )),
+        )),
+        Err(OrganizationError::InvalidParams(_)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "Invalid params".to_string(),
+                "bad_request".to_string(),
+            )),
+        )),
+        Err(OrganizationError::AlreadyMember) => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse::new(
+                "Already a member".to_string(),
+                "conflict".to_string(),
+            )),
+        )),
         Err(e) => {
             error!("Failed to accept invitation: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to accept invitation".to_string(),
+                    "server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -468,7 +563,7 @@ pub async fn decline_invitation(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(invitation_id): Path<Uuid>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "User {} declining invitation {}",
         user.0.email, invitation_id
@@ -480,12 +575,36 @@ pub async fn decline_invitation(
         .await
     {
         Ok(()) => Ok(StatusCode::OK),
-        Err(OrganizationError::NotFound) => Err(StatusCode::NOT_FOUND),
-        Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
-        Err(OrganizationError::InvalidParams(_)) => Err(StatusCode::BAD_REQUEST),
+        Err(OrganizationError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Organization not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
+        Err(OrganizationError::Unauthorized(_)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "Organization forbidden".to_string(),
+                "forbidden".to_string(),
+            )),
+        )),
+        Err(OrganizationError::InvalidParams(_)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "Invalid params".to_string(),
+                "bad_request".to_string(),
+            )),
+        )),
         Err(e) => {
             error!("Failed to decline invitation: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to decline invitation".to_string(),
+                    "server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -511,7 +630,8 @@ pub async fn decline_invitation(
 pub async fn get_invitation_by_token(
     State(app_state): State<AppState>,
     Path(token): Path<String>,
-) -> Result<Json<crate::models::OrganizationInvitationResponse>, StatusCode> {
+) -> Result<Json<crate::models::OrganizationInvitationResponse>, (StatusCode, Json<ErrorResponse>)>
+{
     debug!("Getting invitation by token");
 
     match app_state
@@ -523,14 +643,32 @@ pub async fn get_invitation_by_token(
             let response = services_invitation_to_api(invitation);
             Ok(Json(response))
         }
-        Err(OrganizationError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(OrganizationError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Organization not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
         Err(OrganizationError::InvalidParams(_)) => {
             // Invitation expired or not pending
-            Err(StatusCode::GONE) // 410 Gone
+            Err((
+                StatusCode::GONE,
+                Json(ErrorResponse::new(
+                    "Invitation expired or not pending".to_string(),
+                    "gone".to_string(),
+                )),
+            ))
         }
         Err(e) => {
             error!("Failed to get invitation by token: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to get invitation".to_string(),
+                    "server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -563,7 +701,7 @@ pub async fn accept_invitation_by_token(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(token): Path<String>,
-) -> Result<Json<crate::models::AcceptInvitationResponse>, StatusCode> {
+) -> Result<Json<crate::models::AcceptInvitationResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!("User {} accepting invitation by token", user.0.email);
 
     let user_id = authenticated_user_to_user_id(user.clone());
@@ -580,13 +718,43 @@ pub async fn accept_invitation_by_token(
             };
             Ok(Json(response))
         }
-        Err(OrganizationError::NotFound) => Err(StatusCode::NOT_FOUND),
-        Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
-        Err(OrganizationError::InvalidParams(_)) => Err(StatusCode::BAD_REQUEST),
-        Err(OrganizationError::AlreadyMember) => Err(StatusCode::CONFLICT),
+        Err(OrganizationError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Organization not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
+        Err(OrganizationError::Unauthorized(_)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "Organization forbidden".to_string(),
+                "forbidden".to_string(),
+            )),
+        )),
+        Err(OrganizationError::InvalidParams(_)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "Invalid params".to_string(),
+                "bad_request".to_string(),
+            )),
+        )),
+        Err(OrganizationError::AlreadyMember) => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse::new(
+                "Already a member".to_string(),
+                "conflict".to_string(),
+            )),
+        )),
         Err(e) => {
             error!("Failed to accept invitation by token: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to accept invitation".to_string(),
+                    "server_error".to_string(),
+                )),
+            ))
         }
     }
 }

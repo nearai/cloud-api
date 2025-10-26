@@ -178,7 +178,7 @@ pub async fn create_workspace(
         Err(e) => {
             error!("Failed to create workspace: {}", e);
             Err((
-                StatusCode::BAD_REQUEST,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "Failed to create workspace".to_string(),
                     "internal_server_error".to_string(),

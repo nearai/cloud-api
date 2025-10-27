@@ -70,11 +70,12 @@ impl OrganizationLimitsRepository {
                     effective_from,
                     changed_by,
                     change_reason,
-                    changed_by_user_id
-                ) VALUES ($1, $2, $3, $4, $5, $6)
+                    changed_by_user_id,
+                    changed_by_user_email
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING id, organization_id, spend_limit,
                           effective_from, effective_until,
-                          changed_by, change_reason, changed_by_user_id, created_at
+                          changed_by, change_reason, changed_by_user_id, changed_by_user_email, created_at
                 "#,
                 &[
                     &organization_id,
@@ -83,6 +84,7 @@ impl OrganizationLimitsRepository {
                     &request.changed_by,
                     &request.change_reason,
                     &request.changed_by_user_id,
+                    &request.changed_by_user_email,
                 ],
             )
             .await
@@ -112,7 +114,7 @@ impl OrganizationLimitsRepository {
                 r#"
                 SELECT id, organization_id, spend_limit,
                        effective_from, effective_until,
-                       changed_by, change_reason, changed_by_user_id, created_at
+                       changed_by, change_reason, changed_by_user_id, changed_by_user_email, created_at
                 FROM organization_limits_history
                 WHERE organization_id = $1 AND effective_until IS NULL
                 ORDER BY effective_from DESC
@@ -167,7 +169,7 @@ impl OrganizationLimitsRepository {
                 r#"
                 SELECT id, organization_id, spend_limit,
                        effective_from, effective_until,
-                       changed_by, change_reason, changed_by_user_id, created_at
+                       changed_by, change_reason, changed_by_user_id, changed_by_user_email, created_at
                 FROM organization_limits_history
                 WHERE organization_id = $1
                 ORDER BY effective_from DESC
@@ -196,6 +198,7 @@ impl OrganizationLimitsRepository {
             changed_by: row.get("changed_by"),
             change_reason: row.get("change_reason"),
             changed_by_user_id: row.get("changed_by_user_id"),
+            changed_by_user_email: row.get("changed_by_user_email"),
             created_at: row.get("created_at"),
         }
     }

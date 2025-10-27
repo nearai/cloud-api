@@ -300,8 +300,9 @@ pub async fn update_organization_limits(
         )
     })?;
 
-    // Extract admin user ID from authenticated user
+    // Extract admin user ID and email from authenticated user
     let admin_user_id = admin_user.0.id;
+    let admin_user_email = admin_user.0.email.clone();
 
     // Convert API request to service request
     let service_request = services::admin::OrganizationLimitsUpdate {
@@ -309,6 +310,7 @@ pub async fn update_organization_limits(
         changed_by: request.changed_by,
         change_reason: request.change_reason,
         changed_by_user_id: Some(admin_user_id),
+        changed_by_user_email: Some(admin_user_email),
     };
 
     // Update organization limits via admin service
@@ -452,6 +454,7 @@ pub async fn get_organization_limits_history(
             changed_by: h.changed_by,
             change_reason: h.change_reason,
             changed_by_user_id: h.changed_by_user_id.map(|id| id.to_string()),
+            changed_by_user_email: h.changed_by_user_email,
             created_at: h.created_at.to_rfc3339(),
         })
         .collect();

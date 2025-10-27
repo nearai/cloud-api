@@ -61,6 +61,7 @@ pub struct OrganizationLimitsUpdate {
     pub changed_by: Option<String>,
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<uuid::Uuid>, // The authenticated user ID who made the change
+    pub changed_by_user_email: Option<String>, // The email of the authenticated user who made the change
 }
 
 /// Organization limits (current active limits)
@@ -84,6 +85,7 @@ pub struct OrganizationLimitsHistoryEntry {
     pub changed_by: Option<String>,
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<uuid::Uuid>, // The authenticated user ID who made the change
+    pub changed_by_user_email: Option<String>, // The email of the authenticated user who made the change
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 

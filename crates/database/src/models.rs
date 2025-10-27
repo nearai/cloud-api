@@ -489,6 +489,7 @@ pub struct OrganizationLimitsHistory {
     pub changed_by: Option<String>,
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<Uuid>, // The authenticated user ID who made the change
+    pub changed_by_user_email: Option<String>, // The email of the authenticated user who made the change
     pub created_at: DateTime<Utc>,
 }
 
@@ -500,6 +501,7 @@ pub struct UpdateOrganizationLimitsDbRequest {
     pub changed_by: Option<String>,
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<Uuid>, // The authenticated user ID who made the change
+    pub changed_by_user_email: Option<String>, // The email of the authenticated user who made the change
 }
 
 // ============================================

@@ -178,10 +178,7 @@ pub async fn create_workspace(
             debug!("User is not authorized to create workspace: {}", msg);
             Err((
                 StatusCode::FORBIDDEN,
-                Json(ErrorResponse::new(
-                    "Workspace forbidden".to_string(),
-                    "forbidden".to_string(),
-                )),
+                Json(ErrorResponse::new(msg, "forbidden".to_string())),
             ))
         }
         Err(services::workspace::WorkspaceError::AlreadyExists) => {
@@ -198,10 +195,7 @@ pub async fn create_workspace(
             debug!("Invalid workspace parameters: {}", msg);
             Err((
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(
-                    format!("Invalid workspace parameters: {}", msg),
-                    "bad_request".to_string(),
-                )),
+                Json(ErrorResponse::new(msg, "bad_request".to_string())),
             ))
         }
         Err(e) => {
@@ -266,13 +260,10 @@ pub async fn list_organization_workspaces(
         .await
     {
         Ok(count) => count,
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => {
+        Err(services::workspace::WorkspaceError::Unauthorized(msg)) => {
             return Err((
                 StatusCode::FORBIDDEN,
-                Json(ErrorResponse::new(
-                    "Workspace forbidden".to_string(),
-                    "forbidden".to_string(),
-                )),
+                Json(ErrorResponse::new(msg, "forbidden".to_string())),
             ));
         }
         Err(e) => {
@@ -324,12 +315,9 @@ pub async fn list_organization_workspaces(
                 offset: params.offset,
             }))
         }
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
+        Err(services::workspace::WorkspaceError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(
-                "Workspace forbidden".to_string(),
-                "forbidden".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
         Err(e) => {
             error!("Failed to list workspaces: {}", e);
@@ -403,12 +391,9 @@ pub async fn get_workspace(
                 "not_found".to_string(),
             )),
         )),
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
+        Err(services::workspace::WorkspaceError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(
-                "Workspace forbidden".to_string(),
-                "forbidden".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
         Err(e) => {
             error!("Failed to get workspace: {}", e);
@@ -494,12 +479,9 @@ pub async fn update_workspace(
                 "not_found".to_string(),
             )),
         )),
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
+        Err(services::workspace::WorkspaceError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(
-                "Workspace forbidden".to_string(),
-                "forbidden".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
         Err(e) => {
             error!("Failed to update workspace: {}", e);
@@ -568,12 +550,9 @@ pub async fn delete_workspace(
                 "not_found".to_string(),
             )),
         )),
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
+        Err(services::workspace::WorkspaceError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(
-                "Workspace forbidden".to_string(),
-                "forbidden".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
         Err(e) => {
             error!("Failed to delete workspace: {}", e);
@@ -648,13 +627,10 @@ pub async fn create_workspace_api_key(
         Ok(false) => {
             // No duplicate, continue
         }
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => {
+        Err(services::workspace::WorkspaceError::Unauthorized(msg)) => {
             return Err((
                 StatusCode::FORBIDDEN,
-                Json(ErrorResponse::new(
-                    "Not authorized to create API key in this workspace".to_string(),
-                    "forbidden".to_string(),
-                )),
+                Json(ErrorResponse::new(msg, "forbidden".to_string())),
             ));
         }
         Err(e) => {
@@ -690,12 +666,9 @@ pub async fn create_workspace_api_key(
             let response = crate::conversions::workspace_api_key_to_api_response(api_key);
             Ok((StatusCode::CREATED, Json(response)))
         }
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
+        Err(services::workspace::WorkspaceError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(
-                "Not authorized to create API key in this workspace".to_string(),
-                "forbidden".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
         Err(services::workspace::WorkspaceError::NotFound) => Err((
             StatusCode::NOT_FOUND,
@@ -773,13 +746,10 @@ pub async fn list_workspace_api_keys(
                 )),
             ));
         }
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => {
+        Err(services::workspace::WorkspaceError::Unauthorized(msg)) => {
             return Err((
                 StatusCode::FORBIDDEN,
-                Json(ErrorResponse::new(
-                    "Workspace forbidden".to_string(),
-                    "forbidden".to_string(),
-                )),
+                Json(ErrorResponse::new(msg, "forbidden".to_string())),
             ));
         }
         Err(e) => {
@@ -818,12 +788,9 @@ pub async fn list_workspace_api_keys(
                 offset: params.offset,
             }))
         }
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
+        Err(services::workspace::WorkspaceError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(
-                "Not authorized to list API keys in this workspace".to_string(),
-                "forbidden".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
         Err(services::workspace::WorkspaceError::NotFound) => Err((
             StatusCode::NOT_FOUND,
@@ -902,12 +869,9 @@ pub async fn revoke_workspace_api_key(
                 "not_found".to_string(),
             )),
         )),
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
+        Err(services::workspace::WorkspaceError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(
-                "Not authorized to revoke API key in this workspace".to_string(),
-                "forbidden".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
         Err(e) => {
             error!("Failed to revoke API key: {}", e);
@@ -961,12 +925,9 @@ pub async fn revoke_api_key_with_context(
                 "not_found".to_string(),
             )),
         )),
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
+        Err(services::workspace::WorkspaceError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(
-                "Not authorized to revoke API key in this workspace".to_string(),
-                "forbidden".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
         Err(e) => {
             error!("Failed to revoke API key: {}", e);
@@ -1053,12 +1014,9 @@ pub async fn update_api_key_spend_limit(
                 "not_found".to_string(),
             )),
         )),
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
+        Err(services::workspace::WorkspaceError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(
-                "Not authorized to update API key spend limit".to_string(),
-                "forbidden".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
         Err(e) => {
             error!("Failed to update API key spend limit: {}", e);
@@ -1148,12 +1106,9 @@ pub async fn update_workspace_api_key(
                 "duplicate_api_key_name".to_string(),
             )),
         )),
-        Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err((
+        Err(services::workspace::WorkspaceError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(
-                "Not authorized to update this API key".to_string(),
-                "forbidden".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
         Err(services::workspace::WorkspaceError::NotFound) => Err((
             StatusCode::NOT_FOUND,

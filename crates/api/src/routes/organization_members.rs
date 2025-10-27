@@ -84,19 +84,13 @@ pub async fn add_organization_member(
                 "not_found".to_string(),
             )),
         )),
-        Err(OrganizationError::Unauthorized(_)) => Err((
+        Err(OrganizationError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(
-                "Organization forbidden".to_string(),
-                "forbidden".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
-        Err(OrganizationError::InvalidParams(_)) => Err((
+        Err(OrganizationError::InvalidParams(msg)) => Err((
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "Invalid params".to_string(),
-                "bad_request".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
         )),
         Err(OrganizationError::AlreadyMember) => Err((
             StatusCode::CONFLICT,
@@ -211,12 +205,9 @@ pub async fn invite_organization_member_by_email(
                 },
             ))
         }
-        Err(OrganizationError::Unauthorized(_)) => Err((
+        Err(OrganizationError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(
-                "Organization forbidden".to_string(),
-                "forbidden".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
         Err(e) => {
             error!("Failed to invite organization members: {}", e);
@@ -279,19 +270,13 @@ pub async fn update_organization_member(
             let response = services_member_to_api_member(member);
             Ok(Json(response))
         }
-        Err(OrganizationError::Unauthorized(_)) => Err((
+        Err(OrganizationError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(
-                "Organization forbidden".to_string(),
-                "forbidden".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
-        Err(OrganizationError::InvalidParams(_)) => Err((
+        Err(OrganizationError::InvalidParams(msg)) => Err((
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "Invalid params".to_string(),
-                "bad_request".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
         )),
         Err(e) => {
             error!("Failed to update organization member: {}", e);
@@ -357,21 +342,15 @@ pub async fn remove_organization_member(
                 "not_found".to_string(),
             )),
         )),
-        Err(OrganizationError::Unauthorized(_)) => Err((
+        Err(OrganizationError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(
-                "Organization forbidden".to_string(),
-                "forbidden".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
         Err(OrganizationError::InvalidParams(msg)) => {
             error!("Cannot remove member: {}", msg);
             Err((
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(
-                    "Invalid params".to_string(),
-                    "bad_request".to_string(),
-                )),
+                Json(ErrorResponse::new(msg, "bad_request".to_string())),
             ))
         }
         Err(e) => {
@@ -444,13 +423,10 @@ pub async fn list_organization_members(
         .await
     {
         Ok(count) => count,
-        Err(services::organization::OrganizationError::Unauthorized(_)) => {
+        Err(services::organization::OrganizationError::Unauthorized(msg)) => {
             return Err((
                 StatusCode::FORBIDDEN,
-                ResponseJson(ErrorResponse::new(
-                    "Not authorized to view organization members".to_string(),
-                    "forbidden".to_string(),
-                )),
+                ResponseJson(ErrorResponse::new(msg, "forbidden".to_string())),
             ));
         }
         Err(services::organization::OrganizationError::NotFound) => {
@@ -504,23 +480,20 @@ pub async fn list_organization_members(
                 offset: params.offset,
             }))
         }
-        Err(OrganizationError::Unauthorized(_)) => {
+        Err(OrganizationError::Unauthorized(msg)) => {
             warn!(
                 "User {} attempted to access organization {} members without membership",
                 user_id, org_id
             );
             Err((
                 StatusCode::FORBIDDEN,
-                ResponseJson(ErrorResponse::new(
-                    "Forbidden".to_string(),
-                    "forbidden".to_string(),
-                )),
+                ResponseJson(ErrorResponse::new(msg, "forbidden".to_string())),
             ))
         }
         Err(OrganizationError::NotFound) => Err((
             StatusCode::NOT_FOUND,
             ResponseJson(ErrorResponse::new(
-                "Not found".to_string(),
+                "Organization not found".to_string(),
                 "not_found".to_string(),
             )),
         )),

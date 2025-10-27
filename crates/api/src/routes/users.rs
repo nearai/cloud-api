@@ -292,14 +292,16 @@ pub async fn revoke_user_refresh_token(
         .await
     {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
-        Ok(false)
-        | Err(UserServiceError::SessionNotFound)
-        | Err(UserServiceError::Unauthorized(_)) => Err((
+        Ok(false) | Err(UserServiceError::SessionNotFound) => Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse::new(
-                "User refresh token not found".to_string(),
+                "Refresh token not found".to_string(),
                 "not_found".to_string(),
             )),
+        )),
+        Err(UserServiceError::Unauthorized(msg)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
         Err(e) => {
             error!("Failed to revoke refresh token: {}", e);
@@ -503,19 +505,13 @@ pub async fn accept_invitation(
                 "not_found".to_string(),
             )),
         )),
-        Err(OrganizationError::Unauthorized(_)) => Err((
+        Err(OrganizationError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(
-                "Organization forbidden".to_string(),
-                "forbidden".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
-        Err(OrganizationError::InvalidParams(_)) => Err((
+        Err(OrganizationError::InvalidParams(msg)) => Err((
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "Invalid params".to_string(),
-                "bad_request".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
         )),
         Err(OrganizationError::AlreadyMember) => Err((
             StatusCode::CONFLICT,
@@ -582,19 +578,13 @@ pub async fn decline_invitation(
                 "not_found".to_string(),
             )),
         )),
-        Err(OrganizationError::Unauthorized(_)) => Err((
+        Err(OrganizationError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(
-                "Organization forbidden".to_string(),
-                "forbidden".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
-        Err(OrganizationError::InvalidParams(_)) => Err((
+        Err(OrganizationError::InvalidParams(msg)) => Err((
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "Invalid params".to_string(),
-                "bad_request".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
         )),
         Err(e) => {
             error!("Failed to decline invitation: {}", e);
@@ -650,16 +640,10 @@ pub async fn get_invitation_by_token(
                 "not_found".to_string(),
             )),
         )),
-        Err(OrganizationError::InvalidParams(_)) => {
-            // Invitation expired or not pending
-            Err((
-                StatusCode::GONE,
-                Json(ErrorResponse::new(
-                    "Invitation expired or not pending".to_string(),
-                    "gone".to_string(),
-                )),
-            ))
-        }
+        Err(OrganizationError::InvalidParams(msg)) => Err((
+            StatusCode::GONE,
+            Json(ErrorResponse::new(msg, "gone".to_string())),
+        )),
         Err(e) => {
             error!("Failed to get invitation by token: {}", e);
             Err((
@@ -725,19 +709,13 @@ pub async fn accept_invitation_by_token(
                 "not_found".to_string(),
             )),
         )),
-        Err(OrganizationError::Unauthorized(_)) => Err((
+        Err(OrganizationError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(
-                "Organization forbidden".to_string(),
-                "forbidden".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
-        Err(OrganizationError::InvalidParams(_)) => Err((
+        Err(OrganizationError::InvalidParams(msg)) => Err((
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "Invalid params".to_string(),
-                "bad_request".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
         )),
         Err(OrganizationError::AlreadyMember) => Err((
             StatusCode::CONFLICT,

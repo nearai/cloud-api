@@ -126,6 +126,7 @@ impl AdminRepository for AdminCompositeRepository {
             spend_limit: limits.spend_limit,
             changed_by: limits.changed_by,
             change_reason: limits.change_reason,
+            changed_by_user_id: limits.changed_by_user_id,
         };
 
         let history = self
@@ -178,6 +179,7 @@ impl AdminRepository for AdminCompositeRepository {
                 effective_until: h.effective_until,
                 changed_by: h.changed_by,
                 change_reason: h.change_reason,
+                changed_by_user_id: h.changed_by_user_id,
                 created_at: h.created_at,
             })
             .collect())

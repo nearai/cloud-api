@@ -98,7 +98,7 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
             get(crate::routes::usage::get_organization_usage_history),
         );
 
-    // User routes
+    // User routes (require access token authentication)
     let user_routes = Router::new()
         .route("/me", get(get_current_user))
         .route("/me/profile", put(update_current_user_profile))
@@ -116,19 +116,25 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
             "/me/refresh_tokens/{refresh_token_id}",
             delete(revoke_user_refresh_token),
         )
-        .route(
-            "/me/access_tokens",
-            axum::routing::post(create_access_token).layer(from_fn_with_state(
-                auth_state.clone(),
-                crate::middleware::auth::refresh_middleware,
-            )),
-        )
         .route("/me/tokens", delete(revoke_all_user_tokens));
 
-    // Combine all routes with auth middleware
+    // Refresh token routes (require refresh token authentication)
+    let refresh_token_routes = Router::new()
+        .route(
+            "/users/me/access_tokens",
+            axum::routing::post(create_access_token),
+        )
+        .with_state(app_state.clone())
+        .layer(from_fn_with_state(
+            auth_state.clone(),
+            crate::middleware::auth::refresh_middleware,
+        ));
+
+    // Combine all routes with appropriate auth middleware
     Router::new()
         .nest("/organizations", org_routes)
         .nest("/users", user_routes)
         .with_state(app_state)
         .layer(from_fn_with_state(auth_state, auth_middleware))
+        .merge(refresh_token_routes)
 }

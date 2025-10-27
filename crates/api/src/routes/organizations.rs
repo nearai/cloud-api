@@ -168,7 +168,7 @@ pub async fn create_organization(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Json(request): Json<CreateOrganizationRequest>,
-) -> Result<Json<OrganizationResponse>, StatusCode> {
+) -> Result<Json<OrganizationResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Creating organization: {} by user: {}",
         request.name, user.0.id
@@ -216,15 +216,30 @@ pub async fn create_organization(
         }
         Err(OrganizationError::InvalidParams(msg)) => {
             debug!("Invalid organization creation params: {}", msg);
-            Err(StatusCode::BAD_REQUEST)
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(msg, "bad_request".to_string())),
+            ))
         }
         Err(OrganizationError::AlreadyExists) => {
             debug!("Organization already exists");
-            Err(StatusCode::CONFLICT)
+            Err((
+                StatusCode::CONFLICT,
+                Json(ErrorResponse::new(
+                    "Organization already exists".to_string(),
+                    "conflict".to_string(),
+                )),
+            ))
         }
         Err(e) => {
             error!("Failed to create organization: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to create organization".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -254,7 +269,7 @@ pub async fn get_organization(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
-) -> Result<Json<OrganizationResponse>, StatusCode> {
+) -> Result<Json<OrganizationResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Getting organization: {} by user: {}", org_id, user.0.id);
 
     let organization_id = OrganizationId(org_id);
@@ -274,17 +289,41 @@ pub async fn get_organization(
                 .await
             {
                 Ok(org) => Ok(Json(crate::conversions::services_org_to_api_org(org))),
-                Err(OrganizationError::NotFound) => Err(StatusCode::NOT_FOUND),
+                Err(OrganizationError::NotFound) => Err((
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse::new(
+                        "Organization not found".to_string(),
+                        "not_found".to_string(),
+                    )),
+                )),
                 Err(e) => {
                     error!("Failed to get organization: {}", e);
-                    Err(StatusCode::INTERNAL_SERVER_ERROR)
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse::new(
+                            "Failed to get organization".to_string(),
+                            "internal_server_error".to_string(),
+                        )),
+                    ))
                 }
             }
         }
-        Ok(false) => Err(StatusCode::FORBIDDEN),
+        Ok(false) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "Not the organization member".to_string(),
+                "forbidden".to_string(),
+            )),
+        )),
         Err(e) => {
             error!("Failed to check organization membership: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to check organization membership".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -317,7 +356,7 @@ pub async fn update_organization(
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
     Json(request): Json<UpdateOrganizationRequest>,
-) -> Result<Json<OrganizationResponse>, StatusCode> {
+) -> Result<Json<OrganizationResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Updating organization: {} by user: {}", org_id, user.0.id);
 
     let organization_id = OrganizationId(org_id);
@@ -338,12 +377,30 @@ pub async fn update_organization(
         Ok(updated_org) => Ok(Json(crate::conversions::services_org_to_api_org(
             updated_org,
         ))),
-        Err(OrganizationError::NotFound) => Err(StatusCode::NOT_FOUND),
-        Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
-        Err(OrganizationError::InvalidParams(_)) => Err(StatusCode::BAD_REQUEST),
+        Err(OrganizationError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Organization not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
+        Err(OrganizationError::Unauthorized(msg)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
+        )),
+        Err(OrganizationError::InvalidParams(msg)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
+        )),
         Err(e) => {
             error!("Failed to update organization: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to update organization".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -373,7 +430,7 @@ pub async fn delete_organization(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Deleting organization: {} by user: {}", org_id, user.0.id);
 
     let organization_id = OrganizationId(org_id);
@@ -391,15 +448,29 @@ pub async fn delete_organization(
                 "deleted": true
             })))
         }
-        Ok(false) => {
-            error!("Failed to delete organization {}", org_id);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        Ok(false) | Err(OrganizationError::NotFound) => {
+            error!("Organization not found {}", org_id);
+            Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse::new(
+                    "Organization not found".to_string(),
+                    "not_found".to_string(),
+                )),
+            ))
         }
-        Err(OrganizationError::NotFound) => Err(StatusCode::NOT_FOUND),
-        Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
+        Err(OrganizationError::Unauthorized(msg)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
+        )),
         Err(e) => {
             error!("Failed to delete organization: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to delete organization".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
         }
     }
 }

@@ -783,6 +783,275 @@ async fn test_admin_update_organization_limits_usd_only() {
     assert_eq!(response_data.spend_limit.amount, 85000000000i64);
 }
 
+#[tokio::test]
+async fn test_admin_get_organization_limits_history() {
+    let server = setup_test_server().await;
+
+    // Create an organization
+    let org = create_org(&server).await;
+    println!("Created organization: {}", org.id);
+
+    // Update limits multiple times to create history
+    let updates = vec![
+        (50000000000i64, "Initial allocation"),
+        (100000000000i64, "Customer purchased credits"),
+        (150000000000i64, "Additional credits added"),
+    ];
+
+    for (amount, reason) in updates {
+        let update_request = serde_json::json!({
+            "spendLimit": {
+                "amount": amount,
+                "currency": "USD"
+            },
+            "changedBy": "admin@test.com",
+            "changeReason": reason
+        });
+
+        let response = server
+            .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .json(&update_request)
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            200,
+            "Failed to update limits to {}",
+            amount
+        );
+
+        // Small delay to ensure different timestamps
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+
+    // Fetch the limits history
+    let history_response = server
+        .get(format!("/v1/admin/organizations/{}/limits/history", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    println!(
+        "History response status: {}",
+        history_response.status_code()
+    );
+    println!("History response body: {}", history_response.text());
+
+    assert_eq!(
+        history_response.status_code(),
+        200,
+        "Should successfully fetch limits history"
+    );
+
+    let history_data =
+        serde_json::from_str::<api::models::OrgLimitsHistoryResponse>(&history_response.text())
+            .expect("Failed to parse history response");
+
+    println!("History data: {:#?}", history_data);
+
+    // Verify we have 3 history entries
+    assert_eq!(
+        history_data.history.len(),
+        3,
+        "Should have 3 history entries"
+    );
+    assert_eq!(history_data.total, 3, "Total should be 3");
+
+    // Verify the entries are in descending order by effectiveFrom (newest first)
+    assert_eq!(
+        history_data.history[0].spend_limit.amount, 150000000000i64,
+        "First entry should be the most recent update"
+    );
+    assert_eq!(
+        history_data.history[1].spend_limit.amount, 100000000000i64,
+        "Second entry should be the middle update"
+    );
+    assert_eq!(
+        history_data.history[2].spend_limit.amount, 50000000000i64,
+        "Third entry should be the first update"
+    );
+
+    // Verify all entries have the changed_by_user_id and changed_by_user_email populated
+    for (idx, entry) in history_data.history.iter().enumerate() {
+        assert!(
+            entry.changed_by_user_id.is_some(),
+            "Entry {} should have changed_by_user_id populated",
+            idx
+        );
+
+        assert_eq!(
+            entry.changed_by_user_id.as_ref().unwrap(),
+            common::MOCK_USER_ID,
+            "Entry {} changed_by_user_id should match the authenticated admin user",
+            idx
+        );
+
+        assert!(
+            entry.changed_by_user_email.is_some(),
+            "Entry {} should have changed_by_user_email populated",
+            idx
+        );
+
+        assert_eq!(
+            entry.changed_by_user_email.as_ref().unwrap(),
+            "admin@test.com",
+            "Entry {} changed_by_user_email should be admin@test.com",
+            idx
+        );
+
+        // Verify other tracking fields
+        assert!(
+            entry.changed_by.is_some(),
+            "Entry {} should have changed_by populated",
+            idx
+        );
+        assert_eq!(
+            entry.changed_by.as_ref().unwrap(),
+            "admin@test.com",
+            "Entry {} changed_by should be admin@test.com",
+            idx
+        );
+
+        assert!(
+            entry.change_reason.is_some(),
+            "Entry {} should have change_reason populated",
+            idx
+        );
+
+        println!(
+            "Entry {}: amount={}, changedBy={:?}, changedByUserId={:?}, changedByUserEmail={:?}, reason={:?}",
+            idx,
+            entry.spend_limit.amount,
+            entry.changed_by,
+            entry.changed_by_user_id,
+            entry.changed_by_user_email,
+            entry.change_reason
+        );
+    }
+
+    // Verify the specific change reasons match what we sent
+    assert_eq!(
+        history_data.history[0].change_reason.as_ref().unwrap(),
+        "Additional credits added"
+    );
+    assert_eq!(
+        history_data.history[1].change_reason.as_ref().unwrap(),
+        "Customer purchased credits"
+    );
+    assert_eq!(
+        history_data.history[2].change_reason.as_ref().unwrap(),
+        "Initial allocation"
+    );
+}
+
+#[tokio::test]
+async fn test_admin_get_organization_limits_history_with_pagination() {
+    let server = setup_test_server().await;
+
+    // Create an organization
+    let org = create_org(&server).await;
+
+    // Create 5 history entries
+    for i in 1..=5 {
+        let amount = i * 10000000000i64; // $10, $20, $30, $40, $50
+        let update_request = serde_json::json!({
+            "spendLimit": {
+                "amount": amount,
+                "currency": "USD"
+            },
+            "changedBy": "admin@test.com",
+            "changeReason": format!("Update {}", i)
+        });
+
+        let response = server
+            .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .json(&update_request)
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+
+    // Fetch first page (limit=2)
+    let page1_response = server
+        .get(
+            format!(
+                "/v1/admin/organizations/{}/limits/history?limit=2&offset=0",
+                org.id
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(page1_response.status_code(), 200);
+    let page1_data =
+        serde_json::from_str::<api::models::OrgLimitsHistoryResponse>(&page1_response.text())
+            .unwrap();
+
+    assert_eq!(
+        page1_data.history.len(),
+        2,
+        "First page should have 2 entries"
+    );
+    assert_eq!(page1_data.total, 5, "Total should be 5");
+    assert_eq!(page1_data.limit, 2);
+    assert_eq!(page1_data.offset, 0);
+
+    // Verify all entries have changed_by_user_id and changed_by_user_email
+    for entry in &page1_data.history {
+        assert_eq!(
+            entry.changed_by_user_id.as_ref().unwrap(),
+            common::MOCK_USER_ID,
+            "All entries should have the admin user ID"
+        );
+        assert_eq!(
+            entry.changed_by_user_email.as_ref().unwrap(),
+            "admin@test.com",
+            "All entries should have the admin user email"
+        );
+    }
+
+    // Fetch second page (limit=2, offset=2)
+    let page2_response = server
+        .get(
+            format!(
+                "/v1/admin/organizations/{}/limits/history?limit=2&offset=2",
+                org.id
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(page2_response.status_code(), 200);
+    let page2_data =
+        serde_json::from_str::<api::models::OrgLimitsHistoryResponse>(&page2_response.text())
+            .unwrap();
+
+    assert_eq!(
+        page2_data.history.len(),
+        2,
+        "Second page should have 2 entries"
+    );
+    assert_eq!(page2_data.total, 5);
+
+    // Verify all entries on page 2 also have changed_by_user_id and changed_by_user_email
+    for entry in &page2_data.history {
+        assert_eq!(
+            entry.changed_by_user_id.as_ref().unwrap(),
+            common::MOCK_USER_ID,
+            "All entries should have the admin user ID"
+        );
+        assert_eq!(
+            entry.changed_by_user_email.as_ref().unwrap(),
+            "admin@test.com",
+            "All entries should have the admin user email"
+        );
+    }
+}
+
 // ============================================
 // Usage Tracking E2E Tests
 // ============================================

@@ -455,7 +455,7 @@ impl ModelRepository {
                 r#"
                 UPDATE models 
                 SET is_active = false, updated_at = NOW()
-                WHERE model_name = $1
+                WHERE model_name = $1 AND is_active = true
                 "#,
                 &[&model_name],
             )

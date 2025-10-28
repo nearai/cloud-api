@@ -1007,15 +1007,21 @@ pub struct UserWorkspaceResponse {
     pub created_at: DateTime<Utc>,
 }
 
-/// Session response model
+/// Refresh token response model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct SessionResponse {
+pub struct RefreshTokenResponse {
     pub id: String,
     pub user_id: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub ip_address: Option<String>,
     pub user_agent: Option<String>,
+}
+
+/// Access token response model
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AccessTokenResponse {
+    pub access_token: String,
 }
 
 /// Organization member response model (non-sensitive)
@@ -1363,6 +1369,10 @@ pub struct OrgLimitsHistoryEntry {
     pub changed_by: Option<String>,
     #[serde(rename = "changeReason")]
     pub change_reason: Option<String>,
+    #[serde(rename = "changedByUserId")]
+    pub changed_by_user_id: Option<String>,
+    #[serde(rename = "changedByUserEmail")]
+    pub changed_by_user_email: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
 }

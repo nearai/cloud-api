@@ -92,7 +92,7 @@ impl UserServiceTrait for UserService {
     async fn revoke_all_sessions(&self, user_id: UserId) -> Result<usize, UserServiceError> {
         debug!("Revoking all sessions for user: {}", user_id);
 
-        // Update tokens_revoked_at timestamp to invalidate all access tokens
+        // Update tokens_revoked_at timestamp to invalidate all JWT access tokens issued before now
         self.user_repository
             .update_tokens_revoked_at(user_id.clone())
             .await
@@ -100,12 +100,14 @@ impl UserServiceTrait for UserService {
                 UserServiceError::InternalError(format!("Failed to update tokens_revoked_at: {e}"))
             })?;
 
-        // Revoke all refresh tokens (sessions)
+        // Revoke all refresh tokens by deleting them from the refresh_tokens table
         self.session_repository
             .revoke_all_for_user(user_id)
             .await
             .map_err(|e| {
-                UserServiceError::InternalError(format!("Failed to revoke all user sessions: {e}"))
+                UserServiceError::InternalError(format!(
+                    "Failed to revoke all user refresh tokens: {e}"
+                ))
             })
     }
 }

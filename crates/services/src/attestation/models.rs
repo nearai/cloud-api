@@ -34,7 +34,7 @@ pub struct ChatSignature {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DstackCpuQuote {
     /// The attestation quote in hexadecimal format
-    pub quote: String,
+    pub intel_quote: String,
     /// The event log associated with the quote
     pub event_log: String,
     /// The report data
@@ -53,7 +53,7 @@ impl DstackCpuQuote {
         nonce: String,
     ) -> Self {
         Self {
-            quote: quote.quote,
+            intel_quote: quote.quote,
             event_log: quote.event_log,
             report_data: quote.report_data,
             request_nonce: nonce,

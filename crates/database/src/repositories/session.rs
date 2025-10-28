@@ -15,19 +15,19 @@ impl SessionRepository {
         Self { pool }
     }
 
-    /// Generate a new session token
+    /// Generate a new refresh token
     fn generate_session_token() -> String {
-        format!("sess_{}", Uuid::new_v4().to_string().replace("-", ""))
+        format!("rt_{}", Uuid::new_v4().to_string().replace("-", ""))
     }
 
-    /// Hash a session token for storage
+    /// Hash a refresh token for storage
     fn hash_session_token(token: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
         format!("{:x}", hasher.finalize())
     }
 
-    /// Create a new session
+    /// Create a new refresh token session
     pub async fn create(
         &self,
         user_id: Uuid,
@@ -50,7 +50,7 @@ impl SessionRepository {
         let row = client
             .query_one(
                 r#"
-            INSERT INTO sessions (
+            INSERT INTO refresh_tokens (
                 id, user_id, token_hash, created_at, expires_at,
                 ip_address, user_agent
             )
@@ -68,15 +68,18 @@ impl SessionRepository {
                 ],
             )
             .await
-            .context("Failed to create session")?;
+            .context("Failed to create refresh token session")?;
 
-        debug!("Created session: {} for user: {}", id, user_id);
+        debug!(
+            "Created refresh token session: {} for user: {}",
+            id, user_id
+        );
 
         let session = self.row_to_session(row)?;
         Ok((session, session_token))
     }
 
-    /// Validate a session token and return the associated session
+    /// Validate a refresh token and return the associated session
     pub async fn validate(&self, session_token: &str) -> Result<Option<Session>> {
         let client = self
             .pool
@@ -84,20 +87,20 @@ impl SessionRepository {
             .await
             .context("Failed to get database connection")?;
 
-        // Hash the token directly (it already includes sess_ prefix if present)
+        // Hash the token directly (it already includes rt_ prefix if present)
         let token_hash = Self::hash_session_token(session_token);
         let now = Utc::now();
 
         let row = client
             .query_opt(
                 r#"
-            SELECT * FROM sessions 
+            SELECT * FROM refresh_tokens 
             WHERE token_hash = $1 AND expires_at > $2
             "#,
                 &[&token_hash, &now],
             )
             .await
-            .context("Failed to validate session")?;
+            .context("Failed to validate refresh token")?;
 
         match row {
             Some(row) => Ok(Some(self.row_to_session(row)?)),
@@ -114,9 +117,9 @@ impl SessionRepository {
             .context("Failed to get database connection")?;
 
         let row = client
-            .query_opt("SELECT * FROM sessions WHERE id = $1", &[&id])
+            .query_opt("SELECT * FROM refresh_tokens WHERE id = $1", &[&id])
             .await
-            .context("Failed to query session")?;
+            .context("Failed to query refresh token session")?;
 
         match row {
             Some(row) => Ok(Some(self.row_to_session(row)?)),
@@ -124,7 +127,7 @@ impl SessionRepository {
         }
     }
 
-    /// List active sessions for a specific user (by user ID)
+    /// List active refresh token sessions for a specific user (by user ID)
     pub async fn list_by_user(&self, user_id: Uuid) -> Result<Vec<Session>> {
         let client = self
             .pool
@@ -135,21 +138,21 @@ impl SessionRepository {
         let rows = client
             .query(
                 r#"
-            SELECT * FROM sessions 
+            SELECT * FROM refresh_tokens 
             WHERE user_id = $1 AND expires_at > $2
             ORDER BY created_at DESC
             "#,
                 &[&user_id, &Utc::now()],
             )
             .await
-            .context("Failed to list user sessions")?;
+            .context("Failed to list user refresh token sessions")?;
 
         rows.into_iter()
             .map(|row| self.row_to_session(row))
             .collect()
     }
 
-    /// Extend a session's expiration time
+    /// Extend a refresh token session's expiration time
     pub async fn extend(&self, session_id: Uuid, additional_hours: i64) -> Result<bool> {
         let client = self
             .pool
@@ -161,16 +164,16 @@ impl SessionRepository {
 
         let result = client
             .execute(
-                "UPDATE sessions SET expires_at = $1 WHERE id = $2",
+                "UPDATE refresh_tokens SET expires_at = $1 WHERE id = $2",
                 &[&new_expiry, &session_id],
             )
             .await
-            .context("Failed to extend session")?;
+            .context("Failed to extend refresh token session")?;
 
         Ok(result > 0)
     }
 
-    /// Revoke a session
+    /// Revoke a refresh token session
     pub async fn revoke(&self, session_id: Uuid) -> Result<bool> {
         let client = self
             .pool
@@ -179,14 +182,14 @@ impl SessionRepository {
             .context("Failed to get database connection")?;
 
         let result = client
-            .execute("DELETE FROM sessions WHERE id = $1", &[&session_id])
+            .execute("DELETE FROM refresh_tokens WHERE id = $1", &[&session_id])
             .await
-            .context("Failed to revoke session")?;
+            .context("Failed to revoke refresh token session")?;
 
         Ok(result > 0)
     }
 
-    /// Revoke all sessions for a user
+    /// Revoke all refresh token sessions for a user
     pub async fn revoke_all_for_user(&self, user_id: Uuid) -> Result<usize> {
         let client = self
             .pool
@@ -195,14 +198,14 @@ impl SessionRepository {
             .context("Failed to get database connection")?;
 
         let result = client
-            .execute("DELETE FROM sessions WHERE user_id = $1", &[&user_id])
+            .execute("DELETE FROM refresh_tokens WHERE user_id = $1", &[&user_id])
             .await
-            .context("Failed to revoke user sessions")?;
+            .context("Failed to revoke user refresh token sessions")?;
 
         Ok(result as usize)
     }
 
-    /// Clean up expired sessions
+    /// Clean up expired refresh token sessions
     pub async fn cleanup_expired(&self) -> Result<usize> {
         let client = self
             .pool
@@ -211,11 +214,14 @@ impl SessionRepository {
             .context("Failed to get database connection")?;
 
         let result = client
-            .execute("DELETE FROM sessions WHERE expires_at < $1", &[&Utc::now()])
+            .execute(
+                "DELETE FROM refresh_tokens WHERE expires_at < $1",
+                &[&Utc::now()],
+            )
             .await
-            .context("Failed to cleanup expired sessions")?;
+            .context("Failed to cleanup expired refresh token sessions")?;
 
-        debug!("Cleaned up {} expired sessions", result);
+        debug!("Cleaned up {} expired refresh token sessions", result);
         Ok(result as usize)
     }
 

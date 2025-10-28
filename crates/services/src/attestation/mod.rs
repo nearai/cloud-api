@@ -147,7 +147,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         let gateway_attestation;
         if let Ok(_dev) = std::env::var("DEV") {
             gateway_attestation = DstackCpuQuote {
-                quote: "0x1234567890abcdef".to_string(),
+                intel_quote: "0x1234567890abcdef".to_string(),
                 event_log: "0x1234567890abcdef".to_string(),
                 report_data: "0x1234567890abcdef".to_string(),
                 request_nonce: nonce.clone(),

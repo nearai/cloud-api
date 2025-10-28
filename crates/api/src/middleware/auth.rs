@@ -190,13 +190,20 @@ pub async fn auth_middleware(
 pub async fn admin_middleware(
     State(state): State<AuthState>,
     request: Request,
-    next: Next,
+    next: Next
 ) -> Result<Response, StatusCode> {
     // Try to extract authentication from various sources
     let auth_header = request
         .headers()
         .get("authorization")
         .and_then(|h| h.to_str().ok());
+
+    let user_agent_header = request
+        .headers()
+        .get("User-Agent")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
 
     tracing::debug!("Admin auth middleware: {:?}", auth_header);
 
@@ -206,7 +213,7 @@ pub async fn admin_middleware(
             debug!("Extracted Bearer token for admin auth: {}", token);
 
             // Try admin access token first
-            match authenticate_admin_access_token(&state, token.to_string()).await {
+            match authenticate_admin_access_token(&state, token.to_string(), user_agent_header.clone()).await {
                 Ok(admin_token) => {
                     debug!("Authenticated via admin access token: {}", admin_token.name);
 
@@ -235,7 +242,6 @@ pub async fn admin_middleware(
                     }
                 }
                 Err(_) => {
-                    // Fall back to session token authentication
                     debug!("Admin access token validation failed, trying session token");
                     authenticate_session_access(&state, token.to_string()).await
                 }
@@ -299,10 +305,11 @@ fn check_admin_access(state: &AuthState, user: &DbUser) -> bool {
 async fn authenticate_admin_access_token(
     state: &AuthState,
     token: String,
+    current_user_agent: String,
 ) -> Result<database::models::AdminAccessToken, StatusCode> {
     debug!("Authenticating admin access token: {}", token);
 
-    match state.admin_access_token_repository.validate(&token).await {
+    match state.admin_access_token_repository.validate(&token, &current_user_agent).await {
         Ok(Some(admin_token)) => {
             debug!(
                 "Admin access token validated successfully: {}",
@@ -311,7 +318,7 @@ async fn authenticate_admin_access_token(
             Ok(admin_token)
         }
         Ok(None) => {
-            debug!("Admin access token not found or inactive");
+            debug!("Admin access token not found, inactive, or User-Agent mismatch");
             Err(StatusCode::UNAUTHORIZED)
         }
         Err(e) => {

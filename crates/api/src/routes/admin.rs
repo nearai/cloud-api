@@ -19,6 +19,9 @@ use services::auth::AuthServiceTrait;
 use std::sync::Arc;
 use tracing::{debug, error};
 
+use axum_extra::headers::UserAgent;
+use axum_extra::extract::TypedHeader;
+
 #[derive(Clone)]
 pub struct AdminAppState {
     pub admin_service: Arc<dyn AdminService + Send + Sync>,
@@ -637,11 +640,15 @@ pub async fn list_users(
 pub async fn create_admin_access_token(
     State(app_state): State<AdminAppState>,
     Extension(admin_user): Extension<AdminUser>, // Require admin auth
+    TypedHeader(user_agent): TypedHeader<UserAgent>,
     Json(request): Json<CreateAdminAccessTokenRequest>,
 ) -> Result<ResponseJson<AdminAccessTokenResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+
+    let user_agent_str = user_agent.to_string();
+
     debug!(
-        "Creating admin access token for user: {} with {} hours expiration",
-        admin_user.0.email, request.expires_in_hours
+        "Creating admin access token for user: {} with {} hours expiration; (User-Agent: {})",
+        admin_user.0.email, request.expires_in_hours, user_agent_str
     );
 
     // Validate expiration time (must be positive)
@@ -660,7 +667,7 @@ pub async fn create_admin_access_token(
 
     match app_state
         .admin_access_token_repository
-        .create(admin_user.0.id, request.name, request.reason, expires_at)
+        .create(admin_user.0.id, request.name, request.reason, expires_at, user_agent_str)
         .await
     {
         Ok((admin_token, access_token)) => {

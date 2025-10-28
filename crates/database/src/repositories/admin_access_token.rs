@@ -34,6 +34,7 @@ impl AdminAccessTokenRepository {
         name: String,
         creation_reason: String,
         expires_at: chrono::DateTime<Utc>,
+        user_agent: String,
     ) -> Result<(AdminAccessToken, String)> {
         let client = self
             .pool
@@ -51,8 +52,8 @@ impl AdminAccessTokenRepository {
                 r#"
                 INSERT INTO admin_access_token (
                     id, token_hash, created_by_user_id, name, creation_reason,
-                    created_at, expires_at, is_active
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    created_at, expires_at, is_active, user_agent
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 RETURNING *
                 "#,
                 &[
@@ -64,6 +65,7 @@ impl AdminAccessTokenRepository {
                     &now,
                     &expires_at,
                     &true,
+                    &user_agent,
                 ],
             )
             .await
@@ -82,6 +84,7 @@ impl AdminAccessTokenRepository {
             revoked_at: row.get("revoked_at"),
             revoked_by_user_id: row.get("revoked_by_user_id"),
             revocation_reason: row.get("revocation_reason"),
+            user_agent: row.get("user_agent"),
         };
 
         debug!(
@@ -93,7 +96,11 @@ impl AdminAccessTokenRepository {
     }
 
     /// Validate an admin access token
-    pub async fn validate(&self, token: &str) -> Result<Option<AdminAccessToken>> {
+    pub async fn validate(
+        &self, 
+        token: &str,
+        current_user_agent: &str,
+    ) -> Result<Option<AdminAccessToken>> {
         let client = self
             .pool
             .get()
@@ -118,6 +125,22 @@ impl AdminAccessTokenRepository {
 
         match row {
             Some(row) => {
+
+                let stored_user_agent: Option<String> = row.get("user_agent");
+
+                // compare user_agent in request to db
+                if let Some(stored) = &stored_user_agent {
+                    if stored != current_user_agent {
+                        tracing::warn!(
+                            "User-Agent mismatch for admin access token {}. Expected '{}', got '{}'",
+                            row.get::<_, Uuid>("id"),
+                            stored,
+                            current_user_agent
+                        );
+                        return Ok(None);
+                    }
+                }
+
                 // Update last_used_at
                 if let Err(e) = client
                     .execute(
@@ -148,6 +171,7 @@ impl AdminAccessTokenRepository {
                     revoked_at: row.get("revoked_at"),
                     revoked_by_user_id: row.get("revoked_by_user_id"),
                     revocation_reason: row.get("revocation_reason"),
+                    user_agent: row.get("user_agent"),
                 };
 
                 Ok(Some(admin_token))
@@ -184,6 +208,7 @@ impl AdminAccessTokenRepository {
                     revoked_at: row.get("revoked_at"),
                     revoked_by_user_id: row.get("revoked_by_user_id"),
                     revocation_reason: row.get("revocation_reason"),
+                    user_agent: row.get("user_agent"),
                 };
                 Ok(Some(admin_token))
             }
@@ -222,6 +247,7 @@ impl AdminAccessTokenRepository {
                 revoked_at: row.get("revoked_at"),
                 revoked_by_user_id: row.get("revoked_by_user_id"),
                 revocation_reason: row.get("revocation_reason"),
+                user_agent: row.get("user_agent"),
             };
             admin_tokens.push(admin_token);
         }

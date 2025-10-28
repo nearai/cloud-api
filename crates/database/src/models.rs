@@ -166,6 +166,7 @@ pub struct AdminAccessToken {
     pub revoked_at: Option<DateTime<Utc>>,
     pub revoked_by_user_id: Option<Uuid>,
     pub revocation_reason: Option<String>,
+    pub user_agent: Option<String>,
 }
 
 /// Request/Response DTOs

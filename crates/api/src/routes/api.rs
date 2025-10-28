@@ -111,9 +111,9 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
             "/me/invitations/{invitation_id}/decline",
             axum::routing::post(decline_invitation),
         )
-        .route("/me/refresh_tokens", get(get_user_refresh_tokens))
+        .route("/me/refresh-tokens", get(get_user_refresh_tokens))
         .route(
-            "/me/refresh_tokens/{refresh_token_id}",
+            "/me/refresh-tokens/{refresh_token_id}",
             delete(revoke_user_refresh_token),
         )
         .route("/me/tokens", delete(revoke_all_user_tokens));
@@ -121,7 +121,7 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
     // Refresh token routes (require refresh token authentication)
     let refresh_token_routes = Router::new()
         .route(
-            "/users/me/access_tokens",
+            "/users/me/access-tokens",
             axum::routing::post(create_access_token),
         )
         .with_state(app_state.clone())

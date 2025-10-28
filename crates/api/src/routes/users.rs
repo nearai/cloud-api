@@ -187,7 +187,7 @@ pub async fn update_current_user_profile(
 /// Returns all active refresh tokens for the currently authenticated user.
 #[utoipa::path(
     get,
-    path = "/users/me/refresh_tokens",
+    path = "/users/me/refresh-tokens",
     tag = "Users",
     responses(
         (status = 200, description = "List of user refresh tokens", body = Vec<crate::models::RefreshTokenResponse>),
@@ -226,7 +226,7 @@ pub async fn get_user_refresh_tokens(
 /// Revokes a specific refresh token for the currently authenticated user.
 #[utoipa::path(
     delete,
-    path = "/users/me/refresh_tokens/{refresh_token_id}",
+    path = "/users/me/refresh-tokens/{refresh_token_id}",
     tag = "Users",
     params(
         ("refresh_token_id" = Uuid, Path, description = "Refresh token ID to revoke")
@@ -313,7 +313,7 @@ pub async fn revoke_all_user_tokens(
 /// Creates a new short-lived access token using the current refresh token.
 #[utoipa::path(
     post,
-    path = "/users/me/access_tokens",
+    path = "/users/me/access-tokens",
     tag = "Users",
     responses(
         (status = 200, description = "Access token created successfully", body = crate::models::AccessTokenResponse),

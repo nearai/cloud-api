@@ -28,7 +28,7 @@ pub fn test_config() -> ApiConfig {
         },
         model_discovery: config::ModelDiscoveryConfig {
             discovery_server_url: "http://localhost:8080/models".to_string(),
-            api_key: Some("REDACTED".to_string()),
+            api_key: Some("test_api_key".to_string()),
             refresh_interval: 3600, // 1 hour - large value to avoid refresh during tests
             timeout: 5,
         },

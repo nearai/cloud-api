@@ -31,7 +31,7 @@ fn get_test_timeout_secs() -> u64 {
 
 /// Create a configured vLLM provider for testing
 fn create_test_provider() -> VLlmProvider {
-    let _ = dotenvy::dotenv().unwrap();
+    let _ = dotenvy::dotenv();
     let config = VLlmConfig {
         base_url: get_vllm_base_url(),
         api_key: get_vllm_api_key(),
@@ -365,7 +365,7 @@ async fn test_error_handling() {
 #[tokio::test]
 async fn test_configuration() {
     // Test with different configurations
-    let _ = dotenvy::dotenv().unwrap();
+    let _ = dotenvy::dotenv(); // OK if .env file doesn't exist (e.g., in CI)
     let config = VLlmConfig {
         base_url: get_vllm_base_url(),
         api_key: get_vllm_api_key(),

@@ -37,6 +37,7 @@ hex = "0.4"
 dstack-sdk = "0.1.2"
 dstack-sdk-types = "0.1.2"
 jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"] }
+regex = "1.11"
 
 [dev-dependencies]
 tokio-test = "0.4"

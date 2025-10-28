@@ -23,14 +23,26 @@ pub const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
 pub fn test_config() -> ApiConfig {
     ApiConfig {
         server: config::ServerConfig {
-            host: "127.0.0.1".to_string(),
-            port: 0, // Use port 0 to get a random available port
+            host: std::env::var("SERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
+            port: std::env::var("SERVER_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(0), // Use port 0 to get a random available port
         },
         model_discovery: config::ModelDiscoveryConfig {
-            discovery_server_url: "http://localhost:8080/models".to_string(),
-            api_key: Some("test_api_key".to_string()),
-            refresh_interval: 3600, // 1 hour - large value to avoid refresh during tests
-            timeout: 5,
+            discovery_server_url: std::env::var("MODEL_DISCOVERY_SERVER_URL")
+                .unwrap_or_else(|_| "http://localhost:8080/models".to_string()),
+            api_key: std::env::var("MODEL_DISCOVERY_API_KEY")
+                .ok()
+                .or(Some("test_api_key".to_string())),
+            refresh_interval: std::env::var("MODEL_DISCOVERY_REFRESH_INTERVAL")
+                .ok()
+                .and_then(|i| i.parse().ok())
+                .unwrap_or(3600), // 1 hour - large value to avoid refresh during tests
+            timeout: std::env::var("MODEL_DISCOVERY_TIMEOUT")
+                .ok()
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(5),
         },
         logging: config::LoggingConfig {
             level: "debug".to_string(),
@@ -38,7 +50,8 @@ pub fn test_config() -> ApiConfig {
             modules: std::collections::HashMap::new(),
         },
         dstack_client: config::DstackClientConfig {
-            url: "http://localhost:8000".to_string(),
+            url: std::env::var("DSTACK_CLIENT_URL")
+                .unwrap_or_else(|_| "http://localhost:8000".to_string()),
         },
         auth: config::AuthConfig {
             mock: true,
@@ -54,15 +67,25 @@ pub fn test_config() -> ApiConfig {
 /// Helper function to create test database configuration
 fn db_config_for_tests() -> config::DatabaseConfig {
     config::DatabaseConfig {
-        primary_app_id: "postgres-test".to_string(),
-        port: 5432,
-        host: None,
-        database: "platform_api".to_string(),
-        username: "postgres".to_string(),
-        password: "postgres".to_string(),
-        max_connections: 2,
-        tls_enabled: false,
-        tls_ca_cert_path: None,
+        primary_app_id: std::env::var("DATABASE_HOST")
+            .unwrap_or_else(|_| "postgres-test".to_string()),
+        port: std::env::var("DATABASE_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(5432),
+        host: std::env::var("DATABASE_HOST").ok(),
+        database: std::env::var("DATABASE_NAME").unwrap_or_else(|_| "platform_api".to_string()),
+        username: std::env::var("DATABASE_USERNAME").unwrap_or_else(|_| "postgres".to_string()),
+        password: std::env::var("DATABASE_PASSWORD").unwrap_or_else(|_| "postgres".to_string()),
+        max_connections: std::env::var("DATABASE_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(2),
+        tls_enabled: std::env::var("DATABASE_TLS_ENABLED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(false),
+        tls_ca_cert_path: std::env::var("DATABASE_TLS_CA_CERT_PATH").ok(),
         refresh_interval: 30,
         mock: false,
     }
@@ -124,7 +147,7 @@ pub async fn setup_test_server() -> axum_test::TestServer {
         .with_max_level(tracing::level_filters::LevelFilter::DEBUG)
         .try_init();
 
-    let config = test_config();
+    let config = ApiConfig::load().unwrap();
     let database = init_test_database(&config.database).await;
 
     // Create mock user in database for foreign key constraints

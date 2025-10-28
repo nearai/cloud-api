@@ -727,15 +727,15 @@ pub fn build_admin_routes(
         )
         .route("/admin/users", axum::routing::get(list_users))
         .route(
-            "/admin/access-token",
+            "/admin/access-tokens",
             axum::routing::post(create_admin_access_token),
         )
         .route(
-            "/admin/access-token",
+            "/admin/access-tokens",
             axum::routing::get(list_admin_access_tokens),
         )
         .route(
-            "/admin/access-token/{token_id}",
+            "/admin/access-tokens/{token_id}",
             axum::routing::delete(delete_admin_access_token),
         )
         .with_state(admin_app_state)

@@ -95,7 +95,7 @@ pub struct NvidiaPayload {
 /// Response for attestation report endpoint
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct DstackCpuQuote {
-    pub quote: String,
+    pub intel_quote: String,
     pub event_log: String,
     pub report_data: String,
     pub request_nonce: String,
@@ -105,7 +105,7 @@ pub struct DstackCpuQuote {
 impl From<services::attestation::models::DstackCpuQuote> for DstackCpuQuote {
     fn from(quote: services::attestation::models::DstackCpuQuote) -> Self {
         Self {
-            quote: quote.quote,
+            intel_quote: quote.intel_quote,
             event_log: quote.event_log,
             report_data: quote.report_data,
             request_nonce: quote.request_nonce,
@@ -182,7 +182,7 @@ pub struct VerifyRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct QuoteResponse {
     /// The attestation quote in hexadecimal format
-    pub quote: String,
+    pub intel_quote: String,
     /// The event log associated with the quote
     pub event_log: String,
 }
@@ -190,7 +190,7 @@ pub struct QuoteResponse {
 impl From<services::attestation::models::DstackCpuQuote> for QuoteResponse {
     fn from(response: services::attestation::models::DstackCpuQuote) -> Self {
         Self {
-            quote: response.quote,
+            intel_quote: response.intel_quote,
             event_log: response.event_log,
         }
     }

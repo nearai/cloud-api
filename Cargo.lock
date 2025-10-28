@@ -4604,6 +4604,7 @@ dependencies = [
  "jsonwebtoken",
  "oauth2",
  "rand 0.8.5",
+ "regex",
  "reqwest 0.12.24",
  "rmcp",
  "serde",

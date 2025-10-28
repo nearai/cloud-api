@@ -3,6 +3,7 @@ use inference_providers::{
     ChatCompletionParams, InferenceProvider, StreamingResult, StreamingResultExt, VLlmConfig,
     VLlmProvider,
 };
+use regex::Regex;
 use serde::Deserialize;
 use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
@@ -303,6 +304,37 @@ impl InferenceProviderPool {
         Some(ordered_providers)
     }
 
+    /// Sanitize error message by removing sensitive information like IP addresses, URLs, and internal details
+    fn sanitize_error_message(error: &str) -> String {
+        let mut sanitized = error.to_string();
+
+        // Remove URLs (http://..., https://...)
+        let url_regex = Regex::new(r"https?://[^\s)]+").unwrap();
+        sanitized = url_regex
+            .replace_all(&sanitized, "[URL_REDACTED]")
+            .to_string();
+
+        // Remove standalone IP addresses with ports (e.g., 192.168.0.1:8000)
+        let ip_port_regex = Regex::new(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}:\d+\b").unwrap();
+        sanitized = ip_port_regex
+            .replace_all(&sanitized, "[IP_REDACTED]")
+            .to_string();
+
+        // Remove standalone IP addresses (e.g., 192.168.0.1)
+        let ip_regex = Regex::new(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b").unwrap();
+        sanitized = ip_regex
+            .replace_all(&sanitized, "[IP_REDACTED]")
+            .to_string();
+
+        // Remove specific error details that might leak internal structure
+        sanitized = sanitized.replace(
+            "error sending request for url",
+            "provider connection failed",
+        );
+
+        sanitized
+    }
+
     /// Generic retry helper that tries each provider in order with automatic fallback
     /// Returns both the result and the provider that succeeded (for chat_id mapping)
     async fn retry_with_fallback<T, F, Fut>(
@@ -332,7 +364,7 @@ impl InferenceProviderPool {
                     "Model not found in provider pool"
                 );
                 return Err(CompletionError::CompletionError(format!(
-                    "Model '{model_id}' not found in any configured provider. Available models: {available_models:?}"
+                    "Model '{model_id}' not found in any configured provider"
                 )));
             }
         };
@@ -346,8 +378,10 @@ impl InferenceProviderPool {
             providers.len()
         );
 
-        // Collect errors from all providers to surface to user
-        let mut provider_errors = Vec::new();
+        // Collect sanitized errors for user-facing message
+        let mut sanitized_errors = Vec::new();
+        // Keep detailed errors for logging only
+        let mut detailed_errors = Vec::new();
 
         // Try each provider in order until one succeeds
         for (attempt, provider) in providers.iter().enumerate() {
@@ -372,34 +406,45 @@ impl InferenceProviderPool {
                     return Ok((result, provider.clone()));
                 }
                 Err(e) => {
+                    let error_str = e.to_string();
+
+                    // Log the full detailed error for debugging
                     tracing::warn!(
                         model_id = %model_id,
                         attempt = attempt + 1,
-                        error = %e,
+                        error = %error_str,
                         operation = operation_name,
                         "Provider failed, will try next provider if available"
                     );
-                    provider_errors.push(format!("Provider {}: {}", attempt + 1, e));
+
+                    // Store detailed error for logging
+                    detailed_errors.push(format!("Provider {}: {}", attempt + 1, error_str));
+
+                    // Store sanitized error for user-facing response
+                    let sanitized = Self::sanitize_error_message(&error_str);
+                    sanitized_errors.push(format!("Provider {}: {}", attempt + 1, sanitized));
                 }
             }
         }
 
-        // All providers failed - include error details
-        let error_details = provider_errors.join("; ");
+        // All providers failed - log detailed errors but return sanitized message to user
+        let detailed_error_msg = detailed_errors.join("; ");
+        let sanitized_error_msg = sanitized_errors.join("; ");
+
         tracing::error!(
             model_id = %model_id,
             providers_tried = providers.len(),
             operation = operation_name,
-            errors = %error_details,
+            errors = %detailed_error_msg,
             "All providers failed for model"
         );
 
+        // Return sanitized error to user
         Err(CompletionError::CompletionError(format!(
-            "All {} provider(s) failed for model '{}' during {}: {}",
+            "All {} provider(s) failed for model '{}': {}",
             providers.len(),
             model_id,
-            operation_name,
-            error_details
+            sanitized_error_msg
         )))
     }
 
@@ -557,5 +602,51 @@ mod tests {
             InferenceProviderPool::parse_ip_port("192.168.1.1:70000"),
             None
         ); // Invalid port
+    }
+
+    #[test]
+    fn test_sanitize_error_message() {
+        // Test URL sanitization
+        let error = "Failed to perform completion: error sending request for url (http://192.168.0.1:8000/v1/chat/completions)";
+        let sanitized = InferenceProviderPool::sanitize_error_message(error);
+        assert!(!sanitized.contains("http://"));
+        assert!(!sanitized.contains("192.168.0.1"));
+        assert!(sanitized.contains("[URL_REDACTED]"));
+        assert!(sanitized.contains("provider connection failed"));
+
+        // Test IP with port sanitization
+        let error = "Connection failed to 192.168.1.100:8080";
+        let sanitized = InferenceProviderPool::sanitize_error_message(error);
+        assert!(!sanitized.contains("192.168.1.100"));
+        assert!(!sanitized.contains("8080"));
+        assert!(sanitized.contains("[IP_REDACTED]"));
+
+        // Test standalone IP sanitization
+        let error = "Server at 10.0.0.1 is unreachable";
+        let sanitized = InferenceProviderPool::sanitize_error_message(error);
+        assert!(!sanitized.contains("10.0.0.1"));
+        assert!(sanitized.contains("[IP_REDACTED]"));
+
+        // Test HTTPS URLs
+        let error = "Failed to connect to https://api.example.com/v1/endpoint";
+        let sanitized = InferenceProviderPool::sanitize_error_message(error);
+        assert!(!sanitized.contains("https://api.example.com"));
+        assert!(sanitized.contains("[URL_REDACTED]"));
+
+        // Test complex error message (like the one from the screenshot)
+        let error = "Failed to perform completion: All 2 provider(s) failed for model 'deepseek-ai/DeepSeek-V3.1' during chat_completion: Provider 1: Failed to perform completion: error sending request for url (http://192.168.0.1:8000/v1/chat/completions): Provider 2: Failed to perform completion: HTTP 401 Unauthorized";
+        let sanitized = InferenceProviderPool::sanitize_error_message(error);
+        assert!(!sanitized.contains("http://"));
+        assert!(!sanitized.contains("192.168.0.1"));
+        assert!(!sanitized.contains("8000"));
+        assert!(!sanitized.contains("/v1/chat/completions"));
+        assert!(sanitized.contains("[URL_REDACTED]"));
+        assert!(sanitized.contains("provider connection failed"));
+
+        // Model name should still be present
+        assert!(sanitized.contains("deepseek-ai/DeepSeek-V3.1"));
+
+        // HTTP status should still be present (not sensitive)
+        assert!(sanitized.contains("401 Unauthorized"));
     }
 }

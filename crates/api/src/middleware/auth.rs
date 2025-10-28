@@ -198,12 +198,11 @@ pub async fn admin_middleware(
         .get("authorization")
         .and_then(|h| h.to_str().ok());
 
-    let user_agent_header = request
+    let user_agent_header: Option<String> = request
         .headers()
         .get("User-Agent")
         .and_then(|h| h.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
+        .map(|s| s.to_string());
 
     tracing::debug!("Admin auth middleware: {:?}", auth_header);
 
@@ -311,13 +310,13 @@ fn check_admin_access(state: &AuthState, user: &DbUser) -> bool {
 async fn authenticate_admin_access_token(
     state: &AuthState,
     token: String,
-    current_user_agent: String,
+    current_user_agent: Option<String>,
 ) -> Result<database::models::AdminAccessToken, StatusCode> {
     debug!("Authenticating admin access token: {}", token);
 
     match state
         .admin_access_token_repository
-        .validate(&token, &current_user_agent)
+        .validate(&token, current_user_agent.as_deref())
         .await
     {
         Ok(Some(admin_token)) => {

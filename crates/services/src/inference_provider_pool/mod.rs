@@ -107,7 +107,7 @@ impl InferenceProviderPool {
         Ok(discovery_map)
     }
 
-    /// Parse IP-based keys like "REDACTED_IP2:8000"
+    /// Parse IP-based keys like "192.0.2.1:8000"
     /// Returns None for keys that don't match IP:PORT format (e.g., "redpill:...")
     fn parse_ip_port(key: &str) -> Option<(String, u16)> {
         let parts: Vec<&str> = key.split(':').collect();
@@ -579,12 +579,12 @@ mod tests {
     fn test_parse_ip_port() {
         // Valid IP-based keys
         assert_eq!(
-            InferenceProviderPool::parse_ip_port("REDACTED_IP2:8000"),
-            Some(("REDACTED_IP2".to_string(), 8000))
+            InferenceProviderPool::parse_ip_port("192.0.2.1:8000"),
+            Some(("192.0.2.1".to_string(), 8000))
         );
         assert_eq!(
-            InferenceProviderPool::parse_ip_port("REDACTED_IP:8001"),
-            Some(("REDACTED_IP".to_string(), 8001))
+            InferenceProviderPool::parse_ip_port("192.0.2.2:8001"),
+            Some(("192.0.2.2".to_string(), 8001))
         );
 
         // Invalid keys (should be filtered out)

@@ -21,16 +21,29 @@ pub const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
 
 /// Helper function to create a test configuration
 pub fn test_config() -> ApiConfig {
+    let _ = dotenvy::dotenv();
     ApiConfig {
         server: config::ServerConfig {
-            host: "127.0.0.1".to_string(),
-            port: 0, // Use port 0 to get a random available port
+            host: std::env::var("SERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
+            port: std::env::var("SERVER_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(0), // Use port 0 to get a random available port
         },
         model_discovery: config::ModelDiscoveryConfig {
-            discovery_server_url: "http://localhost:8080/models".to_string(),
-            api_key: Some("test_api_key".to_string()),
-            refresh_interval: 3600, // 1 hour - large value to avoid refresh during tests
-            timeout: 5,
+            discovery_server_url: std::env::var("MODEL_DISCOVERY_SERVER_URL")
+                .unwrap_or_else(|_| "http://localhost:8080/models".to_string()),
+            api_key: std::env::var("MODEL_DISCOVERY_API_KEY")
+                .ok()
+                .or(Some("test_api_key".to_string())),
+            refresh_interval: std::env::var("MODEL_DISCOVERY_REFRESH_INTERVAL")
+                .ok()
+                .and_then(|i| i.parse().ok())
+                .unwrap_or(3600), // 1 hour - large value to avoid refresh during tests
+            timeout: std::env::var("MODEL_DISCOVERY_TIMEOUT")
+                .ok()
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(5),
         },
         logging: config::LoggingConfig {
             level: "debug".to_string(),
@@ -38,7 +51,8 @@ pub fn test_config() -> ApiConfig {
             modules: std::collections::HashMap::new(),
         },
         dstack_client: config::DstackClientConfig {
-            url: "http://localhost:8000".to_string(),
+            url: std::env::var("DSTACK_CLIENT_URL")
+                .unwrap_or_else(|_| "http://localhost:8000".to_string()),
         },
         auth: config::AuthConfig {
             mock: true,

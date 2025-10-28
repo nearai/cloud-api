@@ -445,6 +445,7 @@ dependencies = [
  "chrono",
  "config",
  "database",
+ "dotenvy",
  "futures",
  "headers",
  "hex",

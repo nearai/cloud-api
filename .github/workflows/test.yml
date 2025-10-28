@@ -58,6 +58,7 @@ jobs:
     - name: Run unit tests
       run: cargo test --lib --bins
       env:
+        POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
         DATABASE_HOST: localhost
         DATABASE_PORT: 5432
         DATABASE_NAME: platform_api
@@ -67,10 +68,13 @@ jobs:
         DATABASE_TLS_ENABLED: "false"
         MODEL_DISCOVERY_SERVER_URL: ${{ secrets.MODEL_DISCOVERY_SERVER_URL }}
         MODEL_DISCOVERY_API_KEY: ${{ secrets.MODEL_DISCOVERY_API_KEY }}
+        AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
+        AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
 
     - name: Run integration tests
       run: cargo test --test e2e_test --test e2e_api_keys --test e2e_auth_tokens --test e2e_duplicate_names
       env:
+        POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
         DATABASE_HOST: localhost
         DATABASE_PORT: 5432
         DATABASE_NAME: platform_api
@@ -80,6 +84,8 @@ jobs:
         DATABASE_TLS_ENABLED: "false"
         MODEL_DISCOVERY_SERVER_URL: ${{ secrets.MODEL_DISCOVERY_SERVER_URL }}
         MODEL_DISCOVERY_API_KEY: ${{ secrets.MODEL_DISCOVERY_API_KEY }}
+        AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
+        AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
         RUST_LOG: debug
 
     - name: Run vLLM integration tests
@@ -87,6 +93,15 @@ jobs:
       env:
         VLLM_BASE_URL: ${{ secrets.VLLM_BASE_URL }}
         VLLM_API_KEY: ${{ secrets.VLLM_API_KEY }}
-
+        
     - name: Build release
       run: cargo build --release
+      env:
+        POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
+        DATABASE_HOST: localhost
+        DATABASE_PORT: 5432
+        DATABASE_NAME: platform_api
+        DATABASE_USERNAME: postgres
+        DATABASE_PASSWORD: postgres
+        MODEL_DISCOVERY_SERVER_URL: ${{ secrets.MODEL_DISCOVERY_SERVER_URL }}
+        AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}

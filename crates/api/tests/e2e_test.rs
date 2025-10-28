@@ -2401,7 +2401,7 @@ async fn test_admin_access_token_create_long_term() {
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
     let response = server
-        .post("/v1/admin/access_token")
+        .post("/v1/admin/access-tokens")
         .add_header("Authorization", format!("Bearer {}", access_token))
         .json(&request)
         .await;
@@ -2448,7 +2448,7 @@ async fn test_admin_access_token_create_invalid_expiration() {
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
     let response = server
-        .post("/v1/admin/access_token")
+        .post("/v1/admin/access-tokens")
         .add_header("Authorization", format!("Bearer {}", access_token))
         .json(&request)
         .await;
@@ -2477,7 +2477,7 @@ async fn test_admin_access_token_create_zero_expiration() {
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
     let response = server
-        .post("/v1/admin/access_token")
+        .post("/v1/admin/access-tokens")
         .add_header("Authorization", format!("Bearer {}", access_token))
         .json(&request)
         .await;
@@ -2500,7 +2500,7 @@ async fn test_admin_access_token_create_unauthorized() {
         "expires_in_hours": 24
     });
 
-    let response = server.post("/v1/admin/access_token").json(&request).await;
+    let response = server.post("/v1/admin/access-tokens").json(&request).await;
 
     assert_eq!(response.status_code(), 401);
 
@@ -2518,7 +2518,7 @@ async fn test_admin_access_token_create_invalid_token() {
     });
 
     let response = server
-        .post("/v1/admin/access_token")
+        .post("/v1/admin/access-tokens")
         .add_header("Authorization", "Bearer invalid_token_12345")
         .json(&request)
         .await;
@@ -2540,7 +2540,7 @@ async fn test_admin_access_token_use_created_token() {
     });
 
     let create_response = server
-        .post("/v1/admin/access_token")
+        .post("/v1/admin/access-tokens")
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .json(&create_request)
         .await;
@@ -2591,7 +2591,7 @@ async fn test_admin_access_token_create_and_list() {
     });
 
     let create_response = server
-        .post("/v1/admin/access_token")
+        .post("/v1/admin/access-tokens")
         .add_header("Authorization", format!("Bearer {}", access_token))
         .json(&create_request)
         .await;
@@ -2603,7 +2603,7 @@ async fn test_admin_access_token_create_and_list() {
 
     // List admin access tokens
     let list_response = server
-        .get("/v1/admin/access_token")
+        .get("/v1/admin/access-tokens")
         .add_header("Authorization", format!("Bearer {}", access_token))
         .await;
 
@@ -2648,7 +2648,7 @@ async fn test_admin_access_token_list_pagination() {
         });
 
         let create_response = server
-            .post("/v1/admin/access_token")
+            .post("/v1/admin/access-tokens")
             .add_header("Authorization", format!("Bearer {}", access_token))
             .json(&create_request)
             .await;
@@ -2658,7 +2658,7 @@ async fn test_admin_access_token_list_pagination() {
 
     // Test pagination with limit and offset
     let list_response = server
-        .get("/v1/admin/access_token?limit=2&offset=0")
+        .get("/v1/admin/access-tokens?limit=2&offset=0")
         .add_header("Authorization", format!("Bearer {}", access_token))
         .await;
 
@@ -2674,7 +2674,7 @@ async fn test_admin_access_token_list_pagination() {
 
     // Test second page
     let list_response2 = server
-        .get("/v1/admin/access_token?limit=2&offset=2")
+        .get("/v1/admin/access-tokens?limit=2&offset=2")
         .add_header("Authorization", format!("Bearer {}", access_token))
         .await;
 
@@ -2703,7 +2703,7 @@ async fn test_admin_access_token_create_and_delete() {
     });
 
     let create_response = server
-        .post("/v1/admin/access_token")
+        .post("/v1/admin/access-tokens")
         .add_header("Authorization", format!("Bearer {}", access_token))
         .json(&create_request)
         .await;
@@ -2718,7 +2718,7 @@ async fn test_admin_access_token_create_and_delete() {
     });
 
     let delete_response = server
-        .delete(&format!("/v1/admin/access_token/{}", token_id))
+        .delete(&format!("/v1/admin/access-tokens/{}", token_id))
         .add_header("Authorization", format!("Bearer {}", access_token))
         .json(&delete_request)
         .await;
@@ -2751,7 +2751,7 @@ async fn test_admin_access_token_delete_not_found() {
     });
 
     let delete_response = server
-        .delete(&format!("/v1/admin/access_token/{}", fake_token_id))
+        .delete(&format!("/v1/admin/access-tokens/{}", fake_token_id))
         .add_header("Authorization", format!("Bearer {}", access_token))
         .json(&delete_request)
         .await;
@@ -2782,7 +2782,7 @@ async fn test_admin_access_token_delete_invalid_id() {
     });
 
     let delete_response = server
-        .delete(&format!("/v1/admin/access_token/{}", invalid_token_id))
+        .delete(&format!("/v1/admin/access-tokens/{}", invalid_token_id))
         .add_header("Authorization", format!("Bearer {}", access_token))
         .json(&delete_request)
         .await;
@@ -2811,14 +2811,14 @@ async fn test_admin_access_token_unauthorized() {
     });
 
     let create_response = server
-        .post("/v1/admin/access_token")
+        .post("/v1/admin/access-tokens")
         .json(&create_request)
         .await;
 
     assert_eq!(create_response.status_code(), 401);
 
     // Test list without authentication
-    let list_response = server.get("/v1/admin/access_token").await;
+    let list_response = server.get("/v1/admin/access-tokens").await;
     assert_eq!(list_response.status_code(), 401);
 
     // Test delete without authentication
@@ -2827,7 +2827,7 @@ async fn test_admin_access_token_unauthorized() {
     });
 
     let delete_response = server
-        .delete("/v1/admin/access_token/00000000-0000-0000-0000-000000000000")
+        .delete("/v1/admin/access-tokens/00000000-0000-0000-0000-000000000000")
         .json(&delete_request)
         .await;
     assert_eq!(delete_response.status_code(), 401);
@@ -2850,7 +2850,7 @@ async fn test_admin_access_token_cannot_manage_tokens() {
     });
 
     let create_response = server
-        .post("/v1/admin/access_token")
+        .post("/v1/admin/access-tokens")
         .add_header("Authorization", format!("Bearer {}", access_token))
         .json(&create_request)
         .await;
@@ -2867,7 +2867,7 @@ async fn test_admin_access_token_cannot_manage_tokens() {
     });
 
     let create_response2 = server
-        .post("/v1/admin/access_token")
+        .post("/v1/admin/access-tokens")
         .add_header("Authorization", format!("Bearer {}", admin_token))
         .json(&create_request2)
         .await;
@@ -2877,7 +2877,7 @@ async fn test_admin_access_token_cannot_manage_tokens() {
 
     // Try to use the admin access token to list admin access tokens (should fail)
     let list_response = server
-        .get("/v1/admin/access_token")
+        .get("/v1/admin/access-tokens")
         .add_header("Authorization", format!("Bearer {}", admin_token))
         .await;
 
@@ -2885,7 +2885,7 @@ async fn test_admin_access_token_cannot_manage_tokens() {
 
     // Try to use the admin access token to delete an admin access token (should fail)
     let delete_response = server
-        .delete("/v1/admin/access_token/00000000-0000-0000-0000-000000000000")
+        .delete("/v1/admin/access-tokens/00000000-0000-0000-0000-000000000000")
         .add_header("Authorization", format!("Bearer {}", admin_token))
         .json(&serde_json::json!({"reason": "This should fail"}))
         .await;

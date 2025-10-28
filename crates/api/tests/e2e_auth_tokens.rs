@@ -12,7 +12,7 @@ async fn test_create_access_token_from_refresh_token() {
     let refresh_token = get_session_id();
 
     let response = server
-        .post("/v1/users/me/access_tokens")
+        .post("/v1/users/me/access-tokens")
         .add_header("Authorization", format!("Bearer {}", refresh_token))
         .await;
 
@@ -31,7 +31,7 @@ async fn test_create_access_token_from_refresh_token() {
 async fn test_create_access_token_without_auth() {
     let server = setup_test_server().await;
 
-    let response = server.post("/v1/users/me/access_tokens").await;
+    let response = server.post("/v1/users/me/access-tokens").await;
 
     assert_eq!(
         response.status_code(),
@@ -47,7 +47,7 @@ async fn test_create_access_token_with_invalid_refresh_token() {
     let server = setup_test_server().await;
 
     let response = server
-        .post("/v1/users/me/access_tokens")
+        .post("/v1/users/me/access-tokens")
         .add_header("Authorization", "Bearer invalid_token_xyz")
         .await;
 
@@ -70,7 +70,7 @@ async fn test_access_token_cannot_create_new_access_token() {
 
     // Try to use access token to create another access token (should fail in production)
     let response = server
-        .post("/v1/users/me/access_tokens")
+        .post("/v1/users/me/access-tokens")
         .add_header("Authorization", format!("Bearer {}", access_token))
         .await;
 
@@ -110,7 +110,7 @@ async fn test_list_user_refresh_tokens() {
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
     let response = server
-        .get("/v1/users/me/refresh_tokens")
+        .get("/v1/users/me/refresh-tokens")
         .add_header("Authorization", format!("Bearer {}", access_token))
         .await;
 
@@ -139,7 +139,7 @@ async fn test_list_user_refresh_tokens() {
 async fn test_list_refresh_tokens_without_auth() {
     let server = setup_test_server().await;
 
-    let response = server.get("/v1/users/me/refresh_tokens").await;
+    let response = server.get("/v1/users/me/refresh-tokens").await;
 
     assert_eq!(response.status_code(), 401, "Should require authentication");
 
@@ -234,7 +234,7 @@ async fn test_revoke_all_tokens_prevents_refresh_token_use() {
 
     // Try to create a new access token with the old refresh token (should fail in production)
     let response = server
-        .post("/v1/users/me/access_tokens")
+        .post("/v1/users/me/access-tokens")
         .add_header("Authorization", format!("Bearer {}", refresh_token))
         .await;
 
@@ -308,6 +308,6 @@ async fn test_access_token_can_create_organization() {
     println!("✅ Access token can perform authenticated actions");
 }
 
-// Note: Specific refresh token revocation (DELETE /users/me/refresh_tokens/{id})
+// Note: Specific refresh token revocation (DELETE /users/me/refresh-tokens/{id})
 // is difficult to test in the current mock setup because we don't have easy access
 // to actual refresh token IDs. In a real database scenario, these would be testable.

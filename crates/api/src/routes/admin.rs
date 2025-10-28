@@ -7,8 +7,9 @@ use crate::models::{
     UpdateOrganizationLimitsResponse,
 };
 use axum::{
-    extract::{Json, Path, State, Request},
+    extract::{Json, Path, State},
     http::StatusCode,
+    http::HeaderMap,
     response::Json as ResponseJson,
     Extension,
 };
@@ -638,19 +639,17 @@ pub async fn list_users(
 pub async fn create_admin_access_token(
     State(app_state): State<AdminAppState>,
     Extension(admin_user): Extension<AdminUser>, // Require admin auth
-    request: Request,
+    headers: HeaderMap,
     Json(request_body): Json<CreateAdminAccessTokenRequest>,
 ) -> Result<ResponseJson<AdminAccessTokenResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
 
-    let user_agent_str = request
-        .headers()
+    let user_agent_str: Option<String> = headers
         .get("User-Agent")
         .and_then(|h| h.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
+        .map(|s| s.to_string());
 
     debug!(
-        "Creating admin access token for user: {} with {} hours expiration; (User-Agent: {})",
+        "Creating admin access token for user: {} with {} hours expiration; (User-Agent: {:?})",
         admin_user.0.email, request_body.expires_in_hours, user_agent_str
     );
 

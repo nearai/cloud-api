@@ -34,7 +34,7 @@ impl AdminAccessTokenRepository {
         name: String,
         creation_reason: String,
         expires_at: chrono::DateTime<Utc>,
-        user_agent: String,
+        user_agent: Option<String>,
     ) -> Result<(AdminAccessToken, String)> {
         let client = self
             .pool

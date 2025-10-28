@@ -57,7 +57,7 @@ pub async fn add_organization_member(
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
-                "Invalid user_id".to_string(),
+                "Invalid user ID".to_string(),
                 "bad_request".to_string(),
             )),
         )

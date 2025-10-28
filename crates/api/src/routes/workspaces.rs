@@ -369,7 +369,7 @@ pub async fn get_workspace(
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
-                    "Failed to list workspaces".to_string(),
+                    "Failed to get workspace".to_string(),
                     "internal_server_error".to_string(),
                 )),
             ))

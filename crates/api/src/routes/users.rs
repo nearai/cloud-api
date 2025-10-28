@@ -299,9 +299,13 @@ pub async fn revoke_user_refresh_token(
                 "not_found".to_string(),
             )),
         )),
-        Err(UserServiceError::Unauthorized(msg)) => Err((
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(msg, "forbidden".to_string())),
+        // Don't leak that the refresh token exists
+        Err(UserServiceError::Unauthorized(_)) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Refresh token not found".to_string(),
+                "not_found".to_string(),
+            )),
         )),
         Err(e) => {
             error!("Failed to revoke refresh token: {}", e);

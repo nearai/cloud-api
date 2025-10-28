@@ -190,7 +190,7 @@ pub async fn auth_middleware(
 pub async fn admin_middleware(
     State(state): State<AuthState>,
     request: Request,
-    next: Next
+    next: Next,
 ) -> Result<Response, StatusCode> {
     // Try to extract authentication from various sources
     let auth_header = request
@@ -213,7 +213,13 @@ pub async fn admin_middleware(
             debug!("Extracted Bearer token for admin auth: {}", token);
 
             // Try admin access token first
-            match authenticate_admin_access_token(&state, token.to_string(), user_agent_header.clone()).await {
+            match authenticate_admin_access_token(
+                &state,
+                token.to_string(),
+                user_agent_header.clone(),
+            )
+            .await
+            {
                 Ok(admin_token) => {
                     debug!("Authenticated via admin access token: {}", admin_token.name);
 
@@ -309,7 +315,11 @@ async fn authenticate_admin_access_token(
 ) -> Result<database::models::AdminAccessToken, StatusCode> {
     debug!("Authenticating admin access token: {}", token);
 
-    match state.admin_access_token_repository.validate(&token, &current_user_agent).await {
+    match state
+        .admin_access_token_repository
+        .validate(&token, &current_user_agent)
+        .await
+    {
         Ok(Some(admin_token)) => {
             debug!(
                 "Admin access token validated successfully: {}",

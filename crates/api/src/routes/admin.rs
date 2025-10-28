@@ -8,8 +8,8 @@ use crate::models::{
 };
 use axum::{
     extract::{Json, Path, State},
-    http::StatusCode,
     http::HeaderMap,
+    http::StatusCode,
     response::Json as ResponseJson,
     Extension,
 };
@@ -19,7 +19,6 @@ use services::admin::{AdminService, UpdateModelAdminRequest};
 use services::auth::AuthServiceTrait;
 use std::sync::Arc;
 use tracing::{debug, error};
-
 
 #[derive(Clone)]
 pub struct AdminAppState {
@@ -642,7 +641,6 @@ pub async fn create_admin_access_token(
     headers: HeaderMap,
     Json(request_body): Json<CreateAdminAccessTokenRequest>,
 ) -> Result<ResponseJson<AdminAccessTokenResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-
     let user_agent_str: Option<String> = headers
         .get("User-Agent")
         .and_then(|h| h.to_str().ok())
@@ -669,7 +667,13 @@ pub async fn create_admin_access_token(
 
     match app_state
         .admin_access_token_repository
-        .create(admin_user.0.id, request_body.name, request_body.reason, expires_at, user_agent_str)
+        .create(
+            admin_user.0.id,
+            request_body.name,
+            request_body.reason,
+            expires_at,
+            user_agent_str,
+        )
         .await
     {
         Ok((admin_token, access_token)) => {

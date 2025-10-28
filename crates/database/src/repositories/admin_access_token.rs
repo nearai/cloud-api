@@ -97,7 +97,7 @@ impl AdminAccessTokenRepository {
 
     /// Validate an admin access token
     pub async fn validate(
-        &self, 
+        &self,
         token: &str,
         current_user_agent: &str,
     ) -> Result<Option<AdminAccessToken>> {
@@ -125,7 +125,6 @@ impl AdminAccessTokenRepository {
 
         match row {
             Some(row) => {
-
                 let stored_user_agent: Option<String> = row.get("user_agent");
 
                 // compare user_agent in request to db

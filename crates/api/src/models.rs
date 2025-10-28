@@ -1369,6 +1369,10 @@ pub struct OrgLimitsHistoryEntry {
     pub changed_by: Option<String>,
     #[serde(rename = "changeReason")]
     pub change_reason: Option<String>,
+    #[serde(rename = "changedByUserId")]
+    pub changed_by_user_id: Option<String>,
+    #[serde(rename = "changedByUserEmail")]
+    pub changed_by_user_email: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
 }

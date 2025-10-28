@@ -280,7 +280,7 @@ pub async fn get_model_history(
 pub async fn update_organization_limits(
     State(app_state): State<AdminAppState>,
     Path(org_id): Path<String>,
-    Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    Extension(admin_user): Extension<AdminUser>, // Require admin auth
     ResponseJson(request): ResponseJson<UpdateOrganizationLimitsRequest>,
 ) -> Result<ResponseJson<UpdateOrganizationLimitsResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
 {
@@ -300,11 +300,17 @@ pub async fn update_organization_limits(
         )
     })?;
 
+    // Extract admin user ID and email from authenticated user
+    let admin_user_id = admin_user.0.id;
+    let admin_user_email = admin_user.0.email.clone();
+
     // Convert API request to service request
     let service_request = services::admin::OrganizationLimitsUpdate {
         spend_limit: request.spend_limit.amount,
         changed_by: request.changed_by,
         change_reason: request.change_reason,
+        changed_by_user_id: Some(admin_user_id),
+        changed_by_user_email: Some(admin_user_email),
     };
 
     // Update organization limits via admin service
@@ -447,6 +453,8 @@ pub async fn get_organization_limits_history(
             effective_until: h.effective_until.map(|dt| dt.to_rfc3339()),
             changed_by: h.changed_by,
             change_reason: h.change_reason,
+            changed_by_user_id: h.changed_by_user_id.map(|id| id.to_string()),
+            changed_by_user_email: h.changed_by_user_email,
             created_at: h.created_at.to_rfc3339(),
         })
         .collect();

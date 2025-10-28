@@ -8,11 +8,10 @@ use axum::{
     http::StatusCode,
 };
 use serde::Deserialize;
-use services::organization::{
-    OrganizationError, OrganizationId, OrganizationOrderBy, OrganizationOrderDirection,
-};
+use services::organization::{OrganizationError, OrganizationId};
 use tracing::{debug, error};
 use utoipa;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// List organizations
@@ -22,6 +21,12 @@ use uuid::Uuid;
     get,
     path = "/organizations",
     tag = "Organizations",
+    params(
+        ("limit" = Option<i64>, Query, description = "Maximum number of organizations to return"),
+        ("offset" = Option<i64>, Query, description = "Number of organizations to skip"),
+        ("order_by" = Option<OrganizationOrderBy>, Query, description = "Order by"),
+        ("order_direction" = Option<OrganizationOrderDirection>, Query, description = "Order direction")
+    ),
     responses(
         (status = 200, description = "Paginated list of organizations", body = ListOrganizationsResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
@@ -67,8 +72,8 @@ pub async fn list_organizations(
             user_id,
             params.limit,
             params.offset,
-            params.order_by,
-            params.order_direction,
+            params.order_by.map(From::from),
+            params.order_direction.map(From::from),
         )
         .await
     {
@@ -108,6 +113,36 @@ pub struct ListOrganizationsParams {
     pub offset: i64,
     pub order_by: Option<OrganizationOrderBy>,
     pub order_direction: Option<OrganizationOrderDirection>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OrganizationOrderBy {
+    CreatedAt,
+}
+
+impl From<OrganizationOrderBy> for services::organization::OrganizationOrderBy {
+    fn from(value: OrganizationOrderBy) -> Self {
+        match value {
+            OrganizationOrderBy::CreatedAt => Self::CreatedAt,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OrganizationOrderDirection {
+    Asc,
+    Desc,
+}
+
+impl From<OrganizationOrderDirection> for services::organization::OrganizationOrderDirection {
+    fn from(value: OrganizationOrderDirection) -> Self {
+        match value {
+            OrganizationOrderDirection::Asc => Self::Asc,
+            OrganizationOrderDirection::Desc => Self::Desc,
+        }
+    }
 }
 
 /// Create a new organization

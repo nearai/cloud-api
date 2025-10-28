@@ -419,7 +419,7 @@ async fn authenticate_session_access(
         StatusCode::UNAUTHORIZED,
         axum::Json(crate::models::ErrorResponse::new(
             "Invalid or expired access token".to_string(),
-            "internal_server_error".to_string(),
+            "unauthorized".to_string(),
         )),
     ))
 }

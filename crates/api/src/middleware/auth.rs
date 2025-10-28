@@ -212,7 +212,7 @@ pub async fn admin_middleware(
 
                     // Check if this is an admin access token management endpoint
                     let path = request.uri().path();
-                    let is_access_token_management = path.starts_with("/admin/access_token");
+                    let is_access_token_management = path.starts_with("/admin/access-token");
                     // For access token management endpoints, only allow session-based authentication
                     if is_access_token_management {
                         debug!("Access token management endpoint detected. Forbidden.");

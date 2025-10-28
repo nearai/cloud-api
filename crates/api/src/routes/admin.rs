@@ -621,7 +621,7 @@ pub async fn list_users(
 /// Store them securely and rotate them regularly.
 #[utoipa::path(
     post,
-    path = "/admin/access_token",
+    path = "/admin/access-token",
     tag = "Admin",
     request_body = CreateAdminAccessTokenRequest,
     responses(
@@ -700,7 +700,7 @@ pub async fn create_admin_access_token(
 /// Only authenticated admins can access this endpoint.
 #[utoipa::path(
     get,
-    path = "/admin/access_token",
+    path = "/admin/access-token",
     tag = "Admin",
     params(
         ("limit" = Option<i64>, Query, description = "Number of records to return (default: 50)"),
@@ -767,7 +767,7 @@ pub async fn list_admin_access_tokens(
 /// Only authenticated admins can perform this operation.
 #[utoipa::path(
     delete,
-    path = "/admin/access_token/{token_id}",
+    path = "/admin/access-token/{token_id}",
     tag = "Admin",
     request_body = DeleteAdminAccessTokenRequest,
     params(

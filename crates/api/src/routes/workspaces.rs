@@ -13,7 +13,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use services::organization::OrganizationId;
-use services::workspace::{WorkspaceOrderBy, WorkspaceOrderDirection};
 use tracing::{debug, error};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -70,6 +69,36 @@ pub struct ListParams {
     pub offset: i64,
     pub order_by: Option<WorkspaceOrderBy>,
     pub order_direction: Option<WorkspaceOrderDirection>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceOrderBy {
+    CreatedAt,
+}
+
+impl From<WorkspaceOrderBy> for services::workspace::WorkspaceOrderBy {
+    fn from(value: WorkspaceOrderBy) -> Self {
+        match value {
+            WorkspaceOrderBy::CreatedAt => Self::CreatedAt,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceOrderDirection {
+    Asc,
+    Desc,
+}
+
+impl From<WorkspaceOrderDirection> for services::workspace::WorkspaceOrderDirection {
+    fn from(value: WorkspaceOrderDirection) -> Self {
+        match value {
+            WorkspaceOrderDirection::Asc => Self::Asc,
+            WorkspaceOrderDirection::Desc => Self::Desc,
+        }
+    }
 }
 
 // ============================================
@@ -175,7 +204,9 @@ pub async fn create_workspace(
     params(
         ("org_id" = Uuid, Path, description = "Organization ID"),
         ("limit" = Option<i64>, Query, description = "Maximum number of results"),
-        ("offset" = Option<i64>, Query, description = "Number of results to skip")
+        ("offset" = Option<i64>, Query, description = "Number of results to skip"),
+        ("order_by" = Option<WorkspaceOrderBy>, Query, description = "Order by"),
+        ("order_direction" = Option<WorkspaceOrderDirection>, Query, description = "Order direction")
     ),
     responses(
         (status = 200, description = "Paginated list of workspaces", body = ListWorkspacesResponse),
@@ -232,8 +263,8 @@ pub async fn list_organization_workspaces(
             user_id,
             params.limit,
             params.offset,
-            params.order_by,
-            params.order_direction,
+            params.order_by.map(From::from),
+            params.order_direction.map(From::from),
         )
         .await
     {

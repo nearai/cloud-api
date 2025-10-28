@@ -65,9 +65,11 @@ jobs:
         DATABASE_PASSWORD: postgres
         DATABASE_MAX_CONNECTIONS: 5
         DATABASE_TLS_ENABLED: "false"
+        MODEL_DISCOVERY_SERVER_URL: ${{ secrets.MODEL_DISCOVERY_SERVER_URL }}
+        MODEL_DISCOVERY_API_KEY: ${{ secrets.MODEL_DISCOVERY_API_KEY }}
 
     - name: Run integration tests
-      run: cargo test --test e2e_test --test e2e_api_keys --test e2e_duplicate_names
+      run: cargo test --test e2e_test --test e2e_api_keys --test e2e_auth_tokens --test e2e_duplicate_names
       env:
         DATABASE_HOST: localhost
         DATABASE_PORT: 5432
@@ -76,7 +78,15 @@ jobs:
         DATABASE_PASSWORD: postgres
         DATABASE_MAX_CONNECTIONS: 5
         DATABASE_TLS_ENABLED: "false"
+        MODEL_DISCOVERY_SERVER_URL: ${{ secrets.MODEL_DISCOVERY_SERVER_URL }}
+        MODEL_DISCOVERY_API_KEY: ${{ secrets.MODEL_DISCOVERY_API_KEY }}
         RUST_LOG: debug
+
+    - name: Run vLLM integration tests
+      run: cargo test --test integration_tests
+      env:
+        VLLM_BASE_URL: ${{ secrets.VLLM_BASE_URL }}
+        VLLM_API_KEY: ${{ secrets.VLLM_API_KEY }}
 
     - name: Build release
       run: cargo build --release

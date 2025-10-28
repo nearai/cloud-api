@@ -246,13 +246,6 @@ pub async fn init_domain_services(
         database::repositories::OrganizationLimitsRepository::new(database.pool().clone()),
     );
 
-    // Create response service
-    let response_service = Arc::new(services::ResponseService::new(
-        response_repo,
-        inference_provider_pool.clone(),
-        conversation_service.clone(),
-    ));
-
     // Create MCP client manager
     let mcp_manager = Arc::new(services::mcp::McpClientManager::new());
 
@@ -286,6 +279,15 @@ pub async fn init_domain_services(
         attestation_service.clone(),
         usage_service.clone(),
         models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
+    ));
+
+    let response_service = Arc::new(services::ResponseService::new(
+        response_repo,
+        inference_provider_pool.clone(),
+        conversation_service.clone(),
+        completion_service.clone(),
+        None, // web_search_provider
+        None, // file_search_provider
     ));
 
     // Create session repository for user service

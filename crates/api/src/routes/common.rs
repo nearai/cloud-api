@@ -1,6 +1,6 @@
 use crate::models::ErrorResponse;
 use axum::{http::StatusCode, response::Json as ResponseJson};
-use services::CompletionError;
+use services::completions::CompletionError;
 
 /// Map domain errors to HTTP status codes
 pub fn map_domain_error_to_status(error: &CompletionError) -> StatusCode {

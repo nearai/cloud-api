@@ -74,7 +74,7 @@ jobs:
         DEV: "true"
 
     - name: Run integration tests
-      run: cargo test --test e2e_test --test e2e_api_keys --test e2e_auth_tokens --test e2e_duplicate_names
+      run: cargo test --test e2e_test --test e2e_api_keys --test e2e_auth_tokens --test e2e_duplicate_names --test e2e_error_msg
       env:
         POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
         DATABASE_HOST: localhost

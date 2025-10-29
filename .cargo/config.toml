@@ -15,6 +15,9 @@ rustflags = [
     "-C", "link-arg=-Wl,--hash-style=gnu",
     # Ensure consistent target features
     "-C", "target-cpu=native",
+    # Slows down the build by single-threading it,
+    # but could possibly eliminate parallel codegen variation
+    "-C", "codegen-units=1",
 ]
 
 [profile.release]

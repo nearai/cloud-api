@@ -315,6 +315,16 @@ pub async fn get_organization(
                 "forbidden".to_string(),
             )),
         )),
+        Err(OrganizationError::NotFound) => {
+            error!("Organization not found");
+            Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse::new(
+                    "Organization not found".to_string(),
+                    "not_found".to_string(),
+                )),
+            ))
+        }
         Err(e) => {
             error!("Failed to check organization membership: {}", e);
             Err((

@@ -14,10 +14,7 @@ rustflags = [
     "-C", "link-arg=-Wl,--no-undefined",
     "-C", "link-arg=-Wl,--hash-style=gnu",
     # Ensure consistent target features
-    "-C", "target-cpu=native",
-    # Slows down the build by single-threading it,
-    # but could possibly eliminate parallel codegen variation
-    "-C", "codegen-units=1",
+    # "-C", "target-cpu=native",
 ]
 
 [profile.release]
@@ -26,10 +23,10 @@ strip = "symbols"
 # Disable link-time optimization variations
 lto = "thin"
 # Use a fixed codegen units value
-codegen-units = 1
+# codegen-units = 1
 # Ensure consistent panic behavior
-panic = "abort"
+# panic = "abort"
 # Disable overflow checks for consistency
-overflow-checks = false
+# overflow-checks = false
 # Explicit optimization level
-opt-level = 3
+# opt-level = 3

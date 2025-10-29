@@ -3,7 +3,6 @@
 rustflags = [
     # Remap source file paths to remove machine-specific paths
     "--remap-path-prefix", "${PWD}=.",
-    "--remap-path-prefix", "/app=/app",
     "--remap-path-prefix", "/usr/local/cargo=/cargo",
     # Disable incremental compilation for reproducibility
     "-C", "incremental=false",

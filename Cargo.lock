@@ -445,6 +445,7 @@ dependencies = [
  "chrono",
  "config",
  "database",
+ "dotenvy",
  "futures",
  "headers",
  "hex",
@@ -2687,6 +2688,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "dotenvy",
  "dstack-sdk",
  "dstack-sdk-types",
  "futures-core",

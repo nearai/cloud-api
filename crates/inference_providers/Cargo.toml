@@ -25,3 +25,4 @@ dstack-sdk-types = "0.1.2"
 [dev-dependencies]
 futures-util = "0.3"
 tokio-test = "0.4"
+dotenvy = "0.15.7"

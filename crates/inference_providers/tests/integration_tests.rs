@@ -11,16 +11,31 @@ use inference_providers::{
 use std::time::Duration;
 use tokio::time::timeout;
 
-const VLLM_BASE_URL: &str = "http://your-vllm-server:8002";
-const VLLM_API_KEY: &str = "your_vllm_api_key_here";
-const TEST_TIMEOUT_SECS: u64 = 30;
+/// Get vLLM base URL from environment variable or use default
+fn get_vllm_base_url() -> String {
+    std::env::var("VLLM_BASE_URL").unwrap_or_else(|_| "http://localhost:8002".to_string())
+}
+
+/// Get vLLM API key from environment variable
+fn get_vllm_api_key() -> Option<String> {
+    std::env::var("VLLM_API_KEY").ok()
+}
+
+/// Get test timeout from environment variable or use default
+fn get_test_timeout_secs() -> u64 {
+    std::env::var("VLLM_TEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
+}
 
 /// Create a configured vLLM provider for testing
 fn create_test_provider() -> VLlmProvider {
+    let _ = dotenvy::dotenv();
     let config = VLlmConfig {
-        base_url: VLLM_BASE_URL.to_string(),
-        api_key: Some(VLLM_API_KEY.to_string()),
-        timeout_seconds: TEST_TIMEOUT_SECS as i64,
+        base_url: get_vllm_base_url(),
+        api_key: get_vllm_api_key(),
+        timeout_seconds: get_test_timeout_secs() as i64,
     };
     VLlmProvider::new(config)
 }
@@ -28,8 +43,9 @@ fn create_test_provider() -> VLlmProvider {
 #[tokio::test]
 async fn test_models_endpoint() {
     let provider = create_test_provider();
+    let test_timeout_secs = get_test_timeout_secs();
 
-    let result = timeout(Duration::from_secs(TEST_TIMEOUT_SECS), provider.models()).await;
+    let result = timeout(Duration::from_secs(test_timeout_secs), provider.models()).await;
 
     match result {
         Ok(Ok(models)) => {
@@ -47,13 +63,14 @@ async fn test_models_endpoint() {
             }
         }
         Ok(Err(e)) => panic!("Models request failed: {e}"),
-        Err(_) => panic!("Models request timed out after {TEST_TIMEOUT_SECS} seconds"),
+        Err(_) => panic!("Models request timed out after {test_timeout_secs} seconds"),
     }
 }
 
 #[tokio::test]
 async fn test_chat_completion_streaming() {
     let provider = create_test_provider();
+    let test_timeout_secs = get_test_timeout_secs();
 
     // First get available models
     let models = provider.models().await.expect("Failed to get models");
@@ -105,7 +122,7 @@ async fn test_chat_completion_streaming() {
     };
 
     let stream_result = timeout(
-        Duration::from_secs(TEST_TIMEOUT_SECS),
+        Duration::from_secs(test_timeout_secs),
         provider.chat_completion_stream(params, "test_request_hash".to_string()),
     )
     .await;
@@ -183,13 +200,14 @@ async fn test_chat_completion_streaming() {
                     "Should receive content or at least 2 chunks (initial + usage). Got {chunks_received} chunks with content: '{content_received}'");
         }
         Ok(Err(e)) => panic!("Chat completion failed: {e}"),
-        Err(_) => panic!("Chat completion timed out after {TEST_TIMEOUT_SECS} seconds"),
+        Err(_) => panic!("Chat completion timed out after {test_timeout_secs} seconds"),
     }
 }
 
 #[tokio::test]
 async fn test_text_completion_streaming() {
     let provider = create_test_provider();
+    let test_timeout_secs = get_test_timeout_secs();
 
     // First get available models
     let models = provider.models().await.expect("Failed to get models");
@@ -220,7 +238,7 @@ async fn test_text_completion_streaming() {
     };
 
     let stream_result = timeout(
-        Duration::from_secs(TEST_TIMEOUT_SECS),
+        Duration::from_secs(test_timeout_secs),
         provider.text_completion_stream(params),
     )
     .await;
@@ -292,7 +310,7 @@ async fn test_text_completion_streaming() {
             println!("Total content received: '{content_received}'");
         }
         Ok(Err(e)) => panic!("Text completion failed: {e}"),
-        Err(_) => panic!("Text completion timed out after {TEST_TIMEOUT_SECS} seconds"),
+        Err(_) => panic!("Text completion timed out after {test_timeout_secs} seconds"),
     }
 }
 
@@ -347,9 +365,10 @@ async fn test_error_handling() {
 #[tokio::test]
 async fn test_configuration() {
     // Test with different configurations
+    let _ = dotenvy::dotenv(); // OK if .env file doesn't exist (e.g., in CI)
     let config = VLlmConfig {
-        base_url: VLLM_BASE_URL.to_string(),
-        api_key: Some(VLLM_API_KEY.to_string()),
+        base_url: get_vllm_base_url(),
+        api_key: get_vllm_api_key(),
         timeout_seconds: 10,
     };
 

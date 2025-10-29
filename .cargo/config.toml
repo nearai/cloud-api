@@ -10,6 +10,11 @@ rustflags = [
     "-C", "debuginfo=0",
     # removes build-id hash
     "-C", "link-arg=-Wl,--build-id=none",
+    # Additional reproducibility flags
+    "-C", "link-arg=-Wl,--no-undefined",
+    "-C", "link-arg=-Wl,--hash-style=gnu",
+    # Ensure consistent target features
+    "-C", "target-cpu=native",
 ]
 
 [profile.release]
@@ -19,3 +24,9 @@ strip = "symbols"
 lto = "thin"
 # Use a fixed codegen units value
 codegen-units = 1
+# Ensure consistent panic behavior
+panic = "abort"
+# Disable overflow checks for consistency
+overflow-checks = false
+# Explicit optimization level
+opt-level = 3

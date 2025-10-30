@@ -94,7 +94,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
     ) -> Result<Option<models::Conversation>, errors::ConversationError> {
         let db_conversation = self
             .conv_repo
-            .get_by_id(conversation_id.into(), user_id)
+            .get_by_id(conversation_id, user_id)
             .await
             .map_err(|e| {
                 errors::ConversationError::InternalError(format!("Failed to get conversation: {e}"))

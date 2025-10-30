@@ -1,5 +1,7 @@
 use crate::{middleware::AuthenticatedUser, models::*};
-use inference_providers::{ChatMessage, ChatCompletionParams, CompletionParams, MessageRole, FinishReason, TokenUsage};
+use inference_providers::{
+    ChatCompletionParams, ChatMessage, CompletionParams, FinishReason, MessageRole, TokenUsage,
+};
 use services::completions::CompletionError;
 
 impl From<&crate::models::Message> for ChatMessage {

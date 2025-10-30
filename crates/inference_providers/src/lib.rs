@@ -66,11 +66,10 @@ use tokio_stream::StreamExt;
 
 // Re-export commonly used types for convenience
 pub use models::{
-    AttestationReportParams, ChatCompletionParams, ChatCompletionResponse,
-    ChatCompletionResponseChoice, ChatCompletionResponseWithBytes, ChatDelta, ChatMessage,
-    ChatResponseMessage, ChatSignature, CompletionError, CompletionParams, FinishReason,
-    FunctionChoice, FunctionDefinition, MessageRole, ModelInfo, NvidiaPayload, StreamChunk,
-    StreamOptions, TokenUsage, ToolChoice, ToolDefinition, VllmAttestationReport,
+    ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
+    ChatCompletionResponseWithBytes, ChatDelta, ChatMessage, ChatResponseMessage, ChatSignature,
+    CompletionError, CompletionParams, FinishReason, FunctionChoice, FunctionDefinition,
+    MessageRole, ModelInfo, StreamChunk, StreamOptions, TokenUsage, ToolChoice, ToolDefinition,
 };
 pub use sse_parser::SSEEvent;
 pub use vllm::{VLlmConfig, VLlmProvider};

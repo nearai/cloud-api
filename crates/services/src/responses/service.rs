@@ -183,6 +183,7 @@ impl ResponseServiceImpl {
                 workspace_id: uuid::Uuid::new_v4(),                 // TODO: Get from request
                 metadata: request.metadata.clone(),
                 body_hash: "placeholder".to_string(), // TODO: Get from request
+                n: None,
                 extra,
             };
 

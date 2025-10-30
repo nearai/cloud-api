@@ -13,10 +13,10 @@ pub async fn run(pool: &DbPool) -> Result<()> {
         .await
         .context("Failed to get database connection for migrations")?;
 
-    let migrations = load_sql_migrations("./crates/database/src/migrations/sql")
+    let migrations = load_sql_migrations(concat!(env!("CARGO_MANIFEST_DIR"), "/src/migrations/sql"))
         .expect("Failed to load migrations");
 
-    let migration_report = migrations::runner()
+    let migration_report = refinery::Runner::new(&migrations)
         .run_async(&mut **client)
         .await
         .context("Failed to run migrations")?;

@@ -1,5 +1,6 @@
 [build]
 # Enable reproducible builds
+[target.'cfg(target_os = "linux")']
 rustflags = [
     # Remap source file paths to remove machine-specific paths
     "--remap-path-prefix", "${PWD}=.",
@@ -13,9 +14,6 @@ rustflags = [
     # Additional reproducibility flags
     "-C", "link-arg=-Wl,--no-undefined",
     "-C", "link-arg=-Wl,--hash-style=gnu",
-    # "-C", "link-arg=-Wl,--no-undefined-version",
-    # Ensure consistent target features
-    # "-C", "target-cpu=native",
 ]
 
 [profile.release]
@@ -28,6 +26,6 @@ codegen-units = 1
 # Ensure consistent panic behavior
 panic = "abort"
 # Disable overflow checks for consistency
-# overflow-checks = false
+overflow-checks = false
 # Explicit optimization level
-# opt-level = 3
+opt-level = 3

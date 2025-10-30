@@ -40,6 +40,7 @@ WORKDIR /app
 
 # Copy the built binary
 COPY --from=builder /app/target/release/api /app/api
+COPY --from=builder /app/crates/database/src/migrations/sql /app/crates/database/src/migrations/sql
 
 # Change ownership to app user
 RUN chown -R app:app /app

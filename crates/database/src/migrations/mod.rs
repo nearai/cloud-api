@@ -1,10 +1,10 @@
 use crate::pool::DbPool;
 use anyhow::{Context, Result};
-use refinery::embed_migrations;
+use refinery::{embed_migrations, load_sql_migrations};
 use tracing::info;
 
 // Embed migrations from the migrations folder
-embed_migrations!("src/migrations/sql");
+// embed_migrations!("src/migrations/sql");
 
 /// Run database migrations
 pub async fn run(pool: &DbPool) -> Result<()> {
@@ -12,6 +12,9 @@ pub async fn run(pool: &DbPool) -> Result<()> {
         .get()
         .await
         .context("Failed to get database connection for migrations")?;
+
+    let migrations = load_sql_migrations("./crates/database/src/migrations/sql")
+        .expect("Failed to load migrations");
 
     let migration_report = migrations::runner()
         .run_async(&mut **client)

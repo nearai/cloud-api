@@ -58,7 +58,7 @@ impl ports::AttestationServiceTrait for AttestationService {
 
         // Fetch signature from provider
         let provider_signature = provider.get_signature(chat_id).await.map_err(|e| {
-            tracing::error!("Failed to get chat signature from provider: {:?}", e);
+            tracing::error!("Failed to get chat signature from provider");
             AttestationError::ProviderError(e.to_string())
         })?;
 
@@ -74,7 +74,7 @@ impl ports::AttestationServiceTrait for AttestationService {
             .add_chat_signature(chat_id, signature)
             .await
             .map_err(|e| {
-                tracing::error!("Failed to store chat signature in repository: {:?}", e);
+                tracing::error!("Failed to store chat signature in repository");
                 AttestationError::RepositoryError(e.to_string())
             })?;
 
@@ -170,19 +170,17 @@ impl ports::AttestationServiceTrait for AttestationService {
             // nonce has 32 bytes, dstack pads to 64
             let report_data = nonce.as_bytes().to_vec();
 
-            let info = client.info().await.map_err(|e| {
+            let info = client.info().await.map_err(|_| {
                 tracing::error!(
-                    "Failed to get cloud API attestation info, are you running in a CVM? {e:?}"
+                    "Failed to get cloud API attestation info, are you running in a CVM?"
                 );
                 AttestationError::InternalError(
                     "failed to get cloud API attestation info".to_string(),
                 )
             })?;
 
-            let cpu_quote = client.get_quote(report_data).await.map_err(|e| {
-                tracing::error!(
-                    "Failed to get cloud API attestation, are you running in a CVM? {e:?}"
-                );
+            let cpu_quote = client.get_quote(report_data).await.map_err(|_| {
+                tracing::error!("Failed to get cloud API attestation, are you running in a CVM?");
                 AttestationError::InternalError("failed to get cloud API attestation".to_string())
             })?;
             gateway_attestation = DstackCpuQuote::from_quote_and_nonce(info, cpu_quote, nonce);

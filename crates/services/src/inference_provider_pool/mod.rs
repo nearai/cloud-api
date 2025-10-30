@@ -69,7 +69,7 @@ impl InferenceProviderPool {
                 Ok(())
             }
             Err(e) => {
-                tracing::error!("Failed to initialize model discovery: {}", e);
+                tracing::error!("Failed to initialize model discovery");
                 Err(e)
             }
         }
@@ -428,14 +428,13 @@ impl InferenceProviderPool {
         }
 
         // All providers failed - log detailed errors but return sanitized message to user
-        let detailed_error_msg = detailed_errors.join("; ");
+        let _detailed_error_msg = detailed_errors.join("; ");
         let sanitized_error_msg = sanitized_errors.join("; ");
 
         tracing::error!(
             model_id = %model_id,
             providers_tried = providers.len(),
             operation = operation_name,
-            errors = %detailed_error_msg,
             "All providers failed for model"
         );
 

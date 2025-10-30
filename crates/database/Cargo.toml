@@ -46,7 +46,7 @@ services = { path = "../services" }
 config = { path = "../config" }
 
 # For database migrations
-refinery = { version = "0.8", features = ["tokio-postgres"] }
+refinery = { version = "0.8", features = ["tokio-postgres", "enums"] }
 
 # For hashing API keys and session tokens
 sha2 = "0.10"

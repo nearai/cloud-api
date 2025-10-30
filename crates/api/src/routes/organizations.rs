@@ -54,8 +54,8 @@ pub async fn list_organizations(
         .await
     {
         Ok(count) => count,
-        Err(e) => {
-            error!("Failed to count organizations for user: {}", e);
+        Err(_) => {
+            error!("Failed to count organizations for user");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -91,8 +91,8 @@ pub async fn list_organizations(
                 offset: params.offset,
             }))
         }
-        Err(e) => {
-            error!("Failed to list organizations for user: {}", e);
+        Err(_) => {
+            error!("Failed to list organizations for user");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -203,12 +203,9 @@ pub async fn create_organization(
                         workspace.id.0, org.id.0
                     );
                 }
-                Err(e) => {
+                Err(_) => {
                     // Log the error but don't fail the organization creation
-                    error!(
-                        "Failed to create default workspace for organization {}: {}",
-                        org.id.0, e
-                    );
+                    error!("Failed to create default workspace for organization",);
                 }
             }
 
@@ -222,8 +219,8 @@ pub async fn create_organization(
             debug!("Organization already exists");
             Err(StatusCode::CONFLICT)
         }
-        Err(e) => {
-            error!("Failed to create organization: {}", e);
+        Err(_) => {
+            error!("Failed to create organization");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -275,15 +272,15 @@ pub async fn get_organization(
             {
                 Ok(org) => Ok(Json(crate::conversions::services_org_to_api_org(org))),
                 Err(OrganizationError::NotFound) => Err(StatusCode::NOT_FOUND),
-                Err(e) => {
-                    error!("Failed to get organization: {}", e);
+                Err(_) => {
+                    error!("Failed to get organization");
                     Err(StatusCode::INTERNAL_SERVER_ERROR)
                 }
             }
         }
         Ok(false) => Err(StatusCode::FORBIDDEN),
-        Err(e) => {
-            error!("Failed to check organization membership: {}", e);
+        Err(_) => {
+            error!("Failed to check organization membership");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -341,8 +338,8 @@ pub async fn update_organization(
         Err(OrganizationError::NotFound) => Err(StatusCode::NOT_FOUND),
         Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
         Err(OrganizationError::InvalidParams(_)) => Err(StatusCode::BAD_REQUEST),
-        Err(e) => {
-            error!("Failed to update organization: {}", e);
+        Err(_) => {
+            error!("Failed to update organization");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -392,13 +389,13 @@ pub async fn delete_organization(
             })))
         }
         Ok(false) => {
-            error!("Failed to delete organization {}", org_id);
+            error!("Failed to delete organization");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
         Err(OrganizationError::NotFound) => Err(StatusCode::NOT_FOUND),
         Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
-        Err(e) => {
-            error!("Failed to delete organization: {}", e);
+        Err(_) => {
+            error!("Failed to delete organization");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }

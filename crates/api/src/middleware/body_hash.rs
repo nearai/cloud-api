@@ -36,8 +36,8 @@ pub async fn body_hash_middleware(request: Request, next: Next) -> Result<Respon
     // Collect the entire body
     let body_bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            error!("Failed to read request body: {}", e);
+        Err(_) => {
+            error!("Failed to read request body");
             return Err(StatusCode::BAD_REQUEST);
         }
     };

@@ -143,6 +143,146 @@ async fn test_workspaces_duplicate_name_conflict_message() {
 }
 
 #[tokio::test]
+async fn test_workspace_get_not_found_message() {
+    let server = setup_test_server().await;
+
+    let random_ws_id = uuid::Uuid::new_v4();
+
+    let response = server
+        .get(format!("/v1/workspaces/{}", random_ws_id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(response.status_code(), 404);
+    let err = response.json::<api::models::ErrorResponse>();
+    assert_eq!(err.error.r#type, "not_found");
+    assert_eq!(err.error.message, "Workspace not found");
+}
+
+#[tokio::test]
+async fn test_list_workspace_api_keys_not_found_message() {
+    let server = setup_test_server().await;
+
+    let random_ws_id = uuid::Uuid::new_v4();
+
+    let response = server
+        .get(format!("/v1/workspaces/{}/api-keys", random_ws_id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(response.status_code(), 404);
+    let err = response.json::<api::models::ErrorResponse>();
+    assert_eq!(err.error.r#type, "not_found");
+    assert_eq!(err.error.message, "Workspace not found");
+}
+
+// ============================================
+// Users Error Messages
+// ============================================
+
+#[tokio::test]
+async fn test_users_refresh_tokens_missing_authorization_message() {
+    let server = setup_test_server().await;
+
+    let response = server.get("/v1/users/me/refresh-tokens").await;
+
+    assert_eq!(response.status_code(), 401);
+    let err = response.json::<api::models::ErrorResponse>();
+    assert_eq!(err.error.r#type, "unauthorized");
+    assert_eq!(err.error.message, "Missing authorization");
+}
+
+// ============================================
+// Additional Missing Auth and Conflict Cases
+// ============================================
+
+#[tokio::test]
+async fn test_create_workspace_missing_authorization_message() {
+    let server = setup_test_server().await;
+    let org = create_org(&server).await;
+
+    let req = api::routes::workspaces::CreateWorkspaceRequest {
+        name: format!("ws-noauth-{}", uuid::Uuid::new_v4()),
+        display_name: Some("No Auth".to_string()),
+        description: Some("desc".to_string()),
+    };
+
+    let response = server
+        .post(format!("/v1/organizations/{}/workspaces", org.id).as_str())
+        .json(&req)
+        .await;
+
+    assert_eq!(response.status_code(), 401);
+    let err = response.json::<api::models::ErrorResponse>();
+    assert_eq!(err.error.r#type, "unauthorized");
+    assert_eq!(err.error.message, "Missing authorization");
+}
+
+#[tokio::test]
+async fn test_list_workspace_api_keys_missing_authorization_message() {
+    let server = setup_test_server().await;
+    let org = create_org(&server).await;
+    let workspaces = list_workspaces(&server, org.id.clone()).await;
+    let workspace = workspaces.first().unwrap();
+
+    let response = server
+        .get(format!("/v1/workspaces/{}/api-keys", workspace.id).as_str())
+        .await;
+
+    assert_eq!(response.status_code(), 401);
+    let err = response.json::<api::models::ErrorResponse>();
+    assert_eq!(err.error.r#type, "unauthorized");
+    assert_eq!(err.error.message, "Missing authorization");
+}
+
+#[tokio::test]
+async fn test_list_organizations_missing_authorization_message() {
+    let server = setup_test_server().await;
+
+    let response = server.get("/v1/organizations").await;
+
+    assert_eq!(response.status_code(), 401);
+    let err = response.json::<api::models::ErrorResponse>();
+    assert_eq!(err.error.r#type, "unauthorized");
+    assert_eq!(err.error.message, "Missing authorization");
+}
+
+#[tokio::test]
+async fn test_create_api_key_duplicate_name_conflict_message() {
+    let server = setup_test_server().await;
+    let org = create_org(&server).await;
+    let workspaces = list_workspaces(&server, org.id.clone()).await;
+    let workspace = workspaces.first().unwrap();
+
+    let req = api::models::CreateApiKeyRequest {
+        name: "dup-key".to_string(),
+        expires_at: None,
+        spend_limit: None,
+    };
+
+    let first = server
+        .post(format!("/v1/workspaces/{}/api-keys", workspace.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&req)
+        .await;
+    assert_eq!(first.status_code(), 201);
+
+    let dup = server
+        .post(format!("/v1/workspaces/{}/api-keys", workspace.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&req)
+        .await;
+
+    assert_eq!(dup.status_code(), 409);
+    let err = dup.json::<api::models::ErrorResponse>();
+    assert_eq!(err.error.r#type, "duplicate_api_key_name");
+    assert_eq!(
+        err.error.message,
+        "API key with this name already exists in this workspace"
+    );
+}
+
+#[tokio::test]
 async fn test_users_me_missing_authorization_message() {
     let server = setup_test_server().await;
 

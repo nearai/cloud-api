@@ -13,7 +13,7 @@ async fn test_create_access_token_from_refresh_token() {
 
     let response = server
         .post("/v1/users/me/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", refresh_token))
+        .add_header("Authorization", format!("Bearer {refresh_token}"))
         .await;
 
     assert_eq!(response.status_code(), 200);
@@ -71,7 +71,7 @@ async fn test_access_token_cannot_create_new_access_token() {
     // Try to use access token to create another access token (should fail in production)
     let response = server
         .post("/v1/users/me/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
     assert_eq!(
@@ -92,7 +92,7 @@ async fn test_refresh_token_cannot_access_regular_endpoints() {
     // Try to use refresh token on a regular endpoint (should fail in production)
     let response = server
         .get("/v1/users/me")
-        .add_header("Authorization", format!("Bearer {}", refresh_token))
+        .add_header("Authorization", format!("Bearer {refresh_token}"))
         .await;
 
     assert_eq!(
@@ -111,7 +111,7 @@ async fn test_list_user_refresh_tokens() {
 
     let response = server
         .get("/v1/users/me/refresh-tokens")
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
     assert_eq!(response.status_code(), 200);
@@ -153,7 +153,7 @@ async fn test_revoke_all_tokens() {
 
     let response = server
         .delete("/v1/users/me/tokens")
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
     assert_eq!(response.status_code(), 200);
@@ -190,21 +190,21 @@ async fn test_revoke_all_tokens_invalidates_access_token() {
     // Verify access token works
     let response = server
         .get("/v1/users/me")
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
     assert_eq!(response.status_code(), 200, "Access token should work");
 
     // Revoke all tokens
     let revoke_response = server
         .delete("/v1/users/me/tokens")
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
     assert_eq!(revoke_response.status_code(), 200);
 
     // Try to use the old access token (should fail in production)
     let response = server
         .get("/v1/users/me")
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
     assert_eq!(
@@ -228,14 +228,14 @@ async fn test_revoke_all_tokens_prevents_refresh_token_use() {
     // Revoke all tokens using the access token
     let revoke_response = server
         .delete("/v1/users/me/tokens")
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
     assert_eq!(revoke_response.status_code(), 200);
 
     // Try to create a new access token with the old refresh token (should fail in production)
     let response = server
         .post("/v1/users/me/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", refresh_token))
+        .add_header("Authorization", format!("Bearer {refresh_token}"))
         .await;
 
     assert_eq!(
@@ -266,7 +266,7 @@ async fn test_access_token_works_on_regular_endpoints() {
     // Test on user endpoint
     let response = server
         .get("/v1/users/me")
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
     assert_eq!(response.status_code(), 200, "Access token should work");
@@ -291,7 +291,7 @@ async fn test_access_token_can_create_organization() {
 
     let response = server
         .post("/v1/organizations")
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&create_request)
         .await;
 

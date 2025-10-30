@@ -35,9 +35,9 @@ impl OrganizationServiceImpl {
             RepositoryError::RequiredFieldMissing(field) => {
                 OrganizationError::InvalidParams(format!("Required field is missing: {field}"))
             }
-            RepositoryError::ForeignKeyViolation(msg) => OrganizationError::InvalidParams(format!(
-                "Referenced entity does not exist: {msg}"
-            )),
+            RepositoryError::ForeignKeyViolation(msg) => {
+                OrganizationError::InvalidParams(format!("Referenced entity does not exist: {msg}"))
+            }
             RepositoryError::ValidationFailed(msg) => {
                 OrganizationError::InvalidParams(format!("Validation failed: {msg}"))
             }

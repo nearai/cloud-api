@@ -191,9 +191,7 @@ pub async fn create_response(
             }
             Err(error) => {
                 tracing::error!(
-                    user_id = %api_key.created_by_user_id.0,
                     model = %request.model,
-                    error = %error,
                     "Failed to create streaming response"
                 );
                 let status_code = map_response_error_to_status(&error);
@@ -371,9 +369,7 @@ pub async fn create_response(
             }
             Err(error) => {
                 tracing::error!(
-                    user_id = %api_key.created_by_user_id.0,
                     model = %request.model,
-                    error = %error,
                     "Failed to create non-streaming response"
                 );
                 let status_code = map_response_error_to_status(&error);

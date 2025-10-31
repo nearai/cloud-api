@@ -58,8 +58,8 @@ pub async fn github_login(
 ) -> Result<Redirect, StatusCode> {
     debug!("Initiating GitHub OAuth flow");
 
-    let (auth_url, state) = oauth.github_auth_url().map_err(|e| {
-        error!("Failed to generate GitHub auth URL: {}", e);
+    let (auth_url, state) = oauth.github_auth_url().map_err(|_| {
+        error!("Failed to generate GitHub auth URL");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -83,8 +83,8 @@ pub async fn google_login(
 ) -> Result<Redirect, StatusCode> {
     debug!("Initiating Google OAuth flow");
 
-    let (auth_url, state, pkce_verifier) = oauth.google_auth_url().map_err(|e| {
-        error!("Failed to generate Google auth URL: {}", e);
+    let (auth_url, state, pkce_verifier) = oauth.google_auth_url().map_err(|_| {
+        error!("Failed to generate Google auth URL");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -123,7 +123,7 @@ pub async fn oauth_callback(
     let oauth_state = match oauth_state {
         Some(state) => state,
         None => {
-            error!("Invalid or expired OAuth state: {}", params.state);
+            error!("Invalid or expired OAuth state");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -179,7 +179,7 @@ pub async fn oauth_callback(
     let (oauth_user_info, _access_token) = match oauth_result {
         Ok(result) => result,
         Err(e) => {
-            error!("OAuth authentication failed: {}", e);
+            error!("OAuth authentication failed");
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({
@@ -195,7 +195,7 @@ pub async fn oauth_callback(
     let user = match auth_service.get_or_create_oauth_user(oauth_user_info).await {
         Ok(user) => user,
         Err(e) => {
-            error!("Failed to get or create user: {}", e);
+            error!("Failed to get or create user");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
@@ -237,7 +237,7 @@ pub async fn oauth_callback(
             Json(response).into_response()
         }
         Err(e) => {
-            error!("Failed to create session: {}", e);
+            error!("Failed to create session");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({

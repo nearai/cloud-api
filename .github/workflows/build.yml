@@ -14,7 +14,7 @@ env:
 
 jobs:
   reproducible-docker-image:
-    name: Reproducible Build
+    name: Reproducible Docker Image
     permissions:
       contents: read
       packages: write

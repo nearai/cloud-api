@@ -5,3 +5,4 @@ config/examples/production.yaml
 .cursor
 *.crt
 .env
+*.DS_Store

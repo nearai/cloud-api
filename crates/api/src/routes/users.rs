@@ -358,7 +358,7 @@ pub async fn create_access_token(
     // fetch the session associated with this current refresh token
     let session_opt = app_state
         .auth_service
-        .get_session_by_token(user.0.id, &curr_refresh_token)
+        .get_session_by_refresh_token(user.0.id, &curr_refresh_token)
         .await
         .map_err(|e| {
             error!(
@@ -380,8 +380,8 @@ pub async fn create_access_token(
         if let Some(req_ua) = user_agent_header.as_ref() {
             if db_ua != req_ua {
                 error!(
-                    "User-Agent mismatch for user {}. DB {:?}, Request: {:?}",
-                    user.0.id, db_ua, req_ua
+                    "User-Agent mismatch for user {}.",
+                    user.0.id
                 );
                 return Err(StatusCode::UNAUTHORIZED);
             }
@@ -425,18 +425,6 @@ pub async fn create_access_token(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
-
-    // match app_state.auth_service.create_session_access_token(
-    //     services::auth::UserId(user.0.id),
-    //     app_state.config.auth.encoding_key.to_string(),
-    //     1, // 1 hour expiration
-    // ) {
-    //     Ok(access_token) => Ok(Json(crate::models::AccessTokenResponse { access_token })),
-    //     Err(e) => {
-    //         error!("Failed to create access token: {}", e);
-    //         Err(StatusCode::INTERNAL_SERVER_ERROR)
-    //     }
-    // }
 }
 
 /// List pending invitations for the current user

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc};
 use uuid::Uuid;
 
 use crate::organization::OrganizationRepository;
@@ -194,7 +194,7 @@ pub trait SessionRepository: Send + Sync {
     ) -> anyhow::Result<(Session, String)>;
 
     // Fetch the session of the inputted refresh token
-    async fn get_session_by_token(
+    async fn get_session_by_refresh_token(
         &self,
         user_id: Uuid,
         token: &str
@@ -219,7 +219,7 @@ pub trait SessionRepository: Send + Sync {
 #[async_trait]
 pub trait AuthServiceTrait: Send + Sync {
     // Fetch the session of the inputted refresh token
-    async fn get_session_by_token(
+    async fn get_session_by_refresh_token(
         &self,
         user_id: Uuid,
         token: &str
@@ -395,12 +395,21 @@ impl MockAuthService {
 impl AuthServiceTrait for MockAuthService {
     
     // Fetch the session of the inputted refresh token
-    async fn get_session_by_token(
+    async fn get_session_by_refresh_token(
         &self,
         _user_id: Uuid,
-        _token: &str
+        _token: &str,
     ) -> Result<Option<Session>, AuthError> {
-        Ok(None)
+        let fake_user_id = Uuid::new_v4();
+
+        let (_access_token, session, _refresh_token) = self.create_mock_session_with_params(
+            UserId(fake_user_id),
+            Some("127.0.0.1".to_string()),
+            Some("Mock User Agent".to_string()),
+            "mock_encoding_key".to_string(),
+            1, 24 * 7
+        );
+        Ok(Some(session))
     }
 
     async fn create_session(

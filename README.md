@@ -122,3 +122,8 @@ The application uses YAML configuration files located in the `config/` directory
 2. Check code formatting: `cargo fmt --check`
 3. Run linting: `cargo clippy`
 4. Ensure database migrations work with test setup
+
+
+## License 
+
+Licensed under the [PolyForm Strict License 1.0.0](LICENSE).

@@ -362,8 +362,8 @@ pub async fn create_access_token(
         .await
         .map_err(|e| {
             error!(
-                "Failed to fetch session by refresh token for user {}: {}.\n refresh token: {}",
-                user.0.id, e, curr_refresh_token
+                "Failed to fetch session by refresh token for user {}: {}.",
+                user.0.id, e
             );
             StatusCode::INTERNAL_SERVER_ERROR
         })?;

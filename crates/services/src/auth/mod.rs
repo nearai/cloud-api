@@ -11,8 +11,21 @@ use async_trait::async_trait;
 use chrono::Utc;
 use std::sync::Arc;
 
+use uuid::Uuid;
+
 #[async_trait]
 impl AuthServiceTrait for AuthService {
+    // Fetch the most recent valid refresh token for a user
+    async fn get_latest_valid_session(
+        &self,
+        user_id: Uuid
+    ) -> Result<Option<Session>, AuthError> {
+        self.session_repository
+            .get_latest_valid_session(user_id)
+            .await
+            .map_err(|e| AuthError::InternalError(format!("Failed to get latest session: {}", e)))
+    }
+
     async fn create_session(
         &self,
         user_id: UserId,

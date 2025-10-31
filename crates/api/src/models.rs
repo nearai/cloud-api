@@ -1024,6 +1024,14 @@ pub struct AccessTokenResponse {
     pub access_token: String,
 }
 
+// acess token + refresh token response model
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AccessAndRefreshTokenResponse {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub refresh_token_expiration: DateTime<Utc>
+}
+
 /// Organization member response model (non-sensitive)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationMemberResponse {

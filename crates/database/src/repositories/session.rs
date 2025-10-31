@@ -79,6 +79,39 @@ impl SessionRepository {
         Ok((session, session_token))
     }
 
+    // Fetch the most recent valid refresh token for a user
+    pub async fn get_latest_valid_session(
+        &self,
+        user_id: Uuid
+    ) -> Result<Option<Session>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let row_opt = client
+            .query_opt(
+                r#"
+                SELECT *
+                FROM refresh_tokens
+                WHERE user_id = $1
+                AND expires_at > NOW()
+                ORDER BY created_at DESC
+                LIMIT 1
+                "#,
+                &[&user_id]
+            )
+            .await
+            .context("Failed to query latest valid refresh token");
+
+        if let Ok(row) = row_opt {
+            Ok(Some(self.row_to_session(row.unwrap())?))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Validate a refresh token and return the associated session
     pub async fn validate(&self, session_token: &str) -> Result<Option<Session>> {
         let client = self
@@ -264,6 +297,49 @@ impl services::auth::SessionRepository for SessionRepository {
         };
 
         Ok((service_session, token))
+    }
+
+    // Fetch the most recent valid refresh token for a user
+    async fn get_latest_valid_session(
+        &self,
+        user_id: Uuid
+    ) -> Result<Option<services::auth::Session>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let row_opt = client
+            .query_opt(
+                r#"
+                SELECT *
+                FROM refresh_tokens
+                WHERE user_id = $1
+                AND expires_at > NOW()
+                ORDER BY created_at DESC
+                LIMIT 1
+                "#,
+                &[&user_id]
+            )
+            .await
+            .context("Failed to query latest valid refresh token");
+
+        if let Ok(row) = row_opt {
+            let db_session = self.row_to_session(row.unwrap())?;
+            let server_session = services::auth::Session {
+                id: services::auth::SessionId(db_session.id),
+                user_id: services::auth::UserId(db_session.user_id),
+                token_hash: db_session.token_hash,
+                created_at: db_session.created_at,
+                expires_at: db_session.expires_at,
+                ip_address: db_session.ip_address,
+                user_agent: db_session.user_agent
+            };
+            Ok(Some(server_session))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn validate(

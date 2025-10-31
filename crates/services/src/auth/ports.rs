@@ -193,6 +193,12 @@ pub trait SessionRepository: Send + Sync {
         expires_in_hours: i64,
     ) -> anyhow::Result<(Session, String)>;
 
+    // Fetch the most recent valid refresh token for a user
+    async fn get_latest_valid_session(
+        &self,
+        user_id: Uuid
+    ) -> anyhow::Result<Option<Session>>;
+
     async fn validate(&self, session_token: SessionToken) -> anyhow::Result<Option<Session>>;
 
     async fn get_by_id(&self, session_id: SessionId) -> anyhow::Result<Option<Session>>;
@@ -211,6 +217,12 @@ pub trait SessionRepository: Send + Sync {
 // Service interfaces
 #[async_trait]
 pub trait AuthServiceTrait: Send + Sync {
+    // Fetch the most recent valid refresh token for a user
+    async fn get_latest_valid_session(
+        &self,
+        user_id: Uuid
+    ) -> Result<Option<Session>, AuthError>;
+
     /// Create a new session for a user
     async fn create_session(
         &self,
@@ -379,6 +391,15 @@ impl MockAuthService {
 
 #[async_trait]
 impl AuthServiceTrait for MockAuthService {
+    // Fetch the most recent valid refresh token for a user
+    async fn get_latest_valid_session(
+        &self,
+        _user_id: Uuid
+    ) -> Result<Option<Session>, AuthError> {
+        // we do not need to do valid session checks for mock testing
+        Ok(None)
+    }
+
     async fn create_session(
         &self,
         user_id: UserId,

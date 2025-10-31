@@ -124,6 +124,7 @@ use utoipa::{Modify, OpenApi};
             UserResponse,
             RefreshTokenResponse,
             AccessTokenResponse,
+            AccessAndRefreshTokenResponse,
             PublicUserResponse,
             AdminUserResponse,
             crate::routes::users::UpdateUserProfileRequest,

@@ -40,7 +40,12 @@ RUN cargo build --release --locked --bin api
 
 
 # Runtime stage
-FROM debian:bookworm@sha256:26f2a7cab45014541c65f9d140ccfa6aaefbb49686c6759bea9c6f7f5bb3d72f AS runtime
+FROM debian:bookworm-slim@sha256:78d2f66e0fec9e5a39fb2c72ea5e052b548df75602b5215ed01a17171529f706 AS runtime
+
+# Bootstrap by installing ca-certificates which will be overridden by the pinned packages
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
 
 # Install pinned apt dependencies
 RUN --mount=type=bind,source=pinned-packages-runtime.txt,target=/tmp/pinned-packages-runtime.txt,ro \

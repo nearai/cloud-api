@@ -15,7 +15,7 @@ RUN --mount=type=bind,source=pinned-packages-builder.txt,target=/tmp/pinned-pack
         pkg=$(echo $line | cut -d= -f1); \
         ver=$(echo $line | cut -d= -f2); \
         if [ ! -z "$pkg" ] && [ ! -z "$ver" ]; then \
-            echo "Package: $pkg\nPin: version $ver\nPin-Priority: 1001\n" >> /etc/apt/preferences.d/pinned-packages; \
+            printf "Package: %s\nPin: version %s\nPin-Priority: 1001\n\n" "$pkg" "$ver" >> /etc/apt/preferences.d/pinned-packages; \
         fi; \
     done && \
     apt-get update && \
@@ -62,7 +62,7 @@ RUN --mount=type=bind,source=pinned-packages-runtime.txt,target=/tmp/pinned-pack
         pkg=$(echo $line | cut -d= -f1); \
         ver=$(echo $line | cut -d= -f2); \
         if [ ! -z "$pkg" ] && [ ! -z "$ver" ]; then \
-            echo "Package: $pkg\nPin: version $ver\nPin-Priority: 1001\n" >> /etc/apt/preferences.d/pinned-packages; \
+            printf "Package: %s\nPin: version %s\nPin-Priority: 1001\n\n" "$pkg" "$ver" >> /etc/apt/preferences.d/pinned-packages; \
         fi; \
     done && \
     apt-get update && \
@@ -78,15 +78,15 @@ RUN useradd -m -u 1000 app
 # Create app directory
 WORKDIR /app
 
-# Copy the pinned package list from builder stage
-COPY --from=builder /app/pinned-packages-builder.txt /app/pinned-packages-builder.txt
-
 # Copy the built binary
 COPY --from=builder /app/target/release/api /app/api
 
 # Copy the migration SQL files
 RUN mkdir -p /app/crates/database/src/migrations/sql
 COPY --chmod=0664 --from=builder /app/crates/database/src/migrations/sql/*.sql /app/crates/database/src/migrations/sql/
+
+# Copy the pinned package list from builder stage
+COPY --from=builder /app/pinned-packages-builder.txt /app/pinned-packages-builder.txt
 
 # Change ownership to app user
 RUN chown -R app:app /app

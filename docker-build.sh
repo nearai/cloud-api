@@ -64,7 +64,7 @@ echo ""
 # Extract package information from the built image
 echo "Extracting package information from built image: $TEMP_TAG"
 # Extract builder stage package information
-docker run --rm --entrypoint bash "$TEMP_TAG" -c "cat /app/pinned-packages-builder.txt" > pinned-packages-builder.txt
+docker run --rm "$TEMP_TAG" cat /app/pinned-packages-builder.txt > pinned-packages-builder.txt
 echo "Package information extracted to pinned-packages-builder.txt ($(wc -l < pinned-packages-builder.txt) packages)"
 # Extract runtime stage package information
 docker run --rm --entrypoint bash "$TEMP_TAG" -c "dpkg -l | grep '^ii' | awk '{print \$2\"=\"\$3}' | sort" > pinned-packages-runtime.txt

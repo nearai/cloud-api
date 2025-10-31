@@ -29,7 +29,8 @@ fi
 touch pinned-packages.txt
 git rev-parse HEAD > .GIT_REV
 TEMP_TAG="cloud-api-temp:$(date +%s)"
-docker buildx build --builder buildkit_20 --no-cache --build-arg SOURCE_DATE_EPOCH="0" \
+docker buildx build --builder buildkit_20 --no-cache --platform linux/amd64 \
+    --build-arg SOURCE_DATE_EPOCH="0" \
     --output type=oci,dest=./oci.tar,rewrite-timestamp=true \
     --output type=docker,name="$TEMP_TAG",rewrite-timestamp=true .
 

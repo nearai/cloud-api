@@ -13,7 +13,7 @@ pub async fn run(pool: &DbPool) -> Result<()> {
     // Load the migration SQL files from the migrations/sql folder
     let migrations =
         load_sql_migrations(concat!(env!("CARGO_MANIFEST_DIR"), "/src/migrations/sql"))
-            .expect("Failed to load migrations");
+            .context("Failed to load migrations")?;
 
     let migration_report = refinery::Runner::new(&migrations)
         .run_async(&mut **client)

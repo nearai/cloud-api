@@ -205,7 +205,7 @@ pub async fn create_organization(
                 }
                 Err(_) => {
                     // Log the error but don't fail the organization creation
-                    error!("Failed to create default workspace for organization",);
+                    error!("Failed to create default workspace for organization");
                 }
             }
 

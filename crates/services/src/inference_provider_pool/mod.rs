@@ -428,7 +428,7 @@ impl InferenceProviderPool {
         }
 
         // All providers failed - log detailed errors but return sanitized message to user
-        let _detailed_error_msg = detailed_errors.join("; ");
+        // let detailed_error_msg = detailed_errors.join("; ");
         let sanitized_error_msg = sanitized_errors.join("; ");
 
         tracing::error!(

@@ -1018,12 +1018,6 @@ pub struct RefreshTokenResponse {
     pub user_agent: Option<String>,
 }
 
-/// Access token response model
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AccessTokenResponse {
-    pub access_token: String,
-}
-
 // acess token + refresh token response model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AccessAndRefreshTokenResponse {

@@ -18,7 +18,7 @@ async fn test_create_access_token_from_refresh_token() {
 
     assert_eq!(response.status_code(), 200);
 
-    let token_response = response.json::<api::models::AccessTokenResponse>();
+    let token_response = response.json::<api::models::AccessAndRefreshTokenResponse>();
     assert!(
         !token_response.access_token.is_empty(),
         "Access token should not be empty"

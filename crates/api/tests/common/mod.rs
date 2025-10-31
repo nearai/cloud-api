@@ -103,7 +103,7 @@ pub async fn get_access_token_from_refresh_token(
         "Failed to refresh access token"
     );
 
-    let refresh_response = response.json::<api::models::AccessTokenResponse>();
+    let refresh_response = response.json::<api::models::AccessAndRefreshTokenResponse>();
     refresh_response.access_token
 }
 

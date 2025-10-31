@@ -137,7 +137,7 @@ impl From<services::CompletionError> for crate::models::ErrorResponse {
             ),
             services::CompletionError::InternalError(msg) => ErrorResponse::new(
                 format!("Internal server error: {msg}"),
-                "internal_error".to_string(),
+                "internal_server_error".to_string(),
             ),
         }
     }

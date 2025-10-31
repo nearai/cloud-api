@@ -54,7 +54,7 @@ pub async fn get_signature(
     Path(chat_id): Path<String>,
     Query(_params): Query<SignatureQuery>,
     State(app_state): State<AppState>,
-) -> Result<ResponseJson<SignatureResponse>, (StatusCode, ResponseJson<serde_json::Value>)> {
+) -> Result<ResponseJson<SignatureResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     let signature = app_state
         .attestation_service
         .get_chat_signature(chat_id.as_str())
@@ -62,7 +62,9 @@ pub async fn get_signature(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(serde_json::json!({ "error": e.to_string() })),
+                ResponseJson(ErrorResponse {
+                    error: e.to_string(),
+                }),
             )
         })?;
 
@@ -152,7 +154,7 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
 pub async fn get_attestation_report(
     Query(params): Query<AttestationQuery>,
     State(app_state): State<AppState>,
-) -> Result<ResponseJson<AttestationResponse>, (StatusCode, ResponseJson<serde_json::Value>)> {
+) -> Result<ResponseJson<AttestationResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     let report = app_state
         .attestation_service
         .get_attestation_report(
@@ -165,7 +167,9 @@ pub async fn get_attestation_report(
         .map_err(|e| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                ResponseJson(serde_json::json!({ "error": e.to_string() })),
+                ResponseJson(ErrorResponse {
+                    error: e.to_string(),
+                }),
             )
         })?;
 
@@ -197,7 +201,7 @@ impl From<services::attestation::models::DstackCpuQuote> for QuoteResponse {
 }
 
 /// Error response
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorResponse {
     pub error: String,
 }

@@ -214,8 +214,8 @@ pub async fn admin_middleware(
             // Try admin access token first
             match authenticate_admin_access_token(
                 &state,
-                token.to_string(),
-                user_agent_header.clone(),
+                token,
+                user_agent_header.as_deref(),
             )
             .await
             {
@@ -309,8 +309,8 @@ fn check_admin_access(state: &AuthState, user: &DbUser) -> bool {
 /// Authenticate admin access token
 async fn authenticate_admin_access_token(
     state: &AuthState,
-    token: String,
-    current_user_agent: Option<String>,
+    token: &str,
+    current_user_agent: Option<&str>,
 ) -> Result<database::models::AdminAccessToken, StatusCode> {
     debug!("Authenticating admin access token: {}", token);
 

@@ -64,6 +64,11 @@ pub trait ResponseServiceTrait: Send + Sync {
     async fn create_response_stream(
         &self,
         request: models::CreateResponseRequest,
+        user_id: UserId,
+        api_key_id: String,
+        organization_id: uuid::Uuid,
+        workspace_id: uuid::Uuid,
+        body_hash: String,
     ) -> Result<
         Pin<Box<dyn Stream<Item = models::ResponseStreamEvent> + Send>>,
         errors::ResponseError,

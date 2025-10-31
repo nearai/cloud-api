@@ -281,13 +281,16 @@ pub async fn init_domain_services(
         models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
     ));
 
+    let web_search_provider =
+        Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
+
     let response_service = Arc::new(services::ResponseService::new(
         response_repo,
         inference_provider_pool.clone(),
         conversation_service.clone(),
         completion_service.clone(),
-        None, // web_search_provider
-        None, // file_search_provider
+        Some(web_search_provider), // web_search_provider
+        None,                      // file_search_provider
     ));
 
     // Create session repository for user service
@@ -570,7 +573,7 @@ pub fn build_response_routes(
         .with_state(response_service)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
-            auth_middleware_with_api_key,
+            middleware::auth::auth_middleware_with_workspace_context,
         ))
         .layer(from_fn(middleware::body_hash_middleware))
 }

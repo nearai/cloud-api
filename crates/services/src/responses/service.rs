@@ -7,15 +7,16 @@ use futures::Stream;
 use crate::completions::ports::CompletionServiceTrait;
 use crate::conversations::ports::ConversationServiceTrait;
 use crate::inference_provider_pool::InferenceProviderPool;
-use crate::responses::{errors, models, ports, tool_providers};
+use crate::responses::tools;
+use crate::responses::{errors, models, ports};
 
 pub struct ResponseServiceImpl {
     pub response_repository: Arc<dyn ports::ResponseRepositoryTrait>,
     pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub conversation_service: Arc<dyn ConversationServiceTrait>,
     pub completion_service: Arc<dyn CompletionServiceTrait>,
-    pub web_search_provider: Option<Arc<dyn tool_providers::WebSearchProviderTrait>>,
-    pub file_search_provider: Option<Arc<dyn tool_providers::FileSearchProviderTrait>>,
+    pub web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
+    pub file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
 }
 
 impl ResponseServiceImpl {
@@ -24,8 +25,8 @@ impl ResponseServiceImpl {
         inference_provider_pool: Arc<InferenceProviderPool>,
         conversation_service: Arc<dyn ConversationServiceTrait>,
         completion_service: Arc<dyn CompletionServiceTrait>,
-        web_search_provider: Option<Arc<dyn tool_providers::WebSearchProviderTrait>>,
-        file_search_provider: Option<Arc<dyn tool_providers::FileSearchProviderTrait>>,
+        web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
+        file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
     ) -> Self {
         Self {
             response_repository,
@@ -43,6 +44,11 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
     async fn create_response_stream(
         &self,
         request: models::CreateResponseRequest,
+        user_id: crate::UserId,
+        api_key_id: String,
+        organization_id: uuid::Uuid,
+        workspace_id: uuid::Uuid,
+        body_hash: String,
     ) -> Result<
         Pin<Box<dyn Stream<Item = models::ResponseStreamEvent> + Send>>,
         errors::ResponseError,
@@ -60,11 +66,15 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let web_search_provider = self.web_search_provider.clone();
         let file_search_provider = self.file_search_provider.clone();
 
-        // Spawn the actual work in a background task
         tokio::spawn(async move {
             if let Err(e) = Self::process_response_stream(
                 tx.clone(),
                 request,
+                user_id,
+                api_key_id,
+                organization_id,
+                workspace_id,
+                body_hash,
                 response_repository,
                 completion_service,
                 conversation_service,
@@ -100,11 +110,16 @@ impl ResponseServiceImpl {
     async fn process_response_stream(
         mut tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
         request: models::CreateResponseRequest,
+        user_id: crate::UserId,
+        api_key_id: String,
+        organization_id: uuid::Uuid,
+        workspace_id: uuid::Uuid,
+        body_hash: String,
         _response_repository: Arc<dyn ports::ResponseRepositoryTrait>,
         completion_service: Arc<dyn CompletionServiceTrait>,
         _conversation_service: Arc<dyn ConversationServiceTrait>,
-        web_search_provider: Option<Arc<dyn tool_providers::WebSearchProviderTrait>>,
-        file_search_provider: Option<Arc<dyn tool_providers::FileSearchProviderTrait>>,
+        web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
+        file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
     ) -> Result<(), errors::ResponseError> {
         use crate::completions::ports::{CompletionMessage, CompletionRequest};
         use futures::SinkExt;
@@ -112,16 +127,13 @@ impl ResponseServiceImpl {
 
         tracing::info!("Starting response stream processing");
 
-        // Step 1: Load conversation context
         let mut messages = Self::load_conversation_context(&request).await?;
 
-        // Step 2: Create initial response object (skeleton - not saving to DB yet)
-        let response_id = uuid::Uuid::new_v4();
+        let response_id = uuid::Uuid::new_v4().simple();
         let response_id_str = format!("resp_{}", response_id);
 
         let initial_response = Self::create_initial_response_object(&request, &response_id_str);
 
-        // Emit response.created event
         let created_event = models::ResponseStreamEvent {
             event_type: "response.created".to_string(),
             response: Some(initial_response.clone()),
@@ -137,11 +149,9 @@ impl ResponseServiceImpl {
             errors::ResponseError::InternalError(format!("Failed to send event: {}", e))
         })?;
 
-        // Step 3: Prepare tools for LLM
         let tools = Self::prepare_tools(&request);
         let tool_choice = Self::prepare_tool_choice(&request);
 
-        // Step 4: Agent loop - iteratively call LLM and execute tools
         let max_iterations = 10; // Prevent infinite loops
         let mut iteration = 0;
         let mut final_response_text = String::new();
@@ -177,12 +187,12 @@ impl ResponseServiceImpl {
                 top_p: request.top_p,
                 stop: None,
                 stream: Some(true),
-                user_id: crate::UserId::from(uuid::Uuid::new_v4()), // TODO: Get from request
-                api_key_id: "placeholder".to_string(),              // TODO: Get from request
-                organization_id: uuid::Uuid::new_v4(),              // TODO: Get from request
-                workspace_id: uuid::Uuid::new_v4(),                 // TODO: Get from request
+                user_id: user_id.clone(),
+                api_key_id: api_key_id.clone(),
+                organization_id,
+                workspace_id,
                 metadata: request.metadata.clone(),
-                body_hash: "placeholder".to_string(), // TODO: Get from request
+                body_hash: body_hash.clone(),
                 n: None,
                 extra,
             };
@@ -197,6 +207,12 @@ impl ResponseServiceImpl {
             // Process the stream
             let mut current_text = String::new();
             let mut tool_calls_detected = Vec::new();
+
+            // Accumulate streaming tool calls by index
+            let mut tool_call_accumulator: std::collections::HashMap<
+                i64,
+                (Option<String>, String),
+            > = std::collections::HashMap::new();
 
             while let Some(event) = completion_stream.next().await {
                 match event {
@@ -220,10 +236,8 @@ impl ResponseServiceImpl {
                             let _ = tx.send(delta_event).await;
                         }
 
-                        // Check for tool calls in the event
-                        if let Some(tool_call) = Self::extract_tool_call(&sse_event) {
-                            tool_calls_detected.push(tool_call);
-                        }
+                        // Accumulate tool call fragments
+                        Self::accumulate_tool_calls(&sse_event, &mut tool_call_accumulator);
                     }
                     Err(e) => {
                         tracing::error!("Error in completion stream: {}", e);
@@ -237,7 +251,6 @@ impl ResponseServiceImpl {
 
             final_response_text.push_str(&current_text);
 
-            // Add assistant response to message history
             if !current_text.is_empty() {
                 messages.push(CompletionMessage {
                     role: "assistant".to_string(),
@@ -245,7 +258,29 @@ impl ResponseServiceImpl {
                 });
             }
 
-            // Step 5: Execute tools if any were called
+            // Convert accumulated tool calls to detected tool calls
+            for (idx, (name_opt, args_str)) in tool_call_accumulator {
+                if let Some(name) = name_opt {
+                    // Try to parse the complete arguments
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str) {
+                        if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
+                            tracing::debug!(
+                                "Tool call {} complete: {} with query: {}",
+                                idx,
+                                name,
+                                query
+                            );
+                            tool_calls_detected.push(ToolCallInfo {
+                                tool_type: name,
+                                query: query.to_string(),
+                            });
+                        }
+                    } else {
+                        tracing::warn!("Failed to parse tool call {} arguments: {}", idx, args_str);
+                    }
+                }
+            }
+
             if tool_calls_detected.is_empty() {
                 // No more tool calls, we're done
                 tracing::debug!("No tool calls detected, ending agent loop");
@@ -254,7 +289,6 @@ impl ResponseServiceImpl {
 
             tracing::debug!("Executing {} tool calls", tool_calls_detected.len());
 
-            // Execute each tool and add results to messages
             for tool_call in tool_calls_detected {
                 let tool_result = Self::execute_tool(
                     &tool_call,
@@ -272,11 +306,10 @@ impl ResponseServiceImpl {
             }
         }
 
-        // Step 6: Finalize and emit completion event
         let mut final_response = initial_response;
         final_response.status = models::ResponseStatus::Completed;
         final_response.output = vec![models::ResponseOutputItem::Message {
-            id: format!("msg_{}", uuid::Uuid::new_v4()),
+            id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
             status: models::ResponseItemStatus::Completed,
             role: "assistant".to_string(),
             content: vec![models::ResponseOutputContent::OutputText {
@@ -561,50 +594,59 @@ impl ResponseServiceImpl {
         }
     }
 
-    /// Extract tool call from SSE event
-    fn extract_tool_call(event: &inference_providers::SSEEvent) -> Option<ToolCallInfo> {
+    /// Accumulate tool call fragments from streaming chunks
+    fn accumulate_tool_calls(
+        event: &inference_providers::SSEEvent,
+        accumulator: &mut std::collections::HashMap<i64, (Option<String>, String)>,
+    ) {
         use inference_providers::StreamChunk;
 
         match &event.chunk {
             StreamChunk::Chat(chat_chunk) => {
-                // Extract tool calls from choices
                 for choice in &chat_chunk.choices {
                     if let Some(delta) = &choice.delta {
                         if let Some(tool_calls) = &delta.tool_calls {
                             for tool_call in tool_calls {
-                                // Parse the tool call
-                                let function_name = tool_call.function.name.clone();
+                                // Get or default to index 0 if not present
+                                let index = tool_call.index.unwrap_or(0);
 
-                                // Parse arguments to extract the query parameter
-                                if let Some(args_str) = &tool_call.function.arguments {
-                                    if let Ok(args) =
-                                        serde_json::from_str::<serde_json::Value>(args_str)
-                                    {
-                                        if let Some(query) =
-                                            args.get("query").and_then(|v| v.as_str())
-                                        {
-                                            return Some(ToolCallInfo {
-                                                tool_type: function_name,
-                                                query: query.to_string(),
-                                            });
-                                        }
-                                    }
+                                // Get or create accumulator entry for this index
+                                let entry =
+                                    accumulator.entry(index).or_insert((None, String::new()));
+
+                                // Accumulate function name (only set once, typically in first chunk)
+                                if let Some(name) = &tool_call.function.name {
+                                    tracing::debug!(
+                                        "Accumulated tool call {} name: {}",
+                                        index,
+                                        name
+                                    );
+                                    entry.0 = Some(name.clone());
+                                }
+
+                                // Accumulate arguments (streamed across multiple chunks)
+                                if let Some(args_fragment) = &tool_call.function.arguments {
+                                    tracing::debug!(
+                                        "Accumulated tool call {} args fragment: {}",
+                                        index,
+                                        args_fragment
+                                    );
+                                    entry.1.push_str(args_fragment);
                                 }
                             }
                         }
                     }
                 }
-                None
             }
-            _ => None,
+            _ => {}
         }
     }
 
     /// Execute a tool call
     async fn execute_tool(
         tool_call: &ToolCallInfo,
-        web_search_provider: &Option<Arc<dyn tool_providers::WebSearchProviderTrait>>,
-        file_search_provider: &Option<Arc<dyn tool_providers::FileSearchProviderTrait>>,
+        web_search_provider: &Option<Arc<dyn tools::WebSearchProviderTrait>>,
+        file_search_provider: &Option<Arc<dyn tools::FileSearchProviderTrait>>,
         request: &models::CreateResponseRequest,
     ) -> Result<String, errors::ResponseError> {
         match tool_call.tool_type.as_str() {
@@ -619,8 +661,6 @@ impl ResponseServiceImpl {
                                 e
                             ))
                         })?;
-
-                    // Format results as text
                     let formatted = results
                         .iter()
                         .map(|r| {
@@ -631,10 +671,9 @@ impl ResponseServiceImpl {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-
                     Ok(formatted)
                 } else {
-                    Ok("Web search not available (no provider configured)".to_string())
+                    Err(errors::ResponseError::UnknownTool("web_search".to_string()))
                 }
             }
             "file_search" => {
@@ -695,7 +734,9 @@ impl ResponseServiceImpl {
                     Ok("File search not available (no provider configured)".to_string())
                 }
             }
-            _ => Ok(format!("Unknown tool type: {}", tool_call.tool_type)),
+            _ => Err(errors::ResponseError::UnknownTool(
+                tool_call.tool_type.clone(),
+            )),
         }
     }
 }

@@ -3,10 +3,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::conversations::models::ConversationId;
 
-// ============================================
-// Tool Provider Traits
-// ============================================
-
 /// Result from a web search
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSearchResult {
@@ -24,11 +20,25 @@ pub struct FileSearchResult {
     pub relevance_score: f32,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum WebSearchError {
+    #[error("Web search failed: {0}")]
+    WebSearchRequestFailed(String),
+    #[error("Web search response parsing failed: {0}")]
+    WebSearchResponseParsingFailed(String),
+}
+
 /// Web search provider trait
 #[async_trait]
 pub trait WebSearchProviderTrait: Send + Sync {
     /// Perform a web search with the given query
-    async fn search(&self, query: String) -> anyhow::Result<Vec<WebSearchResult>>;
+    async fn search(&self, query: String) -> Result<Vec<WebSearchResult>, WebSearchError>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum FileSearchError {
+    #[error("File search failed: {0}")]
+    FileSearchFailed(String),
 }
 
 /// File search provider trait
@@ -39,5 +49,5 @@ pub trait FileSearchProviderTrait: Send + Sync {
         &self,
         conversation_id: ConversationId,
         query: String,
-    ) -> anyhow::Result<Vec<FileSearchResult>>;
+    ) -> Result<Vec<FileSearchResult>, FileSearchError>;
 }

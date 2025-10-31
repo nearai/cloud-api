@@ -41,9 +41,13 @@ pub enum MessageRole {
 /// Tool call in a message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
-    pub id: String,
+    /// Tool call ID (optional in streaming mode where it may come in a later chunk)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Tool type (optional in streaming mode where it may come in a later chunk)
     #[serde(rename = "type")]
-    pub type_: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_: Option<String>,
     pub function: FunctionCall,
     /// Index of the tool call in streaming responses (for tracking multiple parallel tool calls)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -53,7 +57,9 @@ pub struct ToolCall {
 /// Function call details
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCall {
-    pub name: String,
+    /// Function name (optional in streaming mode where it may come in a later chunk)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub arguments: Option<String>,
 }
 
@@ -299,6 +305,7 @@ pub enum FinishReason {
     Stop,
     Length,
     ContentFilter,
+    ToolCalls,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

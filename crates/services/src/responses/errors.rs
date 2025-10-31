@@ -4,4 +4,6 @@ pub enum ResponseError {
     InvalidParams(String),
     #[error("Internal error: {0}")]
     InternalError(String),
+    #[error("Unknown tool: {0}")]
+    UnknownTool(String),
 }

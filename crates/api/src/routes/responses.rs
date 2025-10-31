@@ -1,4 +1,7 @@
-use crate::{middleware::RequestBodyHash, models::ErrorResponse};
+use crate::{
+    middleware::{auth::AuthenticatedApiKey, RequestBodyHash},
+    models::ErrorResponse,
+};
 use axum::{
     extract::{Extension, Json, Path, Query, State},
     http::StatusCode,
@@ -23,6 +26,7 @@ fn map_response_error_to_status(error: &ServiceResponseError) -> StatusCode {
     match error {
         ServiceResponseError::InvalidParams(_) => StatusCode::BAD_REQUEST,
         ServiceResponseError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        ServiceResponseError::UnknownTool(_) => StatusCode::BAD_REQUEST,
     }
 }
 
@@ -52,11 +56,14 @@ impl From<ServiceResponseError> for ErrorResponse {
 )]
 pub async fn create_response(
     State(service): State<Arc<ResponseServiceImpl>>,
-    Extension(api_key): Extension<services::workspace::ApiKey>,
-    Extension(_body_hash): Extension<RequestBodyHash>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(body_hash): Extension<RequestBodyHash>,
     Json(mut request): Json<CreateResponseRequest>,
 ) -> axum::response::Response {
-    debug!("Create response request from key: {:?}", api_key);
+    debug!(
+        "Create response request from api key: {:?}",
+        api_key.api_key.id
+    );
 
     // Validate the request
     if let Err(error) = request.validate() {
@@ -87,16 +94,26 @@ pub async fn create_response(
     // Check if streaming is requested
     if request.stream.unwrap_or(false) {
         tracing::debug!(
-            user_id = %api_key.created_by_user_id.0,
+            user_id = %api_key.api_key.created_by_user_id.0,
             model = %model,
             "Processing streaming response request"
         );
 
         // Create streaming response
-        match service.create_response_stream(request).await {
+        match service
+            .create_response_stream(
+                request,
+                services::UserId(api_key.api_key.created_by_user_id.0),
+                api_key.api_key.id.0.clone(),
+                api_key.organization.id.0,
+                api_key.workspace.id.0,
+                body_hash.hash.clone(),
+            )
+            .await
+        {
             Ok(stream) => {
                 tracing::debug!(
-                    user_id = %api_key.created_by_user_id.0,
+                    user_id = %api_key.api_key.created_by_user_id.0,
                     "Successfully created streaming response, returning SSE stream"
                 );
 
@@ -115,7 +132,7 @@ pub async fn create_response(
             }
             Err(error) => {
                 tracing::error!(
-                    user_id = %api_key.created_by_user_id.0,
+                    user_id = %api_key.api_key.created_by_user_id.0,
                     model = %model,
                     error = %error,
                     "Failed to create streaming response"
@@ -126,16 +143,26 @@ pub async fn create_response(
         }
     } else {
         tracing::debug!(
-            user_id = %api_key.created_by_user_id.0,
+            user_id = %api_key.api_key.created_by_user_id.0,
             model = %model,
             "Processing non-streaming response request"
         );
 
         // Service only supports streaming - collect stream for non-streaming response
-        match service.create_response_stream(request.clone()).await {
+        match service
+            .create_response_stream(
+                request.clone(),
+                services::UserId(api_key.api_key.created_by_user_id.0),
+                api_key.api_key.id.0.clone(),
+                api_key.organization.id.0,
+                api_key.workspace.id.0,
+                body_hash.hash.clone(),
+            )
+            .await
+        {
             Ok(stream) => {
                 tracing::debug!(
-                    user_id = %api_key.created_by_user_id.0,
+                    user_id = %api_key.api_key.created_by_user_id.0,
                     "Successfully created stream, collecting events for non-streaming response"
                 );
 
@@ -282,13 +309,13 @@ pub async fn create_response(
 
                 debug!(
                     "Created response {} for key {}",
-                    response.id, api_key.created_by_user_id.0
+                    response.id, api_key.api_key.created_by_user_id.0
                 );
                 (StatusCode::OK, ResponseJson(response)).into_response()
             }
             Err(error) => {
                 tracing::error!(
-                    user_id = %api_key.created_by_user_id.0,
+                    user_id = %api_key.api_key.created_by_user_id.0,
                     model = %model,
                     error = %error,
                     "Failed to create non-streaming response"

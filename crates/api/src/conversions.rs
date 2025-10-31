@@ -99,6 +99,7 @@ fn finish_reason_to_string(reason: &FinishReason) -> String {
         FinishReason::Stop => "stop".to_string(),
         FinishReason::Length => "length".to_string(),
         FinishReason::ContentFilter => "content_filter".to_string(),
+        FinishReason::ToolCalls => "tool_calls".to_string(),
     }
 }
 

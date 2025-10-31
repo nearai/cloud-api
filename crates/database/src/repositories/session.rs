@@ -299,34 +299,30 @@ impl services::auth::SessionRepository for SessionRepository {
         Ok((service_session, token))
     }
 
-    // Fetch the most recent valid refresh token for a user
-    async fn get_latest_valid_session(
+    // Fetch the session of the inputted refresh token
+    async fn get_session_by_token(
         &self,
-        user_id: Uuid
+        user_id: Uuid,
+        token: &str
     ) -> Result<Option<services::auth::Session>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
+        let client = self.pool.get().await?;
+        let token_hash = Self::hash_session_token(token);
         let row_opt = client
             .query_opt(
                 r#"
                 SELECT *
                 FROM refresh_tokens
                 WHERE user_id = $1
+                AND token_hash = $2
                 AND expires_at > NOW()
-                ORDER BY created_at DESC
                 LIMIT 1
                 "#,
-                &[&user_id]
-            )
-            .await
-            .context("Failed to query latest valid refresh token");
+                &[&user_id, &token_hash]
+            ).await?;
+        
+        if let Some(row) = row_opt {
+            let db_session = self.row_to_session(row)?;
 
-        if let Ok(row) = row_opt {
-            let db_session = self.row_to_session(row.unwrap())?;
             let server_session = services::auth::Session {
                 id: services::auth::SessionId(db_session.id),
                 user_id: services::auth::UserId(db_session.user_id),
@@ -336,6 +332,7 @@ impl services::auth::SessionRepository for SessionRepository {
                 ip_address: db_session.ip_address,
                 user_agent: db_session.user_agent
             };
+
             Ok(Some(server_session))
         } else {
             Ok(None)

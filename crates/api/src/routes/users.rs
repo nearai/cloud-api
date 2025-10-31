@@ -340,33 +340,60 @@ pub async fn create_access_token(
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
-    // fetch most recent valid refresh token for this user
-    let latest_session = app_state
+    // fetch the refresh token used for the current request
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|h| h.to_str().ok());
+    let curr_refresh_token = match auth_header {
+        Some(header) if header.starts_with("Bearer rt_") => {
+            header.trim_start_matches("Bearer ").to_string()
+        }
+        _ => {
+            error!("Missing or invalid refresh token");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    };
+
+    // fetch the session associated with this current refresh token
+    let session_opt = app_state
         .auth_service
-        .get_latest_valid_session(user.0.id)
+        .get_session_by_token(user.0.id, &curr_refresh_token)
         .await
         .map_err(|e| {
-            error!("Failed to get latest valid refresh token for user {}: {}", user.0.id, e);
+            error!(
+                "Failed to fetch session by refresh token for user {}: {}.\n refresh token: {}",
+                user.0.id, e, curr_refresh_token
+            );
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // validate that the User-Agent matches
-    if let Some(session) = latest_session {
-        let db_user_agent = session.user_agent;
-
-        if let Some(db_ua) = db_user_agent.as_ref() {
-            if user_agent_header.as_deref() != Some(db_ua.as_str()) {
+    // validate token existence and User-Agent match
+    let session = match session_opt {
+        Some(s) => s,
+        None => {
+            error!("Invalid or expired refresh token for user {}", user.0.id);
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    };
+    if let Some(db_ua) = session.user_agent.as_ref() {
+        if let Some(req_ua) = user_agent_header.as_ref() {
+            if db_ua != req_ua {
                 error!(
                     "User-Agent mismatch for user {}. DB {:?}, Request: {:?}",
-                    user.0.id, db_user_agent, user_agent_header
+                    user.0.id, db_ua, req_ua
                 );
                 return Err(StatusCode::UNAUTHORIZED);
             }
+        } else {
+            error!(
+                "Missing User-Agent header on request for user {}",
+                user.0.id
+            );
+            return Err(StatusCode::UNAUTHORIZED);
         }
-    } else {
-        error!("No valid refresh token found for user {}", user.0.id);
-        return Err(StatusCode::UNAUTHORIZED);
     }
+    
 
 
     let expires_in_hours = 7 * 24;

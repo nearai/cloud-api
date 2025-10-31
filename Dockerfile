@@ -28,7 +28,7 @@ RUN --mount=type=bind,source=pinned-packages-builder.txt,target=/tmp/pinned-pack
 WORKDIR /app
 
 # Fetch the latest pinned package list
-RUN dpkg -l | grep '^ii' | awk '{print \$2\"=\"\$3}' | sort > ./pinned-packages-builder.txt
+RUN dpkg -l | grep '^ii' | awk '{print $2"="$3}' | sort > ./pinned-packages-builder.txt
 
 # Copy workspace files
 COPY Cargo.toml Cargo.lock ./
@@ -83,10 +83,10 @@ COPY --from=builder /app/target/release/api /app/api
 
 # Copy the migration SQL files
 RUN mkdir -p /app/crates/database/src/migrations/sql
-COPY --chmod=0664 --from=builder /app/crates/database/src/migrations/sql/*.sql /app/crates/database/src/migrations/sql/
+COPY --from=builder --chmod=0664 /app/crates/database/src/migrations/sql/*.sql /app/crates/database/src/migrations/sql/
 
 # Copy the pinned package list from builder stage
-COPY --from=builder /app/pinned-packages-builder.txt /app/pinned-packages-builder.txt
+COPY --from=builder --chmod=0664 /app/pinned-packages-builder.txt /app/pinned-packages-builder.txt
 
 # Change ownership to app user
 RUN chown -R app:app /app

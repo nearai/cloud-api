@@ -37,6 +37,9 @@ README.md
 .env*
 !.env.example
 
+# Cargo config (we need this for reproducible builds)
+!.cargo/
+
 # Node modules (if any)
 node_modules/
 

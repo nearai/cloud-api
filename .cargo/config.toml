@@ -1,0 +1,31 @@
+[build]
+# Enable reproducible builds
+[target.'cfg(target_os = "linux")']
+rustflags = [
+    # Remap source file paths to remove machine-specific paths
+    "--remap-path-prefix", "${PWD}=.",
+    "--remap-path-prefix", "/usr/local/cargo=/cargo",
+    # Disable incremental compilation for reproducibility
+    "-C", "incremental=false",
+    # Disable debug info for reproducibility
+    "-C", "debuginfo=0",
+    # removes build-id hash
+    "-C", "link-arg=-Wl,--build-id=none",
+    # Additional reproducibility flags
+    "-C", "link-arg=-Wl,--no-undefined",
+    "-C", "link-arg=-Wl,--hash-style=gnu",
+]
+
+[profile.release]
+# Strip debug symbols for smaller, more reproducible binaries
+strip = "symbols"
+# Keep link time optimization enabled
+lto = true
+# Use a fixed codegen units value
+codegen-units = 1
+# Ensure consistent panic behavior
+panic = "abort"
+# Disable overflow checks for consistency
+overflow-checks = false
+# Explicit optimization level
+opt-level = 3

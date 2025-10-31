@@ -817,8 +817,7 @@ async fn test_admin_get_organization_limits_history() {
         assert_eq!(
             response.status_code(),
             200,
-            "Failed to update limits to {}",
-            amount
+            "Failed to update limits to {amount}"
         );
 
         // Small delay to ensure different timestamps
@@ -847,7 +846,7 @@ async fn test_admin_get_organization_limits_history() {
         serde_json::from_str::<api::models::OrgLimitsHistoryResponse>(&history_response.text())
             .expect("Failed to parse history response");
 
-    println!("History data: {:#?}", history_data);
+    println!("History data: {history_data:#?}");
 
     // Verify we have 3 history entries
     assert_eq!(
@@ -875,47 +874,40 @@ async fn test_admin_get_organization_limits_history() {
     for (idx, entry) in history_data.history.iter().enumerate() {
         assert!(
             entry.changed_by_user_id.is_some(),
-            "Entry {} should have changed_by_user_id populated",
-            idx
+            "Entry {idx} should have changed_by_user_id populated"
         );
 
         assert_eq!(
             entry.changed_by_user_id.as_ref().unwrap(),
             common::MOCK_USER_ID,
-            "Entry {} changed_by_user_id should match the authenticated admin user",
-            idx
+            "Entry {idx} changed_by_user_id should match the authenticated admin user"
         );
 
         assert!(
             entry.changed_by_user_email.is_some(),
-            "Entry {} should have changed_by_user_email populated",
-            idx
+            "Entry {idx} should have changed_by_user_email populated"
         );
 
         assert_eq!(
             entry.changed_by_user_email.as_ref().unwrap(),
             "admin@test.com",
-            "Entry {} changed_by_user_email should be admin@test.com",
-            idx
+            "Entry {idx} changed_by_user_email should be admin@test.com"
         );
 
         // Verify other tracking fields
         assert!(
             entry.changed_by.is_some(),
-            "Entry {} should have changed_by populated",
-            idx
+            "Entry {idx} should have changed_by populated"
         );
         assert_eq!(
             entry.changed_by.as_ref().unwrap(),
             "admin@test.com",
-            "Entry {} changed_by should be admin@test.com",
-            idx
+            "Entry {idx} changed_by should be admin@test.com"
         );
 
         assert!(
             entry.change_reason.is_some(),
-            "Entry {} should have change_reason populated",
-            idx
+            "Entry {idx} should have change_reason populated"
         );
 
         println!(
@@ -2402,7 +2394,7 @@ async fn test_admin_access_token_create_long_term() {
 
     let response = server
         .post("/v1/admin/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&request)
         .await;
 
@@ -2449,7 +2441,7 @@ async fn test_admin_access_token_create_invalid_expiration() {
 
     let response = server
         .post("/v1/admin/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&request)
         .await;
 
@@ -2478,7 +2470,7 @@ async fn test_admin_access_token_create_zero_expiration() {
 
     let response = server
         .post("/v1/admin/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&request)
         .await;
 
@@ -2592,7 +2584,7 @@ async fn test_admin_access_token_create_and_list() {
 
     let create_response = server
         .post("/v1/admin/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&create_request)
         .await;
 
@@ -2604,7 +2596,7 @@ async fn test_admin_access_token_create_and_list() {
     // List admin access tokens
     let list_response = server
         .get("/v1/admin/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
     assert_eq!(list_response.status_code(), 200);
@@ -2649,7 +2641,7 @@ async fn test_admin_access_token_list_pagination() {
 
         let create_response = server
             .post("/v1/admin/access-tokens")
-            .add_header("Authorization", format!("Bearer {}", access_token))
+            .add_header("Authorization", format!("Bearer {access_token}"))
             .json(&create_request)
             .await;
 
@@ -2659,7 +2651,7 @@ async fn test_admin_access_token_list_pagination() {
     // Test pagination with limit and offset
     let list_response = server
         .get("/v1/admin/access-tokens?limit=2&offset=0")
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
     assert_eq!(list_response.status_code(), 200);
@@ -2675,7 +2667,7 @@ async fn test_admin_access_token_list_pagination() {
     // Test second page
     let list_response2 = server
         .get("/v1/admin/access-tokens?limit=2&offset=2")
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
     assert_eq!(list_response2.status_code(), 200);
@@ -2704,7 +2696,7 @@ async fn test_admin_access_token_create_and_delete() {
 
     let create_response = server
         .post("/v1/admin/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&create_request)
         .await;
 
@@ -2718,8 +2710,8 @@ async fn test_admin_access_token_create_and_delete() {
     });
 
     let delete_response = server
-        .delete(&format!("/v1/admin/access-tokens/{}", token_id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .delete(&format!("/v1/admin/access-tokens/{token_id}"))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&delete_request)
         .await;
 
@@ -2751,8 +2743,8 @@ async fn test_admin_access_token_delete_not_found() {
     });
 
     let delete_response = server
-        .delete(&format!("/v1/admin/access-tokens/{}", fake_token_id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .delete(&format!("/v1/admin/access-tokens/{fake_token_id}"))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&delete_request)
         .await;
 
@@ -2782,8 +2774,8 @@ async fn test_admin_access_token_delete_invalid_id() {
     });
 
     let delete_response = server
-        .delete(&format!("/v1/admin/access-tokens/{}", invalid_token_id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .delete(&format!("/v1/admin/access-tokens/{invalid_token_id}"))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&delete_request)
         .await;
 
@@ -2851,7 +2843,7 @@ async fn test_admin_access_token_cannot_manage_tokens() {
 
     let create_response = server
         .post("/v1/admin/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&create_request)
         .await;
 
@@ -2868,7 +2860,7 @@ async fn test_admin_access_token_cannot_manage_tokens() {
 
     let create_response2 = server
         .post("/v1/admin/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", admin_token))
+        .add_header("Authorization", format!("Bearer {admin_token}"))
         .json(&create_request2)
         .await;
 
@@ -2878,7 +2870,7 @@ async fn test_admin_access_token_cannot_manage_tokens() {
     // Try to use the admin access token to list admin access tokens (should fail)
     let list_response = server
         .get("/v1/admin/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", admin_token))
+        .add_header("Authorization", format!("Bearer {admin_token}"))
         .await;
 
     assert_eq!(list_response.status_code(), 403);
@@ -2886,7 +2878,7 @@ async fn test_admin_access_token_cannot_manage_tokens() {
     // Try to use the admin access token to delete an admin access token (should fail)
     let delete_response = server
         .delete("/v1/admin/access-tokens/00000000-0000-0000-0000-000000000000")
-        .add_header("Authorization", format!("Bearer {}", admin_token))
+        .add_header("Authorization", format!("Bearer {admin_token}"))
         .json(&serde_json::json!({"reason": "This should fail"}))
         .await;
 

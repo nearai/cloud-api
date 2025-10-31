@@ -19,8 +19,8 @@ rustflags = [
 [profile.release]
 # Strip debug symbols for smaller, more reproducible binaries
 strip = "symbols"
-# Disable link-time optimization variations
-lto = "thin"
+# Keep link time optimization enabled
+lto = true
 # Use a fixed codegen units value
 codegen-units = 1
 # Ensure consistent panic behavior

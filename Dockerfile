@@ -2,7 +2,7 @@
 FROM rust:1.88.0-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS builder
 
 # Install pinned apt dependencies
-RUN --mount=type=bind,source=pinned-packages.txt,target=/tmp/pinned-packages.txt,ro \
+RUN --mount=type=bind,source=pinned-packages-builder.txt,target=/tmp/pinned-packages-builder.txt,ro \
     set -e; \
     # Create a sources.list file pointing to a specific snapshot
     echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20250411T024939Z bookworm main' > /etc/apt/sources.list && \
@@ -11,7 +11,7 @@ RUN --mount=type=bind,source=pinned-packages.txt,target=/tmp/pinned-packages.txt
     # Create preferences file to pin all packages
     rm -rf /etc/apt/sources.list.d/debian.sources && \
     mkdir -p /etc/apt/preferences.d && \
-    cat /tmp/pinned-packages.txt | while read line; do \
+    cat /tmp/pinned-packages-builder.txt | while read line; do \
         pkg=$(echo $line | cut -d= -f1); \
         ver=$(echo $line | cut -d= -f2); \
         if [ ! -z "$pkg" ] && [ ! -z "$ver" ]; then \
@@ -20,15 +20,15 @@ RUN --mount=type=bind,source=pinned-packages.txt,target=/tmp/pinned-packages.txt
     done && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-        ca-certificates \
-        libssl3 \
-        curl \
         pkg-config \
         libssl-dev \
         && rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
 
 # Set the working directory
 WORKDIR /app
+
+# Fetch the latest pinned package list
+RUN dpkg -l | grep '^ii' | awk '{print \$2\"=\"\$3}' | sort > ./pinned-packages-builder.txt
 
 # Copy workspace files
 COPY Cargo.toml Cargo.lock ./
@@ -43,7 +43,7 @@ RUN cargo build --release --locked --bin api
 FROM debian:bookworm-slim@sha256:78d2f66e0fec9e5a39fb2c72ea5e052b548df75602b5215ed01a17171529f706 AS runtime
 
 # Install pinned apt dependencies
-RUN --mount=type=bind,source=pinned-packages.txt,target=/tmp/pinned-packages.txt,ro \
+RUN --mount=type=bind,source=pinned-packages-runtime.txt,target=/tmp/pinned-packages-runtime.txt,ro \
     set -e; \
     # Create a sources.list file pointing to a specific snapshot
     echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20250411T024939Z bookworm main' > /etc/apt/sources.list && \
@@ -52,7 +52,7 @@ RUN --mount=type=bind,source=pinned-packages.txt,target=/tmp/pinned-packages.txt
     # Create preferences file to pin all packages
     rm -rf /etc/apt/sources.list.d/debian.sources && \
     mkdir -p /etc/apt/preferences.d && \
-    cat /tmp/pinned-packages.txt | while read line; do \
+    cat /tmp/pinned-packages-runtime.txt | while read line; do \
         pkg=$(echo $line | cut -d= -f1); \
         ver=$(echo $line | cut -d= -f2); \
         if [ ! -z "$pkg" ] && [ ! -z "$ver" ]; then \
@@ -64,8 +64,6 @@ RUN --mount=type=bind,source=pinned-packages.txt,target=/tmp/pinned-packages.txt
         ca-certificates \
         libssl3 \
         curl \
-        pkg-config \
-        libssl-dev \
         && rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
 
 # Create app user
@@ -73,6 +71,9 @@ RUN useradd -m -u 1000 app
 
 # Create app directory
 WORKDIR /app
+
+# Copy the pinned package list from builder stage
+COPY --from=builder /app/pinned-packages-builder.txt /app/pinned-packages-builder.txt
 
 # Copy the built binary
 COPY --from=builder /app/target/release/api /app/api

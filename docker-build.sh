@@ -26,7 +26,7 @@ done
 if ! docker buildx inspect buildkit_20 &>/dev/null; then
     docker buildx create --use --driver-opt image=moby/buildkit:v0.20.2 --name buildkit_20
 fi
-touch pinned-packages.txt
+touch pinned-packages-builder.txt pinned-packages-runtime.txt
 git rev-parse HEAD > .GIT_REV
 TEMP_TAG="cloud-api-temp:$(date +%s)"
 docker buildx build --builder buildkit_20 --no-cache --platform linux/amd64 \
@@ -63,9 +63,12 @@ echo ""
 
 # Extract package information from the built image
 echo "Extracting package information from built image: $TEMP_TAG"
-docker run --rm --entrypoint bash "$TEMP_TAG" -c "dpkg -l | grep '^ii' | awk '{print \$2\"=\"\$3}' | sort" > pinned-packages.txt
-
-echo "Package information extracted to pinned-packages.txt ($(wc -l < pinned-packages.txt) packages)"
+# Extract builder stage package information
+docker run --rm --entrypoint bash "$TEMP_TAG" -c "cat /app/pinned-packages-builder.txt" > pinned-packages-builder.txt
+echo "Package information extracted to pinned-packages-builder.txt ($(wc -l < pinned-packages-builder.txt) packages)"
+# Extract runtime stage package information
+docker run --rm --entrypoint bash "$TEMP_TAG" -c "dpkg -l | grep '^ii' | awk '{print \$2\"=\"\$3}' | sort" > pinned-packages-runtime.txt
+echo "Package information extracted to pinned-packages-runtime.txt ($(wc -l < pinned-packages-runtime.txt) packages)"
 
 # Clean up the temporary image from Docker daemon
 docker rmi "$TEMP_TAG" 2>/dev/null || true

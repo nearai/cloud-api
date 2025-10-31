@@ -1,4 +1,4 @@
-name: Build & Publish Docker Image
+name: Build & Deploy
 on:
   workflow_dispatch:
   push:
@@ -13,7 +13,8 @@ env:
   IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/cloud-api
 
 jobs:
-  build-and-publish-docker-image:
+  reproducible-docker-image:
+    name: Reproducible Build
     permissions:
       contents: read
       packages: write

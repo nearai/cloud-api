@@ -212,12 +212,7 @@ pub async fn admin_middleware(
             debug!("Extracted Bearer token for admin auth: {}", token);
 
             // Try admin access token first
-            match authenticate_admin_access_token(
-                &state,
-                token,
-                user_agent_header.as_deref(),
-            )
-            .await
+            match authenticate_admin_access_token(&state, token, user_agent_header.as_deref()).await
             {
                 Ok(admin_token) => {
                     debug!("Authenticated via admin access token: {}", admin_token.name);

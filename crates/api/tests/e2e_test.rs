@@ -2899,7 +2899,7 @@ async fn test_create_access_token_success_user_agent_match() {
     // Perform API request
     let response = server
         .post("/v1/users/me/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", refresh_token))
+        .add_header("Authorization", format!("Bearer {refresh_token}"))
         .add_header("User-Agent", user_agent)
         .await;
 
@@ -2916,7 +2916,7 @@ async fn test_create_access_token_success_user_agent_match() {
         "Refresh token should start with rt_"
     );
 
-    println!("✅ Success: {:?}", body);
+    println!("✅ Success: {body:?}");
 }
 
 #[tokio::test]
@@ -2928,7 +2928,7 @@ async fn test_create_access_token_success_user_agent_mismatch() {
 
     let response = server
         .post("/v1/users/me/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", refresh_token))
+        .add_header("Authorization", format!("Bearer {refresh_token}"))
         .add_header("User-Agent", user_agent)
         .await;
 

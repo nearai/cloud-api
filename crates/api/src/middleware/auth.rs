@@ -308,7 +308,7 @@ async fn authenticate_admin_access_token(
 
     match state
         .admin_access_token_repository
-        .validate(&token, current_user_agent.as_deref())
+        .validate(&token, current_user_agent)
         .await
     {
         Ok(Some(admin_token)) => {

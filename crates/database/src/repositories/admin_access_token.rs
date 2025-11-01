@@ -132,18 +132,15 @@ impl AdminAccessTokenRepository {
                     match current_user_agent {
                         None => {
                             tracing::warn!(
-                                "User-Agent missing for admin access token {} (expected '{}')",
-                                row.get::<_, Uuid>("id"),
-                                stored
+                                "User-Agent missing for admin access token {}",
+                                row.get::<_, Uuid>("id")
                             );
                             return Ok(None);
                         }
                         Some(current) if stored != current => {
                             tracing::warn!(
-                                "User-Agent mismatch for admin access token {}. Expected '{}', got '{}'",
-                                row.get::<_, Uuid>("id"),
-                                stored,
-                                current
+                                "User-Agent mismatch for admin access token {}.",
+                                row.get::<_, Uuid>("id")
                             );
                             return Ok(None);
                         }

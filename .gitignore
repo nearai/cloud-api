@@ -6,3 +6,5 @@ config/examples/production.yaml
 *.crt
 .env
 *.DS_Store
+.GIT_REV
+oci.tar

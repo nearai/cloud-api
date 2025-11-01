@@ -316,8 +316,8 @@ impl McpConnectorRepository {
                 .await
         }
         .map_err(|e| {
-            error!("Database UPDATE failed for connector {}: {:?}", id, e);
-            error!("SQL Error details: {:#}", e);
+            error!("Database UPDATE failed for connector {}", id);
+            debug!("SQL Error details: {:#}", e);
             e
         })
         .context("Failed to update connection status")?;

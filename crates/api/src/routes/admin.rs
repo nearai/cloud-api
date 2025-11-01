@@ -94,7 +94,7 @@ pub async fn batch_upsert_models(
         .batch_upsert_models(models)
         .await
         .map_err(|e| {
-            error!("Failed to upsert models: {}", e);
+            error!("Failed to upsert models");
             match e {
                 services::admin::AdminError::ModelNotFound(msg) => (
                     StatusCode::NOT_FOUND,
@@ -191,7 +191,7 @@ pub async fn get_model_history(
         .get_model_history(&model_name, params.limit, params.offset)
         .await
         .map_err(|e| {
-            error!("Failed to get model history: {}", e);
+            error!("Failed to get model history");
             match e {
                 services::admin::AdminError::ModelNotFound(_) => (
                     StatusCode::NOT_FOUND,
@@ -320,7 +320,7 @@ pub async fn update_organization_limits(
         .update_organization_limits(organization_id, service_request)
         .await
         .map_err(|e| {
-            error!("Failed to update organization limits: {}", e);
+            error!("Failed to update organization limits");
             match e {
                 services::admin::AdminError::OrganizationNotFound(msg) => (
                     StatusCode::NOT_FOUND,
@@ -417,7 +417,7 @@ pub async fn get_organization_limits_history(
         .get_organization_limits_history(organization_uuid, params.limit, params.offset)
         .await
         .map_err(|e| {
-            error!("Failed to retrieve organization limits history: {}", e);
+            error!("Failed to retrieve organization limits history");
             match e {
                 services::admin::AdminError::OrganizationNotFound(msg) => (
                     StatusCode::NOT_FOUND,
@@ -506,7 +506,7 @@ pub async fn delete_model(
         .delete_model(&model_name)
         .await
         .map_err(|e| {
-            error!("Failed to delete model: {}", e);
+            error!("Failed to delete model");
             match e {
                 services::admin::AdminError::ModelNotFound(_) => (
                     StatusCode::NOT_FOUND,
@@ -573,7 +573,7 @@ pub async fn list_users(
         .list_users(params.limit, params.offset)
         .await
         .map_err(|e| {
-            error!("Failed to list users: {}", e);
+            error!("Failed to list users");
             match e {
                 services::admin::AdminError::Unauthorized(msg) => (
                     StatusCode::UNAUTHORIZED,
@@ -695,7 +695,7 @@ pub async fn create_admin_access_token(
             Ok(ResponseJson(response))
         }
         Err(e) => {
-            error!("Failed to create admin access token: {}", e);
+            error!("Failed to create admin access token");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -762,7 +762,7 @@ pub async fn list_admin_access_tokens(
             Ok(ResponseJson(response))
         }
         Err(e) => {
-            error!("Failed to list admin access tokens: {}", e);
+            error!("Failed to list admin access tokens");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -853,7 +853,7 @@ pub async fn delete_admin_access_token(
             ))
         }
         Err(e) => {
-            error!("Failed to revoke admin access token: {}", e);
+            error!("Failed to revoke admin access token");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(

@@ -76,8 +76,8 @@ pub async fn add_organization_member(
         Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
         Err(OrganizationError::InvalidParams(_)) => Err(StatusCode::BAD_REQUEST),
         Err(OrganizationError::AlreadyMember) => Err(StatusCode::CONFLICT),
-        Err(e) => {
-            error!("Failed to add organization member: {}", e);
+        Err(_) => {
+            error!("Failed to add organization member");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -168,8 +168,8 @@ pub async fn invite_organization_member_by_email(
             ))
         }
         Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
-        Err(e) => {
-            error!("Failed to invite organization members: {}", e);
+        Err(_) => {
+            error!("Failed to invite organization members");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -225,8 +225,8 @@ pub async fn update_organization_member(
         }
         Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
         Err(OrganizationError::InvalidParams(_)) => Err(StatusCode::BAD_REQUEST),
-        Err(e) => {
-            error!("Failed to update organization member: {}", e);
+        Err(_) => {
+            error!("Failed to update organization member");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -282,8 +282,8 @@ pub async fn remove_organization_member(
             error!("Cannot remove member: {}", msg);
             Err(StatusCode::BAD_REQUEST)
         }
-        Err(e) => {
-            error!("Failed to remove organization member: {}", e);
+        Err(_) => {
+            error!("Failed to remove organization member");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -364,8 +364,8 @@ pub async fn list_organization_members(
                 )),
             ));
         }
-        Err(e) => {
-            error!("Failed to count organization members: {}", e);
+        Err(_) => {
+            error!("Failed to count organization members");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -426,8 +426,8 @@ pub async fn list_organization_members(
                 "not_found".to_string(),
             )),
         )),
-        Err(e) => {
-            error!("Failed to list organization members: {}", e);
+        Err(_) => {
+            error!("Failed to list organization members");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(

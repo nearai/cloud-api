@@ -49,8 +49,8 @@ pub async fn usage_check_middleware(
 
     // First, check API key spend limit if one is set
     if let Some(api_key_limit) = api_key.api_key.spend_limit {
-        let api_key_uuid = uuid::Uuid::parse_str(&api_key_id.0).map_err(|e| {
-            tracing::error!("Failed to parse API key ID: {}", e);
+        let api_key_uuid = uuid::Uuid::parse_str(&api_key_id.0).map_err(|_| {
+            tracing::error!("Failed to parse API key ID");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(ErrorResponse::new(
@@ -64,8 +64,8 @@ pub async fn usage_check_middleware(
             .usage_repository
             .get_api_key_spend(api_key_uuid)
             .await
-            .map_err(|e| {
-                tracing::error!("Failed to get API key spend: {}", e);
+            .map_err(|_| {
+                tracing::error!("Failed to get API key spend");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     axum::Json(ErrorResponse::new(
@@ -109,8 +109,8 @@ pub async fn usage_check_middleware(
         .usage_service
         .check_can_use(organization_id)
         .await
-        .map_err(|e| {
-            tracing::error!("Failed to check usage limits: {}", e);
+        .map_err(|_| {
+            tracing::error!("Failed to check usage limits");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(ErrorResponse::new(

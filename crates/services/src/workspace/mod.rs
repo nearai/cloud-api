@@ -33,37 +33,37 @@ impl WorkspaceServiceImpl {
         match err {
             RepositoryError::AlreadyExists => WorkspaceError::AlreadyExists,
             RepositoryError::NotFound(msg) => {
-                WorkspaceError::InternalError(format!("Resource not found: {}", msg))
+                WorkspaceError::InternalError(format!("Resource not found: {msg}"))
             }
             RepositoryError::RequiredFieldMissing(field) => {
-                WorkspaceError::InvalidParams(format!("Required field is missing: {}", field))
+                WorkspaceError::InvalidParams(format!("Required field is missing: {field}"))
             }
             RepositoryError::ForeignKeyViolation(msg) => {
-                WorkspaceError::InvalidParams(format!("Referenced entity does not exist: {}", msg))
+                WorkspaceError::InvalidParams(format!("Referenced entity does not exist: {msg}"))
             }
             RepositoryError::ValidationFailed(msg) => {
-                WorkspaceError::InvalidParams(format!("Validation failed: {}", msg))
+                WorkspaceError::InvalidParams(format!("Validation failed: {msg}"))
             }
             RepositoryError::DependencyExists(msg) => {
-                WorkspaceError::InvalidParams(format!("Cannot delete due to dependencies: {}", msg))
+                WorkspaceError::InvalidParams(format!("Cannot delete due to dependencies: {msg}"))
             }
             RepositoryError::TransactionConflict => {
                 WorkspaceError::InternalError("Transaction conflict, please retry".to_string())
             }
             RepositoryError::ConnectionFailed(msg) => {
-                WorkspaceError::InternalError(format!("Database connection failed: {}", msg))
+                WorkspaceError::InternalError(format!("Database connection failed: {msg}"))
             }
             RepositoryError::AuthenticationFailed => {
                 WorkspaceError::InternalError("Database authentication failed".to_string())
             }
             RepositoryError::PoolError(err) => {
-                WorkspaceError::InternalError(format!("Database connection pool error: {}", err))
+                WorkspaceError::InternalError(format!("Database connection pool error: {err}"))
             }
             RepositoryError::DatabaseError(err) => {
-                WorkspaceError::InternalError(format!("Database operation failed: {}", err))
+                WorkspaceError::InternalError(format!("Database operation failed: {err}"))
             }
             RepositoryError::DataConversionError(err) => {
-                WorkspaceError::InternalError(format!("Data conversion error: {}", err))
+                WorkspaceError::InternalError(format!("Data conversion error: {err}"))
             }
         }
     }

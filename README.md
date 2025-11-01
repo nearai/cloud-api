@@ -52,6 +52,9 @@ cargo test --test e2e_test
 
 ### Test Database Setup
 
+Tests use the same environment variables as the main application (from `env.example`).
+If environment variables are not set, tests use sensible defaults for local testing.
+
 #### Option 1: Using Docker (Recommended)
 ```bash
 # Start test database
@@ -61,31 +64,53 @@ docker run --name test-postgres \
   -p 5432:5432 \
   -d postgres:latest
 
-# Run tests
-TEST_DB_HOST=localhost \
-TEST_DB_PORT=5432 \
-TEST_DB_NAME=platform_api \
-TEST_DB_USER=postgres \
-TEST_DB_PASSWORD=postgres \
+# Run tests with default values (or override with env vars)
+cargo test --test e2e_test
+
+# Or with custom database settings
+DATABASE_HOST=localhost \
+DATABASE_PORT=5432 \
+DATABASE_NAME=platform_api \
+DATABASE_USERNAME=postgres \
+DATABASE_PASSWORD=postgres \
 cargo test --test e2e_test
 ```
 
 #### Option 2: Using existing PostgreSQL
 Set these environment variables before running tests:
 ```bash
-export TEST_DB_HOST=localhost
-export TEST_DB_PORT=5432
-export TEST_DB_NAME=platform_api_test  # Use a dedicated test database
-export TEST_DB_USER=your_username
-export TEST_DB_PASSWORD=your_password
+export DATABASE_HOST=localhost
+export DATABASE_PORT=5432
+export DATABASE_NAME=platform_api_test  # Use a dedicated test database
+export DATABASE_USERNAME=your_username
+export DATABASE_PASSWORD=your_password
+export DATABASE_MAX_CONNECTIONS=5
+export DATABASE_TLS_ENABLED=false
 ```
 
-### Test Database Verification
-
-You can verify your test database setup using the provided script:
+#### Option 3: Using .env file
+Copy `env.example` to `.env` and configure your test database:
 ```bash
-./scripts/test-db-setup.sh
+cp env.example .env
+# Edit .env with your database credentials
+cargo test --test e2e_test
 ```
+
+### vLLM Integration Tests
+
+The vLLM integration tests require a running vLLM instance. Configure using environment variables:
+
+```bash
+# Configure vLLM endpoint
+export VLLM_BASE_URL=http://localhost:8002
+export VLLM_API_KEY=your_vllm_api_key_here  # Optional
+export VLLM_TEST_TIMEOUT_SECS=30  # Optional
+
+# Run vLLM integration tests
+cargo test --test integration_tests
+```
+
+If not set, tests will use default values but may fail if vLLM is not running at the default URL.
 
 ## Configuration
 
@@ -97,3 +122,8 @@ The application uses YAML configuration files located in the `config/` directory
 2. Check code formatting: `cargo fmt --check`
 3. Run linting: `cargo clippy`
 4. Ensure database migrations work with test setup
+
+
+## License 
+
+Licensed under the [PolyForm Strict License 1.0.0](LICENSE).

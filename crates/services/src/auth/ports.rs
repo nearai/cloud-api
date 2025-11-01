@@ -193,6 +193,13 @@ pub trait SessionRepository: Send + Sync {
         expires_in_hours: i64,
     ) -> anyhow::Result<(Session, String)>;
 
+    // Fetch the session of the inputted refresh token
+    async fn get_session_by_refresh_token(
+        &self,
+        user_id: Uuid,
+        token: &str,
+    ) -> anyhow::Result<Option<Session>>;
+
     async fn validate(&self, session_token: SessionToken) -> anyhow::Result<Option<Session>>;
 
     async fn get_by_id(&self, session_id: SessionId) -> anyhow::Result<Option<Session>>;
@@ -211,6 +218,13 @@ pub trait SessionRepository: Send + Sync {
 // Service interfaces
 #[async_trait]
 pub trait AuthServiceTrait: Send + Sync {
+    // Fetch the session of the inputted refresh token
+    async fn get_session_by_refresh_token(
+        &self,
+        user_id: Uuid,
+        token: &str,
+    ) -> Result<Option<Session>, AuthError>;
+
     /// Create a new session for a user
     async fn create_session(
         &self,
@@ -379,6 +393,25 @@ impl MockAuthService {
 
 #[async_trait]
 impl AuthServiceTrait for MockAuthService {
+    // Fetch the session of the inputted refresh token
+    async fn get_session_by_refresh_token(
+        &self,
+        _user_id: Uuid,
+        _token: &str,
+    ) -> Result<Option<Session>, AuthError> {
+        let fake_user_id = Uuid::new_v4();
+
+        let (_access_token, session, _refresh_token) = self.create_mock_session_with_params(
+            UserId(fake_user_id),
+            Some("127.0.0.1".to_string()),
+            Some("Mock User Agent".to_string()),
+            "mock_encoding_key".to_string(),
+            1,
+            24 * 7,
+        );
+        Ok(Some(session))
+    }
+
     async fn create_session(
         &self,
         user_id: UserId,

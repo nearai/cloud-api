@@ -123,7 +123,7 @@ use utoipa::{Modify, OpenApi};
             // Users models
             UserResponse,
             RefreshTokenResponse,
-            AccessTokenResponse,
+            AccessAndRefreshTokenResponse,
             PublicUserResponse,
             AdminUserResponse,
             crate::routes::users::UpdateUserProfileRequest,

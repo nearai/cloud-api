@@ -266,6 +266,47 @@ impl services::auth::SessionRepository for SessionRepository {
         Ok((service_session, token))
     }
 
+    // Fetch the session of the inputted refresh token
+    async fn get_session_by_refresh_token(
+        &self,
+        user_id: Uuid,
+        token: &str,
+    ) -> Result<Option<services::auth::Session>> {
+        let client = self.pool.get().await?;
+        let token_hash = Self::hash_session_token(token);
+        let row_opt = client
+            .query_opt(
+                r#"
+                SELECT *
+                FROM refresh_tokens
+                WHERE user_id = $1
+                AND token_hash = $2
+                AND expires_at > NOW()
+                LIMIT 1
+                "#,
+                &[&user_id, &token_hash],
+            )
+            .await?;
+
+        if let Some(row) = row_opt {
+            let db_session = self.row_to_session(row)?;
+
+            let server_session = services::auth::Session {
+                id: services::auth::SessionId(db_session.id),
+                user_id: services::auth::UserId(db_session.user_id),
+                token_hash: db_session.token_hash,
+                created_at: db_session.created_at,
+                expires_at: db_session.expires_at,
+                ip_address: db_session.ip_address,
+                user_agent: db_session.user_agent,
+            };
+
+            Ok(Some(server_session))
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn validate(
         &self,
         session_token: services::auth::SessionToken,

@@ -10,9 +10,22 @@ use crate::workspace::{ApiKey, ApiKeyRepository, WorkspaceId, WorkspaceRepositor
 use async_trait::async_trait;
 use chrono::Utc;
 use std::sync::Arc;
+use uuid::Uuid;
 
 #[async_trait]
 impl AuthServiceTrait for AuthService {
+    // Fetch the session of the inputted refresh token
+    async fn get_session_by_refresh_token(
+        &self,
+        user_id: Uuid,
+        token: &str,
+    ) -> Result<Option<Session>, AuthError> {
+        self.session_repository
+            .get_session_by_refresh_token(user_id, token)
+            .await
+            .map_err(|e| AuthError::InternalError(format!("Failed to get session by token: {e}")))
+    }
+
     async fn create_session(
         &self,
         user_id: UserId,

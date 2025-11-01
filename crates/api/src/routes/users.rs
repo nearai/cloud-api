@@ -8,14 +8,17 @@ use crate::{
     routes::api::AppState,
 };
 use axum::{
-    extract::{Extension, Json, Path, State},
+    extract::{Extension, Json, Path, Request, State},
     http::StatusCode,
 };
+use chrono::{Duration, Utc};
 use serde::Deserialize;
 use services::{organization::OrganizationError, user::UserServiceError};
 use tracing::{debug, error};
 use utoipa::ToSchema;
 use uuid::Uuid;
+
+use services::auth::UserId;
 
 /// Convert service Session (refresh token) to API RefreshTokenResponse
 fn services_session_to_api_refresh_token(
@@ -316,7 +319,7 @@ pub async fn revoke_all_user_tokens(
     path = "/users/me/access-tokens",
     tag = "Users",
     responses(
-        (status = 200, description = "Access token created successfully", body = crate::models::AccessTokenResponse),
+        (status = 200, description = "Access token created successfully", body = crate::models::AccessAndRefreshTokenResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -327,17 +330,96 @@ pub async fn revoke_all_user_tokens(
 pub async fn create_access_token(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
-) -> Result<Json<crate::models::AccessTokenResponse>, StatusCode> {
-    debug!("Creating access token for user: {}", user.0.id);
+    request: Request,
+) -> Result<Json<crate::models::AccessAndRefreshTokenResponse>, StatusCode> {
+    debug!(
+        "Creating access token & refresh token for user: {}",
+        user.0.id
+    );
 
-    match app_state.auth_service.create_session_access_token(
-        services::auth::UserId(user.0.id),
-        app_state.config.auth.encoding_key.to_string(),
-        1, // 1 hour expiration
-    ) {
-        Ok(access_token) => Ok(Json(crate::models::AccessTokenResponse { access_token })),
-        Err(_) => {
-            error!("Failed to create access token");
+    let user_agent_header: Option<String> = request
+        .headers()
+        .get("User-Agent")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    // fetch the refresh token used for the current request
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|h| h.to_str().ok());
+    let curr_refresh_token = match auth_header {
+        Some(header) if header.starts_with("Bearer rt_") => {
+            header.trim_start_matches("Bearer ").to_string()
+        }
+        _ => {
+            error!("Missing or invalid refresh token");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    };
+
+    // fetch the session associated with this current refresh token
+    let session_opt = app_state
+        .auth_service
+        .get_session_by_refresh_token(user.0.id, &curr_refresh_token)
+        .await
+        .map_err(|e| {
+            error!(
+                "Failed to fetch session by refresh token for user {}: {}.",
+                user.0.id, e
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // validate token existence and User-Agent match
+    let session = match session_opt {
+        Some(s) => s,
+        None => {
+            error!("Invalid or expired refresh token for user {}", user.0.id);
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    };
+    if let Some(db_ua) = session.user_agent.as_ref() {
+        if let Some(req_ua) = user_agent_header.as_ref() {
+            if db_ua != req_ua {
+                error!("User-Agent mismatch for user {}.", user.0.id);
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+        } else {
+            error!(
+                "Missing User-Agent header on request for user {}",
+                user.0.id
+            );
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    let expires_in_hours = 7 * 24;
+    let result = app_state
+        .auth_service
+        .create_session(
+            UserId(user.0.id),
+            None,
+            user_agent_header,
+            app_state.config.auth.encoding_key.to_string(),
+            1,
+            expires_in_hours,
+        )
+        .await;
+
+    let now = Utc::now();
+    let expires_at = now + Duration::hours(expires_in_hours);
+
+    match result {
+        Ok((access_token, _refresh_session, refresh_token)) => {
+            Ok(Json(crate::models::AccessAndRefreshTokenResponse {
+                access_token,
+                refresh_token,
+                refresh_token_expiration: expires_at,
+            }))
+        }
+        Err(e) => {
+            error!("Failed to create session (access + refresh): {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }

@@ -270,7 +270,7 @@ impl services::auth::SessionRepository for SessionRepository {
     async fn get_session_by_refresh_token(
         &self,
         user_id: Uuid,
-        token: &str
+        token: &str,
     ) -> Result<Option<services::auth::Session>> {
         let client = self.pool.get().await?;
         let token_hash = Self::hash_session_token(token);
@@ -284,9 +284,10 @@ impl services::auth::SessionRepository for SessionRepository {
                 AND expires_at > NOW()
                 LIMIT 1
                 "#,
-                &[&user_id, &token_hash]
-            ).await?;
-        
+                &[&user_id, &token_hash],
+            )
+            .await?;
+
         if let Some(row) = row_opt {
             let db_session = self.row_to_session(row)?;
 
@@ -297,7 +298,7 @@ impl services::auth::SessionRepository for SessionRepository {
                 created_at: db_session.created_at,
                 expires_at: db_session.expires_at,
                 ip_address: db_session.ip_address,
-                user_agent: db_session.user_agent
+                user_agent: db_session.user_agent,
             };
 
             Ok(Some(server_session))

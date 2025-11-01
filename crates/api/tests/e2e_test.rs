@@ -2887,7 +2887,6 @@ async fn test_admin_access_token_cannot_manage_tokens() {
     println!("✅ Admin access tokens correctly restricted from token management endpoints");
 }
 
-
 #[tokio::test]
 async fn test_create_access_token_success_user_agent_match() {
     // Spin up full test server (with MockAuthService, DB, etc.)

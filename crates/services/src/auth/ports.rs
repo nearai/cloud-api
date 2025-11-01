@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::organization::OrganizationRepository;
@@ -197,7 +197,7 @@ pub trait SessionRepository: Send + Sync {
     async fn get_session_by_refresh_token(
         &self,
         user_id: Uuid,
-        token: &str
+        token: &str,
     ) -> anyhow::Result<Option<Session>>;
 
     async fn validate(&self, session_token: SessionToken) -> anyhow::Result<Option<Session>>;
@@ -222,7 +222,7 @@ pub trait AuthServiceTrait: Send + Sync {
     async fn get_session_by_refresh_token(
         &self,
         user_id: Uuid,
-        token: &str
+        token: &str,
     ) -> Result<Option<Session>, AuthError>;
 
     /// Create a new session for a user
@@ -393,7 +393,6 @@ impl MockAuthService {
 
 #[async_trait]
 impl AuthServiceTrait for MockAuthService {
-    
     // Fetch the session of the inputted refresh token
     async fn get_session_by_refresh_token(
         &self,
@@ -407,7 +406,8 @@ impl AuthServiceTrait for MockAuthService {
             Some("127.0.0.1".to_string()),
             Some("Mock User Agent".to_string()),
             "mock_encoding_key".to_string(),
-            1, 24 * 7
+            1,
+            24 * 7,
         );
         Ok(Some(session))
     }

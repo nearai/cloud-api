@@ -1,6 +1,9 @@
 use crate::middleware::AuthenticatedUser;
 use axum::{
-    Extension, Json, extract::{Query, Request, State}, http::{StatusCode, header::SET_COOKIE}, response::{Html, IntoResponse, Redirect, Response}
+    extract::{Query, Request, State},
+    http::{header::SET_COOKIE, StatusCode},
+    response::{Html, IntoResponse, Redirect, Response},
+    Extension, Json,
 };
 use chrono::Utc;
 use config::ApiConfig;
@@ -108,7 +111,7 @@ pub async fn google_login(
 pub async fn oauth_callback(
     Query(params): Query<OAuthCallback>,
     State((oauth, state_store, auth_service, config)): State<AuthState>,
-    request: Request
+    request: Request,
 ) -> Response {
     debug!("OAuth callback received with state: {}", params.state);
 

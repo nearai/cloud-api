@@ -8,15 +8,15 @@ use crate::{
     routes::api::AppState,
 };
 use axum::{
-    extract::{Extension, Json, Path, State, Request},
+    extract::{Extension, Json, Path, Request, State},
     http::StatusCode,
 };
+use chrono::{Duration, Utc};
 use serde::Deserialize;
 use services::{organization::OrganizationError, user::UserServiceError};
 use tracing::{debug, error};
 use utoipa::ToSchema;
 use uuid::Uuid;
-use chrono::{Duration, Utc};
 
 use services::auth::UserId;
 
@@ -330,9 +330,12 @@ pub async fn revoke_all_user_tokens(
 pub async fn create_access_token(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
-    request: Request
+    request: Request,
 ) -> Result<Json<crate::models::AccessAndRefreshTokenResponse>, StatusCode> {
-    debug!("Creating access token & refresh token for user: {}", user.0.id);
+    debug!(
+        "Creating access token & refresh token for user: {}",
+        user.0.id
+    );
 
     let user_agent_header: Option<String> = request
         .headers()
@@ -379,10 +382,7 @@ pub async fn create_access_token(
     if let Some(db_ua) = session.user_agent.as_ref() {
         if let Some(req_ua) = user_agent_header.as_ref() {
             if db_ua != req_ua {
-                error!(
-                    "User-Agent mismatch for user {}.",
-                    user.0.id
-                );
+                error!("User-Agent mismatch for user {}.", user.0.id);
                 return Err(StatusCode::UNAUTHORIZED);
             }
         } else {
@@ -393,8 +393,6 @@ pub async fn create_access_token(
             return Err(StatusCode::UNAUTHORIZED);
         }
     }
-    
-
 
     let expires_in_hours = 7 * 24;
     let result = app_state
@@ -405,7 +403,7 @@ pub async fn create_access_token(
             user_agent_header,
             app_state.config.auth.encoding_key.to_string(),
             1,
-            expires_in_hours
+            expires_in_hours,
         )
         .await;
 
@@ -417,7 +415,7 @@ pub async fn create_access_token(
             Ok(Json(crate::models::AccessAndRefreshTokenResponse {
                 access_token,
                 refresh_token,
-                refresh_token_expiration: expires_at
+                refresh_token_expiration: expires_at,
             }))
         }
         Err(e) => {

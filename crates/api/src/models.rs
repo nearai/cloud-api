@@ -1023,7 +1023,7 @@ pub struct RefreshTokenResponse {
 pub struct AccessAndRefreshTokenResponse {
     pub access_token: String,
     pub refresh_token: String,
-    pub refresh_token_expiration: DateTime<Utc>
+    pub refresh_token_expiration: DateTime<Utc>,
 }
 
 /// Organization member response model (non-sensitive)

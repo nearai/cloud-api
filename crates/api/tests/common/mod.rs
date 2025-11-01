@@ -95,6 +95,7 @@ pub async fn get_access_token_from_refresh_token(
     let response = server
         .post("/v1/users/me/access-tokens")
         .add_header("Authorization", format!("Bearer {refresh_token}"))
+        .add_header("User-Agent", "e2e-test-client")
         .await;
 
     assert_eq!(
@@ -191,6 +192,7 @@ pub async fn create_org(server: &axum_test::TestServer) -> api::models::Organiza
     let response = server
         .post("/v1/organizations")
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", "e2e-test-client")
         .json(&serde_json::json!(request))
         .await;
     assert_eq!(response.status_code(), 200);
@@ -217,6 +219,7 @@ pub async fn setup_org_with_credits(
     let response = server
         .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", "e2e-test-client")
         .json(&update_request)
         .await;
 
@@ -232,6 +235,7 @@ pub async fn list_workspaces(
     let response = server
         .get(format!("/v1/organizations/{org_id}/workspaces").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", "e2e-test-client")
         .await;
     assert_eq!(response.status_code(), 200);
     let list_response = response.json::<api::routes::workspaces::ListWorkspacesResponse>();
@@ -252,6 +256,7 @@ pub async fn create_api_key_in_workspace(
     let response = server
         .post(format!("/v1/workspaces/{workspace_id}/api-keys").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", "e2e-test-client")
         .json(&serde_json::json!(request))
         .await;
     assert_eq!(response.status_code(), 201);
@@ -324,6 +329,7 @@ pub async fn admin_batch_upsert_models(
     let response = server
         .patch("/v1/admin/models")
         .add_header("Authorization", format!("Bearer {session_id}"))
+        .add_header("User-Agent", "e2e-test-client")
         .json(&models)
         .await;
 
@@ -343,6 +349,7 @@ pub async fn list_models(
     let response = server
         .get("/v1/models")
         .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", "e2e-test-client")
         .await;
     assert_eq!(response.status_code(), 200);
     response.json::<api::models::ModelsResponse>()

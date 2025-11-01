@@ -276,23 +276,15 @@ impl AuthServiceTrait for AuthService {
                             workspace.id.0, new_user.email
                         );
                     }
-                    Err(e) => {
+                    Err(_) => {
                         // Log error but don't fail user creation
-                        tracing::error!(
-                            "Failed to create default workspace for new user {}: {}",
-                            new_user.email,
-                            e
-                        );
+                        tracing::error!("Failed to create default workspace for new user");
                     }
                 }
             }
-            Err(e) => {
+            Err(_) => {
                 // Log error but don't fail user creation
-                tracing::error!(
-                    "Failed to create default organization for new user {}: {}",
-                    new_user.email,
-                    e
-                );
+                tracing::error!("Failed to create default organization for new user");
             }
         }
 

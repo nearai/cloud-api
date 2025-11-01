@@ -186,8 +186,8 @@ pub async fn create_workspace(
             debug!("Invalid workspace parameters: {}", msg);
             Err(StatusCode::BAD_REQUEST)
         }
-        Err(e) => {
-            error!("Failed to create workspace: {}", e);
+        Err(_) => {
+            error!("Failed to create workspace");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -249,8 +249,8 @@ pub async fn list_organization_workspaces(
         Err(services::workspace::WorkspaceError::Unauthorized(_)) => {
             return Err(StatusCode::FORBIDDEN);
         }
-        Err(e) => {
-            error!("Failed to count workspaces: {}", e);
+        Err(_) => {
+            error!("Failed to count workspaces");
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
@@ -293,8 +293,8 @@ pub async fn list_organization_workspaces(
             }))
         }
         Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
-        Err(e) => {
-            error!("Failed to list workspaces: {}", e);
+        Err(_) => {
+            error!("Failed to list workspaces");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -354,8 +354,8 @@ pub async fn get_workspace(
         }
         Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
         Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
-        Err(e) => {
-            error!("Failed to get workspace: {}", e);
+        Err(_) => {
+            error!("Failed to get workspace");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -427,8 +427,8 @@ pub async fn update_workspace(
         }
         Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
         Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
-        Err(e) => {
-            error!("Failed to update workspace: {}", e);
+        Err(_) => {
+            error!("Failed to update workspace");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -484,8 +484,8 @@ pub async fn delete_workspace(
         Ok(false) => Err(StatusCode::NOT_FOUND),
         Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
         Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
-        Err(e) => {
-            error!("Failed to delete workspace: {}", e);
+        Err(_) => {
+            error!("Failed to delete workspace");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -560,8 +560,8 @@ pub async fn create_workspace_api_key(
                 )),
             ));
         }
-        Err(e) => {
-            error!("Failed to check API key name duplication: {}", e);
+        Err(_) => {
+            error!("Failed to check API key name duplication");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -607,8 +607,8 @@ pub async fn create_workspace_api_key(
                 "not_found".to_string(),
             )),
         )),
-        Err(e) => {
-            error!("Failed to create API key: {}", e);
+        Err(_) => {
+            error!("Failed to create API key");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -677,8 +677,8 @@ pub async fn list_workspace_api_keys(
         Err(services::workspace::WorkspaceError::NotFound) => {
             return Err(StatusCode::NOT_FOUND);
         }
-        Err(e) => {
-            error!("Failed to count API keys for workspace: {}", e);
+        Err(_) => {
+            error!("Failed to count API keys for workspace");
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
@@ -709,8 +709,8 @@ pub async fn list_workspace_api_keys(
         }
         Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
         Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
-        Err(e) => {
-            error!("Failed to list API keys: {}", e);
+        Err(_) => {
+            error!("Failed to list API keys");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -763,8 +763,8 @@ pub async fn revoke_workspace_api_key(
         Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
         Err(services::workspace::WorkspaceError::ApiKeyNotFound) => Err(StatusCode::NOT_FOUND),
         Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
-        Err(e) => {
-            error!("Failed to revoke API key: {}", e);
+        Err(_) => {
+            error!("Failed to revoke API key");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -799,8 +799,8 @@ pub async fn revoke_api_key_with_context(
         Err(services::workspace::WorkspaceError::NotFound) => Err(StatusCode::NOT_FOUND),
         Err(services::workspace::WorkspaceError::ApiKeyNotFound) => Err(StatusCode::NOT_FOUND),
         Err(services::workspace::WorkspaceError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
-        Err(e) => {
-            error!("Failed to revoke API key: {}", e);
+        Err(_) => {
+            error!("Failed to revoke API key");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -885,8 +885,8 @@ pub async fn update_api_key_spend_limit(
                 "forbidden".to_string(),
             )),
         )),
-        Err(e) => {
-            error!("Failed to update API key spend limit: {}", e);
+        Err(_) => {
+            error!("Failed to update API key spend limit");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -994,8 +994,8 @@ pub async fn update_workspace_api_key(
                 "not_found".to_string(),
             )),
         )),
-        Err(e) => {
-            error!("Failed to update API key: {}", e);
+        Err(_) => {
+            error!("Failed to update API key");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(

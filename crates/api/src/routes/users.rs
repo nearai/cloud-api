@@ -70,8 +70,8 @@ pub async fn get_current_user(
     let user_data = match app_state.user_service.get_user(user_id.clone()).await {
         Ok(user) => user,
         Err(UserServiceError::UserNotFound) => return Err(StatusCode::NOT_FOUND),
-        Err(e) => {
-            error!("Failed to get current user: {}", e);
+        Err(_) => {
+            error!("Failed to get current user");
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
@@ -103,8 +103,8 @@ pub async fn get_current_user(
             }
             user_orgs
         }
-        Err(e) => {
-            error!("Failed to list organizations for user: {}", e);
+        Err(_) => {
+            error!("Failed to list organizations for user");
             Vec::new()
         }
     };
@@ -178,8 +178,8 @@ pub async fn update_current_user_profile(
     {
         Ok(updated_user) => Ok(Json(services_user_to_api_user(&updated_user))),
         Err(UserServiceError::UserNotFound) => Err(StatusCode::NOT_FOUND),
-        Err(e) => {
-            error!("Failed to update user profile: {}", e);
+        Err(_) => {
+            error!("Failed to update user profile");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -217,8 +217,8 @@ pub async fn get_user_refresh_tokens(
                 .collect();
             Ok(Json(api_refresh_tokens))
         }
-        Err(e) => {
-            error!("Failed to get user refresh tokens: {}", e);
+        Err(_) => {
+            error!("Failed to get user refresh tokens");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -266,8 +266,8 @@ pub async fn revoke_user_refresh_token(
         Ok(false) => Err(StatusCode::NOT_FOUND),
         Err(UserServiceError::SessionNotFound) => Err(StatusCode::NOT_FOUND),
         Err(UserServiceError::Unauthorized(_)) => Err(StatusCode::NOT_FOUND), // Don't leak that the refresh token exists
-        Err(e) => {
-            error!("Failed to revoke refresh token: {}", e);
+        Err(_) => {
+            error!("Failed to revoke refresh token");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -304,8 +304,8 @@ pub async fn revoke_all_user_tokens(
             "message": format!("Revoked {} refresh tokens and invalidated all access tokens", count),
             "count": count
         }))),
-        Err(e) => {
-            error!("Failed to revoke all user tokens: {}", e);
+        Err(_) => {
+            error!("Failed to revoke all user tokens");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -461,8 +461,8 @@ pub async fn list_user_invitations(
                 .collect();
             Ok(Json(responses))
         }
-        Err(e) => {
-            error!("Failed to list user invitations: {}", e);
+        Err(_) => {
+            error!("Failed to list user invitations");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -519,8 +519,8 @@ pub async fn accept_invitation(
         Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
         Err(OrganizationError::InvalidParams(_)) => Err(StatusCode::BAD_REQUEST),
         Err(OrganizationError::AlreadyMember) => Err(StatusCode::CONFLICT),
-        Err(e) => {
-            error!("Failed to accept invitation: {}", e);
+        Err(_) => {
+            error!("Failed to accept invitation");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -567,8 +567,8 @@ pub async fn decline_invitation(
         Err(OrganizationError::NotFound) => Err(StatusCode::NOT_FOUND),
         Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
         Err(OrganizationError::InvalidParams(_)) => Err(StatusCode::BAD_REQUEST),
-        Err(e) => {
-            error!("Failed to decline invitation: {}", e);
+        Err(_) => {
+            error!("Failed to decline invitation");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -612,8 +612,8 @@ pub async fn get_invitation_by_token(
             // Invitation expired or not pending
             Err(StatusCode::GONE) // 410 Gone
         }
-        Err(e) => {
-            error!("Failed to get invitation by token: {}", e);
+        Err(_) => {
+            error!("Failed to get invitation by token");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -668,8 +668,8 @@ pub async fn accept_invitation_by_token(
         Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
         Err(OrganizationError::InvalidParams(_)) => Err(StatusCode::BAD_REQUEST),
         Err(OrganizationError::AlreadyMember) => Err(StatusCode::CONFLICT),
-        Err(e) => {
-            error!("Failed to accept invitation by token: {}", e);
+        Err(_) => {
+            error!("Failed to accept invitation by token");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }

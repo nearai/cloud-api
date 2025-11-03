@@ -73,6 +73,7 @@ impl AdminRepository for AdminCompositeRepository {
             context_length: model.context_length,
             verifiable: model.verifiable,
             is_active: model.is_active,
+            aliases: model.aliases,
         })
     }
 

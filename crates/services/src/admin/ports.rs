@@ -33,6 +33,7 @@ pub struct ModelPricing {
     pub context_length: i32,
     pub verifiable: bool,
     pub is_active: bool,
+    pub aliases: Vec<String>,
 }
 
 /// Model history entry - includes pricing, context length, and other model attributes

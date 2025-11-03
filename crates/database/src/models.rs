@@ -406,6 +406,7 @@ pub struct Model {
     // Model metadata
     pub context_length: i32,
     pub verifiable: bool,
+    pub aliases: Vec<String>,
 
     // Tracking fields
     pub is_active: bool,

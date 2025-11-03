@@ -157,11 +157,7 @@ impl McpClientManager {
                 }
             })?
             .map_err(|e| {
-                error!(
-                    "Failed to connect to MCP server {}: {:?}",
-                    connector.name, e
-                );
-                error!("Connection error details: {:#}", e);
+                error!("Failed to connect to MCP server {}", connector.name);
                 McpError::NetworkError(format!("Failed to connect: {e}"))
             })?;
 

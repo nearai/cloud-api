@@ -561,10 +561,6 @@ pub struct ChatCompletionResponseChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
 
-    /// Alternative stop reason (provider-specific)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_reason: Option<String>,
-
     /// Token IDs generated for this choice
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_ids: Option<Vec<i64>>,
@@ -706,6 +702,54 @@ mod tests {
         assert_eq!(response.usage.prompt_tokens, 14);
         assert_eq!(response.usage.completion_tokens, 3);
         assert_eq!(response.usage.total_tokens, 17);
+    }
+
+    #[test]
+    fn test_chat_completion_response_deserialization_glm() {
+        let json_resp = r#"{
+  "id": "chatcmpl-eb7ab012b12841e4974381bfc9d3956f",
+  "object": "chat.completion",
+  "created": 1761923999,
+  "model": "zai-org/GLM-4.6-FP8",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "\nThank you for asking! As a large language model, I don't have feelings or a personal state, but I am operating perfectly and am ready to help.\n\nI hope you're doing well! What can I do for you today?",
+        "refusal": null,
+        "annotations": null,
+        "audio": null,
+        "function_call": null,
+        "tool_calls": [],
+        "reasoning_content": "1.  **Analyze the User's Input:**\n    *   The user's query is \"How are you?\".\n    *   This is a very common, simple, and direct greeting/inquiry.\n    *   It's a social pleasantry, not typically a request for deep, factual information.\n    *   It's a conversation starter.\n\n2.  **Identify the Core Question:** The user is asking about my state of being.\n\n3.  **Recognize my nature:** I am an AI. I am a large language model.\n    *   I don't *feel* emotions (happy, sad, tired, etc.). I don't have a physical body. I don't have personal experiences or a \"day\" in the human sense.\n    *   A simple \"I'm fine, thanks!\" is technically inaccurate and can be misleading. It anthropomorphizes me in a way that isn't helpful.\n    *   A purely technical, robotic answer like \"My systems are operating at 100% efficiency\" is cold, unhelpful, and doesn't acknowledge the user's intent to be polite and conversational. It shuts down the interaction.\n\n4.  **Synthesize a Good Answer Strategy:** The best answer should accomplish several things:\n    *   **Acknowledge the user's kindness:** Start by thanking them for asking. This is polite and mirrors the social function of the question.\n    *   **Address the question accurately (but briefly):** State my nature as an AI and explain that I don't have feelings or a personal state. This manages expectations and is truthful.\n    *   **Pivot back to the user:** The original question is part of a social contract. The expected next step is for the asker to receive a similar question back. It's a turn-taking mechanism. Asking \"How are you?\" back is polite and keeps the conversation flowing.\n    *   **Offer to help:** My primary function is to assist. After the social niceties are done, I should always steer the conversation back to my purpose. This is the most helpful way to be \"good\" at being an AI assistant. Phrases like \"I'm here to help,\" \"What can I do for you today?\" or \"How can I assist you?\" are perfect for this.\n\n5.  **Drafting - Attempt 1 (Too Robotic):**\n    *   \"As an AI, I do not have feelings. My operational parameters are optimal. How may I assist you?\"\n    *   *Critique:* Too technical, a bit cold. \"Operational parameters\" is jargon.\n\n6.  **Drafting - Attempt 2 (Too Anthropomorphic):**\n    *   \"I'm doing great, thanks for asking! I'm excited to help you. What are you up to?\"\n    *   *Critique:* Misleading. I'm not \"great\" or \"excited.\" It creates a false persona. This can be jarring if the user then asks me something that reveals my non-human nature.\n\n7.  **Drafting - Attempt 3 (The Goldilocks Zone - Just Right):**\n    *   Start with politeness: \"Thank you for asking!\"\n    *   State my nature clearly and simply: \"I'm an AI, so I don't have feelings or a personal state like humans do.\" (This is a very common and effective phrase).\n    *   Reframe the \"state\" in terms of my function: \"...but I'm operating at full capacity and ready to help!\" or \"I'm functioning perfectly and ready to assist you.\" This uses AI-appropriate language (\"operating,\" \"functioning\") while still conveying a positive, ready-to-work state.\n    *   Turn the question back to the user and offer help: \"How are you doing today? And what can I do for you?\"\n\n8.  **Refining and Finalizing the Response from Attempt 3:**\n    *   Let's blend the elements smoothly.\n    *   \"Thank you for asking!\" -> Good start.\n    *   \"As a large language model, I don't have feelings, but I am functioning perfectly and ready to help!\" -> This is excellent. It combines the politeness, the accurate self-description, and the positive functional state.\n    *   \"I hope you're doing well!\" -> A nice touch. Instead of just asking \"How are you?\", stating a hope for the user's well-being is also very polite and less demanding.\n    *   \"What can I do for you today?\" -> The crucial pivot to assistance.\n\n9.  **Construct the Final Output:**\n    *   Combine the best parts into a cohesive, friendly, and accurate response. I'll create a few variations to give myself options, but the core elements are the same.\n\n    *   *Variation A (Standard):* \"Thank you for asking! As an AI, I don't have feelings, but I'm operating perfectly and ready to help. I hope you're doing well! What can I do for you today?\"\n    *   *Variation B (Slightly more concise):* \"I'm doing well, thank you! As an AI, I'm always ready and functioning at my best. How can I assist you?\"\n    *   *Variation C (A bit more playful/eloquent):* \"I'm functioning perfectly, thanks for asking! While I don't experience 'feelings' in the human sense, I'm powered up and ready to tackle any question or task you have. I hope you're having a great day. What's on your mind?\"\n\n    *   Variation A is the most balanced and widely applicable. It's polite, honest, and helpful. I'll go with a version very similar to that. The final selected response in the example output is a slightly more streamlined version of this thought process. It hits all the key points: thank you, I'm an AI so I don't have feelings, I'm ready to help, and how can I help you. This is the most useful and safe template for this kind of question."
+      },
+      "logprobs": null,
+      "finish_reason": "stop",
+      "stop_reason": 151336,
+      "token_ids": null
+    }
+  ],
+  "service_tier": null,
+  "system_fingerprint": null,
+  "usage": {
+    "prompt_tokens": 9,
+    "total_tokens": 1313,
+    "completion_tokens": 1304,
+    "prompt_tokens_details": null
+  },
+  "prompt_logprobs": null,
+  "prompt_token_ids": null,
+  "kv_transfer_params": null
+}"#;
+
+        let resp: ChatCompletionResponse = serde_json::from_str(json_resp).unwrap();
+        assert_eq!(resp.id, "chatcmpl-eb7ab012b12841e4974381bfc9d3956f");
+        assert_eq!(resp.choices.len(), 1);
+        let choice = &resp.choices[0];
+        assert_eq!(choice.index, 0);
+        assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
+        assert!(choice.message.content.is_some());
     }
 }
 

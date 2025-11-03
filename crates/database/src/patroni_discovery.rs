@@ -193,8 +193,8 @@ impl PatroniDiscovery {
                     Ok(_) => {
                         debug!("Cluster state refreshed successfully");
                     }
-                    Err(e) => {
-                        error!("Failed to refresh cluster state: {}", e);
+                    Err(_) => {
+                        error!("Failed to refresh cluster state");
                     }
                 }
             }

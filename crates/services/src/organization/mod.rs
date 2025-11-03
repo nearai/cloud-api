@@ -30,39 +30,37 @@ impl OrganizationServiceImpl {
         match err {
             RepositoryError::AlreadyExists => OrganizationError::AlreadyExists,
             RepositoryError::NotFound(msg) => {
-                OrganizationError::InternalError(format!("Resource not found: {}", msg))
+                OrganizationError::InternalError(format!("Resource not found: {msg}"))
             }
             RepositoryError::RequiredFieldMissing(field) => {
-                OrganizationError::InvalidParams(format!("Required field is missing: {}", field))
+                OrganizationError::InvalidParams(format!("Required field is missing: {field}"))
             }
-            RepositoryError::ForeignKeyViolation(msg) => OrganizationError::InvalidParams(format!(
-                "Referenced entity does not exist: {}",
-                msg
-            )),
+            RepositoryError::ForeignKeyViolation(msg) => {
+                OrganizationError::InvalidParams(format!("Referenced entity does not exist: {msg}"))
+            }
             RepositoryError::ValidationFailed(msg) => {
-                OrganizationError::InvalidParams(format!("Validation failed: {}", msg))
+                OrganizationError::InvalidParams(format!("Validation failed: {msg}"))
             }
             RepositoryError::DependencyExists(msg) => OrganizationError::InvalidParams(format!(
-                "Cannot delete due to dependencies: {}",
-                msg
+                "Cannot delete due to dependencies: {msg}"
             )),
             RepositoryError::TransactionConflict => {
                 OrganizationError::InternalError("Transaction conflict, please retry".to_string())
             }
             RepositoryError::ConnectionFailed(msg) => {
-                OrganizationError::InternalError(format!("Database connection failed: {}", msg))
+                OrganizationError::InternalError(format!("Database connection failed: {msg}"))
             }
             RepositoryError::AuthenticationFailed => {
                 OrganizationError::InternalError("Database authentication failed".to_string())
             }
             RepositoryError::PoolError(err) => {
-                OrganizationError::InternalError(format!("Database connection pool error: {}", err))
+                OrganizationError::InternalError(format!("Database connection pool error: {err}"))
             }
             RepositoryError::DatabaseError(err) => {
-                OrganizationError::InternalError(format!("Database operation failed: {}", err))
+                OrganizationError::InternalError(format!("Database operation failed: {err}"))
             }
             RepositoryError::DataConversionError(err) => {
-                OrganizationError::InternalError(format!("Data conversion error: {}", err))
+                OrganizationError::InternalError(format!("Data conversion error: {err}"))
             }
         }
     }

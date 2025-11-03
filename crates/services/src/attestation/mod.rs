@@ -4,6 +4,7 @@ pub use models::{AttestationError, ChatSignature};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use hex;
 use rand::RngCore;
 
 use crate::{
@@ -58,7 +59,7 @@ impl ports::AttestationServiceTrait for AttestationService {
 
         // Fetch signature from provider
         let provider_signature = provider.get_signature(chat_id).await.map_err(|e| {
-            tracing::error!("Failed to get chat signature from provider: {:?}", e);
+            tracing::error!("Failed to get chat signature from provider");
             AttestationError::ProviderError(e.to_string())
         })?;
 
@@ -74,7 +75,7 @@ impl ports::AttestationServiceTrait for AttestationService {
             .add_chat_signature(chat_id, signature)
             .await
             .map_err(|e| {
-                tracing::error!("Failed to store chat signature in repository: {:?}", e);
+                tracing::error!("Failed to store chat signature in repository");
                 AttestationError::RepositoryError(e.to_string())
             })?;
 
@@ -167,22 +168,36 @@ impl ports::AttestationServiceTrait for AttestationService {
             };
         } else {
             let client = dstack_client::DstackClient::new(None);
-            // nonce has 32 bytes, dstack pads to 64
-            let report_data = nonce.as_bytes().to_vec();
+            // Decode hex string nonce to bytes (nonce should be 64 hex chars = 32 bytes)
+            let nonce_bytes = hex::decode(&nonce).map_err(|e| {
+                tracing::error!("Failed to decode nonce hex string: {}", e);
+                AttestationError::InvalidParameter(format!("Invalid nonce format: {e}"))
+            })?;
 
-            let info = client.info().await.map_err(|e| {
+            if nonce_bytes.len() != 32 {
+                return Err(AttestationError::InvalidParameter(format!(
+                    "Nonce must be exactly 32 bytes, got {} bytes",
+                    nonce_bytes.len()
+                )));
+            }
+
+            // Construct 64-byte report_data: first 32 bytes are zeros for gateway attestation,
+            // last 32 bytes are the nonce
+            let mut report_data = vec![0u8; 64];
+            // Place nonce in the last 32 bytes
+            report_data[32..64].copy_from_slice(&nonce_bytes);
+
+            let info = client.info().await.map_err(|_| {
                 tracing::error!(
-                    "Failed to get cloud API attestation info, are you running in a CVM? {e:?}"
+                    "Failed to get cloud API attestation info, are you running in a CVM?"
                 );
                 AttestationError::InternalError(
                     "failed to get cloud API attestation info".to_string(),
                 )
             })?;
 
-            let cpu_quote = client.get_quote(report_data).await.map_err(|e| {
-                tracing::error!(
-                    "Failed to get cloud API attestation, are you running in a CVM? {e:?}"
-                );
+            let cpu_quote = client.get_quote(report_data).await.map_err(|_| {
+                tracing::error!("Failed to get cloud API attestation, are you running in a CVM?");
                 AttestationError::InternalError("failed to get cloud API attestation".to_string())
             })?;
             gateway_attestation = DstackCpuQuote::from_quote_and_nonce(info, cpu_quote, nonce);

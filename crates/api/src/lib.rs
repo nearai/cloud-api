@@ -181,8 +181,8 @@ pub fn create_oauth_manager(config: &ApiConfig) -> OAuthManager {
         .clone()
         .map(config::OAuthProviderConfig::from);
 
-    let manager = OAuthManager::new(github_config, google_config).unwrap_or_else(|e| {
-        tracing::error!("Failed to create OAuth manager: {}", e);
+    let manager = OAuthManager::new(github_config, google_config).unwrap_or_else(|_| {
+        tracing::error!("Failed to create OAuth manager");
         std::process::exit(1);
     });
 
@@ -349,8 +349,8 @@ pub async fn init_inference_providers(
             interval.tick().await;
             tracing::debug!("Running periodic model discovery refresh");
             // Re-run model discovery
-            if let Err(e) = pool_clone.initialize().await {
-                tracing::error!("Failed to refresh model discovery: {}", e);
+            if pool_clone.initialize().await.is_err() {
+                tracing::error!("Failed to refresh model discovery");
             }
         }
     });

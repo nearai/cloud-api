@@ -42,11 +42,12 @@ where
                         let attestation_service = self.attestation_service.clone();
                         let chat_id = chat_chunk.id.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = attestation_service
+                            if attestation_service
                                 .store_chat_signature_from_provider(chat_id.as_str())
                                 .await
+                                .is_err()
                             {
-                                tracing::error!("Failed to store chat signature: {:?}", e);
+                                tracing::error!("Failed to store chat signature");
                             } else {
                                 tracing::debug!("Stored signature for chat_id: {}", chat_id);
                             }
@@ -63,7 +64,7 @@ where
                         let output_tokens = usage.completion_tokens;
 
                         tokio::spawn(async move {
-                            if let Err(e) = usage_service
+                            if usage_service
                                 .record_usage(RecordUsageServiceRequest {
                                     organization_id,
                                     workspace_id,
@@ -75,11 +76,9 @@ where
                                     request_type,
                                 })
                                 .await
+                                .is_err()
                             {
-                                tracing::error!(
-                                    "Failed to record usage in completion service: {}",
-                                    e
-                                );
+                                tracing::error!("Failed to record usage in completion service");
                             } else {
                                 tracing::debug!(
                                     "Recorded usage for org {}: {} input, {} output tokens (api_key: {})",
@@ -251,7 +250,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     // For server errors (5xx), log details but return generic message to user
                     tracing::error!(
                         model = %request.model,
-                        error = %e,
                         "Provider error during chat completion stream"
                     );
                     ports::CompletionError::ProviderError(
@@ -360,7 +358,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     // For server errors (5xx), log details but return generic message to user
                     tracing::error!(
                         model = %request.model,
-                        error = %e,
                         "Provider error during chat completion"
                     );
                     ports::CompletionError::ProviderError(
@@ -373,11 +370,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let attestation_service = self.attestation_service.clone();
         let chat_id = response_with_bytes.response.id.clone();
         tokio::spawn(async move {
-            if let Err(e) = attestation_service
+            if attestation_service
                 .store_chat_signature_from_provider(chat_id.as_str())
                 .await
+                .is_err()
             {
-                tracing::error!("Failed to store chat signature: {:?}", e);
+                tracing::error!("Failed to store chat signature");
             } else {
                 tracing::debug!("Stored signature for chat_id: {}", chat_id);
             }
@@ -395,7 +393,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let output_tokens = response_with_bytes.response.usage.completion_tokens;
 
         tokio::spawn(async move {
-            if let Err(e) = usage_service
+            if usage_service
                 .record_usage(RecordUsageServiceRequest {
                     organization_id,
                     workspace_id,
@@ -407,8 +405,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     request_type: "chat_completion".to_string(),
                 })
                 .await
+                .is_err()
             {
-                tracing::error!("Failed to record usage in completion service: {}", e);
+                tracing::error!("Failed to record usage in completion service");
             } else {
                 tracing::debug!(
                     "Recorded usage for org {}: {} input, {} output tokens (api_key: {})",

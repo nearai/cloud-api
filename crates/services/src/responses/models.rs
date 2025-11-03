@@ -149,6 +149,8 @@ pub enum ResponseTool {
     CodeInterpreter {},
     #[serde(rename = "computer")]
     Computer {},
+    #[serde(rename = "current_date")]
+    CurrentDate {},
 }
 
 /// Tool choice configuration
@@ -274,6 +276,12 @@ pub enum ResponseOutputItem {
         tool_type: String,
         function: ResponseOutputFunction,
     },
+    #[serde(rename = "web_search_call")]
+    WebSearchCall {
+        id: String,
+        status: ResponseItemStatus,
+        action: WebSearchAction,
+    },
     #[serde(rename = "reasoning")]
     Reasoning {
         id: String,
@@ -281,6 +289,14 @@ pub enum ResponseOutputItem {
         summary: String,
         content: String,
     },
+}
+
+/// Web search action details
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type")]
+pub enum WebSearchAction {
+    #[serde(rename = "search")]
+    Search { query: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -292,6 +308,19 @@ pub enum ResponseItemStatus {
     Cancelled,
 }
 
+/// Annotation for output text (citations, etc.)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type")]
+pub enum TextAnnotation {
+    #[serde(rename = "url_citation")]
+    UrlCitation {
+        start_index: usize,
+        end_index: usize,
+        title: String,
+        url: String,
+    },
+}
+
 /// Output content part
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
@@ -299,7 +328,7 @@ pub enum ResponseOutputContent {
     #[serde(rename = "output_text")]
     OutputText {
         text: String,
-        annotations: Vec<serde_json::Value>,
+        annotations: Vec<TextAnnotation>,
     },
     #[serde(rename = "tool_calls")]
     ToolCalls {
@@ -358,6 +387,8 @@ pub struct ResponseStreamEvent {
     #[serde(rename = "type")]
     pub event_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<ResponseObject>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_index: Option<usize>,
@@ -373,6 +404,14 @@ pub struct ResponseStreamEvent {
     pub delta: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub obfuscation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotation_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<TextAnnotation>,
 }
 
 /// Input item list for responses
@@ -457,7 +496,7 @@ pub enum ConversationContentPart {
     OutputText {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        annotations: Option<Vec<serde_json::Value>>,
+        annotations: Option<Vec<TextAnnotation>>,
     },
 }
 

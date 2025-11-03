@@ -88,6 +88,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 // Send error event
                 let error_event = models::ResponseStreamEvent {
                     event_type: "response.failed".to_string(),
+                    sequence_number: None,
                     response: None,
                     output_index: None,
                     content_index: None,
@@ -96,6 +97,10 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                     part: None,
                     delta: None,
                     text: Some(e.to_string()),
+                    logprobs: None,
+                    obfuscation: None,
+                    annotation_index: None,
+                    annotation: None,
                 };
                 let _ = tx.send(error_event).await;
             }
@@ -134,8 +139,13 @@ impl ResponseServiceImpl {
 
         let initial_response = Self::create_initial_response_object(&request, &response_id_str);
 
+        // Sequence number tracker
+        let mut sequence_number: u64 = 0;
+
+        // Event: response.created
         let created_event = models::ResponseStreamEvent {
             event_type: "response.created".to_string(),
+            sequence_number: Some(sequence_number),
             response: Some(initial_response.clone()),
             output_index: None,
             content_index: None,
@@ -144,10 +154,37 @@ impl ResponseServiceImpl {
             part: None,
             delta: None,
             text: None,
+            logprobs: None,
+            obfuscation: None,
+            annotation_index: None,
+            annotation: None,
         };
         tx.send(created_event).await.map_err(|e| {
             errors::ResponseError::InternalError(format!("Failed to send event: {}", e))
         })?;
+        sequence_number += 1;
+
+        // Event: response.in_progress
+        let in_progress_event = models::ResponseStreamEvent {
+            event_type: "response.in_progress".to_string(),
+            sequence_number: Some(sequence_number),
+            response: Some(initial_response.clone()),
+            output_index: None,
+            content_index: None,
+            item: None,
+            item_id: None,
+            part: None,
+            delta: None,
+            text: None,
+            logprobs: None,
+            obfuscation: None,
+            annotation_index: None,
+            annotation: None,
+        };
+        tx.send(in_progress_event).await.map_err(|e| {
+            errors::ResponseError::InternalError(format!("Failed to send event: {}", e))
+        })?;
+        sequence_number += 1;
 
         let tools = Self::prepare_tools(&request);
         let tool_choice = Self::prepare_tool_choice(&request);
@@ -155,6 +192,7 @@ impl ResponseServiceImpl {
         let max_iterations = 10; // Prevent infinite loops
         let mut iteration = 0;
         let mut final_response_text = String::new();
+        let mut output_item_index: usize = 0;
 
         loop {
             iteration += 1;
@@ -214,26 +252,89 @@ impl ResponseServiceImpl {
                 (Option<String>, String),
             > = std::collections::HashMap::new();
 
+            // Track whether we've emitted the message item and content part events
+            let mut message_item_emitted = false;
+            let message_item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+
             while let Some(event) = completion_stream.next().await {
                 match event {
                     Ok(sse_event) => {
                         // Parse the SSE event for content and tool calls
                         if let Some(delta_text) = Self::extract_text_delta(&sse_event) {
+                            // First time we receive text, emit the item.added and content_part.added events
+                            if !message_item_emitted {
+                                // Event: response.output_item.added (for message)
+                                let item_added_event = models::ResponseStreamEvent {
+                                    event_type: "response.output_item.added".to_string(),
+                                    sequence_number: Some(sequence_number),
+                                    response: None,
+                                    output_index: Some(output_item_index),
+                                    content_index: None,
+                                    item: Some(models::ResponseOutputItem::Message {
+                                        id: message_item_id.clone(),
+                                        status: models::ResponseItemStatus::InProgress,
+                                        role: "assistant".to_string(),
+                                        content: vec![],
+                                    }),
+                                    item_id: Some(message_item_id.clone()),
+                                    part: None,
+                                    delta: None,
+                                    text: None,
+                                    logprobs: None,
+                                    obfuscation: None,
+                                    annotation_index: None,
+                                    annotation: None,
+                                };
+                                let _ = tx.send(item_added_event).await;
+                                sequence_number += 1;
+
+                                // Event: response.content_part.added
+                                let content_part_added_event = models::ResponseStreamEvent {
+                                    event_type: "response.content_part.added".to_string(),
+                                    sequence_number: Some(sequence_number),
+                                    response: None,
+                                    output_index: Some(output_item_index),
+                                    content_index: Some(0),
+                                    item: None,
+                                    item_id: Some(message_item_id.clone()),
+                                    part: Some(models::ResponseOutputContent::OutputText {
+                                        text: String::new(),
+                                        annotations: vec![],
+                                    }),
+                                    delta: None,
+                                    text: None,
+                                    logprobs: None,
+                                    obfuscation: None,
+                                    annotation_index: None,
+                                    annotation: None,
+                                };
+                                let _ = tx.send(content_part_added_event).await;
+                                sequence_number += 1;
+
+                                message_item_emitted = true;
+                            }
+
                             current_text.push_str(&delta_text);
 
                             // Emit delta event
                             let delta_event = models::ResponseStreamEvent {
                                 event_type: "response.output_text.delta".to_string(),
+                                sequence_number: Some(sequence_number),
                                 response: None,
-                                output_index: Some(0),
+                                output_index: Some(output_item_index),
                                 content_index: Some(0),
                                 item: None,
-                                item_id: None,
+                                item_id: Some(message_item_id.clone()),
                                 part: None,
                                 delta: Some(delta_text.clone()),
                                 text: None,
+                                logprobs: Some(vec![]), // Empty array for now
+                                obfuscation: None,
+                                annotation_index: None,
+                                annotation: None,
                             };
                             let _ = tx.send(delta_event).await;
+                            sequence_number += 1;
                         }
 
                         // Accumulate tool call fragments
@@ -249,6 +350,82 @@ impl ResponseServiceImpl {
                 }
             }
 
+            // If we emitted a message, close it with done events
+            if message_item_emitted {
+                // Event: response.output_text.done
+                let text_done_event = models::ResponseStreamEvent {
+                    event_type: "response.output_text.done".to_string(),
+                    sequence_number: Some(sequence_number),
+                    response: None,
+                    output_index: Some(output_item_index),
+                    content_index: Some(0),
+                    item: None,
+                    item_id: Some(message_item_id.clone()),
+                    part: None,
+                    delta: None,
+                    text: Some(current_text.clone()),
+                    logprobs: Some(vec![]),
+                    obfuscation: None,
+                    annotation_index: None,
+                    annotation: None,
+                };
+                let _ = tx.send(text_done_event).await;
+                sequence_number += 1;
+
+                // Event: response.content_part.done
+                let content_part_done_event = models::ResponseStreamEvent {
+                    event_type: "response.content_part.done".to_string(),
+                    sequence_number: Some(sequence_number),
+                    response: None,
+                    output_index: Some(output_item_index),
+                    content_index: Some(0),
+                    item: None,
+                    item_id: Some(message_item_id.clone()),
+                    part: Some(models::ResponseOutputContent::OutputText {
+                        text: current_text.clone(),
+                        annotations: vec![],
+                    }),
+                    delta: None,
+                    text: None,
+                    logprobs: None,
+                    obfuscation: None,
+                    annotation_index: None,
+                    annotation: None,
+                };
+                let _ = tx.send(content_part_done_event).await;
+                sequence_number += 1;
+
+                // Event: response.output_item.done
+                let item_done_event = models::ResponseStreamEvent {
+                    event_type: "response.output_item.done".to_string(),
+                    sequence_number: Some(sequence_number),
+                    response: None,
+                    output_index: Some(output_item_index),
+                    content_index: None,
+                    item: Some(models::ResponseOutputItem::Message {
+                        id: message_item_id.clone(),
+                        status: models::ResponseItemStatus::Completed,
+                        role: "assistant".to_string(),
+                        content: vec![models::ResponseOutputContent::OutputText {
+                            text: current_text.clone(),
+                            annotations: vec![],
+                        }],
+                    }),
+                    item_id: Some(message_item_id.clone()),
+                    part: None,
+                    delta: None,
+                    text: None,
+                    logprobs: None,
+                    obfuscation: None,
+                    annotation_index: None,
+                    annotation: None,
+                };
+                let _ = tx.send(item_done_event).await;
+                sequence_number += 1;
+
+                output_item_index += 1;
+            }
+
             final_response_text.push_str(&current_text);
 
             if !current_text.is_empty() {
@@ -261,22 +438,35 @@ impl ResponseServiceImpl {
             // Convert accumulated tool calls to detected tool calls
             for (idx, (name_opt, args_str)) in tool_call_accumulator {
                 if let Some(name) = name_opt {
-                    // Try to parse the complete arguments
-                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str) {
-                        if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
-                            tracing::debug!(
-                                "Tool call {} complete: {} with query: {}",
-                                idx,
-                                name,
-                                query
-                            );
-                            tool_calls_detected.push(ToolCallInfo {
-                                tool_type: name,
-                                query: query.to_string(),
-                            });
-                        }
+                    // Handle tools that don't require parameters (like current_date)
+                    if name == "current_date" {
+                        tracing::debug!("Tool call {} complete: {}", idx, name);
+                        tool_calls_detected.push(ToolCallInfo {
+                            tool_type: name,
+                            query: String::new(), // No query needed
+                        });
                     } else {
-                        tracing::warn!("Failed to parse tool call {} arguments: {}", idx, args_str);
+                        // Try to parse the complete arguments for tools that need parameters
+                        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str) {
+                            if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
+                                tracing::debug!(
+                                    "Tool call {} complete: {} with query: {}",
+                                    idx,
+                                    name,
+                                    query
+                                );
+                                tool_calls_detected.push(ToolCallInfo {
+                                    tool_type: name,
+                                    query: query.to_string(),
+                                });
+                            }
+                        } else {
+                            tracing::warn!(
+                                "Failed to parse tool call {} arguments: {}",
+                                idx,
+                                args_str
+                            );
+                        }
                     }
                 }
             }
@@ -290,6 +480,78 @@ impl ResponseServiceImpl {
             tracing::debug!("Executing {} tool calls", tool_calls_detected.len());
 
             for tool_call in tool_calls_detected {
+                let tool_call_id =
+                    format!("{}_{}", tool_call.tool_type, uuid::Uuid::new_v4().simple());
+
+                // Emit tool call events
+                if tool_call.tool_type == "web_search" {
+                    // Event: response.output_item.added (for web search)
+                    let item_added_event = models::ResponseStreamEvent {
+                        event_type: "response.output_item.added".to_string(),
+                        sequence_number: Some(sequence_number),
+                        response: None,
+                        output_index: Some(output_item_index),
+                        content_index: None,
+                        item: Some(models::ResponseOutputItem::WebSearchCall {
+                            id: tool_call_id.clone(),
+                            status: models::ResponseItemStatus::InProgress,
+                            action: models::WebSearchAction::Search {
+                                query: tool_call.query.clone(),
+                            },
+                        }),
+                        item_id: Some(tool_call_id.clone()),
+                        part: None,
+                        delta: None,
+                        text: None,
+                        logprobs: None,
+                        obfuscation: None,
+                        annotation_index: None,
+                        annotation: None,
+                    };
+                    let _ = tx.send(item_added_event).await;
+                    sequence_number += 1;
+
+                    // Event: response.web_search_call.in_progress
+                    let web_search_in_progress_event = models::ResponseStreamEvent {
+                        event_type: "response.web_search_call.in_progress".to_string(),
+                        sequence_number: Some(sequence_number),
+                        response: None,
+                        output_index: Some(output_item_index),
+                        content_index: None,
+                        item: None,
+                        item_id: Some(tool_call_id.clone()),
+                        part: None,
+                        delta: None,
+                        text: None,
+                        logprobs: None,
+                        obfuscation: None,
+                        annotation_index: None,
+                        annotation: None,
+                    };
+                    let _ = tx.send(web_search_in_progress_event).await;
+                    sequence_number += 1;
+
+                    // Event: response.web_search_call.searching
+                    let web_search_searching_event = models::ResponseStreamEvent {
+                        event_type: "response.web_search_call.searching".to_string(),
+                        sequence_number: Some(sequence_number),
+                        response: None,
+                        output_index: Some(output_item_index),
+                        content_index: None,
+                        item: None,
+                        item_id: Some(tool_call_id.clone()),
+                        part: None,
+                        delta: None,
+                        text: None,
+                        logprobs: None,
+                        obfuscation: None,
+                        annotation_index: None,
+                        annotation: None,
+                    };
+                    let _ = tx.send(web_search_searching_event).await;
+                    sequence_number += 1;
+                }
+
                 let tool_result = Self::execute_tool(
                     &tool_call,
                     &web_search_provider,
@@ -297,6 +559,57 @@ impl ResponseServiceImpl {
                     &request,
                 )
                 .await?;
+
+                // Emit completion events for web search
+                if tool_call.tool_type == "web_search" {
+                    // Event: response.web_search_call.completed
+                    let web_search_completed_event = models::ResponseStreamEvent {
+                        event_type: "response.web_search_call.completed".to_string(),
+                        sequence_number: Some(sequence_number),
+                        response: None,
+                        output_index: Some(output_item_index),
+                        content_index: None,
+                        item: None,
+                        item_id: Some(tool_call_id.clone()),
+                        part: None,
+                        delta: None,
+                        text: None,
+                        logprobs: None,
+                        obfuscation: None,
+                        annotation_index: None,
+                        annotation: None,
+                    };
+                    let _ = tx.send(web_search_completed_event).await;
+                    sequence_number += 1;
+
+                    // Event: response.output_item.done (for web search)
+                    let item_done_event = models::ResponseStreamEvent {
+                        event_type: "response.output_item.done".to_string(),
+                        sequence_number: Some(sequence_number),
+                        response: None,
+                        output_index: Some(output_item_index),
+                        content_index: None,
+                        item: Some(models::ResponseOutputItem::WebSearchCall {
+                            id: tool_call_id.clone(),
+                            status: models::ResponseItemStatus::Completed,
+                            action: models::WebSearchAction::Search {
+                                query: tool_call.query.clone(),
+                            },
+                        }),
+                        item_id: Some(tool_call_id.clone()),
+                        part: None,
+                        delta: None,
+                        text: None,
+                        logprobs: None,
+                        obfuscation: None,
+                        annotation_index: None,
+                        annotation: None,
+                    };
+                    let _ = tx.send(item_done_event).await;
+                    sequence_number += 1;
+
+                    output_item_index += 1;
+                }
 
                 // Add tool result to message history
                 messages.push(CompletionMessage {
@@ -320,6 +633,7 @@ impl ResponseServiceImpl {
 
         let completed_event = models::ResponseStreamEvent {
             event_type: "response.completed".to_string(),
+            sequence_number: Some(sequence_number),
             response: Some(final_response),
             output_index: None,
             content_index: None,
@@ -328,6 +642,10 @@ impl ResponseServiceImpl {
             part: None,
             delta: None,
             text: None,
+            logprobs: None,
+            obfuscation: None,
+            annotation_index: None,
+            annotation: None,
         };
         tx.send(completed_event).await.map_err(|e| {
             errors::ResponseError::InternalError(format!("Failed to send event: {}", e))
@@ -548,8 +866,48 @@ impl ResponseServiceImpl {
                             },
                         });
                     }
+                    models::ResponseTool::CurrentDate {} => {
+                        // Note: current_date is added by default below, so this case
+                        // should not typically be hit unless explicitly requested
+                        tool_definitions.push(inference_providers::ToolDefinition {
+                            type_: "function".to_string(),
+                            function: inference_providers::FunctionDefinition {
+                                name: "current_date".to_string(),
+                                description: Some(
+                                    "Get the current date and time. Use this when you need to know what day it is, the current time, or to answer questions about temporal information.".to_string()
+                                ),
+                                parameters: serde_json::json!({
+                                    "type": "object",
+                                    "properties": {},
+                                    "required": []
+                                }),
+                            },
+                        });
+                    }
                 }
             }
+        }
+
+        // Always add current_date tool by default (not visible at API level)
+        // Check if it's not already added to avoid duplicates
+        if !tool_definitions
+            .iter()
+            .any(|t| t.function.name == "current_date")
+        {
+            tool_definitions.push(inference_providers::ToolDefinition {
+                type_: "function".to_string(),
+                function: inference_providers::FunctionDefinition {
+                    name: "current_date".to_string(),
+                    description: Some(
+                        "Get the current date and time. Use this when you need to know what day it is, the current time, or to answer questions about temporal information.".to_string()
+                    ),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }),
+                },
+            });
         }
 
         tool_definitions
@@ -733,6 +1091,22 @@ impl ResponseServiceImpl {
                 } else {
                     Ok("File search not available (no provider configured)".to_string())
                 }
+            }
+            "current_date" => {
+                // Get current date and time
+                let now = chrono::Utc::now();
+                let formatted = format!(
+                    "Current Date and Time:\n\
+                    Date: {}\n\
+                    Time: {} UTC\n\
+                    ISO 8601: {}\n\
+                    Unix timestamp: {}",
+                    now.format("%A, %B %d, %Y"),
+                    now.format("%H:%M:%S"),
+                    now.to_rfc3339(),
+                    now.timestamp()
+                );
+                Ok(formatted)
             }
             _ => Err(errors::ResponseError::UnknownTool(
                 tool_call.tool_type.clone(),

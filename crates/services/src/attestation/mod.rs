@@ -4,6 +4,7 @@ pub use models::{AttestationError, ChatSignature};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use hex;
 use rand::RngCore;
 
 use crate::{
@@ -167,8 +168,24 @@ impl ports::AttestationServiceTrait for AttestationService {
             };
         } else {
             let client = dstack_client::DstackClient::new(None);
-            // nonce has 32 bytes, dstack pads to 64
-            let report_data = nonce.as_bytes().to_vec();
+            // Decode hex string nonce to bytes (nonce should be 64 hex chars = 32 bytes)
+            let nonce_bytes = hex::decode(&nonce).map_err(|e| {
+                tracing::error!("Failed to decode nonce hex string: {}", e);
+                AttestationError::InvalidParameter(format!("Invalid nonce format: {e}"))
+            })?;
+
+            if nonce_bytes.len() != 32 {
+                return Err(AttestationError::InvalidParameter(format!(
+                    "Nonce must be exactly 32 bytes, got {} bytes",
+                    nonce_bytes.len()
+                )));
+            }
+
+            // Construct 64-byte report_data: first 32 bytes are zeros for gateway attestation,
+            // last 32 bytes are the nonce
+            let mut report_data = vec![0u8; 64];
+            // Place nonce in the last 32 bytes
+            report_data[32..64].copy_from_slice(&nonce_bytes);
 
             let info = client.info().await.map_err(|_| {
                 tracing::error!(

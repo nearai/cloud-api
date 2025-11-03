@@ -133,7 +133,7 @@ pub async fn get_model_by_name(
     // Get the model from the service
     let model = app_state
         .models_service
-        .get_model_by_name(&model_name)
+        .resolve_and_get_model(&model_name)
         .await
         .map_err(|e| match e {
             services::models::ModelsError::NotFound(_) => {

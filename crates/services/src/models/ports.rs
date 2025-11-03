@@ -92,6 +92,11 @@ pub trait ModelsServiceTrait: Send + Sync {
     /// Get a specific model by name
     async fn get_model_by_name(&self, model_name: &str) -> Result<ModelWithPricing, ModelsError>;
 
+    async fn resolve_and_get_model(
+        &self,
+        identifier: &str,
+    ) -> Result<ModelWithPricing, ModelsError>;
+
     /// Get list of configured model names (canonical names) from database
     /// Returns only active models that have been configured with pricing
     async fn get_configured_model_names(&self) -> Result<Vec<String>, ModelsError>;

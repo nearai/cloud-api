@@ -143,28 +143,29 @@ impl ModelRepository {
             .query(
                 r#"
                 SELECT 
-                    m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
-                    m.input_cost_per_token, m.output_cost_per_token,
-                    m.context_length, m.verifiable, m.is_active, m.created_at, m.updated_at,
+                    m.id,
+                    m.model_name,
+                    m.model_display_name,
+                    m.model_description,
+                    m.model_icon,
+                    m.input_cost_per_token,
+                    m.output_cost_per_token,
+                    m.context_length,
+                    m.verifiable,
+                    m.is_active,
+                    m.created_at,
+                    m.updated_at,
                     COALESCE(
-                    array_agg(ma_all.alias_name) FILTER (WHERE ma_all.alias_name IS NOT NULL),
-                    '{}'
+                        array_agg(ma.alias_name)
+                        FILTER (WHERE ma.alias_name IS NOT NULL),
+                        '{}'
                     ) AS aliases
                 FROM models m
-                LEFT JOIN model_aliases ma_all
-                ON ma_all.canonical_model_id = m.id
-                AND ma_all.is_active = true
+                LEFT JOIN model_aliases ma
+                    ON ma.canonical_model_id = m.id
+                    AND ma.is_active = true
                 WHERE m.is_active = true
-                AND (
-                    m.model_name = $1
-                    OR EXISTS (
-                    SELECT 1
-                    FROM model_aliases ma_match
-                    WHERE ma_match.canonical_model_id = m.id
-                        AND ma_match.alias_name = $1
-                        AND ma_match.is_active = true
-                    )
-                )
+                AND m.model_name = $1
                 GROUP BY m.id
                 LIMIT 1;
                 "#,
@@ -530,32 +531,45 @@ impl ModelRepository {
             .query_opt(
                 r#"
                 SELECT 
-                    m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
-                    m.input_cost_per_token, m.output_cost_per_token,
-                    m.context_length, m.verifiable, m.is_active, m.created_at, m.updated_at,
-                    COALESCE(array_agg(ma2.alias_name) FILTER (WHERE ma2.alias_name IS NOT NULL), '{}') AS aliases
+                    m.id,
+                    m.model_name,
+                    m.model_display_name,
+                    m.model_description,
+                    m.model_icon,
+                    m.input_cost_per_token,
+                    m.output_cost_per_token,
+                    m.context_length,
+                    m.verifiable,
+                    m.is_active,
+                    m.created_at,
+                    m.updated_at,
+                    COALESCE(
+                        array_agg(ma_all.alias_name)
+                        FILTER (WHERE ma_all.alias_name IS NOT NULL),
+                        '{}'
+                    ) AS aliases
                 FROM models m
-                LEFT JOIN model_aliases ma_lookup
-                    ON ma_lookup.canonical_model_id = m.id
-                LEFT JOIN model_aliases ma2
-                    ON ma2.canonical_model_id = m.id
+                LEFT JOIN model_aliases ma_all
+                    ON ma_all.canonical_model_id = m.id
+                    AND ma_all.is_active = true
                 WHERE m.is_active = true
                 AND (
                     m.model_name = $1
                     OR EXISTS (
-                        SELECT 1 FROM model_aliases ma_sub
-                        WHERE ma_sub.alias_name = $1
-                        AND ma_sub.canonical_model_id = m.id
-                        AND ma_sub.is_active = true
+                        SELECT 1
+                        FROM model_aliases ma_match
+                        WHERE ma_match.canonical_model_id = m.id
+                        AND ma_match.alias_name = $1
+                        AND ma_match.is_active = true
                     )
                 )
                 GROUP BY m.id
-                LIMIT 1
+                LIMIT 1;
                 "#,
                 &[&identifier],
             )
             .await
-            .context("Failed to resolve and fetch model with aliases")?;
+            .context("Failed to resolve and fetch model (by name or alias)")?;
 
         Ok(row.map(|r| self.row_to_model(&r)))
     }

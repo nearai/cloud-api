@@ -72,6 +72,17 @@ impl ModelsServiceTrait for ModelsServiceImpl {
             .ok_or_else(|| ModelsError::NotFound(format!("Model '{model_name}' not found")))
     }
 
+    async fn resolve_and_get_model(
+        &self,
+        identifier: &str,
+    ) -> Result<ModelWithPricing, ModelsError> {
+        self.models_repository
+            .resolve_and_get_model(identifier)
+            .await
+            .map_err(|e| ModelsError::InternalError(e.to_string()))?
+            .ok_or_else(|| ModelsError::NotFound(format!("Model '{identifier}' not found")))
+    }
+
     async fn get_configured_model_names(&self) -> Result<Vec<String>, ModelsError> {
         self.models_repository
             .get_configured_model_names()

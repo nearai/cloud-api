@@ -246,7 +246,7 @@ pub async fn admin_middleware(
                             );
                             Ok(admin_user)
                         }
-                        Err(e) => {
+                        Err(_) => {
                             error!("Failed to get admin user for access token");
                             Err((
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -402,7 +402,7 @@ async fn authenticate_session_access(
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     axum::Json(crate::models::ErrorResponse::new(
-                        format!("Failed to validate session via auth service: {}", e),
+                        "Failed to validate session via auth service".to_string(),
                         "internal_server_error".to_string(),
                     )),
                 ));

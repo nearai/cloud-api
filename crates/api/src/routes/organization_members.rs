@@ -278,7 +278,7 @@ pub async fn update_organization_member(
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(msg, "bad_request".to_string())),
         )),
-        Err(e) => {
+        Err(_) => {
             error!("Failed to update organization member");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,

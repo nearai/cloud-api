@@ -11,9 +11,14 @@ pub async fn run(pool: &DbPool) -> Result<()> {
         .context("Failed to get database connection for migrations")?;
 
     // Load the migration SQL files from the migrations/sql folder
-    let migrations =
-        load_sql_migrations(concat!(env!("CARGO_MANIFEST_DIR"), "/src/migrations/sql"))
-            .context("Failed to load migrations")?;
+    // Use runtime path resolution relative to current working directory
+    let migrations_path = std::env::current_dir()
+        .context("Failed to get current directory")?
+        .join("crates/database/src/migrations/sql");
+
+    let migrations = load_sql_migrations(&migrations_path).context(format!(
+        "Failed to load migrations from {migrations_path:?}"
+    ))?;
 
     let migration_report = refinery::Runner::new(&migrations)
         .run_async(&mut **client)

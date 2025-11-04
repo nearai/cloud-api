@@ -94,7 +94,7 @@ pub async fn get_access_token_from_refresh_token(
 ) -> String {
     let response = server
         .post("/v1/users/me/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", refresh_token))
+        .add_header("Authorization", format!("Bearer {refresh_token}"))
         .await;
 
     assert_eq!(

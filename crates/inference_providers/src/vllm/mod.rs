@@ -33,7 +33,9 @@ impl VLlmProvider {
     /// Create a new vLLM provider with the given configuration
     pub fn new(config: VLlmConfig) -> Self {
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .read_timeout(std::time::Duration::from_secs(
                 config.timeout_seconds as u64,
             ))
             .build()

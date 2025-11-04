@@ -167,7 +167,7 @@ pub async fn chat_completions(
                             Ok::<Bytes, Infallible>(Bytes::from(format!("data: {json_data}\n\n")))
                         }
                         Err(e) => {
-                            tracing::error!("Completion stream error: {}", e);
+                            tracing::error!("Completion stream error");
                             Ok::<Bytes, Infallible>(Bytes::from(format!("data: error: {e}\n\n")))
                         }
                     })

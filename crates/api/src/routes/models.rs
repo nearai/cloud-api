@@ -57,8 +57,8 @@ pub async fn list_models(
         .models_service
         .get_models_with_pricing(query.limit, query.offset)
         .await
-        .map_err(|e| {
-            error!("Failed to get models: {}", e);
+        .map_err(|_| {
+            error!("Failed to get models");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -146,7 +146,7 @@ pub async fn get_model_by_name(
                 )
             }
             _ => {
-                error!("Failed to get model '{}': {}", model_name, e);
+                error!("Failed to get model '{}'", model_name);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(

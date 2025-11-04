@@ -116,8 +116,8 @@ pub async fn get_organization_balance(
             user_id,
         )
         .await
-        .map_err(|e| {
-            tracing::error!("Failed to check organization membership: {}", e);
+        .map_err(|_| {
+            tracing::error!("Failed to check organization membership");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -141,8 +141,8 @@ pub async fn get_organization_balance(
         .usage_service
         .get_balance(organization_id)
         .await
-        .map_err(|e| {
-            tracing::error!("Failed to get balance: {}", e);
+        .map_err(|_| {
+            tracing::error!("Failed to get balance");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -157,8 +157,8 @@ pub async fn get_organization_balance(
         .usage_service
         .get_limit(organization_id)
         .await
-        .map_err(|e| {
-            tracing::error!("Failed to get limit: {}", e);
+        .map_err(|_| {
+            tracing::error!("Failed to get limit");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -285,8 +285,8 @@ pub async fn get_organization_usage_history(
             user_id,
         )
         .await
-        .map_err(|e| {
-            tracing::error!("Failed to check organization membership: {}", e);
+        .map_err(|_| {
+            tracing::error!("Failed to check organization membership");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -310,8 +310,8 @@ pub async fn get_organization_usage_history(
         .usage_service
         .get_usage_history(organization_id, Some(query.limit), Some(query.offset))
         .await
-        .map_err(|e| {
-            tracing::error!("Failed to get usage history: {}", e);
+        .map_err(|_| {
+            tracing::error!("Failed to get usage history");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -420,7 +420,7 @@ pub async fn get_api_key_usage_history(
         )
         .await
         .map_err(|e| {
-            tracing::error!("Failed to get usage history: {}", e);
+            tracing::error!("Failed to get usage history");
             match e {
                 services::usage::UsageError::Unauthorized(_) => (
                     StatusCode::FORBIDDEN,

@@ -33,8 +33,8 @@ async fn get_admin_user_by_id(
             debug!("Found admin user: {}", user.email);
             Ok(convert_user_to_db_user(user))
         }
-        Err(e) => {
-            error!("Failed to get admin user by ID: {}", e);
+        Err(_) => {
+            error!("Failed to get admin user by ID");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -247,7 +247,7 @@ pub async fn admin_middleware(
                             Ok(admin_user)
                         }
                         Err(e) => {
-                            error!("Failed to get admin user for access token: {}", e);
+                            error!("Failed to get admin user for access token");
                             Err((
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 axum::Json(crate::models::ErrorResponse::new(
@@ -290,10 +290,7 @@ pub async fn admin_middleware(
             let is_admin = check_admin_access(&state, &user);
 
             if !is_admin {
-                error!(
-                    "User {} ({}) attempted admin action without admin privileges",
-                    user.id, user.email
-                );
+                error!("User attempted admin action without admin privileges");
                 return Err((
                     StatusCode::FORBIDDEN,
                     axum::Json(crate::models::ErrorResponse::new(
@@ -365,8 +362,8 @@ async fn authenticate_admin_access_token(
                 )),
             ))
         }
-        Err(e) => {
-            error!("Failed to validate admin access token: {}", e);
+        Err(_) => {
+            error!("Failed to validate admin access token");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(crate::models::ErrorResponse::new(
@@ -400,8 +397,8 @@ async fn authenticate_session_access(
                 debug!("Session not found in auth service, trying OAuth manager");
                 // Fall through to OAuth manager
             }
-            Err(e) => {
-                error!("Failed to validate session via auth service: {}", e);
+            Err(_) => {
+                error!("Failed to validate session via auth service");
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     axum::Json(crate::models::ErrorResponse::new(
@@ -483,8 +480,8 @@ async fn authenticate_session_refresh(
                 debug!("Session not found in auth service, trying OAuth manager");
                 // Fall through to OAuth manager
             }
-            Err(e) => {
-                error!("Failed to validate session via auth service: {}", e);
+            Err(_) => {
+                error!("Failed to validate session via auth service");
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
         }
@@ -528,8 +525,8 @@ async fn authenticate_api_key(
                 )),
             ))
         }
-        Err(e) => {
-            error!("Failed to validate API key: {}", e);
+        Err(_) => {
+            error!("Failed to validate API key");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(crate::models::ErrorResponse::new(
@@ -584,8 +581,8 @@ async fn authenticate_api_key_with_context(
                 )),
             ))
         }
-        Err(e) => {
-            error!("Failed to resolve workspace/organization: {}", e);
+        Err(_) => {
+            error!("Failed to resolve workspace/organization");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(crate::models::ErrorResponse::new(

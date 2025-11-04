@@ -75,8 +75,8 @@ pub async fn get_current_user(
                 )),
             ))
         }
-        Err(e) => {
-            error!("Failed to get current user: {}", e);
+        Err(_) => {
+            error!("Failed to get current user");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -114,8 +114,8 @@ pub async fn get_current_user(
             }
             user_orgs
         }
-        Err(e) => {
-            error!("Failed to list organizations for user: {}", e);
+        Err(_) => {
+            error!("Failed to list organizations for user");
             Vec::new()
         }
     };
@@ -195,8 +195,8 @@ pub async fn update_current_user_profile(
                 "not_found".to_string(),
             )),
         )),
-        Err(e) => {
-            error!("Failed to update user profile: {}", e);
+        Err(_) => {
+            error!("Failed to update user profile");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -240,8 +240,8 @@ pub async fn get_user_refresh_tokens(
                 .collect();
             Ok(Json(api_refresh_tokens))
         }
-        Err(e) => {
-            error!("Failed to get user refresh tokens: {}", e);
+        Err(_) => {
+            error!("Failed to get user refresh tokens");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -307,8 +307,8 @@ pub async fn revoke_user_refresh_token(
                 "not_found".to_string(),
             )),
         )),
-        Err(e) => {
-            error!("Failed to revoke refresh token: {}", e);
+        Err(_) => {
+            error!("Failed to revoke refresh token");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -351,8 +351,8 @@ pub async fn revoke_all_user_tokens(
             "message": format!("Revoked {} refresh tokens and invalidated all access tokens", count),
             "count": count
         }))),
-        Err(e) => {
-            error!("Failed to revoke all user tokens: {}", e);
+        Err(_) => {
+            error!("Failed to revoke all user tokens");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -392,8 +392,8 @@ pub async fn create_access_token(
         1, // 1 hour expiration
     ) {
         Ok(access_token) => Ok(Json(crate::models::AccessTokenResponse { access_token })),
-        Err(e) => {
-            error!("Failed to create access token: {}", e);
+        Err(_) => {
+            error!("Failed to create access token");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -442,8 +442,8 @@ pub async fn list_user_invitations(
                 .collect();
             Ok(Json(responses))
         }
-        Err(e) => {
-            error!("Failed to list user invitations: {}", e);
+        Err(_) => {
+            error!("Failed to list user invitations");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -524,8 +524,8 @@ pub async fn accept_invitation(
                 "conflict".to_string(),
             )),
         )),
-        Err(e) => {
-            error!("Failed to accept invitation: {}", e);
+        Err(_) => {
+            error!("Failed to accept invitation");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -590,8 +590,8 @@ pub async fn decline_invitation(
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(msg, "bad_request".to_string())),
         )),
-        Err(e) => {
-            error!("Failed to decline invitation: {}", e);
+        Err(_) => {
+            error!("Failed to decline invitation");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -648,8 +648,8 @@ pub async fn get_invitation_by_token(
             StatusCode::GONE,
             Json(ErrorResponse::new(msg, "gone".to_string())),
         )),
-        Err(e) => {
-            error!("Failed to get invitation by token: {}", e);
+        Err(_) => {
+            error!("Failed to get invitation by token");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -728,8 +728,8 @@ pub async fn accept_invitation_by_token(
                 "conflict".to_string(),
             )),
         )),
-        Err(e) => {
-            error!("Failed to accept invitation by token: {}", e);
+        Err(_) => {
+            error!("Failed to accept invitation by token");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(

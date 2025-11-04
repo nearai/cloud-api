@@ -152,8 +152,8 @@ impl ClusterManager {
                         read_pools.insert(replica.host.clone(), pool);
                         debug!("Read pool created for replica {}", replica.name);
                     }
-                    Err(e) => {
-                        error!("Failed to create pool for replica {}: {}", replica.name, e);
+                    Err(_) => {
+                        error!("Failed to create pool for replica {}", replica.name);
                     }
                 }
             }
@@ -320,8 +320,8 @@ impl ClusterManager {
                         if last_leader.is_some() {
                             // Leader changed
                             info!("Leader change detected");
-                            if let Err(e) = manager.handle_leader_change().await {
-                                error!("Failed to handle leader change: {}", e);
+                            if manager.handle_leader_change().await.is_err() {
+                                error!("Failed to handle leader change");
                             }
                         }
                         last_leader = current_leader;
@@ -329,8 +329,8 @@ impl ClusterManager {
                 }
 
                 // Update read pools periodically
-                if let Err(e) = manager.update_read_pools().await {
-                    error!("Failed to update read pools: {}", e);
+                if manager.update_read_pools().await.is_err() {
+                    error!("Failed to update read pools");
                 }
             }
         });

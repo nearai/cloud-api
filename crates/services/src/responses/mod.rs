@@ -168,9 +168,8 @@ impl ResponseService {
         // Prepare messages
         tracing::debug!("Preparing messages for response");
         let (input_messages, llm_context_messages) =
-            self.prepare_messages(&request).await.map_err(|e| {
-                tracing::error!("Failed to prepare messages: {}", e);
-                e
+            self.prepare_messages(&request).await.inspect_err(|_| {
+                tracing::error!("Failed to prepare messages");
             })?;
         tracing::debug!(
             "Successfully prepared {} input messages",
@@ -182,9 +181,8 @@ impl ResponseService {
         let response_id = self
             .create_database_response(&request, &input_messages)
             .await
-            .map_err(|e| {
-                tracing::error!("Failed to create database response: {}", e);
-                e
+            .inspect_err(|_| {
+                tracing::error!("Failed to create database response");
             })?;
         tracing::debug!(
             response_id = %response_id,
@@ -241,7 +239,6 @@ impl ResponseService {
             .map_err(|e| {
                 tracing::error!(
                     model = %request.model,
-                    error = %e,
                     "Failed to create LLM stream from inference provider"
                 );
                 ResponseError::InternalError(format!("Failed to create LLM stream: {e}"))
@@ -341,7 +338,7 @@ impl ResponseService {
                                         let usage_json = serde_json::to_value(&usage_clone).ok();
                                         if let Ok(user_uuid) = Uuid::parse_str(&user_id.to_string())
                                         {
-                                            if let Err(e) = response_repository
+                                            if response_repository
                                                 .update(
                                                     db_id,
                                                     user_uuid.into(),
@@ -350,10 +347,10 @@ impl ResponseService {
                                                     usage_json,
                                                 )
                                                 .await
+                                                .is_err()
                                             {
                                                 tracing::error!(
-                                                    "Failed to update response in database: {}",
-                                                    e
+                                                    "Failed to update response in database"
                                                 );
                                             }
                                         }
@@ -375,15 +372,15 @@ impl ResponseService {
                         }
                         None
                     }
-                    Err(e) => {
-                        let error_msg = format!("LLM stream error: {e}");
+                    Err(_) => {
+                        let error_msg = "LLM stream error".to_string();
 
                         // Update database with error asynchronously
                         let db_id = response_id.clone();
                         let response_repository = response_repository.clone();
                         let error_msg_clone = error_msg.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = response_repository
+                            if response_repository
                                 .update(
                                     db_id,
                                     user_id.clone(),
@@ -392,11 +389,9 @@ impl ResponseService {
                                     None,
                                 )
                                 .await
+                                .is_err()
                             {
-                                tracing::error!(
-                                    "Failed to update failed response in database: {}",
-                                    e
-                                );
+                                tracing::error!("Failed to update failed response in database");
                             }
                         });
 

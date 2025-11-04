@@ -407,10 +407,7 @@ pub async fn list_organization_members(
             }))
         }
         Err(OrganizationError::Unauthorized(_)) => {
-            warn!(
-                "User {} attempted to access organization {} members without membership",
-                user_id, org_id
-            );
+            warn!("User attempted to access organization members without membership");
             Err((
                 StatusCode::FORBIDDEN,
                 ResponseJson(ErrorResponse::new(

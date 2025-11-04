@@ -7,3 +7,4 @@ config/examples/production.yaml
 .env
 .GIT_REV
 oci.tar
+.idea

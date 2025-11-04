@@ -328,8 +328,8 @@ pub async fn init_inference_providers(
     );
 
     // Initialize model discovery during startup
-    if let Err(e) = pool.initialize().await {
-        tracing::warn!("Failed to initialize model discovery during startup: {}", e);
+    if pool.initialize().await.is_err() {
+        tracing::warn!("Failed to initialize model discovery during startup");
         tracing::info!("Models will be discovered on first request");
     }
 

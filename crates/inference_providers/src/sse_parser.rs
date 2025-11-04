@@ -48,9 +48,9 @@ where
                 let chunk = if is_chat {
                     match serde_json::from_value::<ChatCompletionChunk>(json.clone()) {
                         Ok(chunk) => StreamChunk::Chat(chunk),
-                        Err(e) => {
+                        Err(_) => {
                             // Log but don't fail - might be a partial chunk
-                            eprintln!("Warning: Failed to parse chat chunk: {e} for json: {json}");
+                            eprintln!("Warning: Failed to parse chat chunk for json");
                             return Err(CompletionError::InvalidResponse(
                                 "Invalid response format".to_string(),
                             ));
@@ -59,9 +59,9 @@ where
                 } else {
                     match serde_json::from_value::<CompletionChunk>(json.clone()) {
                         Ok(chunk) => StreamChunk::Text(chunk),
-                        Err(e) => {
+                        Err(_) => {
                             // Log but don't fail - might be a partial chunk
-                            eprintln!("Warning: Failed to parse text chunk: {e} for json: {json}");
+                            eprintln!("Warning: Failed to parse text chunk for json");
                             return Err(CompletionError::InvalidResponse(
                                 "Invalid response format".to_string(),
                             ));
@@ -70,9 +70,9 @@ where
                 };
                 Ok(Some(chunk))
             }
-            Err(e) => {
+            Err(_) => {
                 // Skip malformed JSON rather than failing the entire stream
-                eprintln!("Warning: Failed to parse SSE JSON: {e} for data: '{data}'");
+                eprintln!("Warning: Failed to parse SSE JSON for data");
                 Err(CompletionError::InvalidResponse(
                     "Invalid JSON in SSE event".to_string(),
                 ))
@@ -157,10 +157,7 @@ where
             Poll::Ready(None) => {
                 // Stream ended - process any remaining buffer content
                 if !self.buffer.trim().is_empty() {
-                    eprintln!(
-                        "Warning: Incomplete SSE data in buffer at stream end: {}",
-                        self.buffer
-                    );
+                    eprintln!("Warning: Incomplete SSE data in buffer at stream end",);
                 }
                 Poll::Ready(None)
             }

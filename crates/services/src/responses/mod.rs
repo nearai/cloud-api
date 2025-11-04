@@ -70,13 +70,9 @@ impl ResponseService {
                     all_messages.extend(input_messages.clone());
                     all_messages
                 }
-                Err(e) => {
+                Err(_) => {
                     // If we can't fetch conversation history, log the error and use just the current input
-                    tracing::warn!(
-                        "Failed to fetch conversation history for {}: {}",
-                        conversation_id,
-                        e
-                    );
+                    tracing::warn!("Failed to fetch conversation history");
                     input_messages.clone()
                 }
             }

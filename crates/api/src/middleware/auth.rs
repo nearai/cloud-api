@@ -437,11 +437,21 @@ pub async fn refresh_middleware(
         auth_header
     );
 
+    // User-Agent is mandatory
+    let user_agent = request
+        .headers()
+        .get("User-Agent")
+        .and_then(|h| h.to_str().ok())
+        .ok_or_else(|| {
+            error!("Missing User-Agent header in refresh token request");
+            StatusCode::BAD_REQUEST
+        })?;
+
     let auth_result = if let Some(auth_value) = auth_header {
         debug!("Found Authorization header: {}", auth_value);
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
             debug!("Extracted Bearer token: {}", token);
-            authenticate_session_refresh(&state, SessionToken(token.to_string())).await
+            authenticate_session_refresh(&state, SessionToken(token.to_string()), user_agent).await
         } else {
             debug!("Authorization header does not start with 'Bearer '");
             Err(StatusCode::UNAUTHORIZED)
@@ -461,17 +471,21 @@ pub async fn refresh_middleware(
     }
 }
 
-/// Authenticate using session token
+/// Authenticate using session token with User-Agent validation
 async fn authenticate_session_refresh(
     state: &AuthState,
     token: SessionToken,
+    user_agent: &str,
 ) -> Result<DbUser, StatusCode> {
     debug!("Authenticating session refresh token: {}", token);
-    // Use auth service
+    // Use auth service to validate session with user_agent
     {
         let auth_service = &state.auth_service;
-        debug!("Validating session via auth service with token");
-        match auth_service.validate_session_refresh(token).await {
+        debug!("Validating session via auth service with token and user_agent");
+        match auth_service
+            .validate_session_refresh(token, user_agent)
+            .await
+        {
             Ok(user) => {
                 debug!("Authenticated user {} via session", user.email);
                 return Ok(convert_user_to_db_user(user));

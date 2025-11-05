@@ -189,18 +189,15 @@ pub trait SessionRepository: Send + Sync {
         &self,
         user_id: UserId,
         ip_address: Option<String>,
-        user_agent: Option<String>,
+        user_agent: String,
         expires_in_hours: i64,
     ) -> anyhow::Result<(Session, String)>;
 
-    // Fetch the session of the inputted refresh token
-    async fn get_session_by_refresh_token(
+    async fn validate(
         &self,
-        user_id: Uuid,
-        token: &str,
+        session_token: SessionToken,
+        user_agent: &str,
     ) -> anyhow::Result<Option<Session>>;
-
-    async fn validate(&self, session_token: SessionToken) -> anyhow::Result<Option<Session>>;
 
     async fn get_by_id(&self, session_id: SessionId) -> anyhow::Result<Option<Session>>;
 
@@ -218,19 +215,12 @@ pub trait SessionRepository: Send + Sync {
 // Service interfaces
 #[async_trait]
 pub trait AuthServiceTrait: Send + Sync {
-    // Fetch the session of the inputted refresh token
-    async fn get_session_by_refresh_token(
-        &self,
-        user_id: Uuid,
-        token: &str,
-    ) -> Result<Option<Session>, AuthError>;
-
     /// Create a new session for a user
     async fn create_session(
         &self,
         user_id: UserId,
         ip_address: Option<String>,
-        user_agent: Option<String>,
+        user_agent: String,
         encoding_key: String,
         expires_in_hours: i64,
         refresh_expires_in_hours: i64,
@@ -259,12 +249,14 @@ pub trait AuthServiceTrait: Send + Sync {
     async fn validate_session_refresh_token(
         &self,
         session_token: SessionToken,
+        user_agent: &str,
     ) -> Result<Option<Session>, AuthError>;
 
     /// Validate a session token and return the associated user
     async fn validate_session_refresh(
         &self,
         session_token: SessionToken,
+        user_agent: &str,
     ) -> Result<User, AuthError>;
 
     /// Get a user by their ID
@@ -393,30 +385,11 @@ impl MockAuthService {
 
 #[async_trait]
 impl AuthServiceTrait for MockAuthService {
-    // Fetch the session of the inputted refresh token
-    async fn get_session_by_refresh_token(
-        &self,
-        _user_id: Uuid,
-        _token: &str,
-    ) -> Result<Option<Session>, AuthError> {
-        let fake_user_id = Uuid::new_v4();
-
-        let (_access_token, session, _refresh_token) = self.create_mock_session_with_params(
-            UserId(fake_user_id),
-            Some("127.0.0.1".to_string()),
-            Some("Mock User Agent".to_string()),
-            "mock_encoding_key".to_string(),
-            1,
-            24 * 7,
-        );
-        Ok(Some(session))
-    }
-
     async fn create_session(
         &self,
         user_id: UserId,
         ip_address: Option<String>,
-        user_agent: Option<String>,
+        user_agent: String,
         encoding_key: String,
         expires_in_hours: i64,
         refresh_expires_in_hours: i64,
@@ -424,7 +397,7 @@ impl AuthServiceTrait for MockAuthService {
         Ok(self.create_mock_session_with_params(
             user_id,
             ip_address,
-            user_agent,
+            Some(user_agent),
             encoding_key,
             expires_in_hours,
             refresh_expires_in_hours,
@@ -498,12 +471,20 @@ impl AuthServiceTrait for MockAuthService {
     async fn validate_session_refresh_token(
         &self,
         session_token: SessionToken,
+        user_agent: &str,
     ) -> Result<Option<Session>, AuthError> {
         // Accept the known test session token or any token that starts with "rt_"
         if session_token.0.starts_with("rt_") {
             let mock_user = Self::create_mock_user();
-            let (_access_token, refresh_session, _refresh_token) =
-                self.create_mock_session(mock_user.id);
+            let (_access_token, refresh_session, _refresh_token) = self
+                .create_mock_session_with_params(
+                    mock_user.id,
+                    Some("127.0.0.1".to_string()),
+                    Some(user_agent.to_string()),
+                    "mock_encoding_key".to_string(),
+                    1,
+                    24 * 7,
+                );
             Ok(Some(refresh_session))
         } else {
             Ok(None)
@@ -513,10 +494,12 @@ impl AuthServiceTrait for MockAuthService {
     async fn validate_session_refresh(
         &self,
         session_token: SessionToken,
+        user_agent: &str,
     ) -> Result<User, AuthError> {
         tracing::debug!(
-            "MockAuthService::validate_session called with token: {}",
-            session_token
+            "MockAuthService::validate_session called with token: {}, user_agent: {}",
+            session_token,
+            user_agent
         );
         // Accept the known test session token or any token that starts with "rt_"
         if session_token.0.starts_with("rt_") {

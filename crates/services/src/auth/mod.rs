@@ -10,27 +10,14 @@ use crate::workspace::{ApiKey, ApiKeyRepository, WorkspaceId, WorkspaceRepositor
 use async_trait::async_trait;
 use chrono::Utc;
 use std::sync::Arc;
-use uuid::Uuid;
 
 #[async_trait]
 impl AuthServiceTrait for AuthService {
-    // Fetch the session of the inputted refresh token
-    async fn get_session_by_refresh_token(
-        &self,
-        user_id: Uuid,
-        token: &str,
-    ) -> Result<Option<Session>, AuthError> {
-        self.session_repository
-            .get_session_by_refresh_token(user_id, token)
-            .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to get session by token: {e}")))
-    }
-
     async fn create_session(
         &self,
         user_id: UserId,
         ip_address: Option<String>,
-        user_agent: Option<String>,
+        user_agent: String,
         encoding_key: String,
         expires_in_hours: i64,
         refresh_expires_in_hours: i64,
@@ -127,9 +114,10 @@ impl AuthServiceTrait for AuthService {
     async fn validate_session_refresh_token(
         &self,
         refresh_token: SessionToken,
+        user_agent: &str,
     ) -> Result<Option<Session>, AuthError> {
         self.session_repository
-            .validate(refresh_token)
+            .validate(refresh_token, user_agent)
             .await
             .map_err(|e| AuthError::InternalError(format!("Failed to validate session: {e}")))
     }
@@ -137,9 +125,10 @@ impl AuthServiceTrait for AuthService {
     async fn validate_session_refresh(
         &self,
         refresh_token: SessionToken,
+        user_agent: &str,
     ) -> Result<User, AuthError> {
         let session = self
-            .validate_session_refresh_token(refresh_token)
+            .validate_session_refresh_token(refresh_token, user_agent)
             .await?
             .ok_or(AuthError::SessionNotFound)?;
 

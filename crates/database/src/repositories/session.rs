@@ -32,7 +32,7 @@ impl SessionRepository {
         &self,
         user_id: Uuid,
         ip_address: Option<String>,
-        user_agent: Option<String>,
+        user_agent: String,
         expires_in_hours: i64,
     ) -> Result<(Session, String)> {
         let client = self
@@ -64,7 +64,7 @@ impl SessionRepository {
                     &now,
                     &expires_at,
                     &ip_address,
-                    &user_agent,
+                    &Some(user_agent),
                 ],
             )
             .await
@@ -80,7 +80,8 @@ impl SessionRepository {
     }
 
     /// Validate a refresh token and return the associated session
-    pub async fn validate(&self, session_token: &str) -> Result<Option<Session>> {
+    /// Validates that user_agent matches the stored user_agent
+    pub async fn validate(&self, session_token: &str, user_agent: &str) -> Result<Option<Session>> {
         let client = self
             .pool
             .get()
@@ -95,9 +96,9 @@ impl SessionRepository {
             .query_opt(
                 r#"
             SELECT * FROM refresh_tokens 
-            WHERE token_hash = $1 AND expires_at > $2
+            WHERE token_hash = $1 AND expires_at > $2 AND user_agent = $3
             "#,
-                &[&token_hash, &now],
+                &[&token_hash, &now, &user_agent],
             )
             .await
             .context("Failed to validate refresh token")?;
@@ -246,7 +247,7 @@ impl services::auth::SessionRepository for SessionRepository {
         &self,
         user_id: services::auth::UserId,
         ip_address: Option<String>,
-        user_agent: Option<String>,
+        user_agent: String,
         expires_in_hours: i64,
     ) -> anyhow::Result<(services::auth::Session, String)> {
         let (db_session, token) = self
@@ -266,52 +267,12 @@ impl services::auth::SessionRepository for SessionRepository {
         Ok((service_session, token))
     }
 
-    // Fetch the session of the inputted refresh token
-    async fn get_session_by_refresh_token(
-        &self,
-        user_id: Uuid,
-        token: &str,
-    ) -> Result<Option<services::auth::Session>> {
-        let client = self.pool.get().await?;
-        let token_hash = Self::hash_session_token(token);
-        let row_opt = client
-            .query_opt(
-                r#"
-                SELECT *
-                FROM refresh_tokens
-                WHERE user_id = $1
-                AND token_hash = $2
-                AND expires_at > NOW()
-                LIMIT 1
-                "#,
-                &[&user_id, &token_hash],
-            )
-            .await?;
-
-        if let Some(row) = row_opt {
-            let db_session = self.row_to_session(row)?;
-
-            let server_session = services::auth::Session {
-                id: services::auth::SessionId(db_session.id),
-                user_id: services::auth::UserId(db_session.user_id),
-                token_hash: db_session.token_hash,
-                created_at: db_session.created_at,
-                expires_at: db_session.expires_at,
-                ip_address: db_session.ip_address,
-                user_agent: db_session.user_agent,
-            };
-
-            Ok(Some(server_session))
-        } else {
-            Ok(None)
-        }
-    }
-
     async fn validate(
         &self,
         session_token: services::auth::SessionToken,
+        user_agent: &str,
     ) -> anyhow::Result<Option<services::auth::Session>> {
-        let maybe_session = self.validate(&session_token.0).await?;
+        let maybe_session = self.validate(&session_token.0, user_agent).await?;
 
         Ok(maybe_session.map(|db_session| services::auth::Session {
             id: services::auth::SessionId(db_session.id),

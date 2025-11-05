@@ -393,89 +393,20 @@ pub async fn create_access_token(
         user.0.id
     );
 
-    let user_agent_header: Option<String> = request
+    let user_agent_header = request
         .headers()
         .get("User-Agent")
         .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
-
-    // fetch the refresh token used for the current request
-    let auth_header = request
-        .headers()
-        .get("authorization")
-        .and_then(|h| h.to_str().ok());
-    let curr_refresh_token = match auth_header {
-        Some(header) if header.starts_with("Bearer rt_") => {
-            header.trim_start_matches("Bearer ").to_string()
-        }
-        _ => {
-            error!("Missing or invalid refresh token");
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse::new(
-                    "Missing or invalid refresh token".to_string(),
-                    "unauthorized".to_string(),
-                )),
-            ));
-        }
-    };
-
-    // fetch the session associated with this current refresh token
-    let session_opt = app_state
-        .auth_service
-        .get_session_by_refresh_token(user.0.id, &curr_refresh_token)
-        .await
-        .map_err(|e| {
-            error!(
-                "Failed to fetch session by refresh token for user {}: {}.",
-                user.0.id, e
-            );
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new(
-                "Failed to fetch session by refresh token".to_string(),
-                "internal_server_error".to_string(),
-            )))
-        })?;
-
-    // validate token existence and User-Agent match
-    let session = match session_opt {
-        Some(s) => s,
-        None => {
-            error!("Invalid or expired refresh token for user {}", user.0.id);
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse::new(
-                    "Invalid or expired refresh token".to_string(),
-                    "unauthorized".to_string(),
-                )),
-            ));
-        }
-    };
-    if let Some(db_ua) = session.user_agent.as_ref() {
-        if let Some(req_ua) = user_agent_header.as_ref() {
-            if db_ua != req_ua {
-                error!("User-Agent mismatch for user {}.", user.0.id);
-                return Err((
-                    StatusCode::UNAUTHORIZED,
-                    Json(ErrorResponse::new(
-                        "User-Agent mismatch".to_string(),
-                        "unauthorized".to_string(),
-                    )),
-                ));
-            }
-        } else {
-            error!(
-                "Missing User-Agent header on request for user {}",
-                user.0.id
-            );
-            return Err((
+        .ok_or_else(|| {
+            error!("Missing User-Agent header when creating access token");
+            (
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorResponse::new(
                     "Missing User-Agent header".to_string(),
                     "unauthorized".to_string(),
                 )),
-            ));
-        }
-    }
+            )
+        })?;
 
     let expires_in_hours = 7 * 24;
     let result = app_state
@@ -483,7 +414,7 @@ pub async fn create_access_token(
         .create_session(
             UserId(user.0.id),
             None,
-            user_agent_header,
+            user_agent_header.to_string(),
             app_state.config.auth.encoding_key.to_string(),
             1,
             expires_in_hours,

@@ -336,8 +336,16 @@ pub async fn list_conversation_items(
         conversation_id, api_key.created_by_user_id.0
     );
 
-    // Validate pagination parameters
-    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+    // Validate limit parameter
+    if params.limit <= 0 || params.limit > 1000 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Limit must be between 1 and 1000".to_string(),
+                "invalid_request_error".to_string(),
+            )),
+        ));
+    }
 
     let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
         Ok(id) => id,
@@ -349,12 +357,23 @@ pub async fn list_conversation_items(
         }
     };
 
-    // Get items from response_items repository
+    // Request limit + 1 items to determine if there are more
+    let fetch_limit = params.limit + 1;
+
+    // Get items from response_items repository with cursor-based pagination
     match response_items_repo
-        .list_by_conversation(parsed_conversation_id)
+        .list_by_conversation(parsed_conversation_id, params.after.clone(), fetch_limit)
         .await
     {
-        Ok(items) => {
+        Ok(mut items) => {
+            // Check if we got more items than requested (indicates more pages exist)
+            let has_more = items.len() > params.limit as usize;
+
+            // Truncate to the requested limit if we got more
+            if has_more {
+                items.truncate(params.limit as usize);
+            }
+
             // Convert ResponseOutputItems to ConversationItems
             let http_items: Vec<ConversationItem> = items
                 .into_iter()
@@ -369,7 +388,7 @@ pub async fn list_conversation_items(
                 data: http_items,
                 first_id,
                 last_id,
-                has_more: false,
+                has_more,
             }))
         }
         Err(error) => Err((

@@ -272,6 +272,8 @@ pub async fn create_response(
                     final_resp
                 } else {
                     // Fallback: Build response from collected data (for compatibility)
+                    // Trim accumulated content to remove leading/trailing whitespace
+                    let trimmed_content = content.trim().to_string();
                     ResponseObject {
                         id: response_id.unwrap_or_else(|| format!("resp_{}", Uuid::new_v4())),
                         object: "response".to_string(),
@@ -301,7 +303,7 @@ pub async fn create_response(
                             status: ResponseItemStatus::Completed,
                             role: "assistant".to_string(),
                             content: vec![ResponseOutputContent::OutputText {
-                                text: content,
+                                text: trimmed_content,
                                 annotations: vec![],
                                 logprobs: vec![],
                             }],

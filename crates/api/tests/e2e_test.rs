@@ -2886,3 +2886,160 @@ async fn test_admin_access_token_cannot_manage_tokens() {
 
     println!("✅ Admin access tokens correctly restricted from token management endpoints");
 }
+
+#[tokio::test]
+async fn test_conversation_items_pagination() {
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let models = list_models(&server, api_key.clone()).await;
+
+    // Create a conversation
+    let conversation = create_conversation(&server, api_key.clone()).await;
+
+    // Create 5 responses to generate multiple items (each response creates 2 items: user input + assistant output)
+    let max_tokens = 10;
+    for i in 0..5 {
+        let message = format!("Test message {}", i + 1);
+        create_response(
+            &server,
+            conversation.id.clone(),
+            models.data[0].id.clone(),
+            message,
+            max_tokens,
+            api_key.clone(),
+        )
+        .await;
+    }
+
+    // Test 1: Fetch first page with limit of 3
+    let response = server
+        .get(format!("/v1/conversations/{}/items?limit=3", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let first_page = response.json::<api::models::ConversationItemList>();
+
+    // Should have exactly 3 items
+    assert_eq!(first_page.data.len(), 3, "First page should have 3 items");
+
+    // Should indicate there are more items
+    assert!(first_page.has_more, "Should indicate more items exist");
+
+    // Should have first_id and last_id
+    assert!(!first_page.first_id.is_empty(), "Should have first_id");
+    assert!(!first_page.last_id.is_empty(), "Should have last_id");
+
+    // Test 2: Fetch next page using 'after' cursor
+    let last_id_from_page1 = first_page.last_id.clone();
+    let response2 = server
+        .get(
+            format!(
+                "/v1/conversations/{}/items?limit=3&after={}",
+                conversation.id, last_id_from_page1
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(response2.status_code(), 200);
+    let second_page = response2.json::<api::models::ConversationItemList>();
+
+    // Should have exactly 3 items
+    assert_eq!(second_page.data.len(), 3, "Second page should have 3 items");
+
+    // Should indicate there are more items
+    assert!(second_page.has_more, "Should indicate more items exist");
+
+    // Test 3: Fetch third page
+    let last_id_from_page2 = second_page.last_id.clone();
+    let response3 = server
+        .get(
+            format!(
+                "/v1/conversations/{}/items?limit=3&after={}",
+                conversation.id, last_id_from_page2
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(response3.status_code(), 200);
+    let third_page = response3.json::<api::models::ConversationItemList>();
+
+    // Should have 3 items (limited by the limit parameter)
+    assert_eq!(third_page.data.len(), 3, "Third page should have 3 items");
+
+    // Should indicate there is 1 more item
+    assert!(third_page.has_more, "Should indicate more items exist");
+
+    // Test 4: Fetch fourth (final) page
+    let last_id_from_page3 = third_page.last_id.clone();
+    let response4 = server
+        .get(
+            format!(
+                "/v1/conversations/{}/items?limit=3&after={}",
+                conversation.id, last_id_from_page3
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(response4.status_code(), 200);
+    let fourth_page = response4.json::<api::models::ConversationItemList>();
+
+    // Should have 1 item (the last remaining item)
+    assert_eq!(
+        fourth_page.data.len(),
+        1,
+        "Fourth page should have 1 remaining item"
+    );
+
+    // Should NOT indicate there are more items (this is the last page)
+    assert!(
+        !fourth_page.has_more,
+        "Should NOT indicate more items exist"
+    );
+
+    // Test 5: Verify no duplicate items across pages
+    let all_ids: Vec<String> = first_page
+        .data
+        .iter()
+        .chain(second_page.data.iter())
+        .chain(third_page.data.iter())
+        .chain(fourth_page.data.iter())
+        .map(|item| match item {
+            ConversationItem::Message { id, .. } => id.clone(),
+        })
+        .collect();
+
+    // Check for uniqueness
+    let unique_ids: std::collections::HashSet<_> = all_ids.iter().collect();
+    assert_eq!(
+        all_ids.len(),
+        unique_ids.len(),
+        "All items should be unique across pages"
+    );
+
+    // Test 6: Fetch all items without pagination (default limit of 100)
+    let response_all = server
+        .get(format!("/v1/conversations/{}/items", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(response_all.status_code(), 200);
+    let all_items = response_all.json::<api::models::ConversationItemList>();
+
+    // Should have all 10 items
+    assert_eq!(
+        all_items.data.len(),
+        10,
+        "Should fetch all 10 items with default limit"
+    );
+
+    // Should NOT indicate there are more items
+    assert!(
+        !all_items.has_more,
+        "Should NOT indicate more items with all items fetched"
+    );
+
+    println!("✅ Conversation items pagination working correctly");
+}

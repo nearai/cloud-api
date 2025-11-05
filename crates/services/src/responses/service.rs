@@ -267,14 +267,17 @@ impl ResponseServiceImpl {
         text: &str,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
     ) -> Result<(), errors::ResponseError> {
+        // Trim leading and trailing whitespace from the final text
+        let trimmed_text = text.trim();
+
         // Event: response.output_text.done
         emitter
-            .emit_text_done(ctx, message_item_id.to_string(), text.to_string())
+            .emit_text_done(ctx, message_item_id.to_string(), trimmed_text.to_string())
             .await?;
 
         // Event: response.content_part.done
         let part = models::ResponseOutputContent::OutputText {
-            text: text.to_string(),
+            text: trimmed_text.to_string(),
             annotations: vec![],
             logprobs: vec![],
         };
@@ -288,7 +291,7 @@ impl ResponseServiceImpl {
             status: models::ResponseItemStatus::Completed,
             role: "assistant".to_string(),
             content: vec![models::ResponseOutputContent::OutputText {
-                text: text.to_string(),
+                text: trimmed_text.to_string(),
                 annotations: vec![],
                 logprobs: vec![],
             }],
@@ -773,12 +776,14 @@ impl ResponseServiceImpl {
         match input {
             models::ResponseInput::Text(text) => {
                 // Create a message item for simple text input
+                // Trim leading and trailing whitespace
+                let trimmed_text = text.trim();
                 let message_item = models::ResponseOutputItem::Message {
                     id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
                     status: models::ResponseItemStatus::Completed,
                     role: "user".to_string(),
                     content: vec![models::ResponseOutputContent::OutputText {
-                        text: text.clone(),
+                        text: trimmed_text.to_string(),
                         annotations: vec![],
                         logprobs: vec![],
                     }],
@@ -804,8 +809,9 @@ impl ResponseServiceImpl {
                 for input_item in items {
                     let content = match &input_item.content {
                         models::ResponseContent::Text(text) => {
+                            // Trim leading and trailing whitespace
                             vec![models::ResponseOutputContent::OutputText {
-                                text: text.clone(),
+                                text: text.trim().to_string(),
                                 annotations: vec![],
                                 logprobs: vec![],
                             }]
@@ -816,8 +822,9 @@ impl ResponseServiceImpl {
                                 .iter()
                                 .filter_map(|part| match part {
                                     models::ResponseContentPart::InputText { text } => {
+                                        // Trim leading and trailing whitespace
                                         Some(models::ResponseOutputContent::OutputText {
-                                            text: text.clone(),
+                                            text: text.trim().to_string(),
                                             annotations: vec![],
                                             logprobs: vec![],
                                         })
@@ -913,8 +920,9 @@ impl ResponseServiceImpl {
                 })?;
 
             // Load all response items from the conversation
+            // Use high limit (1000) and no 'after' cursor for context loading
             let conversation_items = response_items_repository
-                .list_by_conversation(conversation_id.clone())
+                .list_by_conversation(conversation_id.clone(), None, 1000)
                 .await
                 .map_err(|e| {
                     errors::ResponseError::InternalError(format!(

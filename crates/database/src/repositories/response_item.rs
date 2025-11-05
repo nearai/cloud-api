@@ -264,9 +264,12 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
     }
 
     /// List all items for a specific conversation (useful for building context)
+    /// Supports cursor-based pagination using the `after` parameter
     async fn list_by_conversation(
         &self,
         conversation_id: ConversationId,
+        after: Option<String>,
+        limit: i64,
     ) -> Result<Vec<ResponseOutputItem>> {
         let client = self
             .pool
@@ -274,17 +277,42 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
             .await
             .context("Failed to get database connection")?;
 
-        let rows = client
-            .query(
-                r#"
-                SELECT * FROM response_items
-                WHERE conversation_id = $1
-                ORDER BY created_at ASC
-                "#,
-                &[&conversation_id.0],
-            )
-            .await
-            .context("Failed to query response items by conversation")?;
+        let rows = if let Some(after_id) = after {
+            // Extract UUID from the after item ID
+            let after_uuid = Self::extract_uuid_from_item_id(&after_id)?;
+
+            // Query items created after the reference item
+            // We fetch limit + 1 to determine if there are more items
+            client
+                .query(
+                    r#"
+                    SELECT * FROM response_items
+                    WHERE conversation_id = $1
+                      AND created_at > (
+                          SELECT created_at FROM response_items WHERE id = $2
+                      )
+                    ORDER BY created_at ASC
+                    LIMIT $3
+                    "#,
+                    &[&conversation_id.0, &after_uuid, &limit],
+                )
+                .await
+                .context("Failed to query response items by conversation with pagination")?
+        } else {
+            // No pagination cursor, fetch from the beginning
+            client
+                .query(
+                    r#"
+                    SELECT * FROM response_items
+                    WHERE conversation_id = $1
+                    ORDER BY created_at ASC
+                    LIMIT $2
+                    "#,
+                    &[&conversation_id.0, &limit],
+                )
+                .await
+                .context("Failed to query response items by conversation")?
+        };
 
         rows.into_iter().map(|row| self.row_to_item(row)).collect()
     }

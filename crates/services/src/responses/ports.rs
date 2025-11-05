@@ -89,6 +89,8 @@ pub trait ResponseItemRepositoryTrait: Send + Sync {
     async fn list_by_conversation(
         &self,
         conversation_id: ConversationId,
+        after: Option<String>,
+        limit: i64,
     ) -> anyhow::Result<Vec<models::ResponseOutputItem>>;
 }
 

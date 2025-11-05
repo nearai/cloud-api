@@ -327,7 +327,7 @@ impl ModelRepository {
                     id, model_id, input_cost_per_token, output_cost_per_token,
                     context_length, model_display_name, model_description,
                     effective_from, effective_until, changed_by, change_reason, created_at
-                FROM model_pricing_history
+                FROM model_history
                 WHERE model_id = $1
                 ORDER BY effective_from DESC
                 "#,
@@ -362,7 +362,7 @@ impl ModelRepository {
                     id, model_id, input_cost_per_token, output_cost_per_token,
                     context_length, model_display_name, model_description,
                     effective_from, effective_until, changed_by, change_reason, created_at
-                FROM model_pricing_history
+                FROM model_history
                 WHERE model_id = $1
                 AND effective_from <= $2
                 AND (effective_until IS NULL OR effective_until > $2)
@@ -393,7 +393,7 @@ impl ModelRepository {
             .query_one(
                 r#"
                 SELECT COUNT(*) as count
-                FROM model_pricing_history h
+                FROM model_history h
                 JOIN models m ON h.model_id = m.id
                 WHERE m.model_name = $1
                 "#,
@@ -424,7 +424,7 @@ impl ModelRepository {
                     h.id, h.model_id, h.input_cost_per_token, h.output_cost_per_token,
                     h.context_length, h.model_display_name, h.model_description,
                     h.effective_from, h.effective_until, h.changed_by, h.change_reason, h.created_at
-                FROM model_pricing_history h
+                FROM model_history h
                 JOIN models m ON h.model_id = m.id
                 WHERE m.model_name = $1
                 ORDER BY h.effective_from DESC

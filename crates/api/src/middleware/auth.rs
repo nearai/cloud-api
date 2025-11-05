@@ -432,26 +432,33 @@ pub async fn refresh_middleware(
         .get("authorization")
         .and_then(|h| h.to_str().ok());
 
-    tracing::debug!(
-        "Auth middleware (session refresh token only): {:?}",
-        auth_header
-    );
-
-    // User-Agent is mandatory
+    // Try to get user agent from header
     let user_agent = request
         .headers()
         .get("User-Agent")
-        .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| {
-            error!("Missing User-Agent header in refresh token request");
-            StatusCode::BAD_REQUEST
-        })?;
+        .and_then(|h| h.to_str().ok());
+
+    tracing::debug!(
+        "Auth middleware (refresh token): refresh token: {:?}, user agent: {:?}",
+        auth_header,
+        user_agent
+    );
 
     let auth_result = if let Some(auth_value) = auth_header {
         debug!("Found Authorization header: {}", auth_value);
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
-            debug!("Extracted Bearer token: {}", token);
-            authenticate_session_refresh(&state, SessionToken(token.to_string()), user_agent).await
+            if let Some(user_agent_value) = user_agent {
+                debug!("Extracted Bearer token: {}", token);
+                authenticate_session_refresh(
+                    &state,
+                    SessionToken(token.to_string()),
+                    user_agent_value,
+                )
+                .await
+            } else {
+                debug!("Missing User-Agent header");
+                Err(StatusCode::UNAUTHORIZED)
+            }
         } else {
             debug!("Authorization header does not start with 'Bearer '");
             Err(StatusCode::UNAUTHORIZED)
@@ -471,17 +478,17 @@ pub async fn refresh_middleware(
     }
 }
 
-/// Authenticate using session token with User-Agent validation
+/// Authenticate using refresh token and user agent validation
 async fn authenticate_session_refresh(
     state: &AuthState,
     token: SessionToken,
     user_agent: &str,
 ) -> Result<DbUser, StatusCode> {
     debug!("Authenticating session refresh token: {}", token);
-    // Use auth service to validate session with user_agent
+    // Use auth service to validate session with refresh token and user agent
     {
         let auth_service = &state.auth_service;
-        debug!("Validating session via auth service with token and user_agent");
+        debug!("Validating session via auth service with refresh token and user agent");
         match auth_service
             .validate_session_refresh(token, user_agent)
             .await

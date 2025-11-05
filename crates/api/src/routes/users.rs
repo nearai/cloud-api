@@ -13,12 +13,10 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use serde::Deserialize;
-use services::{organization::OrganizationError, user::UserServiceError};
+use services::{auth::UserId, organization::OrganizationError, user::UserServiceError};
 use tracing::{debug, error};
 use utoipa::ToSchema;
 use uuid::Uuid;
-
-use services::auth::UserId;
 
 /// Convert service Session (refresh token) to API RefreshTokenResponse
 fn services_session_to_api_refresh_token(
@@ -64,7 +62,7 @@ pub async fn get_current_user(
 ) -> Result<Json<crate::models::UserResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Getting current user: {}", user.0.id);
 
-    let user_id = services::auth::UserId(user.0.id);
+    let user_id = UserId(user.0.id);
 
     // Get user information
     let user_data = match app_state.user_service.get_user(user_id.clone()).await {
@@ -183,7 +181,7 @@ pub async fn update_current_user_profile(
 ) -> Result<Json<crate::models::UserResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Updating profile for user: {}", user.0.id);
 
-    let user_id = services::auth::UserId(user.0.id);
+    let user_id = UserId(user.0.id);
 
     match app_state
         .user_service
@@ -233,7 +231,7 @@ pub async fn get_user_refresh_tokens(
 ) -> Result<Json<Vec<crate::models::RefreshTokenResponse>>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Getting refresh tokens for user: {}", current_user.0.id);
 
-    let user_id = services::auth::UserId(current_user.0.id);
+    let user_id = UserId(current_user.0.id);
 
     match app_state.user_service.get_user_sessions(user_id).await {
         Ok(sessions) => {
@@ -286,7 +284,7 @@ pub async fn revoke_user_refresh_token(
         refresh_token_id, current_user.0.id
     );
 
-    let user_id = services::auth::UserId(current_user.0.id);
+    let user_id = UserId(current_user.0.id);
     let session_id = services::auth::SessionId(refresh_token_id);
 
     match app_state
@@ -347,7 +345,7 @@ pub async fn revoke_all_user_tokens(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Revoking all tokens for user: {}", current_user.0.id);
 
-    let user_id = services::auth::UserId(current_user.0.id);
+    let user_id = UserId(current_user.0.id);
 
     match app_state.user_service.revoke_all_sessions(user_id).await {
         Ok(count) => Ok(Json(serde_json::json!({
@@ -433,7 +431,7 @@ pub async fn create_access_token(
             }))
         }
         Err(_) => {
-            error!("Failed to create access token");
+            error!("Failed to create access token and refresh token");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(

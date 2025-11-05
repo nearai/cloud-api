@@ -1018,7 +1018,7 @@ pub struct RefreshTokenResponse {
     pub user_agent: Option<String>,
 }
 
-// Access token + refresh token response model
+/// Access token + refresh token response model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AccessAndRefreshTokenResponse {
     pub access_token: String,

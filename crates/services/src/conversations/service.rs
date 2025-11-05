@@ -157,6 +157,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
         _conversation_id: models::ConversationId,
         _user_id: UserId,
         _limit: i64,
+        _offset: i64,
     ) -> Result<Vec<models::ConversationMessage>, errors::ConversationError> {
         unimplemented!()
         // Get responses for this conversation

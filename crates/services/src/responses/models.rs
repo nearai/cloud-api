@@ -21,6 +21,15 @@ impl std::fmt::Display for ResponseId {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseItemId(pub Uuid);
+
+impl From<Uuid> for ResponseItemId {
+    fn from(uuid: Uuid) -> Self {
+        ResponseItemId(uuid)
+    }
+}
+
 /// Request to create a response
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateResponseRequest {
@@ -68,7 +77,7 @@ pub struct CreateResponseRequest {
 }
 
 /// Input for a response - can be text, array of items, or single item
-#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum ResponseInput {
     Text(String),
@@ -142,7 +151,14 @@ pub enum ResponseTool {
         parameters: Option<serde_json::Value>,
     },
     #[serde(rename = "web_search")]
-    WebSearch {},
+    WebSearch {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filters: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        search_context_size: Option<String>, // "small", "medium", "large"
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user_location: Option<UserLocation>,
+    },
     #[serde(rename = "file_search")]
     FileSearch {},
     #[serde(rename = "code_interpreter")]
@@ -151,6 +167,21 @@ pub enum ResponseTool {
     Computer {},
     #[serde(rename = "current_date")]
     CurrentDate {},
+}
+
+/// User location for web search
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserLocation {
+    #[serde(rename = "type")]
+    pub type_: String, // "approximate", "exact"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
 }
 
 /// Tool choice configuration
@@ -174,6 +205,8 @@ pub struct ResponseToolChoiceFunction {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResponseTextConfig {
     pub format: ResponseTextFormat,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verbosity: Option<String>, // "low", "medium", "high"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -201,6 +234,10 @@ pub struct ResponseObject {
     pub object: String, // "response"
     pub created_at: i64,
     pub status: ResponseStatus,
+    #[serde(default)]
+    pub background: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<ConversationResponseReference>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ResponseError>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -217,20 +254,45 @@ pub struct ResponseObject {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ResponseReasoningOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_identifier: Option<String>,
+    #[serde(default = "default_service_tier")]
+    pub service_tier: String,
     pub store: bool,
     pub temperature: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<ResponseTextConfig>,
     pub tool_choice: ResponseToolChoiceOutput,
     pub tools: Vec<ResponseTool>,
+    #[serde(default)]
+    pub top_logprobs: i32,
     pub top_p: f32,
+    #[serde(default = "default_truncation")]
     pub truncation: String,
     pub usage: Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+}
+
+fn default_service_tier() -> String {
+    "default".to_string()
+}
+
+fn default_truncation() -> String {
+    "disabled".to_string()
+}
+
+/// Conversation reference in response object
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ConversationResponseReference {
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
@@ -291,6 +353,28 @@ pub enum ResponseOutputItem {
     },
 }
 
+impl ResponseOutputItem {
+    /// Get the ID of the output item
+    pub fn id(&self) -> &str {
+        match self {
+            ResponseOutputItem::Message { id, .. } => id,
+            ResponseOutputItem::ToolCall { id, .. } => id,
+            ResponseOutputItem::WebSearchCall { id, .. } => id,
+            ResponseOutputItem::Reasoning { id, .. } => id,
+        }
+    }
+
+    /// Get the status of the output item
+    pub fn status(&self) -> &ResponseItemStatus {
+        match self {
+            ResponseOutputItem::Message { status, .. } => status,
+            ResponseOutputItem::ToolCall { status, .. } => status,
+            ResponseOutputItem::WebSearchCall { status, .. } => status,
+            ResponseOutputItem::Reasoning { status, .. } => status,
+        }
+    }
+}
+
 /// Web search action details
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
@@ -329,6 +413,8 @@ pub enum ResponseOutputContent {
     OutputText {
         text: String,
         annotations: Vec<TextAnnotation>,
+        #[serde(default)]
+        logprobs: Vec<serde_json::Value>,
     },
     #[serde(rename = "tool_calls")]
     ToolCalls {

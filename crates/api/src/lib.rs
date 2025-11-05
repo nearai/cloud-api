@@ -57,6 +57,7 @@ pub struct AuthComponents {
 pub struct DomainServices {
     pub conversation_service: Arc<services::ConversationService>,
     pub response_service: Arc<services::ResponseService>,
+    pub response_items_repository: Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>,
     pub completion_service: Arc<services::CompletionServiceImpl>,
     pub models_service: Arc<services::models::ModelsServiceImpl>,
     pub mcp_manager: Arc<services::mcp::McpClientManager>,
@@ -207,6 +208,9 @@ pub async fn init_domain_services(
         database.pool().clone(),
     ));
     let response_repo = Arc::new(database::PgResponseRepository::new(database.pool().clone()));
+    let response_items_repo = Arc::new(database::PgResponseItemsRepository::new(
+        database.pool().clone(),
+    )) as Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>;
     let user_repo = Arc::new(database::UserRepository::new(database.pool().clone()))
         as Arc<dyn services::auth::UserRepository>;
     let attestation_repo = Arc::new(database::PgAttestationRepository::new(
@@ -286,6 +290,7 @@ pub async fn init_domain_services(
 
     let response_service = Arc::new(services::ResponseService::new(
         response_repo,
+        response_items_repo.clone(),
         inference_provider_pool.clone(),
         conversation_service.clone(),
         completion_service.clone(),
@@ -304,6 +309,7 @@ pub async fn init_domain_services(
     DomainServices {
         conversation_service,
         response_service,
+        response_items_repository: response_items_repo,
         completion_service,
         models_service,
         mcp_manager,
@@ -415,6 +421,7 @@ pub fn build_app_with_config(
 
     let conversation_routes = build_conversation_routes(
         domain_services.conversation_service,
+        domain_services.response_items_repository.clone(),
         &auth_components.auth_state_middleware,
     );
 
@@ -581,9 +588,10 @@ pub fn build_response_routes(
 /// Build conversation routes with auth
 pub fn build_conversation_routes(
     conversation_service: Arc<services::ConversationService>,
+    response_items_repository: Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>,
     auth_state_middleware: &AuthState,
 ) -> Router {
-    Router::new()
+    let conversation_routes = Router::new()
         .route("/conversations", post(conversations::create_conversation))
         .route(
             "/conversations/{conversation_id}",
@@ -597,15 +605,24 @@ pub fn build_conversation_routes(
             "/conversations/{conversation_id}",
             axum::routing::delete(conversations::delete_conversation),
         )
-        .route(
-            "/conversations/{conversation_id}/items",
-            get(conversations::list_conversation_items),
-        )
         .with_state(conversation_service)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware_with_api_key,
-        ))
+        ));
+    
+    let items_routes = Router::new()
+        .route(
+            "/conversations/{conversation_id}/items",
+            get(conversations::list_conversation_items),
+        )
+        .with_state(response_items_repository)
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            auth_middleware_with_api_key,
+        ));
+    
+    conversation_routes.merge(items_routes)
 }
 
 /// Build attestation routes with auth

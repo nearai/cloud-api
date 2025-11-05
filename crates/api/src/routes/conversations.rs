@@ -5,7 +5,10 @@ use axum::{
     response::Json as ResponseJson,
 };
 use serde::Deserialize;
-use services::conversations::{errors::ConversationError, models::ConversationId};
+use services::{
+    conversations::{errors::ConversationError, models::ConversationId},
+    responses::models::TextAnnotation,
+};
 use std::sync::Arc;
 use tracing::debug;
 use uuid::Uuid;
@@ -323,7 +326,9 @@ pub async fn delete_conversation(
 pub async fn list_conversation_items(
     Path(conversation_id): Path<String>,
     Query(params): Query<ListItemsQuery>,
-    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
+    State(response_items_repo): State<
+        Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>,
+    >,
     Extension(api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ConversationItemList>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
@@ -344,24 +349,16 @@ pub async fn list_conversation_items(
         }
     };
 
-    match service
-        .get_conversation_messages(
-            parsed_conversation_id,
-            api_key.created_by_user_id.clone(),
-            params.limit,
-        )
+    // Get items from response_items repository
+    match response_items_repo
+        .list_by_conversation(parsed_conversation_id)
         .await
     {
-        Ok(messages) => {
-            let http_items: Vec<ConversationItem> = messages
+        Ok(items) => {
+            // Convert ResponseOutputItems to ConversationItems
+            let http_items: Vec<ConversationItem> = items
                 .into_iter()
-                .map(|msg| ConversationItem::Message {
-                    id: msg.id.to_string(),
-                    status: ResponseItemStatus::Completed,
-                    role: msg.role,
-                    content: vec![ConversationContentPart::InputText { text: msg.content }],
-                    metadata: msg.metadata,
-                })
+                .filter_map(|item| convert_output_item_to_conversation_item(item))
                 .collect();
 
             let first_id = http_items.first().map(get_item_id).unwrap_or_default();
@@ -376,13 +373,95 @@ pub async fn list_conversation_items(
             }))
         }
         Err(error) => Err((
-            map_conversation_error_to_status(&error),
-            ResponseJson(error.into()),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse::new(
+                format!("Failed to get conversation items: {}", error),
+                "internal_error".to_string(),
+            )),
         )),
     }
 }
 
 // Helper functions
+
+fn convert_output_item_to_conversation_item(
+    item: services::responses::models::ResponseOutputItem,
+) -> Option<ConversationItem> {
+    use services::responses::models::ResponseOutputItem;
+
+    match item {
+        ResponseOutputItem::Message {
+            id,
+            status,
+            role,
+            content,
+        } => {
+            // Convert ResponseOutputContent to ConversationContentPart
+            let conv_content: Vec<ConversationContentPart> = content
+                .into_iter()
+                .filter_map(|c| match c {
+                    services::responses::models::ResponseOutputContent::OutputText {
+                        text,
+                        annotations,
+                        logprobs: _,
+                    } => Some(ConversationContentPart::OutputText {
+                        text,
+                        annotations: Some(
+                            annotations
+                                .into_iter()
+                                .map(|a| convert_text_annotation(a))
+                                .map(|a| serde_json::to_value(a).unwrap())
+                                .collect(),
+                        ),
+                    }),
+                    _ => None,
+                })
+                .collect();
+
+            Some(ConversationItem::Message {
+                id,
+                status: convert_response_item_status(status),
+                role,
+                content: conv_content,
+                metadata: None,
+            })
+        }
+        // Other item types like ToolCall, WebSearchCall, Reasoning
+        // are not currently converted to ConversationItems
+        _ => None,
+    }
+}
+
+fn convert_text_annotation(
+    annotation: services::responses::models::TextAnnotation,
+) -> TextAnnotation {
+    match annotation {
+        services::responses::models::TextAnnotation::UrlCitation {
+            start_index,
+            end_index,
+            title,
+            url,
+        } => TextAnnotation::UrlCitation {
+            start_index,
+            end_index,
+            title,
+            url,
+        },
+    }
+}
+
+fn convert_response_item_status(
+    status: services::responses::models::ResponseItemStatus,
+) -> ResponseItemStatus {
+    match status {
+        services::responses::models::ResponseItemStatus::Completed => ResponseItemStatus::Completed,
+        services::responses::models::ResponseItemStatus::Failed => ResponseItemStatus::Failed,
+        services::responses::models::ResponseItemStatus::InProgress => {
+            ResponseItemStatus::InProgress
+        }
+        services::responses::models::ResponseItemStatus::Cancelled => ResponseItemStatus::Cancelled,
+    }
+}
 
 fn convert_domain_conversation_to_http(
     domain_conversation: services::conversations::models::Conversation,

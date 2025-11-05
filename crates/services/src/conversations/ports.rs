@@ -62,6 +62,7 @@ pub trait ConversationServiceTrait: Send + Sync {
         conversation_id: conversations::models::ConversationId,
         user_id: UserId,
         limit: i64,
+        offset: i64,
     ) -> Result<
         Vec<conversations::models::ConversationMessage>,
         conversations::errors::ConversationError,

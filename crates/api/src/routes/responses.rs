@@ -83,6 +83,7 @@ pub async fn create_response(
     request.background = request.background.or(Some(false));
     request.text = request.text.or(Some(ResponseTextConfig {
         format: ResponseTextFormat::Text,
+        verbosity: Some("medium".to_string()),
     }));
     request.reasoning = request
         .reasoning
@@ -276,6 +277,19 @@ pub async fn create_response(
                         object: "response".to_string(),
                         created_at: chrono::Utc::now().timestamp(),
                         status,
+                        background: request.background.unwrap_or(false),
+                        conversation: request.conversation.as_ref().map(|conv_ref| {
+                            let id = match conv_ref {
+                                services::responses::models::ConversationReference::Id(id) => {
+                                    id.clone()
+                                }
+                                services::responses::models::ConversationReference::Object {
+                                    id,
+                                    ..
+                                } => id.clone(),
+                            };
+                            services::responses::models::ConversationResponseReference { id }
+                        }),
                         error: None,
                         incomplete_details: None,
                         instructions: request.instructions,
@@ -289,18 +303,24 @@ pub async fn create_response(
                             content: vec![ResponseOutputContent::OutputText {
                                 text: content,
                                 annotations: vec![],
+                                logprobs: vec![],
                             }],
                         }],
                         parallel_tool_calls: request.parallel_tool_calls.unwrap_or(false),
                         previous_response_id: request.previous_response_id,
+                        prompt_cache_key: request.prompt_cache_key,
+                        prompt_cache_retention: None,
                         reasoning: None,
+                        safety_identifier: request.safety_identifier,
+                        service_tier: "default".to_string(),
                         store: request.store.unwrap_or(false),
-                        temperature: request.temperature.unwrap_or(0.7),
+                        temperature: request.temperature.unwrap_or(1.0),
                         text: request.text,
                         tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
                         tools: request.tools.unwrap_or_default(),
+                        top_logprobs: 0,
                         top_p: request.top_p.unwrap_or(1.0),
-                        truncation: "stop".to_string(),
+                        truncation: "disabled".to_string(),
                         usage: Usage::new(0, 0), // TODO: Get actual usage from stream
                         user: None,
                         metadata: request.metadata,

@@ -387,7 +387,7 @@ pub async fn create_access_token(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     request: Request,
-) -> Result<Json<crate::models::AccessTokenResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<crate::models::AccessAndRefreshTokenResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Creating access token & refresh token for user: {}",
         user.0.id
@@ -410,7 +410,13 @@ pub async fn create_access_token(
         }
         _ => {
             error!("Missing or invalid refresh token");
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse::new(
+                    "Missing or invalid refresh token".to_string(),
+                    "unauthorized".to_string(),
+                )),
+            ));
         }
     };
 
@@ -424,7 +430,10 @@ pub async fn create_access_token(
                 "Failed to fetch session by refresh token for user {}: {}.",
                 user.0.id, e
             );
-            StatusCode::INTERNAL_SERVER_ERROR
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::new(
+                "Failed to fetch session by refresh token".to_string(),
+                "internal_server_error".to_string(),
+            )))
         })?;
 
     // validate token existence and User-Agent match
@@ -432,21 +441,39 @@ pub async fn create_access_token(
         Some(s) => s,
         None => {
             error!("Invalid or expired refresh token for user {}", user.0.id);
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse::new(
+                    "Invalid or expired refresh token".to_string(),
+                    "unauthorized".to_string(),
+                )),
+            ));
         }
     };
     if let Some(db_ua) = session.user_agent.as_ref() {
         if let Some(req_ua) = user_agent_header.as_ref() {
             if db_ua != req_ua {
                 error!("User-Agent mismatch for user {}.", user.0.id);
-                return Err(StatusCode::UNAUTHORIZED);
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse::new(
+                        "User-Agent mismatch".to_string(),
+                        "unauthorized".to_string(),
+                    )),
+                ));
             }
         } else {
             error!(
                 "Missing User-Agent header on request for user {}",
                 user.0.id
             );
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse::new(
+                    "Missing User-Agent header".to_string(),
+                    "unauthorized".to_string(),
+                )),
+            ));
         }
     }
 

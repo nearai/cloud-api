@@ -333,7 +333,7 @@ impl MockAuthService {
         self.create_mock_session_with_params(
             user_id,
             None,
-            None,
+            Some("Mock User Agent".to_string()),
             "mock_encoding_key".to_string(),
             1,
             7 * 24,
@@ -474,17 +474,10 @@ impl AuthServiceTrait for MockAuthService {
         user_agent: &str,
     ) -> Result<Option<Session>, AuthError> {
         // Accept the known test session token or any token that starts with "rt_"
-        if session_token.0.starts_with("rt_") {
+        if session_token.0.starts_with("rt_") && user_agent == "Mock User Agent" {
             let mock_user = Self::create_mock_user();
-            let (_access_token, refresh_session, _refresh_token) = self
-                .create_mock_session_with_params(
-                    mock_user.id,
-                    Some("127.0.0.1".to_string()),
-                    Some(user_agent.to_string()),
-                    "mock_encoding_key".to_string(),
-                    1,
-                    24 * 7,
-                );
+            let (_access_token, refresh_session, _refresh_token) =
+                self.create_mock_session(mock_user.id);
             Ok(Some(refresh_session))
         } else {
             Ok(None)
@@ -502,7 +495,7 @@ impl AuthServiceTrait for MockAuthService {
             user_agent
         );
         // Accept the known test session token or any token that starts with "rt_"
-        if session_token.0.starts_with("rt_") {
+        if session_token.0.starts_with("rt_") && user_agent == "Mock User Agent" {
             let user = Self::create_mock_user();
             tracing::debug!("MockAuthService returning mock user: {}", user.email);
             Ok(user)

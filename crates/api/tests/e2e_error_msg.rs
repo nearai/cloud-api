@@ -102,7 +102,7 @@ async fn test_organizations_not_found() {
     let random_org_id = uuid::Uuid::new_v4();
 
     let response = server
-        .get(format!("/v1/organizations/{}", random_org_id).as_str())
+        .get(format!("/v1/organizations/{random_org_id}").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .await;
 
@@ -122,7 +122,7 @@ async fn test_org_members_list_missing_authorization_message() {
     let random_org_id = uuid::Uuid::new_v4();
 
     let response = server
-        .get(format!("/v1/organizations/{}/members", random_org_id).as_str())
+        .get(format!("/v1/organizations/{random_org_id}/members").as_str())
         .await;
 
     assert_eq!(response.status_code(), 401);
@@ -137,7 +137,7 @@ async fn test_org_members_list_not_found_message() {
     let random_org_id = uuid::Uuid::new_v4();
 
     let response = server
-        .get(format!("/v1/organizations/{}/members", random_org_id).as_str())
+        .get(format!("/v1/organizations/{random_org_id}/members").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .await;
 
@@ -236,7 +236,7 @@ async fn test_workspace_get_not_found_message() {
     let random_ws_id = uuid::Uuid::new_v4();
 
     let response = server
-        .get(format!("/v1/workspaces/{}", random_ws_id).as_str())
+        .get(format!("/v1/workspaces/{random_ws_id}").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .await;
 
@@ -253,7 +253,7 @@ async fn test_list_workspace_api_keys_not_found_message() {
     let random_ws_id = uuid::Uuid::new_v4();
 
     let response = server
-        .get(format!("/v1/workspaces/{}/api-keys", random_ws_id).as_str())
+        .get(format!("/v1/workspaces/{random_ws_id}/api-keys").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .await;
 

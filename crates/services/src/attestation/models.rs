@@ -14,6 +14,9 @@ pub enum AttestationError {
     #[error("Client error: {0}")]
     ClientError(String),
 
+    #[error("Invalid parameter: {0}")]
+    InvalidParameter(String),
+
     #[error("Internal error: {0}")]
     InternalError(String),
 }

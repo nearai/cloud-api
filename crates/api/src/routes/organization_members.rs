@@ -46,17 +46,22 @@ pub async fn add_organization_member(
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
     Json(request): Json<crate::models::AddOrganizationMemberRequest>,
-) -> Result<Json<crate::models::OrganizationMemberResponse>, StatusCode> {
+) -> Result<Json<crate::models::OrganizationMemberResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Adding member to organization: {} by user: {}",
         org_id, user.0.id
     );
 
     // Convert user_id from String to Uuid
-    let user_id_to_add = request
-        .user_id
-        .parse::<Uuid>()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let user_id_to_add = request.user_id.parse::<Uuid>().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "Invalid user ID".to_string(),
+                "bad_request".to_string(),
+            )),
+        )
+    })?;
 
     let organization_id = OrganizationId(org_id);
     let requester_id = authenticated_user_to_user_id(user);
@@ -72,13 +77,37 @@ pub async fn add_organization_member(
             let response = services_member_to_api_member(member);
             Ok(Json(response))
         }
-        Err(OrganizationError::UserNotFound) => Err(StatusCode::NOT_FOUND),
-        Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
-        Err(OrganizationError::InvalidParams(_)) => Err(StatusCode::BAD_REQUEST),
-        Err(OrganizationError::AlreadyMember) => Err(StatusCode::CONFLICT),
-        Err(_) => {
-            error!("Failed to add organization member");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        Err(OrganizationError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Organization not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
+        Err(OrganizationError::Unauthorized(msg)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
+        )),
+        Err(OrganizationError::InvalidParams(msg)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
+        )),
+        Err(OrganizationError::AlreadyMember) => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse::new(
+                "Already a member".to_string(),
+                "conflict".to_string(),
+            )),
+        )),
+        Err(e) => {
+            error!("Failed to add organization member: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to add organization member".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -111,7 +140,10 @@ pub async fn invite_organization_member_by_email(
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
     Json(request): Json<crate::models::InviteOrganizationMemberByEmailRequest>,
-) -> Result<Json<crate::models::InviteOrganizationMemberByEmailResponse>, StatusCode> {
+) -> Result<
+    Json<crate::models::InviteOrganizationMemberByEmailResponse>,
+    (StatusCode, Json<ErrorResponse>),
+> {
     debug!(
         "Inviting {} members by email to organization: {} by user: {}",
         request.invitations.len(),
@@ -121,7 +153,13 @@ pub async fn invite_organization_member_by_email(
 
     // Validate request
     if request.invitations.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "Empty invitations".to_string(),
+                "bad_request".to_string(),
+            )),
+        ));
     }
 
     let organization_id = OrganizationId(org_id);
@@ -167,10 +205,19 @@ pub async fn invite_organization_member_by_email(
                 },
             ))
         }
-        Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
+        Err(OrganizationError::Unauthorized(msg)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
+        )),
         Err(_) => {
             error!("Failed to invite organization members");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to invite organization members".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -203,7 +250,7 @@ pub async fn update_organization_member(
     Extension(user): Extension<AuthenticatedUser>,
     Path((org_id, user_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<crate::models::UpdateOrganizationMemberRequest>,
-) -> Result<Json<crate::models::OrganizationMemberResponse>, StatusCode> {
+) -> Result<Json<crate::models::OrganizationMemberResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Updating member {} in organization: {} by user: {}",
         user_id, org_id, user.0.id
@@ -223,11 +270,23 @@ pub async fn update_organization_member(
             let response = services_member_to_api_member(member);
             Ok(Json(response))
         }
-        Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
-        Err(OrganizationError::InvalidParams(_)) => Err(StatusCode::BAD_REQUEST),
+        Err(OrganizationError::Unauthorized(msg)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
+        )),
+        Err(OrganizationError::InvalidParams(msg)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
+        )),
         Err(_) => {
             error!("Failed to update organization member");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to update organization member".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -260,7 +319,7 @@ pub async fn remove_organization_member(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path((org_id, user_id)): Path<(Uuid, Uuid)>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Removing member {} from organization: {} by user: {}",
         user_id, org_id, user.0.id
@@ -276,15 +335,33 @@ pub async fn remove_organization_member(
         .await
     {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
-        Ok(false) => Err(StatusCode::NOT_FOUND),
-        Err(OrganizationError::Unauthorized(_)) => Err(StatusCode::FORBIDDEN),
+        Ok(false) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Organization member not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
+        Err(OrganizationError::Unauthorized(msg)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
+        )),
         Err(OrganizationError::InvalidParams(msg)) => {
             error!("Cannot remove member: {}", msg);
-            Err(StatusCode::BAD_REQUEST)
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(msg, "bad_request".to_string())),
+            ))
         }
         Err(_) => {
             error!("Failed to remove organization member");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to remove organization member".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -346,13 +423,10 @@ pub async fn list_organization_members(
         .await
     {
         Ok(count) => count,
-        Err(services::organization::OrganizationError::Unauthorized(_)) => {
+        Err(services::organization::OrganizationError::Unauthorized(msg)) => {
             return Err((
                 StatusCode::FORBIDDEN,
-                ResponseJson(ErrorResponse::new(
-                    "Not authorized to view organization members".to_string(),
-                    "forbidden".to_string(),
-                )),
+                ResponseJson(ErrorResponse::new(msg, "forbidden".to_string())),
             ));
         }
         Err(services::organization::OrganizationError::NotFound) => {
@@ -410,16 +484,13 @@ pub async fn list_organization_members(
             warn!("User attempted to access organization members without membership");
             Err((
                 StatusCode::FORBIDDEN,
-                ResponseJson(ErrorResponse::new(
-                    "Forbidden".to_string(),
-                    "forbidden".to_string(),
-                )),
+                ResponseJson(ErrorResponse::new(msg, "forbidden".to_string())),
             ))
         }
         Err(OrganizationError::NotFound) => Err((
             StatusCode::NOT_FOUND,
             ResponseJson(ErrorResponse::new(
-                "Not found".to_string(),
+                "Organization not found".to_string(),
                 "not_found".to_string(),
             )),
         )),

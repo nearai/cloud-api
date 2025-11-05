@@ -122,7 +122,7 @@ pub async fn get_organization_balance(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
                     "Failed to verify organization access".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             )
         })?;
@@ -147,7 +147,7 @@ pub async fn get_organization_balance(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
                     "Failed to retrieve balance".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             )
         })?;
@@ -163,7 +163,7 @@ pub async fn get_organization_balance(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
                     "Failed to retrieve limit".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             )
         })?;
@@ -291,7 +291,7 @@ pub async fn get_organization_usage_history(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
                     "Failed to verify organization access".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             )
         })?;
@@ -316,7 +316,7 @@ pub async fn get_organization_usage_history(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
                     "Failed to retrieve usage history".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             )
         })?;
@@ -440,7 +440,7 @@ pub async fn get_api_key_usage_history(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(
                         "Failed to retrieve usage history".to_string(),
-                        "internal_error".to_string(),
+                        "internal_server_error".to_string(),
                     )),
                 ),
             }

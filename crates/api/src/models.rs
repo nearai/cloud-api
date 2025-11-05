@@ -735,6 +735,39 @@ pub enum ConversationItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         metadata: Option<serde_json::Value>,
     },
+    #[serde(rename = "tool_call")]
+    ToolCall {
+        id: String,
+        status: ResponseItemStatus,
+        tool_type: String,
+        function: ConversationItemFunction,
+    },
+    #[serde(rename = "web_search_call")]
+    WebSearchCall {
+        id: String,
+        status: ResponseItemStatus,
+        action: ConversationItemWebSearchAction,
+    },
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        id: String,
+        status: ResponseItemStatus,
+        summary: String,
+        content: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ConversationItemFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase", tag = "type")]
+pub enum ConversationItemWebSearchAction {
+    #[serde(rename = "search")]
+    Search { query: String },
 }
 
 /// List of conversation items

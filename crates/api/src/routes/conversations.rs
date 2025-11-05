@@ -365,20 +365,20 @@ pub async fn list_conversation_items(
         .list_by_conversation(parsed_conversation_id, params.after.clone(), fetch_limit)
         .await
     {
-        Ok(mut items) => {
-            // Check if we got more items than requested (indicates more pages exist)
-            let has_more = items.len() > params.limit as usize;
-
-            // Truncate to the requested limit if we got more
-            if has_more {
-                items.truncate(params.limit as usize);
-            }
-
+        Ok(items) => {
             // Convert ResponseOutputItems to ConversationItems
             let http_items: Vec<ConversationItem> = items
                 .into_iter()
-                .filter_map(|item| convert_output_item_to_conversation_item(item))
+                .map(|item| convert_output_item_to_conversation_item(item))
                 .collect();
+
+            // Now check has_more and truncate AFTER filtering
+            let has_more = http_items.len() > params.limit as usize;
+            let http_items = if has_more {
+                http_items.into_iter().take(params.limit as usize).collect()
+            } else {
+                http_items
+            };
 
             let first_id = http_items.first().map(get_item_id).unwrap_or_default();
             let last_id = http_items.last().map(get_item_id).unwrap_or_default();
@@ -405,7 +405,7 @@ pub async fn list_conversation_items(
 
 fn convert_output_item_to_conversation_item(
     item: services::responses::models::ResponseOutputItem,
-) -> Option<ConversationItem> {
+) -> ConversationItem {
     use services::responses::models::ResponseOutputItem;
 
     match item {
@@ -437,17 +437,50 @@ fn convert_output_item_to_conversation_item(
                 })
                 .collect();
 
-            Some(ConversationItem::Message {
+            ConversationItem::Message {
                 id,
                 status: convert_response_item_status(status),
                 role,
                 content: conv_content,
                 metadata: None,
-            })
+            }
         }
-        // Other item types like ToolCall, WebSearchCall, Reasoning
-        // are not currently converted to ConversationItems
-        _ => None,
+        ResponseOutputItem::ToolCall {
+            id,
+            status,
+            tool_type,
+            function,
+        } => ConversationItem::ToolCall {
+            id,
+            status: convert_response_item_status(status),
+            tool_type,
+            function: ConversationItemFunction {
+                name: function.name,
+                arguments: function.arguments,
+            },
+        },
+        ResponseOutputItem::WebSearchCall { id, status, action } => {
+            ConversationItem::WebSearchCall {
+                id,
+                status: convert_response_item_status(status),
+                action: match action {
+                    services::responses::models::WebSearchAction::Search { query } => {
+                        ConversationItemWebSearchAction::Search { query }
+                    }
+                },
+            }
+        }
+        ResponseOutputItem::Reasoning {
+            id,
+            status,
+            summary,
+            content,
+        } => ConversationItem::Reasoning {
+            id,
+            status: convert_response_item_status(status),
+            summary,
+            content,
+        },
     }
 }
 
@@ -496,6 +529,9 @@ fn convert_domain_conversation_to_http(
 fn get_item_id(item: &ConversationItem) -> String {
     match item {
         ConversationItem::Message { id, .. } => id.clone(),
+        ConversationItem::ToolCall { id, .. } => id.clone(),
+        ConversationItem::WebSearchCall { id, .. } => id.clone(),
+        ConversationItem::Reasoning { id, .. } => id.clone(),
     }
 }
 

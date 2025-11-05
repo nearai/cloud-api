@@ -281,17 +281,18 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
             // Extract UUID from the after item ID
             let after_uuid = Self::extract_uuid_from_item_id(&after_id)?;
 
-            // Query items created after the reference item
+            // Query items after the reference item using composite (created_at, id) comparison
+            // This handles cases where multiple items have the same created_at timestamp
             // We fetch limit + 1 to determine if there are more items
             client
                 .query(
                     r#"
                     SELECT * FROM response_items
                     WHERE conversation_id = $1
-                      AND created_at > (
-                          SELECT created_at FROM response_items WHERE id = $2
+                      AND (created_at, id) > (
+                          SELECT created_at, id FROM response_items WHERE id = $2
                       )
-                    ORDER BY created_at ASC
+                    ORDER BY created_at ASC, id ASC
                     LIMIT $3
                     "#,
                     &[&conversation_id.0, &after_uuid, &limit],
@@ -305,7 +306,7 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
                     r#"
                     SELECT * FROM response_items
                     WHERE conversation_id = $1
-                    ORDER BY created_at ASC
+                    ORDER BY created_at ASC, id ASC
                     LIMIT $2
                     "#,
                     &[&conversation_id.0, &limit],

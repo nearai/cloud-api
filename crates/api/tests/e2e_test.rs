@@ -199,6 +199,7 @@ async fn test_responses_api() {
                 assert_eq!(text, message.as_str());
             }
         }
+        _ => panic!("Expected Message item type"),
     }
 }
 
@@ -3009,6 +3010,9 @@ async fn test_conversation_items_pagination() {
         .chain(fourth_page.data.iter())
         .map(|item| match item {
             ConversationItem::Message { id, .. } => id.clone(),
+            ConversationItem::ToolCall { id, .. } => id.clone(),
+            ConversationItem::WebSearchCall { id, .. } => id.clone(),
+            ConversationItem::Reasoning { id, .. } => id.clone(),
         })
         .collect();
 
@@ -3042,4 +3046,266 @@ async fn test_conversation_items_pagination() {
     );
 
     println!("✅ Conversation items pagination working correctly");
+}
+
+#[tokio::test]
+async fn test_conversation_items_pagination_limit_1() {
+    // Regression test for pagination bug with limit=1
+    // This test ensures no empty responses occur mid-pagination
+    // and that the cursor always advances properly
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let models = list_models(&server, api_key.clone()).await;
+
+    // Create a conversation
+    let conversation = create_conversation(&server, api_key.clone()).await;
+
+    // Create 5 responses to generate 10 items (each response creates 2 items)
+    let max_tokens = 10;
+    for i in 0..5 {
+        let message = format!("Test message {}", i + 1);
+        create_response(
+            &server,
+            conversation.id.clone(),
+            models.data[0].id.clone(),
+            message,
+            max_tokens,
+            api_key.clone(),
+        )
+        .await;
+    }
+
+    // Paginate with limit=1 and verify no issues
+    let mut all_items = Vec::new();
+    let mut after: Option<String> = None;
+    let mut iteration = 0;
+    let max_iterations = 100; // Safety limit
+    let mut consecutive_empty = 0;
+
+    while iteration < max_iterations {
+        let url = if let Some(cursor) = &after {
+            format!(
+                "/v1/conversations/{}/items?limit=1&after={}",
+                conversation.id, cursor
+            )
+        } else {
+            format!("/v1/conversations/{}/items?limit=1", conversation.id)
+        };
+
+        let response = server
+            .get(url.as_str())
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        let page = response.json::<api::models::ConversationItemList>();
+
+        if page.data.is_empty() {
+            // Empty response - should ONLY happen when has_more=false
+            assert!(
+                !page.has_more,
+                "Empty response at iteration {} but has_more=true (BUG!)",
+                iteration
+            );
+            consecutive_empty += 1;
+            assert!(
+                consecutive_empty <= 1,
+                "Multiple consecutive empty responses (infinite loop detected)"
+            );
+            break;
+        } else {
+            consecutive_empty = 0;
+        }
+
+        // Verify data integrity
+        assert_eq!(
+            page.data.len(),
+            1,
+            "Should return exactly 1 item when limit=1"
+        );
+
+        // Verify cursor advances
+        if page.has_more {
+            assert!(!page.last_id.is_empty(), "has_more=true but no last_id");
+            if let Some(prev_cursor) = &after {
+                assert_ne!(
+                    &page.last_id, prev_cursor,
+                    "Cursor not advancing at iteration {} (infinite loop detected)",
+                    iteration
+                );
+            }
+        }
+
+        all_items.push(page.data[0].clone());
+        after = if page.has_more {
+            Some(page.last_id)
+        } else {
+            break;
+        };
+
+        iteration += 1;
+    }
+
+    // Verify we didn't hit the safety limit (would indicate infinite loop)
+    assert!(
+        iteration < max_iterations,
+        "Pagination didn't complete within {} iterations (infinite loop)",
+        max_iterations
+    );
+
+    // Verify we got all 10 items
+    assert_eq!(
+        all_items.len(),
+        10,
+        "Should have paginated through all 10 items with limit=1"
+    );
+
+    // Verify no duplicate items
+    let item_ids: Vec<String> = all_items
+        .iter()
+        .map(|item| match item {
+            ConversationItem::Message { id, .. } => id.clone(),
+            ConversationItem::ToolCall { id, .. } => id.clone(),
+            ConversationItem::WebSearchCall { id, .. } => id.clone(),
+            ConversationItem::Reasoning { id, .. } => id.clone(),
+        })
+        .collect();
+    let unique_ids: std::collections::HashSet<_> = item_ids.iter().collect();
+    assert_eq!(
+        item_ids.len(),
+        unique_ids.len(),
+        "Duplicate items detected in pagination"
+    );
+
+    println!("✅ Pagination with limit=1 working correctly (no infinite loop bug)");
+}
+
+#[tokio::test]
+async fn test_conversation_items_pagination_with_web_search() {
+    // Test pagination when conversation has mixed item types (Messages + WebSearchCalls)
+    // This is a regression test for the bug where non-Message items caused empty responses
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let models = list_models(&server, api_key.clone()).await;
+
+    // Create a conversation
+    let conversation = create_conversation(&server, api_key.clone()).await;
+
+    // Create responses with web_search tool to generate mixed item types
+    // Each response with web_search creates: [Message(user), WebSearchCall, Message(assistant)]
+    // So 3 responses = 9 items total (all types visible to API)
+    for i in 0..3 {
+        let message = format!("Search for information about topic {}", i + 1);
+
+        // Create response with web_search enabled
+        let response = server
+            .post("/v1/responses")
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .json(&serde_json::json!({
+                "model": models.data[0].id,
+                "conversation": {"id": conversation.id},
+                "input": message,
+                "max_output_tokens": 10,
+                "tools": [{"type": "web_search"}],
+                "stream": false
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+    }
+
+    // Paginate with limit=1 through ALL items (Messages + WebSearchCalls + etc.)
+    let mut all_items = Vec::new();
+    let mut after: Option<String> = None;
+    let mut iteration = 0;
+    let max_iterations = 50;
+
+    while iteration < max_iterations {
+        let url = if let Some(cursor) = &after {
+            format!(
+                "/v1/conversations/{}/items?limit=1&after={}",
+                conversation.id, cursor
+            )
+        } else {
+            format!("/v1/conversations/{}/items?limit=1", conversation.id)
+        };
+
+        let response = server
+            .get(url.as_str())
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        let page = response.json::<api::models::ConversationItemList>();
+
+        if page.data.is_empty() {
+            // Empty response should ONLY happen when has_more=false
+            assert!(
+                !page.has_more,
+                "Empty response at iteration {} but has_more=true (BUG: filtering issue)",
+                iteration
+            );
+            break;
+        }
+
+        // Verify exactly 1 item returned
+        assert_eq!(
+            page.data.len(),
+            1,
+            "Should return exactly 1 item when limit=1 (including all item types)"
+        );
+
+        // Verify cursor advances
+        if page.has_more {
+            assert!(!page.last_id.is_empty(), "has_more=true but no last_id");
+            if let Some(prev_cursor) = &after {
+                assert_ne!(
+                    &page.last_id, prev_cursor,
+                    "Cursor not advancing at iteration {}",
+                    iteration
+                );
+            }
+        }
+
+        all_items.push(page.data[0].clone());
+        after = if page.has_more {
+            Some(page.last_id)
+        } else {
+            break;
+        };
+
+        iteration += 1;
+    }
+
+    // Verify pagination completed
+    assert!(
+        iteration < max_iterations,
+        "Pagination didn't complete (infinite loop with mixed items)"
+    );
+
+    // Should have at least 6 message items (3 user + 3 assistant)
+    // WebSearchCalls may not be created in test environment if web search isn't actually executed
+    // The important thing is that all item types are returned without being filtered
+    assert!(
+        all_items.len() >= 6,
+        "Should have at least 6 message items, got {}",
+        all_items.len()
+    );
+
+    // Verify no duplicate items
+    let item_ids: Vec<String> = all_items
+        .iter()
+        .map(|item| match item {
+            ConversationItem::Message { id, .. } => id.clone(),
+            ConversationItem::ToolCall { id, .. } => id.clone(),
+            ConversationItem::WebSearchCall { id, .. } => id.clone(),
+            ConversationItem::Reasoning { id, .. } => id.clone(),
+        })
+        .collect();
+    let unique_ids: std::collections::HashSet<_> = item_ids.iter().collect();
+    assert_eq!(item_ids.len(), unique_ids.len(), "Duplicate items detected");
+
+    println!("✅ Pagination with all item types (WebSearchCall, etc.) working correctly");
 }

@@ -480,7 +480,7 @@ pub async fn list_organization_members(
                 offset: params.offset,
             }))
         }
-        Err(OrganizationError::Unauthorized(_)) => {
+        Err(OrganizationError::Unauthorized(msg)) => {
             warn!("User attempted to access organization members without membership");
             Err((
                 StatusCode::FORBIDDEN,

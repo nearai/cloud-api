@@ -157,7 +157,7 @@ where
             Poll::Ready(None) => {
                 // Stream ended - process any remaining buffer content
                 if !self.buffer.trim().is_empty() {
-                    eprintln!("Warning: Incomplete SSE data in buffer at stream end",);
+                    eprintln!("Warning: Incomplete SSE data in buffer at stream end");
                 }
                 Poll::Ready(None)
             }

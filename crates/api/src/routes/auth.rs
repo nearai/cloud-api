@@ -152,7 +152,7 @@ pub async fn oauth_callback(
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({
-                            "error": "server_error",
+                            "error": "internal_server_error",
                             "error_description": "Missing PKCE verifier for Google OAuth"
                         })),
                     )
@@ -168,7 +168,7 @@ pub async fn oauth_callback(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
-                    "error": "server_error",
+                    "error": "internal_server_error",
                     "error_description": "Unknown OAuth provider"
                 })),
             )
@@ -199,7 +199,7 @@ pub async fn oauth_callback(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
-                    "error": "server_error",
+                    "error": "internal_server_error",
                     "error_description": format!("User creation failed: {}", e)
                 })),
             )
@@ -241,7 +241,7 @@ pub async fn oauth_callback(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
-                    "error": "server_error",
+                    "error": "internal_server_error",
                     "error_description": format!("Session creation failed: {}", e)
                 })),
             )

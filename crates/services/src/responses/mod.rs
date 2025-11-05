@@ -562,7 +562,7 @@ impl ResponseService {
                 "error".to_string(),
                 serde_json::json!({
                     "message": error,
-                    "type": "internal_error"
+                    "type": "internal_server_error"
                 }),
             );
         }

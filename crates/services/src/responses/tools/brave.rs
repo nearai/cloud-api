@@ -52,11 +52,96 @@ pub struct BraveWebSearchResult {
 
 #[async_trait::async_trait]
 impl WebSearchProviderTrait for BraveWebSearchProvider {
-    async fn search(&self, query: String) -> Result<Vec<WebSearchResult>, WebSearchError> {
-        tracing::debug!("Searching for query: {}", query);
+    async fn search(&self, params: WebSearchParams) -> Result<Vec<WebSearchResult>, WebSearchError> {
+        tracing::debug!("Searching with params: {:?}", params);
+        
+        // Build query parameters dynamically
+        let mut query_params = vec![("q", params.query.clone())];
+        
+        // Add optional parameters
+        let country;
+        if let Some(ref c) = params.country {
+            country = c.clone();
+            query_params.push(("country", country));
+        }
+        
+        let search_lang;
+        if let Some(ref sl) = params.search_lang {
+            search_lang = sl.clone();
+            query_params.push(("search_lang", search_lang));
+        }
+        
+        let ui_lang;
+        if let Some(ref ul) = params.ui_lang {
+            ui_lang = ul.clone();
+            query_params.push(("ui_lang", ui_lang));
+        }
+        
+        let count;
+        if let Some(c) = params.count {
+            count = c.to_string();
+            query_params.push(("count", count));
+        }
+        
+        let offset;
+        if let Some(o) = params.offset {
+            offset = o.to_string();
+            query_params.push(("offset", offset));
+        }
+        
+        let safesearch;
+        if let Some(ref ss) = params.safesearch {
+            safesearch = ss.clone();
+            query_params.push(("safesearch", safesearch));
+        }
+        
+        let freshness;
+        if let Some(ref f) = params.freshness {
+            freshness = f.clone();
+            query_params.push(("freshness", freshness));
+        }
+        
+        let text_decorations;
+        if let Some(td) = params.text_decorations {
+            text_decorations = td.to_string();
+            query_params.push(("text_decorations", text_decorations));
+        }
+        
+        let spellcheck;
+        if let Some(sc) = params.spellcheck {
+            spellcheck = sc.to_string();
+            query_params.push(("spellcheck", spellcheck));
+        }
+        
+        let result_filter;
+        if let Some(ref rf) = params.result_filter {
+            result_filter = rf.clone();
+            query_params.push(("result_filter", result_filter));
+        }
+        
+        let units;
+        if let Some(ref u) = params.units {
+            units = u.clone();
+            query_params.push(("units", units));
+        }
+        
+        let extra_snippets;
+        if let Some(es) = params.extra_snippets {
+            extra_snippets = es.to_string();
+            query_params.push(("extra_snippets", extra_snippets));
+        }
+        
+        let summary;
+        if let Some(s) = params.summary {
+            summary = s.to_string();
+            query_params.push(("summary", summary));
+        }
+        
+        tracing::debug!("Query parameters: {:?}", query_params);
+
         let response = self
             .brave_get_builder()
-            .query(&[("q", query)])
+            .query(&query_params)
             .send()
             .await
             .map_err(|e| WebSearchError::WebSearchRequestFailed(e.to_string()))?;

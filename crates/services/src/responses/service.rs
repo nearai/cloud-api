@@ -324,7 +324,7 @@ impl ResponseServiceImpl {
 
         let mut tool_calls_detected = Vec::new();
 
-        for (_idx, (name_opt, args_str)) in tool_call_accumulator {
+        for (idx, (name_opt, args_str)) in tool_call_accumulator {
             if let Some(name) = name_opt {
                 // Handle tools that don't require parameters (like current_date)
                 if name == "current_date" {
@@ -332,21 +332,46 @@ impl ResponseServiceImpl {
                     tool_calls_detected.push(ToolCallInfo {
                         tool_type: name,
                         query: String::new(),
+                        params: None,
                     });
                 } else {
                     // Try to parse the complete arguments for tools that need parameters
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str) {
                         if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
-                            tracing::debug!("Tool call detected: {} with query: {}", name, query);
+                            tracing::debug!(
+                                "Tool call detected: {} with query: {} and params: {:?}",
+                                name,
+                                query,
+                                args
+                            );
                             tool_calls_detected.push(ToolCallInfo {
                                 tool_type: name,
                                 query: query.to_string(),
+                                params: Some(args),
                             });
+                        } else {
+                            tracing::warn!(
+                                "Tool call {} (index {}) has no 'query' field in arguments: {}",
+                                name,
+                                idx,
+                                args_str
+                            );
                         }
                     } else {
-                        tracing::warn!("Failed to parse tool call arguments: {}", args_str);
+                        tracing::warn!(
+                            "Failed to parse tool call {} (index {}) arguments: {}",
+                            name,
+                            idx,
+                            args_str
+                        );
                     }
                 }
+            } else {
+                tracing::warn!(
+                    "Tool call at index {} has arguments but no name. Args: {}",
+                    idx,
+                    args_str
+                );
             }
         }
 
@@ -1029,14 +1054,78 @@ impl ResponseServiceImpl {
                             function: inference_providers::FunctionDefinition {
                                 name: "web_search".to_string(),
                                 description: Some(
-                                    "Search the web for current information. Use this when you need up-to-date information or facts that you don't have.".to_string()
+                                    "Search the web for current information. Use this when you need up-to-date information or facts that you don't have. \
+                                    \n\nIMPORTANT PARAMETERS TO CONSIDER:\
+                                    \n- Use 'freshness' for time-sensitive queries (news, recent events, current trends)\
+                                    \n- Use 'country' for location-specific information\
+                                    \n- Use 'result_filter' to focus on specific content (news, videos, discussions)\
+                                    \n- Use 'count' to limit results when user asks for specific number\
+                                    \n- Use 'safesearch' when dealing with sensitive topics".to_string()
                                 ),
                                 parameters: serde_json::json!({
                                     "type": "object",
                                     "properties": {
                                         "query": {
                                             "type": "string",
-                                            "description": "The search query to look up"
+                                            "description": "The search query to look up (required, max 400 characters)"
+                                        },
+                                        "country": {
+                                            "type": "string",
+                                            "description": "2-character country code where results come from (e.g., 'US', 'GB', 'DE'). Use when user asks about location-specific information or mentions a country."
+                                        },
+                                        "search_lang": {
+                                            "type": "string",
+                                            "description": "2+ character language code for search results (e.g., 'en', 'es', 'de'). Use when user's query or language preference suggests non-English results."
+                                        },
+                                        "ui_lang": {
+                                            "type": "string",
+                                            "description": "User interface language (e.g., 'en-US', 'es-ES')"
+                                        },
+                                        "count": {
+                                            "type": "integer",
+                                            "description": "Number of search results to return (1-20, default: 20). Use lower values (5-10) for focused queries, higher values (15-20) for comprehensive research.",
+                                            "minimum": 1,
+                                            "maximum": 20
+                                        },
+                                        "offset": {
+                                            "type": "integer",
+                                            "description": "Zero-based offset for pagination (0-9)",
+                                            "minimum": 0,
+                                            "maximum": 9
+                                        },
+                                        "safesearch": {
+                                            "type": "string",
+                                            "description": "Safe search filter: 'strict' for educational/family content, 'moderate' (default) for general use, 'off' only when explicitly needed",
+                                            "enum": ["off", "moderate", "strict"]
+                                        },
+                                        "freshness": {
+                                            "type": "string",
+                                            "description": "Filter by freshness: 'pd' (24h) for breaking news, 'pw' (7d) for recent events, 'pm' (31d) for current trends, 'py' (365d) for recent developments. Always use for: news, current events, latest updates, recent changes, today's info."
+                                        },
+                                        "text_decorations": {
+                                            "type": "boolean",
+                                            "description": "Include text highlighting markers (default: true)"
+                                        },
+                                        "spellcheck": {
+                                            "type": "boolean",
+                                            "description": "Enable spellcheck on query (default: true)"
+                                        },
+                                        "result_filter": {
+                                            "type": "string",
+                                            "description": "Comma-delimited result types: 'news' (for news/updates), 'videos' (for tutorials/demos), 'discussions' (for community opinions/Q&A), 'faq' (for how-to questions). Use to focus on most relevant content type."
+                                        },
+                                        "units": {
+                                            "type": "string",
+                                            "description": "Measurement units: 'metric' or 'imperial'",
+                                            "enum": ["metric", "imperial"]
+                                        },
+                                        "extra_snippets": {
+                                            "type": "boolean",
+                                            "description": "Get up to 5 additional alternative excerpts (requires AI/Data plan)"
+                                        },
+                                        "summary": {
+                                            "type": "boolean",
+                                            "description": "Enable summary key generation (requires AI/Data plan)"
                                         }
                                     },
                                     "required": ["query"]
@@ -1270,15 +1359,64 @@ impl ResponseServiceImpl {
         match tool_call.tool_type.as_str() {
             "web_search" => {
                 if let Some(provider) = web_search_provider {
-                    let results = provider
-                        .search(tool_call.query.clone())
-                        .await
-                        .map_err(|e| {
-                            errors::ResponseError::InternalError(format!(
-                                "Web search failed: {}",
-                                e
-                            ))
-                        })?;
+                    // Build WebSearchParams from tool call parameters
+                    let mut search_params = tools::WebSearchParams::new(tool_call.query.clone());
+
+                    // Parse additional parameters if present
+                    if let Some(params) = &tool_call.params {
+                        // Extract optional parameters from JSON
+                        if let Some(country) = params.get("country").and_then(|v| v.as_str()) {
+                            search_params.country = Some(country.to_string());
+                        }
+                        if let Some(lang) = params.get("search_lang").and_then(|v| v.as_str()) {
+                            search_params.search_lang = Some(lang.to_string());
+                        }
+                        if let Some(ui_lang) = params.get("ui_lang").and_then(|v| v.as_str()) {
+                            search_params.ui_lang = Some(ui_lang.to_string());
+                        }
+                        if let Some(count) = params.get("count").and_then(|v| v.as_u64()) {
+                            search_params.count = Some(count as u32);
+                        }
+                        if let Some(offset) = params.get("offset").and_then(|v| v.as_u64()) {
+                            search_params.offset = Some(offset as u32);
+                        }
+                        if let Some(safesearch) = params.get("safesearch").and_then(|v| v.as_str())
+                        {
+                            search_params.safesearch = Some(safesearch.to_string());
+                        }
+                        if let Some(freshness) = params.get("freshness").and_then(|v| v.as_str()) {
+                            search_params.freshness = Some(freshness.to_string());
+                        }
+                        if let Some(text_decorations) =
+                            params.get("text_decorations").and_then(|v| v.as_bool())
+                        {
+                            search_params.text_decorations = Some(text_decorations);
+                        }
+                        if let Some(spellcheck) = params.get("spellcheck").and_then(|v| v.as_bool())
+                        {
+                            search_params.spellcheck = Some(spellcheck);
+                        }
+                        if let Some(result_filter) =
+                            params.get("result_filter").and_then(|v| v.as_str())
+                        {
+                            search_params.result_filter = Some(result_filter.to_string());
+                        }
+                        if let Some(units) = params.get("units").and_then(|v| v.as_str()) {
+                            search_params.units = Some(units.to_string());
+                        }
+                        if let Some(extra_snippets) =
+                            params.get("extra_snippets").and_then(|v| v.as_bool())
+                        {
+                            search_params.extra_snippets = Some(extra_snippets);
+                        }
+                        if let Some(summary) = params.get("summary").and_then(|v| v.as_bool()) {
+                            search_params.summary = Some(summary);
+                        }
+                    }
+
+                    let results = provider.search(search_params).await.map_err(|e| {
+                        errors::ResponseError::InternalError(format!("Web search failed: {}", e))
+                    })?;
                     let formatted = results
                         .iter()
                         .map(|r| {

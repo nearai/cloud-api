@@ -315,6 +315,8 @@ impl EventEmitter {
 pub struct ToolCallInfo {
     pub tool_type: String,
     pub query: String,
+    /// Additional parameters parsed from the tool call arguments
+    pub params: Option<serde_json::Value>,
 }
 
 /// Accumulator for streaming tool calls

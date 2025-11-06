@@ -2945,7 +2945,7 @@ async fn test_admin_list_users_with_organizations() {
 
     // Create organizations with spend limits for the mock user
     let org1 = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
-    // Small delay to ensure org1 is created before org2 (for earliest org test)
+                                                                      // Small delay to ensure org1 is created before org2 (for earliest org test)
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     let _org2 = setup_org_with_credits(&server, 20000000000i64).await; // $20.00 USD
 

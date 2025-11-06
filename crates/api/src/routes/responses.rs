@@ -32,7 +32,19 @@ fn map_response_error_to_status(error: &ServiceResponseError) -> StatusCode {
 
 impl From<ServiceResponseError> for ErrorResponse {
     fn from(error: ServiceResponseError) -> Self {
-        ErrorResponse::new(error.to_string(), "response_error".to_string())
+        match error {
+            ServiceResponseError::InvalidParams(msg) => {
+                ErrorResponse::new(msg, "invalid_request_error".to_string())
+            }
+            ServiceResponseError::InternalError(msg) => ErrorResponse::new(
+                format!("Internal server error: {msg}"),
+                "internal_server_error".to_string(),
+            ),
+            ServiceResponseError::UnknownTool(msg) => ErrorResponse::new(
+                format!("Unknown tool: {msg}"),
+                "invalid_request_error".to_string(),
+            ),
+        }
     }
 }
 

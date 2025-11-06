@@ -142,7 +142,7 @@ impl From<CompletionError> for crate::models::ErrorResponse {
             ),
             CompletionError::InternalError(msg) => ErrorResponse::new(
                 format!("Internal server error: {msg}"),
-                "internal_error".to_string(),
+                "internal_server_error".to_string(),
             ),
         }
     }
@@ -544,6 +544,7 @@ pub fn db_user_to_admin_user(user: &database::User) -> AdminUserResponse {
         created_at: user.created_at,
         last_login_at: user.last_login_at,
         is_active: user.is_active,
+        organizations: None,
     }
 }
 

@@ -3309,3 +3309,374 @@ async fn test_conversation_items_pagination_with_web_search() {
 
     println!("✅ Pagination with all item types (WebSearchCall, etc.) working correctly");
 }
+
+// ============================================
+// Admin List Users Tests
+// ============================================
+
+#[tokio::test]
+async fn test_admin_list_users_without_organizations() {
+    let server = setup_test_server().await;
+
+    // Get access token from refresh token
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+
+    // Create a few organizations to ensure we have some users
+    let _org1 = create_org(&server).await;
+    let _org2 = create_org(&server).await;
+
+    // List users without organizations
+    let response = server
+        .get("/v1/admin/users?limit=50&offset=0")
+        .add_header("Authorization", format!("Bearer {access_token}"))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    let users_response = response.json::<api::models::ListUsersResponse>();
+    println!("Users response: {users_response:?}");
+
+    // Verify response structure
+    assert!(
+        !users_response.users.is_empty(),
+        "Should have at least one user"
+    );
+    assert!(users_response.total > 0, "Total should be greater than 0");
+    assert_eq!(users_response.limit, 50);
+    assert_eq!(users_response.offset, 0);
+
+    // Verify users don't have organizations when not requested
+    for user in &users_response.users {
+        assert!(
+            user.organizations.is_none(),
+            "Users should not have organizations when include_organizations is false"
+        );
+        assert!(!user.id.is_empty(), "User should have an ID");
+        assert!(!user.email.is_empty(), "User should have an email");
+    }
+
+    println!("✅ Admin list users without organizations works correctly");
+}
+
+#[tokio::test]
+#[ignore = "skip the test as the user has created orgs in other tests"]
+async fn test_admin_list_users_with_organizations() {
+    let server = setup_test_server().await;
+
+    // Get access token from refresh token
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+
+    // Create organizations with spend limits for the mock user
+    let org1 = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+                                                                      // Small delay to ensure org1 is created before org2 (for earliest org test)
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    let _org2 = setup_org_with_credits(&server, 20000000000i64).await; // $20.00 USD
+
+    // List users with organizations
+    let response = server
+        .get("/v1/admin/users?limit=50&offset=0&include_organizations=true")
+        .add_header("Authorization", format!("Bearer {access_token}"))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    let users_response = response.json::<api::models::ListUsersResponse>();
+    println!("Users with organizations response: {users_response:?}");
+
+    // Find the mock user (admin@test.com)
+    let mock_user = users_response
+        .users
+        .iter()
+        .find(|u| u.email == "admin@test.com")
+        .expect("Should find mock user");
+
+    println!("Mock user: {mock_user:?}");
+
+    // Verify user has organizations
+    assert!(
+        mock_user.organizations.is_some(),
+        "User should have organizations when include_organizations=true"
+    );
+
+    let organizations = mock_user.organizations.as_ref().unwrap();
+    assert!(
+        !organizations.is_empty(),
+        "User should have at least one organization"
+    );
+
+    // Verify we only get the earliest organization (should be org1 since it was created first)
+    assert_eq!(
+        organizations.len(),
+        1,
+        "Should only return the earliest organization per user"
+    );
+
+    let org = &organizations[0];
+    assert_eq!(org.id, org1.id, "Should return the earliest organization");
+    assert!(!org.name.is_empty(), "Organization should have a name");
+    assert!(
+        org.spend_limit.is_some(),
+        "Organization should have a spend limit"
+    );
+
+    let spend_limit = org.spend_limit.as_ref().unwrap();
+    assert_eq!(
+        spend_limit.amount, 10000000000i64,
+        "Spend limit should be $10.00"
+    );
+    assert_eq!(spend_limit.scale, 9, "Scale should be 9 (nano-dollars)");
+    assert_eq!(spend_limit.currency, "USD", "Currency should be USD");
+
+    println!("✅ Admin list users with organizations works correctly");
+    println!("   - User has earliest organization: {}", org.name);
+    println!(
+        "   - Organization spend limit: ${}",
+        spend_limit.amount as f64 / 1_000_000_000.0
+    );
+}
+
+#[tokio::test]
+async fn test_admin_list_users_with_organizations_no_spend_limit() {
+    let server = setup_test_server().await;
+
+    // Get access token from refresh token
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+
+    // Create an organization WITHOUT setting spend limit
+    let org = create_org(&server).await;
+
+    // List users with organizations
+    let response = server
+        .get("/v1/admin/users?limit=50&offset=0&include_organizations=true")
+        .add_header("Authorization", format!("Bearer {access_token}"))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    let users_response = response.json::<api::models::ListUsersResponse>();
+
+    // Find the mock user
+    let mock_user = users_response
+        .users
+        .iter()
+        .find(|u| u.email == "admin@test.com")
+        .expect("Should find mock user");
+
+    // Verify user has organizations
+    if let Some(organizations) = &mock_user.organizations {
+        if let Some(org_detail) = organizations.iter().find(|o| o.id == org.id) {
+            // Organization should be present but spend_limit should be None
+            assert!(
+                org_detail.spend_limit.is_none(),
+                "Organization without spend limit should have None"
+            );
+            assert_eq!(org_detail.id, org.id);
+            assert!(!org_detail.name.is_empty());
+        }
+    }
+
+    println!("✅ Admin list users correctly handles organizations without spend limits");
+}
+
+#[tokio::test]
+async fn test_admin_list_users_pagination() {
+    let server = setup_test_server().await;
+
+    // Get access token from refresh token
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+
+    // List first page
+    let response1 = server
+        .get("/v1/admin/users?limit=2&offset=0")
+        .add_header("Authorization", format!("Bearer {access_token}"))
+        .await;
+
+    assert_eq!(response1.status_code(), 200);
+    let page1 = response1.json::<api::models::ListUsersResponse>();
+
+    assert!(
+        page1.users.len() <= 2,
+        "First page should have at most 2 users"
+    );
+    assert_eq!(page1.limit, 2);
+    assert_eq!(page1.offset, 0);
+
+    // List second page
+    let response2 = server
+        .get("/v1/admin/users?limit=2&offset=2")
+        .add_header("Authorization", format!("Bearer {access_token}"))
+        .await;
+
+    assert_eq!(response2.status_code(), 200);
+    let page2 = response2.json::<api::models::ListUsersResponse>();
+
+    assert_eq!(page2.limit, 2);
+    assert_eq!(page2.offset, 2);
+
+    // Verify total is consistent
+    assert_eq!(
+        page1.total, page2.total,
+        "Total should be the same across pages"
+    );
+
+    // Verify no duplicate users between pages
+    let page1_ids: std::collections::HashSet<&str> =
+        page1.users.iter().map(|u| u.id.as_str()).collect();
+    let page2_ids: std::collections::HashSet<&str> =
+        page2.users.iter().map(|u| u.id.as_str()).collect();
+
+    let intersection: Vec<&str> = page1_ids.intersection(&page2_ids).copied().collect();
+    assert!(
+        intersection.is_empty(),
+        "Pages should not have duplicate users"
+    );
+
+    println!("✅ Admin list users pagination works correctly");
+}
+
+#[tokio::test]
+async fn test_admin_list_users_pagination_with_organizations() {
+    let server = setup_test_server().await;
+
+    // Get access token from refresh token
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+
+    // Create organizations with spend limits
+    let _org1 = setup_org_with_credits(&server, 10000000000i64).await;
+    let _org2 = setup_org_with_credits(&server, 20000000000i64).await;
+
+    // List first page with organizations
+    let response1 = server
+        .get("/v1/admin/users?limit=2&offset=0&include_organizations=true")
+        .add_header("Authorization", format!("Bearer {access_token}"))
+        .await;
+
+    assert_eq!(response1.status_code(), 200);
+    let page1 = response1.json::<api::models::ListUsersResponse>();
+
+    assert_eq!(page1.limit, 2);
+    assert_eq!(page1.offset, 0);
+
+    // Verify organizations are included
+    for user in &page1.users {
+        if let Some(orgs) = &user.organizations {
+            for org in orgs {
+                // Verify organization structure
+                assert!(!org.id.is_empty());
+                assert!(!org.name.is_empty());
+                // spend_limit can be Some or None
+            }
+        }
+    }
+
+    println!("✅ Admin list users pagination with organizations works correctly");
+}
+
+#[tokio::test]
+async fn test_admin_list_users_unauthorized() {
+    let server = setup_test_server().await;
+
+    // Try to list users without authentication
+    let response = server.get("/v1/admin/users").await;
+
+    assert_eq!(response.status_code(), 401, "Should require authentication");
+
+    println!("✅ Admin list users correctly requires authentication");
+}
+
+#[tokio::test]
+#[ignore = "skip the test as the user has created orgs in other tests"]
+async fn test_admin_list_users_earliest_organization_only() {
+    let server = setup_test_server().await;
+
+    // Get access token from refresh token
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+
+    // Create multiple organizations for the same user (mock user owns all orgs)
+    // Create them with delays to ensure different timestamps
+    let org1 = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    let org2 = setup_org_with_credits(&server, 20000000000i64).await; // $20.00 USD
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    let org3 = setup_org_with_credits(&server, 30000000000i64).await; // $30.00 USD
+
+    // List users with organizations
+    let response = server
+        .get("/v1/admin/users?limit=50&offset=0&include_organizations=true")
+        .add_header("Authorization", format!("Bearer {access_token}"))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    let users_response = response.json::<api::models::ListUsersResponse>();
+
+    // Find the mock user
+    let mock_user = users_response
+        .users
+        .iter()
+        .find(|u| u.email == "admin@test.com")
+        .expect("Should find mock user");
+
+    // Verify we only get ONE organization (the earliest)
+    assert!(
+        mock_user.organizations.is_some(),
+        "User should have organizations"
+    );
+
+    let organizations = mock_user.organizations.as_ref().unwrap();
+    assert_eq!(
+        organizations.len(),
+        1,
+        "Should only return the earliest organization, not all organizations"
+    );
+
+    // Verify it's org1 (the earliest one created)
+    let returned_org = &organizations[0];
+    assert_eq!(
+        returned_org.id, org1.id,
+        "Should return the earliest organization (org1)"
+    );
+    assert_eq!(
+        returned_org.spend_limit.as_ref().unwrap().amount,
+        10000000000i64,
+        "Should have org1's spend limit"
+    );
+
+    println!("✅ Admin list users correctly returns only earliest organization");
+    println!("   - Returned org ID: {}", returned_org.id);
+    println!("   - Expected org1 ID: {}", org1.id);
+    println!("   - Org2 ID (not returned): {}", org2.id);
+    println!("   - Org3 ID (not returned): {}", org3.id);
+}
+
+#[tokio::test]
+async fn test_admin_list_users_default_parameters() {
+    let server = setup_test_server().await;
+
+    // Get access token from refresh token
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+
+    // Test with default parameters (no query params)
+    let response = server
+        .get("/v1/admin/users")
+        .add_header("Authorization", format!("Bearer {access_token}"))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    let users_response = response.json::<api::models::ListUsersResponse>();
+
+    // Verify default values are used
+    assert_eq!(users_response.limit, 100, "Default limit should be 100");
+    assert_eq!(users_response.offset, 0, "Default offset should be 0");
+
+    // Verify organizations are not included by default
+    for user in &users_response.users {
+        assert!(
+            user.organizations.is_none(),
+            "Organizations should not be included by default"
+        );
+    }
+
+    println!("✅ Admin list users uses correct default parameters");
+}

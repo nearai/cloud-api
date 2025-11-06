@@ -50,7 +50,7 @@ impl ResponseStreamContext {
 
 /// Helper for emitting stream events
 pub struct EventEmitter {
-    tx: UnboundedSender<models::ResponseStreamEvent>,
+    pub(crate) tx: UnboundedSender<models::ResponseStreamEvent>,
 }
 
 impl EventEmitter {
@@ -79,6 +79,7 @@ impl EventEmitter {
             obfuscation: None,
             annotation_index: None,
             annotation: None,
+            conversation_title: None,
         };
         self.send(event).await
     }
@@ -104,6 +105,7 @@ impl EventEmitter {
             obfuscation: None,
             annotation_index: None,
             annotation: None,
+            conversation_title: None,
         };
         self.send(event).await
     }
@@ -129,6 +131,7 @@ impl EventEmitter {
             obfuscation: None,
             annotation_index: None,
             annotation: None,
+            conversation_title: None,
         };
         self.send(event).await
     }
@@ -155,6 +158,7 @@ impl EventEmitter {
             obfuscation: None,
             annotation_index: None,
             annotation: None,
+            conversation_title: None,
         };
         self.send(event).await
     }
@@ -181,6 +185,7 @@ impl EventEmitter {
             obfuscation: None,
             annotation_index: None,
             annotation: None,
+            conversation_title: None,
         };
         self.send(event).await
     }
@@ -207,6 +212,7 @@ impl EventEmitter {
             obfuscation: None,
             annotation_index: None,
             annotation: None,
+            conversation_title: None,
         };
         self.send(event).await
     }
@@ -233,6 +239,7 @@ impl EventEmitter {
             obfuscation: None,
             annotation_index: None,
             annotation: None,
+            conversation_title: None,
         };
         self.send(event).await
     }
@@ -259,6 +266,7 @@ impl EventEmitter {
             obfuscation: None,
             annotation_index: None,
             annotation: None,
+            conversation_title: None,
         };
         self.send(event).await
     }
@@ -285,6 +293,7 @@ impl EventEmitter {
             obfuscation: None,
             annotation_index: None,
             annotation: None,
+            conversation_title: None,
         };
         self.send(event).await
     }

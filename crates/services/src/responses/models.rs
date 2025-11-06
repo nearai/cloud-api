@@ -498,6 +498,8 @@ pub struct ResponseStreamEvent {
     pub annotation_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotation: Option<TextAnnotation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_title: Option<String>,
 }
 
 /// Input item list for responses

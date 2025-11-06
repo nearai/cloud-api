@@ -107,6 +107,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                     obfuscation: None,
                     annotation_index: None,
                     annotation: None,
+                    conversation_title: None,
                 };
                 let _ = tx.send(error_event).await;
             }
@@ -448,6 +449,19 @@ impl ResponseServiceImpl {
             .emit_in_progress(&mut ctx, initial_response.clone())
             .await?;
 
+        // Spawn background task to generate conversation title if needed
+        let title_task_handle = Self::maybe_generate_conversation_title(
+            conversation_id.clone(),
+            &request,
+            user_id.clone(),
+            api_key_id.clone(),
+            organization_id,
+            workspace_id,
+            conversation_service.clone(),
+            completion_service.clone(),
+            emitter.tx.clone(),
+        );
+
         let tools = Self::prepare_tools(&request);
         let tool_choice = Self::prepare_tool_choice(&request);
 
@@ -503,6 +517,25 @@ impl ResponseServiceImpl {
             .collect();
 
         final_response.output = output_items;
+
+        // Wait for title generation with a timeout (2 seconds)
+        // This ensures the title event is sent before response.completed
+        if let Some(handle) = title_task_handle {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await {
+                Ok(Ok(Ok(()))) => {
+                    tracing::debug!("Title generation completed before response");
+                }
+                Ok(Ok(Err(e))) => {
+                    tracing::warn!("Title generation failed: {:?}", e);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Title generation task panicked: {:?}", e);
+                }
+                Err(_) => {
+                    tracing::debug!("Title generation timed out, continuing with response");
+                }
+            }
+        }
 
         // Event: response.completed
         emitter.emit_completed(&mut ctx, final_response).await?;
@@ -785,6 +818,7 @@ impl ResponseServiceImpl {
             obfuscation: None,
             annotation_index: None,
             annotation: None,
+            conversation_title: None,
         };
 
         emitter.send_raw(event).await
@@ -1510,5 +1544,225 @@ impl ResponseServiceImpl {
                 tool_call.tool_type.clone(),
             )),
         }
+    }
+
+    /// Check if conversation needs title generation and spawn background task if needed
+    /// Returns a JoinHandle that can be awaited to ensure title generation completes before response finishes
+    fn maybe_generate_conversation_title(
+        conversation_id: Option<ConversationId>,
+        request: &models::CreateResponseRequest,
+        user_id: crate::UserId,
+        api_key_id: String,
+        organization_id: uuid::Uuid,
+        workspace_id: uuid::Uuid,
+        conversation_service: Arc<dyn ConversationServiceTrait>,
+        completion_service: Arc<dyn CompletionServiceTrait>,
+        tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
+    ) -> Option<tokio::task::JoinHandle<Result<(), errors::ResponseError>>> {
+        let model = request.model.clone();
+        // Only proceed if we have a conversation_id
+        let conv_id = match conversation_id {
+            Some(id) => id,
+            None => return None,
+        };
+
+        // Extract first user message from request
+        let user_message = match &request.input {
+            Some(models::ResponseInput::Text(text)) => text.clone(),
+            Some(models::ResponseInput::Items(items)) => {
+                // Find first user message
+                items
+                    .iter()
+                    .find(|item| item.role == "user")
+                    .and_then(|item| match &item.content {
+                        models::ResponseContent::Text(text) => Some(text.clone()),
+                        models::ResponseContent::Parts(parts) => {
+                            // Extract text from parts
+                            let text = parts
+                                .iter()
+                                .filter_map(|part| match part {
+                                    models::ResponseContentPart::InputText { text } => {
+                                        Some(text.clone())
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            if text.is_empty() {
+                                None
+                            } else {
+                                Some(text)
+                            }
+                        }
+                    })
+                    .unwrap_or_default()
+            }
+            None => return None,
+        };
+
+        if user_message.is_empty() {
+            return None;
+        }
+
+        // Spawn background task to check and generate title
+        let handle = tokio::spawn(async move {
+            Self::generate_and_update_title(
+                conv_id,
+                user_id,
+                user_message,
+                model,
+                api_key_id,
+                organization_id,
+                workspace_id,
+                conversation_service,
+                completion_service,
+                tx,
+            )
+            .await
+        });
+
+        Some(handle)
+    }
+
+    /// Generate conversation title and update metadata (background task)
+    async fn generate_and_update_title(
+        conversation_id: ConversationId,
+        user_id: crate::UserId,
+        user_message: String,
+        model: String,
+        api_key_id: String,
+        organization_id: uuid::Uuid,
+        workspace_id: uuid::Uuid,
+        conversation_service: Arc<dyn ConversationServiceTrait>,
+        completion_service: Arc<dyn CompletionServiceTrait>,
+        mut tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
+    ) -> Result<(), errors::ResponseError> {
+        // Get conversation to check if it already has a title
+        let conversation = conversation_service
+            .get_conversation(conversation_id.clone(), user_id.clone())
+            .await
+            .map_err(|e| {
+                errors::ResponseError::InternalError(format!("Failed to get conversation: {}", e))
+            })?;
+
+        let conversation = match conversation {
+            Some(c) => c,
+            None => {
+                tracing::debug!("Conversation not found, skipping title generation");
+                return Ok(());
+            }
+        };
+
+        // Check if conversation already has a title
+        if let Some(title) = conversation.metadata.get("title") {
+            if !title.is_null() && title.as_str().is_some() {
+                tracing::debug!("Conversation already has a title, skipping generation");
+                return Ok(());
+            }
+        }
+
+        // Truncate user message for title generation (max 500 chars for context)
+        let truncated_message = if user_message.len() > 500 {
+            format!("{}...", &user_message[..500])
+        } else {
+            user_message.clone()
+        };
+
+        // Create prompt for title generation
+        let title_prompt = format!(
+            "Generate a short, descriptive title (maximum 60 characters) for a conversation that starts with this message. \
+            Only respond with the title, nothing else.\n\nMessage: {}",
+            truncated_message
+        );
+
+        // Generate title using completion service
+        let completion_request = crate::completions::ports::CompletionRequest {
+            model, // Use the same model as the user's request
+            messages: vec![crate::completions::ports::CompletionMessage {
+                role: "user".to_string(),
+                content: title_prompt,
+            }],
+            max_tokens: Some(20), // Short response for title
+            temperature: Some(0.7),
+            top_p: None,
+            stop: None,
+            stream: Some(false),
+            user_id: user_id.clone(),
+            api_key_id, // Use the same API key as the user's request
+            organization_id,
+            workspace_id,
+            metadata: None,
+            body_hash: String::new(),
+            n: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        // Call completion service to generate title
+        let completion_result = completion_service
+            .create_chat_completion(completion_request)
+            .await
+            .map_err(|e| {
+                errors::ResponseError::InternalError(format!("Failed to generate title: {}", e))
+            })?;
+
+        // Extract title from completion result
+        let generated_title = completion_result
+            .response
+            .choices
+            .first()
+            .and_then(|choice| choice.message.content.as_ref())
+            .map(|content| content.trim().to_string())
+            .unwrap_or_else(|| "Conversation".to_string());
+
+        // Truncate to max 60 characters
+        let title = if generated_title.len() > 60 {
+            format!("{}...", &generated_title[..57])
+        } else {
+            generated_title
+        };
+
+        // Update conversation metadata with title
+        let mut updated_metadata = conversation.metadata.clone();
+        updated_metadata["title"] = serde_json::Value::String(title.clone());
+
+        conversation_service
+            .update_conversation(conversation_id.clone(), user_id.clone(), updated_metadata)
+            .await
+            .map_err(|e| {
+                errors::ResponseError::InternalError(format!(
+                    "Failed to update conversation metadata: {}",
+                    e
+                ))
+            })?;
+
+        tracing::info!(
+            "Generated title for conversation {}: {}",
+            conversation_id,
+            title
+        );
+
+        // Emit conversation.title.updated event
+        use futures::SinkExt;
+        let event = models::ResponseStreamEvent {
+            event_type: "conversation.title.updated".to_string(),
+            sequence_number: None, // No sequence number for background events
+            response: None,
+            output_index: None,
+            content_index: None,
+            item: None,
+            item_id: None,
+            part: None,
+            delta: None,
+            text: None,
+            logprobs: None,
+            obfuscation: None,
+            annotation_index: None,
+            annotation: None,
+            conversation_title: Some(title),
+        };
+
+        let _ = tx.send(event).await;
+
+        Ok(())
     }
 }

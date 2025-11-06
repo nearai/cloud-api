@@ -1433,3 +1433,11 @@ pub struct FileListResponse {
     pub last_id: Option<String>,
     pub has_more: bool,
 }
+
+/// File delete response
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct FileDeleteResponse {
+    pub id: String,
+    pub object: String, // Always "file"
+    pub deleted: bool,
+}

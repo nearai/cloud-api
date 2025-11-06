@@ -1,6 +1,6 @@
 use crate::{
     middleware::auth::AuthenticatedApiKey,
-    models::{ErrorResponse, FileListResponse, FileUploadResponse},
+    models::{ErrorResponse, FileDeleteResponse, FileListResponse, FileUploadResponse},
     routes::api::AppState,
 };
 use axum::{
@@ -455,6 +455,115 @@ pub async fn get_file(
         expires_at: file.expires_at.map(|dt| dt.timestamp()),
         filename: file.filename,
         purpose: file.purpose,
+    };
+
+    Ok(Json(response))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/files/{file_id}",
+    tag = "Files",
+    params(
+        ("file_id" = String, Path, description = "The ID of the file to delete")
+    ),
+    responses(
+        (status = 200, description = "File deleted successfully", body = FileDeleteResponse),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "File not found", body = ErrorResponse)
+    ),
+    security(("api_key" = []))
+)]
+pub async fn delete_file(
+    State(app_state): State<AppState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    axum::extract::Path(file_id): axum::extract::Path<String>,
+) -> Result<Json<FileDeleteResponse>, (StatusCode, Json<ErrorResponse>)> {
+    debug!("Delete file request: {} from workspace: {}", file_id, api_key.workspace.id.0);
+
+    // Parse file ID (remove "file-" prefix if present)
+    let id_str = file_id.strip_prefix("file-").unwrap_or(&file_id);
+    let file_uuid = uuid::Uuid::parse_str(id_str).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                format!("Invalid file ID format: {}", file_id),
+                "invalid_request_error".to_string(),
+            )),
+        )
+    })?;
+
+    // Get file from database (with workspace authorization check)
+    let file_repo = FileRepository::new(app_state.db_pool.clone());
+    let file = file_repo
+        .get_by_id_and_workspace(file_uuid, api_key.workspace.id.0)
+        .await
+        .map_err(|e| {
+            error!("Failed to retrieve file for deletion: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    format!("Failed to retrieve file: {}", e),
+                    "internal_error".to_string(),
+                )),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse::new(
+                    format!("File not found: {}", file_id),
+                    "not_found_error".to_string(),
+                )),
+            )
+        })?;
+
+    // Initialize S3 storage
+    let s3_config = aws_config::load_from_env().await;
+    let s3_client = aws_sdk_s3::Client::new(&s3_config);
+    let s3_bucket = app_state.config.s3.bucket.clone();
+    let s3_encryption_key = app_state.config.s3.encryption_key.clone();
+
+    let storage = S3Storage::new(s3_client, s3_bucket, s3_encryption_key);
+
+    // Delete file from S3
+    storage
+        .delete(&file.storage_key)
+        .await
+        .map_err(|e| {
+            error!("Failed to delete file from S3: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    format!("Failed to delete file from storage: {}", e),
+                    "internal_error".to_string(),
+                )),
+            )
+        })?;
+
+    // Delete file record from database
+    file_repo
+        .delete(file_uuid)
+        .await
+        .map_err(|e| {
+            error!("Failed to delete file record from database: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    format!("Failed to delete file record: {}", e),
+                    "internal_error".to_string(),
+                )),
+            )
+        })?;
+
+    debug!("File deleted successfully: {}", file_id);
+
+    // Build response
+    let response = FileDeleteResponse {
+        id: format!("file-{}", file_uuid),
+        object: "file".to_string(),
+        deleted: true,
     };
 
     Ok(Json(response))

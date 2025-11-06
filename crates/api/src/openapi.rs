@@ -92,6 +92,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::files::upload_file,
         crate::routes::files::list_files,
         crate::routes::files::get_file,
+        crate::routes::files::delete_file,
     ),
     components(
         schemas(
@@ -158,8 +159,8 @@ use utoipa::{Modify, OpenApi};
             crate::routes::usage::OrganizationBalanceResponse,
             crate::routes::usage::UsageHistoryResponse,
             crate::routes::usage::UsageHistoryEntryResponse,
-            // File upload models
-            FileUploadResponse, ExpiresAfter, FileListResponse,
+            // File models
+            FileUploadResponse, ExpiresAfter, FileListResponse, FileDeleteResponse,
         ),
     ),
     modifiers(&SecurityAddon)

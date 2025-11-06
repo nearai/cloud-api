@@ -673,7 +673,7 @@ pub fn build_files_routes(app_state: AppState, auth_state_middleware: &AuthState
 
     Router::new()
         .route("/files", post(upload_file).get(list_files))
-        .route("/files/:file_id", get(get_file))
+        .route("/files/:file_id", get(get_file).delete(delete_file))
         .with_state(app_state)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),

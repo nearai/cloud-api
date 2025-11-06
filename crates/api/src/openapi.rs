@@ -90,6 +90,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::usage::get_api_key_usage_history,
         // Files endpoints
         crate::routes::files::upload_file,
+        crate::routes::files::list_files,
     ),
     components(
         schemas(
@@ -157,7 +158,7 @@ use utoipa::{Modify, OpenApi};
             crate::routes::usage::UsageHistoryResponse,
             crate::routes::usage::UsageHistoryEntryResponse,
             // File upload models
-            FileUploadResponse, ExpiresAfter,
+            FileUploadResponse, ExpiresAfter, FileListResponse,
         ),
     ),
     modifiers(&SecurityAddon)

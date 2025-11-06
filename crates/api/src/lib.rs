@@ -672,7 +672,7 @@ pub fn build_files_routes(app_state: AppState, auth_state_middleware: &AuthState
     use crate::routes::files::*;
 
     Router::new()
-        .route("/files", post(upload_file))
+        .route("/files", post(upload_file).get(list_files))
         .with_state(app_state)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
@@ -985,6 +985,12 @@ mod tests {
                 refresh_interval: 30,
                 mock: false,
             },
+            s3: config::S3Config {
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(), // Mock 256-bit hex key
+            },
         };
 
         // Initialize services
@@ -1068,6 +1074,12 @@ mod tests {
                 tls_ca_cert_path: None,
                 refresh_interval: 30,
                 mock: false,
+            },
+            s3: config::S3Config {
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(), // Mock 256-bit hex key
             },
         };
 

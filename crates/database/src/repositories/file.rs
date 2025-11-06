@@ -191,6 +191,93 @@ impl FileRepository {
             .collect()
     }
 
+    /// List files with cursor-based pagination
+    pub async fn list_with_pagination(
+        &self,
+        workspace_id: Uuid,
+        after: Option<Uuid>,
+        limit: i64,
+        order: &str,
+        purpose: Option<String>,
+    ) -> Result<Vec<File>, RepositoryError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
+
+        let order_clause = if order == "asc" { "ASC" } else { "DESC" };
+        let comparison = if order == "asc" { ">" } else { "<" };
+
+        let rows = match (after, purpose) {
+            (Some(after_id), Some(purpose_str)) => {
+                // With cursor and purpose filter
+                let query = format!(
+                    "SELECT f.* FROM files f
+                     WHERE f.workspace_id = $1
+                     AND f.purpose = $2
+                     AND f.created_at {} (SELECT created_at FROM files WHERE id = $3)
+                     ORDER BY f.created_at {}
+                     LIMIT $4",
+                    comparison, order_clause
+                );
+                client
+                    .query(&query, &[&workspace_id, &purpose_str, &after_id, &limit])
+                    .await
+            }
+            (Some(after_id), None) => {
+                // With cursor, no purpose filter
+                let query = format!(
+                    "SELECT f.* FROM files f
+                     WHERE f.workspace_id = $1
+                     AND f.created_at {} (SELECT created_at FROM files WHERE id = $2)
+                     ORDER BY f.created_at {}
+                     LIMIT $3",
+                    comparison, order_clause
+                );
+                client
+                    .query(&query, &[&workspace_id, &after_id, &limit])
+                    .await
+            }
+            (None, Some(purpose_str)) => {
+                // No cursor, with purpose filter
+                let query = format!(
+                    "SELECT * FROM files
+                     WHERE workspace_id = $1
+                     AND purpose = $2
+                     ORDER BY created_at {}
+                     LIMIT $3",
+                    order_clause
+                );
+                client
+                    .query(&query, &[&workspace_id, &purpose_str, &limit])
+                    .await
+            }
+            (None, None) => {
+                // No cursor, no purpose filter
+                let query = format!(
+                    "SELECT * FROM files
+                     WHERE workspace_id = $1
+                     ORDER BY created_at {}
+                     LIMIT $2",
+                    order_clause
+                );
+                client
+                    .query(&query, &[&workspace_id, &limit])
+                    .await
+            }
+        }
+        .map_err(map_db_error)?;
+
+        rows.into_iter()
+            .map(|row| {
+                self.row_to_file(row)
+                    .map_err(RepositoryError::DataConversionError)
+            })
+            .collect()
+    }
+
     /// Delete a file record
     pub async fn delete(&self, id: Uuid) -> Result<bool, RepositoryError> {
         let client = self

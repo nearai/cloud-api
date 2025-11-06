@@ -1,6 +1,6 @@
 use crate::{
     middleware::auth::AuthenticatedApiKey,
-    models::{ErrorResponse, FileUploadResponse},
+    models::{ErrorResponse, FileListResponse, FileUploadResponse},
     routes::api::AppState,
 };
 use axum::{
@@ -273,4 +273,116 @@ pub async fn upload_file(
     };
 
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/files",
+    tag = "Files",
+    params(
+        ("after" = Option<String>, Query, description = "A cursor for pagination. Pass the file ID to fetch files after this one."),
+        ("limit" = Option<i64>, Query, description = "Number of files to return (1-10000, default 10000)"),
+        ("order" = Option<String>, Query, description = "Sort order by created_at timestamp: 'asc' or 'desc' (default 'desc')"),
+        ("purpose" = Option<String>, Query, description = "Filter files by purpose")
+    ),
+    responses(
+        (status = 200, description = "List of files retrieved successfully", body = FileListResponse),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse)
+    ),
+    security(("api_key" = []))
+)]
+pub async fn list_files(
+    State(app_state): State<AppState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<crate::models::FileListResponse>, (StatusCode, Json<ErrorResponse>)> {
+    debug!("List files request from workspace: {}", api_key.workspace.id.0);
+
+    // Parse query parameters
+    let after = params.get("after").and_then(|s| {
+        // Remove "file-" prefix if present
+        let id_str = s.strip_prefix("file-").unwrap_or(s);
+        uuid::Uuid::parse_str(id_str).ok()
+    });
+
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(10000)
+        .clamp(1, 10000);
+
+    let order = params
+        .get("order")
+        .map(|s| s.as_str())
+        .unwrap_or("desc");
+
+    if order != "asc" && order != "desc" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "Invalid order parameter. Must be 'asc' or 'desc'".to_string(),
+                "invalid_request_error".to_string(),
+            )),
+        ));
+    }
+
+    let purpose = params.get("purpose").map(|s| s.to_string());
+
+    // Validate purpose if provided
+    if let Some(ref p) = purpose {
+        services::files::validate_purpose(p).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(e.to_string(), "invalid_request_error".to_string())),
+            )
+        })?;
+    }
+
+    // Query files from database
+    let file_repo = FileRepository::new(app_state.db_pool.clone());
+    let files = file_repo
+        .list_with_pagination(api_key.workspace.id.0, after, limit + 1, order, purpose)
+        .await
+        .map_err(|e| {
+            error!("Failed to list files: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    format!("Failed to list files: {}", e),
+                    "internal_error".to_string(),
+                )),
+            )
+        })?;
+
+    // Determine if there are more results
+    let has_more = files.len() > limit as usize;
+    let files_to_return: Vec<_> = files.into_iter().take(limit as usize).collect();
+
+    // Convert to response format
+    let data: Vec<crate::models::FileUploadResponse> = files_to_return
+        .iter()
+        .map(|file| crate::models::FileUploadResponse {
+            id: format!("file-{}", file.id),
+            object: "file".to_string(),
+            bytes: file.bytes,
+            created_at: file.created_at.timestamp(),
+            expires_at: file.expires_at.map(|dt| dt.timestamp()),
+            filename: file.filename.clone(),
+            purpose: file.purpose.clone(),
+        })
+        .collect();
+
+    let first_id = data.first().map(|f| f.id.clone());
+    let last_id = data.last().map(|f| f.id.clone());
+
+    let response = crate::models::FileListResponse {
+        object: "list".to_string(),
+        data,
+        first_id,
+        last_id,
+        has_more,
+    };
+
+    Ok(Json(response))
 }

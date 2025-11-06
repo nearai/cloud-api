@@ -320,6 +320,8 @@ pub enum FinishReason {
     Stop,
     Length,
     ContentFilter,
+    #[serde(alias = "function_call")]
+    ToolCalls,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

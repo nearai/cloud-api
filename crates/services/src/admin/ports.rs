@@ -102,6 +102,15 @@ pub struct UserInfo {
     pub is_active: bool,
 }
 
+/// Organization information for user listing (earliest organization with spend limit)
+#[derive(Debug, Clone)]
+pub struct UserOrganizationInfo {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub spend_limit: Option<i64>, // Amount in nano-dollars (scale 9)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
     #[error("Model not found: {0}")]
@@ -168,6 +177,13 @@ pub trait AdminRepository: Send + Sync {
 
     /// List all users with pagination (admin only)
     async fn list_users(&self, limit: i64, offset: i64) -> Result<Vec<UserInfo>, anyhow::Error>;
+
+    /// List all users with their earliest organization and spend limit (admin only)
+    async fn list_users_with_organizations(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<(UserInfo, Option<UserOrganizationInfo>)>, anyhow::Error>;
 }
 
 /// Admin service trait for managing platform configuration
@@ -208,4 +224,11 @@ pub trait AdminService: Send + Sync {
     /// List all users with pagination (admin only)
     async fn list_users(&self, limit: i64, offset: i64)
         -> Result<(Vec<UserInfo>, i64), AdminError>;
+
+    /// List all users with their earliest organization and spend limit (admin only)
+    async fn list_users_with_organizations(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64), AdminError>;
 }

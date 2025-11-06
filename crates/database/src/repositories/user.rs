@@ -205,6 +205,70 @@ impl UserRepository {
         rows.into_iter().map(|row| self.row_to_user(row)).collect()
     }
 
+    /// List all users with organizations (with pagination)
+    /// Returns the earliest organization created by each user (any role) with spend limit
+    /// Returns a tuple of (User, Option<UserOrganizationInfo>)
+    pub async fn list_with_organizations(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<(User, Option<services::admin::UserOrganizationInfo>)>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let rows = client
+            .query(
+                r#"
+            SELECT DISTINCT ON (u.id)
+                u.*,
+                o.id as organization_id,
+                o.name as organization_name,
+                o.description as organization_description,
+                olh.spend_limit as organization_spend_limit
+            FROM users u
+            LEFT JOIN organization_members om ON u.id = om.user_id
+            LEFT JOIN organizations o ON om.organization_id = o.id AND o.is_active = true
+            LEFT JOIN LATERAL (
+                SELECT spend_limit
+                FROM organization_limits_history
+                WHERE organization_id = o.id
+                  AND effective_until IS NULL
+                ORDER BY effective_from DESC
+                LIMIT 1
+            ) olh ON true
+            WHERE u.is_active = true
+            ORDER BY u.id, o.created_at ASC NULLS LAST
+            LIMIT $1
+            OFFSET $2
+            "#,
+                &[&limit, &offset],
+            )
+            .await
+            .context("Failed to list users with organizations")?;
+
+        rows.into_iter()
+            .map(|row| {
+                let user = self.row_to_user(row.clone())?;
+                let org_id: Option<Uuid> = row.get("organization_id");
+                let org_name: Option<String> = row.get("organization_name");
+                let org_description: Option<String> = row.get("organization_description");
+                let spend_limit: Option<i64> = row.get("organization_spend_limit");
+
+                let org_data = org_id.map(|id| services::admin::UserOrganizationInfo {
+                    id,
+                    name: org_name.unwrap_or_default(),
+                    description: org_description,
+                    spend_limit,
+                });
+
+                Ok((user, org_data))
+            })
+            .collect()
+    }
+
     /// Search users by username or email
     pub async fn search(&self, query: &str, limit: i64) -> Result<Vec<User>> {
         let client = self

@@ -952,6 +952,16 @@ pub struct PublicUserResponse {
     pub created_at: DateTime<Utc>,
 }
 
+/// Organization details with spend limit (for admin user listing)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminUserOrganizationDetails {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(rename = "spendLimit", skip_serializing_if = "Option::is_none")]
+    pub spend_limit: Option<SpendLimit>,
+}
+
 /// Admin user response model (for owners/admins)
 /// Contains sensitive information only visible to organization owners/admins
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -964,6 +974,8 @@ pub struct AdminUserResponse {
     pub created_at: DateTime<Utc>,
     pub last_login_at: Option<DateTime<Utc>>,
     pub is_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organizations: Option<Vec<AdminUserOrganizationDetails>>,
 }
 
 /// User response model (full user profile)
@@ -1337,7 +1349,7 @@ pub struct SpendLimitRequest {
 /// Examples:
 ///   $100.00 USD: amount=100000000000, scale=9, currency="USD"
 ///   $0.01 USD: amount=10000000, scale=9, currency="USD"
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
 pub struct SpendLimit {
     pub amount: i64,
     pub scale: i64,

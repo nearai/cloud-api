@@ -163,6 +163,24 @@ impl AdminService for AdminServiceImpl {
 
         Ok((users, total))
     }
+
+    async fn list_users_with_organizations(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64), AdminError> {
+        let users_with_orgs = self
+            .repository
+            .list_users_with_organizations(limit, offset)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+
+        // For now, return the count as the number of users retrieved
+        // In a production system, you'd want a separate count query
+        let total = users_with_orgs.len() as i64;
+
+        Ok((users_with_orgs, total))
+    }
 }
 
 impl AdminServiceImpl {

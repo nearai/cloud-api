@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use services::admin::{
     AdminRepository, ModelHistoryEntry, ModelPricing, OrganizationLimits,
     OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate, UpdateModelAdminRequest, UserInfo,
+    UserOrganizationInfo,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -203,5 +204,37 @@ impl AdminRepository for AdminCompositeRepository {
                 is_active: u.is_active,
             })
             .collect())
+    }
+
+    async fn list_users_with_organizations(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<(UserInfo, Option<UserOrganizationInfo>)>> {
+        let users_with_orgs = self
+            .user_repo
+            .list_with_organizations(limit, offset)
+            .await?;
+
+        Ok(users_with_orgs
+            .into_iter()
+            .map(|(u, org_data)| {
+                let user_info = UserInfo {
+                    id: u.id,
+                    email: u.email,
+                    username: u.username,
+                    display_name: u.display_name,
+                    avatar_url: u.avatar_url,
+                    created_at: u.created_at,
+                    last_login_at: u.last_login_at,
+                    is_active: u.is_active,
+                };
+                (user_info, org_data)
+            })
+            .collect())
+    }
+
+    async fn get_active_user_count(&self) -> Result<i64> {
+        self.user_repo.get_active_user_count().await
     }
 }

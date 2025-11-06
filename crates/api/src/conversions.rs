@@ -95,6 +95,7 @@ fn finish_reason_to_string(reason: &services::FinishReason) -> String {
         services::FinishReason::Stop => "stop".to_string(),
         services::FinishReason::Length => "length".to_string(),
         services::FinishReason::ContentFilter => "content_filter".to_string(),
+        services::FinishReason::ToolCalls => "tool_calls".to_string(),
     }
 }
 

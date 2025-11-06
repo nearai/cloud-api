@@ -412,7 +412,6 @@ impl InferenceProviderPool {
                     tracing::warn!(
                         model_id = %model_id,
                         attempt = attempt + 1,
-                        error = %error_str,
                         operation = operation_name,
                         "Provider failed, will try next provider if available"
                     );

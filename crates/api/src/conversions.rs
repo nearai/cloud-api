@@ -95,6 +95,7 @@ fn finish_reason_to_string(reason: &services::FinishReason) -> String {
         services::FinishReason::Stop => "stop".to_string(),
         services::FinishReason::Length => "length".to_string(),
         services::FinishReason::ContentFilter => "content_filter".to_string(),
+        services::FinishReason::ToolCalls => "tool_calls".to_string(),
     }
 }
 
@@ -539,6 +540,7 @@ pub fn db_user_to_admin_user(user: &database::User) -> AdminUserResponse {
         created_at: user.created_at,
         last_login_at: user.last_login_at,
         is_active: user.is_active,
+        organizations: None,
     }
 }
 

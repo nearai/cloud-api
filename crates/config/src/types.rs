@@ -392,10 +392,8 @@ impl S3Config {
         }
 
         Ok(Self {
-            bucket: env::var("AWS_S3_BUCKET")
-                .map_err(|_| "AWS_S3_BUCKET not set".to_string())?,
-            region: env::var("AWS_S3_REGION")
-                .map_err(|_| "AWS_S3_REGION not set".to_string())?,
+            bucket: env::var("AWS_S3_BUCKET").map_err(|_| "AWS_S3_BUCKET not set".to_string())?,
+            region: env::var("AWS_S3_REGION").map_err(|_| "AWS_S3_REGION not set".to_string())?,
             encryption_key,
         })
     }

@@ -23,9 +23,8 @@ pub enum EncryptionError {
 /// The nonce is prepended to the ciphertext for later decryption
 pub fn encrypt(data: &[u8], key: &str) -> Result<Vec<u8>, EncryptionError> {
     // Decode the key from hex string
-    let key_bytes = hex::decode(key).map_err(|e| {
-        EncryptionError::EncryptionFailed(format!("Invalid hex key: {}", e))
-    })?;
+    let key_bytes = hex::decode(key)
+        .map_err(|e| EncryptionError::EncryptionFailed(format!("Invalid hex key: {}", e)))?;
 
     if key_bytes.len() != 32 {
         return Err(EncryptionError::InvalidKeyLength(key_bytes.len()));
@@ -42,9 +41,9 @@ pub fn encrypt(data: &[u8], key: &str) -> Result<Vec<u8>, EncryptionError> {
     let nonce = Nonce::from(nonce_bytes);
 
     // Encrypt the data
-    let ciphertext = cipher.encrypt(&nonce, data).map_err(|e| {
-        EncryptionError::EncryptionFailed(format!("Encryption failed: {}", e))
-    })?;
+    let ciphertext = cipher
+        .encrypt(&nonce, data)
+        .map_err(|e| EncryptionError::EncryptionFailed(format!("Encryption failed: {}", e)))?;
 
     // Prepend nonce to ciphertext
     let mut result = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
@@ -58,9 +57,8 @@ pub fn encrypt(data: &[u8], key: &str) -> Result<Vec<u8>, EncryptionError> {
 /// Expects the nonce to be prepended to the ciphertext
 pub fn decrypt(encrypted_data: &[u8], key: &str) -> Result<Vec<u8>, EncryptionError> {
     // Decode the key from hex string
-    let key_bytes = hex::decode(key).map_err(|e| {
-        EncryptionError::DecryptionFailed(format!("Invalid hex key: {}", e))
-    })?;
+    let key_bytes = hex::decode(key)
+        .map_err(|e| EncryptionError::DecryptionFailed(format!("Invalid hex key: {}", e)))?;
 
     if key_bytes.len() != 32 {
         return Err(EncryptionError::InvalidKeyLength(key_bytes.len()));
@@ -73,9 +71,10 @@ pub fn decrypt(encrypted_data: &[u8], key: &str) -> Result<Vec<u8>, EncryptionEr
 
     // Extract nonce and ciphertext
     let (nonce_bytes, ciphertext) = encrypted_data.split_at(NONCE_SIZE);
-    let nonce = Nonce::from(*<&[u8; NONCE_SIZE]>::try_from(nonce_bytes).map_err(|_| {
-        EncryptionError::InvalidCiphertext
-    })?);
+    let nonce = Nonce::from(
+        *<&[u8; NONCE_SIZE]>::try_from(nonce_bytes)
+            .map_err(|_| EncryptionError::InvalidCiphertext)?,
+    );
 
     // Create cipher instance
     let cipher = Aes256Gcm::new_from_slice(&key_bytes).map_err(|e| {
@@ -83,9 +82,9 @@ pub fn decrypt(encrypted_data: &[u8], key: &str) -> Result<Vec<u8>, EncryptionEr
     })?;
 
     // Decrypt the data
-    let plaintext = cipher.decrypt(&nonce, ciphertext).map_err(|e| {
-        EncryptionError::DecryptionFailed(format!("Decryption failed: {}", e))
-    })?;
+    let plaintext = cipher
+        .decrypt(&nonce, ciphertext)
+        .map_err(|e| EncryptionError::DecryptionFailed(format!("Decryption failed: {}", e)))?;
 
     Ok(plaintext)
 }

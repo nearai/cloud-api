@@ -1,5 +1,5 @@
 use super::{encryption, FileServiceError};
-use aws_sdk_s3::{Client as S3Client, primitives::ByteStream};
+use aws_sdk_s3::{primitives::ByteStream, Client as S3Client};
 use tracing::{debug, error};
 
 #[derive(Clone)]
@@ -25,11 +25,18 @@ impl S3Storage {
         data: Vec<u8>,
         content_type: &str,
     ) -> Result<(), FileServiceError> {
-        debug!("Encrypting and uploading file to S3: bucket={}, key={}", self.bucket, key);
+        debug!(
+            "Encrypting and uploading file to S3: bucket={}, key={}",
+            self.bucket, key
+        );
 
         // Encrypt the data before uploading
         let encrypted_data = encryption::encrypt(&data, &self.encryption_key)?;
-        debug!("File encrypted: original_size={}, encrypted_size={}", data.len(), encrypted_data.len());
+        debug!(
+            "File encrypted: original_size={}, encrypted_size={}",
+            data.len(),
+            encrypted_data.len()
+        );
 
         let byte_stream = ByteStream::from(encrypted_data);
 
@@ -52,7 +59,10 @@ impl S3Storage {
 
     /// Download a file from S3 (with decryption)
     pub async fn download(&self, key: &str) -> Result<Vec<u8>, FileServiceError> {
-        debug!("Downloading file from S3: bucket={}, key={}", self.bucket, key);
+        debug!(
+            "Downloading file from S3: bucket={}, key={}",
+            self.bucket, key
+        );
 
         let response = self
             .client
@@ -77,11 +87,18 @@ impl S3Storage {
             .into_bytes()
             .to_vec();
 
-        debug!("Downloaded encrypted file from S3: {} bytes", encrypted_data.len());
+        debug!(
+            "Downloaded encrypted file from S3: {} bytes",
+            encrypted_data.len()
+        );
 
         // Decrypt the data after downloading
         let decrypted_data = encryption::decrypt(&encrypted_data, &self.encryption_key)?;
-        debug!("File decrypted: encrypted_size={}, decrypted_size={}", encrypted_data.len(), decrypted_data.len());
+        debug!(
+            "File decrypted: encrypted_size={}, decrypted_size={}",
+            encrypted_data.len(),
+            decrypted_data.len()
+        );
 
         Ok(decrypted_data)
     }

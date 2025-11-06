@@ -93,6 +93,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::files::list_files,
         crate::routes::files::get_file,
         crate::routes::files::delete_file,
+        crate::routes::files::get_file_content,
     ),
     components(
         schemas(

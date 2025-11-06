@@ -1,8 +1,14 @@
 pub mod encryption;
+pub mod ports;
 pub mod storage;
 
+pub use ports::{File, FileRepositoryTrait};
+
 use crate::common::RepositoryError;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use std::sync::Arc;
+use storage::S3Storage;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -38,7 +44,10 @@ pub const ALLOWED_MIME_TYPES: &[(&str, bool)] = &[
     ("text/x-csharp", true),
     ("text/css", true),
     ("application/msword", false),
-    ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", false),
+    (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        false,
+    ),
     ("text/x-golang", true),
     ("text/html", true),
     ("text/x-java", true),
@@ -47,7 +56,10 @@ pub const ALLOWED_MIME_TYPES: &[(&str, bool)] = &[
     ("text/markdown", true),
     ("application/pdf", false),
     ("text/x-php", true),
-    ("application/vnd.openxmlformats-officedocument.presentationml.presentation", false),
+    (
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        false,
+    ),
     ("text/x-python", true),
     ("text/x-script.python", true),
     ("text/x-ruby", true),
@@ -59,9 +71,16 @@ pub const ALLOWED_MIME_TYPES: &[(&str, bool)] = &[
 
 pub fn validate_mime_type(content_type: &str) -> Result<(), FileServiceError> {
     // Extract just the MIME type (remove charset if present)
-    let mime_type = content_type.split(';').next().unwrap_or(content_type).trim();
+    let mime_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
 
-    if ALLOWED_MIME_TYPES.iter().any(|(allowed, _)| *allowed == mime_type) {
+    if ALLOWED_MIME_TYPES
+        .iter()
+        .any(|(allowed, _)| *allowed == mime_type)
+    {
         Ok(())
     } else {
         Err(FileServiceError::InvalidFileType(content_type.to_string()))
@@ -70,7 +89,11 @@ pub fn validate_mime_type(content_type: &str) -> Result<(), FileServiceError> {
 
 pub fn validate_encoding(content_type: &str, data: &[u8]) -> Result<(), FileServiceError> {
     // Extract just the MIME type
-    let mime_type = content_type.split(';').next().unwrap_or(content_type).trim();
+    let mime_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
 
     // Check if this MIME type requires UTF encoding
     let requires_utf = ALLOWED_MIME_TYPES
@@ -128,9 +151,7 @@ pub fn calculate_expires_at(
     }
 
     match anchor {
-        "created_at" => {
-            Ok(created_at + chrono::Duration::seconds(seconds))
-        }
+        "created_at" => Ok(created_at + chrono::Duration::seconds(seconds)),
         _ => Err(FileServiceError::InvalidExpiresAfter(format!(
             "Invalid anchor: {}. Must be 'created_at'",
             anchor
@@ -147,4 +168,177 @@ pub fn validate_purpose(purpose: &str) -> Result<(), FileServiceError> {
 
 pub fn generate_storage_key(workspace_id: Uuid, file_id: Uuid, filename: &str) -> String {
     format!("{}/{}/{}", workspace_id, file_id, filename)
+}
+
+/// File service trait for managing file uploads, downloads, and metadata
+#[async_trait]
+pub trait FileServiceTrait: Send + Sync {
+    /// Upload a file to storage and create a database record
+    async fn upload_file(
+        &self,
+        filename: String,
+        file_data: Vec<u8>,
+        content_type: String,
+        purpose: String,
+        workspace_id: Uuid,
+        uploaded_by_user_id: Option<Uuid>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<File, FileServiceError>;
+
+    /// Get file metadata by ID with workspace authorization
+    async fn get_file(&self, file_id: Uuid, workspace_id: Uuid) -> Result<File, FileServiceError>;
+
+    /// Get file content (metadata and raw bytes) with workspace authorization
+    async fn get_file_content(
+        &self,
+        file_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Result<(File, Vec<u8>), FileServiceError>;
+
+    /// List files with pagination
+    async fn list_files(
+        &self,
+        workspace_id: Uuid,
+        after: Option<Uuid>,
+        limit: i64,
+        order: &str,
+        purpose: Option<String>,
+    ) -> Result<Vec<File>, FileServiceError>;
+
+    /// Delete a file from storage and database
+    async fn delete_file(
+        &self,
+        file_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Result<bool, FileServiceError>;
+}
+
+/// Implementation of the file service
+pub struct FileServiceImpl {
+    file_repository: Arc<dyn FileRepositoryTrait>,
+    storage: Arc<S3Storage>,
+}
+
+impl FileServiceImpl {
+    pub fn new(file_repository: Arc<dyn FileRepositoryTrait>, storage: Arc<S3Storage>) -> Self {
+        Self {
+            file_repository,
+            storage,
+        }
+    }
+}
+
+#[async_trait]
+impl FileServiceTrait for FileServiceImpl {
+    async fn upload_file(
+        &self,
+        filename: String,
+        file_data: Vec<u8>,
+        content_type: String,
+        purpose: String,
+        workspace_id: Uuid,
+        uploaded_by_user_id: Option<Uuid>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<File, FileServiceError> {
+        // Validate MIME type
+        validate_mime_type(&content_type)?;
+
+        // Validate encoding for text files
+        validate_encoding(&content_type, &file_data)?;
+
+        // Validate purpose
+        validate_purpose(&purpose)?;
+
+        // Generate file ID and storage key
+        let file_id = Uuid::new_v4();
+        let storage_key = generate_storage_key(workspace_id, file_id, &filename);
+
+        // Upload to storage (automatically encrypted)
+        self.storage
+            .upload(&storage_key, file_data.clone(), &content_type)
+            .await
+            .map_err(|e| FileServiceError::StorageError(e.to_string()))?;
+
+        // Create database record
+        let file = self
+            .file_repository
+            .create(
+                filename,
+                file_data.len() as i64,
+                content_type,
+                purpose,
+                storage_key,
+                workspace_id,
+                uploaded_by_user_id,
+                expires_at,
+            )
+            .await?;
+
+        Ok(file)
+    }
+
+    async fn get_file(&self, file_id: Uuid, workspace_id: Uuid) -> Result<File, FileServiceError> {
+        // Get file with workspace authorization
+        let file = self
+            .file_repository
+            .get_by_id_and_workspace(file_id, workspace_id)
+            .await?
+            .ok_or(FileServiceError::NotFound)?;
+
+        Ok(file)
+    }
+
+    async fn get_file_content(
+        &self,
+        file_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Result<(File, Vec<u8>), FileServiceError> {
+        // Get file metadata with workspace authorization
+        let file = self.get_file(file_id, workspace_id).await?;
+
+        // Download from storage (automatically decrypted)
+        let file_content = self
+            .storage
+            .download(&file.storage_key)
+            .await
+            .map_err(|e| FileServiceError::StorageError(e.to_string()))?;
+
+        Ok((file, file_content))
+    }
+
+    async fn list_files(
+        &self,
+        workspace_id: Uuid,
+        after: Option<Uuid>,
+        limit: i64,
+        order: &str,
+        purpose: Option<String>,
+    ) -> Result<Vec<File>, FileServiceError> {
+        let files = self
+            .file_repository
+            .list_with_pagination(workspace_id, after, limit, order, purpose)
+            .await?;
+
+        Ok(files)
+    }
+
+    async fn delete_file(
+        &self,
+        file_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Result<bool, FileServiceError> {
+        // Get file with workspace authorization
+        let file = self.get_file(file_id, workspace_id).await?;
+
+        // Delete from storage
+        self.storage
+            .delete(&file.storage_key)
+            .await
+            .map_err(|e| FileServiceError::StorageError(e.to_string()))?;
+
+        // Delete from database
+        let deleted = self.file_repository.delete(file_id).await?;
+
+        Ok(deleted)
+    }
 }

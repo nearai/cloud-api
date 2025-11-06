@@ -67,6 +67,7 @@ pub struct DomainServices {
     pub workspace_service: Arc<dyn services::workspace::WorkspaceServiceTrait + Send + Sync>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
+    pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
 }
 
 /// Initialize database connection and run migrations
@@ -296,6 +297,24 @@ pub async fn init_domain_services(
     let user_service = Arc::new(services::user::UserService::new(user_repo, session_repo))
         as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
 
+    // Create S3 storage and file service
+    let s3_config = aws_config::load_from_env().await;
+    let s3_client = aws_sdk_s3::Client::new(&s3_config);
+    let s3_storage = Arc::new(services::files::storage::S3Storage::new(
+        s3_client,
+        config.s3.bucket.clone(),
+        config.s3.encryption_key.clone(),
+    ));
+
+    let file_repository = Arc::new(database::repositories::FileRepository::new(
+        database.pool().clone(),
+    )) as Arc<dyn services::files::FileRepositoryTrait>;
+
+    let files_service = Arc::new(services::files::FileServiceImpl::new(
+        file_repository,
+        s3_storage,
+    )) as Arc<dyn services::files::FileServiceTrait + Send + Sync>;
+
     DomainServices {
         conversation_service,
         response_service,
@@ -308,6 +327,7 @@ pub async fn init_domain_services(
         workspace_service,
         usage_service,
         user_service,
+        files_service,
     }
 }
 
@@ -371,6 +391,7 @@ pub fn build_app_with_config(
         attestation_service: domain_services.attestation_service.clone(),
         usage_service: domain_services.usage_service.clone(),
         user_service: domain_services.user_service.clone(),
+        files_service: domain_services.files_service.clone(),
         config: config.clone(),
         db_pool: database.pool().clone(),
     };
@@ -673,7 +694,8 @@ pub fn build_files_routes(app_state: AppState, auth_state_middleware: &AuthState
 
     Router::new()
         .route("/files", post(upload_file).get(list_files))
-        .route("/files/:file_id", get(get_file).delete(delete_file))
+        .route("/files/{file_id}", get(get_file).delete(delete_file))
+        .route("/files/{file_id}/content", get(get_file_content))
         .with_state(app_state)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),

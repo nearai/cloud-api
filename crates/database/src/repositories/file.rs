@@ -1,7 +1,9 @@
-use crate::{models::File, pool::DbPool, repositories::utils::map_db_error};
+use crate::{pool::DbPool, repositories::utils::map_db_error};
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use services::common::RepositoryError;
+use services::files::{File, FileRepositoryTrait};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -263,9 +265,7 @@ impl FileRepository {
                      LIMIT $2",
                     order_clause
                 );
-                client
-                    .query(&query, &[&workspace_id, &limit])
-                    .await
+                client.query(&query, &[&workspace_id, &limit]).await
             }
         }
         .map_err(map_db_error)?;
@@ -336,5 +336,84 @@ impl FileRepository {
             created_at: row.get("created_at"),
             expires_at: row.get("expires_at"),
         })
+    }
+}
+
+#[async_trait]
+impl FileRepositoryTrait for FileRepository {
+    async fn create(
+        &self,
+        filename: String,
+        bytes: i64,
+        content_type: String,
+        purpose: String,
+        storage_key: String,
+        workspace_id: Uuid,
+        uploaded_by_user_id: Option<Uuid>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<File, RepositoryError> {
+        self.create(
+            filename,
+            bytes,
+            content_type,
+            purpose,
+            storage_key,
+            workspace_id,
+            uploaded_by_user_id,
+            expires_at,
+        )
+        .await
+    }
+
+    async fn get_by_id(&self, id: Uuid) -> Result<Option<File>, RepositoryError> {
+        self.get_by_id(id).await
+    }
+
+    async fn get_by_id_and_workspace(
+        &self,
+        id: Uuid,
+        workspace_id: Uuid,
+    ) -> Result<Option<File>, RepositoryError> {
+        self.get_by_id_and_workspace(id, workspace_id).await
+    }
+
+    async fn list_by_workspace(
+        &self,
+        workspace_id: Uuid,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<Vec<File>, RepositoryError> {
+        self.list_by_workspace(workspace_id, limit, offset).await
+    }
+
+    async fn list_by_workspace_and_purpose(
+        &self,
+        workspace_id: Uuid,
+        purpose: &str,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<Vec<File>, RepositoryError> {
+        self.list_by_workspace_and_purpose(workspace_id, purpose, limit, offset)
+            .await
+    }
+
+    async fn list_with_pagination(
+        &self,
+        workspace_id: Uuid,
+        after: Option<Uuid>,
+        limit: i64,
+        order: &str,
+        purpose: Option<String>,
+    ) -> Result<Vec<File>, RepositoryError> {
+        self.list_with_pagination(workspace_id, after, limit, order, purpose)
+            .await
+    }
+
+    async fn delete(&self, id: Uuid) -> Result<bool, RepositoryError> {
+        self.delete(id).await
+    }
+
+    async fn get_expired_files(&self) -> Result<Vec<File>, RepositoryError> {
+        self.get_expired_files().await
     }
 }

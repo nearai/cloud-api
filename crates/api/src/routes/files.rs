@@ -4,23 +4,20 @@ use crate::{
     routes::api::AppState,
 };
 use axum::{
+    body::Body,
     extract::{Multipart, State},
-    http::StatusCode,
-    response::Json,
+    http::{header, StatusCode},
+    response::{Json, Response},
     Extension,
 };
-use database::repositories::FileRepository;
-use services::files::{
-    calculate_expires_at, generate_storage_key, storage::S3Storage, validate_encoding,
-    validate_mime_type, validate_purpose,
-};
+use services::files::calculate_expires_at;
 use tracing::{debug, error};
 
 const MAX_FILE_SIZE: u64 = 512 * 1024 * 1024; // 512 MB
 
 #[utoipa::path(
     post,
-    path = "/v1/files",
+    path = "/files",
     tag = "Files",
     request_body(content_type = "multipart/form-data"),
     responses(
@@ -36,7 +33,10 @@ pub async fn upload_file(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<FileUploadResponse>), (StatusCode, Json<ErrorResponse>)> {
-    debug!("File upload request from workspace: {}", api_key.workspace.id.0);
+    debug!(
+        "File upload request from workspace: {}",
+        api_key.workspace.id.0
+    );
 
     let mut file_data: Option<Vec<u8>> = None;
     let mut filename: Option<String> = None;
@@ -168,94 +168,56 @@ pub async fn upload_file(
         )
     })?;
 
-    // Validate purpose
-    validate_purpose(&purpose).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(e.to_string(), "invalid_request_error".to_string())),
-        )
-    })?;
-
-    // Validate MIME type
-    validate_mime_type(&content_type).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(e.to_string(), "invalid_request_error".to_string())),
-        )
-    })?;
-
-    // Validate encoding for text files
-    validate_encoding(&content_type, &file_data).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(e.to_string(), "invalid_request_error".to_string())),
-        )
-    })?;
-
     // Calculate expires_at if expires_after is provided
     let created_at = chrono::Utc::now();
-    let expires_at = if let (Some(anchor), Some(seconds)) =
-        (expires_after_anchor, expires_after_seconds)
-    {
-        Some(calculate_expires_at(&anchor, seconds, created_at).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(e.to_string(), "invalid_request_error".to_string())),
+    let expires_at =
+        if let (Some(anchor), Some(seconds)) = (expires_after_anchor, expires_after_seconds) {
+            Some(
+                calculate_expires_at(&anchor, seconds, created_at).map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse::new(
+                            e.to_string(),
+                            "invalid_request_error".to_string(),
+                        )),
+                    )
+                })?,
             )
-        })?)
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
-    // Generate file ID and storage key
-    let file_id = uuid::Uuid::new_v4();
-    let storage_key = generate_storage_key(api_key.workspace.id.0, file_id, &filename);
-
-    // Initialize S3 storage
-    let s3_config = aws_config::load_from_env().await;
-    let s3_client = aws_sdk_s3::Client::new(&s3_config);
-    let s3_bucket = app_state.config.s3.bucket.clone();
-    let s3_encryption_key = app_state.config.s3.encryption_key.clone();
-
-    let storage = S3Storage::new(s3_client, s3_bucket, s3_encryption_key);
-
-    // Upload file to S3
-    storage
-        .upload(&storage_key, file_data.clone(), &content_type)
-        .await
-        .map_err(|e| {
-            error!("Failed to upload file to S3: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    format!("Failed to upload file: {}", e),
-                    "internal_error".to_string(),
-                )),
-            )
-        })?;
-
-    // Create file record in database
-    let file_repo = FileRepository::new(app_state.db_pool.clone());
-    let file = file_repo
-        .create(
-            filename.clone(),
-            file_data.len() as i64,
+    // Use file service to handle upload (includes validation, storage, and DB operations)
+    let file = app_state
+        .files_service
+        .upload_file(
+            filename,
+            file_data,
             content_type,
-            purpose.clone(),
-            storage_key,
+            purpose,
             api_key.workspace.id.0,
             Some(api_key.api_key.created_by_user_id.0),
             expires_at,
         )
         .await
         .map_err(|e| {
-            error!("Failed to create file record: {}", e);
+            error!("Failed to upload file: {}", e);
+            let (status, error_type) = match e {
+                services::files::FileServiceError::FileTooLarge(_, _) => {
+                    (StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error")
+                }
+                services::files::FileServiceError::InvalidFileType(_)
+                | services::files::FileServiceError::InvalidPurpose(_)
+                | services::files::FileServiceError::InvalidEncoding
+                | services::files::FileServiceError::MissingField(_)
+                | services::files::FileServiceError::InvalidExpiresAfter(_) => {
+                    (StatusCode::BAD_REQUEST, "invalid_request_error")
+                }
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+            };
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    format!("Failed to save file metadata: {}", e),
-                    "internal_error".to_string(),
-                )),
+                status,
+                Json(ErrorResponse::new(e.to_string(), error_type.to_string())),
             )
         })?;
 
@@ -277,7 +239,7 @@ pub async fn upload_file(
 
 #[utoipa::path(
     get,
-    path = "/v1/files",
+    path = "/files",
     tag = "Files",
     params(
         ("after" = Option<String>, Query, description = "A cursor for pagination. Pass the file ID to fetch files after this one."),
@@ -297,7 +259,10 @@ pub async fn list_files(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<crate::models::FileListResponse>, (StatusCode, Json<ErrorResponse>)> {
-    debug!("List files request from workspace: {}", api_key.workspace.id.0);
+    debug!(
+        "List files request from workspace: {}",
+        api_key.workspace.id.0
+    );
 
     // Parse query parameters
     let after = params.get("after").and_then(|s| {
@@ -312,10 +277,7 @@ pub async fn list_files(
         .unwrap_or(10000)
         .clamp(1, 10000);
 
-    let order = params
-        .get("order")
-        .map(|s| s.as_str())
-        .unwrap_or("desc");
+    let order = params.get("order").map(|s| s.as_str()).unwrap_or("desc");
 
     if order != "asc" && order != "desc" {
         return Err((
@@ -334,15 +296,19 @@ pub async fn list_files(
         services::files::validate_purpose(p).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(e.to_string(), "invalid_request_error".to_string())),
+                Json(ErrorResponse::new(
+                    e.to_string(),
+                    "invalid_request_error".to_string(),
+                )),
             )
         })?;
     }
 
     // Query files from database
-    let file_repo = FileRepository::new(app_state.db_pool.clone());
-    let files = file_repo
-        .list_with_pagination(api_key.workspace.id.0, after, limit + 1, order, purpose)
+    // Use file service to list files
+    let files = app_state
+        .files_service
+        .list_files(api_key.workspace.id.0, after, limit + 1, order, purpose)
         .await
         .map_err(|e| {
             error!("Failed to list files: {}", e);
@@ -389,7 +355,7 @@ pub async fn list_files(
 
 #[utoipa::path(
     get,
-    path = "/v1/files/{file_id}",
+    path = "/files/{file_id}",
     tag = "Files",
     params(
         ("file_id" = String, Path, description = "The ID of the file to retrieve")
@@ -407,7 +373,10 @@ pub async fn get_file(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     axum::extract::Path(file_id): axum::extract::Path<String>,
 ) -> Result<Json<FileUploadResponse>, (StatusCode, Json<ErrorResponse>)> {
-    debug!("Get file request: {} from workspace: {}", file_id, api_key.workspace.id.0);
+    debug!(
+        "Get file request: {} from workspace: {}",
+        file_id, api_key.workspace.id.0
+    );
 
     // Parse file ID (remove "file-" prefix if present)
     let id_str = file_id.strip_prefix("file-").unwrap_or(&file_id);
@@ -421,27 +390,24 @@ pub async fn get_file(
         )
     })?;
 
-    // Query file from database (with workspace authorization check)
-    let file_repo = FileRepository::new(app_state.db_pool.clone());
-    let file = file_repo
-        .get_by_id_and_workspace(file_uuid, api_key.workspace.id.0)
+    // Use file service to get file (with workspace authorization check)
+    let file = app_state
+        .files_service
+        .get_file(file_uuid, api_key.workspace.id.0)
         .await
         .map_err(|e| {
             error!("Failed to retrieve file: {}", e);
+            let (status, error_type) = match e {
+                services::files::FileServiceError::NotFound => {
+                    (StatusCode::NOT_FOUND, "not_found_error")
+                }
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+            };
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                status,
                 Json(ErrorResponse::new(
                     format!("Failed to retrieve file: {}", e),
-                    "internal_error".to_string(),
-                )),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new(
-                    format!("File not found: {}", file_id),
-                    "not_found_error".to_string(),
+                    error_type.to_string(),
                 )),
             )
         })?;
@@ -462,7 +428,7 @@ pub async fn get_file(
 
 #[utoipa::path(
     delete,
-    path = "/v1/files/{file_id}",
+    path = "/files/{file_id}",
     tag = "Files",
     params(
         ("file_id" = String, Path, description = "The ID of the file to delete")
@@ -480,7 +446,10 @@ pub async fn delete_file(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     axum::extract::Path(file_id): axum::extract::Path<String>,
 ) -> Result<Json<FileDeleteResponse>, (StatusCode, Json<ErrorResponse>)> {
-    debug!("Delete file request: {} from workspace: {}", file_id, api_key.workspace.id.0);
+    debug!(
+        "Delete file request: {} from workspace: {}",
+        file_id, api_key.workspace.id.0
+    );
 
     // Parse file ID (remove "file-" prefix if present)
     let id_str = file_id.strip_prefix("file-").unwrap_or(&file_id);
@@ -494,68 +463,37 @@ pub async fn delete_file(
         )
     })?;
 
-    // Get file from database (with workspace authorization check)
-    let file_repo = FileRepository::new(app_state.db_pool.clone());
-    let file = file_repo
-        .get_by_id_and_workspace(file_uuid, api_key.workspace.id.0)
+    // Use file service to delete file (includes workspace authorization check)
+    let deleted = app_state
+        .files_service
+        .delete_file(file_uuid, api_key.workspace.id.0)
         .await
         .map_err(|e| {
-            error!("Failed to retrieve file for deletion: {}", e);
+            error!("Failed to delete file: {}", e);
+            let (status, error_type) = match e {
+                services::files::FileServiceError::NotFound => {
+                    (StatusCode::NOT_FOUND, "not_found_error")
+                }
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+            };
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                status,
                 Json(ErrorResponse::new(
-                    format!("Failed to retrieve file: {}", e),
-                    "internal_error".to_string(),
-                )),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new(
-                    format!("File not found: {}", file_id),
-                    "not_found_error".to_string(),
+                    format!("Failed to delete file: {}", e),
+                    error_type.to_string(),
                 )),
             )
         })?;
 
-    // Initialize S3 storage
-    let s3_config = aws_config::load_from_env().await;
-    let s3_client = aws_sdk_s3::Client::new(&s3_config);
-    let s3_bucket = app_state.config.s3.bucket.clone();
-    let s3_encryption_key = app_state.config.s3.encryption_key.clone();
-
-    let storage = S3Storage::new(s3_client, s3_bucket, s3_encryption_key);
-
-    // Delete file from S3
-    storage
-        .delete(&file.storage_key)
-        .await
-        .map_err(|e| {
-            error!("Failed to delete file from S3: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    format!("Failed to delete file from storage: {}", e),
-                    "internal_error".to_string(),
-                )),
-            )
-        })?;
-
-    // Delete file record from database
-    file_repo
-        .delete(file_uuid)
-        .await
-        .map_err(|e| {
-            error!("Failed to delete file record from database: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    format!("Failed to delete file record: {}", e),
-                    "internal_error".to_string(),
-                )),
-            )
-        })?;
+    if !deleted {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                format!("File not found: {}", file_id),
+                "not_found_error".to_string(),
+            )),
+        ));
+    }
 
     debug!("File deleted successfully: {}", file_id);
 
@@ -567,4 +505,93 @@ pub async fn delete_file(
     };
 
     Ok(Json(response))
+}
+
+#[utoipa::path(
+    get,
+    path = "/files/{file_id}/content",
+    tag = "Files",
+    params(
+        ("file_id" = String, Path, description = "The ID of the file to retrieve content from")
+    ),
+    responses(
+        (status = 200, description = "File content retrieved successfully", content_type = "application/octet-stream"),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "File not found", body = ErrorResponse)
+    ),
+    security(("api_key" = []))
+)]
+pub async fn get_file_content(
+    State(app_state): State<AppState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    axum::extract::Path(file_id): axum::extract::Path<String>,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    debug!(
+        "Get file content request: {} from workspace: {}",
+        file_id, api_key.workspace.id.0
+    );
+
+    // Parse file ID (remove "file-" prefix if present)
+    let id_str = file_id.strip_prefix("file-").unwrap_or(&file_id);
+    let file_uuid = uuid::Uuid::parse_str(id_str).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                format!("Invalid file ID format: {}", file_id),
+                "invalid_request_error".to_string(),
+            )),
+        )
+    })?;
+
+    // Use file service to get file metadata and content (with workspace authorization check)
+    let (file, file_content) = app_state
+        .files_service
+        .get_file_content(file_uuid, api_key.workspace.id.0)
+        .await
+        .map_err(|e| {
+            error!("Failed to retrieve file content: {}", e);
+            let (status, error_type) = match e {
+                services::files::FileServiceError::NotFound => {
+                    (StatusCode::NOT_FOUND, "not_found_error")
+                }
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+            };
+            (
+                status,
+                Json(ErrorResponse::new(
+                    format!("Failed to retrieve file content: {}", e),
+                    error_type.to_string(),
+                )),
+            )
+        })?;
+
+    debug!(
+        "File content retrieved successfully: {} ({} bytes)",
+        file_id,
+        file_content.len()
+    );
+
+    // Build response with appropriate content-type
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, file.content_type)
+        .header(header::CONTENT_LENGTH, file_content.len())
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", file.filename),
+        )
+        .body(Body::from(file_content))
+        .map_err(|e| {
+            error!("Failed to build response: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to build response".to_string(),
+                    "internal_error".to_string(),
+                )),
+            )
+        })?;
+
+    Ok(response)
 }

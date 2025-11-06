@@ -189,6 +189,26 @@ impl UserRepository {
         self.row_to_user(row)
     }
 
+    /// Get the number of active users
+    pub async fn get_active_user_count(&self) -> Result<i64> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let row = client
+            .query_one(
+                r#"
+                SELECT COUNT(*) as count FROM users WHERE is_active = true
+                "#,
+                &[],
+            )
+            .await
+            .context("Failed to query users")?;
+        Ok(row.get::<_, i64>("count"))
+    }
+
     /// List all users (with pagination)
     pub async fn list(&self, limit: i64, offset: i64) -> Result<Vec<User>> {
         let client = self

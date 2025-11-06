@@ -233,4 +233,8 @@ impl AdminRepository for AdminCompositeRepository {
             })
             .collect())
     }
+
+    async fn get_active_user_count(&self) -> Result<i64> {
+        self.user_repo.get_active_user_count().await
+    }
 }

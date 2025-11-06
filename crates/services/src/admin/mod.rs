@@ -157,9 +157,11 @@ impl AdminService for AdminServiceImpl {
             .await
             .map_err(|e| AdminError::InternalError(e.to_string()))?;
 
-        // For now, return the count as the number of users retrieved
-        // In a production system, you'd want a separate count query
-        let total = users.len() as i64;
+        let total = self
+            .repository
+            .get_active_user_count()
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
 
         Ok((users, total))
     }
@@ -175,9 +177,11 @@ impl AdminService for AdminServiceImpl {
             .await
             .map_err(|e| AdminError::InternalError(e.to_string()))?;
 
-        // For now, return the count as the number of users retrieved
-        // In a production system, you'd want a separate count query
-        let total = users_with_orgs.len() as i64;
+        let total = self
+            .repository
+            .get_active_user_count()
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
 
         Ok((users_with_orgs, total))
     }

@@ -160,8 +160,8 @@ pub async fn batch_upsert_models(
     tag = "Admin",
     params(
         ("model_name" = String, Path, description = "Model name to get complete history for (URL-encode if it contains slashes)"),
-        ("limit" = i64, Query, description = "Maximum number of history entries to return (default: 50)"),
-        ("offset" = i64, Query, description = "Number of history entries to skip (default: 0)")
+        ("limit" = Option<i64>, Query, description = "Maximum number of history entries to return (default: 50)"),
+        ("offset" = Option<i64>, Query, description = "Number of history entries to skip (default: 0)")
     ),
     responses(
         (status = 200, description = "Model history retrieved successfully", body = ModelHistoryResponse),
@@ -373,8 +373,8 @@ pub async fn update_organization_limits(
     tag = "Admin",
     params(
         ("organization_id" = String, Path, description = "The organization's ID (as a UUID)"),
-        ("limit" = i64, Query, description = "Maximum number of history records to return (default: 50)"),
-        ("offset" = i64, Query, description = "Number of records to skip (default: 0)")
+        ("limit" = Option<i64>, Query, description = "Maximum number of history records to return (default: 50)"),
+        ("offset" = Option<i64>, Query, description = "Number of records to skip (default: 0)")
     ),
     responses(
         (status = 200, description = "Limits history retrieved successfully", body = OrgLimitsHistoryResponse),
@@ -544,8 +544,8 @@ pub async fn delete_model(
     path = "/admin/users",
     tag = "Admin",
     params(
-        ("limit" = i64, Query, description = "Maximum number of users to return (default: 50)"),
-        ("offset" = i64, Query, description = "Number of users to skip (default: 0)"),
+        ("limit" = Option<i64>, Query, description = "Maximum number of users to return (default: 50)"),
+        ("offset" = Option<i64>, Query, description = "Number of users to skip (default: 0)"),
         ("include_organizations" = Option<bool>, Query, description = "Whether to include organization information and spend limits for the first organization owned by each user (default: false)")
     ),
     responses(

@@ -184,6 +184,9 @@ pub trait AdminRepository: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<(UserInfo, Option<UserOrganizationInfo>)>, anyhow::Error>;
+
+    /// Get the count of active users (admin only)
+    async fn get_active_user_count(&self) -> Result<i64, anyhow::Error>;
 }
 
 /// Admin service trait for managing platform configuration

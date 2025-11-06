@@ -199,6 +199,9 @@ impl ResponseServiceImpl {
                             .await?;
                     }
 
+                    // Extract usage from the final chunk
+                    Self::extract_and_accumulate_usage(&sse_event, ctx);
+
                     // Accumulate tool call fragments
                     Self::accumulate_tool_calls(&sse_event, &mut tool_call_accumulator);
                 }
@@ -517,6 +520,15 @@ impl ResponseServiceImpl {
             .collect();
 
         final_response.output = output_items;
+
+        // Set usage from accumulated token counts
+        final_response.usage = models::Usage::new(ctx.total_input_tokens, ctx.total_output_tokens);
+        tracing::debug!(
+            "Final response usage: input={}, output={}, total={}",
+            ctx.total_input_tokens,
+            ctx.total_output_tokens,
+            ctx.total_input_tokens + ctx.total_output_tokens
+        );
 
         // Wait for title generation with a timeout (2 seconds)
         // This ensures the title event is sent before response.completed
@@ -1332,6 +1344,29 @@ impl ResponseServiceImpl {
                 None
             }
             _ => None,
+        }
+    }
+
+    /// Extract and accumulate usage information from SSE event
+    /// Usage typically comes in the final chunk from the provider
+    fn extract_and_accumulate_usage(
+        event: &inference_providers::SSEEvent,
+        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
+    ) {
+        use inference_providers::StreamChunk;
+
+        match &event.chunk {
+            StreamChunk::Chat(chat_chunk) => {
+                if let Some(usage) = &chat_chunk.usage {
+                    tracing::debug!(
+                        "Extracted usage from completion stream: input={}, output={}",
+                        usage.prompt_tokens,
+                        usage.completion_tokens
+                    );
+                    ctx.add_usage(usage.prompt_tokens, usage.completion_tokens);
+                }
+            }
+            _ => {}
         }
     }
 

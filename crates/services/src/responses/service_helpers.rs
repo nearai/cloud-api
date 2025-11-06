@@ -18,6 +18,9 @@ pub struct ResponseStreamContext {
     pub conversation_id: Option<ConversationId>,
     pub sequence_number: u64,
     pub output_item_index: usize,
+    /// Accumulated token usage from all completion calls
+    pub total_input_tokens: i32,
+    pub total_output_tokens: i32,
 }
 
 impl ResponseStreamContext {
@@ -32,6 +35,8 @@ impl ResponseStreamContext {
             conversation_id,
             sequence_number: 0,
             output_item_index: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
         }
     }
 
@@ -45,6 +50,12 @@ impl ResponseStreamContext {
     /// Increment output item index
     pub fn next_output_index(&mut self) {
         self.output_item_index += 1;
+    }
+
+    /// Add usage from a completion call
+    pub fn add_usage(&mut self, input_tokens: i32, output_tokens: i32) {
+        self.total_input_tokens += input_tokens;
+        self.total_output_tokens += output_tokens;
     }
 }
 

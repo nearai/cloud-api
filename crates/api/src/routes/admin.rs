@@ -570,7 +570,7 @@ pub async fn list_users(
     );
 
     let (user_responses, total) = if params.include_organizations {
-        // Use SQL query to fetch users with their earliest organization and spend limit
+        // Fetch users with their default organization and spend limit
         let (users_with_orgs, total) = app_state
             .admin_service
             .list_users_with_organizations(params.limit, params.offset)
@@ -624,7 +624,7 @@ pub async fn list_users(
 
         (responses, total)
     } else {
-        // Simple mapping without organizations
+        // Return users data only
         let (users, total) = app_state
             .admin_service
             .list_users(params.limit, params.offset)

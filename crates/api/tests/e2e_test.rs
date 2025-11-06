@@ -3243,7 +3243,7 @@ async fn test_admin_list_users_default_parameters() {
     let users_response = response.json::<api::models::ListUsersResponse>();
 
     // Verify default values are used
-    assert_eq!(users_response.limit, 50, "Default limit should be 50");
+    assert_eq!(users_response.limit, 100, "Default limit should be 100");
     assert_eq!(users_response.offset, 0, "Default offset should be 0");
 
     // Verify organizations are not included by default

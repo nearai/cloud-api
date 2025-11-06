@@ -544,7 +544,7 @@ pub async fn delete_model(
     path = "/admin/users",
     tag = "Admin",
     params(
-        ("limit" = Option<i64>, Query, description = "Maximum number of users to return (default: 50)"),
+        ("limit" = Option<i64>, Query, description = "Maximum number of users to return (default: 100)"),
         ("offset" = Option<i64>, Query, description = "Number of users to skip (default: 0)"),
         ("include_organizations" = Option<bool>, Query, description = "Whether to include organization information and spend limits for the first organization owned by each user (default: false)")
     ),
@@ -765,7 +765,7 @@ pub async fn create_admin_access_token(
     path = "/admin/access-tokens",
     tag = "Admin",
     params(
-        ("limit" = Option<i64>, Query, description = "Number of records to return (default: 50)"),
+        ("limit" = Option<i64>, Query, description = "Number of records to return (default: 100)"),
         ("offset" = Option<i64>, Query, description = "Number of records to skip (default: 0)")
     ),
     responses(

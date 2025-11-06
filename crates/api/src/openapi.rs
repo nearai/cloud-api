@@ -91,6 +91,7 @@ use utoipa::{Modify, OpenApi};
         // Files endpoints
         crate::routes::files::upload_file,
         crate::routes::files::list_files,
+        crate::routes::files::get_file,
     ),
     components(
         schemas(

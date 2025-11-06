@@ -386,3 +386,76 @@ pub async fn list_files(
 
     Ok(Json(response))
 }
+
+#[utoipa::path(
+    get,
+    path = "/v1/files/{file_id}",
+    tag = "Files",
+    params(
+        ("file_id" = String, Path, description = "The ID of the file to retrieve")
+    ),
+    responses(
+        (status = 200, description = "File information retrieved successfully", body = FileUploadResponse),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "File not found", body = ErrorResponse)
+    ),
+    security(("api_key" = []))
+)]
+pub async fn get_file(
+    State(app_state): State<AppState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    axum::extract::Path(file_id): axum::extract::Path<String>,
+) -> Result<Json<FileUploadResponse>, (StatusCode, Json<ErrorResponse>)> {
+    debug!("Get file request: {} from workspace: {}", file_id, api_key.workspace.id.0);
+
+    // Parse file ID (remove "file-" prefix if present)
+    let id_str = file_id.strip_prefix("file-").unwrap_or(&file_id);
+    let file_uuid = uuid::Uuid::parse_str(id_str).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                format!("Invalid file ID format: {}", file_id),
+                "invalid_request_error".to_string(),
+            )),
+        )
+    })?;
+
+    // Query file from database (with workspace authorization check)
+    let file_repo = FileRepository::new(app_state.db_pool.clone());
+    let file = file_repo
+        .get_by_id_and_workspace(file_uuid, api_key.workspace.id.0)
+        .await
+        .map_err(|e| {
+            error!("Failed to retrieve file: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    format!("Failed to retrieve file: {}", e),
+                    "internal_error".to_string(),
+                )),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse::new(
+                    format!("File not found: {}", file_id),
+                    "not_found_error".to_string(),
+                )),
+            )
+        })?;
+
+    // Build response
+    let response = FileUploadResponse {
+        id: format!("file-{}", file.id),
+        object: "file".to_string(),
+        bytes: file.bytes,
+        created_at: file.created_at.timestamp(),
+        expires_at: file.expires_at.map(|dt| dt.timestamp()),
+        filename: file.filename,
+        purpose: file.purpose,
+    };
+
+    Ok(Json(response))
+}

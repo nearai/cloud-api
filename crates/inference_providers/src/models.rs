@@ -26,7 +26,7 @@ pub struct ChatDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCall>>,
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,10 +47,34 @@ pub struct ToolCall {
     pub function: FunctionCall,
 }
 
+/// Delta tool call in streaming chat completions
+/// All fields are optional as they may not be present in every chunk
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub type_: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<FunctionCallDelta>,
+}
+
 /// Function call details
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCall {
     pub name: String,
+    pub arguments: Option<String>,
+}
+
+/// Delta function call in streaming chat completions
+/// All fields are optional as they may not be present in every chunk
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionCallDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<String>,
 }
 

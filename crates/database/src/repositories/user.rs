@@ -249,7 +249,7 @@ impl UserRepository {
                 o.description as organization_description,
                 olh.spend_limit as organization_spend_limit
             FROM users u
-            LEFT JOIN organization_members om ON u.id = om.user_id and om.role = 'owner'
+            LEFT JOIN organization_members om ON u.id = om.user_id AND om.role = 'owner'
             LEFT JOIN organizations o ON om.organization_id = o.id AND o.is_active = true
             LEFT JOIN LATERAL (
                 SELECT spend_limit

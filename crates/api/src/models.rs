@@ -1397,3 +1397,27 @@ pub struct OrgLimitsHistoryResponse {
     pub limit: i64,
     pub offset: i64,
 }
+
+// ============================================
+// File Upload Models
+// ============================================
+
+/// File upload response
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct FileUploadResponse {
+    pub id: String,
+    pub object: String, // Always "file"
+    pub bytes: i64,
+    pub created_at: i64, // Unix timestamp
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>, // Unix timestamp
+    pub filename: String,
+    pub purpose: String,
+}
+
+/// Expires after configuration
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ExpiresAfter {
+    pub anchor: String, // "created_at"
+    pub seconds: i64,   // Max: 31536000 (1 year)
+}

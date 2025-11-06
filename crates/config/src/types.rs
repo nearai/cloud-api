@@ -8,6 +8,7 @@ pub struct ApiConfig {
     pub dstack_client: DstackClientConfig,
     pub auth: AuthConfig,
     pub database: DatabaseConfig,
+    pub s3: S3Config,
 }
 
 impl ApiConfig {
@@ -20,6 +21,7 @@ impl ApiConfig {
             dstack_client: DstackClientConfig::from_env()?,
             auth: AuthConfig::from_env()?,
             database: DatabaseConfig::from_env()?,
+            s3: S3Config::from_env()?,
         })
     }
 }
@@ -357,6 +359,45 @@ impl From<ApiConfig> for DomainConfig {
             dstack_client: api_config.dstack_client,
             auth: api_config.auth,
         }
+    }
+}
+
+/// S3 configuration for file storage
+#[derive(Debug, Clone)]
+pub struct S3Config {
+    pub bucket: String,
+    pub region: String,
+    pub encryption_key: String,
+}
+
+impl S3Config {
+    /// Load from environment variables
+    pub fn from_env() -> Result<Self, String> {
+        // Encryption key is read from a file: S3_ENCRYPTION_KEY_FILE.
+        // This file would be mounted as a secret in production deployments.
+        let encryption_key = if let Ok(path) = env::var("S3_ENCRYPTION_KEY_FILE") {
+            std::fs::read_to_string(path)
+                .map_err(|e| format!("Failed to read S3_ENCRYPTION_KEY_FILE: {e}"))?
+                .trim()
+                .to_string()
+        } else {
+            env::var("S3_ENCRYPTION_KEY").map_err(|_| {
+                "Either S3_ENCRYPTION_KEY_FILE or S3_ENCRYPTION_KEY environment variable must be set"
+                    .to_string()
+            })?
+        };
+
+        if encryption_key.is_empty() {
+            return Err("S3 encryption key cannot be empty".to_string());
+        }
+
+        Ok(Self {
+            bucket: env::var("AWS_S3_BUCKET")
+                .map_err(|_| "AWS_S3_BUCKET not set".to_string())?,
+            region: env::var("AWS_S3_REGION")
+                .map_err(|_| "AWS_S3_REGION not set".to_string())?,
+            encryption_key,
+        })
     }
 }
 

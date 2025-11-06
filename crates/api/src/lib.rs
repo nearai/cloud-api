@@ -372,6 +372,7 @@ pub fn build_app_with_config(
         usage_service: domain_services.usage_service.clone(),
         user_service: domain_services.user_service.clone(),
         config: config.clone(),
+        db_pool: database.pool().clone(),
     };
 
     // Create usage state for middleware
@@ -435,6 +436,9 @@ pub fn build_app_with_config(
     let invitation_routes =
         build_invitation_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
+    let files_routes =
+        build_files_routes(app_state.clone(), &auth_components.auth_state_middleware);
+
     // Build OpenAPI and documentation routes
     let openapi_routes = build_openapi_routes();
 
@@ -455,6 +459,7 @@ pub fn build_app_with_config(
                 .merge(model_routes)
                 .merge(admin_routes)
                 .merge(invitation_routes)
+                .merge(files_routes)
                 .merge(health_routes),
         )
         .merge(openapi_routes)
@@ -659,6 +664,19 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware,
+        ))
+}
+
+/// Build file upload routes
+pub fn build_files_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
+    use crate::routes::files::*;
+
+    Router::new()
+        .route("/files", post(upload_file))
+        .with_state(app_state)
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            auth_middleware_with_api_key,
         ))
 }
 

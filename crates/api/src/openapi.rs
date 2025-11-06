@@ -88,6 +88,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::usage::get_organization_balance,
         crate::routes::usage::get_organization_usage_history,
         crate::routes::usage::get_api_key_usage_history,
+        // Files endpoints
+        crate::routes::files::upload_file,
     ),
     components(
         schemas(
@@ -154,6 +156,8 @@ use utoipa::{Modify, OpenApi};
             crate::routes::usage::OrganizationBalanceResponse,
             crate::routes::usage::UsageHistoryResponse,
             crate::routes::usage::UsageHistoryEntryResponse,
+            // File upload models
+            FileUploadResponse, ExpiresAfter,
         ),
     ),
     modifiers(&SecurityAddon)

@@ -546,7 +546,7 @@ pub async fn delete_model(
     params(
         ("limit" = i64, Query, description = "Maximum number of users to return (default: 50)"),
         ("offset" = i64, Query, description = "Number of users to skip (default: 0)"),
-        ("include_organizations" = Option<bool>, Query, description = "Whether to include organization information and spend limits for organizations owned by each user (default: false)")
+        ("include_organizations" = Option<bool>, Query, description = "Whether to include organization information and spend limits for the first organization owned by each user (default: false)")
     ),
     responses(
         (status = 200, description = "Users retrieved successfully", body = ListUsersResponse),

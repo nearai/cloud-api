@@ -206,7 +206,7 @@ impl UserRepository {
     }
 
     /// List all users with organizations (with pagination)
-    /// Returns the earliest organization created by each user (any role) with spend limit
+    /// Returns the earliest organization created by each user (owner role) with spend limit
     /// Returns a tuple of (User, Option<UserOrganizationInfo>)
     pub async fn list_with_organizations(
         &self,
@@ -229,7 +229,7 @@ impl UserRepository {
                 o.description as organization_description,
                 olh.spend_limit as organization_spend_limit
             FROM users u
-            LEFT JOIN organization_members om ON u.id = om.user_id
+            LEFT JOIN organization_members om ON u.id = om.user_id and om.role = 'owner'
             LEFT JOIN organizations o ON om.organization_id = o.id AND o.is_active = true
             LEFT JOIN LATERAL (
                 SELECT spend_limit

@@ -790,7 +790,7 @@ impl ResponseServiceImpl {
             Ok(result) => result,
             Err(e) => {
                 // Convert tool execution errors into error messages for the LLM
-                let error_message = format!("ERROR: {}", e);
+                let error_message = format!("ERROR: {e}");
                 tracing::warn!(
                     "Tool execution error for '{}': {}. Returning error message to LLM.",
                     tool_call.tool_type,

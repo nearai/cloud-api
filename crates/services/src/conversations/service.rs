@@ -381,8 +381,24 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             created_items.push(created_item);
         }
 
+        // Update the response status to "completed" since all items have been backfilled
+        self.resp_repo
+            .update(
+                response_id.clone(),
+                workspace_id.clone(),
+                None, // output_message not used - messages stored as response_items
+                crate::responses::models::ResponseStatus::Completed,
+                None, // usage not updated for backfilled responses
+            )
+            .await
+            .map_err(|e| {
+                errors::ConversationError::InternalError(format!(
+                    "Failed to update backfill response status: {e}"
+                ))
+            })?;
+
         tracing::debug!(
-            "Created {} items in conversation {}",
+            "Created {} items in conversation {} and marked response as completed",
             created_items.len(),
             conversation_id
         );

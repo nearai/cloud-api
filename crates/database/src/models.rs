@@ -339,7 +339,8 @@ pub struct McpConnectorUsage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
     pub id: Uuid,
-    pub user_id: Uuid,
+    pub workspace_id: Uuid,
+    pub api_key_id: Uuid,
     pub model: String,
     pub input_messages: serde_json::Value, // JSONB storing input messages
     pub output_message: Option<String>,
@@ -375,10 +376,12 @@ impl std::fmt::Display for ResponseStatus {
 }
 
 /// Conversation model - stores conversation metadata
+/// Note: This model is scoped to workspace/api_key, not user (for app developers)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
     pub id: Uuid,
-    pub user_id: Uuid,
+    pub workspace_id: Uuid,
+    pub api_key_id: Uuid,
     pub metadata: serde_json::Value, // JSONB storing conversation metadata
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

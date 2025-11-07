@@ -5,8 +5,8 @@
 
 use crate::conversations::models::ConversationId;
 use crate::responses::{errors, models};
-use crate::UserId;
 use futures::channel::mpsc::UnboundedSender;
+use uuid::Uuid;
 
 /// Context for processing a response stream
 ///
@@ -14,7 +14,7 @@ use futures::channel::mpsc::UnboundedSender;
 /// reducing the number of parameters passed between functions.
 pub struct ResponseStreamContext {
     pub response_id: models::ResponseId,
-    pub user_id: UserId,
+    pub api_key_id: Uuid,
     pub conversation_id: Option<ConversationId>,
     pub sequence_number: u64,
     pub output_item_index: usize,
@@ -26,12 +26,12 @@ pub struct ResponseStreamContext {
 impl ResponseStreamContext {
     pub fn new(
         response_id: models::ResponseId,
-        user_id: UserId,
+        api_key_id: Uuid,
         conversation_id: Option<ConversationId>,
     ) -> Self {
         Self {
             response_id,
-            user_id,
+            api_key_id,
             conversation_id,
             sequence_number: 0,
             output_item_index: 0,

@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{conversations::errors, UserId};
+use crate::{conversations::errors, workspace::WorkspaceId};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationId(pub Uuid);
@@ -33,7 +33,8 @@ impl std::fmt::Display for ConversationId {
 /// Domain model for a conversation request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationRequest {
-    pub user_id: UserId,
+    pub workspace_id: WorkspaceId,
+    pub api_key_id: uuid::Uuid,
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -41,7 +42,8 @@ pub struct ConversationRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
     pub id: ConversationId,
-    pub user_id: UserId,
+    pub workspace_id: WorkspaceId,
+    pub api_key_id: uuid::Uuid,
     pub metadata: serde_json::Value, // JSONB storing conversation metadata
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

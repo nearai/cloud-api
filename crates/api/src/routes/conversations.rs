@@ -71,8 +71,21 @@ pub async fn create_conversation(
         ));
     }
 
+    // Parse API key ID from string to UUID
+    let api_key_uuid = uuid::Uuid::parse_str(&api_key.id.0)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Invalid API key ID format: {}", e),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
     let domain_request = services::conversations::models::ConversationRequest {
-        user_id: api_key.created_by_user_id.0.into(),
+        workspace_id: api_key.workspace_id.clone(),
+        api_key_id: api_key_uuid,
         metadata: request.metadata,
     };
 
@@ -80,8 +93,8 @@ pub async fn create_conversation(
         Ok(domain_conversation) => {
             let http_conversation = convert_domain_conversation_to_http(domain_conversation);
             debug!(
-                "Created conversation {} for user {}",
-                http_conversation.id, api_key.created_by_user_id.0
+                "Created conversation {} for workspace {}",
+                http_conversation.id, api_key.workspace_id.0
             );
             Ok((StatusCode::CREATED, ResponseJson(http_conversation)))
         }
@@ -119,8 +132,8 @@ pub async fn get_conversation(
     Extension(api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ConversationObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
-        "Get conversation {} for user {}",
-        conversation_id, api_key.created_by_user_id.0
+        "Get conversation {} for workspace {}",
+        conversation_id, api_key.workspace_id.0
     );
 
     let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
@@ -134,7 +147,7 @@ pub async fn get_conversation(
     };
 
     match service
-        .get_conversation(parsed_conversation_id, api_key.created_by_user_id.clone())
+        .get_conversation(parsed_conversation_id, api_key.workspace_id.clone())
         .await
     {
         Ok(Some(domain_conversation)) => {
@@ -184,8 +197,8 @@ pub async fn update_conversation(
     Json(request): Json<UpdateConversationRequest>,
 ) -> Result<ResponseJson<ConversationObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
-        "Update conversation {} for user {}",
-        conversation_id, api_key.created_by_user_id.0
+        "Update conversation {} for workspace {}",
+        conversation_id, api_key.workspace_id.0
     );
 
     let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
@@ -203,7 +216,7 @@ pub async fn update_conversation(
     match service
         .update_conversation(
             parsed_conversation_id,
-            api_key.created_by_user_id.clone(),
+            api_key.workspace_id.clone(),
             metadata,
         )
         .await
@@ -211,8 +224,8 @@ pub async fn update_conversation(
         Ok(Some(domain_conversation)) => {
             let http_conversation = convert_domain_conversation_to_http(domain_conversation);
             debug!(
-                "Updated conversation {} for user {}",
-                conversation_id, api_key.created_by_user_id.0
+                "Updated conversation {} for workspace {}",
+                conversation_id, api_key.workspace_id.0
             );
             Ok(ResponseJson(http_conversation))
         }
@@ -257,8 +270,8 @@ pub async fn delete_conversation(
     Extension(api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ConversationDeleteResult>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
-        "Delete conversation {} for user {}",
-        conversation_id, api_key.created_by_user_id.0
+        "Delete conversation {} for workspace {}",
+        conversation_id, api_key.workspace_id.0
     );
 
     let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
@@ -272,13 +285,13 @@ pub async fn delete_conversation(
     };
 
     match service
-        .delete_conversation(parsed_conversation_id, api_key.created_by_user_id.clone())
+        .delete_conversation(parsed_conversation_id, api_key.workspace_id.clone())
         .await
     {
         Ok(true) => {
             debug!(
-                "Deleted conversation {} for user {}",
-                conversation_id, api_key.created_by_user_id
+                "Deleted conversation {} for workspace {}",
+                conversation_id, api_key.workspace_id.0
             );
             Ok(ResponseJson(ConversationDeleteResult {
                 id: conversation_id,
@@ -332,8 +345,8 @@ pub async fn list_conversation_items(
     Extension(api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ConversationItemList>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
-        "List items in conversation {} for user {}",
-        conversation_id, api_key.created_by_user_id.0
+        "List items in conversation {} for workspace {}",
+        conversation_id, api_key.workspace_id.0
     );
 
     // Validate limit parameter

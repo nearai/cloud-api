@@ -40,7 +40,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use services::conversations::models::ConversationId;
 use services::responses::models::*;
-use services::{responses::ports::*, UserId};
+use services::responses::ports::*;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -90,7 +90,7 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
     async fn create(
         &self,
         response_id: ResponseId,
-        user_id: UserId,
+        api_key_id: uuid::Uuid,
         conversation_id: Option<ConversationId>,
         item: ResponseOutputItem,
     ) -> Result<ResponseOutputItem> {
@@ -113,14 +113,14 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
         let row = client
             .query_one(
                 r#"
-                INSERT INTO response_items (id, response_id, user_id, conversation_id, item, created_at, updated_at)
+                INSERT INTO response_items (id, response_id, api_key_id, conversation_id, item, created_at, updated_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING *
                 "#,
                 &[
                     &id,
                     &response_id.0,
-                    &user_id.0,
+                    &api_key_id,
                     &conversation_uuid,
                     &item_json,
                     &now,
@@ -131,8 +131,8 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
             .context("Failed to insert response item")?;
 
         debug!(
-            "Created response item: {} for response: {} user: {}",
-            item_id, response_id, user_id
+            "Created response item: {} for response: {} api_key: {}",
+            item_id, response_id, api_key_id
         );
 
         self.row_to_item(row)
@@ -240,8 +240,8 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
         rows.into_iter().map(|row| self.row_to_item(row)).collect()
     }
 
-    /// List all items for a specific user
-    async fn list_by_user(&self, user_id: UserId) -> Result<Vec<ResponseOutputItem>> {
+    /// List all items for a specific API key
+    async fn list_by_api_key(&self, api_key_id: uuid::Uuid) -> Result<Vec<ResponseOutputItem>> {
         let client = self
             .pool
             .get()
@@ -252,13 +252,13 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
             .query(
                 r#"
                 SELECT * FROM response_items
-                WHERE user_id = $1
+                WHERE api_key_id = $1
                 ORDER BY created_at DESC
                 "#,
-                &[&user_id.0],
+                &[&api_key_id],
             )
             .await
-            .context("Failed to query response items by user")?;
+            .context("Failed to query response items by API key")?;
 
         rows.into_iter().map(|row| self.row_to_item(row)).collect()
     }

@@ -1,5 +1,5 @@
 use crate::conversations;
-use crate::UserId;
+use crate::workspace::WorkspaceId;
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -8,7 +8,8 @@ pub trait ConversationRepository: Send + Sync {
     /// Create a new conversation
     async fn create(
         &self,
-        user_id: UserId,
+        workspace_id: WorkspaceId,
+        api_key_id: uuid::Uuid,
         metadata: serde_json::Value,
     ) -> Result<conversations::models::Conversation>;
 
@@ -16,14 +17,14 @@ pub trait ConversationRepository: Send + Sync {
     async fn get_by_id(
         &self,
         id: conversations::models::ConversationId,
-        user_id: UserId,
+        workspace_id: WorkspaceId,
     ) -> Result<Option<conversations::models::Conversation>>;
 
     /// Update a conversation's metadata
     async fn update(
         &self,
         id: conversations::models::ConversationId,
-        user_id: UserId,
+        workspace_id: WorkspaceId,
         metadata: serde_json::Value,
     ) -> Result<Option<conversations::models::Conversation>>;
 
@@ -31,7 +32,7 @@ pub trait ConversationRepository: Send + Sync {
     async fn delete(
         &self,
         id: conversations::models::ConversationId,
-        user_id: UserId,
+        workspace_id: WorkspaceId,
     ) -> Result<bool>;
 }
 
@@ -44,23 +45,23 @@ pub trait ConversationServiceTrait: Send + Sync {
     async fn get_conversation(
         &self,
         conversation_id: conversations::models::ConversationId,
-        user_id: UserId,
+        workspace_id: WorkspaceId,
     ) -> Result<Option<conversations::models::Conversation>, conversations::errors::ConversationError>;
     async fn update_conversation(
         &self,
         conversation_id: conversations::models::ConversationId,
-        user_id: UserId,
+        workspace_id: WorkspaceId,
         metadata: serde_json::Value,
     ) -> Result<Option<conversations::models::Conversation>, conversations::errors::ConversationError>;
     async fn delete_conversation(
         &self,
         conversation_id: conversations::models::ConversationId,
-        user_id: UserId,
+        workspace_id: WorkspaceId,
     ) -> Result<bool, conversations::errors::ConversationError>;
     async fn get_conversation_messages(
         &self,
         conversation_id: conversations::models::ConversationId,
-        user_id: UserId,
+        workspace_id: WorkspaceId,
         limit: i64,
         offset: i64,
     ) -> Result<

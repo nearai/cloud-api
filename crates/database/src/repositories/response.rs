@@ -3,7 +3,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use services::responses::models::*;
-use services::{responses::ports::*, UserId};
+use services::responses::ports::*;
+use services::workspace::WorkspaceId;
 use uuid::Uuid;
 
 pub struct PgResponseRepository {
@@ -21,7 +22,8 @@ impl PgResponseRepository {
 impl ResponseRepositoryTrait for PgResponseRepository {
     async fn create(
         &self,
-        user_id: UserId,
+        workspace_id: WorkspaceId,
+        api_key_id: uuid::Uuid,
         request: CreateResponseRequest,
     ) -> Result<ResponseObject, anyhow::Error> {
         let client = self
@@ -76,14 +78,15 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             .execute(
                 r#"
                 INSERT INTO responses (
-                    id, user_id, model, status, instructions, conversation_id, 
+                    id, workspace_id, api_key_id, model, status, instructions, conversation_id, 
                     previous_response_id, usage, metadata, created_at, updated_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                 "#,
                 &[
                     &response_uuid,
-                    &user_id.0,
+                    &workspace_id.0,
+                    &api_key_id,
                     &request.model,
                     &status,
                     &request.instructions,
@@ -154,9 +157,10 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         };
 
         tracing::info!(
-            "Created response {} for user {}",
+            "Created response {} for workspace {} with api_key {}",
             response_obj.id,
-            user_id.0
+            workspace_id.0,
+            api_key_id
         );
         Ok(response_obj)
     }
@@ -164,26 +168,157 @@ impl ResponseRepositoryTrait for PgResponseRepository {
     async fn get_by_id(
         &self,
         _response_id: ResponseId,
-        _user_id: UserId,
+        _workspace_id: WorkspaceId,
     ) -> Result<Option<ResponseObject>, anyhow::Error> {
         unimplemented!("get_by_id not yet implemented")
     }
 
     async fn update(
         &self,
-        _response_id: ResponseId,
-        _user_id: UserId,
-        _output_message: Option<String>,
-        _status: ResponseStatus,
-        _usage: Option<serde_json::Value>,
+        response_id: ResponseId,
+        workspace_id: WorkspaceId,
+        _output_message: Option<String>, // Not used - messages stored as response_items
+        status: ResponseStatus,
+        usage: Option<serde_json::Value>,
     ) -> Result<Option<ResponseObject>, anyhow::Error> {
-        unimplemented!("update not yet implemented")
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let response_uuid = response_id.0;
+        let status_str = match status {
+            ResponseStatus::InProgress => "in_progress",
+            ResponseStatus::Completed => "completed",
+            ResponseStatus::Failed => "failed",
+            ResponseStatus::Cancelled => "cancelled",
+            ResponseStatus::Queued => "queued",
+            ResponseStatus::Incomplete => "incomplete",
+        };
+        let now = Utc::now();
+
+        // Update the response in the database
+        // Note: output_message column was removed in migration V0021
+        // Messages are now stored as response_items instead
+        let rows_affected = client
+            .execute(
+                r#"
+                UPDATE responses
+                SET status = $1,
+                    usage = COALESCE($2, usage),
+                    updated_at = $3
+                WHERE id = $4 AND workspace_id = $5
+                "#,
+                &[&status_str, &usage, &now, &response_uuid, &workspace_id.0],
+            )
+            .await
+            .context("Failed to update response")?;
+
+        if rows_affected == 0 {
+            // Response not found or doesn't belong to this workspace
+            return Ok(None);
+        }
+
+        // Fetch the updated response
+        let row = client
+            .query_one(
+                r#"
+                SELECT id, workspace_id, api_key_id, model, status, instructions, 
+                       conversation_id, previous_response_id, usage, metadata, 
+                       created_at, updated_at
+                FROM responses
+                WHERE id = $1 AND workspace_id = $2
+                "#,
+                &[&response_uuid, &workspace_id.0],
+            )
+            .await
+            .context("Failed to fetch updated response")?;
+
+        // Parse usage from JSONB
+        let usage_value: Option<serde_json::Value> = row.get(8);
+        let usage_obj = if let Some(usage_json) = usage_value {
+            serde_json::from_value(usage_json.clone()).unwrap_or_else(|_| {
+                // Fallback to default if deserialization fails
+                Usage::new(0, 0)
+            })
+        } else {
+            Usage::new(0, 0)
+        };
+
+        // Parse conversation_id
+        let conversation_uuid: Option<Uuid> = row.get(6);
+        let conversation_ref = conversation_uuid.map(|uuid| ConversationResponseReference {
+            id: format!("conv_{}", uuid.simple()),
+        });
+
+        // Parse metadata
+        let metadata_value: Option<serde_json::Value> = row.get(9);
+        let metadata = metadata_value;
+
+        // Parse status
+        let status_str: String = row.get(4);
+        let response_status = match status_str.as_str() {
+            "in_progress" => ResponseStatus::InProgress,
+            "completed" => ResponseStatus::Completed,
+            "failed" => ResponseStatus::Failed,
+            "cancelled" => ResponseStatus::Cancelled,
+            _ => ResponseStatus::InProgress,
+        };
+
+        let response_obj = ResponseObject {
+            id: format!("resp_{}", response_uuid.simple()),
+            object: "response".to_string(),
+            created_at: row.get::<_, chrono::DateTime<Utc>>(10).timestamp(),
+            status: response_status,
+            background: false, // Not stored in DB, default value
+            conversation: conversation_ref,
+            error: None,
+            incomplete_details: None,
+            instructions: row.get(5),
+            max_output_tokens: None, // Not stored in DB
+            max_tool_calls: None,    // Not stored in DB
+            model: row.get(3),
+            output: vec![],             // Output items are stored separately
+            parallel_tool_calls: false, // Not stored in DB
+            previous_response_id: row
+                .get::<_, Option<Uuid>>(7)
+                .map(|uuid| format!("resp_{}", uuid.simple())),
+            prompt_cache_key: None, // Not stored in DB
+            prompt_cache_retention: None,
+            reasoning: None,
+            safety_identifier: None, // Not stored in DB
+            service_tier: "default".to_string(),
+            store: false,     // Not stored in DB
+            temperature: 1.0, // Not stored in DB
+            text: Some(ResponseTextConfig {
+                format: ResponseTextFormat::Text,
+                verbosity: Some("medium".to_string()),
+            }),
+            tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
+            tools: vec![], // Not stored in DB
+            top_logprobs: 0,
+            top_p: 1.0, // Not stored in DB
+            truncation: "disabled".to_string(),
+            usage: usage_obj,
+            user: None,
+            metadata,
+        };
+
+        tracing::debug!(
+            "Updated response {} with status={}, usage={:?}",
+            response_obj.id,
+            status_str,
+            usage
+        );
+
+        Ok(Some(response_obj))
     }
 
     async fn delete(
         &self,
         _response_id: ResponseId,
-        _user_id: UserId,
+        _workspace_id: WorkspaceId,
     ) -> Result<bool, anyhow::Error> {
         unimplemented!("delete not yet implemented")
     }
@@ -191,24 +326,24 @@ impl ResponseRepositoryTrait for PgResponseRepository {
     async fn cancel(
         &self,
         _response_id: ResponseId,
-        _user_id: UserId,
+        _workspace_id: WorkspaceId,
     ) -> Result<Option<ResponseObject>, anyhow::Error> {
         unimplemented!("cancel not yet implemented")
     }
 
-    async fn list_by_user(
+    async fn list_by_workspace(
         &self,
-        _user_id: UserId,
+        _workspace_id: WorkspaceId,
         _limit: i64,
         _offset: i64,
     ) -> Result<Vec<ResponseObject>, anyhow::Error> {
-        unimplemented!("list_by_user not yet implemented")
+        unimplemented!("list_by_workspace not yet implemented")
     }
 
     async fn list_by_conversation(
         &self,
         _conversation_id: services::conversations::models::ConversationId,
-        _user_id: UserId,
+        _workspace_id: WorkspaceId,
         _limit: i64,
     ) -> Result<Vec<ResponseObject>, anyhow::Error> {
         unimplemented!("list_by_conversation not yet implemented")
@@ -217,7 +352,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
     async fn get_previous(
         &self,
         _response_id: ResponseId,
-        _user_id: UserId,
+        _workspace_id: WorkspaceId,
     ) -> Result<Option<ResponseObject>, anyhow::Error> {
         unimplemented!("get_previous not yet implemented")
     }

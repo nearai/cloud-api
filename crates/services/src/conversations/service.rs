@@ -1,7 +1,7 @@
 use crate::{
     conversations::{errors, models},
     responses::ports::ResponseRepositoryTrait,
-    UserId,
+    workspace::WorkspaceId,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -61,11 +61,11 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
     ) -> Result<models::Conversation, errors::ConversationError> {
         let metadata = request.metadata.unwrap_or_else(|| serde_json::json!({}));
 
-        tracing::info!("Creating conversation for user: {}", request.user_id.0);
+        tracing::info!("Creating conversation for workspace: {}", request.workspace_id.0);
 
         let db_conversation = self
             .conv_repo
-            .create(request.user_id, metadata)
+            .create(request.workspace_id.clone(), request.api_key_id, metadata)
             .await
             .map_err(|e| {
                 errors::ConversationError::InternalError(format!(
@@ -77,7 +77,8 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
 
         let conversation = models::Conversation {
             id: db_conversation.id,
-            user_id: db_conversation.user_id,
+            workspace_id: db_conversation.workspace_id,
+            api_key_id: db_conversation.api_key_id,
             metadata: db_conversation.metadata,
             created_at: db_conversation.created_at,
             updated_at: db_conversation.updated_at,
@@ -90,11 +91,11 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
     async fn get_conversation(
         &self,
         conversation_id: models::ConversationId,
-        user_id: UserId,
+        workspace_id: WorkspaceId,
     ) -> Result<Option<models::Conversation>, errors::ConversationError> {
         let db_conversation = self
             .conv_repo
-            .get_by_id(conversation_id, user_id)
+            .get_by_id(conversation_id, workspace_id.clone())
             .await
             .map_err(|e| {
                 errors::ConversationError::InternalError(format!("Failed to get conversation: {e}"))
@@ -102,7 +103,8 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
 
         Ok(db_conversation.map(|c| models::Conversation {
             id: c.id,
-            user_id: c.user_id,
+            workspace_id: c.workspace_id,
+            api_key_id: c.api_key_id,
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,
@@ -113,12 +115,12 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
     async fn update_conversation(
         &self,
         conversation_id: models::ConversationId,
-        user_id: UserId,
+        workspace_id: WorkspaceId,
         metadata: serde_json::Value,
     ) -> Result<Option<models::Conversation>, errors::ConversationError> {
         let db_conversation = self
             .conv_repo
-            .update(conversation_id, user_id, metadata)
+            .update(conversation_id, workspace_id.clone(), metadata)
             .await
             .map_err(|e| {
                 errors::ConversationError::InternalError(format!(
@@ -128,7 +130,8 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
 
         Ok(db_conversation.map(|c| models::Conversation {
             id: c.id,
-            user_id: c.user_id,
+            workspace_id: c.workspace_id,
+            api_key_id: c.api_key_id,
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,
@@ -139,10 +142,10 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
     async fn delete_conversation(
         &self,
         conversation_id: models::ConversationId,
-        user_id: UserId,
+        workspace_id: WorkspaceId,
     ) -> Result<bool, errors::ConversationError> {
         self.conv_repo
-            .delete(conversation_id, user_id)
+            .delete(conversation_id, workspace_id)
             .await
             .map_err(|e| {
                 errors::ConversationError::InternalError(format!(
@@ -155,7 +158,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
     async fn get_conversation_messages(
         &self,
         _conversation_id: models::ConversationId,
-        _user_id: UserId,
+        _workspace_id: WorkspaceId,
         _limit: i64,
         _offset: i64,
     ) -> Result<Vec<models::ConversationMessage>, errors::ConversationError> {

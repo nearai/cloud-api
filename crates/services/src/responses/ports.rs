@@ -4,6 +4,7 @@ use futures::Stream;
 use std::pin::Pin;
 
 use crate::conversations::models::ConversationId;
+use crate::workspace::WorkspaceId;
 use crate::UserId;
 
 #[async_trait]
@@ -11,36 +12,37 @@ pub trait ResponseRepositoryTrait: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     async fn create(
         &self,
-        user_id: UserId,
+        workspace_id: WorkspaceId,
+        api_key_id: uuid::Uuid,
         request: models::CreateResponseRequest,
     ) -> anyhow::Result<models::ResponseObject>;
 
     async fn get_by_id(
         &self,
         id: models::ResponseId,
-        user_id: UserId,
+        workspace_id: WorkspaceId,
     ) -> anyhow::Result<Option<models::ResponseObject>>;
 
     async fn update(
         &self,
         id: models::ResponseId,
-        user_id: UserId,
+        workspace_id: WorkspaceId,
         output_message: Option<String>,
         status: models::ResponseStatus,
         usage: Option<serde_json::Value>,
     ) -> anyhow::Result<Option<models::ResponseObject>>;
 
-    async fn delete(&self, id: models::ResponseId, user_id: UserId) -> anyhow::Result<bool>;
+    async fn delete(&self, id: models::ResponseId, workspace_id: WorkspaceId) -> anyhow::Result<bool>;
 
     async fn cancel(
         &self,
         id: models::ResponseId,
-        user_id: UserId,
+        workspace_id: WorkspaceId,
     ) -> anyhow::Result<Option<models::ResponseObject>>;
 
-    async fn list_by_user(
+    async fn list_by_workspace(
         &self,
-        user_id: UserId,
+        workspace_id: WorkspaceId,
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<models::ResponseObject>>;
@@ -48,14 +50,14 @@ pub trait ResponseRepositoryTrait: Send + Sync {
     async fn list_by_conversation(
         &self,
         conversation_id: ConversationId,
-        user_id: UserId,
+        workspace_id: WorkspaceId,
         limit: i64,
     ) -> anyhow::Result<Vec<models::ResponseObject>>;
 
     async fn get_previous(
         &self,
         response_id: models::ResponseId,
-        user_id: UserId,
+        workspace_id: WorkspaceId,
     ) -> anyhow::Result<Option<models::ResponseObject>>;
 }
 
@@ -64,7 +66,7 @@ pub trait ResponseItemRepositoryTrait: Send + Sync {
     async fn create(
         &self,
         response_id: models::ResponseId,
-        user_id: UserId,
+        api_key_id: uuid::Uuid,
         conversation_id: Option<ConversationId>,
         item: models::ResponseOutputItem,
     ) -> anyhow::Result<models::ResponseOutputItem>;
@@ -82,9 +84,9 @@ pub trait ResponseItemRepositoryTrait: Send + Sync {
         &self,
         response_id: models::ResponseId,
     ) -> anyhow::Result<Vec<models::ResponseOutputItem>>;
-    async fn list_by_user(
+    async fn list_by_api_key(
         &self,
-        user_id: UserId,
+        api_key_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<models::ResponseOutputItem>>;
     async fn list_by_conversation(
         &self,

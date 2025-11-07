@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::Stream;
+use uuid::Uuid;
 
 use crate::completions::ports::CompletionServiceTrait;
 use crate::conversations::models::ConversationId;
@@ -308,7 +309,7 @@ impl ResponseServiceImpl {
         if let Err(e) = response_items_repository
             .create(
                 ctx.response_id.clone(),
-                ctx.user_id.clone(),
+                ctx.api_key_id,
                 ctx.conversation_id.clone(),
                 item,
             )
@@ -329,53 +330,99 @@ impl ResponseServiceImpl {
         let mut tool_calls_detected = Vec::new();
 
         for (idx, (name_opt, args_str)) in tool_call_accumulator {
-            if let Some(name) = name_opt {
-                // Handle tools that don't require parameters (like current_date)
-                if name == "current_date" {
-                    tracing::debug!("Tool call detected: {}", name);
+            // Check if name is None or empty string
+            let name = match name_opt {
+                Some(n) if !n.trim().is_empty() => n,
+                _ => {
+                    tracing::warn!(
+                        "Tool call at index {} has no name or empty name. Args: {}",
+                        idx,
+                        args_str
+                    );
+                    // Create a special error tool call to inform the LLM
                     tool_calls_detected.push(ToolCallInfo {
-                        tool_type: name,
-                        query: String::new(),
-                        params: None,
+                        tool_type: "__error__".to_string(),
+                        query: format!(
+                            "Tool call at index {} is missing a tool name. Please ensure all tool calls include a valid 'name' field. Arguments provided: {}",
+                            idx, args_str
+                        ),
+                        params: Some(serde_json::json!({
+                            "error_type": "missing_tool_name",
+                            "index": idx,
+                            "arguments": args_str
+                        })),
                     });
-                } else {
-                    // Try to parse the complete arguments for tools that need parameters
-                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str) {
-                        if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
-                            tracing::debug!(
-                                "Tool call detected: {} with query: {} and params: {:?}",
-                                name,
-                                query,
-                                args
-                            );
-                            tool_calls_detected.push(ToolCallInfo {
-                                tool_type: name,
-                                query: query.to_string(),
-                                params: Some(args),
-                            });
-                        } else {
-                            tracing::warn!(
-                                "Tool call {} (index {}) has no 'query' field in arguments: {}",
-                                name,
-                                idx,
-                                args_str
-                            );
-                        }
+                    continue;
+                }
+            };
+
+            // Handle tools that don't require parameters (like current_date)
+            if name == "current_date" {
+                tracing::debug!("Tool call detected: {}", name);
+                tool_calls_detected.push(ToolCallInfo {
+                    tool_type: name,
+                    query: String::new(),
+                    params: None,
+                });
+            } else {
+                // Try to parse the complete arguments for tools that need parameters
+                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str) {
+                    if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
+                        tracing::debug!(
+                            "Tool call detected: {} with query: {} and params: {:?}",
+                            name,
+                            query,
+                            args
+                        );
+                        tool_calls_detected.push(ToolCallInfo {
+                            tool_type: name,
+                            query: query.to_string(),
+                            params: Some(args),
+                        });
                     } else {
                         tracing::warn!(
-                            "Failed to parse tool call {} (index {}) arguments: {}",
+                            "Tool call {} (index {}) has no 'query' field in arguments: {}",
                             name,
                             idx,
                             args_str
                         );
+                        // Create an error tool call to inform the LLM about missing query
+                        tool_calls_detected.push(ToolCallInfo {
+                            tool_type: "__error__".to_string(),
+                            query: format!(
+                                "Tool call for '{}' (index {}) is missing the required 'query' field in its arguments. Please include a 'query' parameter. Arguments provided: {}",
+                                name, idx, args_str
+                            ),
+                            params: Some(serde_json::json!({
+                                "error_type": "missing_query_field",
+                                "tool_name": name,
+                                "index": idx,
+                                "arguments": args_str
+                            })),
+                        });
                     }
+                } else {
+                    tracing::warn!(
+                        "Failed to parse tool call {} (index {}) arguments: {}",
+                        name,
+                        idx,
+                        args_str
+                    );
+                    // Create an error tool call to inform the LLM about invalid JSON
+                    tool_calls_detected.push(ToolCallInfo {
+                        tool_type: "__error__".to_string(),
+                        query: format!(
+                            "Tool call for '{}' (index {}) has invalid JSON arguments. Please ensure arguments are valid JSON. Arguments provided: {}",
+                            name, idx, args_str
+                        ),
+                        params: Some(serde_json::json!({
+                            "error_type": "invalid_json",
+                            "tool_name": name,
+                            "index": idx,
+                            "arguments": args_str
+                        })),
+                    });
                 }
-            } else {
-                tracing::warn!(
-                    "Tool call at index {} has arguments but no name. Args: {}",
-                    idx,
-                    args_str
-                );
             }
         }
 
@@ -402,18 +449,22 @@ impl ResponseServiceImpl {
 
         let conversation_id = Self::parse_conversation_id(&request)?;
 
+        let workspace_id_domain = crate::workspace::WorkspaceId(workspace_id);
         let mut messages = Self::load_conversation_context(
             &request,
             &conversation_service,
             &response_items_repository,
-            user_id.clone(),
+            workspace_id_domain.clone(),
         )
         .await?;
 
         // Create the response in the database FIRST before creating any response items
         // This ensures the foreign key constraint is satisfied
+        let api_key_uuid = Uuid::parse_str(&api_key_id).map_err(|e| {
+            errors::ResponseError::InternalError(format!("Invalid API key ID: {}", e))
+        })?;
         let initial_response = response_repository
-            .create(user_id.clone(), request.clone())
+            .create(workspace_id_domain.clone(), api_key_uuid, request.clone())
             .await
             .map_err(|e| {
                 errors::ResponseError::InternalError(format!("Failed to create response: {}", e))
@@ -427,7 +478,7 @@ impl ResponseServiceImpl {
             Self::store_input_as_response_items(
                 &response_items_repository,
                 response_id.clone(),
-                user_id.clone(),
+                api_key_uuid,
                 conversation_id.clone(),
                 input,
             )
@@ -437,7 +488,7 @@ impl ResponseServiceImpl {
         // Initialize context and emitter
         let mut ctx = crate::responses::service_helpers::ResponseStreamContext::new(
             response_id.clone(),
-            user_id.clone(),
+            api_key_uuid,
             conversation_id.clone(),
         );
         let mut emitter = crate::responses::service_helpers::EventEmitter::new(tx);
@@ -468,7 +519,7 @@ impl ResponseServiceImpl {
         let tools = Self::prepare_tools(&request);
         let tool_choice = Self::prepare_tool_choice(&request);
 
-        let max_iterations = 10; // Prevent infinite loops
+        let max_iterations = 100; // Prevent infinite loops
         let mut iteration = 0;
         let mut final_response_text = String::new();
 
@@ -529,6 +580,26 @@ impl ResponseServiceImpl {
             ctx.total_output_tokens,
             ctx.total_input_tokens + ctx.total_output_tokens
         );
+
+        // Serialize usage to JSON for database storage
+        let usage_json = serde_json::to_value(&final_response.usage).map_err(|e| {
+            errors::ResponseError::InternalError(format!("Failed to serialize usage: {}", e))
+        })?;
+
+        // Update the response in the database with usage, status, and output message
+        if let Err(e) = response_repository
+            .update(
+                ctx.response_id.clone(),
+                workspace_id_domain.clone(),
+                Some(final_response_text.clone()),
+                final_response.status.clone(),
+                Some(usage_json),
+            )
+            .await
+        {
+            tracing::warn!("Failed to update response with usage: {}", e);
+            // Continue even if update fails - the response was already created
+        }
 
         // Wait for title generation with a timeout (2 seconds)
         // This ensures the title event is sent before response.completed
@@ -687,19 +758,71 @@ impl ResponseServiceImpl {
 
         let tool_call_id = format!("{}_{}", tool_call.tool_type, uuid::Uuid::new_v4().simple());
 
+        // Handle error tool calls (malformed tool calls detected during parsing)
+        if tool_call.tool_type == "__error__" {
+            // For error tool calls, just return the error message as the tool result
+            // This allows the LLM to see what went wrong and retry
+            messages.push(CompletionMessage {
+                role: "tool".to_string(),
+                content: format!(
+                    "ERROR: {}\n\nPlease correct the tool call format and try again.",
+                    tool_call.query
+                ),
+            });
+            return Ok(());
+        }
+
         // Emit tool-specific start events
         if tool_call.tool_type == "web_search" {
             Self::emit_web_search_start(ctx, emitter, &tool_call_id, tool_call).await?;
         }
 
-        // Execute the tool
-        let tool_result = Self::execute_tool(
+        // Execute the tool and catch errors to provide feedback to the LLM
+        let tool_result = match Self::execute_tool(
             tool_call,
             web_search_provider,
             file_search_provider,
             request,
         )
-        .await?;
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                // Convert tool execution errors into error messages for the LLM
+                let error_message = match &e {
+                    errors::ResponseError::UnknownTool(tool_name) => {
+                        if tool_name.is_empty() {
+                            format!(
+                                "ERROR: Tool call is missing a tool name. Please ensure all tool calls include a valid 'name' field. Available tools: web_search, file_search, current_date"
+                            )
+                        } else {
+                            format!(
+                                "ERROR: Unknown tool '{}'. Available tools are: web_search, file_search, current_date. Please use one of these valid tool names.",
+                                tool_name
+                            )
+                        }
+                    }
+                    errors::ResponseError::InvalidParams(msg) => {
+                        format!(
+                            "ERROR: Invalid parameters for tool '{}': {}. Please check the tool call arguments and try again.",
+                            tool_call.tool_type, msg
+                        )
+                    }
+                    errors::ResponseError::InternalError(msg) => {
+                        format!(
+                            "ERROR: Internal error while executing tool '{}': {}. Please try again or use a different approach.",
+                            tool_call.tool_type, msg
+                        )
+                    }
+                };
+                tracing::warn!(
+                    "Tool execution error for '{}': {}. Returning error message to LLM.",
+                    tool_call.tool_type,
+                    error_message
+                );
+                error_message
+            }
+        };
 
         // Emit tool-specific completion events
         if tool_call.tool_type == "web_search" {
@@ -794,7 +917,7 @@ impl ResponseServiceImpl {
         if let Err(e) = response_items_repository
             .create(
                 ctx.response_id.clone(),
-                ctx.user_id.clone(),
+                ctx.api_key_id,
                 ctx.conversation_id.clone(),
                 item,
             )
@@ -840,7 +963,7 @@ impl ResponseServiceImpl {
     async fn store_input_as_response_items(
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
         response_id: models::ResponseId,
-        user_id: crate::UserId,
+        api_key_id: uuid::Uuid,
         conversation_id: Option<ConversationId>,
         input: &models::ResponseInput,
     ) -> Result<(), errors::ResponseError> {
@@ -863,7 +986,7 @@ impl ResponseServiceImpl {
                 response_items_repository
                     .create(
                         response_id.clone(),
-                        user_id.clone(),
+                        api_key_id,
                         conversation_id.clone(),
                         message_item,
                     )
@@ -917,7 +1040,7 @@ impl ResponseServiceImpl {
                     response_items_repository
                         .create(
                             response_id.clone(),
-                            user_id.clone(),
+                            api_key_id,
                             conversation_id.clone(),
                             message_item,
                         )
@@ -944,7 +1067,7 @@ impl ResponseServiceImpl {
         request: &models::CreateResponseRequest,
         conversation_service: &Arc<dyn ConversationServiceTrait>,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
-        user_id: crate::UserId,
+        workspace_id: crate::workspace::WorkspaceId,
     ) -> Result<Vec<crate::completions::ports::CompletionMessage>, errors::ResponseError> {
         use crate::completions::ports::CompletionMessage;
 
@@ -981,7 +1104,7 @@ impl ResponseServiceImpl {
 
             // Load conversation metadata to verify it exists
             let _conversation = conversation_service
-                .get_conversation(conversation_id.clone(), user_id.clone())
+                .get_conversation(conversation_id.clone(), workspace_id.clone())
                 .await
                 .map_err(|e| {
                     errors::ResponseError::InternalError(format!(
@@ -1390,24 +1513,27 @@ impl ResponseServiceImpl {
                                 let entry =
                                     accumulator.entry(index).or_insert((None, String::new()));
 
-                                // Accumulate function name (only set once, typically in first chunk)
-                                if let Some(name) = &tool_call.function.name {
-                                    tracing::debug!(
-                                        "Accumulated tool call {} name: {}",
-                                        index,
-                                        name
-                                    );
-                                    entry.0 = Some(name.clone());
-                                }
+                                // Handle function delta if present
+                                if let Some(function) = &tool_call.function {
+                                    // Accumulate function name (only set once, typically in first chunk)
+                                    if let Some(name) = &function.name {
+                                        tracing::debug!(
+                                            "Accumulated tool call {} name: {}",
+                                            index,
+                                            name
+                                        );
+                                        entry.0 = Some(name.clone());
+                                    }
 
-                                // Accumulate arguments (streamed across multiple chunks)
-                                if let Some(args_fragment) = &tool_call.function.arguments {
-                                    tracing::debug!(
-                                        "Accumulated tool call {} args fragment: {}",
-                                        index,
-                                        args_fragment
-                                    );
-                                    entry.1.push_str(args_fragment);
+                                    // Accumulate arguments (streamed across multiple chunks)
+                                    if let Some(args_fragment) = &function.arguments {
+                                        tracing::debug!(
+                                            "Accumulated tool call {} args fragment: {}",
+                                            index,
+                                            args_fragment
+                                        );
+                                        entry.1.push_str(args_fragment);
+                                    }
                                 }
                             }
                         }
@@ -1425,6 +1551,11 @@ impl ResponseServiceImpl {
         file_search_provider: &Option<Arc<dyn tools::FileSearchProviderTrait>>,
         request: &models::CreateResponseRequest,
     ) -> Result<String, errors::ResponseError> {
+        // Check for empty tool type
+        if tool_call.tool_type.trim().is_empty() {
+            return Err(errors::ResponseError::UnknownTool("".to_string()));
+        }
+
         match tool_call.tool_type.as_str() {
             "web_search" => {
                 if let Some(provider) = web_search_provider {
@@ -1673,8 +1804,9 @@ impl ResponseServiceImpl {
         mut tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
     ) -> Result<(), errors::ResponseError> {
         // Get conversation to check if it already has a title
+        let workspace_id_domain = crate::workspace::WorkspaceId(workspace_id);
         let conversation = conversation_service
-            .get_conversation(conversation_id.clone(), user_id.clone())
+            .get_conversation(conversation_id.clone(), workspace_id_domain.clone())
             .await
             .map_err(|e| {
                 errors::ResponseError::InternalError(format!("Failed to get conversation: {}", e))
@@ -1760,8 +1892,13 @@ impl ResponseServiceImpl {
         let mut updated_metadata = conversation.metadata.clone();
         updated_metadata["title"] = serde_json::Value::String(title.clone());
 
+        let workspace_id_domain = crate::workspace::WorkspaceId(workspace_id);
         conversation_service
-            .update_conversation(conversation_id.clone(), user_id.clone(), updated_metadata)
+            .update_conversation(
+                conversation_id.clone(),
+                workspace_id_domain,
+                updated_metadata,
+            )
             .await
             .map_err(|e| {
                 errors::ResponseError::InternalError(format!(

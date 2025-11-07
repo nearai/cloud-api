@@ -1,6 +1,6 @@
 use crate::{
     conversations::{errors, models},
-    responses::ports::ResponseRepositoryTrait,
+    responses::ports::{ResponseItemRepositoryTrait, ResponseRepositoryTrait},
     workspace::WorkspaceId,
 };
 use anyhow::Result;
@@ -38,16 +38,19 @@ pub fn parse_uuid_from_prefixed(id: &str, prefix: &str) -> Result<Uuid, errors::
 pub struct ConversationServiceImpl {
     pub conv_repo: Arc<dyn ports::ConversationRepository>,
     pub resp_repo: Arc<dyn ResponseRepositoryTrait>,
+    pub response_items_repo: Arc<dyn ResponseItemRepositoryTrait>,
 }
 
 impl ConversationServiceImpl {
     pub fn new(
         conv_repo: Arc<dyn ports::ConversationRepository>,
         resp_repo: Arc<dyn ResponseRepositoryTrait>,
+        response_items_repo: Arc<dyn ResponseItemRepositoryTrait>,
     ) -> Self {
         Self {
             conv_repo,
             resp_repo,
+            response_items_repo,
         }
     }
 }
@@ -248,5 +251,31 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
         // messages.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
         // Ok(messages)
+    }
+
+    /// List items in a conversation (messages, tool calls, etc.)
+    async fn list_conversation_items(
+        &self,
+        conversation_id: models::ConversationId,
+        _workspace_id: WorkspaceId,
+        after: Option<String>,
+        limit: i64,
+    ) -> Result<Vec<crate::responses::models::ResponseOutputItem>, errors::ConversationError> {
+        tracing::debug!(
+            "Listing conversation items for conversation_id={}, after={:?}, limit={}",
+            conversation_id,
+            after,
+            limit
+        );
+
+        // Get items from response_items repository
+        self.response_items_repo
+            .list_by_conversation(conversation_id, after, limit)
+            .await
+            .map_err(|e| {
+                errors::ConversationError::InternalError(format!(
+                    "Failed to list conversation items: {e}"
+                ))
+            })
     }
 }

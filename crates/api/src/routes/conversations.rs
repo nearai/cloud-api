@@ -338,9 +338,7 @@ pub async fn delete_conversation(
 pub async fn list_conversation_items(
     Path(conversation_id): Path<String>,
     Query(params): Query<ListItemsQuery>,
-    State(response_items_repo): State<
-        Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>,
-    >,
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
     Extension(api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ConversationItemList>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
@@ -372,9 +370,14 @@ pub async fn list_conversation_items(
     // Request limit + 1 items to determine if there are more
     let fetch_limit = params.limit + 1;
 
-    // Get items from response_items repository with cursor-based pagination
-    match response_items_repo
-        .list_by_conversation(parsed_conversation_id, params.after.clone(), fetch_limit)
+    // Get items from conversation service
+    match service
+        .list_conversation_items(
+            parsed_conversation_id,
+            api_key.workspace_id.clone(),
+            params.after.clone(),
+            fetch_limit,
+        )
         .await
     {
         Ok(items) => {
@@ -404,11 +407,8 @@ pub async fn list_conversation_items(
             }))
         }
         Err(error) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ResponseJson(ErrorResponse::new(
-                format!("Failed to get conversation items: {error}"),
-                "internal_error".to_string(),
-            )),
+            map_conversation_error_to_status(&error),
+            ResponseJson(error.into()),
         )),
     }
 }

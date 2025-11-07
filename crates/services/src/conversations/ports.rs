@@ -68,4 +68,14 @@ pub trait ConversationServiceTrait: Send + Sync {
         Vec<conversations::models::ConversationMessage>,
         conversations::errors::ConversationError,
     >;
+    async fn list_conversation_items(
+        &self,
+        conversation_id: conversations::models::ConversationId,
+        workspace_id: WorkspaceId,
+        after: Option<String>,
+        limit: i64,
+    ) -> Result<
+        Vec<crate::responses::models::ResponseOutputItem>,
+        conversations::errors::ConversationError,
+    >;
 }

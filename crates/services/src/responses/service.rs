@@ -790,29 +790,7 @@ impl ResponseServiceImpl {
             Ok(result) => result,
             Err(e) => {
                 // Convert tool execution errors into error messages for the LLM
-                let error_message = match &e {
-                    errors::ResponseError::UnknownTool(tool_name) => {
-                        if tool_name.is_empty() {
-                            "ERROR: Tool call is missing a tool name. Please ensure all tool calls include a valid 'name' field. Available tools: web_search, file_search, current_date".to_string()
-                        } else {
-                            format!(
-                                "ERROR: Unknown tool '{tool_name}'. Available tools are: web_search, file_search, current_date. Please use one of these valid tool names."
-                            )
-                        }
-                    }
-                    errors::ResponseError::InvalidParams(msg) => {
-                        format!(
-                            "ERROR: Invalid parameters for tool '{}': {}. Please check the tool call arguments and try again.",
-                            tool_call.tool_type, msg
-                        )
-                    }
-                    errors::ResponseError::InternalError(msg) => {
-                        format!(
-                            "ERROR: Internal error while executing tool '{}': {}. Please try again or use a different approach.",
-                            tool_call.tool_type, msg
-                        )
-                    }
-                };
+                let error_message = format!("ERROR: {}", e);
                 tracing::warn!(
                     "Tool execution error for '{}': {}. Returning error message to LLM.",
                     tool_call.tool_type,
@@ -1533,7 +1511,7 @@ impl ResponseServiceImpl {
     ) -> Result<String, errors::ResponseError> {
         // Check for empty tool type
         if tool_call.tool_type.trim().is_empty() {
-            return Err(errors::ResponseError::UnknownTool("".to_string()));
+            return Err(errors::ResponseError::EmptyToolName);
         }
 
         match tool_call.tool_type.as_str() {

@@ -27,6 +27,7 @@ fn map_response_error_to_status(error: &ServiceResponseError) -> StatusCode {
         ServiceResponseError::InvalidParams(_) => StatusCode::BAD_REQUEST,
         ServiceResponseError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         ServiceResponseError::UnknownTool(_) => StatusCode::BAD_REQUEST,
+        ServiceResponseError::EmptyToolName => StatusCode::BAD_REQUEST,
     }
 }
 
@@ -42,6 +43,10 @@ impl From<ServiceResponseError> for ErrorResponse {
             ),
             ServiceResponseError::UnknownTool(msg) => ErrorResponse::new(
                 format!("Unknown tool: {msg}"),
+                "invalid_request_error".to_string(),
+            ),
+            ServiceResponseError::EmptyToolName => ErrorResponse::new(
+                "Tool call is missing a tool name".to_string(),
                 "invalid_request_error".to_string(),
             ),
         }

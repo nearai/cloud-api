@@ -7,7 +7,7 @@ CREATE TABLE files (
     purpose VARCHAR(20) NOT NULL,
     storage_key TEXT NOT NULL,
     workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    uploaded_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    uploaded_by_api_key_id UUID REFERENCES api_keys(id) ON DELETE CASCADE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at TIMESTAMPTZ,
     CONSTRAINT files_purpose_check CHECK (purpose IN ('assistants', 'batch', 'fine-tune', 'vision', 'user_data', 'evals'))

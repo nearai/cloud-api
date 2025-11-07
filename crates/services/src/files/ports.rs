@@ -15,7 +15,7 @@ pub struct File {
     pub purpose: String,
     pub storage_key: String,
     pub workspace_id: Uuid,
-    pub uploaded_by_user_id: Option<Uuid>,
+    pub uploaded_by_api_key_id: Uuid,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
 }
@@ -29,7 +29,7 @@ pub struct CreateFileParams {
     pub purpose: String,
     pub storage_key: String,
     pub workspace_id: Uuid,
-    pub uploaded_by_user_id: Option<Uuid>,
+    pub uploaded_by_api_key_id: Uuid,
     pub expires_at: Option<DateTime<Utc>>,
 }
 

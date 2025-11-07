@@ -11,6 +11,7 @@ use axum::{
 };
 use services::files::calculate_expires_at;
 use tracing::{debug, error};
+use uuid::Uuid;
 
 const MAX_FILE_SIZE: u64 = 512 * 1024 * 1024; // 512 MB
 
@@ -186,6 +187,18 @@ pub async fn upload_file(
             None
         };
 
+    // Parse API key ID
+    let api_key_id = Uuid::parse_str(&api_key.id.0).map_err(|e| {
+        error!("Failed to parse API key ID: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new(
+                "Invalid API key ID".to_string(),
+                "internal_error".to_string(),
+            )),
+        )
+    })?;
+
     // Use file service to handle upload (includes validation, storage, and DB operations)
     let file = app_state
         .files_service
@@ -195,7 +208,7 @@ pub async fn upload_file(
             content_type,
             purpose,
             workspace_id: api_key.workspace_id.0,
-            uploaded_by_user_id: Some(api_key.created_by_user_id.0),
+            uploaded_by_api_key_id: api_key_id,
             expires_at,
         })
         .await

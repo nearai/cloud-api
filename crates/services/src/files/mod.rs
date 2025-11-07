@@ -177,7 +177,7 @@ pub struct UploadFileParams {
     pub content_type: String,
     pub purpose: String,
     pub workspace_id: Uuid,
-    pub uploaded_by_user_id: Option<Uuid>,
+    pub uploaded_by_api_key_id: Uuid,
     pub expires_at: Option<DateTime<Utc>>,
 }
 
@@ -265,7 +265,7 @@ impl FileServiceTrait for FileServiceImpl {
                 purpose: params.purpose,
                 storage_key,
                 workspace_id: params.workspace_id,
-                uploaded_by_user_id: params.uploaded_by_user_id,
+                uploaded_by_api_key_id: params.uploaded_by_api_key_id,
                 expires_at: params.expires_at,
             })
             .await?;

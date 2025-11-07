@@ -94,7 +94,7 @@ jobs:
         DEV: "true"
 
     - name: Run vLLM integration tests
-      run: cargo test --test integration_tests
+      run: cargo test --test integration_tests -- --nocapture
       env:
         VLLM_BASE_URL: ${{ secrets.VLLM_BASE_URL }}
         VLLM_API_KEY: ${{ secrets.VLLM_API_KEY }}

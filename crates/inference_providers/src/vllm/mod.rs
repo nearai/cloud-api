@@ -140,7 +140,7 @@ impl InferenceProvider for VLlmProvider {
             .headers(headers)
             .send()
             .await
-            .map_err(|e| ListModelsError::FetchError(e.to_string()))?;
+            .map_err(|e| ListModelsError::FetchError(format!("{e:?}")))?;
 
         if !response.status().is_success() {
             return Err(ListModelsError::FetchError(format!(

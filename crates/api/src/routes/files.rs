@@ -13,7 +13,7 @@ use services::files::calculate_expires_at;
 use tracing::{debug, error};
 use uuid::Uuid;
 
-const MAX_FILE_SIZE: u64 = 512 * 1024 * 1024; // 512 MB
+pub const MAX_FILE_SIZE: usize = 512 * 1024 * 1024; // 512 MB
 
 #[utoipa::path(
     post,
@@ -53,6 +53,8 @@ pub async fn upload_file(
             "file" => {
                 filename = field.file_name().map(|s| s.to_string());
                 content_type = field.content_type().map(|s| s.to_string());
+
+                // Read file data (size limit enforced by DefaultBodyLimit layer at framework level)
                 let data = field.bytes().await.map_err(|e| {
                     error!("Failed to read file data: {}", e);
                     (
@@ -64,8 +66,8 @@ pub async fn upload_file(
                     )
                 })?;
 
-                // Check file size
-                if data.len() as u64 > MAX_FILE_SIZE {
+                // Defense-in-depth: verify size (should already be caught by DefaultBodyLimit layer)
+                if data.len() > MAX_FILE_SIZE {
                     return Err((
                         StatusCode::PAYLOAD_TOO_LARGE,
                         Json(ErrorResponse::new(

@@ -1,6 +1,6 @@
 use crate::{models::StreamOptions, sse_parser::SSEParser, *};
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{header::HeaderValue, Client};
 
 /// Configuration for vLLM provider
 #[derive(Debug, Clone)]
@@ -45,18 +45,18 @@ impl VLlmProvider {
     }
 
     /// Build HTTP request headers
-    fn build_headers(&self) -> reqwest::header::HeaderMap {
+    fn build_headers(&self) -> Result<reqwest::header::HeaderMap, String> {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("Content-Type", "application/json".parse().unwrap());
+        headers.insert("Content-Type", HeaderValue::from_static("application/json"));
 
         if let Some(ref api_key) = self.config.api_key {
-            headers.insert(
-                "Authorization",
-                format!("Bearer {api_key}").parse().unwrap(),
-            );
+            let auth_value = format!("Bearer {}", api_key);
+            let header_value = HeaderValue::from_str(&auth_value)
+                .map_err(|e| format!("Invalid API key format: {}", e))?;
+            headers.insert("Authorization", header_value);
         }
 
-        headers
+        Ok(headers)
     }
 }
 
@@ -64,10 +64,13 @@ impl VLlmProvider {
 impl InferenceProvider for VLlmProvider {
     async fn get_signature(&self, chat_id: &str) -> Result<ChatSignature, CompletionError> {
         let url = format!("{}/v1/signature/{}", self.config.base_url, chat_id);
+        let headers = self
+            .build_headers()
+            .map_err(|e| CompletionError::CompletionError(e))?;
         let response = self
             .client
             .get(&url)
-            .headers(self.build_headers())
+            .headers(headers)
             .send()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
@@ -99,10 +102,13 @@ impl InferenceProvider for VLlmProvider {
             url.push_str(&format!("&signing_address={signing_address}"));
         }
 
+        let headers = self
+            .build_headers()
+            .map_err(|e| CompletionError::CompletionError(e))?;
         let response = self
             .client
             .get(&url)
-            .headers(self.build_headers())
+            .headers(headers)
             .send()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
@@ -127,10 +133,13 @@ impl InferenceProvider for VLlmProvider {
         let url = format!("{}/v1/models", self.config.base_url);
         tracing::debug!("Listing models from vLLM server, url: {}", url);
 
+        let headers = self
+            .build_headers()
+            .map_err(|e| ListModelsError::FetchError(e))?;
         let response = self
             .client
             .get(&url)
-            .headers(self.build_headers())
+            .headers(headers)
             .send()
             .await
             .map_err(|e| ListModelsError::FetchError(e.to_string()))?;
@@ -166,8 +175,13 @@ impl InferenceProvider for VLlmProvider {
             include_usage: Some(true),
         });
 
-        let mut headers = self.build_headers();
-        headers.insert("X-Request-Hash", request_hash.parse().unwrap());
+        let mut headers = self
+            .build_headers()
+            .map_err(|e| CompletionError::CompletionError(e))?;
+        let request_hash_value = HeaderValue::from_str(&request_hash).map_err(|e| {
+            CompletionError::CompletionError(format!("Invalid request hash: {}", e))
+        })?;
+        headers.insert("X-Request-Hash", request_hash_value);
 
         let response = self
             .client
@@ -199,8 +213,13 @@ impl InferenceProvider for VLlmProvider {
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
         let url = format!("{}/v1/chat/completions", self.config.base_url);
 
-        let mut headers = self.build_headers();
-        headers.insert("X-Request-Hash", request_hash.parse().unwrap());
+        let mut headers = self
+            .build_headers()
+            .map_err(|e| CompletionError::CompletionError(e))?;
+        let request_hash_value = HeaderValue::from_str(&request_hash).map_err(|e| {
+            CompletionError::CompletionError(format!("Invalid request hash: {}", e))
+        })?;
+        headers.insert("X-Request-Hash", request_hash_value);
 
         let response = self
             .client
@@ -252,10 +271,13 @@ impl InferenceProvider for VLlmProvider {
             include_usage: Some(true),
         });
 
+        let headers = self
+            .build_headers()
+            .map_err(|e| CompletionError::CompletionError(e))?;
         let response = self
             .client
             .post(&url)
-            .headers(self.build_headers())
+            .headers(headers)
             .json(&streaming_params)
             .send()
             .await

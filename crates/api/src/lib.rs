@@ -336,6 +336,7 @@ pub async fn init_inference_providers(
             discovery_url,
             api_key,
             config.model_discovery.timeout,
+            config.model_discovery.inference_timeout,
         ),
     );
 
@@ -961,6 +962,7 @@ mod tests {
                 api_key: Some("test-key".to_string()),
                 refresh_interval: 0,
                 timeout: 5,
+                inference_timeout: 30 * 60, // 30 minutes
             },
             logging: config::LoggingConfig {
                 level: "info".to_string(),
@@ -1045,6 +1047,7 @@ mod tests {
                 api_key: Some("test-key".to_string()),
                 refresh_interval: 0,
                 timeout: 5,
+                inference_timeout: 30 * 60, // 30 minutes
             },
             logging: config::LoggingConfig {
                 level: "info".to_string(),

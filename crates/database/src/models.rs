@@ -342,8 +342,6 @@ pub struct Response {
     pub workspace_id: Uuid,
     pub api_key_id: Uuid,
     pub model: String,
-    pub input_messages: serde_json::Value, // JSONB storing input messages
-    pub output_message: Option<String>,
     pub status: ResponseStatus,
     pub instructions: Option<String>,
     pub conversation_id: Option<Uuid>,

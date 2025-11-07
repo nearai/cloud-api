@@ -1,14 +1,18 @@
 use crate::{middleware::AuthenticatedUser, models::*};
+use inference_providers::{
+    ChatCompletionParams, ChatMessage, CompletionParams, FinishReason, MessageRole, TokenUsage,
+};
+use services::completions::CompletionError;
 
-impl From<&crate::models::Message> for services::ChatMessage {
+impl From<&crate::models::Message> for ChatMessage {
     fn from(msg: &crate::models::Message) -> Self {
         Self {
             role: match msg.role.as_str() {
-                "system" => services::MessageRole::System,
-                "user" => services::MessageRole::User,
-                "assistant" => services::MessageRole::Assistant,
-                "tool" => services::MessageRole::Tool,
-                _ => services::MessageRole::User, // Default to user for unknown roles
+                "system" => MessageRole::System,
+                "user" => MessageRole::User,
+                "assistant" => MessageRole::Assistant,
+                "tool" => MessageRole::Tool,
+                _ => MessageRole::User, // Default to user for unknown roles
             },
             content: msg.content.clone(),
             name: msg.name.clone(),
@@ -18,7 +22,7 @@ impl From<&crate::models::Message> for services::ChatMessage {
     }
 }
 
-impl From<&ChatCompletionRequest> for services::ChatCompletionParams {
+impl From<&ChatCompletionRequest> for ChatCompletionParams {
     fn from(req: &ChatCompletionRequest) -> Self {
         Self {
             model: req.model.clone(),
@@ -49,7 +53,7 @@ impl From<&ChatCompletionRequest> for services::ChatCompletionParams {
     }
 }
 
-impl From<&CompletionRequest> for services::CompletionParams {
+impl From<&CompletionRequest> for CompletionParams {
     fn from(req: &CompletionRequest) -> Self {
         Self {
             model: req.model.clone(),
@@ -74,14 +78,14 @@ impl From<&CompletionRequest> for services::CompletionParams {
     }
 }
 
-impl From<&services::ChatMessage> for crate::models::Message {
-    fn from(msg: &services::ChatMessage) -> Self {
+impl From<&ChatMessage> for crate::models::Message {
+    fn from(msg: &ChatMessage) -> Self {
         Self {
             role: match msg.role {
-                services::MessageRole::System => "system".to_string(),
-                services::MessageRole::User => "user".to_string(),
-                services::MessageRole::Assistant => "assistant".to_string(),
-                services::MessageRole::Tool => "tool".to_string(),
+                MessageRole::System => "system".to_string(),
+                MessageRole::User => "user".to_string(),
+                MessageRole::Assistant => "assistant".to_string(),
+                MessageRole::Tool => "tool".to_string(),
             },
             content: msg.content.clone(),
             name: msg.name.clone(),
@@ -90,17 +94,17 @@ impl From<&services::ChatMessage> for crate::models::Message {
 }
 
 #[allow(dead_code)]
-fn finish_reason_to_string(reason: &services::FinishReason) -> String {
+fn finish_reason_to_string(reason: &FinishReason) -> String {
     match reason {
-        services::FinishReason::Stop => "stop".to_string(),
-        services::FinishReason::Length => "length".to_string(),
-        services::FinishReason::ContentFilter => "content_filter".to_string(),
-        services::FinishReason::ToolCalls => "tool_calls".to_string(),
+        FinishReason::Stop => "stop".to_string(),
+        FinishReason::Length => "length".to_string(),
+        FinishReason::ContentFilter => "content_filter".to_string(),
+        FinishReason::ToolCalls => "tool_calls".to_string(),
     }
 }
 
-impl From<&services::TokenUsage> for crate::models::Usage {
-    fn from(usage: &services::TokenUsage) -> Self {
+impl From<&TokenUsage> for crate::models::Usage {
+    fn from(usage: &TokenUsage) -> Self {
         Self {
             input_tokens: usage.prompt_tokens,
             input_tokens_details: Some(InputTokensDetails { cached_tokens: 0 }),
@@ -117,26 +121,26 @@ impl From<&services::TokenUsage> for crate::models::Usage {
 // since the service only supports streaming. Response construction is handled
 // directly in the route handlers by collecting stream events.
 
-impl From<services::CompletionError> for crate::models::ErrorResponse {
-    fn from(err: services::CompletionError) -> Self {
+impl From<CompletionError> for crate::models::ErrorResponse {
+    fn from(err: CompletionError) -> Self {
         match err {
-            services::CompletionError::InvalidModel(msg) => ErrorResponse::with_param(
+            CompletionError::InvalidModel(msg) => ErrorResponse::with_param(
                 msg,
                 "invalid_request_error".to_string(),
                 "model".to_string(),
             ),
-            services::CompletionError::InvalidParams(msg) => {
+            CompletionError::InvalidParams(msg) => {
                 ErrorResponse::new(msg, "invalid_request_error".to_string())
             }
-            services::CompletionError::RateLimitExceeded => ErrorResponse::new(
+            CompletionError::RateLimitExceeded => ErrorResponse::new(
                 "Rate limit exceeded".to_string(),
                 "rate_limit_exceeded".to_string(),
             ),
-            services::CompletionError::ProviderError(msg) => ErrorResponse::new(
+            CompletionError::ProviderError(msg) => ErrorResponse::new(
                 format!("Provider error: {msg}"),
                 "provider_error".to_string(),
             ),
-            services::CompletionError::InternalError(msg) => ErrorResponse::new(
+            CompletionError::InternalError(msg) => ErrorResponse::new(
                 format!("Internal server error: {msg}"),
                 "internal_server_error".to_string(),
             ),
@@ -558,8 +562,8 @@ mod tests {
             name: None,
         };
 
-        let domain_msg: services::ChatMessage = (&http_msg).into();
-        assert!(matches!(domain_msg.role, services::MessageRole::User));
+        let domain_msg: ChatMessage = (&http_msg).into();
+        assert!(matches!(domain_msg.role, MessageRole::User));
         assert_eq!(domain_msg.content, Some("Hello".to_string()));
 
         let back_to_http: crate::models::Message = (&domain_msg).into();
@@ -588,7 +592,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let domain_params: services::ChatCompletionParams = (&http_req).into();
+        let domain_params: ChatCompletionParams = (&http_req).into();
         assert_eq!(domain_params.model, "gpt-3.5-turbo");
         assert_eq!(domain_params.messages.len(), 1);
         assert_eq!(domain_params.max_tokens, Some(100));

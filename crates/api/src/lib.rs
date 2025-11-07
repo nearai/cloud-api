@@ -207,6 +207,10 @@ pub async fn init_domain_services(
         database.pool().clone(),
     ));
     let response_repo = Arc::new(database::PgResponseRepository::new(database.pool().clone()));
+    let response_items_repo = Arc::new(database::PgResponseItemsRepository::new(
+        database.pool().clone(),
+    ))
+        as Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>;
     let user_repo = Arc::new(database::UserRepository::new(database.pool().clone()))
         as Arc<dyn services::auth::UserRepository>;
     let attestation_repo = Arc::new(database::PgAttestationRepository::new(
@@ -220,6 +224,7 @@ pub async fn init_domain_services(
     let conversation_service = Arc::new(services::ConversationService::new(
         conversation_repo.clone(),
         response_repo.clone(),
+        response_items_repo.clone(),
     ));
 
     // Create inference provider pool
@@ -245,13 +250,6 @@ pub async fn init_domain_services(
     let limits_repository_for_usage = Arc::new(
         database::repositories::OrganizationLimitsRepository::new(database.pool().clone()),
     );
-
-    // Create response service
-    let response_service = Arc::new(services::ResponseService::new(
-        response_repo,
-        inference_provider_pool.clone(),
-        conversation_service.clone(),
-    ));
 
     // Create MCP client manager
     let mcp_manager = Arc::new(services::mcp::McpClientManager::new());
@@ -286,6 +284,19 @@ pub async fn init_domain_services(
         attestation_service.clone(),
         usage_service.clone(),
         models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
+    ));
+
+    let web_search_provider =
+        Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
+
+    let response_service = Arc::new(services::ResponseService::new(
+        response_repo,
+        response_items_repo.clone(),
+        inference_provider_pool.clone(),
+        conversation_service.clone(),
+        completion_service.clone(),
+        Some(web_search_provider), // web_search_provider
+        None,                      // file_search_provider
     ));
 
     // Create session repository for user service
@@ -324,6 +335,7 @@ pub async fn init_inference_providers(
             discovery_url,
             api_key,
             config.model_discovery.timeout,
+            config.model_discovery.inference_timeout,
         ),
     );
 
@@ -568,7 +580,7 @@ pub fn build_response_routes(
         .with_state(response_service)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
-            auth_middleware_with_api_key,
+            middleware::auth::auth_middleware_with_workspace_context,
         ))
         .layer(from_fn(middleware::body_hash_middleware))
 }
@@ -596,7 +608,10 @@ pub fn build_conversation_routes(
             "/conversations/{conversation_id}/items",
             get(conversations::list_conversation_items),
         )
-        .with_state(conversation_service)
+        .with_state(
+            conversation_service
+                as Arc<dyn services::conversations::ports::ConversationServiceTrait>,
+        )
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware_with_api_key,
@@ -938,6 +953,7 @@ mod tests {
                 api_key: Some("test-key".to_string()),
                 refresh_interval: 0,
                 timeout: 5,
+                inference_timeout: 30 * 60, // 30 minutes
             },
             logging: config::LoggingConfig {
                 level: "info".to_string(),
@@ -1022,6 +1038,7 @@ mod tests {
                 api_key: Some("test-key".to_string()),
                 refresh_interval: 0,
                 timeout: 5,
+                inference_timeout: 30 * 60, // 30 minutes
             },
             logging: config::LoggingConfig {
                 level: "info".to_string(),

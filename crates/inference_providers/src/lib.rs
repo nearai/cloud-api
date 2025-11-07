@@ -68,8 +68,8 @@ use tokio_stream::StreamExt;
 pub use models::{
     ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionResponseWithBytes, ChatDelta, ChatMessage, ChatResponseMessage, ChatSignature,
-    CompletionError, CompletionParams, FinishReason, FunctionDefinition, MessageRole, ModelInfo,
-    StreamChunk, StreamOptions, TokenUsage, ToolChoice, ToolDefinition,
+    CompletionError, CompletionParams, FinishReason, FunctionChoice, FunctionDefinition,
+    MessageRole, ModelInfo, StreamChunk, StreamOptions, TokenUsage, ToolChoice, ToolDefinition,
 };
 pub use sse_parser::SSEEvent;
 pub use vllm::{VLlmConfig, VLlmProvider};

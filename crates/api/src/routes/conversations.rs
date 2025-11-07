@@ -72,16 +72,15 @@ pub async fn create_conversation(
     }
 
     // Parse API key ID from string to UUID
-    let api_key_uuid = uuid::Uuid::parse_str(&api_key.id.0)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Invalid API key ID format: {}", e),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
+    let api_key_uuid = uuid::Uuid::parse_str(&api_key.id.0).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse::new(
+                format!("Invalid API key ID format: {e}"),
+                "internal_server_error".to_string(),
+            )),
+        )
+    })?;
 
     let domain_request = services::conversations::models::ConversationRequest {
         workspace_id: api_key.workspace_id.clone(),
@@ -382,7 +381,7 @@ pub async fn list_conversation_items(
             // Convert ResponseOutputItems to ConversationItems
             let http_items: Vec<ConversationItem> = items
                 .into_iter()
-                .map(|item| convert_output_item_to_conversation_item(item))
+                .map(convert_output_item_to_conversation_item)
                 .collect();
 
             // Now check has_more and truncate AFTER filtering
@@ -407,7 +406,7 @@ pub async fn list_conversation_items(
         Err(error) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             ResponseJson(ErrorResponse::new(
-                format!("Failed to get conversation items: {}", error),
+                format!("Failed to get conversation items: {error}"),
                 "internal_error".to_string(),
             )),
         )),
@@ -441,7 +440,7 @@ fn convert_output_item_to_conversation_item(
                         annotations: Some(
                             annotations
                                 .into_iter()
-                                .map(|a| convert_text_annotation(a))
+                                .map(convert_text_annotation)
                                 .map(|a| serde_json::to_value(a).unwrap())
                                 .collect(),
                         ),

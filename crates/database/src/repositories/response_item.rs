@@ -74,13 +74,13 @@ impl PgResponseItemsRepository {
         let parts: Vec<&str> = item_id.split('_').collect();
 
         let uuid = Uuid::parse_str(parts[parts.len() - 1])
-            .with_context(|| format!("Failed to parse UUID from item ID: {}", item_id))?;
+            .with_context(|| format!("Failed to parse UUID from item ID: {item_id}"))?;
         Ok(uuid)
     }
 
     /// Helper to create a response item ID from a UUID
     pub fn create_item_id(uuid: Uuid, prefix: &str) -> String {
-        format!("{}_{}", prefix, uuid)
+        format!("{prefix}_{uuid}")
     }
 }
 

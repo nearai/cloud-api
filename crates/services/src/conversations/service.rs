@@ -61,7 +61,10 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
     ) -> Result<models::Conversation, errors::ConversationError> {
         let metadata = request.metadata.unwrap_or_else(|| serde_json::json!({}));
 
-        tracing::info!("Creating conversation for workspace: {}", request.workspace_id.0);
+        tracing::info!(
+            "Creating conversation for workspace: {}",
+            request.workspace_id.0
+        );
 
         let db_conversation = self
             .conv_repo

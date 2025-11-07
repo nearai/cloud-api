@@ -7,8 +7,10 @@ use crate::{conversations::errors, workspace::WorkspaceId};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationId(pub Uuid);
 
-impl ConversationId {
-    pub fn from_str(value: &str) -> Result<Self, errors::ConversationError> {
+impl std::str::FromStr for ConversationId {
+    type Err = errors::ConversationError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         let value = value.strip_prefix("conv_").unwrap_or(value);
         Uuid::parse_str(value).map(ConversationId).map_err(|e| {
             errors::ConversationError::InvalidParams(format!(

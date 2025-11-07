@@ -210,7 +210,8 @@ pub async fn init_domain_services(
     let response_repo = Arc::new(database::PgResponseRepository::new(database.pool().clone()));
     let response_items_repo = Arc::new(database::PgResponseItemsRepository::new(
         database.pool().clone(),
-    )) as Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>;
+    ))
+        as Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>;
     let user_repo = Arc::new(database::UserRepository::new(database.pool().clone()))
         as Arc<dyn services::auth::UserRepository>;
     let attestation_repo = Arc::new(database::PgAttestationRepository::new(
@@ -610,7 +611,7 @@ pub fn build_conversation_routes(
             auth_state_middleware.clone(),
             auth_middleware_with_api_key,
         ));
-    
+
     let items_routes = Router::new()
         .route(
             "/conversations/{conversation_id}/items",
@@ -621,7 +622,7 @@ pub fn build_conversation_routes(
             auth_state_middleware.clone(),
             auth_middleware_with_api_key,
         ));
-    
+
     conversation_routes.merge(items_routes)
 }
 

@@ -3105,8 +3105,7 @@ async fn test_conversation_items_pagination_limit_1() {
             // Empty response - should ONLY happen when has_more=false
             assert!(
                 !page.has_more,
-                "Empty response at iteration {} but has_more=true (BUG!)",
-                iteration
+                "Empty response at iteration {iteration} but has_more=true (BUG!)"
             );
             consecutive_empty += 1;
             assert!(
@@ -3131,8 +3130,7 @@ async fn test_conversation_items_pagination_limit_1() {
             if let Some(prev_cursor) = &after {
                 assert_ne!(
                     &page.last_id, prev_cursor,
-                    "Cursor not advancing at iteration {} (infinite loop detected)",
-                    iteration
+                    "Cursor not advancing at iteration {iteration} (infinite loop detected)"
                 );
             }
         }
@@ -3150,8 +3148,7 @@ async fn test_conversation_items_pagination_limit_1() {
     // Verify we didn't hit the safety limit (would indicate infinite loop)
     assert!(
         iteration < max_iterations,
-        "Pagination didn't complete within {} iterations (infinite loop)",
-        max_iterations
+        "Pagination didn't complete within {max_iterations} iterations (infinite loop)"
     );
 
     // Verify we got all 10 items
@@ -3244,8 +3241,7 @@ async fn test_conversation_items_pagination_with_web_search() {
             // Empty response should ONLY happen when has_more=false
             assert!(
                 !page.has_more,
-                "Empty response at iteration {} but has_more=true (BUG: filtering issue)",
-                iteration
+                "Empty response at iteration {iteration} but has_more=true (BUG: filtering issue)"
             );
             break;
         }
@@ -3263,8 +3259,7 @@ async fn test_conversation_items_pagination_with_web_search() {
             if let Some(prev_cursor) = &after {
                 assert_ne!(
                     &page.last_id, prev_cursor,
-                    "Cursor not advancing at iteration {}",
-                    iteration
+                    "Cursor not advancing at iteration {iteration}"
                 );
             }
         }

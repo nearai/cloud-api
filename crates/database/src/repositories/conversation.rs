@@ -37,7 +37,12 @@ impl PgConversationRepository {
 #[async_trait]
 impl ConversationRepository for PgConversationRepository {
     /// Create a new conversation
-    async fn create(&self, workspace_id: WorkspaceId, api_key_id: uuid::Uuid, metadata: serde_json::Value) -> Result<Conversation> {
+    async fn create(
+        &self,
+        workspace_id: WorkspaceId,
+        api_key_id: uuid::Uuid,
+        metadata: serde_json::Value,
+    ) -> Result<Conversation> {
         let client = self
             .pool
             .get()
@@ -59,12 +64,19 @@ impl ConversationRepository for PgConversationRepository {
             .await
             .context("Failed to create conversation")?;
 
-        debug!("Created conversation: {} for workspace: {} with api_key: {}", id, workspace_id.0, api_key_id);
+        debug!(
+            "Created conversation: {} for workspace: {} with api_key: {}",
+            id, workspace_id.0, api_key_id
+        );
         self.row_to_conversation(row)
     }
 
     /// Get a conversation by ID
-    async fn get_by_id(&self, id: ConversationId, workspace_id: WorkspaceId) -> Result<Option<Conversation>> {
+    async fn get_by_id(
+        &self,
+        id: ConversationId,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<Conversation>> {
         let client = self
             .pool
             .get()
@@ -115,7 +127,10 @@ impl ConversationRepository for PgConversationRepository {
 
         match row {
             Some(row) => {
-                debug!("Updated conversation: {} for workspace: {}", id, workspace_id.0);
+                debug!(
+                    "Updated conversation: {} for workspace: {}",
+                    id, workspace_id.0
+                );
                 Ok(Some(self.row_to_conversation(row)?))
             }
             None => Ok(None),
@@ -139,7 +154,10 @@ impl ConversationRepository for PgConversationRepository {
             .context("Failed to delete conversation")?;
 
         if result > 0 {
-            debug!("Deleted conversation: {} for workspace: {}", id, workspace_id.0);
+            debug!(
+                "Deleted conversation: {} for workspace: {}",
+                id, workspace_id.0
+            );
             Ok(true)
         } else {
             Ok(false)

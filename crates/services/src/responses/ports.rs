@@ -32,7 +32,11 @@ pub trait ResponseRepositoryTrait: Send + Sync {
         usage: Option<serde_json::Value>,
     ) -> anyhow::Result<Option<models::ResponseObject>>;
 
-    async fn delete(&self, id: models::ResponseId, workspace_id: WorkspaceId) -> anyhow::Result<bool>;
+    async fn delete(
+        &self,
+        id: models::ResponseId,
+        workspace_id: WorkspaceId,
+    ) -> anyhow::Result<bool>;
 
     async fn cancel(
         &self,

@@ -12,6 +12,22 @@ use crate::inference_provider_pool::InferenceProviderPool;
 use crate::responses::tools;
 use crate::responses::{errors, models, ports};
 
+/// Context for processing a response stream
+struct ProcessStreamContext {
+    request: models::CreateResponseRequest,
+    user_id: crate::UserId,
+    api_key_id: String,
+    organization_id: uuid::Uuid,
+    workspace_id: uuid::Uuid,
+    body_hash: String,
+    response_repository: Arc<dyn ports::ResponseRepositoryTrait>,
+    response_items_repository: Arc<dyn ports::ResponseItemRepositoryTrait>,
+    completion_service: Arc<dyn CompletionServiceTrait>,
+    conversation_service: Arc<dyn ConversationServiceTrait>,
+    web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
+    file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
+}
+
 pub struct ResponseServiceImpl {
     pub response_repository: Arc<dyn ports::ResponseRepositoryTrait>,
     pub response_items_repository: Arc<dyn ports::ResponseItemRepositoryTrait>,
@@ -73,8 +89,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let file_search_provider = self.file_search_provider.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = Self::process_response_stream(
-                tx.clone(),
+            let context = ProcessStreamContext {
                 request,
                 user_id,
                 api_key_id,
@@ -87,9 +102,9 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 conversation_service,
                 web_search_provider,
                 file_search_provider,
-            )
-            .await
-            {
+            };
+
+            if let Err(e) = Self::process_response_stream(tx.clone(), context).await {
                 tracing::error!("Error processing response stream: {:?}", e);
 
                 // Send error event
@@ -129,8 +144,8 @@ impl ResponseServiceImpl {
                 models::ConversationReference::Object { id, .. } => id,
             };
 
-            let conv_id = ConversationId::from_str(id).map_err(|e| {
-                errors::ResponseError::InvalidParams(format!("Invalid conversation ID: {}", e))
+            let conv_id = id.parse::<ConversationId>().map_err(|e| {
+                errors::ResponseError::InvalidParams(format!("Invalid conversation ID: {e}"))
             })?;
 
             Ok(Some(conv_id))
@@ -146,10 +161,7 @@ impl ResponseServiceImpl {
         let response_uuid =
             uuid::Uuid::parse_str(response.id.strip_prefix("resp_").unwrap_or(&response.id))
                 .map_err(|e| {
-                    errors::ResponseError::InternalError(format!(
-                        "Invalid response ID format: {}",
-                        e
-                    ))
+                    errors::ResponseError::InternalError(format!("Invalid response ID format: {e}"))
                 })?;
 
         Ok(models::ResponseId(response_uuid))
@@ -209,8 +221,7 @@ impl ResponseServiceImpl {
                 Err(e) => {
                     tracing::error!("Error in completion stream: {}", e);
                     return Err(errors::ResponseError::InternalError(format!(
-                        "Stream error: {}",
-                        e
+                        "Stream error: {e}"
                     )));
                 }
             }
@@ -343,8 +354,7 @@ impl ResponseServiceImpl {
                     tool_calls_detected.push(ToolCallInfo {
                         tool_type: "__error__".to_string(),
                         query: format!(
-                            "Tool call at index {} is missing a tool name. Please ensure all tool calls include a valid 'name' field. Arguments provided: {}",
-                            idx, args_str
+                            "Tool call at index {idx} is missing a tool name. Please ensure all tool calls include a valid 'name' field. Arguments provided: {args_str}"
                         ),
                         params: Some(serde_json::json!({
                             "error_type": "missing_tool_name",
@@ -390,8 +400,7 @@ impl ResponseServiceImpl {
                         tool_calls_detected.push(ToolCallInfo {
                             tool_type: "__error__".to_string(),
                             query: format!(
-                                "Tool call for '{}' (index {}) is missing the required 'query' field in its arguments. Please include a 'query' parameter. Arguments provided: {}",
-                                name, idx, args_str
+                                "Tool call for '{name}' (index {idx}) is missing the required 'query' field in its arguments. Please include a 'query' parameter. Arguments provided: {args_str}"
                             ),
                             params: Some(serde_json::json!({
                                 "error_type": "missing_query_field",
@@ -412,8 +421,7 @@ impl ResponseServiceImpl {
                     tool_calls_detected.push(ToolCallInfo {
                         tool_type: "__error__".to_string(),
                         query: format!(
-                            "Tool call for '{}' (index {}) has invalid JSON arguments. Please ensure arguments are valid JSON. Arguments provided: {}",
-                            name, idx, args_str
+                            "Tool call for '{name}' (index {idx}) has invalid JSON arguments. Please ensure arguments are valid JSON. Arguments provided: {args_str}"
                         ),
                         params: Some(serde_json::json!({
                             "error_type": "invalid_json",
@@ -432,51 +440,40 @@ impl ResponseServiceImpl {
     /// Process the response stream - main logic
     async fn process_response_stream(
         tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
-        request: models::CreateResponseRequest,
-        user_id: crate::UserId,
-        api_key_id: String,
-        organization_id: uuid::Uuid,
-        workspace_id: uuid::Uuid,
-        body_hash: String,
-        response_repository: Arc<dyn ports::ResponseRepositoryTrait>,
-        response_items_repository: Arc<dyn ports::ResponseItemRepositoryTrait>,
-        completion_service: Arc<dyn CompletionServiceTrait>,
-        conversation_service: Arc<dyn ConversationServiceTrait>,
-        web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
-        file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
+        context: ProcessStreamContext,
     ) -> Result<(), errors::ResponseError> {
         tracing::info!("Starting response stream processing");
 
-        let conversation_id = Self::parse_conversation_id(&request)?;
+        let conversation_id = Self::parse_conversation_id(&context.request)?;
 
-        let workspace_id_domain = crate::workspace::WorkspaceId(workspace_id);
+        let workspace_id_domain = crate::workspace::WorkspaceId(context.workspace_id);
         let mut messages = Self::load_conversation_context(
-            &request,
-            &conversation_service,
-            &response_items_repository,
+            &context.request,
+            &context.conversation_service,
+            &context.response_items_repository,
             workspace_id_domain.clone(),
         )
         .await?;
 
         // Create the response in the database FIRST before creating any response items
         // This ensures the foreign key constraint is satisfied
-        let api_key_uuid = Uuid::parse_str(&api_key_id).map_err(|e| {
-            errors::ResponseError::InternalError(format!("Invalid API key ID: {}", e))
+        let api_key_uuid = Uuid::parse_str(&context.api_key_id).map_err(|e| {
+            errors::ResponseError::InternalError(format!("Invalid API key ID: {e}"))
         })?;
-        let initial_response = response_repository
-            .create(workspace_id_domain.clone(), api_key_uuid, request.clone())
+        let initial_response = context.response_repository
+            .create(workspace_id_domain.clone(), api_key_uuid, context.request.clone())
             .await
             .map_err(|e| {
-                errors::ResponseError::InternalError(format!("Failed to create response: {}", e))
+                errors::ResponseError::InternalError(format!("Failed to create response: {e}"))
             })?;
 
         // Extract response_id from the created response
         let response_id = Self::extract_response_uuid(&initial_response)?;
 
         // Store user input messages as response_items
-        if let Some(input) = &request.input {
+        if let Some(input) = &context.request.input {
             Self::store_input_as_response_items(
-                &response_items_repository,
+                &context.response_items_repository,
                 response_id.clone(),
                 api_key_uuid,
                 conversation_id.clone(),
@@ -506,18 +503,18 @@ impl ResponseServiceImpl {
         // Spawn background task to generate conversation title if needed
         let title_task_handle = Self::maybe_generate_conversation_title(
             conversation_id.clone(),
-            &request,
-            user_id.clone(),
-            api_key_id.clone(),
-            organization_id,
-            workspace_id,
-            conversation_service.clone(),
-            completion_service.clone(),
+            &context.request,
+            context.user_id.clone(),
+            context.api_key_id.clone(),
+            context.organization_id,
+            context.workspace_id,
+            context.conversation_service.clone(),
+            context.completion_service.clone(),
             emitter.tx.clone(),
         );
 
-        let tools = Self::prepare_tools(&request);
-        let tool_choice = Self::prepare_tool_choice(&request);
+        let tools = Self::prepare_tools(&context.request);
+        let tool_choice = Self::prepare_tool_choice(&context.request);
 
         let max_iterations = 100; // Prevent infinite loops
         let mut iteration = 0;
@@ -529,20 +526,20 @@ impl ResponseServiceImpl {
             &mut emitter,
             &mut messages,
             &mut final_response_text,
-            &request,
-            user_id.clone(),
-            &api_key_id,
-            organization_id,
-            workspace_id,
-            &body_hash,
+            &context.request,
+            context.user_id.clone(),
+            &context.api_key_id,
+            context.organization_id,
+            context.workspace_id,
+            &context.body_hash,
             &tools,
             &tool_choice,
             max_iterations,
             &mut iteration,
-            &response_items_repository,
-            &completion_service,
-            &web_search_provider,
-            &file_search_provider,
+            &context.response_items_repository,
+            &context.completion_service,
+            &context.web_search_provider,
+            &context.file_search_provider,
         )
         .await?;
 
@@ -551,14 +548,11 @@ impl ResponseServiceImpl {
         final_response.status = models::ResponseStatus::Completed;
 
         // Load all response items from the database for this response
-        let response_items = response_items_repository
+        let response_items = context.response_items_repository
             .list_by_response(ctx.response_id.clone())
             .await
             .map_err(|e| {
-                errors::ResponseError::InternalError(format!(
-                    "Failed to load response items: {}",
-                    e
-                ))
+                errors::ResponseError::InternalError(format!("Failed to load response items: {e}"))
             })?;
 
         // Filter to get only assistant output items (excluding user input items)
@@ -583,11 +577,11 @@ impl ResponseServiceImpl {
 
         // Serialize usage to JSON for database storage
         let usage_json = serde_json::to_value(&final_response.usage).map_err(|e| {
-            errors::ResponseError::InternalError(format!("Failed to serialize usage: {}", e))
+            errors::ResponseError::InternalError(format!("Failed to serialize usage: {e}"))
         })?;
 
         // Update the response in the database with usage, status, and output message
-        if let Err(e) = response_repository
+        if let Err(e) = context.response_repository
             .update(
                 ctx.response_id.clone(),
                 workspace_id_domain.clone(),
@@ -693,7 +687,7 @@ impl ResponseServiceImpl {
                 .create_chat_completion_stream(completion_request)
                 .await
                 .map_err(|e| {
-                    errors::ResponseError::InternalError(format!("Completion error: {}", e))
+                    errors::ResponseError::InternalError(format!("Completion error: {e}"))
                 })?;
 
             // Process the completion stream and extract text + tool calls
@@ -792,13 +786,10 @@ impl ResponseServiceImpl {
                 let error_message = match &e {
                     errors::ResponseError::UnknownTool(tool_name) => {
                         if tool_name.is_empty() {
-                            format!(
-                                "ERROR: Tool call is missing a tool name. Please ensure all tool calls include a valid 'name' field. Available tools: web_search, file_search, current_date"
-                            )
+                            "ERROR: Tool call is missing a tool name. Please ensure all tool calls include a valid 'name' field. Available tools: web_search, file_search, current_date".to_string()
                         } else {
                             format!(
-                                "ERROR: Unknown tool '{}'. Available tools are: web_search, file_search, current_date. Please use one of these valid tool names.",
-                                tool_name
+                                "ERROR: Unknown tool '{tool_name}'. Available tools are: web_search, file_search, current_date. Please use one of these valid tool names."
                             )
                         }
                     }
@@ -993,8 +984,7 @@ impl ResponseServiceImpl {
                     .await
                     .map_err(|e| {
                         errors::ResponseError::InternalError(format!(
-                            "Failed to store user input: {}",
-                            e
+                            "Failed to store user input: {e}"
                         ))
                     })?;
             }
@@ -1047,8 +1037,7 @@ impl ResponseServiceImpl {
                         .await
                         .map_err(|e| {
                             errors::ResponseError::InternalError(format!(
-                                "Failed to store user input item: {}",
-                                e
+                                "Failed to store user input item: {e}"
                             ))
                         })?;
                 }
@@ -1085,18 +1074,16 @@ impl ResponseServiceImpl {
         if let Some(conversation_ref) = &request.conversation {
             let conversation_id = match conversation_ref {
                 models::ConversationReference::Id(id) => {
-                    crate::conversations::models::ConversationId::from_str(id).map_err(|e| {
+                    id.parse::<crate::conversations::models::ConversationId>().map_err(|e| {
                         errors::ResponseError::InvalidParams(format!(
-                            "Invalid conversation ID: {}",
-                            e
+                            "Invalid conversation ID: {e}"
                         ))
                     })?
                 }
                 models::ConversationReference::Object { id, metadata: _ } => {
-                    crate::conversations::models::ConversationId::from_str(id).map_err(|e| {
+                    id.parse::<crate::conversations::models::ConversationId>().map_err(|e| {
                         errors::ResponseError::InvalidParams(format!(
-                            "Invalid conversation ID: {}",
-                            e
+                            "Invalid conversation ID: {e}"
                         ))
                     })?
                 }
@@ -1107,10 +1094,7 @@ impl ResponseServiceImpl {
                 .get_conversation(conversation_id.clone(), workspace_id.clone())
                 .await
                 .map_err(|e| {
-                    errors::ResponseError::InternalError(format!(
-                        "Failed to get conversation: {}",
-                        e
-                    ))
+                    errors::ResponseError::InternalError(format!("Failed to get conversation: {e}"))
                 })?;
 
             // Load all response items from the conversation
@@ -1120,39 +1104,35 @@ impl ResponseServiceImpl {
                 .await
                 .map_err(|e| {
                     errors::ResponseError::InternalError(format!(
-                        "Failed to load conversation items: {}",
-                        e
+                        "Failed to load conversation items: {e}"
                     ))
                 })?;
 
             // Convert response items to completion messages
             let messages_before = messages.len();
             for item in conversation_items {
-                match item {
-                    models::ResponseOutputItem::Message { role, content, .. } => {
-                        // Extract text from content parts
-                        let text = content
-                            .iter()
-                            .filter_map(|part| match part {
-                                models::ResponseOutputContent::OutputText { text, .. } => {
-                                    Some(text.clone())
-                                }
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
+                if let models::ResponseOutputItem::Message { role, content, .. } = item {
+                    // Extract text from content parts
+                    let text = content
+                        .iter()
+                        .filter_map(|part| match part {
+                            models::ResponseOutputContent::OutputText { text, .. } => {
+                                Some(text.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
 
-                        if !text.is_empty() {
-                            messages.push(CompletionMessage {
-                                role: role.clone(),
-                                content: text,
-                            });
-                        }
+                    if !text.is_empty() {
+                        messages.push(CompletionMessage {
+                            role: role.clone(),
+                            content: text,
+                        });
                     }
-                    // For now, we only process message items
-                    // TODO: Handle other item types (tool calls, web searches, etc.) if needed
-                    _ => {}
                 }
+                // For now, we only process message items
+                // TODO: Handle other item types (tool calls, web searches, etc.) if needed
             }
 
             let loaded_count = messages.len() - messages_before;
@@ -1478,18 +1458,15 @@ impl ResponseServiceImpl {
     ) {
         use inference_providers::StreamChunk;
 
-        match &event.chunk {
-            StreamChunk::Chat(chat_chunk) => {
-                if let Some(usage) = &chat_chunk.usage {
-                    tracing::debug!(
-                        "Extracted usage from completion stream: input={}, output={}",
-                        usage.prompt_tokens,
-                        usage.completion_tokens
-                    );
-                    ctx.add_usage(usage.prompt_tokens, usage.completion_tokens);
-                }
+        if let StreamChunk::Chat(chat_chunk) = &event.chunk {
+            if let Some(usage) = &chat_chunk.usage {
+                tracing::debug!(
+                    "Extracted usage from completion stream: input={}, output={}",
+                    usage.prompt_tokens,
+                    usage.completion_tokens
+                );
+                ctx.add_usage(usage.prompt_tokens, usage.completion_tokens);
             }
-            _ => {}
         }
     }
 
@@ -1500,47 +1477,43 @@ impl ResponseServiceImpl {
     ) {
         use inference_providers::StreamChunk;
 
-        match &event.chunk {
-            StreamChunk::Chat(chat_chunk) => {
-                for choice in &chat_chunk.choices {
-                    if let Some(delta) = &choice.delta {
-                        if let Some(tool_calls) = &delta.tool_calls {
-                            for tool_call in tool_calls {
-                                // Get or default to index 0 if not present
-                                let index = tool_call.index.unwrap_or(0);
+        if let StreamChunk::Chat(chat_chunk) = &event.chunk {
+            for choice in &chat_chunk.choices {
+                if let Some(delta) = &choice.delta {
+                    if let Some(tool_calls) = &delta.tool_calls {
+                        for tool_call in tool_calls {
+                            // Get or default to index 0 if not present
+                            let index = tool_call.index.unwrap_or(0);
 
-                                // Get or create accumulator entry for this index
-                                let entry =
-                                    accumulator.entry(index).or_insert((None, String::new()));
+                            // Get or create accumulator entry for this index
+                            let entry = accumulator.entry(index).or_insert((None, String::new()));
 
-                                // Handle function delta if present
-                                if let Some(function) = &tool_call.function {
-                                    // Accumulate function name (only set once, typically in first chunk)
-                                    if let Some(name) = &function.name {
-                                        tracing::debug!(
-                                            "Accumulated tool call {} name: {}",
-                                            index,
-                                            name
-                                        );
-                                        entry.0 = Some(name.clone());
-                                    }
+                            // Handle function delta if present
+                            if let Some(function) = &tool_call.function {
+                                // Accumulate function name (only set once, typically in first chunk)
+                                if let Some(name) = &function.name {
+                                    tracing::debug!(
+                                        "Accumulated tool call {} name: {}",
+                                        index,
+                                        name
+                                    );
+                                    entry.0 = Some(name.clone());
+                                }
 
-                                    // Accumulate arguments (streamed across multiple chunks)
-                                    if let Some(args_fragment) = &function.arguments {
-                                        tracing::debug!(
-                                            "Accumulated tool call {} args fragment: {}",
-                                            index,
-                                            args_fragment
-                                        );
-                                        entry.1.push_str(args_fragment);
-                                    }
+                                // Accumulate arguments (streamed across multiple chunks)
+                                if let Some(args_fragment) = &function.arguments {
+                                    tracing::debug!(
+                                        "Accumulated tool call {} args fragment: {}",
+                                        index,
+                                        args_fragment
+                                    );
+                                    entry.1.push_str(args_fragment);
                                 }
                             }
                         }
                     }
                 }
             }
-            _ => {}
         }
     }
 
@@ -1615,7 +1588,7 @@ impl ResponseServiceImpl {
                     }
 
                     let results = provider.search(search_params).await.map_err(|e| {
-                        errors::ResponseError::InternalError(format!("Web search failed: {}", e))
+                        errors::ResponseError::InternalError(format!("Web search failed: {e}"))
                     })?;
                     let formatted = results
                         .iter()
@@ -1641,8 +1614,7 @@ impl ResponseServiceImpl {
                             let uuid_str = id.strip_prefix("conv_").unwrap_or(id);
                             uuid::Uuid::parse_str(uuid_str).map_err(|e| {
                                 errors::ResponseError::InvalidParams(format!(
-                                    "Invalid conversation ID: {}",
-                                    e
+                                    "Invalid conversation ID: {e}"
                                 ))
                             })?
                         }
@@ -1650,8 +1622,7 @@ impl ResponseServiceImpl {
                             let uuid_str = id.strip_prefix("conv_").unwrap_or(id);
                             uuid::Uuid::parse_str(uuid_str).map_err(|e| {
                                 errors::ResponseError::InvalidParams(format!(
-                                    "Invalid conversation ID: {}",
-                                    e
+                                    "Invalid conversation ID: {e}"
                                 ))
                             })?
                         }
@@ -1667,10 +1638,7 @@ impl ResponseServiceImpl {
                         )
                         .await
                         .map_err(|e| {
-                            errors::ResponseError::InternalError(format!(
-                                "File search failed: {}",
-                                e
-                            ))
+                            errors::ResponseError::InternalError(format!("File search failed: {e}"))
                         })?;
 
                     // Format results as text
@@ -1714,6 +1682,7 @@ impl ResponseServiceImpl {
 
     /// Check if conversation needs title generation and spawn background task if needed
     /// Returns a JoinHandle that can be awaited to ensure title generation completes before response finishes
+    #[allow(clippy::too_many_arguments)]
     fn maybe_generate_conversation_title(
         conversation_id: Option<ConversationId>,
         request: &models::CreateResponseRequest,
@@ -1727,10 +1696,7 @@ impl ResponseServiceImpl {
     ) -> Option<tokio::task::JoinHandle<Result<(), errors::ResponseError>>> {
         let model = request.model.clone();
         // Only proceed if we have a conversation_id
-        let conv_id = match conversation_id {
-            Some(id) => id,
-            None => return None,
-        };
+        let conv_id = conversation_id?;
 
         // Extract first user message from request
         let user_message = match &request.input {
@@ -1791,6 +1757,7 @@ impl ResponseServiceImpl {
     }
 
     /// Generate conversation title and update metadata (background task)
+    #[allow(clippy::too_many_arguments)]
     async fn generate_and_update_title(
         conversation_id: ConversationId,
         user_id: crate::UserId,
@@ -1809,7 +1776,7 @@ impl ResponseServiceImpl {
             .get_conversation(conversation_id.clone(), workspace_id_domain.clone())
             .await
             .map_err(|e| {
-                errors::ResponseError::InternalError(format!("Failed to get conversation: {}", e))
+                errors::ResponseError::InternalError(format!("Failed to get conversation: {e}"))
             })?;
 
         let conversation = match conversation {
@@ -1838,8 +1805,7 @@ impl ResponseServiceImpl {
         // Create prompt for title generation
         let title_prompt = format!(
             "Generate a short, descriptive title (maximum 60 characters) for a conversation that starts with this message. \
-            Only respond with the title, nothing else.\n\nMessage: {}",
-            truncated_message
+            Only respond with the title, nothing else.\n\nMessage: {truncated_message}"
         );
 
         // Generate title using completion service
@@ -1869,7 +1835,7 @@ impl ResponseServiceImpl {
             .create_chat_completion(completion_request)
             .await
             .map_err(|e| {
-                errors::ResponseError::InternalError(format!("Failed to generate title: {}", e))
+                errors::ResponseError::InternalError(format!("Failed to generate title: {e}"))
             })?;
 
         // Extract title from completion result
@@ -1902,8 +1868,7 @@ impl ResponseServiceImpl {
             .await
             .map_err(|e| {
                 errors::ResponseError::InternalError(format!(
-                    "Failed to update conversation metadata: {}",
-                    e
+                    "Failed to update conversation metadata: {e}"
                 ))
             })?;
 

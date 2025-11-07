@@ -89,6 +89,7 @@ pub async fn list_models(
                 model_display_name: model.model_display_name.clone(),
                 model_description: model.model_description.clone(),
                 model_icon: model.model_icon.clone(),
+                aliases: model.aliases.clone(),
             },
         })
         .collect();
@@ -132,7 +133,7 @@ pub async fn get_model_by_name(
     // Get the model from the service
     let model = app_state
         .models_service
-        .get_model_by_name(&model_name)
+        .resolve_and_get_model(&model_name)
         .await
         .map_err(|e| match e {
             services::models::ModelsError::NotFound(_) => {
@@ -176,6 +177,7 @@ pub async fn get_model_by_name(
             model_display_name: model.model_display_name,
             model_description: model.model_description,
             model_icon: model.model_icon,
+            aliases: model.aliases,
         },
     };
 

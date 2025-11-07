@@ -1273,6 +1273,9 @@ pub struct ModelMetadata {
     pub model_description: String,
     #[serde(rename = "modelIcon", skip_serializing_if = "Option::is_none")]
     pub model_icon: Option<String>,
+
+    #[serde(rename = "aliases", skip_serializing_if = "Vec::is_empty", default)]
+    pub aliases: Vec<String>,
 }
 
 /// Request to update model pricing (admin endpoint)

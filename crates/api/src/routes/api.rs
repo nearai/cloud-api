@@ -26,7 +26,6 @@ pub struct AppState {
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub files_service: Arc<dyn FileServiceTrait + Send + Sync>,
     pub config: Arc<config::ApiConfig>,
-    pub db_pool: database::pool::DbPool,
 }
 
 // Import route handlers

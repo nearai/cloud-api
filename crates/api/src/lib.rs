@@ -405,7 +405,6 @@ pub fn build_app_with_config(
         user_service: domain_services.user_service.clone(),
         files_service: domain_services.files_service.clone(),
         config: config.clone(),
-        db_pool: database.pool().clone(),
     };
 
     // Create usage state for middleware

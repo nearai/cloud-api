@@ -604,8 +604,10 @@ impl std::fmt::Display for FilePurpose {
     }
 }
 
-impl FilePurpose {
-    pub fn from_str(s: &str) -> Result<Self, String> {
+impl std::str::FromStr for FilePurpose {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "assistants" => Ok(FilePurpose::Assistants),
             "batch" => Ok(FilePurpose::Batch),
@@ -613,7 +615,7 @@ impl FilePurpose {
             "vision" => Ok(FilePurpose::Vision),
             "user_data" => Ok(FilePurpose::UserData),
             "evals" => Ok(FilePurpose::Evals),
-            _ => Err(format!("Invalid file purpose: {}", s)),
+            _ => Err(format!("Invalid file purpose: {s}")),
         }
     }
 }

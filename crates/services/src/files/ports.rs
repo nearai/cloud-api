@@ -20,20 +20,23 @@ pub struct File {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+/// Parameters for creating a file record
+#[derive(Debug, Clone)]
+pub struct CreateFileParams {
+    pub filename: String,
+    pub bytes: i64,
+    pub content_type: String,
+    pub purpose: String,
+    pub storage_key: String,
+    pub workspace_id: Uuid,
+    pub uploaded_by_user_id: Option<Uuid>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
 /// Repository trait for file operations
 #[async_trait]
 pub trait FileRepositoryTrait: Send + Sync {
-    async fn create(
-        &self,
-        filename: String,
-        bytes: i64,
-        content_type: String,
-        purpose: String,
-        storage_key: String,
-        workspace_id: Uuid,
-        uploaded_by_user_id: Option<Uuid>,
-        expires_at: Option<DateTime<Utc>>,
-    ) -> Result<File, RepositoryError>;
+    async fn create(&self, params: CreateFileParams) -> Result<File, RepositoryError>;
 
     async fn get_by_id(&self, id: Uuid) -> Result<Option<File>, RepositoryError>;
 

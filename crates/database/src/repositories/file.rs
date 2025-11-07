@@ -1,7 +1,7 @@
 use crate::{pool::DbPool, repositories::utils::map_db_error};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use services::common::RepositoryError;
 use services::files::{File, FileRepositoryTrait};
 use tracing::debug;
@@ -19,14 +19,7 @@ impl FileRepository {
     /// Create a new file record
     pub async fn create(
         &self,
-        filename: String,
-        bytes: i64,
-        content_type: String,
-        purpose: String,
-        storage_key: String,
-        workspace_id: Uuid,
-        uploaded_by_user_id: Option<Uuid>,
-        expires_at: Option<DateTime<Utc>>,
+        params: services::files::ports::CreateFileParams,
     ) -> Result<File, RepositoryError> {
         let client = self
             .pool
@@ -50,15 +43,15 @@ impl FileRepository {
                 "#,
                 &[
                     &id,
-                    &filename,
-                    &bytes,
-                    &content_type,
-                    &purpose,
-                    &storage_key,
-                    &workspace_id,
-                    &uploaded_by_user_id,
+                    &params.filename,
+                    &params.bytes,
+                    &params.content_type,
+                    &params.purpose,
+                    &params.storage_key,
+                    &params.workspace_id,
+                    &params.uploaded_by_user_id,
                     &now,
-                    &expires_at,
+                    &params.expires_at,
                 ],
             )
             .await
@@ -66,7 +59,7 @@ impl FileRepository {
 
         debug!(
             "Created file: {} ({} bytes) for workspace: {}",
-            id, bytes, workspace_id
+            id, params.bytes, params.workspace_id
         );
 
         self.row_to_file(row)
@@ -219,10 +212,9 @@ impl FileRepository {
                     "SELECT f.* FROM files f
                      WHERE f.workspace_id = $1
                      AND f.purpose = $2
-                     AND f.created_at {} (SELECT created_at FROM files WHERE id = $3)
-                     ORDER BY f.created_at {}
-                     LIMIT $4",
-                    comparison, order_clause
+                     AND f.created_at {comparison} (SELECT created_at FROM files WHERE id = $3)
+                     ORDER BY f.created_at {order_clause}
+                     LIMIT $4"
                 );
                 client
                     .query(&query, &[&workspace_id, &purpose_str, &after_id, &limit])
@@ -233,10 +225,9 @@ impl FileRepository {
                 let query = format!(
                     "SELECT f.* FROM files f
                      WHERE f.workspace_id = $1
-                     AND f.created_at {} (SELECT created_at FROM files WHERE id = $2)
-                     ORDER BY f.created_at {}
-                     LIMIT $3",
-                    comparison, order_clause
+                     AND f.created_at {comparison} (SELECT created_at FROM files WHERE id = $2)
+                     ORDER BY f.created_at {order_clause}
+                     LIMIT $3"
                 );
                 client
                     .query(&query, &[&workspace_id, &after_id, &limit])
@@ -248,9 +239,8 @@ impl FileRepository {
                     "SELECT * FROM files
                      WHERE workspace_id = $1
                      AND purpose = $2
-                     ORDER BY created_at {}
-                     LIMIT $3",
-                    order_clause
+                     ORDER BY created_at {order_clause}
+                     LIMIT $3"
                 );
                 client
                     .query(&query, &[&workspace_id, &purpose_str, &limit])
@@ -261,9 +251,8 @@ impl FileRepository {
                 let query = format!(
                     "SELECT * FROM files
                      WHERE workspace_id = $1
-                     ORDER BY created_at {}
-                     LIMIT $2",
-                    order_clause
+                     ORDER BY created_at {order_clause}
+                     LIMIT $2"
                 );
                 client.query(&query, &[&workspace_id, &limit]).await
             }
@@ -343,26 +332,9 @@ impl FileRepository {
 impl FileRepositoryTrait for FileRepository {
     async fn create(
         &self,
-        filename: String,
-        bytes: i64,
-        content_type: String,
-        purpose: String,
-        storage_key: String,
-        workspace_id: Uuid,
-        uploaded_by_user_id: Option<Uuid>,
-        expires_at: Option<DateTime<Utc>>,
+        params: services::files::ports::CreateFileParams,
     ) -> Result<File, RepositoryError> {
-        self.create(
-            filename,
-            bytes,
-            content_type,
-            purpose,
-            storage_key,
-            workspace_id,
-            uploaded_by_user_id,
-            expires_at,
-        )
-        .await
+        self.create(params).await
     }
 
     async fn get_by_id(&self, id: Uuid) -> Result<Option<File>, RepositoryError> {

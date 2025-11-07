@@ -73,7 +73,7 @@ impl StorageTrait for S3Storage {
             .await
             .map_err(|e| {
                 error!("Failed to upload file to S3: {}", e);
-                FileServiceError::StorageError(format!("Failed to upload file: {}", e))
+                FileServiceError::StorageError(format!("Failed to upload file: {e}"))
             })?;
 
         debug!("Successfully uploaded encrypted file to S3: {}", key);
@@ -96,7 +96,7 @@ impl StorageTrait for S3Storage {
             .await
             .map_err(|e| {
                 error!("Failed to download file from S3: {}", e);
-                FileServiceError::StorageError(format!("Failed to download file: {}", e))
+                FileServiceError::StorageError(format!("Failed to download file: {e}"))
             })?;
 
         let encrypted_data = response
@@ -105,7 +105,7 @@ impl StorageTrait for S3Storage {
             .await
             .map_err(|e| {
                 error!("Failed to read file data from S3: {}", e);
-                FileServiceError::StorageError(format!("Failed to read file data: {}", e))
+                FileServiceError::StorageError(format!("Failed to read file data: {e}"))
             })?
             .into_bytes()
             .to_vec();
@@ -138,7 +138,7 @@ impl StorageTrait for S3Storage {
             .await
             .map_err(|e| {
                 error!("Failed to delete file from S3: {}", e);
-                FileServiceError::StorageError(format!("Failed to delete file: {}", e))
+                FileServiceError::StorageError(format!("Failed to delete file: {e}"))
             })?;
 
         debug!("Successfully deleted file from S3: {}", key);
@@ -163,8 +163,7 @@ impl StorageTrait for S3Storage {
                 } else {
                     error!("Failed to check file existence in S3: {}", e);
                     Err(FileServiceError::StorageError(format!(
-                        "Failed to check file existence: {}",
-                        e
+                        "Failed to check file existence: {e}"
                     )))
                 }
             }
@@ -212,10 +211,7 @@ impl StorageTrait for MockStorage {
         debug!("Mock storage: downloading file with key: {}", key);
 
         let files = self.files.read().unwrap();
-        let encrypted_data = files
-            .get(key)
-            .ok_or(FileServiceError::NotFound)?
-            .clone();
+        let encrypted_data = files.get(key).ok_or(FileServiceError::NotFound)?.clone();
 
         // Decrypt the data (same as S3)
         let decrypted_data = encryption::decrypt(&encrypted_data, &self.encryption_key)?;

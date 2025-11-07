@@ -2,7 +2,7 @@ pub mod encryption;
 pub mod ports;
 pub mod storage;
 
-pub use ports::{File, FileRepositoryTrait};
+pub use ports::{CreateFileParams, File, FileRepositoryTrait};
 
 use crate::common::RepositoryError;
 use async_trait::async_trait;
@@ -140,8 +140,7 @@ pub fn calculate_expires_at(
 
     if seconds > MAX_EXPIRATION_SECONDS {
         return Err(FileServiceError::InvalidExpiresAfter(format!(
-            "seconds cannot exceed {} (1 year)",
-            MAX_EXPIRATION_SECONDS
+            "seconds cannot exceed {MAX_EXPIRATION_SECONDS} (1 year)"
         )));
     }
 
@@ -154,8 +153,7 @@ pub fn calculate_expires_at(
     match anchor {
         "created_at" => Ok(created_at + chrono::Duration::seconds(seconds)),
         _ => Err(FileServiceError::InvalidExpiresAfter(format!(
-            "Invalid anchor: {}. Must be 'created_at'",
-            anchor
+            "Invalid anchor: {anchor}. Must be 'created_at'"
         ))),
     }
 }
@@ -168,23 +166,26 @@ pub fn validate_purpose(purpose: &str) -> Result<(), FileServiceError> {
 }
 
 pub fn generate_storage_key(workspace_id: Uuid, file_id: Uuid) -> String {
-    format!("{}/{}", workspace_id, file_id)
+    format!("{workspace_id}/{file_id}")
+}
+
+/// Parameters for uploading a file
+#[derive(Debug, Clone)]
+pub struct UploadFileParams {
+    pub filename: String,
+    pub file_data: Vec<u8>,
+    pub content_type: String,
+    pub purpose: String,
+    pub workspace_id: Uuid,
+    pub uploaded_by_user_id: Option<Uuid>,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// File service trait for managing file uploads, downloads, and metadata
 #[async_trait]
 pub trait FileServiceTrait: Send + Sync {
     /// Upload a file to storage and create a database record
-    async fn upload_file(
-        &self,
-        filename: String,
-        file_data: Vec<u8>,
-        content_type: String,
-        purpose: String,
-        workspace_id: Uuid,
-        uploaded_by_user_id: Option<Uuid>,
-        expires_at: Option<DateTime<Utc>>,
-    ) -> Result<File, FileServiceError>;
+    async fn upload_file(&self, params: UploadFileParams) -> Result<File, FileServiceError>;
 
     /// Get file metadata by ID with workspace authorization
     async fn get_file(&self, file_id: Uuid, workspace_id: Uuid) -> Result<File, FileServiceError>;
@@ -221,7 +222,10 @@ pub struct FileServiceImpl {
 }
 
 impl FileServiceImpl {
-    pub fn new(file_repository: Arc<dyn FileRepositoryTrait>, storage: Arc<dyn StorageTrait>) -> Self {
+    pub fn new(
+        file_repository: Arc<dyn FileRepositoryTrait>,
+        storage: Arc<dyn StorageTrait>,
+    ) -> Self {
         Self {
             file_repository,
             storage,
@@ -231,48 +235,39 @@ impl FileServiceImpl {
 
 #[async_trait]
 impl FileServiceTrait for FileServiceImpl {
-    async fn upload_file(
-        &self,
-        filename: String,
-        file_data: Vec<u8>,
-        content_type: String,
-        purpose: String,
-        workspace_id: Uuid,
-        uploaded_by_user_id: Option<Uuid>,
-        expires_at: Option<DateTime<Utc>>,
-    ) -> Result<File, FileServiceError> {
+    async fn upload_file(&self, params: UploadFileParams) -> Result<File, FileServiceError> {
         // Validate MIME type
-        validate_mime_type(&content_type)?;
+        validate_mime_type(&params.content_type)?;
 
         // Validate encoding for text files
-        validate_encoding(&content_type, &file_data)?;
+        validate_encoding(&params.content_type, &params.file_data)?;
 
         // Validate purpose
-        validate_purpose(&purpose)?;
+        validate_purpose(&params.purpose)?;
 
         // Generate file ID and storage key
         let file_id = Uuid::new_v4();
-        let storage_key = generate_storage_key(workspace_id, file_id);
+        let storage_key = generate_storage_key(params.workspace_id, file_id);
 
         // Upload to storage (automatically encrypted)
         self.storage
-            .upload(&storage_key, file_data.clone(), &content_type)
+            .upload(&storage_key, params.file_data.clone(), &params.content_type)
             .await
             .map_err(|e| FileServiceError::StorageError(e.to_string()))?;
 
         // Create database record
         let file = self
             .file_repository
-            .create(
-                filename,
-                file_data.len() as i64,
-                content_type,
-                purpose,
+            .create(ports::CreateFileParams {
+                filename: params.filename,
+                bytes: params.file_data.len() as i64,
+                content_type: params.content_type,
+                purpose: params.purpose,
                 storage_key,
-                workspace_id,
-                uploaded_by_user_id,
-                expires_at,
-            )
+                workspace_id: params.workspace_id,
+                uploaded_by_user_id: params.uploaded_by_user_id,
+                expires_at: params.expires_at,
+            })
             .await?;
 
         Ok(file)

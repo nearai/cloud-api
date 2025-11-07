@@ -175,7 +175,8 @@ pub async fn setup_test_server() -> axum_test::TestServer {
     domain_services.files_service = Arc::new(services::files::FileServiceImpl::new(
         file_repository,
         mock_storage,
-    )) as Arc<dyn services::files::FileServiceTrait + Send + Sync>;
+    ))
+        as Arc<dyn services::files::FileServiceTrait + Send + Sync>;
 
     let app = build_app_with_config(database, auth_components, domain_services, Arc::new(config));
     axum_test::TestServer::new(app).unwrap()

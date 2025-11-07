@@ -45,7 +45,7 @@ async fn upload_file_with_expiration(
             axum_test::multipart::MultipartForm::new()
                 .add_text("purpose", purpose)
                 .add_text("expires_after[anchor]", "created_at")
-                .add_text("expires_after[seconds]", &expires_after_seconds.to_string())
+                .add_text("expires_after[seconds]", expires_after_seconds.to_string())
                 .add_part(
                     "file",
                     axum_test::multipart::Part::bytes(content.to_vec())
@@ -243,11 +243,11 @@ async fn test_list_files() {
 
     // Upload multiple files
     for i in 1..=5 {
-        let content = format!("File content {}", i);
+        let content = format!("File content {i}");
         upload_file(
             &server,
             &api_key,
-            &format!("file{}.txt", i),
+            &format!("file{i}.txt"),
             content.as_bytes(),
             "text/plain",
             "user_data",
@@ -276,11 +276,11 @@ async fn test_list_files_with_limit() {
 
     // Upload multiple files
     for i in 1..=5 {
-        let content = format!("File content {}", i);
+        let content = format!("File content {i}");
         upload_file(
             &server,
             &api_key,
-            &format!("file{}.txt", i),
+            &format!("file{i}.txt"),
             content.as_bytes(),
             "text/plain",
             "user_data",
@@ -307,11 +307,11 @@ async fn test_list_files_with_pagination() {
 
     // Upload multiple files
     for i in 1..=5 {
-        let content = format!("File content {}", i);
+        let content = format!("File content {i}");
         upload_file(
             &server,
             &api_key,
-            &format!("file{}.txt", i),
+            &format!("file{i}.txt"),
             content.as_bytes(),
             "text/plain",
             "user_data",
@@ -332,13 +332,13 @@ async fn test_list_files_with_pagination() {
     // Get second page using cursor
     let after_id = first_page.last_id.unwrap();
     let response = server
-        .get(&format!("/v1/files?limit=2&after={}", after_id))
+        .get(&format!("/v1/files?limit=2&after={after_id}"))
         .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
 
     assert_eq!(response.status_code(), 200);
     let second_page: api::models::FileListResponse = response.json();
-    assert!(second_page.data.len() > 0);
+    assert!(!second_page.data.is_empty());
     // Ensure we got different files
     assert_ne!(first_page.data[0].id, second_page.data[0].id);
 }
@@ -389,11 +389,11 @@ async fn test_list_files_with_order() {
 
     // Upload multiple files
     for i in 1..=3 {
-        let content = format!("File content {}", i);
+        let content = format!("File content {i}");
         upload_file(
             &server,
             &api_key,
-            &format!("file{}.txt", i),
+            &format!("file{i}.txt"),
             content.as_bytes(),
             "text/plain",
             "user_data",
@@ -746,7 +746,7 @@ async fn test_file_id_formats() {
     // Test without "file-" prefix (strip prefix from ID)
     let id_without_prefix = uploaded_file.id.strip_prefix("file-").unwrap();
     let response = server
-        .get(&format!("/v1/files/{}", id_without_prefix))
+        .get(&format!("/v1/files/{id_without_prefix}"))
         .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
     assert_eq!(response.status_code(), 200);

@@ -57,7 +57,7 @@ pub async fn upload_file(
                     (
                         StatusCode::BAD_REQUEST,
                         Json(ErrorResponse::new(
-                            format!("Failed to read file data: {}", e),
+                            format!("Failed to read file data: {e}"),
                             "invalid_request_error".to_string(),
                         )),
                     )
@@ -86,7 +86,7 @@ pub async fn upload_file(
                     (
                         StatusCode::BAD_REQUEST,
                         Json(ErrorResponse::new(
-                            format!("Failed to read purpose: {}", e),
+                            format!("Failed to read purpose: {e}"),
                             "invalid_request_error".to_string(),
                         )),
                     )
@@ -99,7 +99,7 @@ pub async fn upload_file(
                     (
                         StatusCode::BAD_REQUEST,
                         Json(ErrorResponse::new(
-                            format!("Failed to read expires_after[anchor]: {}", e),
+                            format!("Failed to read expires_after[anchor]: {e}"),
                             "invalid_request_error".to_string(),
                         )),
                     )
@@ -112,7 +112,7 @@ pub async fn upload_file(
                     (
                         StatusCode::BAD_REQUEST,
                         Json(ErrorResponse::new(
-                            format!("Failed to read expires_after[seconds]: {}", e),
+                            format!("Failed to read expires_after[seconds]: {e}"),
                             "invalid_request_error".to_string(),
                         )),
                     )
@@ -122,7 +122,7 @@ pub async fn upload_file(
                     (
                         StatusCode::BAD_REQUEST,
                         Json(ErrorResponse::new(
-                            format!("Invalid expires_after[seconds]: must be an integer"),
+                            "Invalid expires_after[seconds]: must be an integer".to_string(),
                             "invalid_request_error".to_string(),
                         )),
                     )
@@ -189,15 +189,15 @@ pub async fn upload_file(
     // Use file service to handle upload (includes validation, storage, and DB operations)
     let file = app_state
         .files_service
-        .upload_file(
+        .upload_file(services::files::UploadFileParams {
             filename,
             file_data,
             content_type,
             purpose,
-            api_key.workspace_id.0,
-            Some(api_key.created_by_user_id.0),
+            workspace_id: api_key.workspace_id.0,
+            uploaded_by_user_id: Some(api_key.created_by_user_id.0),
             expires_at,
-        )
+        })
         .await
         .map_err(|e| {
             error!("Failed to upload file: {}", e);
@@ -314,7 +314,7 @@ pub async fn list_files(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
-                    format!("Failed to list files: {}", e),
+                    format!("Failed to list files: {e}"),
                     "internal_error".to_string(),
                 )),
             )
@@ -383,7 +383,7 @@ pub async fn get_file(
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
-                format!("Invalid file ID format: {}", file_id),
+                format!("Invalid file ID format: {file_id}"),
                 "invalid_request_error".to_string(),
             )),
         )
@@ -405,7 +405,7 @@ pub async fn get_file(
             (
                 status,
                 Json(ErrorResponse::new(
-                    format!("Failed to retrieve file: {}", e),
+                    format!("Failed to retrieve file: {e}"),
                     error_type.to_string(),
                 )),
             )
@@ -456,7 +456,7 @@ pub async fn delete_file(
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
-                format!("Invalid file ID format: {}", file_id),
+                format!("Invalid file ID format: {file_id}"),
                 "invalid_request_error".to_string(),
             )),
         )
@@ -478,7 +478,7 @@ pub async fn delete_file(
             (
                 status,
                 Json(ErrorResponse::new(
-                    format!("Failed to delete file: {}", e),
+                    format!("Failed to delete file: {e}"),
                     error_type.to_string(),
                 )),
             )
@@ -488,7 +488,7 @@ pub async fn delete_file(
         return Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse::new(
-                format!("File not found: {}", file_id),
+                format!("File not found: {file_id}"),
                 "not_found_error".to_string(),
             )),
         ));
@@ -498,7 +498,7 @@ pub async fn delete_file(
 
     // Build response
     let response = FileDeleteResponse {
-        id: format!("file-{}", file_uuid),
+        id: format!("file-{file_uuid}"),
         object: "file".to_string(),
         deleted: true,
     };
@@ -537,7 +537,7 @@ pub async fn get_file_content(
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
-                format!("Invalid file ID format: {}", file_id),
+                format!("Invalid file ID format: {file_id}"),
                 "invalid_request_error".to_string(),
             )),
         )
@@ -559,7 +559,7 @@ pub async fn get_file_content(
             (
                 status,
                 Json(ErrorResponse::new(
-                    format!("Failed to retrieve file content: {}", e),
+                    format!("Failed to retrieve file content: {e}"),
                     error_type.to_string(),
                 )),
             )

@@ -24,16 +24,15 @@ pub enum EncryptionError {
 pub fn encrypt(data: &[u8], key: &str) -> Result<Vec<u8>, EncryptionError> {
     // Decode the key from hex string
     let key_bytes = hex::decode(key)
-        .map_err(|e| EncryptionError::EncryptionFailed(format!("Invalid hex key: {}", e)))?;
+        .map_err(|e| EncryptionError::EncryptionFailed(format!("Invalid hex key: {e}")))?;
 
     if key_bytes.len() != 32 {
         return Err(EncryptionError::InvalidKeyLength(key_bytes.len()));
     }
 
     // Create cipher instance
-    let cipher = Aes256Gcm::new_from_slice(&key_bytes).map_err(|e| {
-        EncryptionError::EncryptionFailed(format!("Failed to create cipher: {}", e))
-    })?;
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+        .map_err(|e| EncryptionError::EncryptionFailed(format!("Failed to create cipher: {e}")))?;
 
     // Generate a random nonce
     let mut nonce_bytes = [0u8; NONCE_SIZE];
@@ -43,7 +42,7 @@ pub fn encrypt(data: &[u8], key: &str) -> Result<Vec<u8>, EncryptionError> {
     // Encrypt the data
     let ciphertext = cipher
         .encrypt(&nonce, data)
-        .map_err(|e| EncryptionError::EncryptionFailed(format!("Encryption failed: {}", e)))?;
+        .map_err(|e| EncryptionError::EncryptionFailed(format!("Encryption failed: {e}")))?;
 
     // Prepend nonce to ciphertext
     let mut result = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
@@ -58,7 +57,7 @@ pub fn encrypt(data: &[u8], key: &str) -> Result<Vec<u8>, EncryptionError> {
 pub fn decrypt(encrypted_data: &[u8], key: &str) -> Result<Vec<u8>, EncryptionError> {
     // Decode the key from hex string
     let key_bytes = hex::decode(key)
-        .map_err(|e| EncryptionError::DecryptionFailed(format!("Invalid hex key: {}", e)))?;
+        .map_err(|e| EncryptionError::DecryptionFailed(format!("Invalid hex key: {e}")))?;
 
     if key_bytes.len() != 32 {
         return Err(EncryptionError::InvalidKeyLength(key_bytes.len()));
@@ -77,14 +76,13 @@ pub fn decrypt(encrypted_data: &[u8], key: &str) -> Result<Vec<u8>, EncryptionEr
     );
 
     // Create cipher instance
-    let cipher = Aes256Gcm::new_from_slice(&key_bytes).map_err(|e| {
-        EncryptionError::DecryptionFailed(format!("Failed to create cipher: {}", e))
-    })?;
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+        .map_err(|e| EncryptionError::DecryptionFailed(format!("Failed to create cipher: {e}")))?;
 
     // Decrypt the data
     let plaintext = cipher
         .decrypt(&nonce, ciphertext)
-        .map_err(|e| EncryptionError::DecryptionFailed(format!("Decryption failed: {}", e)))?;
+        .map_err(|e| EncryptionError::DecryptionFailed(format!("Decryption failed: {e}")))?;
 
     Ok(plaintext)
 }

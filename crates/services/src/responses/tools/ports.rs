@@ -78,36 +78,6 @@ impl WebSearchParams {
             ..Default::default()
         }
     }
-
-    /// Builder method to set country
-    pub fn with_country(mut self, country: impl Into<String>) -> Self {
-        self.country = Some(country.into());
-        self
-    }
-
-    /// Builder method to set search language
-    pub fn with_search_lang(mut self, lang: impl Into<String>) -> Self {
-        self.search_lang = Some(lang.into());
-        self
-    }
-
-    /// Builder method to set count
-    pub fn with_count(mut self, count: u32) -> Self {
-        self.count = Some(count);
-        self
-    }
-
-    /// Builder method to set safesearch
-    pub fn with_safesearch(mut self, safesearch: impl Into<String>) -> Self {
-        self.safesearch = Some(safesearch.into());
-        self
-    }
-
-    /// Builder method to set freshness
-    pub fn with_freshness(mut self, freshness: impl Into<String>) -> Self {
-        self.freshness = Some(freshness.into());
-        self
-    }
 }
 
 /// Result from a file search

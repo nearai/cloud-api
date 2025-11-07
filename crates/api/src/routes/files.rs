@@ -45,7 +45,7 @@ pub async fn upload_file(
     let mut expires_after_seconds: Option<i64> = None;
 
     // Parse multipart form data
-    while let Ok(Some(mut field)) = multipart.next_field().await {
+    while let Ok(Some(field)) = multipart.next_field().await {
         let field_name = field.name().unwrap_or("").to_string();
 
         match field_name.as_str() {
@@ -53,31 +53,34 @@ pub async fn upload_file(
                 filename = field.file_name().map(|s| s.to_string());
                 content_type = field.content_type().map(|s| s.to_string());
 
-                // Stream file and validate size incrementally to prevent DoS attacks
-                let mut chunks = Vec::new();
-                let mut total_size: u64 = 0;
+                // Read file data (size limit enforced by DefaultBodyLimit layer at framework level)
+                let data = field.bytes().await.map_err(|e| {
+                    error!("Failed to read file data: {}", e);
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse::new(
+                            format!("Failed to read file data: {e}"),
+                            "invalid_request_error".to_string(),
+                        )),
+                    )
+                })?;
 
-                while let Ok(Some(chunk)) = field.chunk().await {
-                    let chunk_size = chunk.len() as u64;
-                    total_size += chunk_size;
-
-                    // Check size limit BEFORE accumulating more data
-                    if total_size > MAX_FILE_SIZE {
-                        return Err((
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            Json(ErrorResponse::new(
-                                format!("File too large: exceeds {} bytes limit", MAX_FILE_SIZE),
-                                "invalid_request_error".to_string(),
-                            )),
-                        ));
-                    }
-
-                    chunks.push(chunk);
+                // Defense-in-depth: verify size (should already be caught by DefaultBodyLimit layer)
+                if data.len() as u64 > MAX_FILE_SIZE {
+                    return Err((
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        Json(ErrorResponse::new(
+                            format!(
+                                "File too large: {} bytes (max: {} bytes)",
+                                data.len(),
+                                MAX_FILE_SIZE
+                            ),
+                            "invalid_request_error".to_string(),
+                        )),
+                    ));
                 }
 
-                // Combine chunks into final vector only after validation
-                let data: Vec<u8> = chunks.into_iter().flat_map(|c| c.to_vec()).collect();
-                file_data = Some(data);
+                file_data = Some(data.to_vec());
             }
             "purpose" => {
                 let text = field.text().await.map_err(|e| {

@@ -22,6 +22,7 @@ use crate::{
     },
 };
 use axum::{
+    extract::DefaultBodyLimit,
     middleware::{from_fn, from_fn_with_state},
     response::Html,
     routing::{get, post},
@@ -706,10 +707,13 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
 pub fn build_files_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
     use crate::routes::files::*;
 
+    const MAX_FILE_SIZE: usize = 512 * 1024 * 1024; // 512 MB
+
     Router::new()
         .route("/files", post(upload_file).get(list_files))
         .route("/files/{file_id}", get(get_file).delete(delete_file))
         .route("/files/{file_id}/content", get(get_file_content))
+        .layer(DefaultBodyLimit::max(MAX_FILE_SIZE))
         .with_state(app_state)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),

@@ -413,7 +413,191 @@ pub async fn list_conversation_items(
     }
 }
 
+/// Create items in a conversation (for backfilling)
+///
+/// Adds items to a conversation, allowing API callers to backfill conversations.
+#[utoipa::path(
+    post,
+    path = "/conversations/{conversation_id}/items",
+    tag = "Conversations",
+    params(
+        ("conversation_id" = String, Path, description = "Conversation ID"),
+        ("include" = Option<Vec<String>>, Query, description = "Additional fields to include in the response")
+    ),
+    request_body = CreateConversationItemsRequest,
+    responses(
+        (status = 200, description = "Items created successfully", body = ConversationItemList),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Conversation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn create_conversation_items(
+    Path(conversation_id): Path<String>,
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
+    Json(request): Json<CreateConversationItemsRequest>,
+) -> Result<ResponseJson<ConversationItemList>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    debug!(
+        "Create items in conversation {} for workspace {}",
+        conversation_id, api_key.workspace_id.0
+    );
+
+    // Validate items count (max 20 items per request)
+    if request.items.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Items array cannot be empty".to_string(),
+                "invalid_request_error".to_string(),
+            )),
+        ));
+    }
+
+    if request.items.len() > 20 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Cannot add more than 20 items at a time".to_string(),
+                "invalid_request_error".to_string(),
+            )),
+        ));
+    }
+
+    let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
+        Ok(id) => id,
+        Err(error) => {
+            return Err((
+                map_conversation_error_to_status(&error),
+                ResponseJson(error.into()),
+            ))
+        }
+    };
+
+    // Parse API key ID from string to UUID
+    let api_key_uuid = uuid::Uuid::parse_str(&api_key.id.0).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse::new(
+                format!("Invalid API key ID format: {e}"),
+                "internal_server_error".to_string(),
+            )),
+        )
+    })?;
+
+    // Convert input items to response output items
+    let response_items: Vec<services::responses::models::ResponseOutputItem> = request
+        .items
+        .into_iter()
+        .map(convert_input_item_to_response_item)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to convert input item: {e}"),
+                    "invalid_request_error".to_string(),
+                )),
+            )
+        })?;
+
+    // Create items via service
+    match service
+        .create_conversation_items(
+            parsed_conversation_id,
+            api_key.workspace_id.clone(),
+            api_key_uuid,
+            response_items,
+        )
+        .await
+    {
+        Ok(created_items) => {
+            // Convert response items back to conversation items
+            let http_items: Vec<ConversationItem> = created_items
+                .into_iter()
+                .map(convert_output_item_to_conversation_item)
+                .collect();
+
+            let first_id = http_items.first().map(get_item_id).unwrap_or_default();
+            let last_id = http_items.last().map(get_item_id).unwrap_or_default();
+
+            Ok(ResponseJson(ConversationItemList {
+                object: "list".to_string(),
+                data: http_items,
+                first_id,
+                last_id,
+                has_more: false,
+            }))
+        }
+        Err(error) => Err((
+            map_conversation_error_to_status(&error),
+            ResponseJson(error.into()),
+        )),
+    }
+}
+
 // Helper functions
+
+fn convert_input_item_to_response_item(
+    item: ConversationInputItem,
+) -> Result<services::responses::models::ResponseOutputItem, String> {
+    match item {
+        ConversationInputItem::Message { role, content, .. } => {
+            // Convert ConversationContent to ResponseOutputContent
+            let response_content = match content {
+                ConversationContent::Text(text) => {
+                    vec![
+                        services::responses::models::ResponseOutputContent::OutputText {
+                            text: text.trim().to_string(),
+                            annotations: vec![],
+                            logprobs: vec![],
+                        },
+                    ]
+                }
+                ConversationContent::Parts(parts) => {
+                    parts
+                        .into_iter()
+                        .filter_map(|part| match part {
+                            ConversationContentPart::InputText { text } => Some(
+                                services::responses::models::ResponseOutputContent::OutputText {
+                                    text: text.trim().to_string(),
+                                    annotations: vec![],
+                                    logprobs: vec![],
+                                },
+                            ),
+                            ConversationContentPart::InputImage { .. } => {
+                                // TODO: Handle image content
+                                None
+                            }
+                            ConversationContentPart::OutputText { text, .. } => Some(
+                                services::responses::models::ResponseOutputContent::OutputText {
+                                    text: text.trim().to_string(),
+                                    annotations: vec![],
+                                    logprobs: vec![],
+                                },
+                            ),
+                        })
+                        .collect()
+                }
+            };
+
+            if response_content.is_empty() {
+                return Err("Message content cannot be empty".to_string());
+            }
+
+            Ok(services::responses::models::ResponseOutputItem::Message {
+                id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
+                status: services::responses::models::ResponseItemStatus::Completed,
+                role,
+                content: response_content,
+            })
+        }
+    }
+}
 
 fn convert_output_item_to_conversation_item(
     item: services::responses::models::ResponseOutputItem,
@@ -428,6 +612,8 @@ fn convert_output_item_to_conversation_item(
             content,
         } => {
             // Convert ResponseOutputContent to ConversationContentPart
+            // For user messages, use input_text; for assistant/system, use output_text
+            let is_user_message = role == "user";
             let conv_content: Vec<ConversationContentPart> = content
                 .into_iter()
                 .filter_map(|c| match c {
@@ -435,16 +621,24 @@ fn convert_output_item_to_conversation_item(
                         text,
                         annotations,
                         logprobs: _,
-                    } => Some(ConversationContentPart::OutputText {
-                        text,
-                        annotations: Some(
-                            annotations
-                                .into_iter()
-                                .map(convert_text_annotation)
-                                .map(|a| serde_json::to_value(a).unwrap())
-                                .collect(),
-                        ),
-                    }),
+                    } => {
+                        if is_user_message {
+                            // User messages should use input_text format
+                            Some(ConversationContentPart::InputText { text })
+                        } else {
+                            // Assistant/system messages use output_text format
+                            Some(ConversationContentPart::OutputText {
+                                text,
+                                annotations: Some(
+                                    annotations
+                                        .into_iter()
+                                        .map(convert_text_annotation)
+                                        .map(|a| serde_json::to_value(a).unwrap())
+                                        .collect(),
+                                ),
+                            })
+                        }
+                    }
                     _ => None,
                 })
                 .collect();

@@ -44,6 +44,10 @@ pub fn test_config() -> ApiConfig {
                 .ok()
                 .and_then(|t| t.parse().ok())
                 .unwrap_or(5),
+            inference_timeout: std::env::var("MODEL_INFERENCE_TIMEOUT")
+                .ok()
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(30 * 60), // 30 minutes
         },
         logging: config::LoggingConfig {
             level: "debug".to_string(),

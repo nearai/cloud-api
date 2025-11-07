@@ -116,8 +116,9 @@ impl ServerConfig {
 pub struct ModelDiscoveryConfig {
     pub discovery_server_url: String,
     pub api_key: Option<String>,
-    pub refresh_interval: i64, // seconds
-    pub timeout: i64,          // seconds
+    pub refresh_interval: i64,  // seconds
+    pub timeout: i64,           // seconds (for discovery requests)
+    pub inference_timeout: i64, // seconds (for model inference requests)
 }
 
 impl ModelDiscoveryConfig {
@@ -135,6 +136,10 @@ impl ModelDiscoveryConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30), // 30 seconds
+            inference_timeout: env::var("MODEL_INFERENCE_TIMEOUT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300), // 5 minutes
         })
     }
 }
@@ -153,6 +158,10 @@ impl Default for ModelDiscoveryConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30), // 30 seconds
+            inference_timeout: env::var("MODEL_INFERENCE_TIMEOUT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300), // 5 minutes
         }
     }
 }

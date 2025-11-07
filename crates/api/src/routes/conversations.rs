@@ -5,8 +5,10 @@ use axum::{
     response::Json as ResponseJson,
 };
 use serde::Deserialize;
-use services::conversations::ports::ConversationRequest;
-use services::{ConversationError, ConversationId};
+use services::{
+    conversations::{errors::ConversationError, models::ConversationId},
+    responses::models::TextAnnotation,
+};
 use std::sync::Arc;
 use tracing::debug;
 use uuid::Uuid;
@@ -51,7 +53,7 @@ fn map_conversation_error_to_status(error: &ConversationError) -> StatusCode {
     )
 )]
 pub async fn create_conversation(
-    State(service): State<Arc<services::ConversationService>>,
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
     Extension(api_key): Extension<services::workspace::ApiKey>,
     Json(request): Json<CreateConversationRequest>,
 ) -> Result<(StatusCode, ResponseJson<ConversationObject>), (StatusCode, ResponseJson<ErrorResponse>)>
@@ -69,8 +71,20 @@ pub async fn create_conversation(
         ));
     }
 
-    let domain_request = ConversationRequest {
-        user_id: api_key.created_by_user_id.0.into(),
+    // Parse API key ID from string to UUID
+    let api_key_uuid = uuid::Uuid::parse_str(&api_key.id.0).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse::new(
+                format!("Invalid API key ID format: {e}"),
+                "internal_server_error".to_string(),
+            )),
+        )
+    })?;
+
+    let domain_request = services::conversations::models::ConversationRequest {
+        workspace_id: api_key.workspace_id.clone(),
+        api_key_id: api_key_uuid,
         metadata: request.metadata,
     };
 
@@ -78,8 +92,8 @@ pub async fn create_conversation(
         Ok(domain_conversation) => {
             let http_conversation = convert_domain_conversation_to_http(domain_conversation);
             debug!(
-                "Created conversation {} for user {}",
-                http_conversation.id, api_key.created_by_user_id.0
+                "Created conversation {} for workspace {}",
+                http_conversation.id, api_key.workspace_id.0
             );
             Ok((StatusCode::CREATED, ResponseJson(http_conversation)))
         }
@@ -113,12 +127,12 @@ pub async fn create_conversation(
 )]
 pub async fn get_conversation(
     Path(conversation_id): Path<String>,
-    State(service): State<Arc<services::ConversationService>>,
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
     Extension(api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ConversationObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
-        "Get conversation {} for user {}",
-        conversation_id, api_key.created_by_user_id.0
+        "Get conversation {} for workspace {}",
+        conversation_id, api_key.workspace_id.0
     );
 
     let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
@@ -132,10 +146,7 @@ pub async fn get_conversation(
     };
 
     match service
-        .get_conversation(
-            &parsed_conversation_id,
-            &api_key.created_by_user_id.0.into(),
-        )
+        .get_conversation(parsed_conversation_id, api_key.workspace_id.clone())
         .await
     {
         Ok(Some(domain_conversation)) => {
@@ -180,13 +191,13 @@ pub async fn get_conversation(
 )]
 pub async fn update_conversation(
     Path(conversation_id): Path<String>,
-    State(service): State<Arc<services::ConversationService>>,
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
     Extension(api_key): Extension<services::workspace::ApiKey>,
     Json(request): Json<UpdateConversationRequest>,
 ) -> Result<ResponseJson<ConversationObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
-        "Update conversation {} for user {}",
-        conversation_id, api_key.created_by_user_id.0
+        "Update conversation {} for workspace {}",
+        conversation_id, api_key.workspace_id.0
     );
 
     let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
@@ -203,8 +214,8 @@ pub async fn update_conversation(
 
     match service
         .update_conversation(
-            &parsed_conversation_id,
-            &api_key.created_by_user_id.0.into(),
+            parsed_conversation_id,
+            api_key.workspace_id.clone(),
             metadata,
         )
         .await
@@ -212,8 +223,8 @@ pub async fn update_conversation(
         Ok(Some(domain_conversation)) => {
             let http_conversation = convert_domain_conversation_to_http(domain_conversation);
             debug!(
-                "Updated conversation {} for user {}",
-                conversation_id, api_key.created_by_user_id.0
+                "Updated conversation {} for workspace {}",
+                conversation_id, api_key.workspace_id.0
             );
             Ok(ResponseJson(http_conversation))
         }
@@ -254,12 +265,12 @@ pub async fn update_conversation(
 )]
 pub async fn delete_conversation(
     Path(conversation_id): Path<String>,
-    State(service): State<Arc<services::ConversationService>>,
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
     Extension(api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ConversationDeleteResult>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
-        "Delete conversation {} for user {}",
-        conversation_id, api_key.created_by_user_id.0
+        "Delete conversation {} for workspace {}",
+        conversation_id, api_key.workspace_id.0
     );
 
     let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
@@ -273,16 +284,13 @@ pub async fn delete_conversation(
     };
 
     match service
-        .delete_conversation(
-            &parsed_conversation_id,
-            &api_key.created_by_user_id.0.into(),
-        )
+        .delete_conversation(parsed_conversation_id, api_key.workspace_id.clone())
         .await
     {
         Ok(true) => {
             debug!(
-                "Deleted conversation {} for user {}",
-                conversation_id, api_key.created_by_user_id.0
+                "Deleted conversation {} for workspace {}",
+                conversation_id, api_key.workspace_id.0
             );
             Ok(ResponseJson(ConversationDeleteResult {
                 id: conversation_id,
@@ -330,16 +338,24 @@ pub async fn delete_conversation(
 pub async fn list_conversation_items(
     Path(conversation_id): Path<String>,
     Query(params): Query<ListItemsQuery>,
-    State(service): State<Arc<services::ConversationService>>,
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
     Extension(api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ConversationItemList>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
-        "List items in conversation {} for user {}",
-        conversation_id, api_key.created_by_user_id.0
+        "List items in conversation {} for workspace {}",
+        conversation_id, api_key.workspace_id.0
     );
 
-    // Validate pagination parameters
-    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+    // Validate limit parameter
+    if params.limit <= 0 || params.limit > 1000 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Limit must be between 1 and 1000".to_string(),
+                "invalid_request_error".to_string(),
+            )),
+        ));
+    }
 
     let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
         Ok(id) => id,
@@ -351,25 +367,33 @@ pub async fn list_conversation_items(
         }
     };
 
+    // Request limit + 1 items to determine if there are more
+    let fetch_limit = params.limit + 1;
+
+    // Get items from conversation service
     match service
-        .get_conversation_messages(
-            &parsed_conversation_id,
-            &api_key.created_by_user_id.0.into(),
-            params.limit,
+        .list_conversation_items(
+            parsed_conversation_id,
+            api_key.workspace_id.clone(),
+            params.after.clone(),
+            fetch_limit,
         )
         .await
     {
-        Ok(messages) => {
-            let http_items: Vec<ConversationItem> = messages
+        Ok(items) => {
+            // Convert ResponseOutputItems to ConversationItems
+            let http_items: Vec<ConversationItem> = items
                 .into_iter()
-                .map(|msg| ConversationItem::Message {
-                    id: msg.id.to_string(),
-                    status: ResponseItemStatus::Completed,
-                    role: msg.role,
-                    content: vec![ConversationContentPart::InputText { text: msg.content }],
-                    metadata: msg.metadata,
-                })
+                .map(convert_output_item_to_conversation_item)
                 .collect();
+
+            // Now check has_more and truncate AFTER filtering
+            let has_more = http_items.len() > params.limit as usize;
+            let http_items = if has_more {
+                http_items.into_iter().take(params.limit as usize).collect()
+            } else {
+                http_items
+            };
 
             let first_id = http_items.first().map(get_item_id).unwrap_or_default();
             let last_id = http_items.last().map(get_item_id).unwrap_or_default();
@@ -379,7 +403,7 @@ pub async fn list_conversation_items(
                 data: http_items,
                 first_id,
                 last_id,
-                has_more: false,
+                has_more,
             }))
         }
         Err(error) => Err((
@@ -391,8 +415,120 @@ pub async fn list_conversation_items(
 
 // Helper functions
 
+fn convert_output_item_to_conversation_item(
+    item: services::responses::models::ResponseOutputItem,
+) -> ConversationItem {
+    use services::responses::models::ResponseOutputItem;
+
+    match item {
+        ResponseOutputItem::Message {
+            id,
+            status,
+            role,
+            content,
+        } => {
+            // Convert ResponseOutputContent to ConversationContentPart
+            let conv_content: Vec<ConversationContentPart> = content
+                .into_iter()
+                .filter_map(|c| match c {
+                    services::responses::models::ResponseOutputContent::OutputText {
+                        text,
+                        annotations,
+                        logprobs: _,
+                    } => Some(ConversationContentPart::OutputText {
+                        text,
+                        annotations: Some(
+                            annotations
+                                .into_iter()
+                                .map(convert_text_annotation)
+                                .map(|a| serde_json::to_value(a).unwrap())
+                                .collect(),
+                        ),
+                    }),
+                    _ => None,
+                })
+                .collect();
+
+            ConversationItem::Message {
+                id,
+                status: convert_response_item_status(status),
+                role,
+                content: conv_content,
+                metadata: None,
+            }
+        }
+        ResponseOutputItem::ToolCall {
+            id,
+            status,
+            tool_type,
+            function,
+        } => ConversationItem::ToolCall {
+            id,
+            status: convert_response_item_status(status),
+            tool_type,
+            function: ConversationItemFunction {
+                name: function.name,
+                arguments: function.arguments,
+            },
+        },
+        ResponseOutputItem::WebSearchCall { id, status, action } => {
+            ConversationItem::WebSearchCall {
+                id,
+                status: convert_response_item_status(status),
+                action: match action {
+                    services::responses::models::WebSearchAction::Search { query } => {
+                        ConversationItemWebSearchAction::Search { query }
+                    }
+                },
+            }
+        }
+        ResponseOutputItem::Reasoning {
+            id,
+            status,
+            summary,
+            content,
+        } => ConversationItem::Reasoning {
+            id,
+            status: convert_response_item_status(status),
+            summary,
+            content,
+        },
+    }
+}
+
+fn convert_text_annotation(
+    annotation: services::responses::models::TextAnnotation,
+) -> TextAnnotation {
+    match annotation {
+        services::responses::models::TextAnnotation::UrlCitation {
+            start_index,
+            end_index,
+            title,
+            url,
+        } => TextAnnotation::UrlCitation {
+            start_index,
+            end_index,
+            title,
+            url,
+        },
+    }
+}
+
+fn convert_response_item_status(
+    status: services::responses::models::ResponseItemStatus,
+) -> ResponseItemStatus {
+    match status {
+        services::responses::models::ResponseItemStatus::Completed => ResponseItemStatus::Completed,
+        services::responses::models::ResponseItemStatus::Failed => ResponseItemStatus::Failed,
+        services::responses::models::ResponseItemStatus::InProgress => {
+            ResponseItemStatus::InProgress
+        }
+        services::responses::models::ResponseItemStatus::Cancelled => ResponseItemStatus::Cancelled,
+    }
+}
+
 fn convert_domain_conversation_to_http(
-    domain_conversation: services::conversations::ports::Conversation,
+    domain_conversation: services::conversations::models::Conversation,
 ) -> ConversationObject {
     ConversationObject {
         id: domain_conversation.id.to_string(),
@@ -405,6 +541,9 @@ fn convert_domain_conversation_to_http(
 fn get_item_id(item: &ConversationItem) -> String {
     match item {
         ConversationItem::Message { id, .. } => id.clone(),
+        ConversationItem::ToolCall { id, .. } => id.clone(),
+        ConversationItem::WebSearchCall { id, .. } => id.clone(),
+        ConversationItem::Reasoning { id, .. } => id.clone(),
     }
 }
 

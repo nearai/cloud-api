@@ -4681,6 +4681,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls 0.23.33",
+ "rustls-native-certs 0.8.2",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -5414,6 +5415,7 @@ dependencies = [
  "tokio-test",
  "tracing",
  "url",
+ "utoipa",
  "uuid",
 ]
 

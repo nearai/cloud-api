@@ -544,7 +544,7 @@ pub enum ResponseOutputItem {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ResponseItemStatus {
     Completed,
@@ -664,6 +664,12 @@ pub struct UpdateConversationRequest {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// Request to create items in a conversation
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateConversationItemsRequest {
+    pub items: Vec<ConversationInputItem>,
+}
+
 /// Conversation object
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ConversationObject {
@@ -755,6 +761,26 @@ pub enum ConversationItem {
         summary: String,
         content: String,
     },
+}
+
+impl ConversationItem {
+    /// Get the ID of the conversation item
+    pub fn id(&self) -> &str {
+        match self {
+            ConversationItem::Message { id, .. } => id,
+            ConversationItem::ToolCall { id, .. } => id,
+            ConversationItem::WebSearchCall { id, .. } => id,
+            ConversationItem::Reasoning { id, .. } => id,
+        }
+    }
+
+    /// Get the role of the conversation item (only for Message items)
+    pub fn role(&self) -> &str {
+        match self {
+            ConversationItem::Message { role, .. } => role,
+            _ => "",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

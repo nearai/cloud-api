@@ -633,6 +633,10 @@ pub fn build_conversation_routes(
             "/conversations/{conversation_id}/items",
             get(conversations::list_conversation_items),
         )
+        .route(
+            "/conversations/{conversation_id}/items",
+            post(conversations::create_conversation_items),
+        )
         .with_state(
             conversation_service
                 as Arc<dyn services::conversations::ports::ConversationServiceTrait>,

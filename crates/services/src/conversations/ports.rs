@@ -78,4 +78,14 @@ pub trait ConversationServiceTrait: Send + Sync {
         Vec<crate::responses::models::ResponseOutputItem>,
         conversations::errors::ConversationError,
     >;
+    async fn create_conversation_items(
+        &self,
+        conversation_id: conversations::models::ConversationId,
+        workspace_id: WorkspaceId,
+        api_key_id: uuid::Uuid,
+        items: Vec<crate::responses::models::ResponseOutputItem>,
+    ) -> Result<
+        Vec<crate::responses::models::ResponseOutputItem>,
+        conversations::errors::ConversationError,
+    >;
 }

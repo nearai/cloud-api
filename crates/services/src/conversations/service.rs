@@ -278,4 +278,115 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
                 ))
             })
     }
+
+    /// Create items in a conversation (for backfilling)
+    async fn create_conversation_items(
+        &self,
+        conversation_id: models::ConversationId,
+        workspace_id: WorkspaceId,
+        api_key_id: uuid::Uuid,
+        items: Vec<crate::responses::models::ResponseOutputItem>,
+    ) -> Result<Vec<crate::responses::models::ResponseOutputItem>, errors::ConversationError> {
+        tracing::debug!(
+            "Creating {} items in conversation {} for workspace {}",
+            items.len(),
+            conversation_id,
+            workspace_id.0
+        );
+
+        // Verify conversation exists
+        let conversation = self
+            .conv_repo
+            .get_by_id(conversation_id.clone(), workspace_id.clone())
+            .await
+            .map_err(|e| {
+                errors::ConversationError::InternalError(format!(
+                    "Failed to verify conversation: {e}"
+                ))
+            })?;
+
+        if conversation.is_none() {
+            return Err(errors::ConversationError::InvalidParams(format!(
+                "Conversation not found: {conversation_id}"
+            )));
+        }
+
+        // Create a minimal response for backfilled items
+        // Response items require a response_id, so we create a placeholder response
+        let backfill_response_request = crate::responses::models::CreateResponseRequest {
+            model: "backfill".to_string(), // Special model name for backfilled items
+            input: None,
+            instructions: None,
+            conversation: Some(crate::responses::models::ConversationReference::Id(
+                conversation_id.to_string(),
+            )),
+            previous_response_id: None,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            temperature: None,
+            top_p: None,
+            stream: Some(false),
+            store: Some(false),
+            background: Some(false),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            text: None,
+            reasoning: None,
+            include: None,
+            metadata: Some(serde_json::json!({
+                "backfill": true
+            })),
+            safety_identifier: None,
+            prompt_cache_key: None,
+        };
+
+        let backfill_response = self
+            .resp_repo
+            .create(workspace_id.clone(), api_key_id, backfill_response_request)
+            .await
+            .map_err(|e| {
+                errors::ConversationError::InternalError(format!(
+                    "Failed to create backfill response: {e}"
+                ))
+            })?;
+
+        // Extract response_id from the created response
+        let response_id_str = backfill_response
+            .id
+            .strip_prefix("resp_")
+            .unwrap_or(&backfill_response.id);
+        let response_uuid = Uuid::parse_str(response_id_str).map_err(|e| {
+            errors::ConversationError::InternalError(format!("Failed to parse response ID: {e}"))
+        })?;
+        let response_id = crate::responses::models::ResponseId(response_uuid);
+
+        // Create each item in the response_items repository
+        let mut created_items = Vec::new();
+        for item in items {
+            let created_item = self
+                .response_items_repo
+                .create(
+                    response_id.clone(),
+                    api_key_id,
+                    Some(conversation_id.clone()),
+                    item,
+                )
+                .await
+                .map_err(|e| {
+                    errors::ConversationError::InternalError(format!(
+                        "Failed to create conversation item: {e}"
+                    ))
+                })?;
+            created_items.push(created_item);
+        }
+
+        tracing::debug!(
+            "Created {} items in conversation {}",
+            created_items.len(),
+            conversation_id
+        );
+
+        Ok(created_items)
+    }
 }

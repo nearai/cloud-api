@@ -36,7 +36,7 @@ impl FileRepository {
                 r#"
                 INSERT INTO files (
                     id, filename, bytes, content_type, purpose, storage_key,
-                    workspace_id, uploaded_by_user_id, created_at, expires_at
+                    workspace_id, uploaded_by_api_key_id, created_at, expires_at
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 RETURNING *
@@ -49,7 +49,7 @@ impl FileRepository {
                     &params.purpose,
                     &params.storage_key,
                     &params.workspace_id,
-                    &params.uploaded_by_user_id,
+                    &params.uploaded_by_api_key_id,
                     &now,
                     &params.expires_at,
                 ],
@@ -321,7 +321,7 @@ impl FileRepository {
             purpose: row.get("purpose"),
             storage_key: row.get("storage_key"),
             workspace_id: row.get("workspace_id"),
-            uploaded_by_user_id: row.get("uploaded_by_user_id"),
+            uploaded_by_api_key_id: row.get("uploaded_by_api_key_id"),
             created_at: row.get("created_at"),
             expires_at: row.get("expires_at"),
         })

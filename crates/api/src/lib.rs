@@ -304,7 +304,7 @@ pub async fn init_domain_services(
         s3_client,
         config.s3.bucket.clone(),
         config.s3.encryption_key.clone(),
-    ));
+    )) as Arc<dyn services::files::storage::StorageTrait>;
 
     let file_repository = Arc::new(database::repositories::FileRepository::new(
         database.pool().clone(),

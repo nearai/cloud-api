@@ -1,5 +1,4 @@
 use crate::{
-    middleware::auth::AuthenticatedApiKey,
     models::{ErrorResponse, FileDeleteResponse, FileListResponse, FileUploadResponse},
     routes::api::AppState,
 };
@@ -30,12 +29,12 @@ const MAX_FILE_SIZE: u64 = 512 * 1024 * 1024; // 512 MB
 )]
 pub async fn upload_file(
     State(app_state): State<AppState>,
-    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<FileUploadResponse>), (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "File upload request from workspace: {}",
-        api_key.workspace.id.0
+        api_key.workspace_id.0
     );
 
     let mut file_data: Option<Vec<u8>> = None;
@@ -195,8 +194,8 @@ pub async fn upload_file(
             file_data,
             content_type,
             purpose,
-            api_key.workspace.id.0,
-            Some(api_key.api_key.created_by_user_id.0),
+            api_key.workspace_id.0,
+            Some(api_key.created_by_user_id.0),
             expires_at,
         )
         .await
@@ -256,12 +255,12 @@ pub async fn upload_file(
 )]
 pub async fn list_files(
     State(app_state): State<AppState>,
-    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<crate::models::FileListResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "List files request from workspace: {}",
-        api_key.workspace.id.0
+        api_key.workspace_id.0
     );
 
     // Parse query parameters
@@ -308,7 +307,7 @@ pub async fn list_files(
     // Use file service to list files
     let files = app_state
         .files_service
-        .list_files(api_key.workspace.id.0, after, limit + 1, order, purpose)
+        .list_files(api_key.workspace_id.0, after, limit + 1, order, purpose)
         .await
         .map_err(|e| {
             error!("Failed to list files: {}", e);
@@ -370,12 +369,12 @@ pub async fn list_files(
 )]
 pub async fn get_file(
     State(app_state): State<AppState>,
-    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
     axum::extract::Path(file_id): axum::extract::Path<String>,
 ) -> Result<Json<FileUploadResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Get file request: {} from workspace: {}",
-        file_id, api_key.workspace.id.0
+        file_id, api_key.workspace_id.0
     );
 
     // Parse file ID (remove "file-" prefix if present)
@@ -393,7 +392,7 @@ pub async fn get_file(
     // Use file service to get file (with workspace authorization check)
     let file = app_state
         .files_service
-        .get_file(file_uuid, api_key.workspace.id.0)
+        .get_file(file_uuid, api_key.workspace_id.0)
         .await
         .map_err(|e| {
             error!("Failed to retrieve file: {}", e);
@@ -443,12 +442,12 @@ pub async fn get_file(
 )]
 pub async fn delete_file(
     State(app_state): State<AppState>,
-    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
     axum::extract::Path(file_id): axum::extract::Path<String>,
 ) -> Result<Json<FileDeleteResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Delete file request: {} from workspace: {}",
-        file_id, api_key.workspace.id.0
+        file_id, api_key.workspace_id.0
     );
 
     // Parse file ID (remove "file-" prefix if present)
@@ -466,7 +465,7 @@ pub async fn delete_file(
     // Use file service to delete file (includes workspace authorization check)
     let deleted = app_state
         .files_service
-        .delete_file(file_uuid, api_key.workspace.id.0)
+        .delete_file(file_uuid, api_key.workspace_id.0)
         .await
         .map_err(|e| {
             error!("Failed to delete file: {}", e);
@@ -524,12 +523,12 @@ pub async fn delete_file(
 )]
 pub async fn get_file_content(
     State(app_state): State<AppState>,
-    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
     axum::extract::Path(file_id): axum::extract::Path<String>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Get file content request: {} from workspace: {}",
-        file_id, api_key.workspace.id.0
+        file_id, api_key.workspace_id.0
     );
 
     // Parse file ID (remove "file-" prefix if present)
@@ -547,7 +546,7 @@ pub async fn get_file_content(
     // Use file service to get file metadata and content (with workspace authorization check)
     let (file, file_content) = app_state
         .files_service
-        .get_file_content(file_uuid, api_key.workspace.id.0)
+        .get_file_content(file_uuid, api_key.workspace_id.0)
         .await
         .map_err(|e| {
             error!("Failed to retrieve file content: {}", e);

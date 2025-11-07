@@ -8,7 +8,7 @@ use crate::common::RepositoryError;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
-use storage::S3Storage;
+use storage::StorageTrait;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -39,6 +39,7 @@ pub enum FileServiceError {
 /// Allowed MIME types for file uploads with their encoding requirements
 pub const ALLOWED_MIME_TYPES: &[(&str, bool)] = &[
     // (MIME type, requires_utf_encoding)
+    ("application/octet-stream", false),
     ("text/x-c", true),
     ("text/x-c++", true),
     ("text/x-csharp", true),
@@ -166,8 +167,8 @@ pub fn validate_purpose(purpose: &str) -> Result<(), FileServiceError> {
     }
 }
 
-pub fn generate_storage_key(workspace_id: Uuid, file_id: Uuid, filename: &str) -> String {
-    format!("{}/{}/{}", workspace_id, file_id, filename)
+pub fn generate_storage_key(workspace_id: Uuid, file_id: Uuid) -> String {
+    format!("{}/{}", workspace_id, file_id)
 }
 
 /// File service trait for managing file uploads, downloads, and metadata
@@ -216,11 +217,11 @@ pub trait FileServiceTrait: Send + Sync {
 /// Implementation of the file service
 pub struct FileServiceImpl {
     file_repository: Arc<dyn FileRepositoryTrait>,
-    storage: Arc<S3Storage>,
+    storage: Arc<dyn StorageTrait>,
 }
 
 impl FileServiceImpl {
-    pub fn new(file_repository: Arc<dyn FileRepositoryTrait>, storage: Arc<S3Storage>) -> Self {
+    pub fn new(file_repository: Arc<dyn FileRepositoryTrait>, storage: Arc<dyn StorageTrait>) -> Self {
         Self {
             file_repository,
             storage,
@@ -251,7 +252,7 @@ impl FileServiceTrait for FileServiceImpl {
 
         // Generate file ID and storage key
         let file_id = Uuid::new_v4();
-        let storage_key = generate_storage_key(workspace_id, file_id, &filename);
+        let storage_key = generate_storage_key(workspace_id, file_id);
 
         // Upload to storage (automatically encrypted)
         self.storage

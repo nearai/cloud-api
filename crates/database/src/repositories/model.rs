@@ -51,7 +51,7 @@ impl ModelRepository {
                     m.context_length, m.verifiable, m.is_active, m.created_at, m.updated_at,
                     COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                 FROM models m
-                LEFT JOIN model_aliases a ON a.canonical_model_id = m.id
+                LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
                 WHERE m.is_active = true
                 GROUP BY m.id
                 ORDER BY m.model_name ASC

@@ -71,6 +71,7 @@ jobs:
         MODEL_DISCOVERY_API_KEY: ${{ secrets.MODEL_DISCOVERY_API_KEY }}
         AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
         AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
+        BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
         DEV: "true"
 
     - name: Run integration tests
@@ -88,6 +89,7 @@ jobs:
         MODEL_DISCOVERY_API_KEY: ${{ secrets.MODEL_DISCOVERY_API_KEY }}
         AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
         AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
+        BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
         RUST_LOG: debug
         DEV: "true"
 

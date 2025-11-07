@@ -67,6 +67,7 @@ pub struct DomainServices {
     pub workspace_service: Arc<dyn services::workspace::WorkspaceServiceTrait + Send + Sync>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
+    pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
 }
 
 /// Initialize database connection and run migrations
@@ -307,6 +308,24 @@ pub async fn init_domain_services(
     let user_service = Arc::new(services::user::UserService::new(user_repo, session_repo))
         as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
 
+    // Create S3 storage and file service
+    let s3_config = aws_config::load_from_env().await;
+    let s3_client = aws_sdk_s3::Client::new(&s3_config);
+    let s3_storage = Arc::new(services::files::storage::S3Storage::new(
+        s3_client,
+        config.s3.bucket.clone(),
+        config.s3.encryption_key.clone(),
+    )) as Arc<dyn services::files::storage::StorageTrait>;
+
+    let file_repository = Arc::new(database::repositories::FileRepository::new(
+        database.pool().clone(),
+    )) as Arc<dyn services::files::FileRepositoryTrait>;
+
+    let files_service = Arc::new(services::files::FileServiceImpl::new(
+        file_repository,
+        s3_storage,
+    )) as Arc<dyn services::files::FileServiceTrait + Send + Sync>;
+
     DomainServices {
         conversation_service,
         response_service,
@@ -319,6 +338,7 @@ pub async fn init_domain_services(
         workspace_service,
         usage_service,
         user_service,
+        files_service,
     }
 }
 
@@ -383,6 +403,7 @@ pub fn build_app_with_config(
         attestation_service: domain_services.attestation_service.clone(),
         usage_service: domain_services.usage_service.clone(),
         user_service: domain_services.user_service.clone(),
+        files_service: domain_services.files_service.clone(),
         config: config.clone(),
     };
 
@@ -447,6 +468,9 @@ pub fn build_app_with_config(
     let invitation_routes =
         build_invitation_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
+    let files_routes =
+        build_files_routes(app_state.clone(), &auth_components.auth_state_middleware);
+
     // Build OpenAPI and documentation routes
     let openapi_routes = build_openapi_routes();
 
@@ -467,6 +491,7 @@ pub fn build_app_with_config(
                 .merge(model_routes)
                 .merge(admin_routes)
                 .merge(invitation_routes)
+                .merge(files_routes)
                 .merge(health_routes),
         )
         .merge(openapi_routes)
@@ -674,6 +699,21 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware,
+        ))
+}
+
+/// Build file upload routes
+pub fn build_files_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
+    use crate::routes::files::*;
+
+    Router::new()
+        .route("/files", post(upload_file).get(list_files))
+        .route("/files/{file_id}", get(get_file).delete(delete_file))
+        .route("/files/{file_id}/content", get(get_file_content))
+        .with_state(app_state)
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            auth_middleware_with_api_key,
         ))
 }
 
@@ -983,6 +1023,12 @@ mod tests {
                 refresh_interval: 30,
                 mock: false,
             },
+            s3: config::S3Config {
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(), // Mock 256-bit hex key
+            },
         };
 
         // Initialize services
@@ -1067,6 +1113,12 @@ mod tests {
                 tls_ca_cert_path: None,
                 refresh_interval: 30,
                 mock: false,
+            },
+            s3: config::S3Config {
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(), // Mock 256-bit hex key
             },
         };
 

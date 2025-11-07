@@ -4,6 +4,7 @@ pub mod auth;
 pub mod common;
 pub mod completions;
 pub mod conversations;
+pub mod files;
 pub mod inference_provider_pool;
 pub mod mcp;
 pub mod models;

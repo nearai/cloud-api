@@ -1426,6 +1426,50 @@ pub struct OrgLimitsHistoryResponse {
     pub offset: i64,
 }
 
+// ============================================
+// File Upload Models
+// ============================================
+
+/// File upload response
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct FileUploadResponse {
+    pub id: String,
+    pub object: String, // Always "file"
+    pub bytes: i64,
+    pub created_at: i64, // Unix timestamp
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>, // Unix timestamp
+    pub filename: String,
+    pub purpose: String,
+}
+
+/// Expires after configuration
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ExpiresAfter {
+    pub anchor: String, // "created_at"
+    pub seconds: i64,   // Max: 31536000 (1 year)
+}
+
+/// File list response
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct FileListResponse {
+    pub object: String, // Always "list"
+    pub data: Vec<FileUploadResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_id: Option<String>,
+    pub has_more: bool,
+}
+
+/// File delete response
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct FileDeleteResponse {
+    pub id: String,
+    pub object: String, // Always "file"
+    pub deleted: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

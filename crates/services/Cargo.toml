@@ -39,6 +39,11 @@ dstack-sdk = "0.1.2"
 dstack-sdk-types = "0.1.2"
 jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"] }
 regex = "1.11"
+# AWS S3 for file storage
+aws-config = { version = "1.5", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.70"
+# Encryption for file storage
+aes-gcm = "0.10"
 
 [dev-dependencies]
 tokio-test = "0.4"

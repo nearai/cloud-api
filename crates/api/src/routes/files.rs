@@ -66,10 +66,7 @@ pub async fn upload_file(
                         return Err((
                             StatusCode::PAYLOAD_TOO_LARGE,
                             Json(ErrorResponse::new(
-                                format!(
-                                    "File too large: exceeds {} bytes limit",
-                                    MAX_FILE_SIZE
-                                ),
+                                format!("File too large: exceeds {} bytes limit", MAX_FILE_SIZE),
                                 "invalid_request_error".to_string(),
                             )),
                         ));

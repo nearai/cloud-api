@@ -705,8 +705,8 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
 
 /// Build file upload routes
 pub fn build_files_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
-    use crate::routes::files::*;
     use crate::routes::files::MAX_FILE_SIZE;
+    use crate::routes::files::*;
     Router::new()
         .route("/files", post(upload_file).get(list_files))
         .route("/files/{file_id}", get(get_file).delete(delete_file))

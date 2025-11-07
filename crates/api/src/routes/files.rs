@@ -12,7 +12,7 @@ use axum::{
 use services::files::calculate_expires_at;
 use tracing::{debug, error};
 
-const MAX_FILE_SIZE: u64 = 512 * 1024 * 1024; // 512 MB
+pub const MAX_FILE_SIZE: usize = 512 * 1024 * 1024; // 512 MB
 
 #[utoipa::path(
     post,
@@ -66,7 +66,7 @@ pub async fn upload_file(
                 })?;
 
                 // Defense-in-depth: verify size (should already be caught by DefaultBodyLimit layer)
-                if data.len() as u64 > MAX_FILE_SIZE {
+                if data.len() > MAX_FILE_SIZE {
                     return Err((
                         StatusCode::PAYLOAD_TOO_LARGE,
                         Json(ErrorResponse::new(

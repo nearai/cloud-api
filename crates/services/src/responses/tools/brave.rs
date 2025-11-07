@@ -20,8 +20,11 @@ impl BraveWebSearchProvider {
             panic!("BRAVE_SEARCH_PRO_API_KEY is not set");
         });
         Self {
-            api_key,               // TODO: Remove this once we have a proper config
-            client: reqwest::Client::new(), // TODO: Add a timeout
+            api_key,
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap(),
         }
     }
 

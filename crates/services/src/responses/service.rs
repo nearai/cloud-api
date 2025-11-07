@@ -460,8 +460,13 @@ impl ResponseServiceImpl {
         let api_key_uuid = Uuid::parse_str(&context.api_key_id).map_err(|e| {
             errors::ResponseError::InternalError(format!("Invalid API key ID: {e}"))
         })?;
-        let initial_response = context.response_repository
-            .create(workspace_id_domain.clone(), api_key_uuid, context.request.clone())
+        let initial_response = context
+            .response_repository
+            .create(
+                workspace_id_domain.clone(),
+                api_key_uuid,
+                context.request.clone(),
+            )
             .await
             .map_err(|e| {
                 errors::ResponseError::InternalError(format!("Failed to create response: {e}"))
@@ -548,7 +553,8 @@ impl ResponseServiceImpl {
         final_response.status = models::ResponseStatus::Completed;
 
         // Load all response items from the database for this response
-        let response_items = context.response_items_repository
+        let response_items = context
+            .response_items_repository
             .list_by_response(ctx.response_id.clone())
             .await
             .map_err(|e| {
@@ -581,7 +587,8 @@ impl ResponseServiceImpl {
         })?;
 
         // Update the response in the database with usage, status, and output message
-        if let Err(e) = context.response_repository
+        if let Err(e) = context
+            .response_repository
             .update(
                 ctx.response_id.clone(),
                 workspace_id_domain.clone(),
@@ -1073,20 +1080,20 @@ impl ResponseServiceImpl {
         // Load from conversation_id if present
         if let Some(conversation_ref) = &request.conversation {
             let conversation_id = match conversation_ref {
-                models::ConversationReference::Id(id) => {
-                    id.parse::<crate::conversations::models::ConversationId>().map_err(|e| {
+                models::ConversationReference::Id(id) => id
+                    .parse::<crate::conversations::models::ConversationId>()
+                    .map_err(|e| {
                         errors::ResponseError::InvalidParams(format!(
                             "Invalid conversation ID: {e}"
                         ))
-                    })?
-                }
-                models::ConversationReference::Object { id, metadata: _ } => {
-                    id.parse::<crate::conversations::models::ConversationId>().map_err(|e| {
+                    })?,
+                models::ConversationReference::Object { id, metadata: _ } => id
+                    .parse::<crate::conversations::models::ConversationId>()
+                    .map_err(|e| {
                         errors::ResponseError::InvalidParams(format!(
                             "Invalid conversation ID: {e}"
                         ))
-                    })?
-                }
+                    })?,
             };
 
             // Load conversation metadata to verify it exists

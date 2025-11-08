@@ -52,11 +52,55 @@ pub struct ChatCompletionRequest {
     pub extra: HashMap<String, Value>,
 }
 
+/// Content can be text or array of content parts
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<MessageContentPart>),
+}
+
+/// Content part (text, image, audio, file)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type")]
+pub enum MessageContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl {
+        image_url: MessageImageUrl,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    #[serde(rename = "audio")]
+    Audio {
+        audio: MessageAudio,
+    },
+    #[serde(rename = "file")]
+    File {
+        file_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum MessageImageUrl {
+    String(String),
+    Object { url: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct MessageAudio {
+    pub data: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Message {
     pub role: String, // "system", "user", "assistant"
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<MessageContent>,
     pub name: Option<String>,
 }
 
@@ -195,6 +239,24 @@ impl ChatCompletionRequest {
             }
             if !["system", "user", "assistant"].contains(&message.role.as_str()) {
                 return Err(format!("invalid message role: {}", message.role));
+            }
+            
+            // Validate content: if it's an array, check that all parts are text-only
+            if let Some(MessageContent::Parts(parts)) = &message.content {
+                for part in parts {
+                    match part {
+                        MessageContentPart::Text { .. } => {
+                            // Text parts are allowed
+                        }
+                        MessageContentPart::ImageUrl { .. }
+                        | MessageContentPart::Audio { .. }
+                        | MessageContentPart::File { .. } => {
+                            return Err(
+                                "Content array contains non-text parts (image, audio, or file). Only text content is currently supported.".to_string()
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -1681,5 +1743,169 @@ mod tests {
         let result: Result<ResponseImageUrl, _> = serde_json::from_str(json);
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), ResponseImageUrl::Object { .. }));
+    }
+
+    // ChatCompletionRequest validation tests
+    #[test]
+    fn test_chat_completion_request_with_text_content_array() {
+        let request = ChatCompletionRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Parts(vec![
+                    MessageContentPart::Text {
+                        text: "Hello".to_string(),
+                    },
+                    MessageContentPart::Text {
+                        text: "World".to_string(),
+                    },
+                ])),
+                name: None,
+            }],
+            max_tokens: Some(100),
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        // Text-only content array should pass validation
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_chat_completion_request_with_image_content_rejected() {
+        let request = ChatCompletionRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Parts(vec![
+                    MessageContentPart::Text {
+                        text: "What's in this image?".to_string(),
+                    },
+                    MessageContentPart::ImageUrl {
+                        image_url: MessageImageUrl::String(
+                            "data:image/jpeg;base64,/9j/4AAQSkZJRg==".to_string(),
+                        ),
+                        detail: Some("low".to_string()),
+                    },
+                ])),
+                name: None,
+            }],
+            max_tokens: Some(100),
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        // Image content should be rejected
+        let result = request.validate();
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "Content array contains non-text parts (image, audio, or file). Only text content is currently supported."
+        );
+    }
+
+    #[test]
+    fn test_chat_completion_request_with_audio_content_rejected() {
+        let request = ChatCompletionRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Parts(vec![
+                    MessageContentPart::Audio {
+                        audio: MessageAudio {
+                            data: "base64_audio_data".to_string(),
+                            format: Some("mp3".to_string()),
+                        },
+                    },
+                ])),
+                name: None,
+            }],
+            max_tokens: Some(100),
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        // Audio content should be rejected
+        let result = request.validate();
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "Content array contains non-text parts (image, audio, or file). Only text content is currently supported."
+        );
+    }
+
+    #[test]
+    fn test_chat_completion_request_with_file_content_rejected() {
+        let request = ChatCompletionRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Parts(vec![
+                    MessageContentPart::File {
+                        file_id: "file-abc123".to_string(),
+                    },
+                ])),
+                name: None,
+            }],
+            max_tokens: Some(100),
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        // File content should be rejected
+        let result = request.validate();
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "Content array contains non-text parts (image, audio, or file). Only text content is currently supported."
+        );
+    }
+
+    #[test]
+    fn test_chat_completion_request_with_string_content_allowed() {
+        let request = ChatCompletionRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("Hello, world!".to_string())),
+                name: None,
+            }],
+            max_tokens: Some(100),
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        // String content should pass validation
+        assert!(request.validate().is_ok());
     }
 }

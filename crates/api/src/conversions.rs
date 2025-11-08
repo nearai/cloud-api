@@ -6,6 +6,27 @@ use services::completions::CompletionError;
 
 impl From<&crate::models::Message> for ChatMessage {
     fn from(msg: &crate::models::Message) -> Self {
+        // Extract text from MessageContent
+        let content = match &msg.content {
+            None => None,
+            Some(crate::models::MessageContent::Text(text)) => Some(text.clone()),
+            Some(crate::models::MessageContent::Parts(parts)) => {
+                // Extract text from all text parts and join with newlines
+                let text_parts: Vec<String> = parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        crate::models::MessageContentPart::Text { text } => Some(text.clone()),
+                        _ => None, // Non-text parts should be filtered out by validation
+                    })
+                    .collect();
+                if text_parts.is_empty() {
+                    None
+                } else {
+                    Some(text_parts.join("\n"))
+                }
+            }
+        };
+
         Self {
             role: match msg.role.as_str() {
                 "system" => MessageRole::System,
@@ -14,7 +35,7 @@ impl From<&crate::models::Message> for ChatMessage {
                 "tool" => MessageRole::Tool,
                 _ => MessageRole::User, // Default to user for unknown roles
             },
-            content: msg.content.clone(),
+            content,
             name: msg.name.clone(),
             tool_call_id: None,
             tool_calls: None,
@@ -80,6 +101,11 @@ impl From<&CompletionRequest> for CompletionParams {
 
 impl From<&ChatMessage> for crate::models::Message {
     fn from(msg: &ChatMessage) -> Self {
+        // Convert Option<String> to Option<MessageContent>
+        let content = msg.content.as_ref().map(|text| {
+            crate::models::MessageContent::Text(text.clone())
+        });
+
         Self {
             role: match msg.role {
                 MessageRole::System => "system".to_string(),
@@ -87,7 +113,7 @@ impl From<&ChatMessage> for crate::models::Message {
                 MessageRole::Assistant => "assistant".to_string(),
                 MessageRole::Tool => "tool".to_string(),
             },
-            content: msg.content.clone(),
+            content,
             name: msg.name.clone(),
         }
     }
@@ -558,7 +584,7 @@ mod tests {
     fn test_message_conversion() {
         let http_msg = crate::models::Message {
             role: "user".to_string(),
-            content: Some("Hello".to_string()),
+            content: Some(crate::models::MessageContent::Text("Hello".to_string())),
             name: None,
         };
 
@@ -568,7 +594,10 @@ mod tests {
 
         let back_to_http: crate::models::Message = (&domain_msg).into();
         assert_eq!(back_to_http.role, "user");
-        assert_eq!(back_to_http.content, Some("Hello".to_string()));
+        assert_eq!(
+            back_to_http.content,
+            Some(crate::models::MessageContent::Text("Hello".to_string()))
+        );
     }
 
     #[test]
@@ -577,7 +606,7 @@ mod tests {
             model: "gpt-3.5-turbo".to_string(),
             messages: vec![crate::models::Message {
                 role: "user".to_string(),
-                content: Some("Test message".to_string()),
+                content: Some(crate::models::MessageContent::Text("Test message".to_string())),
                 name: None,
             }],
             max_tokens: Some(100),

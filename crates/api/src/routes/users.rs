@@ -11,7 +11,6 @@ use axum::{
     extract::{Extension, Json, Path, Request, State},
     http::StatusCode,
 };
-use chrono::{Duration, Utc};
 use serde::Deserialize;
 use services::{auth::UserId, organization::OrganizationError, user::UserServiceError};
 use tracing::{debug, error};
@@ -398,10 +397,10 @@ pub async fn create_access_token(
         .ok_or_else(|| {
             error!("Missing User-Agent header when creating access token");
             (
-                StatusCode::UNAUTHORIZED,
+                StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(
                     "Missing User-Agent header".to_string(),
-                    "unauthorized".to_string(),
+                    "bad_request".to_string(),
                 )),
             )
         })?;
@@ -419,15 +418,12 @@ pub async fn create_access_token(
         )
         .await;
 
-    let now = Utc::now();
-    let expires_at = now + Duration::hours(expires_in_hours);
-
     match result {
         Ok((access_token, _refresh_session, refresh_token)) => {
             Ok(Json(crate::models::AccessAndRefreshTokenResponse {
                 access_token,
                 refresh_token,
-                refresh_token_expiration: expires_at,
+                refresh_token_expiration: _refresh_session.expires_at,
             }))
         }
         Err(_) => {

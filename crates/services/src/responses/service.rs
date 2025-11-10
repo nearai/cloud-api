@@ -366,71 +366,61 @@ impl ResponseServiceImpl {
                 }
             };
 
-            // Handle tools that don't require parameters (like current_date)
-            if name == "current_date" {
-                tracing::debug!("Tool call detected: {}", name);
-                tool_calls_detected.push(ToolCallInfo {
-                    tool_type: name,
-                    query: String::new(),
-                    params: None,
-                });
-            } else {
-                // Try to parse the complete arguments for tools that need parameters
-                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str) {
-                    if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
-                        tracing::debug!(
-                            "Tool call detected: {} with query: {} and params: {:?}",
-                            name,
-                            query,
-                            args
-                        );
-                        tool_calls_detected.push(ToolCallInfo {
-                            tool_type: name,
-                            query: query.to_string(),
-                            params: Some(args),
-                        });
-                    } else {
-                        tracing::warn!(
-                            "Tool call {} (index {}) has no 'query' field in arguments: {}",
-                            name,
-                            idx,
-                            args_str
-                        );
-                        // Create an error tool call to inform the LLM about missing query
-                        tool_calls_detected.push(ToolCallInfo {
-                            tool_type: "__error__".to_string(),
-                            query: format!(
-                                "Tool call for '{name}' (index {idx}) is missing the required 'query' field in its arguments. Please include a 'query' parameter. Arguments provided: {args_str}"
-                            ),
-                            params: Some(serde_json::json!({
-                                "error_type": "missing_query_field",
-                                "tool_name": name,
-                                "index": idx,
-                                "arguments": args_str
-                            })),
-                        });
-                    }
+            // Try to parse the complete arguments for tools that need parameters
+            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str) {
+                if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
+                    tracing::debug!(
+                        "Tool call detected: {} with query: {} and params: {:?}",
+                        name,
+                        query,
+                        args
+                    );
+                    tool_calls_detected.push(ToolCallInfo {
+                        tool_type: name,
+                        query: query.to_string(),
+                        params: Some(args),
+                    });
                 } else {
                     tracing::warn!(
-                        "Failed to parse tool call {} (index {}) arguments: {}",
+                        "Tool call {} (index {}) has no 'query' field in arguments: {}",
                         name,
                         idx,
                         args_str
                     );
-                    // Create an error tool call to inform the LLM about invalid JSON
+                    // Create an error tool call to inform the LLM about missing query
                     tool_calls_detected.push(ToolCallInfo {
                         tool_type: "__error__".to_string(),
                         query: format!(
-                            "Tool call for '{name}' (index {idx}) has invalid JSON arguments. Please ensure arguments are valid JSON. Arguments provided: {args_str}"
+                            "Tool call for '{name}' (index {idx}) is missing the required 'query' field in its arguments. Please include a 'query' parameter. Arguments provided: {args_str}"
                         ),
                         params: Some(serde_json::json!({
-                            "error_type": "invalid_json",
+                            "error_type": "missing_query_field",
                             "tool_name": name,
                             "index": idx,
                             "arguments": args_str
                         })),
                     });
                 }
+            } else {
+                tracing::warn!(
+                    "Failed to parse tool call {} (index {}) arguments: {}",
+                    name,
+                    idx,
+                    args_str
+                );
+                // Create an error tool call to inform the LLM about invalid JSON
+                tool_calls_detected.push(ToolCallInfo {
+                    tool_type: "__error__".to_string(),
+                    query: format!(
+                        "Tool call for '{name}' (index {idx}) has invalid JSON arguments. Please ensure arguments are valid JSON. Arguments provided: {args_str}"
+                    ),
+                    params: Some(serde_json::json!({
+                        "error_type": "invalid_json",
+                        "tool_name": name,
+                        "index": idx,
+                        "arguments": args_str
+                    })),
+                });
             }
         }
 
@@ -1047,11 +1037,26 @@ impl ResponseServiceImpl {
 
         let mut messages = Vec::new();
 
+        // Add UTC time context to system message
+        let now = chrono::Utc::now();
+        let time_context = format!(
+            "Current UTC time: {} ({})",
+            now.to_rfc3339(),
+            now.format("%A, %B %d, %Y at %H:%M:%S UTC")
+        );
+
         // Add system instructions if present
         if let Some(instructions) = &request.instructions {
+            let combined_instructions = format!("{}\n\n{}", instructions, time_context);
             messages.push(CompletionMessage {
                 role: "system".to_string(),
-                content: instructions.clone(),
+                content: combined_instructions,
+            });
+        } else {
+            // Add time context as a system message if no instructions provided
+            messages.push(CompletionMessage {
+                role: "system".to_string(),
+                content: time_context,
             });
         }
 
@@ -1349,48 +1354,8 @@ impl ResponseServiceImpl {
                             },
                         });
                     }
-                    models::ResponseTool::CurrentDate {} => {
-                        // Note: current_date is added by default below, so this case
-                        // should not typically be hit unless explicitly requested
-                        tool_definitions.push(inference_providers::ToolDefinition {
-                            type_: "function".to_string(),
-                            function: inference_providers::FunctionDefinition {
-                                name: "current_date".to_string(),
-                                description: Some(
-                                    "Get the current date and time. Use this when you need to know what day it is, the current time, or to answer questions about temporal information.".to_string()
-                                ),
-                                parameters: serde_json::json!({
-                                    "type": "object",
-                                    "properties": {},
-                                    "required": []
-                                }),
-                            },
-                        });
-                    }
                 }
             }
-        }
-
-        // Always add current_date tool by default (not visible at API level)
-        // Check if it's not already added to avoid duplicates
-        if !tool_definitions
-            .iter()
-            .any(|t| t.function.name == "current_date")
-        {
-            tool_definitions.push(inference_providers::ToolDefinition {
-                type_: "function".to_string(),
-                function: inference_providers::FunctionDefinition {
-                    name: "current_date".to_string(),
-                    description: Some(
-                        "Get the current date and time. Use this when you need to know what day it is, the current time, or to answer questions about temporal information.".to_string()
-                    ),
-                    parameters: serde_json::json!({
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }),
-                },
-            });
         }
 
         tool_definitions
@@ -1642,22 +1607,6 @@ impl ResponseServiceImpl {
                 } else {
                     Ok("File search not available (no provider configured)".to_string())
                 }
-            }
-            "current_date" => {
-                // Get current date and time
-                let now = chrono::Utc::now();
-                let formatted = format!(
-                    "Current Date and Time:\n\
-                    Date: {}\n\
-                    Time: {} UTC\n\
-                    ISO 8601: {}\n\
-                    Unix timestamp: {}",
-                    now.format("%A, %B %d, %Y"),
-                    now.format("%H:%M:%S"),
-                    now.to_rfc3339(),
-                    now.timestamp()
-                );
-                Ok(formatted)
             }
             _ => Err(errors::ResponseError::UnknownTool(
                 tool_call.tool_type.clone(),

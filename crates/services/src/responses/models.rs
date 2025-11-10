@@ -165,8 +165,6 @@ pub enum ResponseTool {
     CodeInterpreter {},
     #[serde(rename = "computer")]
     Computer {},
-    #[serde(rename = "current_date")]
-    CurrentDate {},
 }
 
 /// User location for web search

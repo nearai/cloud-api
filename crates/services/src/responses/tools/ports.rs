@@ -53,10 +53,6 @@ pub struct WebSearchParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spellcheck: Option<bool>,
 
-    /// Comma-delimited string of result types: "discussions", "faq", "infobox", "news", "videos", "web", "locations"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result_filter: Option<String>,
-
     /// Measurement units: "metric" or "imperial"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub units: Option<String>,

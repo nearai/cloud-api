@@ -125,12 +125,6 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
             query_params.push(("spellcheck", spellcheck));
         }
 
-        let result_filter;
-        if let Some(ref rf) = params.result_filter {
-            result_filter = rf.clone();
-            query_params.push(("result_filter", result_filter));
-        }
-
         let units;
         if let Some(ref u) = params.units {
             units = u.clone();

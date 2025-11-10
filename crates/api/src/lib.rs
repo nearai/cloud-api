@@ -22,6 +22,7 @@ use crate::{
     },
 };
 use axum::{
+    extract::DefaultBodyLimit,
     middleware::{from_fn, from_fn_with_state},
     response::Html,
     routing::{get, post},
@@ -67,6 +68,7 @@ pub struct DomainServices {
     pub workspace_service: Arc<dyn services::workspace::WorkspaceServiceTrait + Send + Sync>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
+    pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
 }
 
 /// Initialize database connection and run migrations
@@ -207,6 +209,10 @@ pub async fn init_domain_services(
         database.pool().clone(),
     ));
     let response_repo = Arc::new(database::PgResponseRepository::new(database.pool().clone()));
+    let response_items_repo = Arc::new(database::PgResponseItemsRepository::new(
+        database.pool().clone(),
+    ))
+        as Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>;
     let user_repo = Arc::new(database::UserRepository::new(database.pool().clone()))
         as Arc<dyn services::auth::UserRepository>;
     let attestation_repo = Arc::new(database::PgAttestationRepository::new(
@@ -220,6 +226,7 @@ pub async fn init_domain_services(
     let conversation_service = Arc::new(services::ConversationService::new(
         conversation_repo.clone(),
         response_repo.clone(),
+        response_items_repo.clone(),
     ));
 
     // Create inference provider pool
@@ -245,13 +252,6 @@ pub async fn init_domain_services(
     let limits_repository_for_usage = Arc::new(
         database::repositories::OrganizationLimitsRepository::new(database.pool().clone()),
     );
-
-    // Create response service
-    let response_service = Arc::new(services::ResponseService::new(
-        response_repo,
-        inference_provider_pool.clone(),
-        conversation_service.clone(),
-    ));
 
     // Create MCP client manager
     let mcp_manager = Arc::new(services::mcp::McpClientManager::new());
@@ -288,6 +288,19 @@ pub async fn init_domain_services(
         models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
     ));
 
+    let web_search_provider =
+        Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
+
+    let response_service = Arc::new(services::ResponseService::new(
+        response_repo,
+        response_items_repo.clone(),
+        inference_provider_pool.clone(),
+        conversation_service.clone(),
+        completion_service.clone(),
+        Some(web_search_provider), // web_search_provider
+        None,                      // file_search_provider
+    ));
+
     // Create session repository for user service
     let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
         as Arc<dyn services::auth::SessionRepository>;
@@ -295,6 +308,24 @@ pub async fn init_domain_services(
     // Create user service
     let user_service = Arc::new(services::user::UserService::new(user_repo, session_repo))
         as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
+
+    // Create S3 storage and file service
+    let s3_config = aws_config::load_from_env().await;
+    let s3_client = aws_sdk_s3::Client::new(&s3_config);
+    let s3_storage = Arc::new(services::files::storage::S3Storage::new(
+        s3_client,
+        config.s3.bucket.clone(),
+        config.s3.encryption_key.clone(),
+    )) as Arc<dyn services::files::storage::StorageTrait>;
+
+    let file_repository = Arc::new(database::repositories::FileRepository::new(
+        database.pool().clone(),
+    )) as Arc<dyn services::files::FileRepositoryTrait>;
+
+    let files_service = Arc::new(services::files::FileServiceImpl::new(
+        file_repository,
+        s3_storage,
+    )) as Arc<dyn services::files::FileServiceTrait + Send + Sync>;
 
     DomainServices {
         conversation_service,
@@ -308,6 +339,7 @@ pub async fn init_domain_services(
         workspace_service,
         usage_service,
         user_service,
+        files_service,
     }
 }
 
@@ -324,6 +356,7 @@ pub async fn init_inference_providers(
             discovery_url,
             api_key,
             config.model_discovery.timeout,
+            config.model_discovery.inference_timeout,
         ),
     );
 
@@ -371,6 +404,7 @@ pub fn build_app_with_config(
         attestation_service: domain_services.attestation_service.clone(),
         usage_service: domain_services.usage_service.clone(),
         user_service: domain_services.user_service.clone(),
+        files_service: domain_services.files_service.clone(),
         config: config.clone(),
     };
 
@@ -435,6 +469,9 @@ pub fn build_app_with_config(
     let invitation_routes =
         build_invitation_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
+    let files_routes =
+        build_files_routes(app_state.clone(), &auth_components.auth_state_middleware);
+
     // Build OpenAPI and documentation routes
     let openapi_routes = build_openapi_routes();
 
@@ -455,6 +492,7 @@ pub fn build_app_with_config(
                 .merge(model_routes)
                 .merge(admin_routes)
                 .merge(invitation_routes)
+                .merge(files_routes)
                 .merge(health_routes),
         )
         .merge(openapi_routes)
@@ -568,7 +606,7 @@ pub fn build_response_routes(
         .with_state(response_service)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
-            auth_middleware_with_api_key,
+            middleware::auth::auth_middleware_with_workspace_context,
         ))
         .layer(from_fn(middleware::body_hash_middleware))
 }
@@ -596,7 +634,14 @@ pub fn build_conversation_routes(
             "/conversations/{conversation_id}/items",
             get(conversations::list_conversation_items),
         )
-        .with_state(conversation_service)
+        .route(
+            "/conversations/{conversation_id}/items",
+            post(conversations::create_conversation_items),
+        )
+        .with_state(
+            conversation_service
+                as Arc<dyn services::conversations::ports::ConversationServiceTrait>,
+        )
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware_with_api_key,
@@ -659,6 +704,22 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware,
+        ))
+}
+
+/// Build file upload routes
+pub fn build_files_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
+    use crate::routes::files::MAX_FILE_SIZE;
+    use crate::routes::files::*;
+    Router::new()
+        .route("/files", post(upload_file).get(list_files))
+        .route("/files/{file_id}", get(get_file).delete(delete_file))
+        .route("/files/{file_id}/content", get(get_file_content))
+        .layer(DefaultBodyLimit::max(MAX_FILE_SIZE))
+        .with_state(app_state)
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            auth_middleware_with_api_key,
         ))
 }
 
@@ -938,6 +999,7 @@ mod tests {
                 api_key: Some("test-key".to_string()),
                 refresh_interval: 0,
                 timeout: 5,
+                inference_timeout: 30 * 60, // 30 minutes
             },
             logging: config::LoggingConfig {
                 level: "info".to_string(),
@@ -966,6 +1028,12 @@ mod tests {
                 tls_ca_cert_path: None,
                 refresh_interval: 30,
                 mock: false,
+            },
+            s3: config::S3Config {
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(), // Mock 256-bit hex key
             },
         };
 
@@ -1022,6 +1090,7 @@ mod tests {
                 api_key: Some("test-key".to_string()),
                 refresh_interval: 0,
                 timeout: 5,
+                inference_timeout: 30 * 60, // 30 minutes
             },
             logging: config::LoggingConfig {
                 level: "info".to_string(),
@@ -1050,6 +1119,12 @@ mod tests {
                 tls_ca_cert_path: None,
                 refresh_interval: 30,
                 mock: false,
+            },
+            s3: config::S3Config {
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(), // Mock 256-bit hex key
             },
         };
 

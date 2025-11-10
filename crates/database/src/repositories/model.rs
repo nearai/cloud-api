@@ -46,12 +46,15 @@ impl ModelRepository {
             .query(
                 r#"
                 SELECT 
-                    id, model_name, model_display_name, model_description, model_icon,
-                    input_cost_per_token, output_cost_per_token,
-                    context_length, verifiable, is_active, created_at, updated_at
-                FROM models 
-                WHERE is_active = true
-                ORDER BY model_name ASC
+                    m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
+                    m.input_cost_per_token, m.output_cost_per_token,
+                    m.context_length, m.verifiable, m.is_active, m.created_at, m.updated_at,
+                    COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
+                FROM models m
+                LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
+                WHERE m.is_active = true
+                GROUP BY m.id
+                ORDER BY m.model_name ASC
                 LIMIT $1 OFFSET $2
                 "#,
                 &[&limit, &offset],
@@ -140,16 +143,36 @@ impl ModelRepository {
             .query(
                 r#"
                 SELECT 
-                    id, model_name, model_display_name, model_description, model_icon,
-                    input_cost_per_token, output_cost_per_token,
-                    context_length, verifiable, is_active, created_at, updated_at
-                FROM models 
-                WHERE model_name = $1 AND is_active = true
+                    m.id,
+                    m.model_name,
+                    m.model_display_name,
+                    m.model_description,
+                    m.model_icon,
+                    m.input_cost_per_token,
+                    m.output_cost_per_token,
+                    m.context_length,
+                    m.verifiable,
+                    m.is_active,
+                    m.created_at,
+                    m.updated_at,
+                    COALESCE(
+                        array_agg(ma.alias_name)
+                        FILTER (WHERE ma.alias_name IS NOT NULL),
+                        '{}'
+                    ) AS aliases
+                FROM models m
+                LEFT JOIN model_aliases ma
+                    ON ma.canonical_model_id = m.id
+                    AND ma.is_active = true
+                WHERE m.is_active = true
+                AND m.model_name = $1
+                GROUP BY m.id
+                LIMIT 1;
                 "#,
                 &[&model_name],
             )
             .await
-            .context("Failed to query model by name")?;
+            .context("Failed to query model by name or alias")?;
 
         if let Some(row) = rows.first() {
             Ok(Some(self.row_to_model(row)))
@@ -508,23 +531,45 @@ impl ModelRepository {
             .query_opt(
                 r#"
                 SELECT 
-                    m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
-                    m.input_cost_per_token, m.output_cost_per_token,
-                    m.context_length, m.verifiable, m.is_active, m.created_at, m.updated_at
+                    m.id,
+                    m.model_name,
+                    m.model_display_name,
+                    m.model_description,
+                    m.model_icon,
+                    m.input_cost_per_token,
+                    m.output_cost_per_token,
+                    m.context_length,
+                    m.verifiable,
+                    m.is_active,
+                    m.created_at,
+                    m.updated_at,
+                    COALESCE(
+                        array_agg(ma_all.alias_name)
+                        FILTER (WHERE ma_all.alias_name IS NOT NULL),
+                        '{}'
+                    ) AS aliases
                 FROM models m
-                LEFT JOIN model_aliases ma
-                  ON ma.canonical_model_id = m.id
-                  AND ma.is_active = true
-                  AND ma.alias_name = $1
+                LEFT JOIN model_aliases ma_all
+                    ON ma_all.canonical_model_id = m.id
+                    AND ma_all.is_active = true
                 WHERE m.is_active = true
-                  AND (ma.alias_name IS NOT NULL OR m.model_name = $1)
-                ORDER BY (ma.alias_name IS NOT NULL) DESC
-                LIMIT 1
+                AND (
+                    m.model_name = $1
+                    OR EXISTS (
+                        SELECT 1
+                        FROM model_aliases ma_match
+                        WHERE ma_match.canonical_model_id = m.id
+                        AND ma_match.alias_name = $1
+                        AND ma_match.is_active = true
+                    )
+                )
+                GROUP BY m.id
+                LIMIT 1;
                 "#,
                 &[&identifier],
             )
             .await
-            .context("Failed to resolve and fetch model")?;
+            .context("Failed to resolve and fetch model (by name or alias)")?;
 
         Ok(row.map(|r| self.row_to_model(&r)))
     }
@@ -544,6 +589,7 @@ impl ModelRepository {
             is_active: row.get("is_active"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
+            aliases: row.try_get("aliases").unwrap_or_default(),
         }
     }
 
@@ -591,6 +637,7 @@ impl services::models::ModelsRepository for ModelRepository {
                 output_cost_per_token: m.output_cost_per_token,
                 context_length: m.context_length,
                 verifiable: m.verifiable,
+                aliases: m.aliases,
             })
             .collect())
     }
@@ -610,6 +657,7 @@ impl services::models::ModelsRepository for ModelRepository {
             output_cost_per_token: m.output_cost_per_token,
             context_length: m.context_length,
             verifiable: m.verifiable,
+            aliases: m.aliases,
         }))
     }
 
@@ -628,6 +676,7 @@ impl services::models::ModelsRepository for ModelRepository {
             output_cost_per_token: m.output_cost_per_token,
             context_length: m.context_length,
             verifiable: m.verifiable,
+            aliases: m.aliases,
         }))
     }
 

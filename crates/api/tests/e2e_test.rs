@@ -3,10 +3,7 @@ mod common;
 
 use common::*;
 
-use api::models::{
-    BatchUpdateModelApiRequest, ConversationContentPart, ConversationItem, ResponseOutputContent,
-    ResponseOutputItem,
-};
+use api::models::BatchUpdateModelApiRequest;
 use inference_providers::{models::ChatCompletionChunk, StreamChunk};
 
 #[tokio::test]
@@ -126,336 +123,6 @@ async fn test_chat_completions_api() {
     } else {
         println!("No final response detected - this is okay for some streaming implementations");
     }
-}
-
-#[tokio::test]
-async fn test_responses_api() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    let response = server
-        .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    let models = response.json::<api::models::ModelsResponse>();
-    assert!(!models.data.is_empty());
-
-    let conversation = create_conversation(&server, api_key.clone()).await;
-    println!("Conversation: {conversation:?}");
-
-    let message = "Hello, how are you?".to_string();
-    let max_tokens = 10;
-    let response = create_response(
-        &server,
-        conversation.id.clone(),
-        models.data[0].id.clone(),
-        message.clone(),
-        max_tokens,
-        api_key.clone(),
-    )
-    .await;
-    println!("Response: {response:?}");
-
-    // Check that response completed successfully
-    assert_eq!(response.status, api::models::ResponseStatus::Completed);
-
-    // Check that we got usage information (tokens were generated)
-    assert!(
-        response.usage.output_tokens > 0,
-        "Expected output tokens to be generated"
-    );
-
-    // Check that we have output content structure (even if text is empty due to VLLM issues)
-    assert!(!response.output.is_empty(), "Expected output items");
-
-    // Log the text we got (may be empty if VLLM has issues)
-    for output_item in &response.output {
-        if let ResponseOutputItem::Message { content, .. } = output_item {
-            for content_part in content {
-                if let ResponseOutputContent::OutputText { text, .. } = content_part {
-                    println!(
-                        "Response text length: {} chars, content: '{}'",
-                        text.len(),
-                        text
-                    );
-                    if text.is_empty() {
-                        println!(
-                            "Warning: VLLM returned empty text despite reporting {} output tokens",
-                            response.usage.output_tokens
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    let conversation_items =
-        list_conversation_items(&server, conversation.id, api_key.clone()).await;
-    assert_eq!(conversation_items.data.len(), 2);
-    match &conversation_items.data[0] {
-        ConversationItem::Message { content, .. } => {
-            if let ConversationContentPart::InputText { text } = &content[0] {
-                assert_eq!(text, message.as_str());
-            }
-        }
-    }
-}
-
-async fn create_conversation(
-    server: &axum_test::TestServer,
-    api_key: String,
-) -> api::models::ConversationObject {
-    let response = server
-        .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "name": "Test Conversation",
-            "description": "A test conversation"
-        }))
-        .await;
-    assert_eq!(response.status_code(), 201);
-    response.json::<api::models::ConversationObject>()
-}
-
-#[allow(dead_code)]
-async fn get_conversation(
-    server: &axum_test::TestServer,
-    conversation_id: String,
-    api_key: String,
-) -> api::models::ConversationObject {
-    let response = server
-        .get(format!("/v1/conversations/{conversation_id}").as_str())
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-    assert_eq!(response.status_code(), 200);
-    response.json::<api::models::ConversationObject>()
-}
-
-async fn list_conversation_items(
-    server: &axum_test::TestServer,
-    conversation_id: String,
-    api_key: String,
-) -> api::models::ConversationItemList {
-    let response = server
-        .get(format!("/v1/conversations/{conversation_id}/items").as_str())
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-    assert_eq!(response.status_code(), 200);
-    response.json::<api::models::ConversationItemList>()
-}
-
-async fn create_response(
-    server: &axum_test::TestServer,
-    conversation_id: String,
-    model: String,
-    message: String,
-    max_tokens: i64,
-    api_key: String,
-) -> api::models::ResponseObject {
-    let response = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "conversation": {
-                "id": conversation_id,
-            },
-            "input": message,
-            "temperature": 0.7,
-            "max_output_tokens": max_tokens,
-            "stream": false,
-            "model": model
-        }))
-        .await;
-    assert_eq!(response.status_code(), 200);
-    response.json::<api::models::ResponseObject>()
-}
-
-async fn create_response_stream(
-    server: &axum_test::TestServer,
-    conversation_id: String,
-    model: String,
-    message: String,
-    max_tokens: i64,
-    api_key: String,
-) -> (String, api::models::ResponseObject) {
-    let response = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "conversation": {
-                "id": conversation_id,
-            },
-            "input": message,
-            "temperature": 0.7,
-            "max_output_tokens": max_tokens,
-            "stream": true,
-            "model": model
-        }))
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-
-    // For streaming responses, we get SSE events as text
-    let response_text = response.text();
-
-    let mut content = String::new();
-    let mut final_response: Option<api::models::ResponseObject> = None;
-
-    // Parse SSE format: "event: <type>\ndata: <json>\n\n"
-    for line_chunk in response_text.split("\n\n") {
-        if line_chunk.trim().is_empty() {
-            continue;
-        }
-
-        let mut event_type = "";
-        let mut event_data = "";
-
-        for line in line_chunk.lines() {
-            if let Some(event_name) = line.strip_prefix("event: ") {
-                event_type = event_name;
-            } else if let Some(data) = line.strip_prefix("data: ") {
-                event_data = data;
-            }
-        }
-
-        if !event_data.is_empty() {
-            if let Ok(event_json) = serde_json::from_str::<serde_json::Value>(event_data) {
-                match event_type {
-                    "response.output_text.delta" => {
-                        // Accumulate content deltas as they arrive
-                        if let Some(delta) = event_json.get("delta").and_then(|v| v.as_str()) {
-                            content.push_str(delta);
-                            println!("Delta: {delta}");
-                        }
-                    }
-                    "response.completed" => {
-                        // Extract final response from completed event
-                        if let Some(response_obj) = event_json.get("response") {
-                            final_response = Some(
-                                serde_json::from_value::<api::models::ResponseObject>(
-                                    response_obj.clone(),
-                                )
-                                .expect("Failed to parse response.completed event"),
-                            );
-                            println!("Stream completed");
-                        }
-                    }
-                    "response.created" => {
-                        println!("Response created");
-                    }
-                    "response.in_progress" => {
-                        println!("Response in progress");
-                    }
-                    _ => {
-                        println!("Event: {event_type}");
-                    }
-                }
-            }
-        }
-    }
-
-    let final_resp =
-        final_response.expect("Expected to receive response.completed event from stream");
-    (content, final_resp)
-}
-
-#[tokio::test]
-async fn test_conversations_api() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    // Test creating a conversation
-    let create_response = server
-        .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "name": "Test Conversation",
-            "description": "A test conversation"
-        }))
-        .await;
-    assert_eq!(create_response.status_code(), 201);
-}
-
-#[tokio::test]
-async fn test_streaming_responses_api() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    // Get available models
-    let response = server
-        .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    let models = response.json::<api::models::ModelsResponse>();
-    assert!(!models.data.is_empty());
-
-    // Create a conversation
-    let conversation = create_conversation(&server, api_key.clone()).await;
-    println!("Conversation: {conversation:?}");
-
-    // Test streaming response
-    let message = "Hello, how are you?".to_string();
-    let (streamed_content, streaming_response) = create_response_stream(
-        &server,
-        conversation.id.clone(),
-        models.data[0].id.clone(),
-        message.clone(),
-        50,
-        api_key.clone(),
-    )
-    .await;
-
-    println!("Streamed Content: {streamed_content}");
-    println!("Final Response: {streaming_response:?}");
-
-    // Verify we got content from the stream
-    assert!(
-        !streamed_content.is_empty(),
-        "Expected non-empty streamed content"
-    );
-
-    // Verify the final response has content
-    assert!(streaming_response.output.iter().any(|o| {
-        if let ResponseOutputItem::Message { content, .. } = o {
-            content.iter().any(|c| {
-                if let ResponseOutputContent::OutputText { text, .. } = c {
-                    println!("Final Response Text: {text}");
-                    !text.is_empty()
-                } else {
-                    false
-                }
-            })
-        } else {
-            false
-        }
-    }));
-
-    // Verify streamed content matches final response content
-    let final_text = streaming_response
-        .output
-        .iter()
-        .filter_map(|o| {
-            if let ResponseOutputItem::Message { content, .. } = o {
-                content.iter().find_map(|c| {
-                    if let ResponseOutputContent::OutputText { text, .. } = c {
-                        Some(text.clone())
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                None
-            }
-        })
-        .next()
-        .unwrap_or_default();
-
-    assert_eq!(
-        streamed_content, final_text,
-        "Streamed content should match final response text"
-    );
 }
 
 #[tokio::test]
@@ -2942,6 +2609,26 @@ async fn test_create_access_token_success_user_agent_mismatch() {
 
 #[tokio::test]
 async fn test_admin_list_users_without_organizations() {
+    let server = setup_test_server().await;
+
+    // Get access token from refresh token
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+
+    // Create a few organizations to ensure we have some users
+    let _org1 = create_org(&server).await;
+    let _org2 = create_org(&server).await;
+
+    // List users without organizations
+    let response = server
+        .get("/v1/admin/users?limit=50&offset=0")
+        .add_header("Authorization", format!("Bearer {access_token}"))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+}
+
+#[tokio::test]
+async fn test_admin_list_users_with_orgs() {
     let server = setup_test_server().await;
 
     // Get access token from refresh token

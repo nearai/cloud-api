@@ -339,10 +339,9 @@ pub struct McpConnectorUsage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
     pub id: Uuid,
-    pub user_id: Uuid,
+    pub workspace_id: Uuid,
+    pub api_key_id: Uuid,
     pub model: String,
-    pub input_messages: serde_json::Value, // JSONB storing input messages
-    pub output_message: Option<String>,
     pub status: ResponseStatus,
     pub instructions: Option<String>,
     pub conversation_id: Option<Uuid>,
@@ -375,10 +374,12 @@ impl std::fmt::Display for ResponseStatus {
 }
 
 /// Conversation model - stores conversation metadata
+/// Note: This model is scoped to workspace/api_key, not user (for app developers)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
     pub id: Uuid,
-    pub user_id: Uuid,
+    pub workspace_id: Uuid,
+    pub api_key_id: Uuid,
     pub metadata: serde_json::Value, // JSONB storing conversation metadata
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -406,6 +407,7 @@ pub struct Model {
     // Model metadata
     pub context_length: i32,
     pub verifiable: bool,
+    pub aliases: Vec<String>,
 
     // Tracking fields
     pub is_active: bool,
@@ -557,4 +559,64 @@ pub struct RecordUsageRequest {
     pub output_cost: i64,
     pub total_cost: i64,
     pub request_type: String,
+}
+
+// ============================================
+// File Storage Models
+// ============================================
+
+/// File model - stores uploaded file metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct File {
+    pub id: Uuid,
+    pub filename: String,
+    pub bytes: i64,
+    pub content_type: String,
+    pub purpose: String,
+    pub storage_key: String,
+    pub workspace_id: Uuid,
+    pub uploaded_by_api_key_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// File purpose enum
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FilePurpose {
+    Assistants,
+    Batch,
+    FineTune,
+    Vision,
+    UserData,
+    Evals,
+}
+
+impl std::fmt::Display for FilePurpose {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FilePurpose::Assistants => write!(f, "assistants"),
+            FilePurpose::Batch => write!(f, "batch"),
+            FilePurpose::FineTune => write!(f, "fine-tune"),
+            FilePurpose::Vision => write!(f, "vision"),
+            FilePurpose::UserData => write!(f, "user_data"),
+            FilePurpose::Evals => write!(f, "evals"),
+        }
+    }
+}
+
+impl std::str::FromStr for FilePurpose {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "assistants" => Ok(FilePurpose::Assistants),
+            "batch" => Ok(FilePurpose::Batch),
+            "fine-tune" => Ok(FilePurpose::FineTune),
+            "vision" => Ok(FilePurpose::Vision),
+            "user_data" => Ok(FilePurpose::UserData),
+            "evals" => Ok(FilePurpose::Evals),
+            _ => Err(format!("Invalid file purpose: {s}")),
+        }
+    }
 }

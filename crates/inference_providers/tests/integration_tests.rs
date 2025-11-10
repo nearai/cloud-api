@@ -1,49 +1,46 @@
-//! Integration tests for the vLLM provider
+//! Integration tests for the inference provider
 //!
-//! These tests require a running vLLM instance and will make real HTTP requests.
+//! These tests use MockProvider by default to avoid external dependencies.
+//! Set USE_REAL_VLLM=true to use the real VLLM provider instead.
 //! Run with: `cargo test --test integration_tests -- --nocapture`
 
 use futures_util::StreamExt;
 use inference_providers::{
     ChatCompletionParams, ChatMessage, CompletionParams, FunctionDefinition, InferenceProvider,
-    MessageRole, StreamChunk, ToolChoice, ToolDefinition, VLlmConfig, VLlmProvider,
+    MessageRole, MockProvider, StreamChunk, ToolChoice, ToolDefinition,
 };
 use std::time::Duration;
 use tokio::time::timeout;
 
-/// Get vLLM base URL from environment variable or use default
-fn get_vllm_base_url() -> String {
-    std::env::var("VLLM_BASE_URL").unwrap_or_else(|_| "http://localhost:8002".to_string())
-}
-
-/// Get vLLM API key from environment variable
-fn get_vllm_api_key() -> Option<String> {
-    std::env::var("VLLM_API_KEY").ok()
-}
-
-/// Get test timeout from environment variable or use default
-fn get_test_timeout_secs() -> u64 {
-    std::env::var("VLLM_TEST_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30)
-}
-
-/// Create a configured vLLM provider for testing
-fn create_test_provider() -> VLlmProvider {
-    let _ = dotenvy::dotenv();
-    let config = VLlmConfig {
-        base_url: get_vllm_base_url(),
-        api_key: get_vllm_api_key(),
-        timeout_seconds: get_test_timeout_secs() as i64,
-    };
-    VLlmProvider::new(config)
+/// Create a mock provider for testing
+///
+/// Uses MockProvider by default to avoid external dependencies.
+/// Set USE_REAL_VLLM=true to use the real VLLM provider instead.
+fn create_test_provider() -> Box<dyn InferenceProvider> {
+    if std::env::var("USE_REAL_VLLM").is_ok() {
+        // Use real VLLM provider if explicitly requested
+        use inference_providers::{VLlmConfig, VLlmProvider};
+        let _ = dotenvy::dotenv();
+        let config = VLlmConfig {
+            base_url: std::env::var("VLLM_BASE_URL")
+                .unwrap_or_else(|_| "http://localhost:8002".to_string()),
+            api_key: std::env::var("VLLM_API_KEY").ok(),
+            timeout_seconds: std::env::var("VLLM_TEST_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30) as i64,
+        };
+        Box::new(VLlmProvider::new(config))
+    } else {
+        // Use mock provider by default
+        Box::new(MockProvider::new())
+    }
 }
 
 #[tokio::test]
 async fn test_models_endpoint() {
     let provider = create_test_provider();
-    let test_timeout_secs = get_test_timeout_secs();
+    let test_timeout_secs = 30;
 
     let result = timeout(Duration::from_secs(test_timeout_secs), provider.models()).await;
 
@@ -70,7 +67,7 @@ async fn test_models_endpoint() {
 #[tokio::test]
 async fn test_chat_completion_streaming() {
     let provider = create_test_provider();
-    let test_timeout_secs = get_test_timeout_secs();
+    let test_timeout_secs = 30;
 
     // First get available models
     let models = provider.models().await.expect("Failed to get models");
@@ -207,7 +204,7 @@ async fn test_chat_completion_streaming() {
 #[tokio::test]
 async fn test_text_completion_streaming() {
     let provider = create_test_provider();
-    let test_timeout_secs = get_test_timeout_secs();
+    let test_timeout_secs = 30;
 
     // First get available models
     let models = provider.models().await.expect("Failed to get models");
@@ -364,25 +361,20 @@ async fn test_error_handling() {
 
 #[tokio::test]
 async fn test_configuration() {
-    // Test with different configurations
-    let _ = dotenvy::dotenv(); // OK if .env file doesn't exist (e.g., in CI)
-    let config = VLlmConfig {
-        base_url: get_vllm_base_url(),
-        api_key: get_vllm_api_key(),
-        timeout_seconds: 10,
-    };
-
-    let provider = VLlmProvider::new(config.clone());
-
-    // Test that the provider was created successfully
+    // Test that the mock provider works correctly
+    let provider = MockProvider::new();
     let models = provider.models().await;
-    assert!(models.is_ok(), "Provider should work with valid config");
+    assert!(models.is_ok(), "Mock provider should work correctly");
+    assert!(
+        !models.unwrap().data.is_empty(),
+        "Mock provider should return models"
+    );
 }
 
 #[tokio::test]
 async fn test_chat_completion_streaming_with_tool_calls() {
     let provider = create_test_provider();
-    let test_timeout_secs = get_test_timeout_secs();
+    let test_timeout_secs = 30;
 
     // First get available models
     let models = provider.models().await.expect("Failed to get models");

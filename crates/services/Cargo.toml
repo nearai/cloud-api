@@ -21,6 +21,7 @@ futures-util = "0.3"
 thiserror = "2.0"
 config = { path = "../config" }
 rand = "0.8"
+utoipa = "5.3"
 # OAuth2 authentication
 oauth2 = { version = "5", features = ["reqwest"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
@@ -38,6 +39,11 @@ dstack-sdk = "0.1.2"
 dstack-sdk-types = "0.1.2"
 jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"] }
 regex = "1.11"
+# AWS S3 for file storage
+aws-config = { version = "1.5", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.70"
+# Encryption for file storage
+aes-gcm = "0.10"
 
 [dev-dependencies]
 tokio-test = "0.4"

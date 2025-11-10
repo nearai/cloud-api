@@ -71,10 +71,11 @@ jobs:
         MODEL_DISCOVERY_API_KEY: ${{ secrets.MODEL_DISCOVERY_API_KEY }}
         AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
         AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
+        BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
         DEV: "true"
 
     - name: Run integration tests
-      run: cargo test --test e2e_test --test e2e_api_keys --test e2e_auth_tokens --test e2e_duplicate_names --test e2e_error_msg
+      run: cargo test --test e2e_test --test e2e_api_keys --test e2e_auth_tokens --test e2e_duplicate_names --test e2e_error_msg --test e2e_files --test e2e_conversations
       env:
         POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
         DATABASE_HOST: localhost
@@ -88,11 +89,12 @@ jobs:
         MODEL_DISCOVERY_API_KEY: ${{ secrets.MODEL_DISCOVERY_API_KEY }}
         AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
         AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
+        BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
         RUST_LOG: debug
         DEV: "true"
 
     - name: Run vLLM integration tests
-      run: cargo test --test integration_tests
+      run: cargo test --test integration_tests -- --nocapture
       env:
         VLLM_BASE_URL: ${{ secrets.VLLM_BASE_URL }}
         VLLM_API_KEY: ${{ secrets.VLLM_API_KEY }}

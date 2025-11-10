@@ -809,3 +809,309 @@ async fn test_complete_file_lifecycle() {
         .await;
     assert_eq!(get_response.status_code(), 404);
 }
+
+#[tokio::test]
+async fn test_file_in_response_api() {
+    let server = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    // 1. Upload a text file
+    let file_content = b"This is a test document.\nIt contains important information about testing.\nLine 3 has more details.";
+    let upload_response = upload_file(
+        &server,
+        &api_key,
+        "test_doc.txt",
+        file_content,
+        "text/plain",
+        "user_data",
+    )
+    .await;
+
+    assert_eq!(upload_response.status_code(), 201);
+    let file: api::models::FileUploadResponse = upload_response.json();
+    println!("Uploaded file: {}", file.id);
+
+    // Get file to check if it exists
+    let file_response = server
+        .get(&format!("/v1/files/{}", file.id))
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(file_response.status_code(), 200);
+    let file_obj: api::models::FileUploadResponse = file_response.json();
+    println!("File: {:?}", file_obj);
+
+    // 2. Get available models
+    let models_response = server
+        .get("/v1/models")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    let models = models_response.json::<api::models::ModelsResponse>();
+    assert!(!models.data.is_empty());
+    let model_id = models.data[0].id.clone();
+
+    // 3. Create a conversation
+    let conversation_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({}))
+        .await;
+    assert_eq!(conversation_response.status_code(), 201);
+    let conversation: api::models::ConversationObject = conversation_response.json();
+    println!("Created conversation: {}", conversation.id);
+
+    // Wait 1 second before continuing, to ensure eventual consistency or to throttle if needed
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    // 4. Create a response with file input (non-streaming)
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model_id,
+            "conversation": conversation.id,
+            "input": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "Please summarize the content of the file."
+                }, {
+                    "type": "input_file",
+                    "file_id": file.id
+                }]
+            }],
+            "max_output_tokens": 100,
+            "stream": false
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    let response_obj: api::models::ResponseObject = response.json();
+    println!("Response status: {:?}", response_obj.status);
+    println!("Response output: {:?}", response_obj.output);
+
+    // 5. Verify the response completed successfully
+    assert_eq!(response_obj.status, api::models::ResponseStatus::Completed);
+
+    // 6. Verify the response has output
+    assert!(!response_obj.output.is_empty());
+
+    // 7. Check that input items were stored (should include file reference)
+    let input_items_response = server
+        .get(&format!("/v1/responses/{}/input_items", response_obj.id))
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+
+    assert_eq!(input_items_response.status_code(), 200);
+    let input_items: api::models::ResponseInputItemList = input_items_response.json();
+    println!("Input items: {:?}", input_items);
+
+    // Should have at least one input item
+    assert!(!input_items.data.is_empty());
+
+    // 8. Test streaming response with file
+    let stream_response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model_id,
+            "conversation": conversation.id,
+            "input": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "What does the file say?"
+                }, {
+                    "type": "input_file",
+                    "file_id": file.id
+                }]
+            }],
+            "max_output_tokens": 50,
+            "stream": true
+        }))
+        .await;
+
+    assert_eq!(stream_response.status_code(), 200);
+    let stream_text = stream_response.text();
+    println!(
+        "Stream response (first 500 chars): {}",
+        &stream_text[..stream_text.len().min(500)]
+    );
+
+    // Verify we got SSE events
+    assert!(stream_text.contains("event:"));
+    assert!(stream_text.contains("data:"));
+
+    // Parse the streaming response to check for completion
+    let mut final_response: Option<api::models::ResponseObject> = None;
+    for line_chunk in stream_text.split("\n\n") {
+        if line_chunk.trim().is_empty() {
+            continue;
+        }
+
+        let mut event_type = "";
+        let mut event_data = "";
+
+        for line in line_chunk.lines() {
+            if let Some(event_name) = line.strip_prefix("event: ") {
+                event_type = event_name;
+            } else if let Some(data) = line.strip_prefix("data: ") {
+                event_data = data;
+            }
+        }
+
+        if event_type == "response.completed" && !event_data.is_empty() {
+            final_response = serde_json::from_str(event_data).ok();
+            break;
+        }
+    }
+
+    assert!(
+        final_response.is_some(),
+        "Expected final response in stream"
+    );
+    let final_resp = final_response.unwrap();
+    assert_eq!(final_resp.status, api::models::ResponseStatus::Completed);
+}
+
+#[tokio::test]
+async fn test_file_not_found_in_response_api() {
+    let server = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    // Get available models
+    let models_response = server
+        .get("/v1/models")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    let models = models_response.json::<api::models::ModelsResponse>();
+    assert!(!models.data.is_empty());
+    let model_id = models.data[0].id.clone();
+
+    // Create a conversation
+    let conversation_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({}))
+        .await;
+    assert_eq!(conversation_response.status_code(), 201);
+    let conversation: api::models::ConversationObject = conversation_response.json();
+
+    // Try to create a response with a non-existent file
+    let fake_file_id = "file-00000000-0000-0000-0000-000000000000";
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model_id,
+            "conversation": conversation.id,
+            "input": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "What's in the file?"
+                }, {
+                    "type": "input_file",
+                    "file_id": fake_file_id
+                }]
+            }],
+            "max_output_tokens": 50,
+            "stream": true
+        }))
+        .await;
+
+    // The response should start streaming, but will fail when trying to fetch the file
+    assert_eq!(response.status_code(), 200);
+    let stream_text = response.text();
+
+    // Check for error event in the stream
+    assert!(
+        stream_text.contains("response.failed") || stream_text.contains("error"),
+        "Expected error in stream response"
+    );
+}
+
+#[tokio::test]
+async fn test_multiple_files_in_response_api() {
+    let server = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    // 1. Upload multiple text files
+    let file1_content = b"File 1: Product specifications\nPrice: $100\nColor: Red";
+    let upload1 = upload_file(
+        &server,
+        &api_key,
+        "product1.txt",
+        file1_content,
+        "text/plain",
+        "user_data",
+    )
+    .await;
+    assert_eq!(upload1.status_code(), 201);
+    let file1: api::models::FileUploadResponse = upload1.json();
+
+    let file2_content = b"File 2: Product specifications\nPrice: $200\nColor: Blue";
+    let upload2 = upload_file(
+        &server,
+        &api_key,
+        "product2.txt",
+        file2_content,
+        "text/plain",
+        "user_data",
+    )
+    .await;
+    assert_eq!(upload2.status_code(), 201);
+    let file2: api::models::FileUploadResponse = upload2.json();
+
+    // 2. Get available models
+    let models_response = server
+        .get("/v1/models")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    let models = models_response.json::<api::models::ModelsResponse>();
+    assert!(!models.data.is_empty());
+    let model_id = models.data[0].id.clone();
+
+    // 3. Create a conversation
+    let conversation_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({}))
+        .await;
+    assert_eq!(conversation_response.status_code(), 201);
+    let conversation: api::models::ConversationObject = conversation_response.json();
+
+    // 4. Create a response with multiple files
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model_id,
+            "conversation": conversation.id,
+            "input": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "Compare these two products:"
+                }, {
+                    "type": "input_file",
+                    "file_id": file1.id
+                }, {
+                    "type": "input_file",
+                    "file_id": file2.id
+                }]
+            }],
+            "max_output_tokens": 100,
+            "stream": false
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    let response_obj: api::models::ResponseObject = response.json();
+
+    // Verify the response completed successfully
+    assert_eq!(response_obj.status, api::models::ResponseStatus::Completed);
+
+    // Verify the response has output
+    assert!(!response_obj.output.is_empty());
+
+    println!("Successfully processed multiple files in response");
+}

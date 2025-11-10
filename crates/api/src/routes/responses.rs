@@ -3,21 +3,23 @@ use crate::{
     models::{ErrorResponse, ResponseInputItemList},
 };
 use axum::{
+    body::Body,
     extract::{Extension, Json, Path, Query, State},
-    http::StatusCode,
-    response::{
-        sse::{Event, Sse},
-        IntoResponse, Json as ResponseJson,
-    },
+    http::{header, Response, StatusCode},
+    response::{IntoResponse, Json as ResponseJson},
 };
+use bytes::Bytes;
 use futures::stream::StreamExt;
 use serde::Deserialize;
+use services::attestation::ports::AttestationServiceTrait;
 use services::responses::errors::ResponseError as ServiceResponseError;
 use services::responses::models::*;
 use services::responses::ports::ResponseServiceTrait;
 use services::responses::service::ResponseServiceImpl;
+use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -29,6 +31,13 @@ fn map_response_error_to_status(error: &ServiceResponseError) -> StatusCode {
         ServiceResponseError::UnknownTool(_) => StatusCode::BAD_REQUEST,
         ServiceResponseError::EmptyToolName => StatusCode::BAD_REQUEST,
     }
+}
+
+/// Compute SHA256 hash of data
+fn compute_sha256(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
 }
 
 impl From<ServiceResponseError> for ErrorResponse {
@@ -53,6 +62,13 @@ impl From<ServiceResponseError> for ErrorResponse {
     }
 }
 
+// State for response routes
+#[derive(Clone)]
+pub struct ResponseRouteState {
+    pub response_service: Arc<ResponseServiceImpl>,
+    pub attestation_service: Arc<dyn AttestationServiceTrait>,
+}
+
 /// Create a new response
 ///
 /// Creates a new response for a conversation.
@@ -72,11 +88,13 @@ impl From<ServiceResponseError> for ErrorResponse {
     )
 )]
 pub async fn create_response(
-    State(service): State<Arc<ResponseServiceImpl>>,
+    State(state): State<ResponseRouteState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
     Json(mut request): Json<CreateResponseRequest>,
 ) -> axum::response::Response {
+    let service = state.response_service.clone();
+    let attestation_service = state.attestation_service.clone();
     debug!(
         "Create response request from api key: {:?}",
         api_key.api_key.id
@@ -108,6 +126,7 @@ pub async fn create_response(
 
     // Store model for logging before moving request
     let model = request.model.clone();
+    let signing_algo = request.signing_algo.clone();
 
     // Check if streaming is requested
     if request.stream.unwrap_or(false) {
@@ -132,21 +151,99 @@ pub async fn create_response(
             Ok(stream) => {
                 tracing::debug!(
                     user_id = %api_key.api_key.created_by_user_id.0,
-                    "Successfully created streaming response, returning SSE stream"
+                    "Successfully created streaming response, returning SSE stream with signature accumulation"
                 );
 
-                let sse_stream = stream.map(|event| {
-                    Ok::<_, Infallible>(
-                        Event::default()
-                            .event(event.event_type.clone())
-                            .data(serde_json::to_string(&event).unwrap_or_default()),
-                    )
+                // Shared state for accumulating bytes and tracking response_id
+                let accumulated_bytes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+                let response_id_state = Arc::new(tokio::sync::Mutex::new(None::<String>));
+                let request_hash = body_hash.hash.clone();
+                
+                // Clone for closures
+                let accumulated_clone = accumulated_bytes.clone();
+                let response_id_clone = response_id_state.clone();
+                let attestation_clone = attestation_service.clone();
+
+                // Format events as SSE bytes and accumulate them
+                let byte_stream = stream.then(move |event| {
+                    let accumulated_inner = accumulated_clone.clone();
+                    let response_id_inner = response_id_clone.clone();
+                    let attestation_inner = attestation_clone.clone();
+                    let request_hash_inner = request_hash.clone();
+                    let signing_algo_inner = signing_algo.clone();
+                    
+                    async move {
+                        // Extract response_id from response.created event
+                        if event.event_type == "response.created" {
+                            if let Some(ref response) = event.response {
+                                let mut rid = response_id_inner.lock().await;
+                                if rid.is_none() {
+                                    *rid = Some(response.id.clone());
+                                    tracing::debug!("Extracted response_id: {}", response.id);
+                                }
+                            }
+                        }
+
+                        // Format as SSE: "event: {type}\ndata: {json}\n\n"
+                        let json = serde_json::to_string(&event).unwrap_or_default();
+                        let sse_bytes = format!("event: {}\ndata: {}\n\n", event.event_type, json);
+                        let bytes = Bytes::from(sse_bytes);
+
+                        // Accumulate bytes asynchronously
+                        let acc = accumulated_inner.clone();
+                        let b = bytes.clone();
+                        tokio::spawn(async move {
+                            acc.lock().await.extend_from_slice(&b);
+                        });
+
+                        // Check if stream is completing - store signature
+                        if event.event_type == "response.completed" {
+                            let acc_final = accumulated_inner.clone();
+                            let rid_final = response_id_inner.clone();
+                            let req_hash = request_hash_inner.clone();
+                            let attest = attestation_inner.clone();
+                            let algo = signing_algo_inner.clone();
+
+                            tokio::spawn(async move {
+                                // Small delay to ensure all bytes are accumulated
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                
+                                let bytes = acc_final.lock().await;
+                                let response_hash = compute_sha256(&bytes);
+                                
+                                if let Some(rid) = rid_final.lock().await.as_ref() {
+                                    tracing::debug!(
+                                        "Storing signature for response_id: {}, request_hash: {}, response_hash: {}, signing_algo: {:?}",
+                                        rid, req_hash, response_hash, algo
+                                    );
+                                    
+                                    // Store the signature with the algorithm from the request (defaults to ed25519 if not specified)
+                                    if let Err(e) = attest.store_response_signature(
+                                        rid,
+                                        req_hash.clone(),
+                                        response_hash.clone(),
+                                        algo,
+                                    ).await {
+                                        tracing::error!("Failed to store response signature: {}", e);
+                                    } else {
+                                        tracing::debug!("Successfully stored signature for response_id: {}", rid);
+                                    }
+                                }
+                            });
+                        }
+
+                        Ok::<Bytes, Infallible>(bytes)
+                    }
                 });
 
-                // Return SSE response
-                Sse::new(sse_stream)
-                    .keep_alive(axum::response::sse::KeepAlive::default())
-                    .into_response()
+                // Return as raw byte stream with SSE headers
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .header(header::CONNECTION, "keep-alive")
+                    .body(Body::from_stream(byte_stream))
+                    .unwrap()
             }
             Err(error) => {
                 tracing::error!(
@@ -370,7 +467,7 @@ pub async fn create_response(
 pub async fn get_response(
     Path(_response_id): Path<String>,
     Query(_params): Query<GetResponseQuery>,
-    State(_service): State<Arc<ResponseServiceImpl>>,
+    State(_state): State<ResponseRouteState>,
     Extension(_api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ResponseObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement get_response method in ResponseService
@@ -386,7 +483,7 @@ pub async fn get_response(
 /// Delete a response
 pub async fn delete_response(
     Path(_response_id): Path<String>,
-    State(_service): State<Arc<ResponseServiceImpl>>,
+    State(_state): State<ResponseRouteState>,
     Extension(_api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ResponseDeleteResult>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement delete_response method in ResponseService
@@ -402,7 +499,7 @@ pub async fn delete_response(
 /// Cancel a response (for background responses)
 pub async fn cancel_response(
     Path(_response_id): Path<String>,
-    State(_service): State<Arc<ResponseServiceImpl>>,
+    State(_state): State<ResponseRouteState>,
     Extension(_api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ResponseObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement cancel_response method in ResponseService
@@ -419,9 +516,10 @@ pub async fn cancel_response(
 pub async fn list_input_items(
     Path(response_id): Path<String>,
     Query(params): Query<ListInputItemsQuery>,
-    State(service): State<Arc<ResponseServiceImpl>>,
+    State(state): State<ResponseRouteState>,
     Extension(auth): Extension<AuthenticatedApiKey>,
 ) -> Result<ResponseJson<ResponseInputItemList>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let service = state.response_service.clone();
     debug!(
         "List input items for response {} from workspace {}",
         response_id, auth.workspace.id.0

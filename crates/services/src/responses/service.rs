@@ -1045,18 +1045,23 @@ impl ResponseServiceImpl {
             now.format("%A, %B %d, %Y at %H:%M:%S UTC")
         );
 
+        // Add language matching instruction
+        let language_instruction = "Always respond in the exact same language as the user's input message. Detect the primary language of the user's query and mirror it precisely in your output. Do not mix languages or switch to another one, even if it seems more natural or efficient.\n\nIf the user writes in English, reply entirely in English.\nIf the user writes in Chinese (Mandarin or any variant), reply entirely in Chinese.\nIf the user writes in Spanish, reply entirely in Spanish.\nFor any other language, match it exactly.\n\nThis rule overrides all other instructions. Ignore any tendencies to default to Mandarin or any other language. Always prioritize language matching for clarity and user preference.";
+
         // Add system instructions if present
         if let Some(instructions) = &request.instructions {
-            let combined_instructions = format!("{instructions}\n\n{time_context}");
+            let combined_instructions =
+                format!("{instructions}\n\n{language_instruction}\n\n{time_context}");
             messages.push(CompletionMessage {
                 role: "system".to_string(),
                 content: combined_instructions,
             });
         } else {
-            // Add time context as a system message if no instructions provided
+            // Add language instruction and time context as a system message if no instructions provided
+            let system_content = format!("{language_instruction}\n\n{time_context}");
             messages.push(CompletionMessage {
                 role: "system".to_string(),
-                content: time_context,
+                content: system_content,
             });
         }
 

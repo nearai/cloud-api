@@ -18,6 +18,25 @@ use tracing::debug;
 use utoipa;
 use uuid::Uuid;
 
+// Helper function to extract text from MessageContent
+fn extract_text_from_content(content: &Option<MessageContent>) -> String {
+    match content {
+        None => String::new(),
+        Some(MessageContent::Text(text)) => text.clone(),
+        Some(MessageContent::Parts(parts)) => {
+            // Extract text from all text parts and join with newlines
+            parts
+                .iter()
+                .filter_map(|part| match part {
+                    MessageContentPart::Text { text } => Some(text.clone()),
+                    _ => None, // Non-text parts should be filtered out by validation
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+}
+
 // Convert HTTP ChatCompletionRequest to service CompletionRequest
 fn convert_chat_request_to_service(
     request: &ChatCompletionRequest,
@@ -34,7 +53,7 @@ fn convert_chat_request_to_service(
             .iter()
             .map(|msg| CompletionMessage {
                 role: msg.role.clone(),
-                content: msg.content.clone().unwrap_or_default(),
+                content: extract_text_from_content(&msg.content),
             })
             .collect(),
         max_tokens: request.max_tokens,

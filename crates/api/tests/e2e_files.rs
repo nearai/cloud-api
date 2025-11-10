@@ -859,8 +859,6 @@ async fn test_file_in_response_api() {
     let conversation: api::models::ConversationObject = conversation_response.json();
     println!("Created conversation: {}", conversation.id);
 
-    // Wait 1 second before continuing, to ensure eventual consistency or to throttle if needed
-    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     // 4. Create a response with file input (non-streaming)
     let response = server
         .post("/v1/responses")

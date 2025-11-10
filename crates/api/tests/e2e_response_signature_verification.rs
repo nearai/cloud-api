@@ -111,7 +111,7 @@ async fn test_streaming_response_signature_verification() {
                             if let Some(response_obj) = event_json.get("response") {
                                 if let Some(id) = response_obj.get("id").and_then(|v| v.as_str()) {
                                     response_id = Some(id.to_string());
-                                    println!("Extracted response_id: {}", id);
+                                    println!("Extracted response_id: {id}");
                                 }
                             }
                         }

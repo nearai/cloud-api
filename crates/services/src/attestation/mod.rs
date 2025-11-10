@@ -158,7 +158,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         signing_algo: Option<String>,
     ) -> Result<(), AttestationError> {
         // Create signature text in format "request_hash:response_hash"
-        let signature_text = format!("{}:{}", request_hash, response_hash);
+        let signature_text = format!("{request_hash}:{response_hash}");
 
         // Determine signing algorithm (default to ed25519)
         let algo = signing_algo
@@ -195,7 +195,7 @@ impl ports::AttestationServiceTrait for AttestationService {
 
         let signature = ChatSignature {
             text: signature_text.clone(),
-            signature: format!("0x{}", signature_hex),
+            signature: format!("0x{signature_hex}"),
             signing_address,
             signing_algo: algo,
         };

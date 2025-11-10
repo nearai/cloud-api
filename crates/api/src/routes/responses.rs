@@ -158,7 +158,7 @@ pub async fn create_response(
                 let accumulated_bytes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
                 let response_id_state = Arc::new(tokio::sync::Mutex::new(None::<String>));
                 let request_hash = body_hash.hash.clone();
-                
+
                 // Clone for closures
                 let accumulated_clone = accumulated_bytes.clone();
                 let response_id_clone = response_id_state.clone();
@@ -171,7 +171,6 @@ pub async fn create_response(
                     let attestation_inner = attestation_clone.clone();
                     let request_hash_inner = request_hash.clone();
                     let signing_algo_inner = signing_algo.clone();
-                    
                     async move {
                         // Extract response_id from response.created event
                         if event.event_type == "response.created" {
@@ -207,16 +206,14 @@ pub async fn create_response(
                             tokio::spawn(async move {
                                 // Small delay to ensure all bytes are accumulated
                                 tokio::time::sleep(Duration::from_millis(100)).await;
-                                
                                 let bytes = acc_final.lock().await;
                                 let response_hash = compute_sha256(&bytes);
-                                
                                 if let Some(rid) = rid_final.lock().await.as_ref() {
                                     tracing::debug!(
                                         "Storing signature for response_id: {}, request_hash: {}, response_hash: {}, signing_algo: {:?}",
                                         rid, req_hash, response_hash, algo
                                     );
-                                    
+
                                     // Store the signature with the algorithm from the request (defaults to ed25519 if not specified)
                                     if let Err(e) = attest.store_response_signature(
                                         rid,

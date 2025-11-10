@@ -1047,7 +1047,7 @@ impl ResponseServiceImpl {
 
         // Add system instructions if present
         if let Some(instructions) = &request.instructions {
-            let combined_instructions = format!("{}\n\n{}", instructions, time_context);
+            let combined_instructions = format!("{instructions}\n\n{time_context}");
             messages.push(CompletionMessage {
                 role: "system".to_string(),
                 content: combined_instructions,

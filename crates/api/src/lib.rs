@@ -300,13 +300,22 @@ pub async fn init_domain_services(
         as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
 
     // Create S3 storage and file service (must be created before response service)
-    let s3_config = aws_config::load_from_env().await;
-    let s3_client = aws_sdk_s3::Client::new(&s3_config);
-    let s3_storage = Arc::new(services::files::storage::S3Storage::new(
-        s3_client,
-        config.s3.bucket.clone(),
-        config.s3.encryption_key.clone(),
-    )) as Arc<dyn services::files::storage::StorageTrait>;
+    let s3_storage: Arc<dyn services::files::storage::StorageTrait> = if config.s3.mock {
+        tracing::info!("Using mock S3 storage for file uploads");
+        Arc::new(services::files::storage::MockStorage::new(
+            config.s3.encryption_key.clone(),
+        ))
+    } else {
+        tracing::info!("Using real S3 storage for file uploads");
+        let s3_config = aws_config::load_from_env().await;
+        let s3_client = aws_sdk_s3::Client::new(&s3_config);
+
+        Arc::new(services::files::storage::S3Storage::new(
+            s3_client,
+            config.s3.bucket.clone(),
+            config.s3.encryption_key.clone(),
+        ))
+    };
 
     let file_repository = Arc::new(database::repositories::FileRepository::new(
         database.pool().clone(),
@@ -1031,6 +1040,7 @@ mod tests {
                 mock: false,
             },
             s3: config::S3Config {
+                mock: true,
                 bucket: "test-bucket".to_string(),
                 region: "us-east-1".to_string(),
                 encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -1122,6 +1132,7 @@ mod tests {
                 mock: false,
             },
             s3: config::S3Config {
+                mock: true,
                 bucket: "test-bucket".to_string(),
                 region: "us-east-1".to_string(),
                 encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

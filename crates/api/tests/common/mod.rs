@@ -67,6 +67,7 @@ pub fn test_config() -> ApiConfig {
         },
         database: db_config_for_tests(),
         s3: config::S3Config {
+            mock: true,
             bucket: std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "test-bucket".to_string()),
             region: std::env::var("AWS_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
             encryption_key: std::env::var("S3_ENCRYPTION_KEY").unwrap_or_else(|_| {

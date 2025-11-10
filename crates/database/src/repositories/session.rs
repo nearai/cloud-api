@@ -192,7 +192,7 @@ impl SessionRepository {
 
         let row = client
             .query_one(
-                "UPDATE refresh_tokens SET token_hash = $1, expires_at = $2 WHERE id = $3",
+                "UPDATE refresh_tokens SET token_hash = $1, expires_at = $2 WHERE id = $3 RETURNING *",
                 &[&new_token_hash, &new_expires_at, &session_id],
             )
             .await

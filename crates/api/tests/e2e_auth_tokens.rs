@@ -316,6 +316,150 @@ async fn test_access_token_can_create_organization() {
     println!("✅ Access token can perform authenticated actions");
 }
 
+#[tokio::test]
+async fn test_create_access_token_success_user_agent_match() {
+    // Spin up full test server (with MockAuthService, DB, etc.)
+    let server = setup_test_server().await;
+
+    // Simulate refresh token for user
+    let refresh_token = "rt_mock_refresh_token";
+    let user_agent = "Mock User Agent";
+
+    // Perform API request
+    let response = server
+        .post("/v1/users/me/access-tokens")
+        .add_header("Authorization", format!("Bearer {refresh_token}"))
+        .add_header("User-Agent", user_agent)
+        .await;
+
+    // Validate response
+    assert_eq!(response.status_code(), 200, "Expected 200 OK");
+    let body = response.json::<api::models::AccessAndRefreshTokenResponse>();
+
+    assert!(
+        body.access_token.len() > 10,
+        "Access token should be non-empty"
+    );
+    assert!(
+        body.refresh_token.starts_with("rt_"),
+        "Refresh token should start with rt_"
+    );
+
+    println!("✅ Success: {body:?}");
+}
+
+#[tokio::test]
+async fn test_create_access_token_success_user_agent_mismatch() {
+    let server = setup_test_server().await;
+
+    let refresh_token = "rt_mock_refresh_token";
+    let user_agent = "Different User Agent";
+
+    let response = server
+        .post("/v1/users/me/access-tokens")
+        .add_header("Authorization", format!("Bearer {refresh_token}"))
+        .add_header("User-Agent", user_agent)
+        .await;
+
+    assert_eq!(response.status_code(), 401, "Expected 401 Unauthorized");
+    println!("Correctly rejected mismatched User-Agent");
+}
+
+#[tokio::test]
+#[ignore] // Requires real database to test token rotation properly
+async fn test_refresh_token_rotation_invalidates_old_token() {
+    let server = setup_test_server().await;
+    let old_refresh_token = get_session_id();
+
+    // Create an access token using the old refresh token
+    let response1 = server
+        .post("/v1/users/me/access-tokens")
+        .add_header("Authorization", format!("Bearer {old_refresh_token}"))
+        .add_header("User-Agent", "Mock User Agent")
+        .await;
+
+    assert_eq!(response1.status_code(), 200, "First request should succeed");
+    let token_response1 = response1.json::<api::models::AccessAndRefreshTokenResponse>();
+    let new_refresh_token = token_response1.refresh_token.clone();
+    assert!(
+        !new_refresh_token.is_empty(),
+        "Should receive new refresh token"
+    );
+    assert_ne!(
+        old_refresh_token, new_refresh_token,
+        "New refresh token should be different from old one"
+    );
+
+    // Validate that the new refresh token has an extended expiration time (7 days = 168 hours)
+    let now = chrono::Utc::now();
+    let expected_expiration = now + chrono::Duration::hours(7 * 24);
+    let actual_expiration = token_response1.refresh_token_expiration;
+
+    // Allow 5 minutes tolerance for test execution time
+    let tolerance = chrono::Duration::minutes(5);
+    let min_expected = expected_expiration - tolerance;
+    let max_expected = expected_expiration + tolerance;
+
+    assert!(
+        actual_expiration >= min_expected && actual_expiration <= max_expected,
+        "New refresh token expiration should be approximately 7 days from now. Expected: {expected_expiration:?}, Actual: {actual_expiration:?}"
+    );
+
+    assert!(
+        actual_expiration > now,
+        "Refresh token expiration should be in the future. Now: {now:?}, Expiration: {actual_expiration:?}"
+    );
+
+    // Try to use the old refresh token again (should fail - token rotation invalidated it)
+    let response2 = server
+        .post("/v1/users/me/access-tokens")
+        .add_header("Authorization", format!("Bearer {old_refresh_token}"))
+        .add_header("User-Agent", "Mock User Agent")
+        .await;
+
+    assert_eq!(
+        response2.status_code(),
+        401,
+        "Old refresh token should be invalidated after rotation"
+    );
+
+    // Verify the new refresh token works
+    let response3 = server
+        .post("/v1/users/me/access-tokens")
+        .add_header("Authorization", format!("Bearer {new_refresh_token}"))
+        .add_header("User-Agent", "Mock User Agent")
+        .await;
+
+    assert_eq!(
+        response3.status_code(),
+        200,
+        "New refresh token should work after rotation"
+    );
+
+    let token_response3 = response3.json::<api::models::AccessAndRefreshTokenResponse>();
+    assert!(
+        !token_response3.access_token.is_empty(),
+        "Should receive access token with new refresh token"
+    );
+
+    // Validate that the rotated refresh token also has extended expiration
+    let now_after_rotation = chrono::Utc::now();
+    let expected_expiration_after_rotation = now_after_rotation + chrono::Duration::hours(7 * 24);
+    let actual_expiration_after_rotation = token_response3.refresh_token_expiration;
+
+    let tolerance = chrono::Duration::minutes(5);
+    let min_expected_after = expected_expiration_after_rotation - tolerance;
+    let max_expected_after = expected_expiration_after_rotation + tolerance;
+
+    assert!(
+        actual_expiration_after_rotation >= min_expected_after
+            && actual_expiration_after_rotation <= max_expected_after,
+        "Rotated refresh token expiration should be approximately 7 days from now. Expected: {expected_expiration_after_rotation:?}, Actual: {actual_expiration_after_rotation:?}"
+    );
+
+    println!("✅ Refresh token rotation correctly invalidates old token and extends expiration");
+}
+
 // Note: Specific refresh token revocation (DELETE /users/me/refresh-tokens/{id})
 // is difficult to test in the current mock setup because we don't have easy access
 // to actual refresh token IDs. In a real database scenario, these would be testable.

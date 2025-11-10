@@ -2554,55 +2554,6 @@ async fn test_admin_access_token_cannot_manage_tokens() {
     println!("✅ Admin access tokens correctly restricted from token management endpoints");
 }
 
-#[tokio::test]
-async fn test_create_access_token_success_user_agent_match() {
-    // Spin up full test server (with MockAuthService, DB, etc.)
-    let server = setup_test_server().await;
-
-    // Simulate refresh token for user
-    let refresh_token = "rt_mock_refresh_token";
-    let user_agent = "Mock User Agent";
-
-    // Perform API request
-    let response = server
-        .post("/v1/users/me/access-tokens")
-        .add_header("Authorization", format!("Bearer {refresh_token}"))
-        .add_header("User-Agent", user_agent)
-        .await;
-
-    // Validate response
-    assert_eq!(response.status_code(), 200, "Expected 200 OK");
-    let body = response.json::<api::models::AccessAndRefreshTokenResponse>();
-
-    assert!(
-        body.access_token.len() > 10,
-        "Access token should be non-empty"
-    );
-    assert!(
-        body.refresh_token.starts_with("rt_"),
-        "Refresh token should start with rt_"
-    );
-
-    println!("✅ Success: {body:?}");
-}
-
-#[tokio::test]
-async fn test_create_access_token_success_user_agent_mismatch() {
-    let server = setup_test_server().await;
-
-    let refresh_token = "rt_mock_refresh_token";
-    let user_agent = "Different User Agent";
-
-    let response = server
-        .post("/v1/users/me/access-tokens")
-        .add_header("Authorization", format!("Bearer {refresh_token}"))
-        .add_header("User-Agent", user_agent)
-        .await;
-
-    assert_eq!(response.status_code(), 401, "Expected 401 Unauthorized");
-    println!("Correctly rejected mismatched User-Agent");
-}
-
 // ============================================
 // Admin List Users Tests
 // ============================================

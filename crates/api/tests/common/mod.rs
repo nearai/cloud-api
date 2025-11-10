@@ -67,8 +67,9 @@ pub fn test_config() -> ApiConfig {
         },
         database: db_config_for_tests(),
         s3: config::S3Config {
-            bucket: std::env::var("S3_BUCKET").unwrap_or_else(|_| "test-bucket".to_string()),
-            region: std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
+            mock: true,
+            bucket: std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "test-bucket".to_string()),
+            region: std::env::var("AWS_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
             encryption_key: std::env::var("S3_ENCRYPTION_KEY").unwrap_or_else(|_| {
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string()
             }),
@@ -156,27 +157,12 @@ pub async fn setup_test_server() -> axum_test::TestServer {
     assert_mock_user_in_db(&database).await;
 
     let auth_components = init_auth_services(database.clone(), &config);
-    let mut domain_services = init_domain_services(
+    let domain_services = init_domain_services(
         database.clone(),
         &config,
         auth_components.organization_service.clone(),
     )
     .await;
-
-    // Override files service with mock storage for tests
-    let mock_storage = Arc::new(services::files::storage::MockStorage::new(
-        config.s3.encryption_key.clone(),
-    )) as Arc<dyn services::files::storage::StorageTrait>;
-
-    let file_repository = Arc::new(database::repositories::FileRepository::new(
-        database.pool().clone(),
-    )) as Arc<dyn services::files::FileRepositoryTrait>;
-
-    domain_services.files_service = Arc::new(services::files::FileServiceImpl::new(
-        file_repository,
-        mock_storage,
-    ))
-        as Arc<dyn services::files::FileServiceTrait + Send + Sync>;
 
     let app = build_app_with_config(database, auth_components, domain_services, Arc::new(config));
     axum_test::TestServer::new(app).unwrap()

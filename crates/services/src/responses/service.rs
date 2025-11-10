@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::completions::ports::CompletionServiceTrait;
 use crate::conversations::models::ConversationId;
 use crate::conversations::ports::ConversationServiceTrait;
+use crate::files::FileServiceTrait;
 use crate::inference_provider_pool::InferenceProviderPool;
 use crate::responses::tools;
 use crate::responses::{errors, models, ports};
@@ -26,6 +27,7 @@ struct ProcessStreamContext {
     conversation_service: Arc<dyn ConversationServiceTrait>,
     web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
     file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
+    file_service: Arc<dyn FileServiceTrait>,
 }
 
 pub struct ResponseServiceImpl {
@@ -36,9 +38,11 @@ pub struct ResponseServiceImpl {
     pub completion_service: Arc<dyn CompletionServiceTrait>,
     pub web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
     pub file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
+    pub file_service: Arc<dyn FileServiceTrait>,
 }
 
 impl ResponseServiceImpl {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         response_repository: Arc<dyn ports::ResponseRepositoryTrait>,
         response_items_repository: Arc<dyn ports::ResponseItemRepositoryTrait>,
@@ -47,6 +51,7 @@ impl ResponseServiceImpl {
         completion_service: Arc<dyn CompletionServiceTrait>,
         web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
         file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
+        file_service: Arc<dyn FileServiceTrait>,
     ) -> Self {
         Self {
             response_repository,
@@ -56,6 +61,7 @@ impl ResponseServiceImpl {
             completion_service,
             web_search_provider,
             file_search_provider,
+            file_service,
         }
     }
 }
@@ -87,6 +93,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let conversation_service = self.conversation_service.clone();
         let web_search_provider = self.web_search_provider.clone();
         let file_search_provider = self.file_search_provider.clone();
+        let file_service = self.file_service.clone();
 
         tokio::spawn(async move {
             let context = ProcessStreamContext {
@@ -102,6 +109,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 conversation_service,
                 web_search_provider,
                 file_search_provider,
+                file_service,
             };
 
             if let Err(e) = Self::process_response_stream(tx.clone(), context).await {
@@ -125,7 +133,10 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                     annotation: None,
                     conversation_title: None,
                 };
-                let _ = tx.send(error_event).await;
+                let result = tx.send(error_event).await;
+                if let Err(e) = result {
+                    tracing::error!("Error sending error event: {e:?}");
+                }
             }
         });
 
@@ -152,6 +163,13 @@ impl ResponseServiceImpl {
         } else {
             Ok(None)
         }
+    }
+
+    /// Parse file ID from string (handles "file-" prefix)
+    fn parse_file_id(file_id: &str) -> Result<Uuid, errors::ResponseError> {
+        let id_str = file_id.strip_prefix("file-").unwrap_or(file_id);
+        Uuid::parse_str(id_str)
+            .map_err(|e| errors::ResponseError::InvalidParams(format!("Invalid file ID: {e}")))
     }
 
     /// Extract response ID UUID from response object
@@ -441,6 +459,7 @@ impl ResponseServiceImpl {
             &context.request,
             &context.conversation_service,
             &context.response_items_repository,
+            &context.file_service,
             workspace_id_domain.clone(),
         )
         .await?;
@@ -988,7 +1007,15 @@ impl ResponseServiceImpl {
                                             logprobs: vec![],
                                         })
                                     }
-                                    // TODO: Handle other content types (images, files, etc.)
+                                    models::ResponseContentPart::InputFile { file_id, .. } => {
+                                        // Store a reference to the file in the output
+                                        Some(models::ResponseOutputContent::OutputText {
+                                            text: format!("[File: {file_id}]"),
+                                            annotations: vec![],
+                                            logprobs: vec![],
+                                        })
+                                    }
+                                    // TODO: Handle other content types (images, etc.)
                                     _ => None,
                                 })
                                 .collect()
@@ -1031,6 +1058,7 @@ impl ResponseServiceImpl {
         request: &models::CreateResponseRequest,
         conversation_service: &Arc<dyn ConversationServiceTrait>,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
+        file_service: &Arc<dyn FileServiceTrait>,
         workspace_id: crate::workspace::WorkspaceId,
     ) -> Result<Vec<crate::completions::ports::CompletionMessage>, errors::ResponseError> {
         use crate::completions::ports::CompletionMessage;
@@ -1157,17 +1185,67 @@ impl ResponseServiceImpl {
                         let content = match &item.content {
                             models::ResponseContent::Text(text) => text.clone(),
                             models::ResponseContent::Parts(parts) => {
-                                // Extract text from parts
-                                parts
-                                    .iter()
-                                    .filter_map(|part| match part {
+                                // Extract text from parts and fetch file content if needed
+                                let mut content_parts = Vec::new();
+                                for part in parts {
+                                    match part {
                                         models::ResponseContentPart::InputText { text } => {
-                                            Some(text.clone())
+                                            content_parts.push(text.clone());
                                         }
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
+                                        models::ResponseContentPart::InputFile {
+                                            file_id, ..
+                                        } => {
+                                            // Parse file ID and fetch content from S3
+                                            let file_uuid = Self::parse_file_id(file_id)?;
+                                            match file_service
+                                                .get_file_content(file_uuid, workspace_id.0)
+                                                .await
+                                            {
+                                                Ok((file, file_content)) => {
+                                                    // Convert file content to string (we currently support only text)
+                                                    match String::from_utf8(file_content) {
+                                                        Ok(text_content) => {
+                                                            // Prepend file content with filename as context
+                                                            content_parts.push(format!(
+                                                                "File: {}\nContent:\n{}",
+                                                                file.filename, text_content
+                                                            ));
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                "Failed to convert file {} to UTF-8 text: {}",
+                                                                file_id,
+                                                                e
+                                                            );
+                                                            content_parts.push(format!(
+                                                                "[File: {} - Content cannot be displayed as text]",
+                                                                file.filename
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        "Failed to fetch file content for {}: {}",
+                                                        file_id,
+                                                        e
+                                                    );
+                                                    return Err(
+                                                        errors::ResponseError::InternalError(
+                                                            format!(
+                                                                "Failed to fetch file content: {e}"
+                                                            ),
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            // Skip other content types for now
+                                        }
+                                    }
+                                }
+                                content_parts.join("\n\n")
                             }
                         };
 

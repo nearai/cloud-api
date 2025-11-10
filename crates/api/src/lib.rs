@@ -291,16 +291,6 @@ pub async fn init_domain_services(
     let web_search_provider =
         Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
 
-    let response_service = Arc::new(services::ResponseService::new(
-        response_repo,
-        response_items_repo.clone(),
-        inference_provider_pool.clone(),
-        conversation_service.clone(),
-        completion_service.clone(),
-        Some(web_search_provider), // web_search_provider
-        None,                      // file_search_provider
-    ));
-
     // Create session repository for user service
     let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
         as Arc<dyn services::auth::SessionRepository>;
@@ -309,14 +299,23 @@ pub async fn init_domain_services(
     let user_service = Arc::new(services::user::UserService::new(user_repo, session_repo))
         as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
 
-    // Create S3 storage and file service
-    let s3_config = aws_config::load_from_env().await;
-    let s3_client = aws_sdk_s3::Client::new(&s3_config);
-    let s3_storage = Arc::new(services::files::storage::S3Storage::new(
-        s3_client,
-        config.s3.bucket.clone(),
-        config.s3.encryption_key.clone(),
-    )) as Arc<dyn services::files::storage::StorageTrait>;
+    // Create S3 storage and file service (must be created before response service)
+    let s3_storage: Arc<dyn services::files::storage::StorageTrait> = if config.s3.mock {
+        tracing::info!("Using mock S3 storage for file uploads");
+        Arc::new(services::files::storage::MockStorage::new(
+            config.s3.encryption_key.clone(),
+        ))
+    } else {
+        tracing::info!("Using real S3 storage for file uploads");
+        let s3_config = aws_config::load_from_env().await;
+        let s3_client = aws_sdk_s3::Client::new(&s3_config);
+
+        Arc::new(services::files::storage::S3Storage::new(
+            s3_client,
+            config.s3.bucket.clone(),
+            config.s3.encryption_key.clone(),
+        ))
+    };
 
     let file_repository = Arc::new(database::repositories::FileRepository::new(
         database.pool().clone(),
@@ -326,6 +325,17 @@ pub async fn init_domain_services(
         file_repository,
         s3_storage,
     )) as Arc<dyn services::files::FileServiceTrait + Send + Sync>;
+
+    let response_service = Arc::new(services::ResponseService::new(
+        response_repo,
+        response_items_repo.clone(),
+        inference_provider_pool.clone(),
+        conversation_service.clone(),
+        completion_service.clone(),
+        Some(web_search_provider), // web_search_provider
+        None,                      // file_search_provider
+        files_service.clone(),     // file_service
+    ));
 
     DomainServices {
         conversation_service,
@@ -1030,6 +1040,7 @@ mod tests {
                 mock: false,
             },
             s3: config::S3Config {
+                mock: true,
                 bucket: "test-bucket".to_string(),
                 region: "us-east-1".to_string(),
                 encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -1121,6 +1132,7 @@ mod tests {
                 mock: false,
             },
             s3: config::S3Config {
+                mock: true,
                 bucket: "test-bucket".to_string(),
                 region: "us-east-1".to_string(),
                 encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

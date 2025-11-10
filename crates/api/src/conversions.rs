@@ -102,9 +102,7 @@ impl From<CompletionRequest> for CompletionParams {
 impl From<ChatMessage> for crate::models::Message {
     fn from(msg: ChatMessage) -> Self {
         // Convert Option<String> to Option<MessageContent>
-        let content = msg
-            .content
-            .map(|text| crate::models::MessageContent::Text(text));
+        let content = msg.content.map(crate::models::MessageContent::Text);
 
         Self {
             role: match msg.role {

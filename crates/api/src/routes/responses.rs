@@ -1,6 +1,6 @@
 use crate::{
     middleware::{auth::AuthenticatedApiKey, RequestBodyHash},
-    models::ErrorResponse,
+    models::{ErrorResponse, ResponseInputItemList},
 };
 use axum::{
     extract::{Extension, Json, Path, Query, State},
@@ -417,19 +417,141 @@ pub async fn cancel_response(
 
 /// List input items for a response (simplified implementation)
 pub async fn list_input_items(
-    Path(_response_id): Path<String>,
-    Query(_params): Query<ListInputItemsQuery>,
-    State(_service): State<Arc<ResponseServiceImpl>>,
-    Extension(_api_key): Extension<services::workspace::ApiKey>,
+    Path(response_id): Path<String>,
+    Query(params): Query<ListInputItemsQuery>,
+    State(service): State<Arc<ResponseServiceImpl>>,
+    Extension(auth): Extension<AuthenticatedApiKey>,
 ) -> Result<ResponseJson<ResponseInputItemList>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    // TODO: Implement get_response method in ResponseService to support listing input items
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        ResponseJson(ErrorResponse::new(
-            "List input items not yet implemented".to_string(),
-            "not_implemented".to_string(),
-        )),
-    ))
+    debug!(
+        "List input items for response {} from workspace {}",
+        response_id, auth.workspace.id.0
+    );
+
+    // Parse response ID (format: "resp_{uuid}")
+    let response_uuid = response_id
+        .strip_prefix("resp_")
+        .unwrap_or(&response_id)
+        .parse::<Uuid>()
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "Invalid response ID format".to_string(),
+                    "invalid_request_error".to_string(),
+                )),
+            )
+        })?;
+
+    let parsed_response_id = ResponseId(response_uuid);
+
+    // Verify the response belongs to this workspace
+    match service
+        .response_repository
+        .get_by_id(parsed_response_id.clone(), auth.workspace.id.clone())
+        .await
+    {
+        Ok(Some(_)) => {
+            // Response exists and belongs to workspace, proceed
+        }
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    "Response not found".to_string(),
+                    "not_found".to_string(),
+                )),
+            ));
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to fetch response: {e}"),
+                    "internal_server_error".to_string(),
+                )),
+            ));
+        }
+    }
+
+    // Get all response items
+    let items = service
+        .response_items_repository
+        .list_by_response(parsed_response_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to fetch response items: {e}"),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    // Filter to only user input items and convert to API format
+    let mut input_items: Vec<crate::models::ResponseInputItem> = Vec::new();
+
+    for item in items {
+        if let ResponseOutputItem::Message { role, content, .. } = item {
+            if role == "user" {
+                // Convert content parts to API format
+                let api_content = content
+                    .into_iter()
+                    .map(|part| match part {
+                        ResponseOutputContent::OutputText { text, .. } => {
+                            // Check if this is a file reference: [File: file-{uuid}]
+                            if let Some(file_id) = text
+                                .strip_prefix("[File: ")
+                                .and_then(|s| s.strip_suffix("]"))
+                            {
+                                crate::models::ResponseContentPart::InputFile {
+                                    file_id: file_id.to_string(),
+                                    detail: None,
+                                }
+                            } else {
+                                crate::models::ResponseContentPart::InputText { text }
+                            }
+                        }
+                        ResponseOutputContent::ToolCalls { .. } => {
+                            // Tool calls shouldn't appear in user messages, but handle gracefully
+                            crate::models::ResponseContentPart::InputText {
+                                text: "[Tool calls]".to_string(),
+                            }
+                        }
+                    })
+                    .collect();
+
+                input_items.push(crate::models::ResponseInputItem {
+                    role,
+                    content: crate::models::ResponseContent::Parts(api_content),
+                });
+            }
+        }
+    }
+
+    // Apply pagination if needed (for now, return all)
+    let limit = params.limit.unwrap_or(100).min(1000);
+    let has_more = input_items.len() > limit as usize;
+    let input_items: Vec<_> = input_items.into_iter().take(limit as usize).collect();
+
+    let first_id = if input_items.is_empty() {
+        String::new()
+    } else {
+        "0".to_string()
+    };
+    let last_id = if input_items.is_empty() {
+        String::new()
+    } else {
+        (input_items.len() - 1).to_string()
+    };
+
+    Ok(ResponseJson(ResponseInputItemList {
+        object: "list".to_string(),
+        data: input_items,
+        first_id,
+        last_id,
+        has_more,
+    }))
 }
 
 // Query parameter structs

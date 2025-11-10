@@ -132,7 +132,10 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                     annotation: None,
                     conversation_title: None,
                 };
-                let _ = tx.send(error_event).await;
+                let result = tx.send(error_event).await;
+                if let Err(e) = result {
+                    tracing::error!("Error sending error event: {e:?}");
+                }
             }
         });
 

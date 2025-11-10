@@ -1,7 +1,7 @@
 use crate::pool::DbPool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use services::responses::models::*;
 use services::responses::ports::*;
 use services::workspace::WorkspaceId;
@@ -167,10 +167,103 @@ impl ResponseRepositoryTrait for PgResponseRepository {
 
     async fn get_by_id(
         &self,
-        _response_id: ResponseId,
-        _workspace_id: WorkspaceId,
+        response_id: ResponseId,
+        workspace_id: WorkspaceId,
     ) -> Result<Option<ResponseObject>, anyhow::Error> {
-        unimplemented!("get_by_id not yet implemented")
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let response_uuid = response_id.0;
+
+        // Fetch the response
+        let row_result = client
+            .query_opt(
+                r#"
+                SELECT id, workspace_id, api_key_id, model, status, instructions, 
+                       conversation_id, previous_response_id, usage, metadata, 
+                       created_at, updated_at
+                FROM responses
+                WHERE id = $1 AND workspace_id = $2
+                "#,
+                &[&response_uuid, &workspace_id.0],
+            )
+            .await
+            .context("Failed to fetch response")?;
+
+        let Some(row) = row_result else {
+            return Ok(None);
+        };
+
+        let status = match row.get::<_, String>("status").as_str() {
+            "in_progress" => ResponseStatus::InProgress,
+            "completed" => ResponseStatus::Completed,
+            "failed" => ResponseStatus::Failed,
+            "cancelled" => ResponseStatus::Cancelled,
+            "queued" => ResponseStatus::Queued,
+            "incomplete" => ResponseStatus::Incomplete,
+            _ => ResponseStatus::Failed,
+        };
+
+        let created_at: DateTime<Utc> = row.get("created_at");
+        let conversation_uuid: Option<Uuid> = row.get("conversation_id");
+        let usage_json: Option<serde_json::Value> = row.get("usage");
+        let metadata_json: Option<serde_json::Value> = row.get("metadata");
+        let model: String = row.get("model");
+        let instructions: Option<String> = row.get("instructions");
+        let previous_response_uuid: Option<Uuid> = row.get("previous_response_id");
+
+        // Build conversation reference if conversation_id is present
+        let conversation_ref = conversation_uuid.map(|uuid| ConversationResponseReference {
+            id: format!("conv_{}", uuid.simple()),
+        });
+
+        // Parse usage from JSON
+        let usage = if let Some(usage_val) = usage_json {
+            serde_json::from_value(usage_val).unwrap_or_else(|_| Usage::new(0, 0))
+        } else {
+            Usage::new(0, 0)
+        };
+
+        // Build ResponseObject from the database row
+        let response_obj = ResponseObject {
+            id: format!("resp_{}", response_uuid.simple()),
+            object: "response".to_string(),
+            created_at: created_at.timestamp(),
+            status,
+            background: false, // Default, not stored in DB
+            conversation: conversation_ref,
+            error: None,
+            incomplete_details: None,
+            instructions,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            model,
+            output: vec![], // Would need to fetch from response_items if needed
+            parallel_tool_calls: false,
+            previous_response_id: previous_response_uuid
+                .map(|uuid| format!("resp_{}", uuid.simple())),
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            reasoning: None,
+            safety_identifier: None,
+            service_tier: "default".to_string(),
+            store: false,
+            temperature: 1.0,
+            text: None,
+            tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
+            tools: vec![],
+            top_logprobs: 0,
+            top_p: 1.0,
+            truncation: "disabled".to_string(),
+            usage,
+            user: None,
+            metadata: metadata_json,
+        };
+
+        Ok(Some(response_obj))
     }
 
     async fn update(

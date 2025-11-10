@@ -898,6 +898,13 @@ async fn test_file_in_response_api() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
 
+    if input_items_response.status_code() != 200 {
+        println!(
+            "Error response: status={}, body={}",
+            input_items_response.status_code(),
+            input_items_response.text()
+        );
+    }
     assert_eq!(input_items_response.status_code(), 200);
     let input_items: api::models::ResponseInputItemList = input_items_response.json();
     println!("Input items: {:?}", input_items);
@@ -957,7 +964,13 @@ async fn test_file_in_response_api() {
         }
 
         if event_type == "response.completed" && !event_data.is_empty() {
-            final_response = serde_json::from_str(event_data).ok();
+            if let Ok(event_json) = serde_json::from_str::<serde_json::Value>(event_data) {
+                if let Some(response_obj) = event_json.get("response") {
+                    final_response =
+                        serde_json::from_value::<api::models::ResponseObject>(response_obj.clone())
+                            .ok();
+                }
+            }
             break;
         }
     }

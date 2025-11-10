@@ -838,7 +838,7 @@ async fn test_file_in_response_api() {
         .await;
     assert_eq!(file_response.status_code(), 200);
     let file_obj: api::models::FileUploadResponse = file_response.json();
-    println!("File: {:?}", file_obj);
+    println!("File: {file_obj:?}");
 
     // 2. Get available models
     let models_response = server
@@ -907,7 +907,7 @@ async fn test_file_in_response_api() {
     }
     assert_eq!(input_items_response.status_code(), 200);
     let input_items: api::models::ResponseInputItemList = input_items_response.json();
-    println!("Input items: {:?}", input_items);
+    println!("Input items: {input_items:?}");
 
     // Should have at least one input item
     assert!(!input_items.data.is_empty());

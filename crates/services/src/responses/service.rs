@@ -42,6 +42,7 @@ pub struct ResponseServiceImpl {
 }
 
 impl ResponseServiceImpl {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         response_repository: Arc<dyn ports::ResponseRepositoryTrait>,
         response_items_repository: Arc<dyn ports::ResponseItemRepositoryTrait>,
@@ -1009,7 +1010,7 @@ impl ResponseServiceImpl {
                                     models::ResponseContentPart::InputFile { file_id, .. } => {
                                         // Store a reference to the file in the output
                                         Some(models::ResponseOutputContent::OutputText {
-                                            text: format!("[File: {}]", file_id),
+                                            text: format!("[File: {file_id}]"),
                                             annotations: vec![],
                                             logprobs: vec![],
                                         })

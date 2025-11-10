@@ -73,13 +73,9 @@ pub enum MessageContentPart {
         detail: Option<String>,
     },
     #[serde(rename = "audio")]
-    Audio {
-        audio: MessageAudio,
-    },
+    Audio { audio: MessageAudio },
     #[serde(rename = "file")]
-    File {
-        file_id: String,
-    },
+    File { file_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -240,7 +236,7 @@ impl ChatCompletionRequest {
             if !["system", "user", "assistant"].contains(&message.role.as_str()) {
                 return Err(format!("invalid message role: {}", message.role));
             }
-            
+
             // Validate content: if it's an array, check that all parts are text-only
             if let Some(MessageContent::Parts(parts)) = &message.content {
                 for part in parts {
@@ -1822,14 +1818,12 @@ mod tests {
             model: "gpt-4".to_string(),
             messages: vec![Message {
                 role: "user".to_string(),
-                content: Some(MessageContent::Parts(vec![
-                    MessageContentPart::Audio {
-                        audio: MessageAudio {
-                            data: "base64_audio_data".to_string(),
-                            format: Some("mp3".to_string()),
-                        },
+                content: Some(MessageContent::Parts(vec![MessageContentPart::Audio {
+                    audio: MessageAudio {
+                        data: "base64_audio_data".to_string(),
+                        format: Some("mp3".to_string()),
                     },
-                ])),
+                }])),
                 name: None,
             }],
             max_tokens: Some(100),
@@ -1858,11 +1852,9 @@ mod tests {
             model: "gpt-4".to_string(),
             messages: vec![Message {
                 role: "user".to_string(),
-                content: Some(MessageContent::Parts(vec![
-                    MessageContentPart::File {
-                        file_id: "file-abc123".to_string(),
-                    },
-                ])),
+                content: Some(MessageContent::Parts(vec![MessageContentPart::File {
+                    file_id: "file-abc123".to_string(),
+                }])),
                 name: None,
             }],
             max_tokens: Some(100),

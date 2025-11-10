@@ -4,18 +4,18 @@ use inference_providers::{
 };
 use services::completions::CompletionError;
 
-impl From<&crate::models::Message> for ChatMessage {
-    fn from(msg: &crate::models::Message) -> Self {
+impl From<crate::models::Message> for ChatMessage {
+    fn from(msg: crate::models::Message) -> Self {
         // Extract text from MessageContent
-        let content = match &msg.content {
+        let content = match msg.content {
             None => None,
-            Some(crate::models::MessageContent::Text(text)) => Some(text.clone()),
+            Some(crate::models::MessageContent::Text(text)) => Some(text),
             Some(crate::models::MessageContent::Parts(parts)) => {
                 // Extract text from all text parts and join with newlines
                 let text_parts: Vec<String> = parts
-                    .iter()
+                    .into_iter()
                     .filter_map(|part| match part {
-                        crate::models::MessageContentPart::Text { text } => Some(text.clone()),
+                        crate::models::MessageContentPart::Text { text } => Some(text),
                         _ => None, // Non-text parts should be filtered out by validation
                     })
                     .collect();
@@ -36,22 +36,22 @@ impl From<&crate::models::Message> for ChatMessage {
                 _ => MessageRole::User, // Default to user for unknown roles
             },
             content,
-            name: msg.name.clone(),
+            name: msg.name,
             tool_call_id: None,
             tool_calls: None,
         }
     }
 }
 
-impl From<&ChatCompletionRequest> for ChatCompletionParams {
-    fn from(req: &ChatCompletionRequest) -> Self {
+impl From<ChatCompletionRequest> for ChatCompletionParams {
+    fn from(req: ChatCompletionRequest) -> Self {
         Self {
-            model: req.model.clone(),
-            messages: req.messages.iter().map(|m| m.into()).collect(),
+            model: req.model,
+            messages: req.messages.into_iter().map(|m| m.into()).collect(),
             max_tokens: req.max_tokens,
             temperature: req.temperature,
             top_p: req.top_p,
-            stop: req.stop.clone(),
+            stop: req.stop,
             stream: req.stream,
             tools: None, // TODO: Add tools support to API request
             max_completion_tokens: req.max_tokens,
@@ -69,22 +69,22 @@ impl From<&ChatCompletionRequest> for ChatCompletionParams {
             metadata: None,
             store: None,
             stream_options: None,
-            extra: req.extra.clone(),
+            extra: req.extra,
         }
     }
 }
 
-impl From<&CompletionRequest> for CompletionParams {
-    fn from(req: &CompletionRequest) -> Self {
+impl From<CompletionRequest> for CompletionParams {
+    fn from(req: CompletionRequest) -> Self {
         Self {
-            model: req.model.clone(),
-            prompt: req.prompt.clone(),
+            model: req.model,
+            prompt: req.prompt,
             max_tokens: req.max_tokens,
             temperature: req.temperature,
             top_p: req.top_p,
             n: req.n,
             stream: req.stream,
-            stop: req.stop.clone(),
+            stop: req.stop,
             frequency_penalty: req.frequency_penalty,
             presence_penalty: req.presence_penalty,
             logit_bias: None,
@@ -99,12 +99,12 @@ impl From<&CompletionRequest> for CompletionParams {
     }
 }
 
-impl From<&ChatMessage> for crate::models::Message {
-    fn from(msg: &ChatMessage) -> Self {
+impl From<ChatMessage> for crate::models::Message {
+    fn from(msg: ChatMessage) -> Self {
         // Convert Option<String> to Option<MessageContent>
-        let content = msg.content.as_ref().map(|text| {
-            crate::models::MessageContent::Text(text.clone())
-        });
+        let content = msg
+            .content
+            .map(|text| crate::models::MessageContent::Text(text));
 
         Self {
             role: match msg.role {
@@ -588,11 +588,11 @@ mod tests {
             name: None,
         };
 
-        let domain_msg: ChatMessage = (&http_msg).into();
+        let domain_msg: ChatMessage = http_msg.into();
         assert!(matches!(domain_msg.role, MessageRole::User));
         assert_eq!(domain_msg.content, Some("Hello".to_string()));
 
-        let back_to_http: crate::models::Message = (&domain_msg).into();
+        let back_to_http: crate::models::Message = domain_msg.into();
         assert_eq!(back_to_http.role, "user");
         assert_eq!(
             back_to_http.content,
@@ -606,7 +606,9 @@ mod tests {
             model: "gpt-3.5-turbo".to_string(),
             messages: vec![crate::models::Message {
                 role: "user".to_string(),
-                content: Some(crate::models::MessageContent::Text("Test message".to_string())),
+                content: Some(crate::models::MessageContent::Text(
+                    "Test message".to_string(),
+                )),
                 name: None,
             }],
             max_tokens: Some(100),
@@ -621,7 +623,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let domain_params: ChatCompletionParams = (&http_req).into();
+        let domain_params: ChatCompletionParams = http_req.into();
         assert_eq!(domain_params.model, "gpt-3.5-turbo");
         assert_eq!(domain_params.messages.len(), 1);
         assert_eq!(domain_params.max_tokens, Some(100));

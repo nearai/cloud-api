@@ -31,58 +31,6 @@ fn services_session_to_api_refresh_token(
     }
 }
 
-/// Revoke the old refresh token used for authentication (refresh token rotation)
-///
-/// This function validates the refresh token to get the session ID, and revokes that session.
-/// This implements refresh token rotation security best practice where
-/// the old token is invalidated when issuing a new one.
-async fn revoke_old_refresh_token(
-    refresh_token: &str,
-    app_state: &AppState,
-    user_agent: &str,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    // Validate the refresh token to get the session ID
-    let old_session = app_state
-        .auth_service
-        .validate_session_refresh_token(
-            services::auth::SessionToken(refresh_token.to_string()),
-            user_agent,
-        )
-        .await
-        .map_err(|_| {
-            error!("Failed to validate refresh token when rotating refresh token");
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse::new(
-                    "Invalid refresh token".to_string(),
-                    "unauthorized".to_string(),
-                )),
-            )
-        })?
-        .ok_or_else(|| {
-            error!("Refresh token session not found when rotating refresh token");
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse::new(
-                    "Invalid refresh token".to_string(),
-                    "unauthorized".to_string(),
-                )),
-            )
-        })?;
-
-    // Revoke the old refresh token session
-    debug!(
-        "Revoking old refresh token session: {} before creating new one",
-        old_session.id
-    );
-    if let Err(e) = app_state.auth_service.logout(old_session.id).await {
-        error!("Failed to revoke old refresh token session: {:?}", e);
-        // Continue anyway - the old token will expire naturally, but log the error
-    }
-
-    Ok(())
-}
-
 /// User profile update request
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateUserProfileRequest {
@@ -434,59 +382,24 @@ pub async fn revoke_all_user_tokens(
 )]
 pub async fn create_access_token(
     State(app_state): State<AppState>,
-    Extension(user): Extension<AuthenticatedUser>,
-    request: Request,
+    Extension((session, user)): Extension<(services::auth::Session, AuthenticatedUser)>,
+    _request: Request,
 ) -> Result<Json<crate::models::AccessAndRefreshTokenResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Creating access token & refresh token for user: {}",
         user.0.id
     );
 
-    let user_agent_header = request
-        .headers()
-        .get("User-Agent")
-        .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| {
-            error!("Missing User-Agent header when creating access token");
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(
-                    "Missing User-Agent header".to_string(),
-                    "bad_request".to_string(),
-                )),
-            )
-        })?;
-
-    // Extract the refresh token from the Authorization header
-    let refresh_token = request
-        .headers()
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .ok_or_else(|| {
-            error!("Missing Authorization header when creating access token");
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(
-                    "Missing Authorization header".to_string(),
-                    "bad_request".to_string(),
-                )),
-            )
-        })?;
-
-    // Revoke the old refresh token before creating a new one (refresh token rotation)
-    revoke_old_refresh_token(refresh_token, &app_state, user_agent_header).await?;
-
+    // Rotate the refresh token session
     let expires_in_hours = 7 * 24;
     let result = app_state
         .auth_service
-        .create_session(
-            UserId(user.0.id),
-            None,
-            user_agent_header.to_string(),
+        .rotate_session(
+            session.user_id,
+            session.id,
             app_state.config.auth.encoding_key.to_string(),
-            1,
-            expires_in_hours,
+            1,                // access token expires in 1 hour
+            expires_in_hours, // refresh token expires in 7 days
         )
         .await;
 

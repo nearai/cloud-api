@@ -205,6 +205,12 @@ pub trait SessionRepository: Send + Sync {
 
     async fn extend(&self, session_id: SessionId, additional_hours: i64) -> anyhow::Result<bool>;
 
+    async fn rotate(
+        &self,
+        session_id: SessionId,
+        expires_in_hours: i64,
+    ) -> anyhow::Result<(Session, String)>;
+
     async fn revoke(&self, session_id: SessionId) -> anyhow::Result<bool>;
 
     async fn revoke_all_for_user(&self, user_id: UserId) -> anyhow::Result<usize>;
@@ -257,13 +263,24 @@ pub trait AuthServiceTrait: Send + Sync {
         &self,
         session_token: SessionToken,
         user_agent: &str,
-    ) -> Result<User, AuthError>;
+    ) -> Result<(Session, User), AuthError>;
 
     /// Get a user by their ID
     async fn get_user_by_id(&self, user_id: UserId) -> Result<User, AuthError>;
 
     /// Logout (revoke session)
     async fn logout(&self, session_id: SessionId) -> Result<bool, AuthError>;
+
+    /// Rotate a refresh token session (refresh token rotation)
+    /// This atomically updates the token hash and expiration, ensuring only one valid token at a time
+    async fn rotate_session(
+        &self,
+        user_id: UserId,
+        session_id: SessionId,
+        encoding_key: String,
+        access_token_expires_in_hours: i64,
+        refresh_token_expires_in_hours: i64,
+    ) -> Result<(String, Session, String), AuthError>;
 
     /// Get or create user from OAuth data
     async fn get_or_create_oauth_user(&self, oauth_info: OAuthUserInfo) -> Result<User, AuthError>;
@@ -488,7 +505,7 @@ impl AuthServiceTrait for MockAuthService {
         &self,
         session_token: SessionToken,
         user_agent: &str,
-    ) -> Result<User, AuthError> {
+    ) -> Result<(Session, User), AuthError> {
         tracing::debug!(
             "MockAuthService::validate_session called with token: {}, user_agent: {}",
             session_token,
@@ -497,8 +514,9 @@ impl AuthServiceTrait for MockAuthService {
         // Accept the known test session token or any token that starts with "rt_"
         if session_token.0.starts_with("rt_") && user_agent == "Mock User Agent" {
             let user = Self::create_mock_user();
+            let (_, session, _) = self.create_mock_session(user.id.clone());
             tracing::debug!("MockAuthService returning mock user: {}", user.email);
-            Ok(user)
+            Ok((session, user))
         } else {
             Err(AuthError::SessionNotFound)
         }
@@ -510,6 +528,27 @@ impl AuthServiceTrait for MockAuthService {
 
     async fn logout(&self, _session_id: SessionId) -> Result<bool, AuthError> {
         Ok(true) // Mock logout always succeeds
+    }
+
+    async fn rotate_session(
+        &self,
+        _user_id: UserId,
+        _session_id: SessionId,
+        encoding_key: String,
+        access_token_expires_in_hours: i64,
+        refresh_token_expires_in_hours: i64,
+    ) -> Result<(String, Session, String), AuthError> {
+        // Create a mock session rotation
+        let mock_user = Self::create_mock_user();
+        let (access_token, refresh_session, refresh_token) = self.create_mock_session_with_params(
+            mock_user.id,
+            None,
+            Some("Mock User Agent".to_string()),
+            encoding_key,
+            access_token_expires_in_hours,
+            refresh_token_expires_in_hours,
+        );
+        Ok((access_token, refresh_session, refresh_token))
     }
 
     async fn get_or_create_oauth_user(

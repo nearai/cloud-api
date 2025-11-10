@@ -468,10 +468,12 @@ pub async fn refresh_middleware(
     };
 
     match auth_result {
-        Ok(user) => {
+        Ok((session, user)) => {
             // Clone request to add extension
             let mut request = request;
-            request.extensions_mut().insert(AuthenticatedUser(user));
+            request
+                .extensions_mut()
+                .insert((session, AuthenticatedUser(user)));
             Ok(next.run(request).await)
         }
         Err(status) => Err(status),
@@ -483,7 +485,7 @@ async fn authenticate_session_refresh(
     state: &AuthState,
     token: SessionToken,
     user_agent: &str,
-) -> Result<DbUser, StatusCode> {
+) -> Result<(services::auth::Session, DbUser), StatusCode> {
     debug!("Authenticating session refresh token: {}", token);
     // Use auth service to validate session with refresh token and user agent
     {
@@ -493,9 +495,9 @@ async fn authenticate_session_refresh(
             .validate_session_refresh(token, user_agent)
             .await
         {
-            Ok(user) => {
+            Ok((session, user)) => {
                 debug!("Authenticated user {} via session", user.email);
-                return Ok(convert_user_to_db_user(user));
+                return Ok((session, convert_user_to_db_user(user)));
             }
             Err(AuthError::SessionNotFound) | Err(AuthError::UserNotFound) => {
                 debug!("Session not found in auth service, trying OAuth manager");

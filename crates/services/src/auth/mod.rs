@@ -126,7 +126,7 @@ impl AuthServiceTrait for AuthService {
         &self,
         refresh_token: SessionToken,
         user_agent: &str,
-    ) -> Result<User, AuthError> {
+    ) -> Result<(Session, User), AuthError> {
         let session = self
             .validate_session_refresh_token(refresh_token, user_agent)
             .await?
@@ -139,11 +139,14 @@ impl AuthServiceTrait for AuthService {
         }
 
         // Get the user
-        self.user_repository
-            .get_by_id(session.user_id)
+        let user = self
+            .user_repository
+            .get_by_id(session.user_id.clone())
             .await
             .map_err(|e| AuthError::InternalError(format!("Failed to get user: {e}")))?
-            .ok_or(AuthError::UserNotFound)
+            .ok_or(AuthError::UserNotFound)?;
+
+        Ok((session, user))
     }
 
     async fn get_user_by_id(&self, user_id: UserId) -> Result<User, AuthError> {
@@ -159,6 +162,31 @@ impl AuthServiceTrait for AuthService {
             .revoke(session_id)
             .await
             .map_err(|e| AuthError::InternalError(format!("Failed to revoke session: {e}")))
+    }
+
+    async fn rotate_session(
+        &self,
+        user_id: UserId,
+        session_id: SessionId,
+        encoding_key: String,
+        access_token_expires_in_hours: i64,
+        refresh_token_expires_in_hours: i64,
+    ) -> Result<(String, Session, String), AuthError> {
+        // Create a new access token
+        let access_token = self.create_session_access_token(
+            user_id.clone(),
+            encoding_key,
+            access_token_expires_in_hours,
+        )?;
+
+        // Rotate the refresh token
+        let (rotated_session, new_refresh_token) = self
+            .session_repository
+            .rotate(session_id, refresh_token_expires_in_hours)
+            .await
+            .map_err(|e| AuthError::InternalError(format!("Failed to rotate session: {e}")))?;
+
+        Ok((access_token, rotated_session, new_refresh_token))
     }
 
     async fn get_or_create_oauth_user(&self, oauth_info: OAuthUserInfo) -> Result<User, AuthError> {

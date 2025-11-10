@@ -1202,7 +1202,6 @@ impl ResponseServiceImpl {
                                     \n\nIMPORTANT PARAMETERS TO CONSIDER:\
                                     \n- Use 'freshness' for time-sensitive queries (news, recent events, current trends)\
                                     \n- Use 'country' for location-specific information\
-                                    \n- Use 'result_filter' to focus on specific content (news, videos, discussions)\
                                     \n- Use 'count' to limit results when user asks for specific number\
                                     \n- Use 'safesearch' when dealing with sensitive topics".to_string()
                                 ),
@@ -1253,10 +1252,6 @@ impl ResponseServiceImpl {
                                         "spellcheck": {
                                             "type": "boolean",
                                             "description": "Enable spellcheck on query (default: true)"
-                                        },
-                                        "result_filter": {
-                                            "type": "string",
-                                            "description": "Comma-delimited result types: 'news' (for news/updates), 'videos' (for tutorials/demos), 'discussions' (for community opinions/Q&A), 'faq' (for how-to questions). Use to focus on most relevant content type."
                                         },
                                         "units": {
                                             "type": "string",
@@ -1523,11 +1518,6 @@ impl ResponseServiceImpl {
                         if let Some(spellcheck) = params.get("spellcheck").and_then(|v| v.as_bool())
                         {
                             search_params.spellcheck = Some(spellcheck);
-                        }
-                        if let Some(result_filter) =
-                            params.get("result_filter").and_then(|v| v.as_str())
-                        {
-                            search_params.result_filter = Some(result_filter.to_string());
                         }
                         if let Some(units) = params.get("units").and_then(|v| v.as_str()) {
                             search_params.units = Some(units.to_string());

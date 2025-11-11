@@ -41,7 +41,7 @@ pub struct CreateResponseRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation: Option<ConversationReference>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_response_id: Option<String>,
+    pub previous_response_id: Option<String>, // Parent response ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -250,7 +250,9 @@ pub struct ResponseObject {
     pub output: Vec<ResponseOutputItem>,
     pub parallel_tool_calls: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_response_id: Option<String>,
+    pub previous_response_id: Option<String>, // Parent response ID
+    #[serde(default)]
+    pub child_response_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

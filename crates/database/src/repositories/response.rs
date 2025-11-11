@@ -53,7 +53,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             None
         };
 
-        // Extract previous_response_id if present
+        // Extract previous_response_id if present (this is the parent response)
         let previous_response_uuid = if let Some(prev_id) = &request.previous_response_id {
             let uuid_str = prev_id.strip_prefix("resp_").unwrap_or(prev_id);
             Some(Uuid::parse_str(uuid_str).context("Invalid previous response ID")?)
@@ -71,6 +71,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             "total_tokens": 0
         });
         let metadata_json = request.metadata.unwrap_or_else(|| serde_json::json!({}));
+        let child_response_ids_json = serde_json::json!([]);
 
         // Insert response into database (without input_messages or output_message)
         // Messages are stored separately as response_items
@@ -79,9 +80,10 @@ impl ResponseRepositoryTrait for PgResponseRepository {
                 r#"
                 INSERT INTO responses (
                     id, workspace_id, api_key_id, model, status, instructions, conversation_id, 
-                    previous_response_id, usage, metadata, created_at, updated_at
+                    previous_response_id, child_response_ids, usage, metadata, 
+                    created_at, updated_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 "#,
                 &[
                     &response_uuid,
@@ -92,6 +94,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
                     &request.instructions,
                     &conversation_uuid,
                     &previous_response_uuid,
+                    &child_response_ids_json,
                     &usage_json,
                     &metadata_json,
                     &now,
@@ -100,6 +103,27 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             )
             .await
             .context("Failed to insert response")?;
+
+        // If previous_response_id is present, update the parent's child_response_ids array
+        if let Some(parent_uuid) = previous_response_uuid {
+            client
+                .execute(
+                    r#"
+                    UPDATE responses
+                    SET child_response_ids = child_response_ids || $1::jsonb,
+                        updated_at = $2
+                    WHERE id = $3 AND workspace_id = $4
+                    "#,
+                    &[
+                        &serde_json::json!([response_uuid.to_string()]),
+                        &now,
+                        &parent_uuid,
+                        &workspace_id.0,
+                    ],
+                )
+                .await
+                .context("Failed to update parent's child_response_ids")?;
+        }
 
         // Build conversation reference if conversation_id is present
         let conversation_ref = conversation_uuid.map(|uuid| ConversationResponseReference {
@@ -122,7 +146,8 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             model: request.model,
             output: vec![],
             parallel_tool_calls: request.parallel_tool_calls.unwrap_or(false),
-            previous_response_id: request.previous_response_id,
+            previous_response_id: request.previous_response_id.clone(),
+            child_response_ids: vec![],
             prompt_cache_key: request.prompt_cache_key,
             prompt_cache_retention: None,
             reasoning: None,
@@ -183,8 +208,8 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             .query_opt(
                 r#"
                 SELECT id, workspace_id, api_key_id, model, status, instructions, 
-                       conversation_id, previous_response_id, usage, metadata, 
-                       created_at, updated_at
+                       conversation_id, previous_response_id, child_response_ids, 
+                       usage, metadata, created_at, updated_at
                 FROM responses
                 WHERE id = $1 AND workspace_id = $2
                 "#,
@@ -214,6 +239,18 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         let model: String = row.get("model");
         let instructions: Option<String> = row.get("instructions");
         let previous_response_uuid: Option<Uuid> = row.get("previous_response_id");
+        let child_response_ids_json: Option<serde_json::Value> = row.get("child_response_ids");
+
+        // Parse child_response_ids from JSON array to Vec<String>
+        let child_response_ids = if let Some(child_ids_val) = child_response_ids_json {
+            serde_json::from_value::<Vec<String>>(child_ids_val)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|uuid_str| format!("resp_{}", uuid_str.replace("-", "")))
+                .collect()
+        } else {
+            vec![]
+        };
 
         // Build conversation reference if conversation_id is present
         let conversation_ref = conversation_uuid.map(|uuid| ConversationResponseReference {
@@ -245,6 +282,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             parallel_tool_calls: false,
             previous_response_id: previous_response_uuid
                 .map(|uuid| format!("resp_{}", uuid.simple())),
+            child_response_ids,
             prompt_cache_key: None,
             prompt_cache_retention: None,
             reasoning: None,
@@ -318,8 +356,8 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             .query_one(
                 r#"
                 SELECT id, workspace_id, api_key_id, model, status, instructions, 
-                       conversation_id, previous_response_id, usage, metadata, 
-                       created_at, updated_at
+                       conversation_id, previous_response_id, child_response_ids, 
+                       usage, metadata, created_at, updated_at
                 FROM responses
                 WHERE id = $1 AND workspace_id = $2
                 "#,
@@ -329,7 +367,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             .context("Failed to fetch updated response")?;
 
         // Parse usage from JSONB
-        let usage_value: Option<serde_json::Value> = row.get(8);
+        let usage_value: Option<serde_json::Value> = row.get(9);
         let usage_obj = if let Some(usage_json) = usage_value {
             serde_json::from_value(usage_json.clone()).unwrap_or_else(|_| {
                 // Fallback to default if deserialization fails
@@ -345,8 +383,20 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             id: format!("conv_{}", uuid.simple()),
         });
 
+        // Parse child_response_ids
+        let child_response_ids_json: Option<serde_json::Value> = row.get(8);
+        let child_response_ids = if let Some(child_ids_val) = child_response_ids_json {
+            serde_json::from_value::<Vec<String>>(child_ids_val)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|uuid_str| format!("resp_{}", uuid_str.replace("-", "")))
+                .collect()
+        } else {
+            vec![]
+        };
+
         // Parse metadata
-        let metadata_value: Option<serde_json::Value> = row.get(9);
+        let metadata_value: Option<serde_json::Value> = row.get(10);
         let metadata = metadata_value;
 
         // Parse status
@@ -362,7 +412,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         let response_obj = ResponseObject {
             id: format!("resp_{}", response_uuid.simple()),
             object: "response".to_string(),
-            created_at: row.get::<_, chrono::DateTime<Utc>>(10).timestamp(),
+            created_at: row.get::<_, chrono::DateTime<Utc>>(11).timestamp(),
             status: response_status,
             background: false, // Not stored in DB, default value
             conversation: conversation_ref,
@@ -377,6 +427,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             previous_response_id: row
                 .get::<_, Option<Uuid>>(7)
                 .map(|uuid| format!("resp_{}", uuid.simple())),
+            child_response_ids,
             prompt_cache_key: None, // Not stored in DB
             prompt_cache_retention: None,
             reasoning: None,

@@ -345,8 +345,9 @@ pub struct Response {
     pub status: ResponseStatus,
     pub instructions: Option<String>,
     pub conversation_id: Option<Uuid>,
-    pub previous_response_id: Option<Uuid>,
-    pub usage: Option<serde_json::Value>, // JSONB storing token usage
+    pub previous_response_id: Option<Uuid>, // Parent response (previous in thread)
+    pub child_response_ids: Option<serde_json::Value>, // JSONB array of child response UUIDs
+    pub usage: Option<serde_json::Value>,   // JSONB storing token usage
     pub metadata: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

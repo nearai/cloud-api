@@ -37,6 +37,8 @@ rmcp = { version = "0.6", features = [
 hex = "0.4"
 dstack-sdk = "0.1.2"
 dstack-sdk-types = "0.1.2"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"] }
 regex = "1.11"
 # AWS S3 for file storage

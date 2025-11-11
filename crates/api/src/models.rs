@@ -384,6 +384,8 @@ pub struct CreateResponseRequest {
     pub safety_identifier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing_algo: Option<String>,
 }
 
 /// Input for a response - can be text, array of items, or single item

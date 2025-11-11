@@ -449,6 +449,7 @@ pub fn build_app_with_config(
 
     let response_routes = build_response_routes(
         domain_services.response_service,
+        domain_services.attestation_service.clone(),
         &auth_components.auth_state_middleware,
     );
 
@@ -596,8 +597,14 @@ pub fn build_completion_routes(
 /// Build response routes with auth
 pub fn build_response_routes(
     response_service: Arc<services::ResponseService>,
+    attestation_service: Arc<dyn services::attestation::ports::AttestationServiceTrait>,
     auth_state_middleware: &AuthState,
 ) -> Router {
+    let route_state = responses::ResponseRouteState {
+        response_service: response_service.clone(),
+        attestation_service,
+    };
+
     Router::new()
         .route("/responses", post(responses::create_response))
         .route("/responses/{response_id}", get(responses::get_response))
@@ -613,7 +620,7 @@ pub fn build_response_routes(
             "/responses/{response_id}/input_items",
             get(responses::list_input_items),
         )
-        .with_state(response_service)
+        .with_state(route_state)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,

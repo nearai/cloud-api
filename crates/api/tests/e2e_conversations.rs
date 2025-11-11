@@ -832,7 +832,7 @@ async fn test_conversation_items_pagination() {
 }
 
 #[tokio::test]
-async fn test_response_parent_child_relationships() {
+async fn test_response_previous_next_relationships() {
     let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -854,18 +854,18 @@ async fn test_response_parent_child_relationships() {
 
     println!("Created parent response: {}", parent_response.id);
 
-    // Verify parent response has no children initially
+    // Verify parent response has no next responses initially
     assert!(
-        parent_response.child_response_ids.is_empty(),
-        "Parent response should have no children initially"
+        parent_response.next_response_ids.is_empty(),
+        "Parent response should have no next responses initially"
     );
     assert!(
         parent_response.previous_response_id.is_none(),
         "Parent response should have no previous_response_id"
     );
 
-    // Create first child response (conversation inherited from parent)
-    let child1_response = server
+    // Create first follow-up response (conversation inherited from parent)
+    let response1 = server
         .post("/v1/responses")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
@@ -878,23 +878,23 @@ async fn test_response_parent_child_relationships() {
         }))
         .await;
 
-    assert_eq!(child1_response.status_code(), 200);
-    let child1_response = child1_response.json::<api::models::ResponseObject>();
-    println!("Created child1 response: {}", child1_response.id);
+    assert_eq!(response1.status_code(), 200);
+    let response1 = response1.json::<api::models::ResponseObject>();
+    println!("Created response1: {}", response1.id);
 
-    // Verify child1 has parent reference
+    // Verify response1 has parent reference
     assert_eq!(
-        child1_response.previous_response_id,
+        response1.previous_response_id,
         Some(parent_response.id.clone()),
-        "Child1 should reference parent as previous_response_id"
+        "Response1 should reference parent as previous_response_id"
     );
     assert!(
-        child1_response.child_response_ids.is_empty(),
-        "Child1 should have no children initially"
+        response1.next_response_ids.is_empty(),
+        "Response1 should have no next responses initially"
     );
 
-    // Create second child response from the same parent (conversation inherited)
-    let child2_response = server
+    // Create second follow-up response from the same parent (conversation inherited)
+    let response2 = server
         .post("/v1/responses")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
@@ -907,19 +907,19 @@ async fn test_response_parent_child_relationships() {
         }))
         .await;
 
-    assert_eq!(child2_response.status_code(), 200);
-    let child2_response = child2_response.json::<api::models::ResponseObject>();
-    println!("Created child2 response: {}", child2_response.id);
+    assert_eq!(response2.status_code(), 200);
+    let response2 = response2.json::<api::models::ResponseObject>();
+    println!("Created response2: {}", response2.id);
 
-    // Verify child2 has parent reference
+    // Verify response2 has parent reference
     assert_eq!(
-        child2_response.previous_response_id,
+        response2.previous_response_id,
         Some(parent_response.id.clone()),
-        "Child2 should reference parent as previous_response_id"
+        "Response2 should reference parent as previous_response_id"
     );
 
-    // Create grandchild response (child of child1, conversation inherited)
-    let grandchild_response = server
+    // Create nested response (follows 1, conversation inherited)
+    let nested_response = server
         .post("/v1/responses")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
@@ -928,46 +928,46 @@ async fn test_response_parent_child_relationships() {
             "max_output_tokens": 100,
             "stream": false,
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-            "previous_response_id": child1_response.id
+            "previous_response_id": response1.id
         }))
         .await;
 
-    assert_eq!(grandchild_response.status_code(), 200);
-    let grandchild_response = grandchild_response.json::<api::models::ResponseObject>();
-    println!("Created grandchild response: {}", grandchild_response.id);
+    assert_eq!(nested_response.status_code(), 200);
+    let nested_response = nested_response.json::<api::models::ResponseObject>();
+    println!("Created nested response: {}", nested_response.id);
 
-    // Verify grandchild has child1 as parent
+    // Verify nested response has response1 as previous
     assert_eq!(
-        grandchild_response.previous_response_id,
-        Some(child1_response.id.clone()),
-        "Grandchild should reference child1 as previous_response_id"
+        nested_response.previous_response_id,
+        Some(response1.id.clone()),
+        "Nested response should reference response1 as previous_response_id"
     );
 
-    // Now fetch the parent response again to verify child_response_ids was updated
+    // Now fetch the parent response again to verify next_response_ids was updated
     // Note: We need to implement a GET endpoint to verify this properly
     // For now, we'll verify through the database by creating a new response and checking
 
-    println!("✅ Response parent-child relationships working correctly");
+    println!("✅ Response previous-next relationships working correctly");
     println!("   - Parent: {}", parent_response.id);
     println!(
-        "   - Child1: {} (parent: {})",
-        child1_response.id,
-        child1_response.previous_response_id.as_ref().unwrap()
+        "   - Response1: {} (previous: {})",
+        response1.id,
+        response1.previous_response_id.as_ref().unwrap()
     );
     println!(
-        "   - Child2: {} (parent: {})",
-        child2_response.id,
-        child2_response.previous_response_id.as_ref().unwrap()
+        "   - Response2: {} (previous: {})",
+        response2.id,
+        response2.previous_response_id.as_ref().unwrap()
     );
     println!(
-        "   - Grandchild: {} (parent: {})",
-        grandchild_response.id,
-        grandchild_response.previous_response_id.as_ref().unwrap()
+        "   - Nested: {} (previous: {})",
+        nested_response.id,
+        nested_response.previous_response_id.as_ref().unwrap()
     );
 }
 
 #[tokio::test]
-async fn test_response_parent_child_relationships_streaming() {
+async fn test_response_previous_next_relationships_streaming() {
     let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -992,13 +992,13 @@ async fn test_response_parent_child_relationships_streaming() {
         parent_response.id
     );
 
-    // Verify parent response has no children initially
+    // Verify parent response has no next responses initially
     assert!(
-        parent_response.child_response_ids.is_empty(),
-        "Parent response should have no children initially"
+        parent_response.next_response_ids.is_empty(),
+        "Parent response should have no next responses initially"
     );
 
-    // Create child response with streaming (conversation inherited from parent)
+    // Create follow-up response with streaming (conversation inherited from parent)
     let response = server
         .post("/v1/responses")
         .add_header("Authorization", format!("Bearer {api_key}"))
@@ -1019,7 +1019,7 @@ async fn test_response_parent_child_relationships_streaming() {
 
     // Parse streaming response
     let response_text = response.text();
-    let mut child_response: Option<api::models::ResponseObject> = None;
+    let mut next_response: Option<api::models::ResponseObject> = None;
 
     for line_chunk in response_text.split("\n\n") {
         if line_chunk.trim().is_empty() {
@@ -1040,7 +1040,7 @@ async fn test_response_parent_child_relationships_streaming() {
         if !event_data.is_empty() && event_type == "response.completed" {
             if let Ok(event_json) = serde_json::from_str::<serde_json::Value>(event_data) {
                 if let Some(response_obj) = event_json.get("response") {
-                    child_response = Some(
+                    next_response = Some(
                         serde_json::from_value::<api::models::ResponseObject>(response_obj.clone())
                             .expect("Failed to parse response.completed event"),
                     );
@@ -1049,25 +1049,28 @@ async fn test_response_parent_child_relationships_streaming() {
         }
     }
 
-    let child_response = child_response.expect("Should have received completed response");
-    println!("Created child response (streaming): {}", child_response.id);
+    let follow_up_response = next_response.expect("Should have received completed response");
+    println!(
+        "Created follow-up response (streaming): {}",
+        follow_up_response.id
+    );
 
-    // Verify child has parent reference
+    // Verify follow-up has parent reference
     assert_eq!(
-        child_response.previous_response_id,
+        follow_up_response.previous_response_id,
         Some(parent_response.id.clone()),
-        "Child should reference parent as previous_response_id"
+        "Follow-up should reference parent as previous_response_id"
     );
     assert!(
-        child_response.child_response_ids.is_empty(),
-        "Child should have no children initially"
+        follow_up_response.next_response_ids.is_empty(),
+        "Follow-up should have no next responses initially"
     );
 
-    println!("✅ Response parent-child relationships working correctly with streaming");
+    println!("✅ Response previous-next relationships working correctly with streaming");
     println!("   - Parent: {}", parent_response.id);
     println!(
-        "   - Child: {} (parent: {})",
-        child_response.id,
-        child_response.previous_response_id.as_ref().unwrap()
+        "   - Follow-up: {} (previous: {})",
+        follow_up_response.id,
+        follow_up_response.previous_response_id.as_ref().unwrap()
     );
 }

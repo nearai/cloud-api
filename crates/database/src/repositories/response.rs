@@ -71,7 +71,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             "total_tokens": 0
         });
         let metadata_json = request.metadata.unwrap_or_else(|| serde_json::json!({}));
-        let child_response_ids_json = serde_json::json!([]);
+        let next_response_ids_json = serde_json::json!([]);
 
         // Insert response into database (without input_messages or output_message)
         // Messages are stored separately as response_items
@@ -80,7 +80,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
                 r#"
                 INSERT INTO responses (
                     id, workspace_id, api_key_id, model, status, instructions, conversation_id, 
-                    previous_response_id, child_response_ids, usage, metadata, 
+                    previous_response_id, next_response_ids, usage, metadata, 
                     created_at, updated_at
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
@@ -94,7 +94,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
                     &request.instructions,
                     &conversation_uuid,
                     &previous_response_uuid,
-                    &child_response_ids_json,
+                    &next_response_ids_json,
                     &usage_json,
                     &metadata_json,
                     &now,
@@ -104,13 +104,13 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             .await
             .context("Failed to insert response")?;
 
-        // If previous_response_id is present, update the parent's child_response_ids array
+        // If previous_response_id is present, update the previous response's next_response_ids array
         if let Some(parent_uuid) = previous_response_uuid {
             client
                 .execute(
                     r#"
                     UPDATE responses
-                    SET child_response_ids = child_response_ids || $1::jsonb,
+                    SET next_response_ids = next_response_ids || $1::jsonb,
                         updated_at = $2
                     WHERE id = $3 AND workspace_id = $4
                     "#,
@@ -122,7 +122,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
                     ],
                 )
                 .await
-                .context("Failed to update parent's child_response_ids")?;
+                .context("Failed to update previous response's next_response_ids")?;
         }
 
         // Build conversation reference if conversation_id is present
@@ -147,7 +147,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             output: vec![],
             parallel_tool_calls: request.parallel_tool_calls.unwrap_or(false),
             previous_response_id: request.previous_response_id.clone(),
-            child_response_ids: vec![],
+            next_response_ids: vec![],
             prompt_cache_key: request.prompt_cache_key,
             prompt_cache_retention: None,
             reasoning: None,
@@ -208,7 +208,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             .query_opt(
                 r#"
                 SELECT id, workspace_id, api_key_id, model, status, instructions, 
-                       conversation_id, previous_response_id, child_response_ids, 
+                       conversation_id, previous_response_id, next_response_ids, 
                        usage, metadata, created_at, updated_at
                 FROM responses
                 WHERE id = $1 AND workspace_id = $2
@@ -239,11 +239,11 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         let model: String = row.get("model");
         let instructions: Option<String> = row.get("instructions");
         let previous_response_uuid: Option<Uuid> = row.get("previous_response_id");
-        let child_response_ids_json: Option<serde_json::Value> = row.get("child_response_ids");
+        let next_response_ids_json: Option<serde_json::Value> = row.get("next_response_ids");
 
-        // Parse child_response_ids from JSON array to Vec<String>
-        let child_response_ids = if let Some(child_ids_val) = child_response_ids_json {
-            serde_json::from_value::<Vec<String>>(child_ids_val)
+        // Parse next_response_ids from JSON array to Vec<String>
+        let next_response_ids = if let Some(next_ids_val) = next_response_ids_json {
+            serde_json::from_value::<Vec<String>>(next_ids_val)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|uuid_str| format!("resp_{}", uuid_str.replace("-", "")))
@@ -282,7 +282,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             parallel_tool_calls: false,
             previous_response_id: previous_response_uuid
                 .map(|uuid| format!("resp_{}", uuid.simple())),
-            child_response_ids,
+            next_response_ids,
             prompt_cache_key: None,
             prompt_cache_retention: None,
             reasoning: None,
@@ -356,7 +356,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             .query_one(
                 r#"
                 SELECT id, workspace_id, api_key_id, model, status, instructions, 
-                       conversation_id, previous_response_id, child_response_ids, 
+                       conversation_id, previous_response_id, next_response_ids, 
                        usage, metadata, created_at, updated_at
                 FROM responses
                 WHERE id = $1 AND workspace_id = $2
@@ -383,10 +383,10 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             id: format!("conv_{}", uuid.simple()),
         });
 
-        // Parse child_response_ids
-        let child_response_ids_json: Option<serde_json::Value> = row.get(8);
-        let child_response_ids = if let Some(child_ids_val) = child_response_ids_json {
-            serde_json::from_value::<Vec<String>>(child_ids_val)
+        // Parse next_response_ids
+        let next_response_ids_json: Option<serde_json::Value> = row.get(8);
+        let next_response_ids = if let Some(next_ids_val) = next_response_ids_json {
+            serde_json::from_value::<Vec<String>>(next_ids_val)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|uuid_str| format!("resp_{}", uuid_str.replace("-", "")))
@@ -427,7 +427,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             previous_response_id: row
                 .get::<_, Option<Uuid>>(7)
                 .map(|uuid| format!("resp_{}", uuid.simple())),
-            child_response_ids,
+            next_response_ids,
             prompt_cache_key: None, // Not stored in DB
             prompt_cache_retention: None,
             reasoning: None,

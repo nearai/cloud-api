@@ -327,7 +327,7 @@ pub async fn create_response(
                         }],
                         parallel_tool_calls: request.parallel_tool_calls.unwrap_or(false),
                         previous_response_id: request.previous_response_id.clone(),
-                        child_response_ids: vec![],
+                        next_response_ids: vec![],
                         prompt_cache_key: request.prompt_cache_key,
                         prompt_cache_retention: None,
                         reasoning: None,

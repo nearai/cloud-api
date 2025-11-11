@@ -329,11 +329,13 @@ pub enum ResponseOutputItem {
     #[serde(rename = "message")]
     Message {
         id: String,
+        #[serde(default)]
         response_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         previous_response_id: Option<String>,
         #[serde(default)]
         next_response_ids: Vec<String>,
+        #[serde(default)]
         created_at: i64,
         status: ResponseItemStatus,
         role: String,
@@ -342,11 +344,13 @@ pub enum ResponseOutputItem {
     #[serde(rename = "tool_call")]
     ToolCall {
         id: String,
+        #[serde(default)]
         response_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         previous_response_id: Option<String>,
         #[serde(default)]
         next_response_ids: Vec<String>,
+        #[serde(default)]
         created_at: i64,
         status: ResponseItemStatus,
         tool_type: String,
@@ -355,11 +359,13 @@ pub enum ResponseOutputItem {
     #[serde(rename = "web_search_call")]
     WebSearchCall {
         id: String,
+        #[serde(default)]
         response_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         previous_response_id: Option<String>,
         #[serde(default)]
         next_response_ids: Vec<String>,
+        #[serde(default)]
         created_at: i64,
         status: ResponseItemStatus,
         action: WebSearchAction,
@@ -367,11 +373,13 @@ pub enum ResponseOutputItem {
     #[serde(rename = "reasoning")]
     Reasoning {
         id: String,
+        #[serde(default)]
         response_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         previous_response_id: Option<String>,
         #[serde(default)]
         next_response_ids: Vec<String>,
+        #[serde(default)]
         created_at: i64,
         status: ResponseItemStatus,
         summary: String,
@@ -726,6 +734,135 @@ impl Usage {
                 reasoning_tokens: 0,
             }),
             total_tokens: input_tokens + output_tokens,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_deserialize_old_response_item_message_without_new_fields() {
+        // Simulate old JSON data that doesn't have response_id, created_at fields
+        // This represents data stored in the database before the new fields were added
+        let old_json = json!({
+            "type": "message",
+            "id": "msg_123",
+            "status": "completed",
+            "role": "assistant",
+            "content": []
+        });
+
+        // This should not panic and should deserialize with default values
+        let result: Result<ResponseOutputItem, _> = serde_json::from_value(old_json);
+
+        assert!(
+            result.is_ok(),
+            "Failed to deserialize old format: {:?}",
+            result.err()
+        );
+
+        let item = result.unwrap();
+        match item {
+            ResponseOutputItem::Message {
+                response_id,
+                created_at,
+                next_response_ids,
+                previous_response_id,
+                ..
+            } => {
+                assert_eq!(
+                    response_id, "",
+                    "response_id should default to empty string"
+                );
+                assert_eq!(created_at, 0, "created_at should default to 0");
+                assert_eq!(
+                    next_response_ids.len(),
+                    0,
+                    "next_response_ids should default to empty vec"
+                );
+                assert_eq!(
+                    previous_response_id, None,
+                    "previous_response_id should be None"
+                );
+            }
+            _ => panic!("Expected Message variant"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_old_response_item_tool_call_without_new_fields() {
+        let old_json = json!({
+            "type": "tool_call",
+            "id": "tool_456",
+            "status": "completed",
+            "tool_type": "function",
+            "function": {
+                "name": "test_function",
+                "arguments": "{}"
+            }
+        });
+
+        let result: Result<ResponseOutputItem, _> = serde_json::from_value(old_json);
+
+        assert!(
+            result.is_ok(),
+            "Failed to deserialize old tool_call format: {:?}",
+            result.err()
+        );
+
+        let item = result.unwrap();
+        match item {
+            ResponseOutputItem::ToolCall {
+                response_id,
+                created_at,
+                next_response_ids,
+                ..
+            } => {
+                assert_eq!(response_id, "");
+                assert_eq!(created_at, 0);
+                assert_eq!(next_response_ids.len(), 0);
+            }
+            _ => panic!("Expected ToolCall variant"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_response_item_with_new_fields() {
+        // Test that new format still works
+        let new_json = json!({
+            "type": "message",
+            "id": "msg_123",
+            "response_id": "resp_abc",
+            "previous_response_id": "resp_xyz",
+            "next_response_ids": ["resp_def", "resp_ghi"],
+            "created_at": 1234567890,
+            "status": "completed",
+            "role": "assistant",
+            "content": []
+        });
+
+        let result: Result<ResponseOutputItem, _> = serde_json::from_value(new_json);
+
+        assert!(result.is_ok());
+
+        let item = result.unwrap();
+        match item {
+            ResponseOutputItem::Message {
+                response_id,
+                created_at,
+                next_response_ids,
+                previous_response_id,
+                ..
+            } => {
+                assert_eq!(response_id, "resp_abc");
+                assert_eq!(created_at, 1234567890);
+                assert_eq!(next_response_ids, vec!["resp_def", "resp_ghi"]);
+                assert_eq!(previous_response_id, Some("resp_xyz".to_string()));
+            }
+            _ => panic!("Expected Message variant"),
         }
     }
 }

@@ -197,13 +197,11 @@ pub async fn create_response(
                             // Now we can safely compute the hash and store the signature
                             let bytes_accumulated = accumulated_inner.lock().await.clone();
                             let response_hash = compute_sha256(&bytes_accumulated);
-                            
                             if let Some(rid) = response_id_inner.lock().await.as_ref() {
                                 let rid = rid.clone();
                                 let req_hash = request_hash_inner.clone();
                                 let attest = attestation_inner.clone();
                                 let algo = signing_algo_inner.clone();
-                                
                                 tracing::debug!(
                                     "Storing signature for response_id: {}, request_hash: {}, response_hash: {}, signing_algo: {:?}",
                                     rid, req_hash, response_hash, algo

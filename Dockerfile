@@ -73,11 +73,9 @@ RUN --mount=type=bind,source=pinned-packages-runtime.txt,target=/tmp/pinned-pack
         && rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
 
 # Create app user
-RUN useradd -m -u 1000 app
-# Normalize /etc/shadow file last password change date to 0
-RUN awk -F: 'BEGIN{OFS=FS} {$3=0}1' /etc/shadow > /etc/shadow.fixed \
-    && install -m 600 /etc/shadow.fixed /etc/shadow \
-    && rm /etc/shadow.fixed
+# Normalize /etc/shadow file last password change date to 0 for app user
+RUN useradd -m -u 1000 app \
+    && sed -i -r 's/^(app:[^:]*:)[0-9]+/\10/' /etc/shadow
 
 # Create app directory
 WORKDIR /app

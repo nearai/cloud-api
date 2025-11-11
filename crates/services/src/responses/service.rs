@@ -274,7 +274,7 @@ impl ResponseServiceImpl {
             id: message_item_id.to_string(),
             response_id: ctx.response_id_str.clone(),
             previous_response_id: ctx.previous_response_id.clone(),
-            next_response_ids: vec![], // next_response_ids are populated later as responses are created
+            next_response_ids: vec![], // next_response_ids will be populated when child responses are created
             created_at: ctx.created_at,
             status: models::ResponseItemStatus::InProgress,
             role: "assistant".to_string(),
@@ -328,7 +328,7 @@ impl ResponseServiceImpl {
             id: message_item_id.to_string(),
             response_id: ctx.response_id_str.clone(),
             previous_response_id: ctx.previous_response_id.clone(),
-            next_response_ids: vec![], // next_response_ids are populated later as responses are created
+            next_response_ids: vec![], // next_response_ids will be populated when child responses are created
             created_at: ctx.created_at,
             status: models::ResponseItemStatus::Completed,
             role: "assistant".to_string(),
@@ -853,7 +853,7 @@ impl ResponseServiceImpl {
             id: tool_call_id.to_string(),
             response_id: ctx.response_id_str.clone(),
             previous_response_id: ctx.previous_response_id.clone(),
-            next_response_ids: vec![], // next_response_ids are populated later as responses are created
+            next_response_ids: vec![], // next_response_ids will be populated when child responses are created
             created_at: ctx.created_at,
             status: models::ResponseItemStatus::InProgress,
             action: models::WebSearchAction::Search {
@@ -906,7 +906,7 @@ impl ResponseServiceImpl {
             id: tool_call_id.to_string(),
             response_id: ctx.response_id_str.clone(),
             previous_response_id: ctx.previous_response_id.clone(),
-            next_response_ids: vec![], // next_response_ids are populated later as responses are created
+            next_response_ids: vec![], // next_response_ids will be populated when child responses are created
             created_at: ctx.created_at,
             status: models::ResponseItemStatus::Completed,
             action: models::WebSearchAction::Search {

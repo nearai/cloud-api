@@ -246,7 +246,11 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             serde_json::from_value::<Vec<String>>(next_ids_val)
                 .unwrap_or_default()
                 .into_iter()
-                .map(|uuid_str| format!("resp_{}", uuid_str.replace("-", "")))
+                .filter_map(|uuid_str| {
+                    Uuid::parse_str(&uuid_str)
+                        .ok()
+                        .map(|uuid| format!("resp_{}", uuid.simple()))
+                })
                 .collect()
         } else {
             vec![]
@@ -389,7 +393,11 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             serde_json::from_value::<Vec<String>>(next_ids_val)
                 .unwrap_or_default()
                 .into_iter()
-                .map(|uuid_str| format!("resp_{}", uuid_str.replace("-", "")))
+                .filter_map(|uuid_str| {
+                    Uuid::parse_str(&uuid_str)
+                        .ok()
+                        .map(|uuid| format!("resp_{}", uuid.simple()))
+                })
                 .collect()
         } else {
             vec![]

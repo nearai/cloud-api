@@ -291,8 +291,9 @@ pub async fn create_response(
                     // Fallback: Build response from collected data (for compatibility)
                     // Trim accumulated content to remove leading/trailing whitespace
                     let trimmed_content = content.trim().to_string();
+                    let resp_id = response_id.unwrap_or_else(|| format!("resp_{}", Uuid::new_v4()));
                     ResponseObject {
-                        id: response_id.unwrap_or_else(|| format!("resp_{}", Uuid::new_v4())),
+                        id: resp_id.clone(),
                         object: "response".to_string(),
                         created_at: chrono::Utc::now().timestamp(),
                         status,
@@ -317,6 +318,10 @@ pub async fn create_response(
                         model: request.model,
                         output: vec![ResponseOutputItem::Message {
                             id: format!("msg_{}", Uuid::new_v4()),
+                            response_id: resp_id.clone(),
+                            previous_response_id: request.previous_response_id.clone(),
+                            next_response_ids: vec![],
+                            created_at: chrono::Utc::now().timestamp(),
                             status: ResponseItemStatus::Completed,
                             role: "assistant".to_string(),
                             content: vec![ResponseOutputContent::OutputText {

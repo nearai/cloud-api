@@ -591,6 +591,10 @@ fn convert_input_item_to_response_item(
 
             Ok(services::responses::models::ResponseOutputItem::Message {
                 id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
+                response_id: String::new(), // Will be enriched by repository
+                previous_response_id: None, // Will be enriched by repository
+                next_response_ids: vec![],  // Will be enriched by repository
+                created_at: 0,              // Will be enriched by repository
                 status: services::responses::models::ResponseItemStatus::Completed,
                 role,
                 content: response_content,
@@ -607,6 +611,10 @@ fn convert_output_item_to_conversation_item(
     match item {
         ResponseOutputItem::Message {
             id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
             status,
             role,
             content,
@@ -645,6 +653,10 @@ fn convert_output_item_to_conversation_item(
 
             ConversationItem::Message {
                 id,
+                response_id,
+                previous_response_id,
+                next_response_ids,
+                created_at,
                 status: convert_response_item_status(status),
                 role,
                 content: conv_content,
@@ -653,11 +665,19 @@ fn convert_output_item_to_conversation_item(
         }
         ResponseOutputItem::ToolCall {
             id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
             status,
             tool_type,
             function,
         } => ConversationItem::ToolCall {
             id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
             status: convert_response_item_status(status),
             tool_type,
             function: ConversationItemFunction {
@@ -665,24 +685,42 @@ fn convert_output_item_to_conversation_item(
                 arguments: function.arguments,
             },
         },
-        ResponseOutputItem::WebSearchCall { id, status, action } => {
-            ConversationItem::WebSearchCall {
-                id,
-                status: convert_response_item_status(status),
-                action: match action {
-                    services::responses::models::WebSearchAction::Search { query } => {
-                        ConversationItemWebSearchAction::Search { query }
-                    }
-                },
-            }
-        }
+        ResponseOutputItem::WebSearchCall {
+            id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
+            status,
+            action,
+        } => ConversationItem::WebSearchCall {
+            id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
+            status: convert_response_item_status(status),
+            action: match action {
+                services::responses::models::WebSearchAction::Search { query } => {
+                    ConversationItemWebSearchAction::Search { query }
+                }
+            },
+        },
         ResponseOutputItem::Reasoning {
             id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
             status,
             summary,
             content,
         } => ConversationItem::Reasoning {
             id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
             status: convert_response_item_status(status),
             summary,
             content,

@@ -272,6 +272,10 @@ impl ResponseServiceImpl {
         // Event: response.output_item.added (for message)
         let item = models::ResponseOutputItem::Message {
             id: message_item_id.to_string(),
+            response_id: ctx.response_id_str.clone(),
+            previous_response_id: ctx.previous_response_id.clone(),
+            next_response_ids: vec![], // next_response_ids are populated later as responses are created
+            created_at: ctx.created_at,
             status: models::ResponseItemStatus::InProgress,
             role: "assistant".to_string(),
             content: vec![],
@@ -322,6 +326,10 @@ impl ResponseServiceImpl {
         // Event: response.output_item.done
         let item = models::ResponseOutputItem::Message {
             id: message_item_id.to_string(),
+            response_id: ctx.response_id_str.clone(),
+            previous_response_id: ctx.previous_response_id.clone(),
+            next_response_ids: vec![], // next_response_ids are populated later as responses are created
+            created_at: ctx.created_at,
             status: models::ResponseItemStatus::Completed,
             role: "assistant".to_string(),
             content: vec![models::ResponseOutputContent::OutputText {
@@ -501,6 +509,9 @@ impl ResponseServiceImpl {
             response_id.clone(),
             api_key_uuid,
             conversation_id.clone(),
+            initial_response.id.clone(),
+            initial_response.previous_response_id.clone(),
+            initial_response.created_at,
         );
         let mut emitter = crate::responses::service_helpers::EventEmitter::new(tx);
 
@@ -840,6 +851,10 @@ impl ResponseServiceImpl {
         // Event: response.output_item.added
         let item = models::ResponseOutputItem::WebSearchCall {
             id: tool_call_id.to_string(),
+            response_id: ctx.response_id_str.clone(),
+            previous_response_id: ctx.previous_response_id.clone(),
+            next_response_ids: vec![], // next_response_ids are populated later as responses are created
+            created_at: ctx.created_at,
             status: models::ResponseItemStatus::InProgress,
             action: models::WebSearchAction::Search {
                 query: tool_call.query.clone(),
@@ -889,6 +904,10 @@ impl ResponseServiceImpl {
         // Event: response.output_item.done
         let item = models::ResponseOutputItem::WebSearchCall {
             id: tool_call_id.to_string(),
+            response_id: ctx.response_id_str.clone(),
+            previous_response_id: ctx.previous_response_id.clone(),
+            next_response_ids: vec![], // next_response_ids are populated later as responses are created
+            created_at: ctx.created_at,
             status: models::ResponseItemStatus::Completed,
             action: models::WebSearchAction::Search {
                 query: tool_call.query.clone(),
@@ -959,6 +978,11 @@ impl ResponseServiceImpl {
                 let trimmed_text = text.trim();
                 let message_item = models::ResponseOutputItem::Message {
                     id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
+                    // These fields are placeholders - repository enriches them via JOIN when storing/retrieving
+                    response_id: String::new(),
+                    previous_response_id: None,
+                    next_response_ids: vec![],
+                    created_at: 0,
                     status: models::ResponseItemStatus::Completed,
                     role: "user".to_string(),
                     content: vec![models::ResponseOutputContent::OutputText {
@@ -1024,6 +1048,11 @@ impl ResponseServiceImpl {
 
                     let message_item = models::ResponseOutputItem::Message {
                         id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
+                        // These fields are placeholders - repository enriches them via JOIN when storing/retrieving
+                        response_id: String::new(),
+                        previous_response_id: None,
+                        next_response_ids: vec![],
+                        created_at: 0,
                         status: models::ResponseItemStatus::Completed,
                         role: input_item.role.clone(),
                         content,

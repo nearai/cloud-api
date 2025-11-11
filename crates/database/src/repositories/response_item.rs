@@ -54,10 +54,84 @@ impl PgResponseItemsRepository {
     }
 
     /// Helper method to convert database row to ResponseOutputItem
+    /// Enriches the item with response metadata (response_id, previous_response_id, next_response_ids, created_at)
     fn row_to_item(&self, row: tokio_postgres::Row) -> Result<ResponseOutputItem> {
         let item_json: serde_json::Value = row.try_get("item")?;
-        let item: ResponseOutputItem = serde_json::from_value(item_json)
+        let mut item: ResponseOutputItem = serde_json::from_value(item_json)
             .context("Failed to deserialize response item from database")?;
+
+        // Get response metadata from joined responses table
+        let response_id: Uuid = row.try_get("response_id")?;
+        let response_id_str = format!("resp_{response_id}");
+
+        let previous_response_id: Option<Uuid> = row.try_get("previous_response_id").ok().flatten();
+        let previous_response_id_str = previous_response_id.map(|id| format!("resp_{id}"));
+
+        let next_response_ids_json: Option<serde_json::Value> =
+            row.try_get("next_response_ids").ok().flatten();
+        let next_response_ids: Vec<String> = next_response_ids_json
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(|s| format!("resp_{s}")))
+            .collect();
+
+        let response_created_at: chrono::DateTime<chrono::Utc> =
+            row.try_get("response_created_at")?;
+        let created_at_timestamp = response_created_at.timestamp();
+
+        // Enrich the item with response metadata
+        match &mut item {
+            ResponseOutputItem::Message {
+                response_id: ref mut rid,
+                previous_response_id: ref mut prev,
+                next_response_ids: ref mut next,
+                created_at: ref mut ts,
+                ..
+            } => {
+                *rid = response_id_str;
+                *prev = previous_response_id_str;
+                *next = next_response_ids;
+                *ts = created_at_timestamp;
+            }
+            ResponseOutputItem::ToolCall {
+                response_id: ref mut rid,
+                previous_response_id: ref mut prev,
+                next_response_ids: ref mut next,
+                created_at: ref mut ts,
+                ..
+            } => {
+                *rid = response_id_str;
+                *prev = previous_response_id_str;
+                *next = next_response_ids;
+                *ts = created_at_timestamp;
+            }
+            ResponseOutputItem::WebSearchCall {
+                response_id: ref mut rid,
+                previous_response_id: ref mut prev,
+                next_response_ids: ref mut next,
+                created_at: ref mut ts,
+                ..
+            } => {
+                *rid = response_id_str;
+                *prev = previous_response_id_str;
+                *next = next_response_ids;
+                *ts = created_at_timestamp;
+            }
+            ResponseOutputItem::Reasoning {
+                response_id: ref mut rid,
+                previous_response_id: ref mut prev,
+                next_response_ids: ref mut next,
+                created_at: ref mut ts,
+                ..
+            } => {
+                *rid = response_id_str;
+                *prev = previous_response_id_str;
+                *next = next_response_ids;
+                *ts = created_at_timestamp;
+            }
+        }
+
         Ok(item)
     }
 
@@ -115,7 +189,11 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
                 r#"
                 INSERT INTO response_items (id, response_id, api_key_id, conversation_id, item, created_at, updated_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
-                RETURNING *
+                RETURNING 
+                    response_items.*,
+                    (SELECT previous_response_id FROM responses WHERE id = $2) as previous_response_id,
+                    (SELECT next_response_ids FROM responses WHERE id = $2) as next_response_ids,
+                    (SELECT created_at FROM responses WHERE id = $2) as response_created_at
                 "#,
                 &[
                     &id,
@@ -228,9 +306,15 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
         let rows = client
             .query(
                 r#"
-                SELECT * FROM response_items
-                WHERE response_id = $1
-                ORDER BY created_at ASC
+                SELECT 
+                    ri.*,
+                    r.previous_response_id,
+                    r.next_response_ids,
+                    r.created_at as response_created_at
+                FROM response_items ri
+                JOIN responses r ON ri.response_id = r.id
+                WHERE ri.response_id = $1
+                ORDER BY ri.created_at ASC
                 "#,
                 &[&response_id.0],
             )
@@ -251,9 +335,15 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
         let rows = client
             .query(
                 r#"
-                SELECT * FROM response_items
-                WHERE api_key_id = $1
-                ORDER BY created_at DESC
+                SELECT 
+                    ri.*,
+                    r.previous_response_id,
+                    r.next_response_ids,
+                    r.created_at as response_created_at
+                FROM response_items ri
+                JOIN responses r ON ri.response_id = r.id
+                WHERE ri.api_key_id = $1
+                ORDER BY ri.created_at DESC
                 "#,
                 &[&api_key_id],
             )
@@ -287,12 +377,18 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
             client
                 .query(
                     r#"
-                    SELECT * FROM response_items
-                    WHERE conversation_id = $1
-                      AND (created_at, id) > (
+                    SELECT 
+                        ri.*,
+                        r.previous_response_id,
+                        r.next_response_ids,
+                        r.created_at as response_created_at
+                    FROM response_items ri
+                    JOIN responses r ON ri.response_id = r.id
+                    WHERE ri.conversation_id = $1
+                      AND (ri.created_at, ri.id) > (
                           SELECT created_at, id FROM response_items WHERE id = $2
                       )
-                    ORDER BY created_at ASC, id ASC
+                    ORDER BY ri.created_at ASC, ri.id ASC
                     LIMIT $3
                     "#,
                     &[&conversation_id.0, &after_uuid, &limit],
@@ -304,9 +400,15 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
             client
                 .query(
                     r#"
-                    SELECT * FROM response_items
-                    WHERE conversation_id = $1
-                    ORDER BY created_at ASC, id ASC
+                    SELECT 
+                        ri.*,
+                        r.previous_response_id,
+                        r.next_response_ids,
+                        r.created_at as response_created_at
+                    FROM response_items ri
+                    JOIN responses r ON ri.response_id = r.id
+                    WHERE ri.conversation_id = $1
+                    ORDER BY ri.created_at ASC, ri.id ASC
                     LIMIT $2
                     "#,
                     &[&conversation_id.0, &limit],

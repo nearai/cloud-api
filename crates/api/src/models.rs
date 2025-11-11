@@ -795,6 +795,12 @@ pub enum ConversationItem {
     #[serde(rename = "message")]
     Message {
         id: String,
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        created_at: i64,
         status: ResponseItemStatus,
         role: String,
         content: Vec<ConversationContentPart>,
@@ -804,6 +810,12 @@ pub enum ConversationItem {
     #[serde(rename = "tool_call")]
     ToolCall {
         id: String,
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        created_at: i64,
         status: ResponseItemStatus,
         tool_type: String,
         function: ConversationItemFunction,
@@ -811,12 +823,24 @@ pub enum ConversationItem {
     #[serde(rename = "web_search_call")]
     WebSearchCall {
         id: String,
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        created_at: i64,
         status: ResponseItemStatus,
         action: ConversationItemWebSearchAction,
     },
     #[serde(rename = "reasoning")]
     Reasoning {
         id: String,
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        created_at: i64,
         status: ResponseItemStatus,
         summary: String,
         content: String,

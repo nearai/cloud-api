@@ -1074,3 +1074,112 @@ async fn test_response_previous_next_relationships_streaming() {
         follow_up_response.previous_response_id.as_ref().unwrap()
     );
 }
+
+#[tokio::test]
+async fn test_conversation_items_include_response_metadata() {
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Create a conversation
+    let conversation = create_conversation(&server, api_key.clone()).await;
+
+    // Create parent response
+    let parent_response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "input": "What is Rust?",
+            "temperature": 0.7,
+            "max_output_tokens": 100,
+            "stream": false,
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "conversation": conversation.id
+        }))
+        .await;
+
+    assert_eq!(parent_response.status_code(), 200);
+    let parent_response = parent_response.json::<api::models::ResponseObject>();
+    println!("Created parent response: {}", parent_response.id);
+
+    // Create follow-up response
+    let follow_up_response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "input": "Tell me more about that.",
+            "temperature": 0.7,
+            "max_output_tokens": 100,
+            "stream": false,
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "previous_response_id": parent_response.id
+        }))
+        .await;
+
+    assert_eq!(follow_up_response.status_code(), 200);
+    let follow_up_response = follow_up_response.json::<api::models::ResponseObject>();
+    println!("Created follow-up response: {}", follow_up_response.id);
+
+    // List conversation items
+    let items_response = server
+        .get(format!("/v1/conversations/{}/items", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+
+    assert_eq!(items_response.status_code(), 200);
+    let items_list = items_response.json::<api::models::ConversationItemList>();
+
+    println!("Retrieved {} conversation items", items_list.data.len());
+
+    // Verify each item has the new metadata fields
+    for item in &items_list.data {
+        match item {
+            api::models::ConversationItem::Message {
+                id,
+                response_id,
+                previous_response_id,
+                next_response_ids,
+                created_at,
+                ..
+            } => {
+                println!("  Item {id}: response_id={response_id}, previous_response_id={previous_response_id:?}, next_response_ids={next_response_ids:?}, created_at={created_at}");
+
+                // Verify required fields are populated
+                assert!(!response_id.is_empty(), "response_id should not be empty");
+                assert!(*created_at > 0, "created_at should be a valid timestamp");
+
+                // If this item belongs to the follow-up response, verify it has the parent's ID
+                if response_id == &follow_up_response.id {
+                    assert_eq!(
+                        previous_response_id.as_ref(),
+                        Some(&parent_response.id),
+                        "Follow-up response item should have parent's ID in previous_response_id"
+                    );
+                }
+            }
+            _ => {
+                // For non-message items, just verify they have the metadata
+                // (could add similar checks for ToolCall, WebSearchCall, Reasoning)
+            }
+        }
+    }
+
+    // Verify items are sorted by created_at (ascending order)
+    let mut prev_timestamp = 0i64;
+    for item in &items_list.data {
+        let current_timestamp = match item {
+            api::models::ConversationItem::Message { created_at, .. } => *created_at,
+            api::models::ConversationItem::ToolCall { created_at, .. } => *created_at,
+            api::models::ConversationItem::WebSearchCall { created_at, .. } => *created_at,
+            api::models::ConversationItem::Reasoning { created_at, .. } => *created_at,
+        };
+        assert!(
+            current_timestamp >= prev_timestamp,
+            "Items should be sorted by created_at in ascending order"
+        );
+        prev_timestamp = current_timestamp;
+    }
+
+    println!("✅ Conversation items include response metadata (response_id, previous_response_id, next_response_ids, created_at)");
+    println!("✅ Items are sorted by created_at in ascending order");
+}

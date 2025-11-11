@@ -291,7 +291,8 @@ pub async fn create_response(
                     // Fallback: Build response from collected data (for compatibility)
                     // Trim accumulated content to remove leading/trailing whitespace
                     let trimmed_content = content.trim().to_string();
-                    let resp_id = response_id.unwrap_or_else(|| format!("resp_{}", Uuid::new_v4().simple()));
+                    let resp_id =
+                        response_id.unwrap_or_else(|| format!("resp_{}", Uuid::new_v4().simple()));
                     ResponseObject {
                         id: resp_id.clone(),
                         object: "response".to_string(),

@@ -145,26 +145,6 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
 }
 
 impl ResponseServiceImpl {
-    /// Parse conversation ID from request
-    fn parse_conversation_id(
-        request: &models::CreateResponseRequest,
-    ) -> Result<Option<ConversationId>, errors::ResponseError> {
-        if let Some(conversation_ref) = &request.conversation {
-            let id = match conversation_ref {
-                models::ConversationReference::Id(id) => id,
-                models::ConversationReference::Object { id, .. } => id,
-            };
-
-            let conv_id = id.parse::<ConversationId>().map_err(|e| {
-                errors::ResponseError::InvalidParams(format!("Invalid conversation ID: {e}"))
-            })?;
-
-            Ok(Some(conv_id))
-        } else {
-            Ok(None)
-        }
-    }
-
     /// Parse file ID from string (handles "file-" prefix)
     fn parse_file_id(file_id: &str) -> Result<Uuid, errors::ResponseError> {
         let id_str = file_id.strip_prefix("file-").unwrap_or(file_id);
@@ -460,8 +440,6 @@ impl ResponseServiceImpl {
     ) -> Result<(), errors::ResponseError> {
         tracing::info!("Starting response stream processing");
 
-        let conversation_id = Self::parse_conversation_id(&context.request)?;
-
         let workspace_id_domain = crate::workspace::WorkspaceId(context.workspace_id);
         let mut messages = Self::load_conversation_context(
             &context.request,
@@ -491,6 +469,13 @@ impl ResponseServiceImpl {
 
         // Extract response_id from the created response
         let response_id = Self::extract_response_uuid(&initial_response)?;
+
+        // Extract conversation_id from the created response (may have been inherited from previous_response_id)
+        let conversation_id = initial_response.conversation.as_ref().and_then(|conv_ref| {
+            let id = &conv_ref.id;
+            let uuid_str = id.strip_prefix("conv_").unwrap_or(id);
+            Uuid::parse_str(uuid_str).ok().map(ConversationId)
+        });
 
         // Store user input messages as response_items
         if let Some(input) = &context.request.input {

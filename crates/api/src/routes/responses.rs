@@ -291,7 +291,7 @@ pub async fn create_response(
                     // Fallback: Build response from collected data (for compatibility)
                     // Trim accumulated content to remove leading/trailing whitespace
                     let trimmed_content = content.trim().to_string();
-                    let resp_id = response_id.unwrap_or_else(|| format!("resp_{}", Uuid::new_v4()));
+                    let resp_id = response_id.unwrap_or_else(|| format!("resp_{}", Uuid::new_v4().simple()));
                     ResponseObject {
                         id: resp_id.clone(),
                         object: "response".to_string(),
@@ -317,7 +317,7 @@ pub async fn create_response(
                         max_tool_calls: request.max_tool_calls,
                         model: request.model,
                         output: vec![ResponseOutputItem::Message {
-                            id: format!("msg_{}", Uuid::new_v4()),
+                            id: format!("msg_{}", Uuid::new_v4().simple()),
                             response_id: resp_id.clone(),
                             previous_response_id: request.previous_response_id.clone(),
                             next_response_ids: vec![],

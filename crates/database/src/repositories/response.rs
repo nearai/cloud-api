@@ -17,7 +17,6 @@ impl PgResponseRepository {
     }
 }
 
-// TODO: Implement ResponseRepositoryTrait methods properly
 #[async_trait]
 impl ResponseRepositoryTrait for PgResponseRepository {
     async fn create(
@@ -37,8 +36,8 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         let response_id = format!("resp_{}", response_uuid.simple());
         let now = Utc::now();
 
-        // Extract conversation_id if present
-        let conversation_uuid = if let Some(conv_ref) = &request.conversation {
+        // Extract conversation_id if present in request
+        let mut conversation_uuid = if let Some(conv_ref) = &request.conversation {
             match conv_ref {
                 ConversationReference::Id(id) => {
                     let uuid_str = id.strip_prefix("conv_").unwrap_or(id);
@@ -54,9 +53,57 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         };
 
         // Extract previous_response_id if present (this is the parent response)
+        // If not provided but conversation is provided, find the latest response in the conversation
         let previous_response_uuid = if let Some(prev_id) = &request.previous_response_id {
             let uuid_str = prev_id.strip_prefix("resp_").unwrap_or(prev_id);
-            Some(Uuid::parse_str(uuid_str).context("Invalid previous response ID")?)
+            let prev_uuid = Uuid::parse_str(uuid_str).context("Invalid previous response ID")?;
+
+            // If conversation_uuid is not explicitly set, inherit it from the previous response
+            if conversation_uuid.is_none() {
+                // Fetch the previous response to get its conversation_id
+                let prev_response = client
+                    .query_opt(
+                        r#"
+                        SELECT conversation_id
+                        FROM responses
+                        WHERE id = $1 AND workspace_id = $2
+                        "#,
+                        &[&prev_uuid, &workspace_id.0],
+                    )
+                    .await
+                    .context("Failed to fetch previous response")?;
+
+                if let Some(row) = prev_response {
+                    let prev_conversation_id: Option<Uuid> = row.get("conversation_id");
+                    conversation_uuid = prev_conversation_id;
+
+                    if conversation_uuid.is_some() {
+                        tracing::debug!(
+                            "Inherited conversation_id from previous response {}",
+                            prev_id
+                        );
+                    }
+                }
+            }
+
+            Some(prev_uuid)
+        } else if let Some(conv_uuid) = conversation_uuid {
+            // No explicit previous_response_id, but conversation exists
+            // Find the latest response in this conversation to link to it
+            let latest_response = self
+                .get_latest_in_conversation(
+                    services::conversations::models::ConversationId(conv_uuid),
+                    workspace_id.clone(),
+                )
+                .await?;
+
+            if let Some(latest) = latest_response {
+                // Extract UUID from the latest response ID (format: "resp_{uuid}")
+                let latest_uuid_str = latest.id.strip_prefix("resp_").unwrap_or(&latest.id);
+                Some(Uuid::parse_str(latest_uuid_str).context("Invalid latest response ID")?)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -507,5 +554,124 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         _workspace_id: WorkspaceId,
     ) -> Result<Option<ResponseObject>, anyhow::Error> {
         unimplemented!("get_previous not yet implemented")
+    }
+
+    async fn get_latest_in_conversation(
+        &self,
+        conversation_id: services::conversations::models::ConversationId,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<ResponseObject>, anyhow::Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        // Fetch the most recent response in this conversation
+        let row_result = client
+            .query_opt(
+                r#"
+                SELECT id, workspace_id, api_key_id, model, status, instructions, 
+                       conversation_id, previous_response_id, next_response_ids, 
+                       usage, metadata, created_at, updated_at
+                FROM responses
+                WHERE conversation_id = $1 AND workspace_id = $2
+                ORDER BY created_at DESC
+                LIMIT 1
+                "#,
+                &[&conversation_id.0, &workspace_id.0],
+            )
+            .await
+            .context("Failed to fetch latest response in conversation")?;
+
+        let Some(row) = row_result else {
+            return Ok(None);
+        };
+
+        let response_uuid: Uuid = row.get("id");
+        let status = match row.get::<_, String>("status").as_str() {
+            "in_progress" => ResponseStatus::InProgress,
+            "completed" => ResponseStatus::Completed,
+            "failed" => ResponseStatus::Failed,
+            "cancelled" => ResponseStatus::Cancelled,
+            "queued" => ResponseStatus::Queued,
+            "incomplete" => ResponseStatus::Incomplete,
+            _ => ResponseStatus::Failed,
+        };
+
+        let created_at: DateTime<Utc> = row.get("created_at");
+        let conversation_uuid: Option<Uuid> = row.get("conversation_id");
+        let usage_json: Option<serde_json::Value> = row.get("usage");
+        let metadata_json: Option<serde_json::Value> = row.get("metadata");
+        let model: String = row.get("model");
+        let instructions: Option<String> = row.get("instructions");
+        let previous_response_uuid: Option<Uuid> = row.get("previous_response_id");
+        let next_response_ids_json: Option<serde_json::Value> = row.get("next_response_ids");
+
+        // Parse next_response_ids from JSON array to Vec<String>
+        let next_response_ids = if let Some(next_ids_val) = next_response_ids_json {
+            serde_json::from_value::<Vec<String>>(next_ids_val)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|uuid_str| {
+                    Uuid::parse_str(&uuid_str)
+                        .ok()
+                        .map(|uuid| format!("resp_{}", uuid.simple()))
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+
+        // Build conversation reference if conversation_id is present
+        let conversation_ref = conversation_uuid.map(|uuid| ConversationResponseReference {
+            id: format!("conv_{}", uuid.simple()),
+        });
+
+        // Parse usage from JSON
+        let usage = if let Some(usage_val) = usage_json {
+            serde_json::from_value(usage_val).unwrap_or_else(|_| Usage::new(0, 0))
+        } else {
+            Usage::new(0, 0)
+        };
+
+        // Build ResponseObject from the database row
+        let response_obj = ResponseObject {
+            id: format!("resp_{}", response_uuid.simple()),
+            object: "response".to_string(),
+            created_at: created_at.timestamp(),
+            status,
+            background: false,
+            conversation: conversation_ref,
+            error: None,
+            incomplete_details: None,
+            instructions,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            model,
+            output: vec![],
+            parallel_tool_calls: false,
+            previous_response_id: previous_response_uuid
+                .map(|uuid| format!("resp_{}", uuid.simple())),
+            next_response_ids,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            reasoning: None,
+            safety_identifier: None,
+            service_tier: "default".to_string(),
+            store: false,
+            temperature: 1.0,
+            text: None,
+            tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
+            tools: vec![],
+            top_logprobs: 0,
+            top_p: 1.0,
+            truncation: "disabled".to_string(),
+            usage,
+            user: None,
+            metadata: metadata_json,
+        };
+
+        Ok(Some(response_obj))
     }
 }

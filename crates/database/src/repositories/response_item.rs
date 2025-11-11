@@ -62,10 +62,11 @@ impl PgResponseItemsRepository {
 
         // Get response metadata from joined responses table
         let response_id: Uuid = row.try_get("response_id")?;
-        let response_id_str = format!("resp_{response_id}");
+        let response_id_str = format!("resp_{}", response_id.simple());
 
         let previous_response_id: Option<Uuid> = row.try_get("previous_response_id").ok().flatten();
-        let previous_response_id_str = previous_response_id.map(|id| format!("resp_{id}"));
+        let previous_response_id_str =
+            previous_response_id.map(|id| format!("resp_{}", id.simple()));
 
         let next_response_ids_json: Option<serde_json::Value> =
             row.try_get("next_response_ids").ok().flatten();
@@ -73,12 +74,19 @@ impl PgResponseItemsRepository {
             .and_then(|v| v.as_array().cloned())
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|v| v.as_str().map(|s| format!("resp_{s}")))
+            .filter_map(|v| {
+                v.as_str().and_then(|s| {
+                    Uuid::parse_str(s)
+                        .ok()
+                        .map(|uuid| format!("resp_{}", uuid.simple()))
+                })
+            })
             .collect();
 
-        let response_created_at: chrono::DateTime<chrono::Utc> =
-            row.try_get("response_created_at")?;
-        let created_at_timestamp = response_created_at.timestamp();
+        // Use the item's own created_at timestamp, not the response's created_at
+        // This ensures each item has a unique timestamp reflecting when it was created
+        let item_created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
+        let created_at_timestamp = item_created_at.timestamp();
 
         // Enrich the item with response metadata
         match &mut item {

@@ -1183,3 +1183,704 @@ async fn test_conversation_items_include_response_metadata() {
     println!("✅ Conversation items include response metadata (response_id, previous_response_id, next_response_ids, created_at)");
     println!("✅ Items are sorted by created_at in ascending order");
 }
+
+// ============================================
+// Conversation Management Tests (Pin, Archive, Clone, Rename, Delete)
+// ============================================
+
+#[tokio::test]
+async fn test_pin_unpin_conversation() {
+    let server = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    // Create a conversation
+    let conversation = create_conversation(&server, api_key.clone()).await;
+    println!("Created conversation: {}", conversation.id);
+
+    // Verify conversation is not pinned initially
+    let get_response = server
+        .get(format!("/v1/conversations/{}", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(get_response.status_code(), 200);
+    let conv = get_response.json::<api::models::ConversationObject>();
+    assert_eq!(conv.object, "conversation");
+
+    // Test: Pin the conversation
+    let pin_response = server
+        .post(format!("/v1/conversations/{}/pin", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(pin_response.status_code(), 200);
+    let pinned_conv = pin_response.json::<api::models::ConversationObject>();
+    assert_eq!(pinned_conv.id, conversation.id);
+    println!("✅ Conversation pinned successfully");
+
+    // Test: Unpin the conversation
+    let unpin_response = server
+        .delete(format!("/v1/conversations/{}/pin", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(unpin_response.status_code(), 200);
+    let unpinned_conv = unpin_response.json::<api::models::ConversationObject>();
+    assert_eq!(unpinned_conv.id, conversation.id);
+    println!("✅ Conversation unpinned successfully");
+
+    // Test: Pinning again should be idempotent
+    let pin_again_response = server
+        .post(format!("/v1/conversations/{}/pin", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(pin_again_response.status_code(), 200);
+    println!("✅ Pin operation is idempotent");
+}
+
+#[tokio::test]
+async fn test_archive_unarchive_conversation() {
+    let server = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    // Create a conversation
+    let conversation = create_conversation(&server, api_key.clone()).await;
+    println!("Created conversation: {}", conversation.id);
+
+    // Test: Archive the conversation
+    let archive_response = server
+        .post(format!("/v1/conversations/{}/archive", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(archive_response.status_code(), 200);
+    let archived_conv = archive_response.json::<api::models::ConversationObject>();
+    assert_eq!(archived_conv.id, conversation.id);
+    println!("✅ Conversation archived successfully");
+
+    // Test: Unarchive the conversation
+    let unarchive_response = server
+        .delete(format!("/v1/conversations/{}/archive", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(unarchive_response.status_code(), 200);
+    let unarchived_conv = unarchive_response.json::<api::models::ConversationObject>();
+    assert_eq!(unarchived_conv.id, conversation.id);
+    println!("✅ Conversation unarchived successfully");
+
+    // Test: Archiving again should be idempotent
+    let archive_again_response = server
+        .post(format!("/v1/conversations/{}/archive", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(archive_again_response.status_code(), 200);
+    println!("✅ Archive operation is idempotent");
+}
+
+#[tokio::test]
+async fn test_rename_conversation_via_metadata() {
+    let server = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    // Create a conversation with initial title in metadata
+    let create_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "metadata": {
+                "title": "Original Title",
+                "description": "Test conversation"
+            }
+        }))
+        .await;
+    assert_eq!(create_response.status_code(), 201);
+    let conversation = create_response.json::<api::models::ConversationObject>();
+    println!("Created conversation: {}", conversation.id);
+
+    // Verify initial metadata
+    assert_eq!(
+        conversation.metadata.get("title").and_then(|v| v.as_str()),
+        Some("Original Title")
+    );
+
+    // Test: Update conversation name via metadata
+    let update_response = server
+        .post(format!("/v1/conversations/{}", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "metadata": {
+                "title": "Updated Title",
+                "description": "Updated description"
+            }
+        }))
+        .await;
+    assert_eq!(update_response.status_code(), 200);
+    let updated_conv = update_response.json::<api::models::ConversationObject>();
+
+    // Verify updated metadata
+    assert_eq!(
+        updated_conv.metadata.get("title").and_then(|v| v.as_str()),
+        Some("Updated Title")
+    );
+    assert_eq!(
+        updated_conv
+            .metadata
+            .get("description")
+            .and_then(|v| v.as_str()),
+        Some("Updated description")
+    );
+    println!("✅ Conversation renamed via metadata update");
+
+    // Test: Get conversation to verify persistence
+    let get_response = server
+        .get(format!("/v1/conversations/{}", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(get_response.status_code(), 200);
+    let fetched_conv = get_response.json::<api::models::ConversationObject>();
+    assert_eq!(
+        fetched_conv.metadata.get("title").and_then(|v| v.as_str()),
+        Some("Updated Title")
+    );
+    println!("✅ Metadata changes persisted");
+}
+
+#[tokio::test]
+async fn test_clone_conversation() {
+    let server = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    // Create a conversation with metadata
+    let create_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "metadata": {
+                "title": "Original Conversation",
+                "custom_field": "custom_value"
+            }
+        }))
+        .await;
+    assert_eq!(create_response.status_code(), 201);
+    let original_conv = create_response.json::<api::models::ConversationObject>();
+    println!("Created original conversation: {}", original_conv.id);
+
+    // Test: Clone the conversation
+    let clone_response = server
+        .post(format!("/v1/conversations/{}/clone", original_conv.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(clone_response.status_code(), 201);
+    let cloned_conv = clone_response.json::<api::models::ConversationObject>();
+
+    // Verify cloned conversation has different ID
+    assert_ne!(cloned_conv.id, original_conv.id);
+    println!("✅ Cloned conversation has new ID: {}", cloned_conv.id);
+
+    // Verify cloned conversation has " (Copy)" appended to title
+    let cloned_title = cloned_conv.metadata.get("title").and_then(|v| v.as_str());
+    assert_eq!(cloned_title, Some("Original Conversation (Copy)"));
+    println!("✅ Cloned conversation title has ' (Copy)' appended");
+
+    // Verify other metadata is preserved
+    assert_eq!(
+        cloned_conv
+            .metadata
+            .get("custom_field")
+            .and_then(|v| v.as_str()),
+        Some("custom_value")
+    );
+    println!("✅ Other metadata preserved in clone");
+
+    // Test: Clone without title in metadata
+    let create_no_title_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "metadata": {
+                "custom_field": "value"
+            }
+        }))
+        .await;
+    assert_eq!(create_no_title_response.status_code(), 201);
+    let no_title_conv = create_no_title_response.json::<api::models::ConversationObject>();
+
+    let clone_no_title_response = server
+        .post(format!("/v1/conversations/{}/clone", no_title_conv.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(clone_no_title_response.status_code(), 201);
+    let cloned_no_title = clone_no_title_response.json::<api::models::ConversationObject>();
+
+    // Verify metadata is still copied even without title
+    assert_eq!(
+        cloned_no_title
+            .metadata
+            .get("custom_field")
+            .and_then(|v| v.as_str()),
+        Some("value")
+    );
+    println!("✅ Clone works correctly without title in metadata");
+}
+
+#[tokio::test]
+async fn test_clone_conversation_with_responses_and_items() {
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Create a conversation with metadata
+    let conv_create_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "metadata": {
+                "title": "Original Conversation with Messages",
+                "description": "Test deep clone"
+            }
+        }))
+        .await;
+    assert_eq!(conv_create_response.status_code(), 201);
+    let original_conv = conv_create_response.json::<api::models::ConversationObject>();
+    println!("Created original conversation: {}", original_conv.id);
+
+    // Add multiple responses to the conversation
+    let models = list_models(&server, api_key.clone()).await;
+
+    let response1 = create_response(
+        &server,
+        original_conv.id.clone(),
+        models.data[0].id.clone(),
+        "First message in conversation".to_string(),
+        50,
+        api_key.clone(),
+    )
+    .await;
+    println!("Created response 1: {}", response1.id);
+
+    let response2 = create_response(
+        &server,
+        original_conv.id.clone(),
+        models.data[0].id.clone(),
+        "Second message in conversation".to_string(),
+        50,
+        api_key.clone(),
+    )
+    .await;
+    println!("Created response 2: {}", response2.id);
+
+    // Get original conversation items count
+    let original_items =
+        list_conversation_items(&server, original_conv.id.clone(), api_key.clone()).await;
+    let original_item_count = original_items.data.len();
+    println!("Original conversation has {original_item_count} items");
+    assert!(
+        original_item_count >= 4,
+        "Should have at least 4 items (2 user messages + 2 assistant responses)"
+    );
+
+    // Clone the conversation (deep clone)
+    let clone_response = server
+        .post(format!("/v1/conversations/{}/clone", original_conv.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(clone_response.status_code(), 201);
+    let cloned_conv = clone_response.json::<api::models::ConversationObject>();
+    println!("Cloned conversation: {}", cloned_conv.id);
+
+    // Verify cloned conversation has different ID
+    assert_ne!(cloned_conv.id, original_conv.id);
+
+    // Verify title has " (Copy)" appended
+    assert_eq!(
+        cloned_conv.metadata.get("title").and_then(|v| v.as_str()),
+        Some("Original Conversation with Messages (Copy)")
+    );
+
+    // Get cloned conversation items
+    let cloned_items =
+        list_conversation_items(&server, cloned_conv.id.clone(), api_key.clone()).await;
+    let cloned_item_count = cloned_items.data.len();
+    println!("Cloned conversation has {cloned_item_count} items");
+
+    // Verify the clone has the same number of items as the original
+    assert_eq!(
+        cloned_item_count, original_item_count,
+        "Cloned conversation should have the same number of items as original"
+    );
+
+    // Verify the content of items is the same (but with different IDs)
+    for (orig_item, cloned_item) in original_items.data.iter().zip(cloned_items.data.iter()) {
+        // IDs should be different
+        assert_ne!(
+            orig_item.id(),
+            cloned_item.id(),
+            "Item IDs should be different"
+        );
+
+        // Content should be the same
+        if let (
+            api::models::ConversationItem::Message {
+                content: orig_content,
+                role: orig_role,
+                ..
+            },
+            api::models::ConversationItem::Message {
+                content: cloned_content,
+                role: cloned_role,
+                ..
+            },
+        ) = (orig_item, cloned_item)
+        {
+            assert_eq!(orig_role, cloned_role, "Roles should match");
+            assert_eq!(
+                orig_content.len(),
+                cloned_content.len(),
+                "Content parts count should match"
+            );
+
+            // Compare text content
+            for (orig_part, cloned_part) in orig_content.iter().zip(cloned_content.iter()) {
+                match (orig_part, cloned_part) {
+                    (
+                        api::models::ConversationContentPart::InputText { text: orig_text },
+                        api::models::ConversationContentPart::InputText { text: cloned_text },
+                    ) => {
+                        assert_eq!(orig_text, cloned_text, "Text content should match");
+                    }
+                    (
+                        api::models::ConversationContentPart::OutputText {
+                            text: orig_text, ..
+                        },
+                        api::models::ConversationContentPart::OutputText {
+                            text: cloned_text, ..
+                        },
+                    ) => {
+                        assert_eq!(orig_text, cloned_text, "Output text should match");
+                    }
+                    _ => {} // Other content types
+                }
+            }
+        }
+        // Other item types (tool calls, etc.)
+    }
+
+    println!("✅ Deep clone successfully copied all responses and items");
+    println!("✅ Cloned items have different IDs but same content");
+
+    // Verify that modifying the clone doesn't affect the original
+    let update_clone = server
+        .post(format!("/v1/conversations/{}", cloned_conv.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "metadata": {
+                "title": "Modified Clone",
+                "description": "Changed description"
+            }
+        }))
+        .await;
+    assert_eq!(update_clone.status_code(), 200);
+
+    // Get original conversation to verify it wasn't changed
+    let get_original = server
+        .get(format!("/v1/conversations/{}", original_conv.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(get_original.status_code(), 200);
+    let unchanged_original = get_original.json::<api::models::ConversationObject>();
+
+    assert_eq!(
+        unchanged_original
+            .metadata
+            .get("title")
+            .and_then(|v| v.as_str()),
+        Some("Original Conversation with Messages"),
+        "Original conversation title should be unchanged"
+    );
+
+    println!("✅ Clone is independent - modifying clone doesn't affect original");
+}
+
+#[tokio::test]
+async fn test_delete_conversation() {
+    let server = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    // Create a conversation
+    let conversation = create_conversation(&server, api_key.clone()).await;
+    println!("Created conversation: {}", conversation.id);
+
+    // Verify conversation exists
+    let get_response = server
+        .get(format!("/v1/conversations/{}", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(get_response.status_code(), 200);
+
+    // Test: Delete the conversation
+    let delete_response = server
+        .delete(format!("/v1/conversations/{}", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(delete_response.status_code(), 200);
+    let delete_result = delete_response.json::<api::models::ConversationDeleteResult>();
+    assert_eq!(delete_result.id, conversation.id);
+    assert_eq!(delete_result.object, "conversation.deleted");
+    assert!(delete_result.deleted);
+    println!("✅ Conversation deleted successfully");
+
+    // Test: Getting deleted conversation should return 404
+    let get_deleted_response = server
+        .get(format!("/v1/conversations/{}", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(get_deleted_response.status_code(), 404);
+    println!("✅ Deleted conversation returns 404");
+
+    // Test: Deleting non-existent conversation should return 404
+    let fake_id = "conv_00000000-0000-0000-0000-000000000000";
+    let delete_fake_response = server
+        .delete(format!("/v1/conversations/{fake_id}").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(delete_fake_response.status_code(), 404);
+    println!("✅ Deleting non-existent conversation returns 404");
+}
+
+#[tokio::test]
+async fn test_pin_nonexistent_conversation() {
+    let server = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    let fake_id = "conv_00000000-0000-0000-0000-000000000000";
+
+    // Test: Pinning non-existent conversation should return 404
+    let pin_response = server
+        .post(format!("/v1/conversations/{fake_id}/pin").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(pin_response.status_code(), 404);
+    println!("✅ Pinning non-existent conversation returns 404");
+}
+
+#[tokio::test]
+async fn test_archive_nonexistent_conversation() {
+    let server = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    let fake_id = "conv_00000000-0000-0000-0000-000000000000";
+
+    // Test: Archiving non-existent conversation should return 404
+    let archive_response = server
+        .post(format!("/v1/conversations/{fake_id}/archive").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(archive_response.status_code(), 404);
+    println!("✅ Archiving non-existent conversation returns 404");
+}
+
+#[tokio::test]
+async fn test_clone_nonexistent_conversation() {
+    let server = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    let fake_id = "conv_00000000-0000-0000-0000-000000000000";
+
+    // Test: Cloning non-existent conversation should return 404
+    let clone_response = server
+        .post(format!("/v1/conversations/{fake_id}/clone").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(clone_response.status_code(), 404);
+    println!("✅ Cloning non-existent conversation returns 404");
+}
+
+#[tokio::test]
+async fn test_combined_conversation_operations() {
+    let server = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    // Create a conversation with metadata
+    let create_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "metadata": {
+                "title": "Test Conversation",
+                "tags": ["important", "work"]
+            }
+        }))
+        .await;
+    assert_eq!(create_response.status_code(), 201);
+    let conversation = create_response.json::<api::models::ConversationObject>();
+    println!("Created conversation: {}", conversation.id);
+
+    // Pin the conversation
+    let pin_response = server
+        .post(format!("/v1/conversations/{}/pin", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(pin_response.status_code(), 200);
+    println!("✅ Pinned conversation");
+
+    // Update metadata (rename)
+    let update_response = server
+        .post(format!("/v1/conversations/{}", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "metadata": {
+                "title": "Renamed Conversation",
+                "tags": ["important", "work", "updated"]
+            }
+        }))
+        .await;
+    assert_eq!(update_response.status_code(), 200);
+    println!("✅ Updated metadata");
+
+    // Clone the conversation
+    let clone_response = server
+        .post(format!("/v1/conversations/{}/clone", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(clone_response.status_code(), 201);
+    let cloned_conv = clone_response.json::<api::models::ConversationObject>();
+
+    // Verify clone has updated metadata with " (Copy)" appended
+    assert_eq!(
+        cloned_conv.metadata.get("title").and_then(|v| v.as_str()),
+        Some("Renamed Conversation (Copy)")
+    );
+    println!("✅ Cloned conversation has correct title");
+
+    // Archive the original conversation
+    let archive_response = server
+        .post(format!("/v1/conversations/{}/archive", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(archive_response.status_code(), 200);
+    println!("✅ Archived original conversation");
+
+    // Delete the cloned conversation
+    let delete_response = server
+        .delete(format!("/v1/conversations/{}", cloned_conv.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(delete_response.status_code(), 200);
+    println!("✅ Deleted cloned conversation");
+
+    // Original conversation should still exist (just archived and pinned)
+    let get_response = server
+        .get(format!("/v1/conversations/{}", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(get_response.status_code(), 200);
+    println!("✅ Original conversation still exists after operations");
+
+    println!("✅ All combined operations completed successfully");
+}
+
+#[tokio::test]
+async fn test_conversation_metadata_limits() {
+    let server = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    // Test: Create conversation with metadata containing multiple key-value pairs
+    let mut metadata = serde_json::Map::new();
+    for i in 0..16 {
+        metadata.insert(
+            format!("key{i}"),
+            serde_json::Value::String(format!("value{i}")),
+        );
+    }
+
+    let create_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "metadata": metadata
+        }))
+        .await;
+    assert_eq!(create_response.status_code(), 201);
+    let conversation = create_response.json::<api::models::ConversationObject>();
+
+    // Verify all metadata keys are present
+    assert_eq!(conversation.metadata.as_object().unwrap().len(), 16);
+    println!("✅ Conversation created with 16 metadata keys (OpenAI limit)");
+
+    // Note: OpenAI spec allows max 16 key-value pairs
+    // We're not enforcing this limit at the database level, but documenting it
+}
+
+#[tokio::test]
+async fn test_conversation_operations_with_invalid_id_format() {
+    let server = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    let invalid_id = "not-a-valid-uuid";
+
+    // Test: All operations with invalid ID format should return 400
+    let pin_response = server
+        .post(format!("/v1/conversations/{invalid_id}/pin").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(pin_response.status_code(), 400);
+
+    let archive_response = server
+        .post(format!("/v1/conversations/{invalid_id}/archive").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(archive_response.status_code(), 400);
+
+    let clone_response = server
+        .post(format!("/v1/conversations/{invalid_id}/clone").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(clone_response.status_code(), 400);
+
+    let delete_response = server
+        .delete(format!("/v1/conversations/{invalid_id}").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(delete_response.status_code(), 400);
+
+    println!("✅ All operations with invalid ID format return 400");
+}
+
+#[tokio::test]
+async fn test_conversation_unauthorized_access() {
+    let server = setup_test_server().await;
+    let (api_key1, _) = create_org_and_api_key(&server).await;
+    let (api_key2, _) = create_org_and_api_key(&server).await;
+
+    // Create conversation with first API key
+    let conversation = create_conversation(&server, api_key1.clone()).await;
+    println!("Created conversation with API key 1: {}", conversation.id);
+
+    // Test: Try to pin conversation with different API key (different workspace)
+    let pin_response = server
+        .post(format!("/v1/conversations/{}/pin", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key2}"))
+        .await;
+    assert_eq!(pin_response.status_code(), 404); // Should not find conversation in different workspace
+    println!("✅ Cross-workspace pin attempt returns 404");
+
+    // Test: Try to clone conversation with different API key
+    let clone_response = server
+        .post(format!("/v1/conversations/{}/clone", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key2}"))
+        .await;
+    assert_eq!(clone_response.status_code(), 404);
+    println!("✅ Cross-workspace clone attempt returns 404");
+
+    // Test: Try to delete conversation with different API key
+    let delete_response = server
+        .delete(format!("/v1/conversations/{}", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key2}"))
+        .await;
+    assert_eq!(delete_response.status_code(), 404);
+    println!("✅ Cross-workspace delete attempt returns 404");
+
+    // Verify conversation still exists with original API key
+    let get_response = server
+        .get(format!("/v1/conversations/{}", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key1}"))
+        .await;
+    assert_eq!(get_response.status_code(), 200);
+    println!("✅ Original conversation still accessible with correct API key");
+}

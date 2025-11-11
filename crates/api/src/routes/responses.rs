@@ -291,8 +291,10 @@ pub async fn create_response(
                     // Fallback: Build response from collected data (for compatibility)
                     // Trim accumulated content to remove leading/trailing whitespace
                     let trimmed_content = content.trim().to_string();
+                    let resp_id =
+                        response_id.unwrap_or_else(|| format!("resp_{}", Uuid::new_v4().simple()));
                     ResponseObject {
-                        id: response_id.unwrap_or_else(|| format!("resp_{}", Uuid::new_v4())),
+                        id: resp_id.clone(),
                         object: "response".to_string(),
                         created_at: chrono::Utc::now().timestamp(),
                         status,
@@ -316,7 +318,11 @@ pub async fn create_response(
                         max_tool_calls: request.max_tool_calls,
                         model: request.model,
                         output: vec![ResponseOutputItem::Message {
-                            id: format!("msg_{}", Uuid::new_v4()),
+                            id: format!("msg_{}", Uuid::new_v4().simple()),
+                            response_id: resp_id.clone(),
+                            previous_response_id: request.previous_response_id.clone(),
+                            next_response_ids: vec![],
+                            created_at: chrono::Utc::now().timestamp(),
                             status: ResponseItemStatus::Completed,
                             role: "assistant".to_string(),
                             content: vec![ResponseOutputContent::OutputText {
@@ -326,7 +332,8 @@ pub async fn create_response(
                             }],
                         }],
                         parallel_tool_calls: request.parallel_tool_calls.unwrap_or(false),
-                        previous_response_id: request.previous_response_id,
+                        previous_response_id: request.previous_response_id.clone(),
+                        next_response_ids: vec![],
                         prompt_cache_key: request.prompt_cache_key,
                         prompt_cache_retention: None,
                         reasoning: None,

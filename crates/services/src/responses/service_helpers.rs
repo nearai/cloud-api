@@ -21,6 +21,10 @@ pub struct ResponseStreamContext {
     /// Accumulated token usage from all completion calls
     pub total_input_tokens: i32,
     pub total_output_tokens: i32,
+    /// Response metadata for enriching output items
+    pub response_id_str: String,
+    pub previous_response_id: Option<String>,
+    pub created_at: i64,
 }
 
 impl ResponseStreamContext {
@@ -28,6 +32,9 @@ impl ResponseStreamContext {
         response_id: models::ResponseId,
         api_key_id: Uuid,
         conversation_id: Option<ConversationId>,
+        response_id_str: String,
+        previous_response_id: Option<String>,
+        created_at: i64,
     ) -> Self {
         Self {
             response_id,
@@ -37,6 +44,9 @@ impl ResponseStreamContext {
             output_item_index: 0,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            response_id_str,
+            previous_response_id,
+            created_at,
         }
     }
 

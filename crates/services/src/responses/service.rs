@@ -145,26 +145,6 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
 }
 
 impl ResponseServiceImpl {
-    /// Parse conversation ID from request
-    fn parse_conversation_id(
-        request: &models::CreateResponseRequest,
-    ) -> Result<Option<ConversationId>, errors::ResponseError> {
-        if let Some(conversation_ref) = &request.conversation {
-            let id = match conversation_ref {
-                models::ConversationReference::Id(id) => id,
-                models::ConversationReference::Object { id, .. } => id,
-            };
-
-            let conv_id = id.parse::<ConversationId>().map_err(|e| {
-                errors::ResponseError::InvalidParams(format!("Invalid conversation ID: {e}"))
-            })?;
-
-            Ok(Some(conv_id))
-        } else {
-            Ok(None)
-        }
-    }
-
     /// Parse file ID from string (handles "file-" prefix)
     fn parse_file_id(file_id: &str) -> Result<Uuid, errors::ResponseError> {
         let id_str = file_id.strip_prefix("file-").unwrap_or(file_id);
@@ -272,6 +252,10 @@ impl ResponseServiceImpl {
         // Event: response.output_item.added (for message)
         let item = models::ResponseOutputItem::Message {
             id: message_item_id.to_string(),
+            response_id: ctx.response_id_str.clone(),
+            previous_response_id: ctx.previous_response_id.clone(),
+            next_response_ids: vec![], // next_response_ids will be populated when child responses are created
+            created_at: ctx.created_at,
             status: models::ResponseItemStatus::InProgress,
             role: "assistant".to_string(),
             content: vec![],
@@ -322,6 +306,10 @@ impl ResponseServiceImpl {
         // Event: response.output_item.done
         let item = models::ResponseOutputItem::Message {
             id: message_item_id.to_string(),
+            response_id: ctx.response_id_str.clone(),
+            previous_response_id: ctx.previous_response_id.clone(),
+            next_response_ids: vec![], // next_response_ids will be populated when child responses are created
+            created_at: ctx.created_at,
             status: models::ResponseItemStatus::Completed,
             role: "assistant".to_string(),
             content: vec![models::ResponseOutputContent::OutputText {
@@ -452,8 +440,6 @@ impl ResponseServiceImpl {
     ) -> Result<(), errors::ResponseError> {
         tracing::info!("Starting response stream processing");
 
-        let conversation_id = Self::parse_conversation_id(&context.request)?;
-
         let workspace_id_domain = crate::workspace::WorkspaceId(context.workspace_id);
         let mut messages = Self::load_conversation_context(
             &context.request,
@@ -484,6 +470,13 @@ impl ResponseServiceImpl {
         // Extract response_id from the created response
         let response_id = Self::extract_response_uuid(&initial_response)?;
 
+        // Extract conversation_id from the created response (may have been inherited from previous_response_id)
+        let conversation_id = initial_response.conversation.as_ref().and_then(|conv_ref| {
+            let id = &conv_ref.id;
+            let uuid_str = id.strip_prefix("conv_").unwrap_or(id);
+            Uuid::parse_str(uuid_str).ok().map(ConversationId)
+        });
+
         // Store user input messages as response_items
         if let Some(input) = &context.request.input {
             Self::store_input_as_response_items(
@@ -501,6 +494,9 @@ impl ResponseServiceImpl {
             response_id.clone(),
             api_key_uuid,
             conversation_id.clone(),
+            initial_response.id.clone(),
+            initial_response.previous_response_id.clone(),
+            initial_response.created_at,
         );
         let mut emitter = crate::responses::service_helpers::EventEmitter::new(tx);
 
@@ -840,6 +836,10 @@ impl ResponseServiceImpl {
         // Event: response.output_item.added
         let item = models::ResponseOutputItem::WebSearchCall {
             id: tool_call_id.to_string(),
+            response_id: ctx.response_id_str.clone(),
+            previous_response_id: ctx.previous_response_id.clone(),
+            next_response_ids: vec![], // next_response_ids will be populated when child responses are created
+            created_at: ctx.created_at,
             status: models::ResponseItemStatus::InProgress,
             action: models::WebSearchAction::Search {
                 query: tool_call.query.clone(),
@@ -889,6 +889,10 @@ impl ResponseServiceImpl {
         // Event: response.output_item.done
         let item = models::ResponseOutputItem::WebSearchCall {
             id: tool_call_id.to_string(),
+            response_id: ctx.response_id_str.clone(),
+            previous_response_id: ctx.previous_response_id.clone(),
+            next_response_ids: vec![], // next_response_ids will be populated when child responses are created
+            created_at: ctx.created_at,
             status: models::ResponseItemStatus::Completed,
             action: models::WebSearchAction::Search {
                 query: tool_call.query.clone(),
@@ -959,6 +963,11 @@ impl ResponseServiceImpl {
                 let trimmed_text = text.trim();
                 let message_item = models::ResponseOutputItem::Message {
                     id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
+                    // These fields are placeholders - repository enriches them via JOIN when storing/retrieving
+                    response_id: String::new(),
+                    previous_response_id: None,
+                    next_response_ids: vec![],
+                    created_at: 0,
                     status: models::ResponseItemStatus::Completed,
                     role: "user".to_string(),
                     content: vec![models::ResponseOutputContent::OutputText {
@@ -1024,6 +1033,11 @@ impl ResponseServiceImpl {
 
                     let message_item = models::ResponseOutputItem::Message {
                         id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
+                        // These fields are placeholders - repository enriches them via JOIN when storing/retrieving
+                        response_id: String::new(),
+                        previous_response_id: None,
+                        next_response_ids: vec![],
+                        created_at: 0,
                         status: models::ResponseItemStatus::Completed,
                         role: input_item.role.clone(),
                         content,

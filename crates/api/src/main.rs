@@ -75,12 +75,17 @@ fn init_tracing(logging_config: &LoggingConfig) {
             tracing_subscriber::fmt()
                 .json()
                 .with_env_filter(filter)
+                .with_current_span(false)
+                .with_span_list(false)
                 .init();
         }
         "compact" => {
             tracing_subscriber::fmt()
                 .compact()
                 .with_env_filter(filter)
+                .with_target(false)
+                .with_thread_ids(false)
+                .with_thread_names(false)
                 .init();
         }
         "pretty" => {
@@ -90,9 +95,12 @@ fn init_tracing(logging_config: &LoggingConfig) {
                 .init();
         }
         _ => {
+            // Default to JSON format for containerized environments (Datadog friendly)
             tracing_subscriber::fmt()
-                .pretty()
+                .json()
                 .with_env_filter(filter)
+                .with_current_span(false)
+                .with_span_list(false)
                 .init();
         }
     }

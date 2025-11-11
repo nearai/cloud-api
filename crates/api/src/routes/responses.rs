@@ -19,7 +19,6 @@ use services::responses::service::ResponseServiceImpl;
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -188,35 +187,34 @@ pub async fn create_response(
                         let sse_bytes = format!("event: {}\ndata: {}\n\n", event.event_type, json);
                         let bytes = Bytes::from(sse_bytes);
 
-                        // Accumulate bytes asynchronously
-                        let acc = accumulated_inner.clone();
-                        let b = bytes.clone();
-                        tokio::spawn(async move {
-                            acc.lock().await.extend_from_slice(&b);
-                        });
+                        // Accumulate bytes synchronously - this ensures all bytes are captured
+                        // before the stream chunk is yielded to the client
+                        accumulated_inner.lock().await.extend_from_slice(&bytes);
 
                         // Check if stream is completing - store signature
                         if event.event_type == "response.completed" {
-                            let acc_final = accumulated_inner.clone();
-                            let rid_final = response_id_inner.clone();
-                            let req_hash = request_hash_inner.clone();
-                            let attest = attestation_inner.clone();
-                            let algo = signing_algo_inner.clone();
+                            // At this point, all bytes have been accumulated synchronously
+                            // Now we can safely compute the hash and store the signature
+                            let bytes_accumulated = accumulated_inner.lock().await.clone();
+                            let response_hash = compute_sha256(&bytes_accumulated);
+                            
+                            if let Some(rid) = response_id_inner.lock().await.as_ref() {
+                                let rid = rid.clone();
+                                let req_hash = request_hash_inner.clone();
+                                let attest = attestation_inner.clone();
+                                let algo = signing_algo_inner.clone();
+                                
+                                tracing::debug!(
+                                    "Storing signature for response_id: {}, request_hash: {}, response_hash: {}, signing_algo: {:?}",
+                                    rid, req_hash, response_hash, algo
+                                );
 
-                            tokio::spawn(async move {
-                                // Small delay to ensure all bytes are accumulated
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                let bytes = acc_final.lock().await;
-                                let response_hash = compute_sha256(&bytes);
-                                if let Some(rid) = rid_final.lock().await.as_ref() {
-                                    tracing::debug!(
-                                        "Storing signature for response_id: {}, request_hash: {}, response_hash: {}, signing_algo: {:?}",
-                                        rid, req_hash, response_hash, algo
-                                    );
-
+                                // Spawn task to store signature asynchronously (doesn't block stream)
+                                // but we've already computed the hash with complete data
+                                tokio::spawn(async move {
                                     // Store the signature with the algorithm from the request (defaults to ed25519 if not specified)
                                     if let Err(e) = attest.store_response_signature(
-                                        rid,
+                                        &rid,
                                         req_hash.clone(),
                                         response_hash.clone(),
                                         algo,
@@ -225,8 +223,8 @@ pub async fn create_response(
                                     } else {
                                         tracing::debug!("Successfully stored signature for response_id: {}", rid);
                                     }
-                                }
-                            });
+                                });
+                            }
                         }
 
                         Ok::<Bytes, Infallible>(bytes)

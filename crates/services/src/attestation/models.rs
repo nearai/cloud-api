@@ -35,6 +35,14 @@ pub struct ChatSignature {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VpcInfo {
+    /// VPC server app ID
+    pub vpc_server_app_id: Option<String>,
+    /// VPC hostname of this node
+    pub vpc_hostname: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DstackCpuQuote {
     /// The attestation quote in hexadecimal format
     pub intel_quote: String,
@@ -47,10 +55,14 @@ pub struct DstackCpuQuote {
     pub request_nonce: String,
     /// Application info from Dstack
     pub info: serde_json::Value,
+    /// VPC information (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vpc: Option<VpcInfo>,
 }
 
 impl DstackCpuQuote {
     pub fn from_quote_and_nonce(
+        vpc: Option<VpcInfo>,
         info: dstack_sdk::dstack_client::InfoResponse,
         quote: dstack_sdk::dstack_client::GetQuoteResponse,
         nonce: String,
@@ -61,6 +73,7 @@ impl DstackCpuQuote {
             report_data: quote.report_data,
             request_nonce: nonce,
             info: serde_json::to_value(info).unwrap_or_default(),
+            vpc,
         }
     }
 }

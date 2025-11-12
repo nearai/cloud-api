@@ -94,6 +94,15 @@ pub struct NvidiaPayload {
     pub evidence_list: Vec<Evidence>,
 }
 
+/// VPC information in attestation
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct VpcInfo {
+    /// VPC server app ID
+    pub vpc_server_app_id: Option<String>,
+    /// VPC hostname of this node
+    pub vpc_hostname: Option<String>,
+}
+
 /// Response for attestation report endpoint
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct DstackCpuQuote {
@@ -102,6 +111,9 @@ pub struct DstackCpuQuote {
     pub report_data: String,
     pub request_nonce: String,
     pub info: serde_json::Value,
+    /// VPC information (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vpc: Option<VpcInfo>,
 }
 
 impl From<services::attestation::models::DstackCpuQuote> for DstackCpuQuote {
@@ -112,6 +124,10 @@ impl From<services::attestation::models::DstackCpuQuote> for DstackCpuQuote {
             report_data: quote.report_data,
             request_nonce: quote.request_nonce,
             info: quote.info,
+            vpc: quote.vpc.map(|v| VpcInfo {
+                vpc_server_app_id: v.vpc_server_app_id,
+                vpc_hostname: v.vpc_hostname,
+            }),
         }
     }
 }

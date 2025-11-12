@@ -23,7 +23,7 @@ use uuid::Uuid;
 /// Adds a new member to the organization. The authenticated user must be an owner or admin.
 #[utoipa::path(
     post,
-    path = "/organizations/{org_id}/members",
+    path = "/v1/organizations/{org_id}/members",
     tag = "Organization Members",
     params(
         ("org_id" = Uuid, Path, description = "Organization ID")
@@ -118,7 +118,7 @@ pub async fn add_organization_member(
 /// Returns results for each invitation attempt, including successes and failures.
 #[utoipa::path(
     post,
-    path = "/organizations/{org_id}/members/invite-by-email",
+    path = "/v1/organizations/{org_id}/members/invite-by-email",
     tag = "Organization Members",
     params(
         ("org_id" = Uuid, Path, description = "Organization ID")
@@ -228,7 +228,7 @@ pub async fn invite_organization_member_by_email(
 /// Only owners can promote members to owner role.
 #[utoipa::path(
     put,
-    path = "/organizations/{org_id}/members/{user_id}",
+    path = "/v1/organizations/{org_id}/members/{user_id}",
     tag = "Organization Members",
     params(
         ("org_id" = Uuid, Path, description = "Organization ID"),
@@ -297,7 +297,7 @@ pub async fn update_organization_member(
 /// or the member can remove themselves. The last owner cannot be removed.
 #[utoipa::path(
     delete,
-    path = "/organizations/{org_id}/members/{user_id}",
+    path = "/v1/organizations/{org_id}/members/{user_id}",
     tag = "Organization Members",
     params(
         ("org_id" = Uuid, Path, description = "Organization ID"),
@@ -382,7 +382,7 @@ pub struct ListMembersParams {
 /// - Sensitive data (email, last login, etc.) is not exposed to any organization members
 #[utoipa::path(
     get,
-    path = "/organizations/{org_id}/members",
+    path = "/v1/organizations/{org_id}/members",
     tag = "Organization Members",
     params(
         ("org_id" = Uuid, Path, description = "Organization ID"),

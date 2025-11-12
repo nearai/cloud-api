@@ -73,7 +73,7 @@ pub struct ResponseRouteState {
 /// Creates a new response for a conversation.
 #[utoipa::path(
     post,
-    path = "/responses",
+    path = "/v1/responses",
     tag = "Responses",
     request_body = CreateResponseRequest,
     responses(

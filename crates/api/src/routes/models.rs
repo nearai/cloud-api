@@ -32,7 +32,7 @@ pub struct ModelListQuery {
 /// This is a public endpoint that does not require authentication.
 #[utoipa::path(
     get,
-    path = "/model/list",
+    path = "/v1/model/list",
     tag = "Models",
     params(ModelListQuery),
     responses(
@@ -113,7 +113,7 @@ pub async fn list_models(
 /// For example, use "Qwen%2FQwen3-30B-A3B-Instruct-2507" in the URL path.
 #[utoipa::path(
     get,
-    path = "/model/{model_name}",
+    path = "/v1/model/{model_name}",
     tag = "Models",
     params(
         ("model_name" = String, Path, description = "The model name to retrieve (URL-encode if it contains slashes)")

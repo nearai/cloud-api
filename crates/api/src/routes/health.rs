@@ -22,7 +22,7 @@ pub struct HealthResponse {
     responses(
         (status = 200, description = "Service is healthy", body = HealthResponse),
     ),
-    tag = "health"
+    tag = "Health"
 )]
 pub async fn health_check() -> (StatusCode, ResponseJson<HealthResponse>) {
     (

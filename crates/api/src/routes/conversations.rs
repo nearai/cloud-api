@@ -39,7 +39,7 @@ fn map_conversation_error_to_status(error: &ConversationError) -> StatusCode {
 /// Creates a new conversation for the authenticated user.
 #[utoipa::path(
     post,
-    path = "/conversations",
+    path = "/v1/conversations",
     tag = "Conversations",
     request_body = CreateConversationRequest,
     responses(
@@ -109,7 +109,7 @@ pub async fn create_conversation(
 /// Returns details for a specific conversation.
 #[utoipa::path(
     get,
-    path = "/conversations/{conversation_id}",
+    path = "/v1/conversations/{conversation_id}",
     tag = "Conversations",
     params(
         ("conversation_id" = String, Path, description = "Conversation ID")
@@ -172,7 +172,7 @@ pub async fn get_conversation(
 /// Updates a conversation's metadata.
 #[utoipa::path(
     post,
-    path = "/conversations/{conversation_id}",
+    path = "/v1/conversations/{conversation_id}",
     tag = "Conversations",
     params(
         ("conversation_id" = String, Path, description = "Conversation ID")
@@ -247,7 +247,7 @@ pub async fn update_conversation(
 /// Deletes a conversation permanently.
 #[utoipa::path(
     delete,
-    path = "/conversations/{conversation_id}",
+    path = "/v1/conversations/{conversation_id}",
     tag = "Conversations",
     params(
         ("conversation_id" = String, Path, description = "Conversation ID")
@@ -317,7 +317,7 @@ pub async fn delete_conversation(
 /// Returns items (messages, responses, etc.) within a specific conversation.
 #[utoipa::path(
     get,
-    path = "/conversations/{conversation_id}/items",
+    path = "/v1/conversations/{conversation_id}/items",
     tag = "Conversations",
     params(
         ("conversation_id" = String, Path, description = "Conversation ID"),
@@ -418,7 +418,7 @@ pub async fn list_conversation_items(
 /// Adds items to a conversation, allowing API callers to backfill conversations.
 #[utoipa::path(
     post,
-    path = "/conversations/{conversation_id}/items",
+    path = "/v1/conversations/{conversation_id}/items",
     tag = "Conversations",
     params(
         ("conversation_id" = String, Path, description = "Conversation ID"),

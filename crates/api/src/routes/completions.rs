@@ -108,7 +108,7 @@ fn convert_text_request_to_service(
 /// Creates a completion for a given chat conversation.
 #[utoipa::path(
     post,
-    path = "/chat/completions",
+    path = "/v1/chat/completions",
     tag = "Chat",
     request_body = ChatCompletionRequest,
     responses(
@@ -246,7 +246,7 @@ pub async fn chat_completions(
 /// Creates a completion for a given text prompt.
 #[utoipa::path(
     post,
-    path = "/completions",
+    path = "/v1/completions",
     tag = "Chat",
     request_body = CompletionRequest,
     responses(
@@ -337,7 +337,7 @@ pub async fn completions(
 /// No pagination to follow the OpenAI API spec - returns all active models.
 #[utoipa::path(
     get,
-    path = "/models",
+    path = "/v1/models",
     tag = "Models",
     responses(
         (status = 200, description = "List of available models", body = ModelsResponse),

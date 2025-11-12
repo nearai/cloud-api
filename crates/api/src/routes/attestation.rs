@@ -36,7 +36,7 @@ impl From<services::attestation::ChatSignature> for SignatureResponse {
 
 #[utoipa::path(
     get,
-    path = "/signature/{chat_id}",
+    path = "/v1/signature/{chat_id}",
     params(
         ("chat_id" = String, Path, description = "Chat completion ID"),
         SignatureQuery
@@ -48,7 +48,8 @@ impl From<services::attestation::ChatSignature> for SignatureResponse {
     ),
     security(
         ("api_key" = [])
-    )
+    ),
+    tag = "Attestation"
 )]
 pub async fn get_signature(
     Path(chat_id): Path<String>,
@@ -138,7 +139,7 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
 
 #[utoipa::path(
     get,
-    path = "/attestation/report",
+    path = "/v1/attestation/report",
     params(
         AttestationQuery
     ),
@@ -149,7 +150,8 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
     ),
     security(
         ("api_key" = [])
-    )
+    ),
+    tag = "Attestation"
 )]
 pub async fn get_attestation_report(
     Query(params): Query<AttestationQuery>,

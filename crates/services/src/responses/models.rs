@@ -338,6 +338,7 @@ pub enum ResponseOutputItem {
         status: ResponseItemStatus,
         role: String,
         content: Vec<ResponseOutputContent>,
+        model: String,
     },
     #[serde(rename = "tool_call")]
     ToolCall {
@@ -351,6 +352,7 @@ pub enum ResponseOutputItem {
         status: ResponseItemStatus,
         tool_type: String,
         function: ResponseOutputFunction,
+        model: String,
     },
     #[serde(rename = "web_search_call")]
     WebSearchCall {
@@ -363,6 +365,7 @@ pub enum ResponseOutputItem {
         created_at: i64,
         status: ResponseItemStatus,
         action: WebSearchAction,
+        model: String,
     },
     #[serde(rename = "reasoning")]
     Reasoning {
@@ -376,6 +379,7 @@ pub enum ResponseOutputItem {
         status: ResponseItemStatus,
         summary: String,
         content: String,
+        model: String,
     },
 }
 

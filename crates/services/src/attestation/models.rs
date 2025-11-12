@@ -34,6 +34,8 @@ pub struct ChatSignature {
     pub signing_algo: String,
 }
 
+/// VPC (Virtual Private Cloud) metadata included in attestation reports
+/// This information is helpful to identify the VPC server and this VPC node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VpcInfo {
     /// VPC server app ID

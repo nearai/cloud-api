@@ -22,6 +22,7 @@ pub struct AttestationService {
     pub repository: Arc<dyn AttestationRepository + Send + Sync>,
     pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub models_repository: Arc<dyn ModelsRepository>,
+    pub vpc_info: Option<VpcInfo>,
 }
 
 impl AttestationService {
@@ -30,15 +31,19 @@ impl AttestationService {
         inference_provider_pool: Arc<InferenceProviderPool>,
         models_repository: Arc<dyn ModelsRepository>,
     ) -> Self {
+        // Load VPC info once during initialization
+        let vpc_info = load_vpc_info();
+
         Self {
             repository,
             inference_provider_pool,
             models_repository,
+            vpc_info,
         }
     }
 }
 
-/// Load VPC information from environment variables
+/// Load VPC (Virtual Private Cloud) information from environment variables
 pub fn load_vpc_info() -> Option<VpcInfo> {
     // Read VPC server app ID from environment
     let vpc_server_app_id = std::env::var("VPC_SERVER_APP_ID").ok();
@@ -172,8 +177,8 @@ impl ports::AttestationServiceTrait for AttestationService {
                 .map_err(|e| AttestationError::ProviderError(e.to_string()))?;
         }
 
-        // Load VPC info
-        let vpc = load_vpc_info();
+        // Use VPC info loaded at initialization
+        let vpc = self.vpc_info.clone();
 
         let gateway_attestation;
         if let Ok(_dev) = std::env::var("DEV") {

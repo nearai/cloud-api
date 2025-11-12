@@ -16,21 +16,21 @@ use uuid::Uuid;
 
 /// List organizations
 ///
-/// Lists all organizations accessible to the authenticated user.
+/// Get all organizations you belong to.
 #[utoipa::path(
     get,
-    path = "/organizations",
+    path = "/v1/organizations",
     tag = "Organizations",
     params(
-        ("limit" = Option<i64>, Query, description = "Maximum number of organizations to return"),
-        ("offset" = Option<i64>, Query, description = "Number of organizations to skip"),
-        ("order_by" = Option<OrganizationOrderBy>, Query, description = "Order by"),
-        ("order_direction" = Option<OrganizationOrderDirection>, Query, description = "Order direction")
+        ("limit" = Option<i64>, Query, description = "Maximum number to return"),
+        ("offset" = Option<i64>, Query, description = "Number to skip"),
+        ("order_by" = Option<OrganizationOrderBy>, Query, description = "Sort by field"),
+        ("order_direction" = Option<OrganizationOrderDirection>, Query, description = "Sort direction")
     ),
     responses(
-        (status = 200, description = "Paginated list of organizations", body = ListOrganizationsResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
+        (status = 200, description = "List of organizations", body = ListOrganizationsResponse),
+        (status = 401, description = "Invalid or missing session token", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
     ),
     security(
         ("session_token" = [])
@@ -150,7 +150,7 @@ impl From<OrganizationOrderDirection> for services::organization::OrganizationOr
 /// Creates a new organization with the authenticated user as owner.
 #[utoipa::path(
     post,
-    path = "/organizations",
+    path = "/v1/organizations",
     tag = "Organizations",
     request_body = CreateOrganizationRequest,
     responses(
@@ -246,7 +246,7 @@ pub async fn create_organization(
 /// Returns organization details for a specific organization ID.
 #[utoipa::path(
     get,
-    path = "/organizations/{org_id}",
+    path = "/v1/organizations/{org_id}",
     tag = "Organizations",
     params(
         ("org_id" = Uuid, Path, description = "Organization ID")
@@ -340,7 +340,7 @@ pub async fn get_organization(
 /// Updates organization details for a specific organization ID.
 #[utoipa::path(
     put,
-    path = "/organizations/{org_id}",
+    path = "/v1/organizations/{org_id}",
     tag = "Organizations",
     params(
         ("org_id" = Uuid, Path, description = "Organization ID")
@@ -417,7 +417,7 @@ pub async fn update_organization(
 /// Deletes an organization. Only the organization owner can perform this action.
 #[utoipa::path(
     delete,
-    path = "/organizations/{org_id}",
+    path = "/v1/organizations/{org_id}",
     tag = "Organizations",
     params(
         ("org_id" = Uuid, Path, description = "Organization ID")

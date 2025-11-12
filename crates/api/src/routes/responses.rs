@@ -68,19 +68,19 @@ pub struct ResponseRouteState {
     pub attestation_service: Arc<dyn AttestationServiceTrait>,
 }
 
-/// Create a new response
+/// Create response
 ///
-/// Creates a new response for a conversation.
+/// Generate an AI response for a conversation with tool calling and streaming support.
 #[utoipa::path(
     post,
-    path = "/responses",
+    path = "/v1/responses",
     tag = "Responses",
     request_body = CreateResponseRequest,
     responses(
-        (status = 200, description = "Response created successfully", body = ResponseObject),
-        (status = 400, description = "Bad request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
+        (status = 200, description = "Response created", body = ResponseObject),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -464,6 +464,25 @@ pub async fn create_response(
 }
 
 /// Get a response by ID
+///
+/// Retrieve details of a specific response.
+#[utoipa::path(
+    get,
+    path = "/v1/responses/{response_id}",
+    tag = "Responses",
+    params(
+        ("response_id" = String, Path, description = "Response ID")
+    ),
+    responses(
+        (status = 200, description = "Response details", body = ResponseObject),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 404, description = "Response not found", body = ErrorResponse),
+        (status = 501, description = "Not implemented", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
 pub async fn get_response(
     Path(_response_id): Path<String>,
     Query(_params): Query<GetResponseQuery>,
@@ -481,6 +500,25 @@ pub async fn get_response(
 }
 
 /// Delete a response
+///
+/// Delete a specific response.
+#[utoipa::path(
+    delete,
+    path = "/v1/responses/{response_id}",
+    tag = "Responses",
+    params(
+        ("response_id" = String, Path, description = "Response ID")
+    ),
+    responses(
+        (status = 200, description = "Response deleted successfully"),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 404, description = "Response not found", body = ErrorResponse),
+        (status = 501, description = "Not implemented", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
 pub async fn delete_response(
     Path(_response_id): Path<String>,
     State(_state): State<ResponseRouteState>,
@@ -497,6 +535,25 @@ pub async fn delete_response(
 }
 
 /// Cancel a response (for background responses)
+///
+/// Cancel an in-progress background response.
+#[utoipa::path(
+    post,
+    path = "/v1/responses/{response_id}/cancel",
+    tag = "Responses",
+    params(
+        ("response_id" = String, Path, description = "Response ID")
+    ),
+    responses(
+        (status = 200, description = "Response cancelled successfully", body = ResponseObject),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 404, description = "Response not found", body = ErrorResponse),
+        (status = 501, description = "Not implemented", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
 pub async fn cancel_response(
     Path(_response_id): Path<String>,
     State(_state): State<ResponseRouteState>,
@@ -512,7 +569,27 @@ pub async fn cancel_response(
     ))
 }
 
-/// List input items for a response (simplified implementation)
+/// List input items for a response
+///
+/// Retrieve all input items (user messages and files) for a specific response.
+#[utoipa::path(
+    get,
+    path = "/v1/responses/{response_id}/input_items",
+    tag = "Responses",
+    params(
+        ("response_id" = String, Path, description = "Response ID")
+    ),
+    responses(
+        (status = 200, description = "List of input items", body = ResponseInputItemList),
+        (status = 400, description = "Invalid response ID", body = ErrorResponse),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 404, description = "Response not found", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
 pub async fn list_input_items(
     Path(response_id): Path<String>,
     Query(params): Query<ListInputItemsQuery>,

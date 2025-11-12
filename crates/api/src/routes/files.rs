@@ -17,7 +17,7 @@ pub const MAX_FILE_SIZE: usize = 512 * 1024 * 1024; // 512 MB
 
 #[utoipa::path(
     post,
-    path = "/files",
+    path = "/v1/files",
     tag = "Files",
     request_body(content_type = "multipart/form-data"),
     responses(
@@ -253,7 +253,7 @@ pub async fn upload_file(
 
 #[utoipa::path(
     get,
-    path = "/files",
+    path = "/v1/files",
     tag = "Files",
     params(
         ("after" = Option<String>, Query, description = "A cursor for pagination. Pass the file ID to fetch files after this one."),
@@ -369,7 +369,7 @@ pub async fn list_files(
 
 #[utoipa::path(
     get,
-    path = "/files/{file_id}",
+    path = "/v1/files/{file_id}",
     tag = "Files",
     params(
         ("file_id" = String, Path, description = "The ID of the file to retrieve")
@@ -442,7 +442,7 @@ pub async fn get_file(
 
 #[utoipa::path(
     delete,
-    path = "/files/{file_id}",
+    path = "/v1/files/{file_id}",
     tag = "Files",
     params(
         ("file_id" = String, Path, description = "The ID of the file to delete")
@@ -523,7 +523,7 @@ pub async fn delete_file(
 
 #[utoipa::path(
     get,
-    path = "/files/{file_id}/content",
+    path = "/v1/files/{file_id}/content",
     tag = "Files",
     params(
         ("file_id" = String, Path, description = "The ID of the file to retrieve content from")

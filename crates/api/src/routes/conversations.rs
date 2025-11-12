@@ -34,19 +34,19 @@ fn map_conversation_error_to_status(error: &ConversationError) -> StatusCode {
     }
 }
 
-/// Create a new conversation
+/// Create conversation
 ///
-/// Creates a new conversation for the authenticated user.
+/// Create a new conversation to organize chat messages.
 #[utoipa::path(
     post,
     path = "/v1/conversations",
     tag = "Conversations",
     request_body = CreateConversationRequest,
     responses(
-        (status = 201, description = "Conversation created successfully", body = ConversationObject),
-        (status = 400, description = "Bad request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
+        (status = 201, description = "Conversation created", body = ConversationObject),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -104,9 +104,9 @@ pub async fn create_conversation(
     }
 }
 
-/// Get a conversation by ID
+/// Get conversation
 ///
-/// Returns details for a specific conversation.
+/// Retrieve conversation details by ID.
 #[utoipa::path(
     get,
     path = "/v1/conversations/{conversation_id}",
@@ -167,9 +167,9 @@ pub async fn get_conversation(
     }
 }
 
-/// Update a conversation
+/// Update conversation
 ///
-/// Updates a conversation's metadata.
+/// Update conversation metadata.
 #[utoipa::path(
     post,
     path = "/v1/conversations/{conversation_id}",
@@ -242,9 +242,9 @@ pub async fn update_conversation(
     }
 }
 
-/// Delete a conversation
+/// Delete conversation
 ///
-/// Deletes a conversation permanently.
+/// Delete a conversation and all its messages.
 #[utoipa::path(
     delete,
     path = "/v1/conversations/{conversation_id}",
@@ -312,9 +312,9 @@ pub async fn delete_conversation(
     }
 }
 
-/// List items in a conversation (extracts from responses)
+/// List conversation messages
 ///
-/// Returns items (messages, responses, etc.) within a specific conversation.
+/// Get all messages and responses in a conversation, sorted by creation time.
 #[utoipa::path(
     get,
     path = "/v1/conversations/{conversation_id}/items",

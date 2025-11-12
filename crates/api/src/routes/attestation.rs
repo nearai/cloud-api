@@ -34,6 +34,9 @@ impl From<services::attestation::ChatSignature> for SignatureResponse {
     }
 }
 
+/// Get completion signature
+///
+/// Get cryptographic signature for a chat completion for verification.
 #[utoipa::path(
     get,
     path = "/v1/signature/{chat_id}",
@@ -42,9 +45,9 @@ impl From<services::attestation::ChatSignature> for SignatureResponse {
         SignatureQuery
     ),
     responses(
-        (status = 200, description = "Signature retrieved successfully", body = SignatureResponse),
-        (status = 404, description = "Signature not found"),
-        (status = 400, description = "Invalid parameters")
+        (status = 200, description = "Signature retrieved", body = SignatureResponse),
+        (status = 404, description = "Signature not found", body = ErrorResponse),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -137,6 +140,9 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
     }
 }
 
+/// Get attestation report
+///
+/// Get hardware attestation report for TEE verification. Public endpoint.
 #[utoipa::path(
     get,
     path = "/v1/attestation/report",
@@ -144,12 +150,9 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
         AttestationQuery
     ),
     responses(
-        (status = 200, description = "Attestation report retrieved successfully", body = AttestationResponse),
-        (status = 400, description = "Invalid nonce format"),
-        (status = 503, description = "Attestation service unavailable")
-    ),
-    security(
-        ("api_key" = [])
+        (status = 200, description = "Attestation report retrieved", body = AttestationResponse),
+        (status = 400, description = "Invalid nonce format", body = ErrorResponse),
+        (status = 503, description = "Service unavailable", body = ErrorResponse)
     ),
     tag = "Attestation"
 )]

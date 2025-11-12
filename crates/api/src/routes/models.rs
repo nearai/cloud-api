@@ -26,10 +26,9 @@ pub struct ModelListQuery {
     pub offset: i64,
 }
 
-/// List all models with pricing information
+/// List models with pricing
 ///
-/// Returns a paginated list of all active models with their pricing and metadata information.
-/// This is a public endpoint that does not require authentication.
+/// Get all available models with pricing information. Public endpoint.
 #[utoipa::path(
     get,
     path = "/v1/model/list",
@@ -37,7 +36,8 @@ pub struct ModelListQuery {
     params(ModelListQuery),
     responses(
         (status = 200, description = "List of models with pricing", body = ModelListResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
+        (status = 400, description = "Invalid pagination parameters", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
     )
 )]
 pub async fn list_models(
@@ -104,24 +104,20 @@ pub async fn list_models(
     Ok(ResponseJson(response))
 }
 
-/// Get details of a single model by model name
+/// Get model details
 ///
-/// Returns the details of a specific model including pricing and metadata information.
-/// This is a public endpoint that does not require authentication.
-///
-/// **Note:** Model names containing forward slashes (e.g., "Qwen/Qwen3-30B-A3B-Instruct-2507") must be URL-encoded.
-/// For example, use "Qwen%2FQwen3-30B-A3B-Instruct-2507" in the URL path.
+/// Get pricing and metadata for a specific model. URL-encode model names containing slashes. Public endpoint.
 #[utoipa::path(
     get,
     path = "/v1/model/{model_name}",
     tag = "Models",
     params(
-        ("model_name" = String, Path, description = "The model name to retrieve (URL-encode if it contains slashes)")
+        ("model_name" = String, Path, description = "Model name (URL-encode if it contains slashes)")
     ),
     responses(
         (status = 200, description = "Model details with pricing", body = ModelWithPricing),
         (status = 404, description = "Model not found", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
+        (status = 500, description = "Server error", body = ErrorResponse)
     )
 )]
 pub async fn get_model_by_name(

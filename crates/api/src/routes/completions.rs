@@ -103,19 +103,21 @@ fn convert_text_request_to_service(
     }
 }
 
-/// Create a chat completion
+/// Create chat completion
 ///
-/// Creates a completion for a given chat conversation.
+/// Generate AI model responses for chat conversations. Supports both streaming and non-streaming modes.
+/// OpenAI-compatible endpoint.
 #[utoipa::path(
     post,
     path = "/v1/chat/completions",
     tag = "Chat",
     request_body = ChatCompletionRequest,
     responses(
-        (status = 200, description = "Successful completion", body = ChatCompletionResponse),
-        (status = 400, description = "Bad request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
+        (status = 200, description = "Completion generated successfully", body = ChatCompletionResponse),
+        (status = 400, description = "Invalid request parameters", body = ErrorResponse),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 402, description = "Insufficient credits", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -241,19 +243,19 @@ pub async fn chat_completions(
     }
 }
 
-/// Create a text completion
+/// Create text completion
 ///
-/// Creates a completion for a given text prompt.
+/// Generate AI model responses for text prompts. OpenAI-compatible endpoint.
 #[utoipa::path(
     post,
     path = "/v1/completions",
     tag = "Chat",
     request_body = CompletionRequest,
     responses(
-        (status = 200, description = "Successful completion", body = ChatCompletionResponse),
-        (status = 400, description = "Bad request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
+        (status = 200, description = "Completion generated successfully", body = ChatCompletionResponse),
+        (status = 400, description = "Invalid request parameters", body = ErrorResponse),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -332,17 +334,15 @@ pub async fn completions(
 
 /// List available models
 ///
-/// Lists all available AI models that can be used for completions.
-/// Returns models from the database with public-facing names.
-/// No pagination to follow the OpenAI API spec - returns all active models.
+/// Returns all AI models available for completions. OpenAI-compatible endpoint.
 #[utoipa::path(
     get,
     path = "/v1/models",
-    tag = "Models",
+    tag = "Chat",
     responses(
         (status = 200, description = "List of available models", body = ModelsResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])

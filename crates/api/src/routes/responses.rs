@@ -68,19 +68,19 @@ pub struct ResponseRouteState {
     pub attestation_service: Arc<dyn AttestationServiceTrait>,
 }
 
-/// Create a new response
+/// Create response
 ///
-/// Creates a new response for a conversation.
+/// Generate an AI response for a conversation with tool calling and streaming support.
 #[utoipa::path(
     post,
     path = "/v1/responses",
     tag = "Responses",
     request_body = CreateResponseRequest,
     responses(
-        (status = 200, description = "Response created successfully", body = ResponseObject),
-        (status = 400, description = "Bad request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
+        (status = 200, description = "Response created", body = ResponseObject),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])

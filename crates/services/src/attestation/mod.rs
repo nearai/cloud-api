@@ -46,6 +46,7 @@ pub fn load_vpc_info() -> Option<VpcInfo> {
     // Read VPC hostname from file
     let vpc_hostname = if let Ok(path) = std::env::var("VPC_HOSTNAME_FILE") {
         std::fs::read_to_string(path)
+            .map_err(|e| tracing::warn!("Failed to read VPC hostname file: {e}"))
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())

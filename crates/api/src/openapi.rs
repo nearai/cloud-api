@@ -47,8 +47,13 @@ use utoipa::{Modify, OpenApi};
         crate::routes::conversations::update_conversation,
         crate::routes::conversations::delete_conversation,
         crate::routes::conversations::list_conversation_items,
+        crate::routes::conversations::create_conversation_items,
         // Response endpoints
         crate::routes::responses::create_response,
+        crate::routes::responses::get_response,
+        crate::routes::responses::delete_response,
+        crate::routes::responses::cancel_response,
+        crate::routes::responses::list_input_items,
         // Organization endpoints
         crate::routes::organizations::list_organizations,
         crate::routes::organizations::create_organization,

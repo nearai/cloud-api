@@ -21,6 +21,8 @@ pub struct ResponseStreamContext {
     /// Accumulated token usage from all completion calls
     pub total_input_tokens: i32,
     pub total_output_tokens: i32,
+    /// Accumulated reasoning tokens from reasoning content
+    pub reasoning_tokens: i32,
     /// Response metadata for enriching output items
     pub response_id_str: String,
     pub previous_response_id: Option<String>,
@@ -44,6 +46,7 @@ impl ResponseStreamContext {
             output_item_index: 0,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            reasoning_tokens: 0,
             response_id_str,
             previous_response_id,
             created_at,
@@ -66,6 +69,16 @@ impl ResponseStreamContext {
     pub fn add_usage(&mut self, input_tokens: i32, output_tokens: i32) {
         self.total_input_tokens += input_tokens;
         self.total_output_tokens += output_tokens;
+    }
+
+    /// Add reasoning tokens from detected reasoning content
+    pub fn add_reasoning_tokens(&mut self, tokens: i32) {
+        self.reasoning_tokens += tokens;
+    }
+
+    /// Estimate token count from text (rough approximation: chars / 4)
+    pub fn estimate_tokens(text: &str) -> i32 {
+        (text.len() / 4).max(1) as i32
     }
 }
 
@@ -317,6 +330,92 @@ impl EventEmitter {
             conversation_title: None,
         };
         self.send(event).await
+    }
+
+    /// Emit reasoning item.added event
+    pub async fn emit_reasoning_started(
+        &mut self,
+        ctx: &mut ResponseStreamContext,
+        reasoning_id: &str,
+    ) -> Result<(), errors::ResponseError> {
+        let item = models::ResponseOutputItem::Reasoning {
+            id: reasoning_id.to_string(),
+            response_id: ctx.response_id_str.clone(),
+            previous_response_id: ctx.previous_response_id.clone(),
+            next_response_ids: vec![],
+            created_at: ctx.created_at,
+            status: models::ResponseItemStatus::InProgress,
+            summary: String::new(),
+            content: String::new(),
+        };
+        self.emit_item_added(ctx, item, reasoning_id.to_string())
+            .await
+    }
+
+    /// Emit reasoning delta event
+    pub async fn emit_reasoning_delta(
+        &mut self,
+        ctx: &mut ResponseStreamContext,
+        reasoning_id: String,
+        delta: String,
+    ) -> Result<(), errors::ResponseError> {
+        let event = models::ResponseStreamEvent {
+            event_type: "response.reasoning.delta".to_string(),
+            sequence_number: Some(ctx.next_sequence()),
+            response: None,
+            output_index: Some(ctx.output_item_index),
+            content_index: None,
+            item: None,
+            item_id: Some(reasoning_id),
+            part: None,
+            delta: Some(delta),
+            text: None,
+            logprobs: None,
+            obfuscation: None,
+            annotation_index: None,
+            annotation: None,
+            conversation_title: None,
+        };
+        self.send(event).await
+    }
+
+    /// Emit reasoning item.done event
+    pub async fn emit_reasoning_completed(
+        &mut self,
+        ctx: &mut ResponseStreamContext,
+        reasoning_id: &str,
+        content: &str,
+        response_items_repository: &std::sync::Arc<dyn crate::responses::ports::ResponseItemRepositoryTrait>,
+    ) -> Result<(), errors::ResponseError> {
+        let item = models::ResponseOutputItem::Reasoning {
+            id: reasoning_id.to_string(),
+            response_id: ctx.response_id_str.clone(),
+            previous_response_id: ctx.previous_response_id.clone(),
+            next_response_ids: vec![],
+            created_at: ctx.created_at,
+            status: models::ResponseItemStatus::Completed,
+            summary: String::new(), // Summary can be populated later if needed
+            content: content.to_string(),
+        };
+
+        // Emit done event
+        self.emit_item_done(ctx, item.clone(), reasoning_id.to_string())
+            .await?;
+
+        // Store the reasoning item in the database
+        if let Err(e) = response_items_repository
+            .create(
+                ctx.response_id.clone(),
+                ctx.api_key_id,
+                ctx.conversation_id,
+                item.clone(),
+            )
+            .await
+        {
+            tracing::error!("Failed to store reasoning item in database: {}", e);
+        }
+
+        Ok(())
     }
 
     /// Send an event to the stream

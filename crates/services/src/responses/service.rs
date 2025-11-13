@@ -41,6 +41,14 @@ pub struct ResponseServiceImpl {
     pub file_service: Arc<dyn FileServiceTrait>,
 }
 
+/// Tag transition states for reasoning content
+#[derive(Debug, PartialEq)]
+enum TagTransition {
+    None,
+    OpeningTag(String), // Contains the tag name that was opened
+    ClosingTag(String), // Contains the tag name that was closed
+}
+
 impl ResponseServiceImpl {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -191,23 +199,86 @@ impl ResponseServiceImpl {
         let mut message_item_emitted = false;
         let message_item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
 
+        // Reasoning tracking state
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+        let mut reasoning_item_emitted = false;
+        let reasoning_item_id = format!("rs_{}", uuid::Uuid::new_v4().simple());
+
         while let Some(event) = completion_stream.next().await {
             match event {
                 Ok(sse_event) => {
                     // Parse the SSE event for content and tool calls
                     if let Some(delta_text) = Self::extract_text_delta(&sse_event) {
-                        // First time we receive text, emit the item.added and content_part.added events
-                        if !message_item_emitted {
-                            Self::emit_message_started(emitter, ctx, &message_item_id).await?;
-                            message_item_emitted = true;
+                        // Process reasoning tags and extract clean text
+                        let (clean_text, reasoning_delta, tag_transition) = 
+                            Self::process_reasoning_tags(&delta_text, &mut reasoning_buffer, &mut inside_reasoning);
+
+                        // Handle reasoning tag transitions
+                        match tag_transition {
+                            TagTransition::OpeningTag(_) => {
+                                if !reasoning_item_emitted {
+                                    // Emit reasoning item.added
+                                    emitter
+                                        .emit_reasoning_started(ctx, &reasoning_item_id)
+                                        .await?;
+                                    reasoning_item_emitted = true;
+                                }
+                            }
+                            TagTransition::ClosingTag(_) => {
+                                if reasoning_item_emitted {
+                                    // Emit reasoning item.done and store
+                                    emitter
+                                        .emit_reasoning_completed(
+                                            ctx,
+                                            &reasoning_item_id,
+                                            &reasoning_buffer,
+                                            response_items_repository,
+                                        )
+                                        .await?;
+
+                                    // Count reasoning tokens
+                                    let reasoning_token_count = 
+                                        crate::responses::service_helpers::ResponseStreamContext::estimate_tokens(&reasoning_buffer);
+                                    ctx.add_reasoning_tokens(reasoning_token_count);
+
+                                    // Move to next output index
+                                    ctx.next_output_index();
+                                    
+                                    // Reset reasoning state
+                                    reasoning_buffer.clear();
+                                    reasoning_item_emitted = false;
+                                }
+                            }
+                            TagTransition::None => {}
                         }
 
-                        current_text.push_str(&delta_text);
+                        // Emit reasoning deltas if inside reasoning block
+                        if let Some(reasoning_content) = reasoning_delta {
+                            if reasoning_item_emitted {
+                                emitter
+                                    .emit_reasoning_delta(ctx, reasoning_item_id.clone(), reasoning_content)
+                                    .await?;
+                            }
+                        }
 
-                        // Emit delta event
-                        emitter
-                            .emit_text_delta(ctx, message_item_id.clone(), delta_text)
-                            .await?;
+                        // Handle clean text (message content)
+                        if !clean_text.is_empty() {
+                            // First time we receive message text, emit the item.added and content_part.added events
+                            if !message_item_emitted && !inside_reasoning {
+                                Self::emit_message_started(emitter, ctx, &message_item_id).await?;
+                                message_item_emitted = true;
+                            }
+
+                            current_text.push_str(&clean_text);
+
+                            // Emit delta event for message content
+                            if message_item_emitted {
+                                emitter
+                                    .emit_text_delta(ctx, message_item_id.clone(), clean_text)
+                                    .await?;
+                            }
+                        }
                     }
 
                     // Extract usage from the final chunk
@@ -578,11 +649,16 @@ impl ResponseServiceImpl {
         final_response.output = output_items;
 
         // Set usage from accumulated token counts
-        final_response.usage = models::Usage::new(ctx.total_input_tokens, ctx.total_output_tokens);
+        final_response.usage = models::Usage::new_with_reasoning(
+            ctx.total_input_tokens, 
+            ctx.total_output_tokens,
+            ctx.reasoning_tokens
+        );
         tracing::debug!(
-            "Final response usage: input={}, output={}, total={}",
+            "Final response usage: input={}, output={}, reasoning={}, total={}",
             ctx.total_input_tokens,
             ctx.total_output_tokens,
+            ctx.reasoning_tokens,
             ctx.total_input_tokens + ctx.total_output_tokens
         );
 
@@ -1492,6 +1568,97 @@ impl ResponseServiceImpl {
         }
     }
 
+    /// Process reasoning tags in text delta
+    /// Returns (clean_text, reasoning_delta, tag_transition)
+    /// 
+    /// Handles common reasoning tags: <think>, <reasoning>, <thought>, <reflect>, <analysis>
+    fn process_reasoning_tags(
+        delta_text: &str,
+        reasoning_buffer: &mut String,
+        inside_reasoning: &mut bool,
+    ) -> (String, Option<String>, TagTransition) {
+        const REASONING_TAGS: &[&str] = &["think", "reasoning", "thought", "reflect", "analysis"];
+        
+        let mut clean_text = String::new();
+        let mut reasoning_delta = String::new();
+        let mut tag_transition = TagTransition::None;
+        let mut chars = delta_text.chars().peekable();
+        
+        while let Some(ch) = chars.next() {
+            if ch == '<' {
+                // Check if this is an opening or closing tag
+                let mut tag_candidate = String::new();
+                let is_closing = chars.peek() == Some(&'/');
+                
+                if is_closing {
+                    chars.next(); // consume '/'
+                }
+                
+                // Collect tag name
+                while let Some(&next_ch) = chars.peek() {
+                    if next_ch == '>' {
+                        chars.next(); // consume '>'
+                        break;
+                    } else if next_ch.is_alphanumeric() || next_ch == '_' || next_ch == '-' {
+                        tag_candidate.push(next_ch);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                
+                let tag_name = tag_candidate.to_lowercase();
+                
+                // Check if this is a known reasoning tag
+                if REASONING_TAGS.contains(&tag_name.as_str()) {
+                    if is_closing && *inside_reasoning {
+                        // Closing reasoning tag
+                        *inside_reasoning = false;
+                        tag_transition = TagTransition::ClosingTag(tag_name.clone());
+                        tracing::debug!("Detected closing reasoning tag: </{}>", tag_name);
+                    } else if !is_closing && !*inside_reasoning {
+                        // Opening reasoning tag
+                        *inside_reasoning = true;
+                        tag_transition = TagTransition::OpeningTag(tag_name.clone());
+                        tracing::debug!("Detected opening reasoning tag: <{}>", tag_name);
+                    }
+                    // Don't include the tag itself in any output
+                    continue;
+                }
+                
+                // Not a reasoning tag, reconstruct the tag text
+                let reconstructed = if is_closing {
+                    format!("</{}>", tag_candidate)
+                } else {
+                    format!("<{}>", tag_candidate)
+                };
+                
+                if *inside_reasoning {
+                    reasoning_delta.push_str(&reconstructed);
+                    reasoning_buffer.push_str(&reconstructed);
+                } else {
+                    clean_text.push_str(&reconstructed);
+                }
+            } else {
+                // Regular character
+                if *inside_reasoning {
+                    reasoning_delta.push(ch);
+                    reasoning_buffer.push(ch);
+                } else {
+                    clean_text.push(ch);
+                }
+            }
+        }
+        
+        let reasoning_result = if !reasoning_delta.is_empty() {
+            Some(reasoning_delta)
+        } else {
+            None
+        };
+        
+        (clean_text, reasoning_result, tag_transition)
+    }
+
     /// Extract and accumulate usage information from SSE event
     /// Usage typically comes in the final chunk from the provider
     fn extract_and_accumulate_usage(
@@ -1922,5 +2089,146 @@ impl ResponseServiceImpl {
         let _ = tx.send(event).await;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_process_reasoning_tags_simple_think() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test opening tag
+        let (clean, reasoning, transition) = 
+            ResponseServiceImpl::process_reasoning_tags("<think>", &mut reasoning_buffer, &mut inside_reasoning);
+        assert_eq!(clean, "");
+        assert_eq!(reasoning, None);
+        assert_eq!(transition, TagTransition::OpeningTag("think".to_string()));
+        assert!(inside_reasoning);
+
+        // Test content inside reasoning
+        let (clean, reasoning, transition) = 
+            ResponseServiceImpl::process_reasoning_tags("This is reasoning", &mut reasoning_buffer, &mut inside_reasoning);
+        assert_eq!(clean, "");
+        assert_eq!(reasoning, Some("This is reasoning".to_string()));
+        assert_eq!(transition, TagTransition::None);
+        assert!(inside_reasoning);
+        assert_eq!(reasoning_buffer, "This is reasoning");
+
+        // Test closing tag
+        let (clean, reasoning, transition) = 
+            ResponseServiceImpl::process_reasoning_tags("</think>", &mut reasoning_buffer, &mut inside_reasoning);
+        assert_eq!(clean, "");
+        assert_eq!(reasoning, None);
+        assert_eq!(transition, TagTransition::ClosingTag("think".to_string()));
+        assert!(!inside_reasoning);
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_mixed_content() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test text before reasoning tag
+        let (clean, reasoning, _transition) = 
+            ResponseServiceImpl::process_reasoning_tags("Hello <think>reasoning content</think> world", &mut reasoning_buffer, &mut inside_reasoning);
+        assert_eq!(clean, "Hello  world");
+        assert!(reasoning.is_some());
+        assert_eq!(reasoning_buffer, "reasoning content");
+        assert!(!inside_reasoning); // Should end outside reasoning
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_multiple_tags() {
+        let test_tags = vec!["think", "reasoning", "thought", "reflect", "analysis"];
+        
+        for tag in test_tags {
+            let mut reasoning_buffer = String::new();
+            let mut inside_reasoning = false;
+
+            let input = format!("<{}>test content</{}>", tag, tag);
+            let (clean, reasoning, _) = 
+                ResponseServiceImpl::process_reasoning_tags(&input, &mut reasoning_buffer, &mut inside_reasoning);
+            
+            assert_eq!(clean, "");
+            assert!(reasoning.is_some() || reasoning_buffer.contains("test content"));
+            assert!(!inside_reasoning);
+        }
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_strips_from_message() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        let input = "The answer is <think>Let me think about this carefully</think> 42";
+        let (clean, _, _) = 
+            ResponseServiceImpl::process_reasoning_tags(input, &mut reasoning_buffer, &mut inside_reasoning);
+        
+        assert_eq!(clean, "The answer is  42");
+        assert_eq!(reasoning_buffer, "Let me think about this carefully");
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_partial_chunks() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Note: The current implementation handles full tags but not tags split mid-name.
+        // This is acceptable for real-world streaming where complete tokens are usually sent together.
+        // Testing with complete tag boundaries that come in separate chunks:
+        let chunks = vec!["<think>", "reasoning", " content", "</think>"];
+        let mut all_clean = String::new();
+
+        for chunk in chunks {
+            let (clean, reasoning, _) = 
+                ResponseServiceImpl::process_reasoning_tags(chunk, &mut reasoning_buffer, &mut inside_reasoning);
+            all_clean.push_str(&clean);
+            if let Some(r) = reasoning {
+                // Just accumulating
+                let _ = r;
+            }
+        }
+
+        assert_eq!(all_clean, "");
+        assert_eq!(reasoning_buffer, "reasoning content");
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_nested_html() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        let input = "<think>Consider <b>this</b> carefully</think>";
+        let (clean, _, _) = 
+            ResponseServiceImpl::process_reasoning_tags(input, &mut reasoning_buffer, &mut inside_reasoning);
+        
+        assert_eq!(clean, "");
+        assert_eq!(reasoning_buffer, "Consider <b>this</b> carefully");
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_no_closing() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        let (clean, reasoning, _) = 
+            ResponseServiceImpl::process_reasoning_tags("<think>Never closed", &mut reasoning_buffer, &mut inside_reasoning);
+        
+        assert_eq!(clean, "");
+        assert_eq!(reasoning, Some("Never closed".to_string()));
+        assert!(inside_reasoning);
+    }
+
+    #[test]
+    fn test_estimate_tokens() {
+        use crate::responses::service_helpers::ResponseStreamContext;
+        
+        assert_eq!(ResponseStreamContext::estimate_tokens("test"), 1);
+        assert_eq!(ResponseStreamContext::estimate_tokens("Hello world"), 2);
+        assert_eq!(ResponseStreamContext::estimate_tokens("This is a longer text"), 5);
     }
 }

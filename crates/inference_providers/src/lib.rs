@@ -53,6 +53,7 @@
 //! }
 //! ```
 
+pub mod mock;
 pub mod models;
 pub mod sse_parser;
 pub mod vllm;
@@ -65,11 +66,12 @@ use models::*;
 use tokio_stream::StreamExt;
 
 // Re-export commonly used types for convenience
+pub use mock::MockProvider;
 pub use models::{
     ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionResponseWithBytes, ChatDelta, ChatMessage, ChatResponseMessage, ChatSignature,
-    CompletionError, CompletionParams, FinishReason, MessageRole, ModelInfo, StreamChunk,
-    StreamOptions, TokenUsage,
+    CompletionError, CompletionParams, FinishReason, FunctionChoice, FunctionDefinition,
+    MessageRole, ModelInfo, StreamChunk, StreamOptions, TokenUsage, ToolChoice, ToolDefinition,
 };
 pub use sse_parser::SSEEvent;
 pub use vllm::{VLlmConfig, VLlmProvider};

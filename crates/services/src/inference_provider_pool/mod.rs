@@ -28,6 +28,8 @@ pub struct InferenceProviderPool {
     api_key: Option<String>,
     /// HTTP timeout for discovery requests
     discovery_timeout: Duration,
+    /// HTTP timeout for model inference requests
+    inference_timeout_secs: i64,
     /// Map of model name -> list of providers (for load balancing)
     model_mapping: Arc<RwLock<HashMap<String, Vec<Arc<InferenceProviderTrait>>>>>,
     /// Round-robin index for each model
@@ -42,11 +44,13 @@ impl InferenceProviderPool {
         discovery_url: String,
         api_key: Option<String>,
         discovery_timeout_secs: i64,
+        inference_timeout_secs: i64,
     ) -> Self {
         Self {
             discovery_url,
             api_key,
             discovery_timeout: Duration::from_secs(discovery_timeout_secs as u64),
+            inference_timeout_secs,
             model_mapping: Arc::new(RwLock::new(HashMap::new())),
             load_balancer_index: Arc::new(RwLock::new(HashMap::new())),
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
@@ -204,7 +208,7 @@ impl InferenceProviderPool {
                 let provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
                     url,
                     self.api_key.clone(),
-                    None,
+                    Some(self.inference_timeout_secs),
                 ))) as Arc<InferenceProviderTrait>;
 
                 providers_for_model.push(provider);
@@ -412,7 +416,6 @@ impl InferenceProviderPool {
                     tracing::warn!(
                         model_id = %model_id,
                         attempt = attempt + 1,
-                        error = %error_str,
                         operation = operation_name,
                         "Provider failed, will try next provider if available"
                     );

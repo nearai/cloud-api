@@ -33,6 +33,7 @@ pub struct ModelWithPricing {
     // Model metadata
     pub context_length: i32,
     pub verifiable: bool,
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -90,6 +91,13 @@ pub trait ModelsServiceTrait: Send + Sync {
 
     /// Get a specific model by name
     async fn get_model_by_name(&self, model_name: &str) -> Result<ModelWithPricing, ModelsError>;
+
+    /// Resolve a model identifier (alias or canonical name) and return the full model details
+    /// Returns an error if the model is not found or not active
+    async fn resolve_and_get_model(
+        &self,
+        identifier: &str,
+    ) -> Result<ModelWithPricing, ModelsError>;
 
     /// Get list of configured model names (canonical names) from database
     /// Returns only active models that have been configured with pricing

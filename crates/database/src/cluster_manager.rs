@@ -228,11 +228,8 @@ impl ClusterManager {
             if let Some(pool) = read_pools.get(&replica.host) {
                 match pool.get().await {
                     Ok(conn) => return Ok(conn),
-                    Err(e) => {
-                        warn!(
-                            "Failed to get connection from replica {}: {}",
-                            replica.name, e
-                        );
+                    Err(_) => {
+                        warn!("Failed to get connection from replica {}", replica.name);
                     }
                 }
             }
@@ -267,11 +264,8 @@ impl ClusterManager {
                         );
                         return Ok(conn);
                     }
-                    Err(e) => {
-                        warn!(
-                            "Failed to get connection from replica {}: {}",
-                            replica.name, e
-                        );
+                    Err(_) => {
+                        warn!("Failed to get connection from replica {}", replica.name);
                     }
                 }
             }

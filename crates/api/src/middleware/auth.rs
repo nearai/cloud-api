@@ -149,7 +149,7 @@ pub async fn auth_middleware(
     State(state): State<AuthState>,
     request: Request,
     next: Next,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
     // Try to extract authentication from various sources
     let auth_header = request
         .headers()
@@ -168,10 +168,22 @@ pub async fn auth_middleware(
             authenticate_session_access(&state, token.to_string()).await
         } else {
             debug!("Authorization header does not start with 'Bearer '");
-            Err(StatusCode::UNAUTHORIZED)
+            Err((
+                StatusCode::UNAUTHORIZED,
+                axum::Json(crate::models::ErrorResponse::new(
+                    "Authorization header does not start with 'Bearer '".to_string(),
+                    "unauthorized".to_string(),
+                )),
+            ))
         }
     } else {
-        Err(StatusCode::UNAUTHORIZED)
+        Err((
+            StatusCode::UNAUTHORIZED,
+            axum::Json(crate::models::ErrorResponse::new(
+                "Missing authorization".to_string(),
+                "unauthorized".to_string(),
+            )),
+        ))
     };
 
     match auth_result {
@@ -191,7 +203,7 @@ pub async fn admin_middleware(
     State(state): State<AuthState>,
     request: Request,
     next: Next,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
     // Try to extract authentication from various sources
     let auth_header = request
         .headers()
@@ -223,7 +235,13 @@ pub async fn admin_middleware(
                     // For access token management endpoints, only allow session-based authentication
                     if is_access_token_management {
                         debug!("Access token management endpoint detected. Forbidden.");
-                        return Err(StatusCode::FORBIDDEN);
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            axum::Json(crate::models::ErrorResponse::new(
+                                "Access token management endpoint detected".to_string(),
+                                "forbidden".to_string(),
+                            )),
+                        ));
                     }
 
                     // Query the actual admin user from database
@@ -237,7 +255,13 @@ pub async fn admin_middleware(
                         }
                         Err(_) => {
                             error!("Failed to get admin user for access token");
-                            Err(StatusCode::INTERNAL_SERVER_ERROR)
+                            Err((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                axum::Json(crate::models::ErrorResponse::new(
+                                    "Failed to get admin user for access token".to_string(),
+                                    "internal_server_error".to_string(),
+                                )),
+                            ))
                         }
                     }
                 }
@@ -248,10 +272,22 @@ pub async fn admin_middleware(
             }
         } else {
             debug!("Authorization header does not start with 'Bearer '");
-            Err(StatusCode::UNAUTHORIZED)
+            Err((
+                StatusCode::UNAUTHORIZED,
+                axum::Json(crate::models::ErrorResponse::new(
+                    "Authorization header does not start with 'Bearer '".to_string(),
+                    "unauthorized".to_string(),
+                )),
+            ))
         }
     } else {
-        Err(StatusCode::UNAUTHORIZED)
+        Err((
+            StatusCode::UNAUTHORIZED,
+            axum::Json(crate::models::ErrorResponse::new(
+                "Missing authorization".to_string(),
+                "unauthorized".to_string(),
+            )),
+        ))
     };
 
     match auth_result {
@@ -261,7 +297,13 @@ pub async fn admin_middleware(
 
             if !is_admin {
                 error!("User attempted admin action without admin privileges");
-                return Err(StatusCode::FORBIDDEN);
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    axum::Json(crate::models::ErrorResponse::new(
+                        "No admin privileges".to_string(),
+                        "forbidden".to_string(),
+                    )),
+                ));
             }
 
             debug!(
@@ -303,7 +345,10 @@ async fn authenticate_admin_access_token(
     state: &AuthState,
     token: &str,
     current_user_agent: Option<&str>,
-) -> Result<database::models::AdminAccessToken, StatusCode> {
+) -> Result<
+    database::models::AdminAccessToken,
+    (StatusCode, axum::Json<crate::models::ErrorResponse>),
+> {
     debug!("Authenticating admin access token: {}", token);
 
     match state
@@ -320,11 +365,23 @@ async fn authenticate_admin_access_token(
         }
         Ok(None) => {
             debug!("Admin access token not found, inactive, or User-Agent mismatch");
-            Err(StatusCode::UNAUTHORIZED)
+            Err((
+                StatusCode::UNAUTHORIZED,
+                axum::Json(crate::models::ErrorResponse::new(
+                    "Admin access token not found or expired".to_string(),
+                    "unauthorized".to_string(),
+                )),
+            ))
         }
         Err(_) => {
             error!("Failed to validate admin access token");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(crate::models::ErrorResponse::new(
+                    "Failed to validate admin access token".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
         }
     }
 }
@@ -332,7 +389,7 @@ async fn authenticate_admin_access_token(
 async fn authenticate_session_access(
     state: &AuthState,
     token: String, // jwt
-) -> Result<DbUser, StatusCode> {
+) -> Result<DbUser, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
     debug!("Authenticating session access token: {}", token);
     // Use auth service
 
@@ -353,14 +410,26 @@ async fn authenticate_session_access(
             }
             Err(_) => {
                 error!("Failed to validate session via auth service");
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(crate::models::ErrorResponse::new(
+                        "Failed to validate session via auth service".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                ));
             }
         }
     }
 
     // No fallback available, session is invalid
     debug!("Invalid or expired session access token");
-    Err(StatusCode::UNAUTHORIZED)
+    Err((
+        StatusCode::UNAUTHORIZED,
+        axum::Json(crate::models::ErrorResponse::new(
+            "Invalid or expired access token".to_string(),
+            "unauthorized".to_string(),
+        )),
+    ))
 }
 
 pub async fn refresh_middleware(
@@ -473,7 +542,7 @@ async fn authenticate_api_key(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(crate::models::ErrorResponse::new(
                     "Failed to validate API key".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }
@@ -529,7 +598,7 @@ async fn authenticate_api_key_with_context(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(crate::models::ErrorResponse::new(
                     "Failed to resolve workspace/organization".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             ))
         }

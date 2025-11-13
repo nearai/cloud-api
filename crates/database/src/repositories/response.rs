@@ -1,9 +1,10 @@
 use crate::pool::DbPool;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
-use services::{responses::ports::*, UserId};
-use tracing::debug;
+use chrono::{DateTime, Utc};
+use services::responses::models::*;
+use services::responses::ports::*;
+use services::workspace::WorkspaceId;
 use uuid::Uuid;
 
 pub struct PgResponseRepository {
@@ -14,287 +15,663 @@ impl PgResponseRepository {
     pub fn new(pool: DbPool) -> Self {
         Self { pool }
     }
+}
 
-    // Helper method to convert database row to domain model
-    fn row_to_response(&self, row: tokio_postgres::Row) -> Result<Response> {
-        let status_str: String = row.try_get("status")?;
-        let status = match status_str.as_str() {
+#[async_trait]
+impl ResponseRepositoryTrait for PgResponseRepository {
+    async fn create(
+        &self,
+        workspace_id: WorkspaceId,
+        api_key_id: uuid::Uuid,
+        request: CreateResponseRequest,
+    ) -> Result<ResponseObject, anyhow::Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        // Generate new response ID
+        let response_uuid = Uuid::new_v4();
+        let response_id = format!("resp_{}", response_uuid.simple());
+        let now = Utc::now();
+
+        // Extract conversation_id if present in request
+        let mut conversation_uuid = if let Some(conv_ref) = &request.conversation {
+            match conv_ref {
+                ConversationReference::Id(id) => {
+                    let uuid_str = id.strip_prefix("conv_").unwrap_or(id);
+                    Some(Uuid::parse_str(uuid_str).context("Invalid conversation ID")?)
+                }
+                ConversationReference::Object { id, .. } => {
+                    let uuid_str = id.strip_prefix("conv_").unwrap_or(id);
+                    Some(Uuid::parse_str(uuid_str).context("Invalid conversation ID")?)
+                }
+            }
+        } else {
+            None
+        };
+
+        // Extract previous_response_id if present (this is the parent response)
+        // If not provided but conversation is provided, find the latest response in the conversation
+        let previous_response_uuid = if let Some(prev_id) = &request.previous_response_id {
+            let uuid_str = prev_id.strip_prefix("resp_").unwrap_or(prev_id);
+            let prev_uuid = Uuid::parse_str(uuid_str).context("Invalid previous response ID")?;
+
+            // If conversation_uuid is not explicitly set, inherit it from the previous response
+            if conversation_uuid.is_none() {
+                // Fetch the previous response to get its conversation_id
+                let prev_response = client
+                    .query_opt(
+                        r#"
+                        SELECT conversation_id
+                        FROM responses
+                        WHERE id = $1 AND workspace_id = $2
+                        "#,
+                        &[&prev_uuid, &workspace_id.0],
+                    )
+                    .await
+                    .context("Failed to fetch previous response")?;
+
+                if let Some(row) = prev_response {
+                    let prev_conversation_id: Option<Uuid> = row.get("conversation_id");
+                    conversation_uuid = prev_conversation_id;
+
+                    if conversation_uuid.is_some() {
+                        tracing::debug!(
+                            "Inherited conversation_id from previous response {}",
+                            prev_id
+                        );
+                    }
+                }
+            }
+
+            Some(prev_uuid)
+        } else if let Some(conv_uuid) = conversation_uuid {
+            // No explicit previous_response_id, but conversation exists
+            // Find the latest response in this conversation to link to it
+            let latest_response = self
+                .get_latest_in_conversation(
+                    services::conversations::models::ConversationId(conv_uuid),
+                    workspace_id.clone(),
+                )
+                .await?;
+
+            if let Some(latest) = latest_response {
+                // Extract UUID from the latest response ID (format: "resp_{uuid}")
+                let latest_uuid_str = latest.id.strip_prefix("resp_").unwrap_or(&latest.id);
+                Some(Uuid::parse_str(latest_uuid_str).context("Invalid latest response ID")?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Initial status is in_progress
+        let status = "in_progress";
+
+        // Prepare usage and metadata as JSONB
+        let usage_json = serde_json::json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0
+        });
+        let metadata_json = request.metadata.unwrap_or_else(|| serde_json::json!({}));
+        let next_response_ids_json = serde_json::json!([]);
+
+        // Insert response into database (without input_messages or output_message)
+        // Messages are stored separately as response_items
+        client
+            .execute(
+                r#"
+                INSERT INTO responses (
+                    id, workspace_id, api_key_id, model, status, instructions, conversation_id, 
+                    previous_response_id, next_response_ids, usage, metadata, 
+                    created_at, updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                "#,
+                &[
+                    &response_uuid,
+                    &workspace_id.0,
+                    &api_key_id,
+                    &request.model,
+                    &status,
+                    &request.instructions,
+                    &conversation_uuid,
+                    &previous_response_uuid,
+                    &next_response_ids_json,
+                    &usage_json,
+                    &metadata_json,
+                    &now,
+                    &now,
+                ],
+            )
+            .await
+            .context("Failed to insert response")?;
+
+        // If previous_response_id is present, update the previous response's next_response_ids array
+        if let Some(parent_uuid) = previous_response_uuid {
+            client
+                .execute(
+                    r#"
+                    UPDATE responses
+                    SET next_response_ids = next_response_ids || $1::jsonb,
+                        updated_at = $2
+                    WHERE id = $3 AND workspace_id = $4
+                    "#,
+                    &[
+                        &serde_json::json!([response_uuid.to_string()]),
+                        &now,
+                        &parent_uuid,
+                        &workspace_id.0,
+                    ],
+                )
+                .await
+                .context("Failed to update previous response's next_response_ids")?;
+        }
+
+        // Build conversation reference if conversation_id is present
+        let conversation_ref = conversation_uuid.map(|uuid| ConversationResponseReference {
+            id: format!("conv_{}", uuid.simple()),
+        });
+
+        // Build ResponseObject from the database row
+        let response_obj = ResponseObject {
+            id: response_id,
+            object: "response".to_string(),
+            created_at: now.timestamp(),
+            status: ResponseStatus::InProgress,
+            background: request.background.unwrap_or(false),
+            conversation: conversation_ref,
+            error: None,
+            incomplete_details: None,
+            instructions: request.instructions,
+            max_output_tokens: request.max_output_tokens,
+            max_tool_calls: request.max_tool_calls,
+            model: request.model,
+            output: vec![],
+            parallel_tool_calls: request.parallel_tool_calls.unwrap_or(false),
+            previous_response_id: request.previous_response_id.clone(),
+            next_response_ids: vec![],
+            prompt_cache_key: request.prompt_cache_key,
+            prompt_cache_retention: None,
+            reasoning: None,
+            safety_identifier: request.safety_identifier,
+            service_tier: "default".to_string(),
+            store: request.store.unwrap_or(false),
+            temperature: request.temperature.unwrap_or(1.0),
+            text: request.text.or(Some(ResponseTextConfig {
+                format: ResponseTextFormat::Text,
+                verbosity: Some("medium".to_string()),
+            })),
+            tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
+            tools: request.tools.clone().unwrap_or_else(|| {
+                vec![ResponseTool::WebSearch {
+                    filters: None,
+                    search_context_size: Some("medium".to_string()),
+                    user_location: Some(UserLocation {
+                        type_: "approximate".to_string(),
+                        city: None,
+                        country: Some("US".to_string()),
+                        region: None,
+                        timezone: None,
+                    }),
+                }]
+            }),
+            top_logprobs: 0,
+            top_p: request.top_p.unwrap_or(1.0),
+            truncation: "disabled".to_string(),
+            usage: Usage::new(0, 0),
+            user: None,
+            metadata: Some(metadata_json),
+        };
+
+        tracing::info!(
+            "Created response {} for workspace {} with api_key {}",
+            response_obj.id,
+            workspace_id.0,
+            api_key_id
+        );
+        Ok(response_obj)
+    }
+
+    async fn get_by_id(
+        &self,
+        response_id: ResponseId,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<ResponseObject>, anyhow::Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let response_uuid = response_id.0;
+
+        // Fetch the response
+        let row_result = client
+            .query_opt(
+                r#"
+                SELECT id, workspace_id, api_key_id, model, status, instructions, 
+                       conversation_id, previous_response_id, next_response_ids, 
+                       usage, metadata, created_at, updated_at
+                FROM responses
+                WHERE id = $1 AND workspace_id = $2
+                "#,
+                &[&response_uuid, &workspace_id.0],
+            )
+            .await
+            .context("Failed to fetch response")?;
+
+        let Some(row) = row_result else {
+            return Ok(None);
+        };
+
+        let status = match row.get::<_, String>("status").as_str() {
             "in_progress" => ResponseStatus::InProgress,
             "completed" => ResponseStatus::Completed,
             "failed" => ResponseStatus::Failed,
             "cancelled" => ResponseStatus::Cancelled,
-            _ => bail!("Unknown response status: {status_str}"),
+            "queued" => ResponseStatus::Queued,
+            "incomplete" => ResponseStatus::Incomplete,
+            _ => ResponseStatus::Failed,
         };
 
-        let id: Uuid = row.try_get("id")?;
-        let user_id: Uuid = row.try_get("user_id")?;
-        let conversation_id: Option<Uuid> = row.try_get("conversation_id")?;
-        let previous_response_id: Option<Uuid> = row.try_get("previous_response_id")?;
+        let created_at: DateTime<Utc> = row.get("created_at");
+        let conversation_uuid: Option<Uuid> = row.get("conversation_id");
+        let usage_json: Option<serde_json::Value> = row.get("usage");
+        let metadata_json: Option<serde_json::Value> = row.get("metadata");
+        let model: String = row.get("model");
+        let instructions: Option<String> = row.get("instructions");
+        let previous_response_uuid: Option<Uuid> = row.get("previous_response_id");
+        let next_response_ids_json: Option<serde_json::Value> = row.get("next_response_ids");
 
-        Ok(Response {
-            id: id.into(),
-            user_id: user_id.into(),
-            model: row.try_get("model")?,
-            input_messages: row.try_get("input_messages")?,
-            output_message: row.try_get("output_message")?,
+        // Parse next_response_ids from JSON array to Vec<String>
+        let next_response_ids = if let Some(next_ids_val) = next_response_ids_json {
+            serde_json::from_value::<Vec<String>>(next_ids_val)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|uuid_str| {
+                    Uuid::parse_str(&uuid_str)
+                        .ok()
+                        .map(|uuid| format!("resp_{}", uuid.simple()))
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+
+        // Build conversation reference if conversation_id is present
+        let conversation_ref = conversation_uuid.map(|uuid| ConversationResponseReference {
+            id: format!("conv_{}", uuid.simple()),
+        });
+
+        // Parse usage from JSON
+        let usage = if let Some(usage_val) = usage_json {
+            serde_json::from_value(usage_val).unwrap_or_else(|_| Usage::new(0, 0))
+        } else {
+            Usage::new(0, 0)
+        };
+
+        // Build ResponseObject from the database row
+        let response_obj = ResponseObject {
+            id: format!("resp_{}", response_uuid.simple()),
+            object: "response".to_string(),
+            created_at: created_at.timestamp(),
             status,
-            instructions: row.try_get("instructions")?,
-            conversation_id: conversation_id.map(|id| id.into()),
-            previous_response_id: previous_response_id.map(|id| id.into()),
-            usage: row.try_get("usage")?,
-            metadata: row.try_get("metadata")?,
-            created_at: row.try_get("created_at")?,
-            updated_at: row.try_get("updated_at")?,
-        })
-    }
-}
+            background: false, // Default, not stored in DB
+            conversation: conversation_ref,
+            error: None,
+            incomplete_details: None,
+            instructions,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            model,
+            output: vec![], // Would need to fetch from response_items if needed
+            parallel_tool_calls: false,
+            previous_response_id: previous_response_uuid
+                .map(|uuid| format!("resp_{}", uuid.simple())),
+            next_response_ids,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            reasoning: None,
+            safety_identifier: None,
+            service_tier: "default".to_string(),
+            store: false,
+            temperature: 1.0,
+            text: None,
+            tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
+            tools: vec![],
+            top_logprobs: 0,
+            top_p: 1.0,
+            truncation: "disabled".to_string(),
+            usage,
+            user: None,
+            metadata: metadata_json,
+        };
 
-#[async_trait]
-impl ResponseRepository for PgResponseRepository {
-    /// Create a new response
-    async fn create(
-        &self,
-        user_id: UserId,
-        model: String,
-        input_messages: serde_json::Value,
-        instructions: Option<String>,
-        conversation_id: Option<ConversationId>,
-        previous_response_id: Option<ResponseId>,
-        metadata: Option<serde_json::Value>,
-    ) -> Result<Response> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
-        let id = Uuid::new_v4();
-        let now = Utc::now();
-        let status = ResponseStatus::InProgress;
-
-        let row = client
-            .query_one(
-                r#"
-            INSERT INTO responses (
-                id, user_id, model, input_messages, output_message, 
-                status, instructions, conversation_id, previous_response_id,
-                usage, metadata, created_at, updated_at
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            RETURNING *
-            "#,
-                &[
-                    &id,
-                    &user_id.0, // Store UUID directly
-                    &model,
-                    &input_messages,
-                    &None::<String>,
-                    &status.to_string(),
-                    &instructions,
-                    &conversation_id.map(|id| id.0), // Store UUID directly
-                    &previous_response_id.map(|id| id.0), // Store UUID directly
-                    &None::<serde_json::Value>,
-                    &metadata,
-                    &now,
-                    &now,
-                ],
-            )
-            .await
-            .context("Failed to create response")?;
-
-        debug!("Created response: {} for user: {}", id, user_id);
-        self.row_to_response(row)
+        Ok(Some(response_obj))
     }
 
-    /// Update a response (for completion, cancellation, or failure)
     async fn update(
         &self,
-        id: ResponseId,
-        user_id: UserId,
-        output_message: Option<String>,
+        response_id: ResponseId,
+        workspace_id: WorkspaceId,
+        _output_message: Option<String>, // Not used - messages stored as response_items
         status: ResponseStatus,
         usage: Option<serde_json::Value>,
-    ) -> Result<Option<Response>> {
+    ) -> Result<Option<ResponseObject>, anyhow::Error> {
         let client = self
             .pool
             .get()
             .await
             .context("Failed to get database connection")?;
 
+        let response_uuid = response_id.0;
+        let status_str = match status {
+            ResponseStatus::InProgress => "in_progress",
+            ResponseStatus::Completed => "completed",
+            ResponseStatus::Failed => "failed",
+            ResponseStatus::Cancelled => "cancelled",
+            ResponseStatus::Queued => "queued",
+            ResponseStatus::Incomplete => "incomplete",
+        };
         let now = Utc::now();
 
-        let row = client
-            .query_opt(
+        // Update the response in the database
+        // Note: output_message column was removed in migration V0021
+        // Messages are now stored as response_items instead
+        let rows_affected = client
+            .execute(
                 r#"
-            UPDATE responses 
-            SET output_message = $3, status = $4, usage = $5, updated_at = $6
-            WHERE id = $1 AND user_id = $2
-            RETURNING *
-            "#,
-                &[
-                    &id.0,      // Store UUID directly
-                    &user_id.0, // Store UUID directly
-                    &output_message,
-                    &status.to_string(),
-                    &usage,
-                    &now,
-                ],
+                UPDATE responses
+                SET status = $1,
+                    usage = COALESCE($2, usage),
+                    updated_at = $3
+                WHERE id = $4 AND workspace_id = $5
+                "#,
+                &[&status_str, &usage, &now, &response_uuid, &workspace_id.0],
             )
             .await
             .context("Failed to update response")?;
 
-        match row {
-            Some(row) => {
-                debug!("Updated response: {} to status: {}", id, status);
-                Ok(Some(self.row_to_response(row)?))
-            }
-            None => Ok(None),
+        if rows_affected == 0 {
+            // Response not found or doesn't belong to this workspace
+            return Ok(None);
         }
-    }
 
-    /// Get a response by ID
-    async fn get_by_id(&self, id: ResponseId, user_id: UserId) -> Result<Option<Response>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
+        // Fetch the updated response
         let row = client
-            .query_opt(
-                "SELECT * FROM responses WHERE id = $1 AND user_id = $2",
-                &[&id.0, &user_id.0],
-            )
-            .await
-            .context("Failed to query response")?;
-
-        match row {
-            Some(row) => Ok(Some(self.row_to_response(row)?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Delete a response
-    async fn delete(&self, id: ResponseId, user_id: UserId) -> Result<bool> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
-        let result = client
-            .execute(
-                "DELETE FROM responses WHERE id = $1 AND user_id = $2",
-                &[&id.0, &user_id.0],
-            )
-            .await
-            .context("Failed to delete response")?;
-
-        if result > 0 {
-            debug!("Deleted response: {} for user: {}", id, user_id);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    /// Cancel a response (set status to cancelled)
-    async fn cancel(&self, id: ResponseId, user_id: UserId) -> Result<Option<Response>> {
-        self.update(id, user_id, None, ResponseStatus::Cancelled, None)
-            .await
-    }
-
-    /// List responses for a user
-    async fn list_by_user(
-        &self,
-        user_id: UserId,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<Response>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
-        let rows = client
-            .query(
+            .query_one(
                 r#"
-            SELECT * FROM responses 
-            WHERE user_id = $1
-            ORDER BY created_at DESC
-            LIMIT $2 OFFSET $3
-            "#,
-                &[&user_id.0, &limit, &offset],
+                SELECT id, workspace_id, api_key_id, model, status, instructions, 
+                       conversation_id, previous_response_id, next_response_ids, 
+                       usage, metadata, created_at, updated_at
+                FROM responses
+                WHERE id = $1 AND workspace_id = $2
+                "#,
+                &[&response_uuid, &workspace_id.0],
             )
             .await
-            .context("Failed to list responses")?;
+            .context("Failed to fetch updated response")?;
 
-        rows.into_iter()
-            .map(|row| self.row_to_response(row))
-            .collect()
+        // Parse usage from JSONB
+        let usage_value: Option<serde_json::Value> = row.get(9);
+        let usage_obj = if let Some(usage_json) = usage_value {
+            serde_json::from_value(usage_json.clone()).unwrap_or_else(|_| {
+                // Fallback to default if deserialization fails
+                Usage::new(0, 0)
+            })
+        } else {
+            Usage::new(0, 0)
+        };
+
+        // Parse conversation_id
+        let conversation_uuid: Option<Uuid> = row.get(6);
+        let conversation_ref = conversation_uuid.map(|uuid| ConversationResponseReference {
+            id: format!("conv_{}", uuid.simple()),
+        });
+
+        // Parse next_response_ids
+        let next_response_ids_json: Option<serde_json::Value> = row.get(8);
+        let next_response_ids = if let Some(next_ids_val) = next_response_ids_json {
+            serde_json::from_value::<Vec<String>>(next_ids_val)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|uuid_str| {
+                    Uuid::parse_str(&uuid_str)
+                        .ok()
+                        .map(|uuid| format!("resp_{}", uuid.simple()))
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+
+        // Parse metadata
+        let metadata_value: Option<serde_json::Value> = row.get(10);
+        let metadata = metadata_value;
+
+        // Parse status
+        let status_str: String = row.get(4);
+        let response_status = match status_str.as_str() {
+            "in_progress" => ResponseStatus::InProgress,
+            "completed" => ResponseStatus::Completed,
+            "failed" => ResponseStatus::Failed,
+            "cancelled" => ResponseStatus::Cancelled,
+            _ => ResponseStatus::InProgress,
+        };
+
+        let response_obj = ResponseObject {
+            id: format!("resp_{}", response_uuid.simple()),
+            object: "response".to_string(),
+            created_at: row.get::<_, chrono::DateTime<Utc>>(11).timestamp(),
+            status: response_status,
+            background: false, // Not stored in DB, default value
+            conversation: conversation_ref,
+            error: None,
+            incomplete_details: None,
+            instructions: row.get(5),
+            max_output_tokens: None, // Not stored in DB
+            max_tool_calls: None,    // Not stored in DB
+            model: row.get(3),
+            output: vec![],             // Output items are stored separately
+            parallel_tool_calls: false, // Not stored in DB
+            previous_response_id: row
+                .get::<_, Option<Uuid>>(7)
+                .map(|uuid| format!("resp_{}", uuid.simple())),
+            next_response_ids,
+            prompt_cache_key: None, // Not stored in DB
+            prompt_cache_retention: None,
+            reasoning: None,
+            safety_identifier: None, // Not stored in DB
+            service_tier: "default".to_string(),
+            store: false,     // Not stored in DB
+            temperature: 1.0, // Not stored in DB
+            text: Some(ResponseTextConfig {
+                format: ResponseTextFormat::Text,
+                verbosity: Some("medium".to_string()),
+            }),
+            tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
+            tools: vec![], // Not stored in DB
+            top_logprobs: 0,
+            top_p: 1.0, // Not stored in DB
+            truncation: "disabled".to_string(),
+            usage: usage_obj,
+            user: None,
+            metadata,
+        };
+
+        tracing::debug!(
+            "Updated response {} with status={}, usage={:?}",
+            response_obj.id,
+            status_str,
+            usage
+        );
+
+        Ok(Some(response_obj))
     }
 
-    /// List responses for a conversation
+    async fn delete(
+        &self,
+        _response_id: ResponseId,
+        _workspace_id: WorkspaceId,
+    ) -> Result<bool, anyhow::Error> {
+        unimplemented!("delete not yet implemented")
+    }
+
+    async fn cancel(
+        &self,
+        _response_id: ResponseId,
+        _workspace_id: WorkspaceId,
+    ) -> Result<Option<ResponseObject>, anyhow::Error> {
+        unimplemented!("cancel not yet implemented")
+    }
+
+    async fn list_by_workspace(
+        &self,
+        _workspace_id: WorkspaceId,
+        _limit: i64,
+        _offset: i64,
+    ) -> Result<Vec<ResponseObject>, anyhow::Error> {
+        unimplemented!("list_by_workspace not yet implemented")
+    }
+
     async fn list_by_conversation(
         &self,
-        conversation_id: ConversationId,
-        user_id: UserId,
-        limit: i64,
-    ) -> Result<Vec<Response>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
-        let rows = client
-            .query(
-                r#"
-            SELECT * FROM responses 
-            WHERE conversation_id = $1 AND user_id = $2
-            ORDER BY created_at DESC
-            LIMIT $3
-            "#,
-                &[&conversation_id.0, &user_id.0, &limit],
-            )
-            .await
-            .context("Failed to list responses by conversation")?;
-
-        rows.into_iter()
-            .map(|row| self.row_to_response(row))
-            .collect()
+        _conversation_id: services::conversations::models::ConversationId,
+        _workspace_id: WorkspaceId,
+        _limit: i64,
+    ) -> Result<Vec<ResponseObject>, anyhow::Error> {
+        unimplemented!("list_by_conversation not yet implemented")
     }
 
-    /// Get the previous response in a chain
     async fn get_previous(
         &self,
-        response_id: ResponseId,
-        user_id: UserId,
-    ) -> Result<Option<Response>> {
+        _response_id: ResponseId,
+        _workspace_id: WorkspaceId,
+    ) -> Result<Option<ResponseObject>, anyhow::Error> {
+        unimplemented!("get_previous not yet implemented")
+    }
+
+    async fn get_latest_in_conversation(
+        &self,
+        conversation_id: services::conversations::models::ConversationId,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<ResponseObject>, anyhow::Error> {
         let client = self
             .pool
             .get()
             .await
             .context("Failed to get database connection")?;
 
-        // First get the current response to find its previous_response_id
-        let current = client
+        // Fetch the most recent response in this conversation
+        let row_result = client
             .query_opt(
-                "SELECT previous_response_id FROM responses WHERE id = $1 AND user_id = $2",
-                &[&response_id.0, &user_id.0],
+                r#"
+                SELECT id, workspace_id, api_key_id, model, status, instructions, 
+                       conversation_id, previous_response_id, next_response_ids, 
+                       usage, metadata, created_at, updated_at
+                FROM responses
+                WHERE conversation_id = $1 AND workspace_id = $2
+                ORDER BY created_at DESC
+                LIMIT 1
+                "#,
+                &[&conversation_id.0, &workspace_id.0],
             )
             .await
-            .context("Failed to query current response")?;
+            .context("Failed to fetch latest response in conversation")?;
 
-        if let Some(current_row) = current {
-            if let Ok(Some(prev_id)) =
-                current_row.try_get::<_, Option<Uuid>>("previous_response_id")
-            {
-                return self.get_by_id(prev_id.into(), user_id).await;
-            }
-        }
+        let Some(row) = row_result else {
+            return Ok(None);
+        };
 
-        Ok(None)
+        let response_uuid: Uuid = row.get("id");
+        let status = match row.get::<_, String>("status").as_str() {
+            "in_progress" => ResponseStatus::InProgress,
+            "completed" => ResponseStatus::Completed,
+            "failed" => ResponseStatus::Failed,
+            "cancelled" => ResponseStatus::Cancelled,
+            "queued" => ResponseStatus::Queued,
+            "incomplete" => ResponseStatus::Incomplete,
+            _ => ResponseStatus::Failed,
+        };
+
+        let created_at: DateTime<Utc> = row.get("created_at");
+        let conversation_uuid: Option<Uuid> = row.get("conversation_id");
+        let usage_json: Option<serde_json::Value> = row.get("usage");
+        let metadata_json: Option<serde_json::Value> = row.get("metadata");
+        let model: String = row.get("model");
+        let instructions: Option<String> = row.get("instructions");
+        let previous_response_uuid: Option<Uuid> = row.get("previous_response_id");
+        let next_response_ids_json: Option<serde_json::Value> = row.get("next_response_ids");
+
+        // Parse next_response_ids from JSON array to Vec<String>
+        let next_response_ids = if let Some(next_ids_val) = next_response_ids_json {
+            serde_json::from_value::<Vec<String>>(next_ids_val)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|uuid_str| {
+                    Uuid::parse_str(&uuid_str)
+                        .ok()
+                        .map(|uuid| format!("resp_{}", uuid.simple()))
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+
+        // Build conversation reference if conversation_id is present
+        let conversation_ref = conversation_uuid.map(|uuid| ConversationResponseReference {
+            id: format!("conv_{}", uuid.simple()),
+        });
+
+        // Parse usage from JSON
+        let usage = if let Some(usage_val) = usage_json {
+            serde_json::from_value(usage_val).unwrap_or_else(|_| Usage::new(0, 0))
+        } else {
+            Usage::new(0, 0)
+        };
+
+        // Build ResponseObject from the database row
+        let response_obj = ResponseObject {
+            id: format!("resp_{}", response_uuid.simple()),
+            object: "response".to_string(),
+            created_at: created_at.timestamp(),
+            status,
+            background: false,
+            conversation: conversation_ref,
+            error: None,
+            incomplete_details: None,
+            instructions,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            model,
+            output: vec![],
+            parallel_tool_calls: false,
+            previous_response_id: previous_response_uuid
+                .map(|uuid| format!("resp_{}", uuid.simple())),
+            next_response_ids,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            reasoning: None,
+            safety_identifier: None,
+            service_tier: "default".to_string(),
+            store: false,
+            temperature: 1.0,
+            text: None,
+            tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
+            tools: vec![],
+            top_logprobs: 0,
+            top_p: 1.0,
+            truncation: "disabled".to_string(),
+            usage,
+            user: None,
+            metadata: metadata_json,
+        };
+
+        Ok(Some(response_obj))
     }
 }

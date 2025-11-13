@@ -18,7 +18,7 @@ async fn test_streaming_chat_completion_signature_verification() {
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Use a simple, consistent model for testing
-    let model_name = "deepseek-ai/DeepSeek-V3.1";
+    let model_name = "Qwen/Qwen3-30B-A3B-Instruct-2507";
 
     // Step 1 & 2: Construct request body with streaming enabled
     let request_body = serde_json::json!({

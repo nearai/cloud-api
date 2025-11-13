@@ -406,7 +406,7 @@ pub async fn create_response(
                         instructions: request.instructions,
                         max_output_tokens: request.max_output_tokens,
                         max_tool_calls: request.max_tool_calls,
-                        model: request.model,
+                        model: request.model.clone(),
                         output: vec![ResponseOutputItem::Message {
                             id: format!("msg_{}", Uuid::new_v4().simple()),
                             response_id: resp_id.clone(),
@@ -420,6 +420,7 @@ pub async fn create_response(
                                 annotations: vec![],
                                 logprobs: vec![],
                             }],
+                            model: request.model,
                         }],
                         parallel_tool_calls: request.parallel_tool_calls.unwrap_or(false),
                         previous_response_id: request.previous_response_id.clone(),

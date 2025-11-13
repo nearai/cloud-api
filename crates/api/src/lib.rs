@@ -288,12 +288,16 @@ pub async fn init_domain_services(
         workspace_service.clone(),
     )) as Arc<dyn services::usage::UsageServiceTrait + Send + Sync>;
 
+    // Create in-memory cache for model resolution to reduce DB load in completions
+    let model_cache = middleware::create_model_cache();
+
     // Create completion service with usage tracking (needs usage_service)
     let completion_service = Arc::new(services::CompletionServiceImpl::new(
         inference_provider_pool.clone(),
         attestation_service.clone(),
         usage_service.clone(),
         models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
+        model_cache,
     ));
 
     let web_search_provider =
@@ -483,6 +487,7 @@ pub fn build_app_with_config(
         database.clone(),
         &auth_components.auth_state_middleware,
         config.clone(),
+        domain_services.completion_service.model_cache.clone(),
     );
 
     let invitation_routes =
@@ -764,6 +769,7 @@ pub fn build_admin_routes(
     database: Arc<Database>,
     auth_state_middleware: &AuthState,
     config: Arc<ApiConfig>,
+    model_cache: middleware::ModelCache,
 ) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
@@ -791,6 +797,7 @@ pub fn build_admin_routes(
         auth_service: auth_state_middleware.auth_service.clone(),
         config,
         admin_access_token_repository,
+        model_cache,
     };
 
     Router::new()

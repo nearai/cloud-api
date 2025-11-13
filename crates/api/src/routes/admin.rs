@@ -26,6 +26,7 @@ pub struct AdminAppState {
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub config: Arc<ApiConfig>,
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
+    pub model_cache: crate::middleware::ModelCache,
 }
 
 /// Batch upsert models metadata (Admin only)
@@ -117,6 +118,19 @@ pub async fn batch_upsert_models(
                 ),
             }
         })?;
+
+    // Invalidate model cache for all updated models and their aliases
+    for (model_name, model) in &updated_models {
+        app_state.model_cache.invalidate(model_name).await;
+        // Also invalidate all aliases
+        for alias in &model.aliases {
+            app_state.model_cache.invalidate(alias).await;
+        }
+    }
+    debug!(
+        "Invalidated model cache for {} model(s)",
+        updated_models.len()
+    );
 
     // Convert to API response - map from HashMap to Vec
     // The key in the HashMap is the canonical model_name
@@ -533,6 +547,12 @@ pub async fn delete_model(
                 ),
             }
         })?;
+
+    // Invalidate model cache for deleted model
+    // Note: We only invalidate by the canonical name since we don't have access to aliases here
+    // Aliases will be invalidated when they're accessed and return a cache miss
+    app_state.model_cache.invalidate(&model_name).await;
+    debug!("Invalidated model cache for deleted model: {}", model_name);
 
     Ok(StatusCode::NO_CONTENT)
 }

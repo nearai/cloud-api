@@ -1,6 +1,6 @@
 use moka::future::Cache;
-use std::time::Duration;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Cache for authenticated API key results to reduce database lookups
 /// TTL is 60 seconds to balance performance and freshness
@@ -8,7 +8,7 @@ pub type ApiKeyCache = Arc<Cache<String, Arc<super::auth::AuthenticatedApiKey>>>
 
 /// Cache for model resolution results
 /// TTL is 5 minutes since model configurations change infrequently
-pub type ModelCache = Arc<Cache<String, Arc<database::models::Model>>>;
+pub type ModelCache = Arc<Cache<String, Arc<services::models::ModelWithPricing>>>;
 
 /// Create a new API key cache with appropriate settings
 pub fn create_api_key_cache() -> ApiKeyCache {
@@ -20,7 +20,7 @@ pub fn create_api_key_cache() -> ApiKeyCache {
             .time_to_live(Duration::from_secs(60))
             // Evict entries based on access time as well
             .time_to_idle(Duration::from_secs(30))
-            .build()
+            .build(),
     )
 }
 
@@ -34,7 +34,6 @@ pub fn create_model_cache() -> ModelCache {
             .time_to_live(Duration::from_secs(300))
             // Keep accessed entries longer
             .time_to_idle(Duration::from_secs(180))
-            .build()
+            .build(),
     )
 }
-

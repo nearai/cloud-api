@@ -88,6 +88,9 @@ impl PgResponseItemsRepository {
         let item_created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
         let created_at_timestamp = item_created_at.timestamp();
 
+        // Get model from joined responses table
+        let model: String = row.try_get("model")?;
+
         // Enrich the item with response metadata
         match &mut item {
             ResponseOutputItem::Message {
@@ -95,48 +98,56 @@ impl PgResponseItemsRepository {
                 previous_response_id: ref mut prev,
                 next_response_ids: ref mut next,
                 created_at: ref mut ts,
+                model: ref mut mdl,
                 ..
             } => {
                 *rid = response_id_str;
                 *prev = previous_response_id_str;
                 *next = next_response_ids;
                 *ts = created_at_timestamp;
+                *mdl = model;
             }
             ResponseOutputItem::ToolCall {
                 response_id: ref mut rid,
                 previous_response_id: ref mut prev,
                 next_response_ids: ref mut next,
                 created_at: ref mut ts,
+                model: ref mut mdl,
                 ..
             } => {
                 *rid = response_id_str;
                 *prev = previous_response_id_str;
                 *next = next_response_ids;
                 *ts = created_at_timestamp;
+                *mdl = model;
             }
             ResponseOutputItem::WebSearchCall {
                 response_id: ref mut rid,
                 previous_response_id: ref mut prev,
                 next_response_ids: ref mut next,
                 created_at: ref mut ts,
+                model: ref mut mdl,
                 ..
             } => {
                 *rid = response_id_str;
                 *prev = previous_response_id_str;
                 *next = next_response_ids;
                 *ts = created_at_timestamp;
+                *mdl = model;
             }
             ResponseOutputItem::Reasoning {
                 response_id: ref mut rid,
                 previous_response_id: ref mut prev,
                 next_response_ids: ref mut next,
                 created_at: ref mut ts,
+                model: ref mut mdl,
                 ..
             } => {
                 *rid = response_id_str;
                 *prev = previous_response_id_str;
                 *next = next_response_ids;
                 *ts = created_at_timestamp;
+                *mdl = model;
             }
         }
 
@@ -201,7 +212,8 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
                     response_items.*,
                     (SELECT previous_response_id FROM responses WHERE id = $2) as previous_response_id,
                     (SELECT next_response_ids FROM responses WHERE id = $2) as next_response_ids,
-                    (SELECT created_at FROM responses WHERE id = $2) as response_created_at
+                    (SELECT created_at FROM responses WHERE id = $2) as response_created_at,
+                    (SELECT model FROM responses WHERE id = $2) as model
                 "#,
                 &[
                     &id,
@@ -318,7 +330,8 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
                     ri.*,
                     r.previous_response_id,
                     r.next_response_ids,
-                    r.created_at as response_created_at
+                    r.created_at as response_created_at,
+                    r.model
                 FROM response_items ri
                 JOIN responses r ON ri.response_id = r.id
                 WHERE ri.response_id = $1
@@ -347,7 +360,8 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
                     ri.*,
                     r.previous_response_id,
                     r.next_response_ids,
-                    r.created_at as response_created_at
+                    r.created_at as response_created_at,
+                    r.model
                 FROM response_items ri
                 JOIN responses r ON ri.response_id = r.id
                 WHERE ri.api_key_id = $1
@@ -389,7 +403,8 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
                         ri.*,
                         r.previous_response_id,
                         r.next_response_ids,
-                        r.created_at as response_created_at
+                        r.created_at as response_created_at,
+                        r.model
                     FROM response_items ri
                     JOIN responses r ON ri.response_id = r.id
                     WHERE ri.conversation_id = $1
@@ -412,7 +427,8 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
                         ri.*,
                         r.previous_response_id,
                         r.next_response_ids,
-                        r.created_at as response_created_at
+                        r.created_at as response_created_at,
+                        r.model
                     FROM response_items ri
                     JOIN responses r ON ri.response_id = r.id
                     WHERE ri.conversation_id = $1

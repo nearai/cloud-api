@@ -27,6 +27,7 @@ pub struct ResponseStreamContext {
     pub response_id_str: String,
     pub previous_response_id: Option<String>,
     pub created_at: i64,
+    pub model: String,
 }
 
 impl ResponseStreamContext {
@@ -37,6 +38,7 @@ impl ResponseStreamContext {
         response_id_str: String,
         previous_response_id: Option<String>,
         created_at: i64,
+        model: String,
     ) -> Self {
         Self {
             response_id,
@@ -49,6 +51,7 @@ impl ResponseStreamContext {
             reasoning_tokens: 0,
             response_id_str,
             previous_response_id,
+            model,
             created_at,
         }
     }

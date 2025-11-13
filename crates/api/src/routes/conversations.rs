@@ -598,6 +598,7 @@ fn convert_input_item_to_response_item(
                 status: services::responses::models::ResponseItemStatus::Completed,
                 role,
                 content: response_content,
+                model: String::new(), // Will be enriched by repository
             })
         }
     }
@@ -618,6 +619,7 @@ fn convert_output_item_to_conversation_item(
             status,
             role,
             content,
+            model,
         } => {
             // Convert ResponseOutputContent to ConversationContentPart
             // For user messages, use input_text; for assistant/system, use output_text
@@ -661,6 +663,7 @@ fn convert_output_item_to_conversation_item(
                 role,
                 content: conv_content,
                 metadata: None,
+                model,
             }
         }
         ResponseOutputItem::ToolCall {
@@ -672,6 +675,7 @@ fn convert_output_item_to_conversation_item(
             status,
             tool_type,
             function,
+            model,
         } => ConversationItem::ToolCall {
             id,
             response_id,
@@ -684,6 +688,7 @@ fn convert_output_item_to_conversation_item(
                 name: function.name,
                 arguments: function.arguments,
             },
+            model,
         },
         ResponseOutputItem::WebSearchCall {
             id,
@@ -693,6 +698,7 @@ fn convert_output_item_to_conversation_item(
             created_at,
             status,
             action,
+            model,
         } => ConversationItem::WebSearchCall {
             id,
             response_id,
@@ -705,6 +711,7 @@ fn convert_output_item_to_conversation_item(
                     ConversationItemWebSearchAction::Search { query }
                 }
             },
+            model,
         },
         ResponseOutputItem::Reasoning {
             id,
@@ -715,6 +722,7 @@ fn convert_output_item_to_conversation_item(
             status,
             summary,
             content,
+            model,
         } => ConversationItem::Reasoning {
             id,
             response_id,
@@ -724,6 +732,7 @@ fn convert_output_item_to_conversation_item(
             status: convert_response_item_status(status),
             summary,
             content,
+            model,
         },
     }
 }

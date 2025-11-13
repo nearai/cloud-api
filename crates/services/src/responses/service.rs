@@ -330,6 +330,7 @@ impl ResponseServiceImpl {
             status: models::ResponseItemStatus::InProgress,
             role: "assistant".to_string(),
             content: vec![],
+            model: ctx.model.clone(),
         };
         emitter
             .emit_item_added(ctx, item, message_item_id.to_string())
@@ -388,6 +389,7 @@ impl ResponseServiceImpl {
                 annotations: vec![],
                 logprobs: vec![],
             }],
+            model: ctx.model.clone(),
         };
         emitter
             .emit_item_done(ctx, item.clone(), message_item_id.to_string())
@@ -556,6 +558,7 @@ impl ResponseServiceImpl {
                 api_key_uuid,
                 conversation_id,
                 input,
+                &context.request.model,
             )
             .await?;
         }
@@ -568,6 +571,7 @@ impl ResponseServiceImpl {
             initial_response.id.clone(),
             initial_response.previous_response_id.clone(),
             initial_response.created_at,
+            context.request.model.clone(),
         );
         let mut emitter = crate::responses::service_helpers::EventEmitter::new(tx);
 
@@ -920,6 +924,7 @@ impl ResponseServiceImpl {
             action: models::WebSearchAction::Search {
                 query: tool_call.query.clone(),
             },
+            model: ctx.model.clone(),
         };
         emitter
             .emit_item_added(ctx, item, tool_call_id.to_string())
@@ -973,6 +978,7 @@ impl ResponseServiceImpl {
             action: models::WebSearchAction::Search {
                 query: tool_call.query.clone(),
             },
+            model: ctx.model.clone(),
         };
         emitter
             .emit_item_done(ctx, item.clone(), tool_call_id.to_string())
@@ -1031,6 +1037,7 @@ impl ResponseServiceImpl {
         api_key_id: uuid::Uuid,
         conversation_id: Option<ConversationId>,
         input: &models::ResponseInput,
+        model: &str,
     ) -> Result<(), errors::ResponseError> {
         match input {
             models::ResponseInput::Text(text) => {
@@ -1051,6 +1058,7 @@ impl ResponseServiceImpl {
                         annotations: vec![],
                         logprobs: vec![],
                     }],
+                    model: model.to_string(),
                 };
 
                 response_items_repository
@@ -1117,6 +1125,7 @@ impl ResponseServiceImpl {
                         status: models::ResponseItemStatus::Completed,
                         role: input_item.role.clone(),
                         content,
+                        model: model.to_string(),
                     };
 
                     response_items_repository

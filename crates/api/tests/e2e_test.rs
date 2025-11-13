@@ -2652,7 +2652,7 @@ async fn test_admin_access_token_user_agent_mismatch() {
         .json(&update_request)
         .await;
 
-    assert_eq!(update_response.status_code(), 200);
+    assert_eq!(update_response.status_code(), 401);
     println!("✅ Admin access token rejected with mismatched User-Agent");
 }
 

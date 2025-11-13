@@ -163,8 +163,7 @@ impl CompletionServiceImpl {
             })?
             .ok_or_else(|| {
                 ports::CompletionError::InvalidModel(format!(
-                    "Model '{}' not found. It's not a valid model name or alias.",
-                    model_name
+                    "Model '{model_name}' not found. It's not a valid model name or alias."
                 ))
             })?;
 

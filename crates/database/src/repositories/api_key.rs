@@ -177,7 +177,11 @@ impl ApiKeyRepository {
         &self,
         key: &str,
     ) -> Result<
-        Option<(ApiKey, crate::models::Workspace, crate::models::Organization)>,
+        Option<(
+            ApiKey,
+            crate::models::Workspace,
+            crate::models::Organization,
+        )>,
         RepositoryError,
     > {
         let key_hash = Self::hash_api_key(key);
@@ -223,7 +227,7 @@ impl ApiKeyRepository {
                 let api_key = self
                     .row_to_api_key(row.clone())
                     .map_err(RepositoryError::DataConversionError)?;
-                
+
                 let workspace = crate::models::Workspace {
                     id: row.get("workspace_id"),
                     name: row.get("workspace_name"),
@@ -251,7 +255,7 @@ impl ApiKeyRepository {
 
                 // Update last used timestamp (non-blocking)
                 let _ = self.update_last_used(api_key.id).await;
-                
+
                 Ok(Some((api_key, workspace, organization)))
             }
             None => Ok(None),

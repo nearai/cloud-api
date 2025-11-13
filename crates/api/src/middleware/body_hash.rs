@@ -33,7 +33,7 @@ impl RequestBodyHash {
 pub async fn body_hash_middleware(request: Request, next: Next) -> Result<Response, StatusCode> {
     let span = tracing::debug_span!("body_hash_middleware");
     let _enter = span.enter();
-    
+
     let start = std::time::Instant::now();
     let (parts, body) = request.into_parts();
 

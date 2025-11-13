@@ -33,11 +33,18 @@ impl VLlmProvider {
     /// Create a new vLLM provider with the given configuration
     pub fn new(config: VLlmConfig) -> Self {
         let client = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(30))
+            // Reduce connect timeout for faster failure
+            .connect_timeout(std::time::Duration::from_secs(10))
+            // Keep connections alive longer to avoid reconnection overhead
             .pool_idle_timeout(std::time::Duration::from_secs(90))
+            // Increase max idle connections per host for better connection reuse
+            .pool_max_idle_per_host(10)
             .read_timeout(std::time::Duration::from_secs(
                 config.timeout_seconds as u64,
             ))
+            // Enable TCP_NODELAY to disable Nagle's algorithm
+            // This eliminates 40-200ms buffering delays for streaming responses
+            .tcp_nodelay(true)
             .build()
             .expect("Failed to create HTTP client");
 

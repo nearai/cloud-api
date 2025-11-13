@@ -168,6 +168,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         &self,
         request: ports::CompletionRequest,
     ) -> Result<StreamingResult, ports::CompletionError> {
+        let span = tracing::debug_span!("create_chat_completion_stream", model = %request.model);
+        let _enter = span.enter();
+        let start = std::time::Instant::now();
+
         // Extract context for usage tracking
         let organization_id = request.organization_id;
         let workspace_id = request.workspace_id;
@@ -205,58 +209,98 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             extra: request.extra.clone(),
         };
 
-        // Resolve model name (could be an alias) and get model details in a single DB call
-        // This also validates that the model exists and is active
-        let model = self
-            .models_repository
-            .resolve_and_get_model(&request.model)
-            .await
-            .map_err(|e| {
-                ports::CompletionError::InternalError(format!("Failed to resolve model: {e}"))
-            })?
-            .ok_or_else(|| {
-                ports::CompletionError::InvalidModel(format!(
-                    "Model '{}' not found. It's not a valid model name or alias.",
-                    request.model
-                ))
-            })?;
+        // Parallelize model resolution and provider stream initiation
+        // Model resolution validates the model and resolves aliases
+        let parallel_start = std::time::Instant::now();
+        let models_repo = self.models_repository.clone();
+        let model_name = request.model.clone();
+        let provider_pool = self.inference_provider_pool.clone();
+        let request_hash = request.body_hash.clone();
+        
+        // Start both operations in parallel
+        let (model_result, stream_result) = tokio::join!(
+            async {
+                models_repo
+                    .resolve_and_get_model(&model_name)
+                    .await
+                    .map_err(|e| {
+                        ports::CompletionError::InternalError(format!("Failed to resolve model: {e}"))
+                    })?
+                    .ok_or_else(|| {
+                        ports::CompletionError::InvalidModel(format!(
+                            "Model '{}' not found. It's not a valid model name or alias.",
+                            model_name
+                        ))
+                    })
+            },
+            async {
+                // Try the original model name first; if it's an alias, this may fail
+                // but we'll retry with the canonical name after model resolution
+                provider_pool
+                    .chat_completion_stream(chat_params.clone(), request_hash)
+                    .await
+            }
+        );
 
+        let model = model_result?;
         let canonical_name = &model.model_name;
+        let parallel_elapsed = parallel_start.elapsed();
+        tracing::debug!(
+            elapsed_ms = parallel_elapsed.as_millis(),
+            "Model resolution and provider connection parallel phase completed in {:?}",
+            parallel_elapsed
+        );
 
-        // Update params with canonical name if it's different
-        if canonical_name != &request.model {
-            tracing::debug!(
-                requested_model = %request.model,
-                canonical_model = %canonical_name,
-                "Resolved alias to canonical model name"
-            );
-            chat_params.model = canonical_name.clone();
-        }
-
-        // Get the LLM stream
-        let llm_stream = self
-            .inference_provider_pool
-            .chat_completion_stream(chat_params, request.body_hash.clone())
-            .await
-            .map_err(|e| {
-                // Check if this is a client error (HTTP 4xx) from the provider
+        // Get the LLM stream - use the result from parallel attempt or retry with canonical name
+        let llm_stream = match stream_result {
+            Ok(stream) => stream,
+            Err(_) if canonical_name != &request.model => {
+                // If parallel attempt failed and we have a different canonical name, retry
+                tracing::debug!(
+                    requested_model = %request.model,
+                    canonical_model = %canonical_name,
+                    "Retrying with canonical model name after alias resolution"
+                );
+                chat_params.model = canonical_name.clone();
+                self
+                    .inference_provider_pool
+                    .chat_completion_stream(chat_params, request.body_hash.clone())
+                    .await
+                    .map_err(|e| {
+                        let error_str = e.to_string();
+                        if error_str.contains("HTTP 4") || error_str.contains("Bad Request") {
+                            ports::CompletionError::InvalidParams(format!(
+                                "Invalid request parameters: {e}"
+                            ))
+                        } else {
+                            tracing::error!(
+                                model = %request.model,
+                                "Provider error during chat completion stream"
+                            );
+                            ports::CompletionError::ProviderError(
+                                "The model is currently unavailable. Please try again later.".to_string(),
+                            )
+                        }
+                    })?
+            }
+            Err(e) => {
+                // Forward the original error
                 let error_str = e.to_string();
                 if error_str.contains("HTTP 4") || error_str.contains("Bad Request") {
-                    // For client errors (4xx), return detailed message to help user fix their request
-                    ports::CompletionError::InvalidParams(format!(
+                    return Err(ports::CompletionError::InvalidParams(format!(
                         "Invalid request parameters: {e}"
-                    ))
+                    )));
                 } else {
-                    // For server errors (5xx), log details but return generic message to user
                     tracing::error!(
                         model = %request.model,
                         "Provider error during chat completion stream"
                     );
-                    ports::CompletionError::ProviderError(
+                    return Err(ports::CompletionError::ProviderError(
                         "The model is currently unavailable. Please try again later.".to_string(),
-                    )
+                    ));
                 }
-            })?;
+            }
+        };
 
         // Determine request type
         let request_type = if is_streaming {
@@ -277,6 +321,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 request_type,
             )
             .await;
+
+        let total_elapsed = start.elapsed();
+        tracing::info!(
+            elapsed_ms = total_elapsed.as_millis(),
+            model = %request.model,
+            "Chat completion stream created in {:?} (TTFT preparation complete)",
+            total_elapsed
+        );
 
         Ok(event_stream)
     }

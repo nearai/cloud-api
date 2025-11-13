@@ -1,14 +1,61 @@
+use futures_util::Stream;
 use inference_providers::{
     models::{CompletionError, ListModelsError, ModelsResponse},
-    ChatCompletionParams, InferenceProvider, StreamingResult, StreamingResultExt, VLlmConfig,
+    ChatCompletionParams, InferenceProvider, SSEEvent, StreamChunk, StreamingResult, VLlmConfig,
     VLlmProvider,
 };
 use regex::Regex;
 use serde::Deserialize;
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
 use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 
 type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
+
+/// Stream wrapper that stores chat_id mapping on first event without blocking
+struct ChatIdMappingStream<S>
+where
+    S: Stream<Item = Result<SSEEvent, CompletionError>> + Unpin,
+{
+    inner: S,
+    pool: Arc<InferenceProviderPool>,
+    provider: Arc<InferenceProviderTrait>,
+    chat_id_stored: bool,
+}
+
+impl<S> Stream for ChatIdMappingStream<S>
+where
+    S: Stream<Item = Result<SSEEvent, CompletionError>> + Unpin,
+{
+    type Item = Result<SSEEvent, CompletionError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(ref event))) => {
+                // On first event, extract chat_id and store mapping asynchronously
+                if !self.chat_id_stored {
+                    if let StreamChunk::Chat(ref chat_chunk) = event.chunk {
+                        let chat_id = chat_chunk.id.clone();
+                        let pool = self.pool.clone();
+                        let provider = self.provider.clone();
+                        self.chat_id_stored = true;
+
+                        tokio::spawn(async move {
+                            tracing::debug!(
+                                chat_id = %chat_id,
+                                "Storing chat_id mapping asynchronously"
+                            );
+                            pool.store_chat_id_mapping(chat_id, provider).await;
+                        });
+                    }
+                }
+                Poll::Ready(Some(Ok(event.clone())))
+            }
+            other => other,
+        }
+    }
+}
 
 /// Discovery entry returned by the discovery layer
 #[derive(Debug, Clone, Deserialize)]
@@ -523,22 +570,15 @@ impl InferenceProviderPool {
             })
             .await?;
 
-        // Store chat_id mapping for sticky routing by peeking at the first event
-        let mut peekable = StreamingResultExt::peekable(stream);
-        if let Some(Ok(event)) = peekable.peek().await {
-            if let inference_providers::StreamChunk::Chat(chat_chunk) = &event.chunk {
-                let chat_id = chat_chunk.id.clone();
-                let pool = self.clone();
-                tokio::spawn(async move {
-                    tracing::info!(
-                        chat_id = %chat_id,
-                        "Storing chat_id mapping"
-                    );
-                    pool.store_chat_id_mapping(chat_id, provider).await;
-                });
-            }
-        }
-        Ok(Box::pin(peekable))
+        // Wrap stream to store chat_id mapping on first event without blocking
+        let mapping_stream = ChatIdMappingStream {
+            inner: stream,
+            pool: Arc::new(self.clone()),
+            provider,
+            chat_id_stored: false,
+        };
+
+        Ok(Box::pin(mapping_stream))
     }
 
     pub async fn chat_completion(

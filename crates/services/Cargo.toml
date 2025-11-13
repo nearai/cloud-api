@@ -46,6 +46,8 @@ aws-config = { version = "1.5", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.70"
 # Encryption for file storage
 aes-gcm = "0.10"
+# In-memory caching for performance optimization
+moka = { version = "0.12", features = ["future"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

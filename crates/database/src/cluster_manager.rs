@@ -174,9 +174,12 @@ impl ClusterManager {
         cfg.pool = Some(deadpool_postgres::PoolConfig {
             max_size: max_connections as usize,
             timeouts: deadpool_postgres::Timeouts {
-                wait: Some(Duration::from_secs(5)),
-                create: Some(Duration::from_secs(5)),
-                recycle: Some(Duration::from_secs(5)),
+                // Reduce wait timeout from 5s to 1s for faster failure
+                wait: Some(Duration::from_secs(1)),
+                // Reduce create timeout from 5s to 2s
+                create: Some(Duration::from_secs(2)),
+                // Keep recycle timeout at 1s
+                recycle: Some(Duration::from_secs(1)),
             },
             queue_mode: QueueMode::Fifo,
         });

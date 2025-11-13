@@ -25,6 +25,10 @@ pub async fn usage_check_middleware(
     request: Request,
     next: Next,
 ) -> Result<Response, (StatusCode, axum::Json<ErrorResponse>)> {
+    let span = tracing::debug_span!("usage_check_middleware");
+    let _enter = span.enter();
+    let start = std::time::Instant::now();
+
     // Extract organization from authenticated API key
     let api_key = request
         .extensions()
@@ -47,9 +51,10 @@ pub async fn usage_check_middleware(
         organization_id, api_key_id.0
     );
 
-    // First, check API key spend limit if one is set
-    if let Some(api_key_limit) = api_key.api_key.spend_limit {
-        let api_key_uuid = uuid::Uuid::parse_str(&api_key_id.0).map_err(|_| {
+    // Parallelize API key spend check and org usage check for better performance
+    let api_key_limit = api_key.api_key.spend_limit;
+    let api_key_uuid = if api_key_limit.is_some() {
+        Some(uuid::Uuid::parse_str(&api_key_id.0).map_err(|_| {
             tracing::error!("Failed to parse API key ID");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -58,23 +63,54 @@ pub async fn usage_check_middleware(
                     "internal_server_error".to_string(),
                 )),
             )
-        })?;
+        })?)
+    } else {
+        None
+    };
 
-        let api_key_spend = state
-            .usage_repository
-            .get_api_key_spend(api_key_uuid)
-            .await
-            .map_err(|_| {
-                tracing::error!("Failed to get API key spend");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    axum::Json(ErrorResponse::new(
-                        "Failed to check API key spend".to_string(),
-                        "internal_server_error".to_string(),
-                    )),
-                )
-            })?;
+    // Run both DB queries in parallel using tokio::join!
+    let (api_key_spend_result, org_check_result) = tokio::join!(
+        async {
+            if let (Some(uuid), Some(limit)) = (api_key_uuid, api_key_limit) {
+                state
+                    .usage_repository
+                    .get_api_key_spend(uuid)
+                    .await
+                    .map(|spend| Some((spend, limit)))
+                    .map_err(|_| {
+                        tracing::error!("Failed to get API key spend");
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            axum::Json(ErrorResponse::new(
+                                "Failed to check API key spend".to_string(),
+                                "internal_server_error".to_string(),
+                            )),
+                        )
+                    })
+            } else {
+                Ok(None)
+            }
+        },
+        async {
+            state
+                .usage_service
+                .check_can_use(organization_id)
+                .await
+                .map_err(|_| {
+                    tracing::error!("Failed to check usage limits");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(ErrorResponse::new(
+                            "Failed to check usage limits".to_string(),
+                            "internal_server_error".to_string(),
+                        )),
+                    )
+                })
+        }
+    );
 
+    // Check API key spend limit if one is set
+    if let Some((api_key_spend, api_key_limit)) = api_key_spend_result? {
         if api_key_spend >= api_key_limit {
             warn!(
                 "API key exceeded spend limit. Spent: {}, Limit: {}",
@@ -103,28 +139,18 @@ pub async fn usage_check_middleware(
         );
     }
 
-    // Check if organization can make request
-    let check_result = state
-        .usage_service
-        .check_can_use(organization_id)
-        .await
-        .map_err(|_| {
-            tracing::error!("Failed to check usage limits");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(ErrorResponse::new(
-                    "Failed to check usage limits".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
+    // Check organization usage result
+    let check_result = org_check_result?;
 
     match check_result {
         UsageCheckResult::Allowed { remaining } => {
+            let elapsed = start.elapsed();
             debug!(
-                "Organization {} has sufficient credits. Remaining: {}",
+                elapsed_ms = elapsed.as_millis(),
+                "Organization {} has sufficient credits. Remaining: {} (checked in {:?})",
                 organization_id,
-                format_amount(remaining)
+                format_amount(remaining),
+                elapsed
             );
             Ok(next.run(request).await)
         }

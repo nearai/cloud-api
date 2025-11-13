@@ -150,15 +150,23 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
     let admin_access_token_repository =
         Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
 
+    // Create API key repository for optimized auth queries
+    let api_key_repository_for_auth = Arc::new(ApiKeyRepository::new(database.pool().clone()));
+
+    // Create in-memory cache for API key authentication to reduce DB load
+    let api_key_cache = middleware::create_api_key_cache();
+
     // Create AuthState for middleware
     let oauth_manager_arc = Arc::new(oauth_manager);
     let auth_state_middleware = AuthState::new(
         oauth_manager_arc.clone(),
         auth_service.clone(),
         workspace_repository.clone(),
+        api_key_repository_for_auth,
         admin_access_token_repository,
         config.auth.admin_domains.clone(),
         config.auth.encoding_key.clone(),
+        api_key_cache,
     );
 
     AuthComponents {

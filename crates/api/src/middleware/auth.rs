@@ -539,54 +539,121 @@ async fn authenticate_api_key(
 }
 
 /// Authenticate using API key and resolve workspace/organization context
+/// This uses a single optimized JOIN query instead of multiple sequential queries
+/// with in-memory caching to reduce database load
 async fn authenticate_api_key_with_context(
     state: &AuthState,
     api_key: &str,
 ) -> Result<AuthenticatedApiKey, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
-    // First validate the API key
-    let validated_api_key = authenticate_api_key(state, api_key).await?;
+    let span = tracing::debug_span!("authenticate_api_key_with_context");
+    let _enter = span.enter();
+    let start = std::time::Instant::now();
 
-    debug!(
-        "Resolving workspace and organization for API key: {:?}",
-        validated_api_key.id
-    );
+    // Check cache first for hot path optimization
+    if let Some(cached) = state.api_key_cache.get(api_key).await {
+        let elapsed = start.elapsed();
+        debug!(
+            elapsed_ms = elapsed.as_millis(),
+            "API key cache hit in {:?}", elapsed
+        );
+        return Ok((*cached).clone());
+    }
 
-    // Clone workspace_id to avoid partial move
-    let workspace_id = validated_api_key.workspace_id.clone();
+    debug!("API key cache miss, querying database");
 
-    // Get workspace with organization info
+    // Use optimized combined query that JOINs api_keys, workspaces, and organizations
     match state
-        .workspace_repository
-        .get_workspace_with_organization(workspace_id)
+        .api_key_repository
+        .validate_with_workspace_and_org(api_key)
         .await
     {
-        Ok(Some((workspace, organization))) => {
+        Ok(Some((db_api_key, db_workspace, db_organization))) => {
             debug!(
-                "Resolved workspace: {} and organization: {} for API key",
-                workspace.name, organization.name
+                "Authenticated API key: {:?}, workspace: {}, organization: {}",
+                db_api_key.id, db_workspace.name, db_organization.name
             );
-            Ok(AuthenticatedApiKey {
-                api_key: validated_api_key,
-                workspace,
-                organization,
-            })
+
+            // Convert database models to service models
+            let api_key_service = services::workspace::ApiKey {
+                id: services::workspace::ApiKeyId(db_api_key.id.to_string()),
+                key: None, // Don't expose the actual key in auth response
+                key_prefix: db_api_key.key_prefix.clone(),
+                workspace_id: services::workspace::WorkspaceId(db_api_key.workspace_id),
+                created_by_user_id: services::auth::UserId(db_api_key.created_by_user_id),
+                name: db_api_key.name.clone(),
+                created_at: db_api_key.created_at,
+                expires_at: db_api_key.expires_at,
+                last_used_at: db_api_key.last_used_at,
+                is_active: db_api_key.is_active,
+                deleted_at: None, // Active keys in auth won't have deleted_at
+                spend_limit: db_api_key.spend_limit,
+                usage: Some(db_api_key.usage),
+            };
+
+            let workspace_service = services::workspace::Workspace {
+                id: services::workspace::WorkspaceId(db_workspace.id),
+                name: db_workspace.name.clone(),
+                display_name: db_workspace.display_name.clone(),
+                description: db_workspace.description.clone(),
+                organization_id: services::organization::OrganizationId(
+                    db_workspace.organization_id,
+                ),
+                created_by_user_id: services::auth::UserId(db_workspace.created_by_user_id),
+                created_at: db_workspace.created_at,
+                updated_at: db_workspace.updated_at,
+                is_active: db_workspace.is_active,
+                settings: db_workspace.settings.clone(),
+            };
+
+            let organization_service = services::organization::Organization {
+                id: services::organization::OrganizationId(db_organization.id),
+                name: db_organization.name.clone(),
+                description: db_organization.description.clone(),
+                owner_id: services::auth::UserId(uuid::Uuid::nil()), // We don't have owner_id in this query
+                created_at: db_organization.created_at,
+                updated_at: db_organization.updated_at,
+                is_active: db_organization.is_active,
+                settings: db_organization
+                    .settings
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            };
+
+            let authenticated = AuthenticatedApiKey {
+                api_key: api_key_service,
+                workspace: workspace_service,
+                organization: organization_service,
+            };
+
+            // Store in cache for future requests
+            state
+                .api_key_cache
+                .insert(api_key.to_string(), Arc::new(authenticated.clone()))
+                .await;
+
+            let elapsed = start.elapsed();
+            debug!(
+                elapsed_ms = elapsed.as_millis(),
+                "API key authenticated in {:?}", elapsed
+            );
+            Ok(authenticated)
         }
         Ok(None) => {
-            error!("Workspace not found for API key");
+            debug!("Invalid or expired API key");
             Err((
                 StatusCode::UNAUTHORIZED,
                 axum::Json(crate::models::ErrorResponse::new(
-                    "Workspace not found for API key".to_string(),
+                    "Invalid or expired API key".to_string(),
                     "invalid_api_key".to_string(),
                 )),
             ))
         }
         Err(_) => {
-            error!("Failed to resolve workspace/organization");
+            error!("Failed to validate API key");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(crate::models::ErrorResponse::new(
-                    "Failed to resolve workspace/organization".to_string(),
+                    "Failed to validate API key".to_string(),
                     "internal_server_error".to_string(),
                 )),
             ))
@@ -600,9 +667,11 @@ pub struct AuthState {
     pub oauth_manager: Arc<OAuthManager>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub workspace_repository: Arc<dyn services::workspace::WorkspaceRepository>,
+    pub api_key_repository: Arc<database::repositories::ApiKeyRepository>,
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
     pub admin_domains: Vec<String>,
     pub encoding_key: String,
+    pub api_key_cache: super::cache::ApiKeyCache,
 }
 
 impl AuthState {
@@ -610,17 +679,21 @@ impl AuthState {
         oauth_manager: Arc<OAuthManager>,
         auth_service: Arc<dyn AuthServiceTrait>,
         workspace_repository: Arc<dyn services::workspace::WorkspaceRepository>,
+        api_key_repository: Arc<database::repositories::ApiKeyRepository>,
         admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
         admin_domains: Vec<String>,
         encoding_key: String,
+        api_key_cache: super::cache::ApiKeyCache,
     ) -> Self {
         Self {
             oauth_manager,
             auth_service,
             workspace_repository,
+            api_key_repository,
             admin_access_token_repository,
             admin_domains,
             encoding_key,
+            api_key_cache,
         }
     }
 }

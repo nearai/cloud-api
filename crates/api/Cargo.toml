@@ -40,6 +40,8 @@ http-body-util = "0.1"
 # AWS S3 for file storage
 aws-config = { version = "1.5", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.70"
+# In-memory caching for performance optimization
+moka = { version = "0.12", features = ["future"] }
 
 [dev-dependencies]
 axum-test = "18"

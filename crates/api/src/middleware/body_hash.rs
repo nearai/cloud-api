@@ -31,6 +31,10 @@ impl RequestBodyHash {
 /// and makes both the hash and original body available to downstream handlers
 /// via request extensions.
 pub async fn body_hash_middleware(request: Request, next: Next) -> Result<Response, StatusCode> {
+    let span = tracing::debug_span!("body_hash_middleware");
+    let _enter = span.enter();
+    
+    let start = std::time::Instant::now();
     let (parts, body) = request.into_parts();
 
     // Collect the entire body
@@ -48,10 +52,14 @@ pub async fn body_hash_middleware(request: Request, next: Next) -> Result<Respon
     let hash_bytes = hasher.finalize();
     let hash = hex::encode(hash_bytes);
 
+    let elapsed = start.elapsed();
     debug!(
-        "Request body hash computed: {} (body size: {} bytes)",
+        elapsed_ms = elapsed.as_millis(),
+        body_size = body_bytes.len(),
+        "Request body hash computed: {} ({} bytes) in {:?}",
         hash,
-        body_bytes.len()
+        body_bytes.len(),
+        elapsed
     );
 
     // Create the hash info struct

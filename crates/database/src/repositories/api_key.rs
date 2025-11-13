@@ -171,6 +171,93 @@ impl ApiKeyRepository {
         }
     }
 
+    /// Validate an API key and fetch workspace and organization in a single query
+    /// This optimizes the auth path by combining three queries into one
+    pub async fn validate_with_workspace_and_org(
+        &self,
+        key: &str,
+    ) -> Result<
+        Option<(ApiKey, crate::models::Workspace, crate::models::Organization)>,
+        RepositoryError,
+    > {
+        let key_hash = Self::hash_api_key(key);
+
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
+
+        let row = client
+            .query_opt(
+                r#"
+                SELECT 
+                    k.*,
+                    w.id as workspace_id, w.name as workspace_name, 
+                    w.display_name as workspace_display_name, w.description as workspace_description,
+                    w.organization_id, w.created_by_user_id as workspace_created_by,
+                    w.created_at as workspace_created_at, w.updated_at as workspace_updated_at,
+                    w.is_active as workspace_is_active, w.settings as workspace_settings,
+                    o.id as org_id, o.name as org_name, o.display_name as org_display_name,
+                    o.description as org_description, o.created_at as org_created_at,
+                    o.updated_at as org_updated_at, o.is_active as org_is_active,
+                    o.rate_limit as org_rate_limit, o.settings as org_settings
+                FROM api_keys k
+                JOIN workspaces w ON k.workspace_id = w.id
+                JOIN organizations o ON w.organization_id = o.id
+                WHERE k.key_hash = $1 
+                  AND k.is_active = true 
+                  AND k.deleted_at IS NULL
+                  AND (k.expires_at IS NULL OR k.expires_at > NOW())
+                  AND w.is_active = true
+                  AND o.is_active = true
+                "#,
+                &[&key_hash],
+            )
+            .await
+            .map_err(map_db_error)?;
+
+        match row {
+            Some(row) => {
+                let api_key = self
+                    .row_to_api_key(row.clone())
+                    .map_err(RepositoryError::DataConversionError)?;
+                
+                let workspace = crate::models::Workspace {
+                    id: row.get("workspace_id"),
+                    name: row.get("workspace_name"),
+                    display_name: row.get("workspace_display_name"),
+                    description: row.get("workspace_description"),
+                    organization_id: row.get("organization_id"),
+                    created_by_user_id: row.get("workspace_created_by"),
+                    created_at: row.get("workspace_created_at"),
+                    updated_at: row.get("workspace_updated_at"),
+                    is_active: row.get("workspace_is_active"),
+                    settings: row.get("workspace_settings"),
+                };
+
+                let organization = crate::models::Organization {
+                    id: row.get("org_id"),
+                    name: row.get("org_name"),
+                    display_name: row.get("org_display_name"),
+                    description: row.get("org_description"),
+                    created_at: row.get("org_created_at"),
+                    updated_at: row.get("org_updated_at"),
+                    is_active: row.get("org_is_active"),
+                    rate_limit: row.get("org_rate_limit"),
+                    settings: row.get("org_settings"),
+                };
+
+                // Update last used timestamp (non-blocking)
+                let _ = self.update_last_used(api_key.id).await;
+                
+                Ok(Some((api_key, workspace, organization)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Update the last used timestamp for an API key
     async fn update_last_used(&self, id: Uuid) -> Result<(), RepositoryError> {
         let client = self

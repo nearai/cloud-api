@@ -297,7 +297,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
         // Verify conversation exists
         let conversation = self
             .conv_repo
-            .get_by_id(conversation_id.clone(), workspace_id.clone())
+            .get_by_id(conversation_id, workspace_id.clone())
             .await
             .map_err(|e| {
                 errors::ConversationError::InternalError(format!(
@@ -370,7 +370,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
                 .create(
                     response_id.clone(),
                     api_key_id,
-                    Some(conversation_id.clone()),
+                    Some(conversation_id),
                     item,
                 )
                 .await

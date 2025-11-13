@@ -265,7 +265,7 @@ impl ResponseServiceImpl {
                         // Handle clean text (message content)
                         if !clean_text.is_empty() {
                             // First time we receive message text, emit the item.added and content_part.added events
-                            if !message_item_emitted && !inside_reasoning {
+                            if !message_item_emitted {
                                 Self::emit_message_started(emitter, ctx, &message_item_id).await?;
                                 message_item_emitted = true;
                             }
@@ -398,7 +398,7 @@ impl ResponseServiceImpl {
             .create(
                 ctx.response_id.clone(),
                 ctx.api_key_id,
-                ctx.conversation_id.clone(),
+                ctx.conversation_id,
                 item,
             )
             .await
@@ -554,7 +554,7 @@ impl ResponseServiceImpl {
                 &context.response_items_repository,
                 response_id.clone(),
                 api_key_uuid,
-                conversation_id.clone(),
+                conversation_id,
                 input,
             )
             .await?;
@@ -564,7 +564,7 @@ impl ResponseServiceImpl {
         let mut ctx = crate::responses::service_helpers::ResponseStreamContext::new(
             response_id.clone(),
             api_key_uuid,
-            conversation_id.clone(),
+            conversation_id,
             initial_response.id.clone(),
             initial_response.previous_response_id.clone(),
             initial_response.created_at,
@@ -583,7 +583,7 @@ impl ResponseServiceImpl {
 
         // Spawn background task to generate conversation title if needed
         let title_task_handle = Self::maybe_generate_conversation_title(
-            conversation_id.clone(),
+            conversation_id,
             &context.request,
             context.user_id.clone(),
             context.api_key_id.clone(),
@@ -983,7 +983,7 @@ impl ResponseServiceImpl {
             .create(
                 ctx.response_id.clone(),
                 ctx.api_key_id,
-                ctx.conversation_id.clone(),
+                ctx.conversation_id,
                 item,
             )
             .await
@@ -1057,7 +1057,7 @@ impl ResponseServiceImpl {
                     .create(
                         response_id.clone(),
                         api_key_id,
-                        conversation_id.clone(),
+                        conversation_id,
                         message_item,
                     )
                     .await
@@ -1123,7 +1123,7 @@ impl ResponseServiceImpl {
                         .create(
                             response_id.clone(),
                             api_key_id,
-                            conversation_id.clone(),
+                            conversation_id,
                             message_item,
                         )
                         .await
@@ -1204,7 +1204,7 @@ impl ResponseServiceImpl {
 
             // Load conversation metadata to verify it exists
             let _conversation = conversation_service
-                .get_conversation(conversation_id.clone(), workspace_id.clone())
+                .get_conversation(conversation_id, workspace_id.clone())
                 .await
                 .map_err(|e| {
                     errors::ResponseError::InternalError(format!("Failed to get conversation: {e}"))
@@ -1213,7 +1213,7 @@ impl ResponseServiceImpl {
             // Load all response items from the conversation
             // Use high limit (1000) and no 'after' cursor for context loading
             let conversation_items = response_items_repository
-                .list_by_conversation(conversation_id.clone(), None, 1000)
+                .list_by_conversation(conversation_id, None, 1000)
                 .await
                 .map_err(|e| {
                     errors::ResponseError::InternalError(format!(
@@ -1628,9 +1628,9 @@ impl ResponseServiceImpl {
                 
                 // Not a reasoning tag, reconstruct the tag text
                 let reconstructed = if is_closing {
-                    format!("</{}>", tag_candidate)
+                    format!("</{tag_candidate}>")
                 } else {
-                    format!("<{}>", tag_candidate)
+                    format!("<{tag_candidate}>")
                 };
                 
                 if *inside_reasoning {
@@ -1961,7 +1961,7 @@ impl ResponseServiceImpl {
         // Get conversation to check if it already has a title
         let workspace_id_domain = crate::workspace::WorkspaceId(workspace_id);
         let conversation = conversation_service
-            .get_conversation(conversation_id.clone(), workspace_id_domain.clone())
+            .get_conversation(conversation_id, workspace_id_domain.clone())
             .await
             .map_err(|e| {
                 errors::ResponseError::InternalError(format!("Failed to get conversation: {e}"))
@@ -2049,7 +2049,7 @@ impl ResponseServiceImpl {
         let workspace_id_domain = crate::workspace::WorkspaceId(workspace_id);
         conversation_service
             .update_conversation(
-                conversation_id.clone(),
+                conversation_id,
                 workspace_id_domain,
                 updated_metadata,
             )
@@ -2149,7 +2149,7 @@ mod tests {
             let mut reasoning_buffer = String::new();
             let mut inside_reasoning = false;
 
-            let input = format!("<{}>test content</{}>", tag, tag);
+            let input = format!("<{tag}>test content</{tag}>");
             let (clean, reasoning, _) = 
                 ResponseServiceImpl::process_reasoning_tags(&input, &mut reasoning_buffer, &mut inside_reasoning);
             
@@ -2230,5 +2230,41 @@ mod tests {
         assert_eq!(ResponseStreamContext::estimate_tokens("test"), 1);
         assert_eq!(ResponseStreamContext::estimate_tokens("Hello world"), 2);
         assert_eq!(ResponseStreamContext::estimate_tokens("This is a longer text"), 5);
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_clean_text_before_reasoning() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test that clean text before reasoning tag is correctly extracted
+        let input = "Hello <think>";
+        let (clean, reasoning, transition) = 
+            ResponseServiceImpl::process_reasoning_tags(input, &mut reasoning_buffer, &mut inside_reasoning);
+        
+        assert_eq!(clean, "Hello ");
+        assert_eq!(reasoning, None);
+        assert_eq!(transition, TagTransition::OpeningTag("think".to_string()));
+        assert!(inside_reasoning);
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_clean_text_after_reasoning() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // First open the reasoning tag
+        let (clean, _, _) = 
+            ResponseServiceImpl::process_reasoning_tags("<think>reasoning", &mut reasoning_buffer, &mut inside_reasoning);
+        assert_eq!(clean, "");
+        assert!(inside_reasoning);
+
+        // Then close it and add clean text after
+        let (clean, _, transition) = 
+            ResponseServiceImpl::process_reasoning_tags("</think> world", &mut reasoning_buffer, &mut inside_reasoning);
+        
+        assert_eq!(clean, " world");
+        assert_eq!(transition, TagTransition::ClosingTag("think".to_string()));
+        assert!(!inside_reasoning);
     }
 }

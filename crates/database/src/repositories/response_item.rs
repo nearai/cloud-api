@@ -330,7 +330,8 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
                     ri.*,
                     r.previous_response_id,
                     r.next_response_ids,
-                    r.created_at as response_created_at
+                    r.created_at as response_created_at,
+                    r.model
                 FROM response_items ri
                 JOIN responses r ON ri.response_id = r.id
                 WHERE ri.response_id = $1
@@ -359,7 +360,8 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
                     ri.*,
                     r.previous_response_id,
                     r.next_response_ids,
-                    r.created_at as response_created_at
+                    r.created_at as response_created_at,
+                    r.model
                 FROM response_items ri
                 JOIN responses r ON ri.response_id = r.id
                 WHERE ri.api_key_id = $1

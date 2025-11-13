@@ -1684,7 +1684,6 @@ async fn test_model_aliases() {
         // Verify model is a canonical model name
         assert!(
             entry.model == "nearai/gpt-oss-120b"
-                || entry.model == "Qwen/Qwen3-30B-A3B-Instruct-2507"
                 || entry.model == "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "Usage should be tracked with canonical model name, got: {}",
             entry.model

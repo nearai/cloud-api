@@ -732,4 +732,20 @@ impl Usage {
             total_tokens: input_tokens + output_tokens,
         }
     }
+
+    pub fn new_with_reasoning(
+        input_tokens: i32,
+        output_tokens: i32,
+        reasoning_tokens: i32,
+    ) -> Self {
+        Self {
+            input_tokens,
+            input_tokens_details: Some(InputTokensDetails { cached_tokens: 0 }),
+            output_tokens,
+            output_tokens_details: Some(OutputTokensDetails {
+                reasoning_tokens: reasoning_tokens as i64,
+            }),
+            total_tokens: input_tokens + output_tokens,
+        }
+    }
 }

@@ -32,7 +32,7 @@ impl SessionRepository {
         &self,
         user_id: Uuid,
         ip_address: Option<String>,
-        user_agent: Option<String>,
+        user_agent: String,
         expires_in_hours: i64,
     ) -> Result<(Session, String)> {
         let client = self
@@ -64,7 +64,7 @@ impl SessionRepository {
                     &now,
                     &expires_at,
                     &ip_address,
-                    &user_agent,
+                    &Some(user_agent),
                 ],
             )
             .await
@@ -80,7 +80,8 @@ impl SessionRepository {
     }
 
     /// Validate a refresh token and return the associated session
-    pub async fn validate(&self, session_token: &str) -> Result<Option<Session>> {
+    /// Validates that user_agent matches the stored user_agent
+    pub async fn validate(&self, session_token: &str, user_agent: &str) -> Result<Option<Session>> {
         let client = self
             .pool
             .get()
@@ -95,9 +96,9 @@ impl SessionRepository {
             .query_opt(
                 r#"
             SELECT * FROM refresh_tokens 
-            WHERE token_hash = $1 AND expires_at > $2
+            WHERE token_hash = $1 AND expires_at > $2 AND user_agent = $3
             "#,
-                &[&token_hash, &now],
+                &[&token_hash, &now, &user_agent],
             )
             .await
             .context("Failed to validate refresh token")?;
@@ -173,6 +174,38 @@ impl SessionRepository {
         Ok(result > 0)
     }
 
+    /// Rotate a refresh token session
+    pub async fn rotate(
+        &self,
+        session_id: Uuid,
+        expires_in_hours: i64,
+    ) -> Result<(Session, String)> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let new_session_token = Self::generate_session_token();
+        let new_token_hash = Self::hash_session_token(&new_session_token);
+        let new_expires_at = Utc::now() + Duration::hours(expires_in_hours);
+
+        let row = client
+            .query_one(
+                "UPDATE refresh_tokens SET token_hash = $1, expires_at = $2 WHERE id = $3 RETURNING *",
+                &[&new_token_hash, &new_expires_at, &session_id],
+            )
+            .await
+            .context("Failed to rotate refresh token session")?;
+
+        debug!(
+            "Rotated refresh token session: {} to {}",
+            session_id, new_session_token
+        );
+        let session = self.row_to_session(row)?;
+        Ok((session, new_session_token))
+    }
+
     /// Revoke a refresh token session
     pub async fn revoke(&self, session_id: Uuid) -> Result<bool> {
         let client = self
@@ -246,7 +279,7 @@ impl services::auth::SessionRepository for SessionRepository {
         &self,
         user_id: services::auth::UserId,
         ip_address: Option<String>,
-        user_agent: Option<String>,
+        user_agent: String,
         expires_in_hours: i64,
     ) -> anyhow::Result<(services::auth::Session, String)> {
         let (db_session, token) = self
@@ -269,8 +302,9 @@ impl services::auth::SessionRepository for SessionRepository {
     async fn validate(
         &self,
         session_token: services::auth::SessionToken,
+        user_agent: &str,
     ) -> anyhow::Result<Option<services::auth::Session>> {
-        let maybe_session = self.validate(&session_token.0).await?;
+        let maybe_session = self.validate(&session_token.0, user_agent).await?;
 
         Ok(maybe_session.map(|db_session| services::auth::Session {
             id: services::auth::SessionId(db_session.id),
@@ -330,6 +364,27 @@ impl services::auth::SessionRepository for SessionRepository {
 
     async fn revoke(&self, session_id: services::auth::SessionId) -> anyhow::Result<bool> {
         self.revoke(session_id.0).await
+    }
+
+    async fn rotate(
+        &self,
+        session_id: services::auth::SessionId,
+        expires_in_hours: i64,
+    ) -> anyhow::Result<(services::auth::Session, String)> {
+        let (db_session, token) =
+            SessionRepository::rotate(self, session_id.0, expires_in_hours).await?;
+
+        let service_session = services::auth::Session {
+            id: services::auth::SessionId(db_session.id),
+            user_id: services::auth::UserId(db_session.user_id),
+            token_hash: db_session.token_hash,
+            created_at: db_session.created_at,
+            expires_at: db_session.expires_at,
+            ip_address: db_session.ip_address,
+            user_agent: db_session.user_agent,
+        };
+
+        Ok((service_session, token))
     }
 
     async fn revoke_all_for_user(&self, user_id: services::auth::UserId) -> anyhow::Result<usize> {

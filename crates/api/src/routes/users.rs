@@ -8,11 +8,11 @@ use crate::{
     routes::api::AppState,
 };
 use axum::{
-    extract::{Extension, Json, Path, State},
+    extract::{Extension, Json, Path, Request, State},
     http::StatusCode,
 };
 use serde::Deserialize;
-use services::{organization::OrganizationError, user::UserServiceError};
+use services::{auth::UserId, organization::OrganizationError, user::UserServiceError};
 use tracing::{debug, error};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -61,7 +61,7 @@ pub async fn get_current_user(
 ) -> Result<Json<crate::models::UserResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Getting current user: {}", user.0.id);
 
-    let user_id = services::auth::UserId(user.0.id);
+    let user_id = UserId(user.0.id);
 
     // Get user information
     let user_data = match app_state.user_service.get_user(user_id.clone()).await {
@@ -180,7 +180,7 @@ pub async fn update_current_user_profile(
 ) -> Result<Json<crate::models::UserResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Updating profile for user: {}", user.0.id);
 
-    let user_id = services::auth::UserId(user.0.id);
+    let user_id = UserId(user.0.id);
 
     match app_state
         .user_service
@@ -230,7 +230,7 @@ pub async fn get_user_refresh_tokens(
 ) -> Result<Json<Vec<crate::models::RefreshTokenResponse>>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Getting refresh tokens for user: {}", current_user.0.id);
 
-    let user_id = services::auth::UserId(current_user.0.id);
+    let user_id = UserId(current_user.0.id);
 
     match app_state.user_service.get_user_sessions(user_id).await {
         Ok(sessions) => {
@@ -283,7 +283,7 @@ pub async fn revoke_user_refresh_token(
         refresh_token_id, current_user.0.id
     );
 
-    let user_id = services::auth::UserId(current_user.0.id);
+    let user_id = UserId(current_user.0.id);
     let session_id = services::auth::SessionId(refresh_token_id);
 
     match app_state
@@ -344,7 +344,7 @@ pub async fn revoke_all_user_tokens(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Revoking all tokens for user: {}", current_user.0.id);
 
-    let user_id = services::auth::UserId(current_user.0.id);
+    let user_id = UserId(current_user.0.id);
 
     match app_state.user_service.revoke_all_sessions(user_id).await {
         Ok(count) => Ok(Json(serde_json::json!({
@@ -372,7 +372,7 @@ pub async fn revoke_all_user_tokens(
     path = "/v1/users/me/access-tokens",
     tag = "Users",
     responses(
-        (status = 200, description = "Access token created successfully", body = crate::models::AccessTokenResponse),
+        (status = 200, description = "Access token created successfully", body = crate::models::AccessAndRefreshTokenResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -382,22 +382,41 @@ pub async fn revoke_all_user_tokens(
 )]
 pub async fn create_access_token(
     State(app_state): State<AppState>,
-    Extension(user): Extension<AuthenticatedUser>,
-) -> Result<Json<crate::models::AccessTokenResponse>, (StatusCode, Json<ErrorResponse>)> {
-    debug!("Creating access token for user: {}", user.0.id);
+    Extension((session, user)): Extension<(services::auth::Session, AuthenticatedUser)>,
+    _request: Request,
+) -> Result<Json<crate::models::AccessAndRefreshTokenResponse>, (StatusCode, Json<ErrorResponse>)> {
+    debug!(
+        "Creating access token & refresh token for user: {}",
+        user.0.id
+    );
 
-    match app_state.auth_service.create_session_access_token(
-        services::auth::UserId(user.0.id),
-        app_state.config.auth.encoding_key.to_string(),
-        1, // 1 hour expiration
-    ) {
-        Ok(access_token) => Ok(Json(crate::models::AccessTokenResponse { access_token })),
+    // Rotate the refresh token session
+    let expires_in_hours = 7 * 24;
+    let result = app_state
+        .auth_service
+        .rotate_session(
+            session.user_id,
+            session.id,
+            app_state.config.auth.encoding_key.to_string(),
+            1,                // access token expires in 1 hour
+            expires_in_hours, // refresh token expires in 7 days
+        )
+        .await;
+
+    match result {
+        Ok((access_token, _refresh_session, refresh_token)) => {
+            Ok(Json(crate::models::AccessAndRefreshTokenResponse {
+                access_token,
+                refresh_token,
+                refresh_token_expiration: _refresh_session.expires_at,
+            }))
+        }
         Err(_) => {
-            error!("Failed to create access token");
+            error!("Failed to create access token and refresh token");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
-                    "Failed to create access token".to_string(),
+                    "Failed to create session (access + refresh)".to_string(),
                     "internal_server_error".to_string(),
                 )),
             ))

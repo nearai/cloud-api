@@ -1174,10 +1174,12 @@ pub struct RefreshTokenResponse {
     pub user_agent: Option<String>,
 }
 
-/// Access token response model
+/// Access token + refresh token response model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AccessTokenResponse {
+pub struct AccessAndRefreshTokenResponse {
     pub access_token: String,
+    pub refresh_token: String,
+    pub refresh_token_expiration: DateTime<Utc>,
 }
 
 /// Organization member response model (non-sensitive)

@@ -1,6 +1,6 @@
 use crate::middleware::AuthenticatedUser;
 use axum::{
-    extract::{Query, State},
+    extract::{Query, Request, State},
     http::{header::SET_COOKIE, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     Extension, Json,
@@ -111,8 +111,28 @@ pub async fn google_login(
 pub async fn oauth_callback(
     Query(params): Query<OAuthCallback>,
     State((oauth, state_store, auth_service, config)): State<AuthState>,
+    request: Request,
 ) -> Response {
     debug!("OAuth callback received with state: {}", params.state);
+
+    let user_agent_header = match request
+        .headers()
+        .get("User-Agent")
+        .and_then(|h| h.to_str().ok())
+    {
+        Some(ua) => ua,
+        None => {
+            error!("Missing User-Agent header in OAuth callback");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "bad_request",
+                    "error_description": "Missing User-Agent header"
+                })),
+            )
+                .into_response();
+        }
+    };
 
     // Retrieve and verify state
     let oauth_state = {
@@ -212,7 +232,7 @@ pub async fn oauth_callback(
         .create_session(
             user.id,
             None,
-            None,
+            user_agent_header.to_string(),
             config.auth.encoding_key.to_string(),
             1,
             7 * 24,

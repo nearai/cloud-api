@@ -246,6 +246,26 @@ async fn test_streaming_response_signature_verification() {
         .expect("Should have signing_algo field");
     assert_eq!(signing_algo, "ecdsa", "Should use ECDSA signing algorithm");
 
+    // Step 10: Verify the ECDSA signature cryptographically
+    println!("\n=== ECDSA Signature Verification ===");
+    println!("Verifying signature for message: {signature_text}");
+    println!(
+        "Signature: {}",
+        &signature[..std::cmp::min(20, signature.len())]
+    );
+    println!("Signing address: {signing_address}");
+
+    let is_valid = common::verify_ecdsa_signature(signature_text, signature, signing_address);
+    assert!(
+        is_valid,
+        "\n\n❌ ECDSA SIGNATURE VERIFICATION FAILED!\n\
+         The signature could not be verified against the message and signing address.\n\
+         This means the signature is cryptographically invalid.\n"
+    );
+
+    println!("✅ ECDSA signature is cryptographically valid!");
+    println!("✅ Recovered public key matches signing address!");
+
     println!("\n=== Test Summary ===");
     println!("✅ Streaming response request succeeded");
     println!("✅ Response ID extracted: {response_id}");
@@ -253,7 +273,11 @@ async fn test_streaming_response_signature_verification() {
     println!("✅ Signature stored and retrieved");
     println!("✅ Request hash matches: {expected_request_hash}");
     println!("✅ Response hash matches: {expected_response_hash}");
-    println!("✅ Signature is present: {}", &signature[..20]);
+    println!(
+        "✅ Signature is present: {}",
+        &signature[..std::cmp::min(20, signature.len())]
+    );
     println!("✅ Signing address: {signing_address}");
     println!("✅ Signing algorithm: {signing_algo}");
+    println!("✅ ECDSA signature cryptographically verified");
 }

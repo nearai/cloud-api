@@ -52,11 +52,51 @@ pub struct ChatCompletionRequest {
     pub extra: HashMap<String, Value>,
 }
 
+/// Content can be text or array of content parts
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<MessageContentPart>),
+}
+
+/// Content part (text, image, audio, file)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type")]
+pub enum MessageContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl {
+        image_url: MessageImageUrl,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    #[serde(rename = "audio")]
+    Audio { audio: MessageAudio },
+    #[serde(rename = "file")]
+    File { file_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum MessageImageUrl {
+    String(String),
+    Object { url: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct MessageAudio {
+    pub data: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Message {
     pub role: String, // "system", "user", "assistant"
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<MessageContent>,
     pub name: Option<String>,
 }
 
@@ -193,8 +233,26 @@ impl ChatCompletionRequest {
             if message.role.is_empty() {
                 return Err("message role is required".to_string());
             }
-            if !["system", "user", "assistant"].contains(&message.role.as_str()) {
+            if !["system", "user", "assistant", "tool"].contains(&message.role.as_str()) {
                 return Err(format!("invalid message role: {}", message.role));
+            }
+
+            // Validate content: if it's an array, check that all parts are text-only
+            if let Some(MessageContent::Parts(parts)) = &message.content {
+                for part in parts {
+                    match part {
+                        MessageContentPart::Text { .. } => {
+                            // Text parts are allowed
+                        }
+                        MessageContentPart::ImageUrl { .. }
+                        | MessageContentPart::Audio { .. }
+                        | MessageContentPart::File { .. } => {
+                            return Err(
+                                "Content array contains non-text parts (image, audio, or file). Only text content is currently supported.".to_string()
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -326,6 +384,8 @@ pub struct CreateResponseRequest {
     pub safety_identifier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing_algo: Option<String>,
 }
 
 /// Input for a response - can be text, array of items, or single item
@@ -338,13 +398,9 @@ pub enum ResponseInput {
 
 /// Single input item
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type")]
-pub enum ResponseInputItem {
-    #[serde(rename = "message")]
-    Message {
-        role: String,
-        content: ResponseContent,
-    },
+pub struct ResponseInputItem {
+    pub role: String,
+    pub content: ResponseContent,
 }
 
 /// Content can be text or array of content parts
@@ -376,8 +432,10 @@ pub enum ResponseContentPart {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ResponseImageUrl {
-    pub url: String,
+#[serde(untagged)]
+pub enum ResponseImageUrl {
+    String(String),
+    Object { url: String },
 }
 
 /// Conversation reference
@@ -397,7 +455,13 @@ pub enum ConversationReference {
 #[serde(tag = "type")]
 pub enum ResponseTool {
     #[serde(rename = "function")]
-    Function { function: ResponseFunction },
+    Function {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parameters: Option<serde_json::Value>,
+    },
     #[serde(rename = "web_search")]
     WebSearch {},
     #[serde(rename = "file_search")]
@@ -406,15 +470,6 @@ pub enum ResponseTool {
     CodeInterpreter {},
     #[serde(rename = "computer")]
     Computer {},
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ResponseFunction {
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parameters: Option<serde_json::Value>,
 }
 
 /// Tool choice configuration
@@ -479,7 +534,9 @@ pub struct ResponseObject {
     pub output: Vec<ResponseOutputItem>,
     pub parallel_tool_calls: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_response_id: Option<String>,
+    pub previous_response_id: Option<String>, // Previous response ID (parent in thread)
+    #[serde(default)]
+    pub next_response_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ResponseReasoningOutput>,
     pub store: bool,
@@ -549,7 +606,7 @@ pub enum ResponseOutputItem {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ResponseItemStatus {
     Completed,
@@ -669,6 +726,12 @@ pub struct UpdateConversationRequest {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// Request to create items in a conversation
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateConversationItemsRequest {
+    pub items: Vec<ConversationInputItem>,
+}
+
 /// Conversation object
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ConversationObject {
@@ -734,12 +797,93 @@ pub enum ConversationItem {
     #[serde(rename = "message")]
     Message {
         id: String,
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        created_at: i64,
         status: ResponseItemStatus,
         role: String,
         content: Vec<ConversationContentPart>,
         #[serde(skip_serializing_if = "Option::is_none")]
         metadata: Option<serde_json::Value>,
+        model: String,
     },
+    #[serde(rename = "tool_call")]
+    ToolCall {
+        id: String,
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        created_at: i64,
+        status: ResponseItemStatus,
+        tool_type: String,
+        function: ConversationItemFunction,
+        model: String,
+    },
+    #[serde(rename = "web_search_call")]
+    WebSearchCall {
+        id: String,
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        created_at: i64,
+        status: ResponseItemStatus,
+        action: ConversationItemWebSearchAction,
+        model: String,
+    },
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        id: String,
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        created_at: i64,
+        status: ResponseItemStatus,
+        summary: String,
+        content: String,
+        model: String,
+    },
+}
+
+impl ConversationItem {
+    /// Get the ID of the conversation item
+    pub fn id(&self) -> &str {
+        match self {
+            ConversationItem::Message { id, .. } => id,
+            ConversationItem::ToolCall { id, .. } => id,
+            ConversationItem::WebSearchCall { id, .. } => id,
+            ConversationItem::Reasoning { id, .. } => id,
+        }
+    }
+
+    /// Get the role of the conversation item (only for Message items)
+    pub fn role(&self) -> &str {
+        match self {
+            ConversationItem::Message { role, .. } => role,
+            _ => "",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ConversationItemFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase", tag = "type")]
+pub enum ConversationItemWebSearchAction {
+    #[serde(rename = "search")]
+    Search { query: String },
 }
 
 /// List of conversation items
@@ -952,6 +1096,16 @@ pub struct PublicUserResponse {
     pub created_at: DateTime<Utc>,
 }
 
+/// Organization details with spend limit (for admin user listing)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminUserOrganizationDetails {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(rename = "spendLimit", skip_serializing_if = "Option::is_none")]
+    pub spend_limit: Option<SpendLimit>,
+}
+
 /// Admin user response model (for owners/admins)
 /// Contains sensitive information only visible to organization owners/admins
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -964,6 +1118,8 @@ pub struct AdminUserResponse {
     pub created_at: DateTime<Utc>,
     pub last_login_at: Option<DateTime<Utc>>,
     pub is_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organizations: Option<Vec<AdminUserOrganizationDetails>>,
 }
 
 /// User response model (full user profile)
@@ -1233,6 +1389,9 @@ pub struct ModelMetadata {
     pub model_description: String,
     #[serde(rename = "modelIcon", skip_serializing_if = "Option::is_none")]
     pub model_icon: Option<String>,
+
+    #[serde(rename = "aliases", skip_serializing_if = "Vec::is_empty", default)]
+    pub aliases: Vec<String>,
 }
 
 /// Request to update model pricing (admin endpoint)
@@ -1337,7 +1496,7 @@ pub struct SpendLimitRequest {
 /// Examples:
 ///   $100.00 USD: amount=100000000000, scale=9, currency="USD"
 ///   $0.01 USD: amount=10000000, scale=9, currency="USD"
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
 pub struct SpendLimit {
     pub amount: i64,
     pub scale: i64,
@@ -1384,4 +1543,393 @@ pub struct OrgLimitsHistoryResponse {
     pub total: i64,
     pub limit: i64,
     pub offset: i64,
+}
+
+// ============================================
+// File Upload Models
+// ============================================
+
+/// File upload response
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct FileUploadResponse {
+    pub id: String,
+    pub object: String, // Always "file"
+    pub bytes: i64,
+    pub created_at: i64, // Unix timestamp
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>, // Unix timestamp
+    pub filename: String,
+    pub purpose: String,
+}
+
+/// Expires after configuration
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ExpiresAfter {
+    pub anchor: String, // "created_at"
+    pub seconds: i64,   // Max: 31536000 (1 year)
+}
+
+/// File list response
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct FileListResponse {
+    pub object: String, // Always "list"
+    pub data: Vec<FileUploadResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_id: Option<String>,
+    pub has_more: bool,
+}
+
+/// File delete response
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct FileDeleteResponse {
+    pub id: String,
+    pub object: String, // Always "file"
+    pub deleted: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_response_request_simple_text_input() {
+        let json = r#"{
+            "model": "gpt-4.1",
+            "input": "Tell me a three sentence bedtime story about a unicorn."
+        }"#;
+
+        let result: Result<CreateResponseRequest, _> = serde_json::from_str(json);
+        assert!(result.is_ok(), "Failed to deserialize: {:?}", result.err());
+
+        let request = result.unwrap();
+        assert_eq!(request.model, "gpt-4.1");
+        assert!(matches!(request.input, Some(ResponseInput::Text(_))));
+        if let Some(ResponseInput::Text(text)) = request.input {
+            assert_eq!(
+                text,
+                "Tell me a three sentence bedtime story about a unicorn."
+            );
+        }
+    }
+
+    #[test]
+    fn test_create_response_request_with_optional_fields() {
+        let json = r#"{
+            "model": "gpt-4.1",
+            "instructions": "You are a helpful assistant.",
+            "input": "Hello!",
+            "stream": true,
+            "temperature": 0.7,
+            "max_output_tokens": 1000
+        }"#;
+
+        let result: Result<CreateResponseRequest, _> = serde_json::from_str(json);
+        assert!(result.is_ok(), "Failed to deserialize: {:?}", result.err());
+
+        let request = result.unwrap();
+        assert_eq!(request.model, "gpt-4.1");
+        assert_eq!(
+            request.instructions,
+            Some("You are a helpful assistant.".to_string())
+        );
+        assert_eq!(request.stream, Some(true));
+        assert_eq!(request.temperature, Some(0.7));
+        assert_eq!(request.max_output_tokens, Some(1000));
+    }
+
+    #[test]
+    fn test_create_response_request_array_input_with_multipart_content() {
+        let json = r#"{
+            "model": "gpt-4.1",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "what is in this image?"},
+                        {
+                            "type": "input_image",
+                            "image_url": "https://example.com/image.jpg"
+                        }
+                    ]
+                }
+            ]
+        }"#;
+
+        let result: Result<CreateResponseRequest, _> = serde_json::from_str(json);
+        assert!(result.is_ok(), "Failed to deserialize: {:?}", result.err());
+
+        let request = result.unwrap();
+        assert_eq!(request.model, "gpt-4.1");
+
+        if let Some(ResponseInput::Items(items)) = request.input {
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].role, "user");
+
+            if let ResponseContent::Parts(parts) = &items[0].content {
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(parts[0], ResponseContentPart::InputText { .. }));
+                assert!(matches!(parts[1], ResponseContentPart::InputImage { .. }));
+
+                if let ResponseContentPart::InputText { text } = &parts[0] {
+                    assert_eq!(text, "what is in this image?");
+                }
+
+                if let ResponseContentPart::InputImage { image_url, .. } = &parts[1] {
+                    match image_url {
+                        ResponseImageUrl::String(url) => {
+                            assert_eq!(url, "https://example.com/image.jpg");
+                        }
+                        ResponseImageUrl::Object { url } => {
+                            assert_eq!(url, "https://example.com/image.jpg");
+                        }
+                    }
+                }
+            } else {
+                panic!("Expected Parts content");
+            }
+        } else {
+            panic!("Expected Items input");
+        }
+    }
+
+    #[test]
+    fn test_create_response_request_with_function_tools() {
+        let json = r#"{
+            "model": "gpt-4.1",
+            "input": "What is the weather like in Boston today?",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "get_current_weather",
+                    "description": "Get the current weather in a given location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "The city and state, e.g. San Francisco, CA"
+                            },
+                            "unit": {
+                                "type": "string",
+                                "enum": ["celsius", "fahrenheit"]
+                            }
+                        },
+                        "required": ["location", "unit"]
+                    }
+                }
+            ],
+            "tool_choice": "auto"
+        }"#;
+
+        let result: Result<CreateResponseRequest, _> = serde_json::from_str(json);
+        assert!(result.is_ok(), "Failed to deserialize: {:?}", result.err());
+
+        let request = result.unwrap();
+        assert_eq!(request.model, "gpt-4.1");
+
+        assert!(request.tools.is_some());
+        let tools = request.tools.unwrap();
+        assert_eq!(tools.len(), 1);
+
+        if let ResponseTool::Function {
+            name,
+            description,
+            parameters,
+        } = &tools[0]
+        {
+            assert_eq!(name, "get_current_weather");
+            assert_eq!(
+                description.as_ref().unwrap(),
+                "Get the current weather in a given location"
+            );
+            assert!(parameters.is_some());
+        } else {
+            panic!("Expected Function tool");
+        }
+
+        assert!(request.tool_choice.is_some());
+        if let Some(ResponseToolChoice::Auto(choice)) = request.tool_choice {
+            assert_eq!(choice, "auto");
+        } else {
+            panic!("Expected Auto tool choice");
+        }
+    }
+
+    #[test]
+    fn test_image_url_string_format() {
+        let json = r#""https://example.com/image.jpg""#;
+        let result: Result<ResponseImageUrl, _> = serde_json::from_str(json);
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), ResponseImageUrl::String(_)));
+    }
+
+    #[test]
+    fn test_image_url_object_format() {
+        let json = r#"{"url": "https://example.com/image.jpg"}"#;
+        let result: Result<ResponseImageUrl, _> = serde_json::from_str(json);
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), ResponseImageUrl::Object { .. }));
+    }
+
+    // ChatCompletionRequest validation tests
+    #[test]
+    fn test_chat_completion_request_with_text_content_array() {
+        let request = ChatCompletionRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Parts(vec![
+                    MessageContentPart::Text {
+                        text: "Hello".to_string(),
+                    },
+                    MessageContentPart::Text {
+                        text: "World".to_string(),
+                    },
+                ])),
+                name: None,
+            }],
+            max_tokens: Some(100),
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        // Text-only content array should pass validation
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_chat_completion_request_with_image_content_rejected() {
+        let request = ChatCompletionRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Parts(vec![
+                    MessageContentPart::Text {
+                        text: "What's in this image?".to_string(),
+                    },
+                    MessageContentPart::ImageUrl {
+                        image_url: MessageImageUrl::String(
+                            "data:image/jpeg;base64,/9j/4AAQSkZJRg==".to_string(),
+                        ),
+                        detail: Some("low".to_string()),
+                    },
+                ])),
+                name: None,
+            }],
+            max_tokens: Some(100),
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        // Image content should be rejected
+        let result = request.validate();
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "Content array contains non-text parts (image, audio, or file). Only text content is currently supported."
+        );
+    }
+
+    #[test]
+    fn test_chat_completion_request_with_audio_content_rejected() {
+        let request = ChatCompletionRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Parts(vec![MessageContentPart::Audio {
+                    audio: MessageAudio {
+                        data: "base64_audio_data".to_string(),
+                        format: Some("mp3".to_string()),
+                    },
+                }])),
+                name: None,
+            }],
+            max_tokens: Some(100),
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        // Audio content should be rejected
+        let result = request.validate();
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "Content array contains non-text parts (image, audio, or file). Only text content is currently supported."
+        );
+    }
+
+    #[test]
+    fn test_chat_completion_request_with_file_content_rejected() {
+        let request = ChatCompletionRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Parts(vec![MessageContentPart::File {
+                    file_id: "file-abc123".to_string(),
+                }])),
+                name: None,
+            }],
+            max_tokens: Some(100),
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        // File content should be rejected
+        let result = request.validate();
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "Content array contains non-text parts (image, audio, or file). Only text content is currently supported."
+        );
+    }
+
+    #[test]
+    fn test_chat_completion_request_with_string_content_allowed() {
+        let request = ChatCompletionRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("Hello, world!".to_string())),
+                name: None,
+            }],
+            max_tokens: Some(100),
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        // String content should pass validation
+        assert!(request.validate().is_ok());
+    }
 }

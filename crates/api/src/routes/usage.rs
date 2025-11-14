@@ -70,7 +70,7 @@ pub struct UsageHistoryQuery {
 /// Returns the current spending balance for an organization
 #[utoipa::path(
     get,
-    path = "/organizations/{org_id}/usage/balance",
+    path = "/v1/organizations/{org_id}/usage/balance",
     tag = "Usage",
     params(
         ("org_id" = String, Path, description = "Organization ID")
@@ -122,7 +122,7 @@ pub async fn get_organization_balance(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
                     "Failed to verify organization access".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             )
         })?;
@@ -147,7 +147,7 @@ pub async fn get_organization_balance(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
                     "Failed to retrieve balance".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             )
         })?;
@@ -163,7 +163,7 @@ pub async fn get_organization_balance(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
                     "Failed to retrieve limit".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             )
         })?;
@@ -232,7 +232,7 @@ pub async fn get_organization_balance(
 /// Returns paginated usage history for an organization
 #[utoipa::path(
     get,
-    path = "/organizations/{org_id}/usage/history",
+    path = "/v1/organizations/{org_id}/usage/history",
     tag = "Usage",
     params(
         ("org_id" = String, Path, description = "Organization ID"),
@@ -291,7 +291,7 @@ pub async fn get_organization_usage_history(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
                     "Failed to verify organization access".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             )
         })?;
@@ -316,7 +316,7 @@ pub async fn get_organization_usage_history(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
                     "Failed to retrieve usage history".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             )
         })?;
@@ -351,7 +351,7 @@ pub async fn get_organization_usage_history(
 /// Returns paginated usage history for a specific API key
 #[utoipa::path(
     get,
-    path = "/workspaces/{workspace_id}/api-keys/{api_key_id}/usage/history",
+    path = "/v1/workspaces/{workspace_id}/api-keys/{api_key_id}/usage/history",
     tag = "Usage",
     params(
         ("workspace_id" = String, Path, description = "Workspace ID"),
@@ -440,7 +440,7 @@ pub async fn get_api_key_usage_history(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(
                         "Failed to retrieve usage history".to_string(),
-                        "internal_error".to_string(),
+                        "internal_server_error".to_string(),
                     )),
                 ),
             }

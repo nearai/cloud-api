@@ -1,9 +1,10 @@
 use crate::middleware::AdminUser;
 use crate::models::{
-    AdminAccessTokenResponse, AdminUserResponse, BatchUpdateModelApiRequest,
-    CreateAdminAccessTokenRequest, DecimalPrice, DeleteAdminAccessTokenRequest, ErrorResponse,
-    ListUsersResponse, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
-    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, SpendLimit, UpdateOrganizationLimitsRequest,
+    AdminAccessTokenResponse, AdminUserOrganizationDetails, AdminUserResponse,
+    BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, DecimalPrice,
+    DeleteAdminAccessTokenRequest, ErrorResponse, ListUsersResponse, ModelHistoryEntry,
+    ModelHistoryResponse, ModelMetadata, ModelWithPricing, OrgLimitsHistoryEntry,
+    OrgLimitsHistoryResponse, SpendLimit, UpdateOrganizationLimitsRequest,
     UpdateOrganizationLimitsResponse,
 };
 use axum::{
@@ -33,7 +34,7 @@ pub struct AdminAppState {
 /// The body should be an array of objects where each key is a model name and the value is the model data.
 #[utoipa::path(
     patch,
-    path = "/admin/models",
+    path = "/v1/admin/models",
     tag = "Admin",
     request_body = BatchUpdateModelApiRequest,
     responses(
@@ -139,6 +140,7 @@ pub async fn batch_upsert_models(
                 model_display_name: updated_model.model_display_name,
                 model_description: updated_model.model_description,
                 model_icon: updated_model.model_icon,
+                aliases: updated_model.aliases,
             },
         })
         .collect();
@@ -155,12 +157,12 @@ pub async fn batch_upsert_models(
 /// For example, use "Qwen%2FQwen3-30B-A3B-Instruct-2507" in the URL path.
 #[utoipa::path(
     get,
-    path = "/admin/models/{model_name}/history",
+    path = "/v1/admin/models/{model_name}/history",
     tag = "Admin",
     params(
         ("model_name" = String, Path, description = "Model name to get complete history for (URL-encode if it contains slashes)"),
-        ("limit" = i64, Query, description = "Maximum number of history entries to return (default: 50)"),
-        ("offset" = i64, Query, description = "Number of history entries to skip (default: 0)")
+        ("limit" = Option<i64>, Query, description = "Maximum number of history entries to return (default: 50)"),
+        ("offset" = Option<i64>, Query, description = "Number of history entries to skip (default: 0)")
     ),
     responses(
         (status = 200, description = "Model history retrieved successfully", body = ModelHistoryResponse),
@@ -260,7 +262,7 @@ pub async fn get_model_history(
 /// a billing service with an admin API key when a customer makes a purchase.
 #[utoipa::path(
     patch,
-    path = "/admin/organizations/{org_id}/limits",
+    path = "/v1/admin/organizations/{org_id}/limits",
     tag = "Admin",
     params(
         ("org_id" = String, Path, description = "Organization ID to update limits for")
@@ -368,12 +370,12 @@ pub async fn update_organization_limits(
 /// Returns the complete limits history for a specific organization, showing all limits changes over time.
 #[utoipa::path(
     get,
-    path = "/admin/organizations/{organization_id}/limits/history",
+    path = "/v1/admin/organizations/{organization_id}/limits/history",
     tag = "Admin",
     params(
         ("organization_id" = String, Path, description = "The organization's ID (as a UUID)"),
-        ("limit" = i64, Query, description = "Maximum number of history records to return (default: 50)"),
-        ("offset" = i64, Query, description = "Number of records to skip (default: 0)")
+        ("limit" = Option<i64>, Query, description = "Maximum number of history records to return (default: 50)"),
+        ("offset" = Option<i64>, Query, description = "Number of records to skip (default: 0)")
     ),
     responses(
         (status = 200, description = "Limits history retrieved successfully", body = OrgLimitsHistoryResponse),
@@ -478,7 +480,7 @@ pub async fn get_organization_limits_history(
 /// For example, use "Qwen%2FQwen3-30B-A3B-Instruct-2507" in the URL path.
 #[utoipa::path(
     delete,
-    path = "/admin/models/{model_name}",
+    path = "/v1/admin/models/{model_name}",
     tag = "Admin",
     params(
         ("model_name" = String, Path, description = "Model name to delete (URL-encode if it contains slashes)")
@@ -540,11 +542,12 @@ pub async fn delete_model(
 /// Returns a paginated list of all users in the system. Only authenticated admins can perform this operation.
 #[utoipa::path(
     get,
-    path = "/admin/users",
+    path = "/v1/admin/users",
     tag = "Admin",
     params(
-        ("limit" = i64, Query, description = "Maximum number of users to return (default: 50)"),
-        ("offset" = i64, Query, description = "Number of users to skip (default: 0)")
+        ("limit" = Option<i64>, Query, description = "Maximum number of users to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Number of users to skip (default: 0)"),
+        ("include_organizations" = Option<bool>, Query, description = "Whether to include organization information and spend limits for the first organization owned by each user (default: false)")
     ),
     responses(
         (status = 200, description = "Users retrieved successfully", body = ListUsersResponse),
@@ -563,44 +566,104 @@ pub async fn list_users(
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     debug!(
-        "List users request with limit={}, offset={}",
-        params.limit, params.offset
+        "List users request with limit={}, offset={}, include_organizations={}",
+        params.limit, params.offset, params.include_organizations
     );
 
-    let (users, total) = app_state
-        .admin_service
-        .list_users(params.limit, params.offset)
-        .await
-        .map_err(|e| {
-            error!("Failed to list users");
-            match e {
-                services::admin::AdminError::Unauthorized(msg) => (
-                    StatusCode::UNAUTHORIZED,
-                    ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
-                ),
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ResponseJson(ErrorResponse::new(
-                        "Failed to retrieve users".to_string(),
-                        "internal_server_error".to_string(),
-                    )),
-                ),
-            }
-        })?;
+    let (user_responses, total) = if params.include_organizations {
+        // Fetch users with their default organization and spend limit
+        let (users_with_orgs, total) = app_state
+            .admin_service
+            .list_users_with_organizations(params.limit, params.offset)
+            .await
+            .map_err(|e| {
+                error!("Failed to list users with organizations");
+                match e {
+                    services::admin::AdminError::Unauthorized(msg) => (
+                        StatusCode::UNAUTHORIZED,
+                        ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
+                    ),
+                    _ => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse::new(
+                            "Failed to retrieve users".to_string(),
+                            "internal_server_error".to_string(),
+                        )),
+                    ),
+                }
+            })?;
 
-    let user_responses: Vec<AdminUserResponse> = users
-        .into_iter()
-        .map(|u| AdminUserResponse {
-            id: u.id.to_string(),
-            email: u.email,
-            username: Some(u.username),
-            display_name: u.display_name,
-            avatar_url: u.avatar_url,
-            created_at: u.created_at,
-            last_login_at: u.last_login_at,
-            is_active: u.is_active,
-        })
-        .collect();
+        let responses: Vec<AdminUserResponse> = users_with_orgs
+            .into_iter()
+            .map(|(u, org_data)| {
+                let organizations = org_data.map(|org_info| {
+                    vec![AdminUserOrganizationDetails {
+                        id: org_info.id.to_string(),
+                        name: org_info.name,
+                        description: org_info.description,
+                        spend_limit: org_info.spend_limit.map(|amount| SpendLimit {
+                            amount,
+                            scale: 9,
+                            currency: "USD".to_string(),
+                        }),
+                    }]
+                });
+
+                AdminUserResponse {
+                    id: u.id.to_string(),
+                    email: u.email,
+                    username: Some(u.username),
+                    display_name: u.display_name,
+                    avatar_url: u.avatar_url,
+                    created_at: u.created_at,
+                    last_login_at: u.last_login_at,
+                    is_active: u.is_active,
+                    organizations,
+                }
+            })
+            .collect();
+
+        (responses, total)
+    } else {
+        // Return users data only
+        let (users, total) = app_state
+            .admin_service
+            .list_users(params.limit, params.offset)
+            .await
+            .map_err(|e| {
+                error!("Failed to list users");
+                match e {
+                    services::admin::AdminError::Unauthorized(msg) => (
+                        StatusCode::UNAUTHORIZED,
+                        ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
+                    ),
+                    _ => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse::new(
+                            "Failed to retrieve users".to_string(),
+                            "internal_server_error".to_string(),
+                        )),
+                    ),
+                }
+            })?;
+
+        let responses: Vec<AdminUserResponse> = users
+            .into_iter()
+            .map(|u| AdminUserResponse {
+                id: u.id.to_string(),
+                email: u.email,
+                username: Some(u.username),
+                display_name: u.display_name,
+                avatar_url: u.avatar_url,
+                created_at: u.created_at,
+                last_login_at: u.last_login_at,
+                is_active: u.is_active,
+                organizations: None,
+            })
+            .collect();
+
+        (responses, total)
+    };
 
     let response = ListUsersResponse {
         users: user_responses,
@@ -621,7 +684,7 @@ pub async fn list_users(
 /// Store them securely and rotate them regularly.
 #[utoipa::path(
     post,
-    path = "/admin/access-tokens",
+    path = "/v1/admin/access-tokens",
     tag = "Admin",
     request_body = CreateAdminAccessTokenRequest,
     responses(
@@ -700,10 +763,10 @@ pub async fn create_admin_access_token(
 /// Only authenticated admins can access this endpoint.
 #[utoipa::path(
     get,
-    path = "/admin/access-tokens",
+    path = "/v1/admin/access-tokens",
     tag = "Admin",
     params(
-        ("limit" = Option<i64>, Query, description = "Number of records to return (default: 50)"),
+        ("limit" = Option<i64>, Query, description = "Number of records to return (default: 100)"),
         ("offset" = Option<i64>, Query, description = "Number of records to skip (default: 0)")
     ),
     responses(
@@ -767,7 +830,7 @@ pub async fn list_admin_access_tokens(
 /// Only authenticated admins can perform this operation.
 #[utoipa::path(
     delete,
-    path = "/admin/access-tokens/{token_id}",
+    path = "/v1/admin/access-tokens/{token_id}",
     tag = "Admin",
     request_body = DeleteAdminAccessTokenRequest,
     params(
@@ -858,6 +921,8 @@ pub struct ListUsersQueryParams {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+    #[serde(default)]
+    pub include_organizations: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]

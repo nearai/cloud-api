@@ -1,49 +1,46 @@
-//! Integration tests for the vLLM provider
+//! Integration tests for the inference provider
 //!
-//! These tests require a running vLLM instance and will make real HTTP requests.
+//! These tests use MockProvider by default to avoid external dependencies.
+//! Set USE_REAL_VLLM=true to use the real VLLM provider instead.
 //! Run with: `cargo test --test integration_tests -- --nocapture`
 
 use futures_util::StreamExt;
 use inference_providers::{
-    ChatCompletionParams, ChatMessage, CompletionParams, InferenceProvider, MessageRole,
-    StreamChunk, VLlmConfig, VLlmProvider,
+    ChatCompletionParams, ChatMessage, CompletionParams, FunctionDefinition, InferenceProvider,
+    MessageRole, MockProvider, StreamChunk, ToolChoice, ToolDefinition,
 };
 use std::time::Duration;
 use tokio::time::timeout;
 
-/// Get vLLM base URL from environment variable or use default
-fn get_vllm_base_url() -> String {
-    std::env::var("VLLM_BASE_URL").unwrap_or_else(|_| "http://localhost:8002".to_string())
-}
-
-/// Get vLLM API key from environment variable
-fn get_vllm_api_key() -> Option<String> {
-    std::env::var("VLLM_API_KEY").ok()
-}
-
-/// Get test timeout from environment variable or use default
-fn get_test_timeout_secs() -> u64 {
-    std::env::var("VLLM_TEST_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30)
-}
-
-/// Create a configured vLLM provider for testing
-fn create_test_provider() -> VLlmProvider {
-    let _ = dotenvy::dotenv();
-    let config = VLlmConfig {
-        base_url: get_vllm_base_url(),
-        api_key: get_vllm_api_key(),
-        timeout_seconds: get_test_timeout_secs() as i64,
-    };
-    VLlmProvider::new(config)
+/// Create a mock provider for testing
+///
+/// Uses MockProvider by default to avoid external dependencies.
+/// Set USE_REAL_VLLM=true to use the real VLLM provider instead.
+fn create_test_provider() -> Box<dyn InferenceProvider> {
+    if std::env::var("USE_REAL_VLLM").is_ok() {
+        // Use real VLLM provider if explicitly requested
+        use inference_providers::{VLlmConfig, VLlmProvider};
+        let _ = dotenvy::dotenv();
+        let config = VLlmConfig {
+            base_url: std::env::var("VLLM_BASE_URL")
+                .unwrap_or_else(|_| "http://localhost:8002".to_string()),
+            api_key: std::env::var("VLLM_API_KEY").ok(),
+            timeout_seconds: std::env::var("VLLM_TEST_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30) as i64,
+        };
+        Box::new(VLlmProvider::new(config))
+    } else {
+        // Use mock provider by default
+        Box::new(MockProvider::new())
+    }
 }
 
 #[tokio::test]
 async fn test_models_endpoint() {
     let provider = create_test_provider();
-    let test_timeout_secs = get_test_timeout_secs();
+    let test_timeout_secs = 30;
 
     let result = timeout(Duration::from_secs(test_timeout_secs), provider.models()).await;
 
@@ -70,7 +67,7 @@ async fn test_models_endpoint() {
 #[tokio::test]
 async fn test_chat_completion_streaming() {
     let provider = create_test_provider();
-    let test_timeout_secs = get_test_timeout_secs();
+    let test_timeout_secs = 30;
 
     // First get available models
     let models = provider.models().await.expect("Failed to get models");
@@ -207,7 +204,7 @@ async fn test_chat_completion_streaming() {
 #[tokio::test]
 async fn test_text_completion_streaming() {
     let provider = create_test_provider();
-    let test_timeout_secs = get_test_timeout_secs();
+    let test_timeout_secs = 30;
 
     // First get available models
     let models = provider.models().await.expect("Failed to get models");
@@ -364,17 +361,215 @@ async fn test_error_handling() {
 
 #[tokio::test]
 async fn test_configuration() {
-    // Test with different configurations
-    let _ = dotenvy::dotenv(); // OK if .env file doesn't exist (e.g., in CI)
-    let config = VLlmConfig {
-        base_url: get_vllm_base_url(),
-        api_key: get_vllm_api_key(),
-        timeout_seconds: 10,
+    // Test that the mock provider works correctly
+    let provider = MockProvider::new();
+    let models = provider.models().await;
+    assert!(models.is_ok(), "Mock provider should work correctly");
+    assert!(
+        !models.unwrap().data.is_empty(),
+        "Mock provider should return models"
+    );
+}
+
+#[tokio::test]
+async fn test_chat_completion_streaming_with_tool_calls() {
+    let provider = create_test_provider();
+    let test_timeout_secs = 30;
+
+    // First get available models
+    let models = provider.models().await.expect("Failed to get models");
+    assert!(!models.data.is_empty(), "No models available for testing");
+
+    let model_id = &models.data[0].id;
+    println!("Testing tool calls with model: {model_id}");
+
+    // Create the tool definition for get_weather
+    let weather_params = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "location": {
+                "type": "string",
+                "description": "City name"
+            }
+        },
+        "required": ["location"]
+    });
+
+    let tools = vec![ToolDefinition {
+        type_: "function".to_string(),
+        function: FunctionDefinition {
+            name: "get_weather".to_string(),
+            description: Some("Get the current weather for a city".to_string()),
+            parameters: weather_params,
+        },
+    }];
+
+    let params = ChatCompletionParams {
+        model: model_id.clone(),
+        messages: vec![ChatMessage {
+            role: MessageRole::User,
+            content: Some("What's the weather in New York today?".to_string()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }],
+        max_completion_tokens: Some(100),
+        temperature: Some(0.7),
+        stream: Some(true),
+        max_tokens: None,
+        top_p: None,
+        n: None,
+        stop: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        logit_bias: None,
+        logprobs: None,
+        top_logprobs: None,
+        user: None,
+        response_format: None,
+        seed: None,
+        tools: Some(tools),
+        tool_choice: Some(ToolChoice::String("auto".to_string())),
+        parallel_tool_calls: None,
+        metadata: None,
+        store: None,
+        stream_options: None,
+        extra: std::collections::HashMap::new(),
     };
 
-    let provider = VLlmProvider::new(config.clone());
+    let stream_result = timeout(
+        Duration::from_secs(test_timeout_secs),
+        provider.chat_completion_stream(params, "test_tool_call_request_hash".to_string()),
+    )
+    .await;
 
-    // Test that the provider was created successfully
-    let models = provider.models().await;
-    assert!(models.is_ok(), "Provider should work with valid config");
+    match stream_result {
+        Ok(Ok(mut stream)) => {
+            let mut chunks_received = 0;
+            let mut content_received = String::new();
+            let mut tool_calls_found = false;
+            let mut tool_call_ids = Vec::new();
+            let mut tool_call_names = Vec::new();
+            let mut tool_call_arguments = std::collections::HashMap::new();
+
+            // Process streaming chunks
+            while let Some(chunk_result) = timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap_or(None)
+            {
+                match chunk_result {
+                    Ok(sse_event) => match sse_event.chunk {
+                        StreamChunk::Chat(chat_chunk) => {
+                            chunks_received += 1;
+
+                            // Check for tool calls in delta
+                            if let Some(choice) = chat_chunk.choices.first() {
+                                if let Some(delta) = &choice.delta {
+                                    // Collect content
+                                    if let Some(content) = &delta.content {
+                                        content_received.push_str(content);
+                                    }
+
+                                    // Check for tool calls
+                                    if let Some(tool_calls) = &delta.tool_calls {
+                                        tool_calls_found = true;
+                                        println!(
+                                            "Received tool call delta in chunk #{chunks_received}: {tool_calls:?}"
+                                        );
+
+                                        for tool_call_delta in tool_calls {
+                                            // Track tool call IDs
+                                            if let Some(id) = &tool_call_delta.id {
+                                                if !tool_call_ids.contains(id) {
+                                                    tool_call_ids.push(id.clone());
+                                                    println!("Tool call ID: {id}");
+                                                }
+                                            }
+
+                                            // Track tool call names
+                                            if let Some(function) = &tool_call_delta.function {
+                                                if let Some(name) = &function.name {
+                                                    if !tool_call_names.contains(name) {
+                                                        tool_call_names.push(name.clone());
+                                                        println!("Tool call function name: {name}");
+                                                    }
+                                                }
+
+                                                // Accumulate arguments (they come in chunks)
+                                                if let Some(arguments_delta) = &function.arguments {
+                                                    if let Some(index) = tool_call_delta.index {
+                                                        let entry = tool_call_arguments
+                                                            .entry(index)
+                                                            .or_insert_with(String::new);
+                                                        entry.push_str(arguments_delta);
+                                                    }
+                                                }
+                                            }
+
+                                            // Log index if present
+                                            if let Some(index) = tool_call_delta.index {
+                                                println!("Tool call index: {index}");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Log chunk details periodically
+                            if chunks_received % 10 == 0 {
+                                println!("Processed {chunks_received} chunks so far...");
+                            }
+                        }
+                        StreamChunk::Text(text_chunk) => {
+                            panic!("CRITICAL ERROR: Received text chunk in chat completion stream with tool calls! Chunk: {text_chunk:?}");
+                        }
+                    },
+                    Err(e) => {
+                        // Stream errors should be treated as test failures
+                        panic!("Stream error in tool call chat completion: {e}. This could indicate SSE parsing issues with ToolCallDelta or stream corruption.");
+                    }
+                }
+
+                // Safety limit to avoid infinite loops
+                if chunks_received > 200 {
+                    break;
+                }
+            }
+
+            assert!(
+                chunks_received > 0,
+                "Should have received at least one chunk"
+            );
+
+            println!("Total chunks received: {chunks_received}");
+            println!("Content received: '{content_received}'");
+            println!("Tool calls found: {tool_calls_found}");
+            println!("Tool call IDs: {tool_call_ids:?}");
+            println!("Tool call function names: {tool_call_names:?}");
+            println!("Tool call arguments (by index): {tool_call_arguments:?}");
+
+            // Verify that tool calls were received (if the model supports them)
+            // Note: Some models may not call tools for this specific query, so we log but don't fail
+            if tool_calls_found {
+                assert!(
+                    !tool_call_ids.is_empty(),
+                    "If tool calls were found, should have at least one tool call ID"
+                );
+                assert!(
+                    !tool_call_names.is_empty(),
+                    "If tool calls were found, should have at least one function name"
+                );
+                // Verify that we got the expected tool call
+                assert!(
+                    tool_call_names.contains(&"get_weather".to_string()),
+                    "Should have received get_weather tool call"
+                );
+                println!("✓ Successfully received and parsed tool calls!");
+            } else {
+                println!("⚠ No tool calls received - this may be expected if the model chose not to call tools");
+            }
+        }
+        Ok(Err(e)) => panic!("Tool call chat completion failed: {e}"),
+        Err(_) => panic!("Tool call chat completion timed out after {test_timeout_secs} seconds"),
+    }
 }

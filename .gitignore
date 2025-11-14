@@ -4,6 +4,7 @@ config/docker.yaml
 config/examples/production.yaml
 .cursor
 *.crt
-.env
+.env*
 .GIT_REV
 oci.tar
+.idea

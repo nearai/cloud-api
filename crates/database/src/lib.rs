@@ -10,8 +10,8 @@ pub use models::*;
 pub use pool::DbPool;
 pub use repositories::{
     ApiKeyRepository, McpConnectorRepository, PgAttestationRepository, PgConversationRepository,
-    PgOrganizationInvitationRepository, PgOrganizationRepository, PgResponseRepository,
-    SessionRepository, UserRepository,
+    PgOrganizationInvitationRepository, PgOrganizationRepository, PgResponseItemsRepository,
+    PgResponseRepository, SessionRepository, UserRepository,
 };
 
 use anyhow::Result;
@@ -33,6 +33,7 @@ pub struct Database {
     pub mcp_connectors: McpConnectorRepository,
     pub conversations: PgConversationRepository,
     pub responses: PgResponseRepository,
+    pub response_items: PgResponseItemsRepository,
     pub attestation: PgAttestationRepository,
     pool: DbPool,
     cluster_manager: Option<Arc<ClusterManager>>,
@@ -49,6 +50,7 @@ impl Database {
             mcp_connectors: McpConnectorRepository::new(pool.clone()),
             conversations: PgConversationRepository::new(pool.clone()),
             responses: PgResponseRepository::new(pool.clone()),
+            response_items: PgResponseItemsRepository::new(pool.clone()),
             attestation: PgAttestationRepository::new(pool.clone()),
             pool,
             cluster_manager: None,

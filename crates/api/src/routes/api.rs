@@ -6,8 +6,9 @@ use axum::{
 };
 use services::{
     attestation::ports::AttestationServiceTrait, auth::AuthServiceTrait,
-    completions::CompletionServiceTrait, mcp::McpClientManager, models::ModelsServiceTrait,
-    organization::OrganizationServiceTrait, workspace::WorkspaceServiceTrait,
+    completions::CompletionServiceTrait, files::FileServiceTrait, mcp::McpClientManager,
+    models::ModelsServiceTrait, organization::OrganizationServiceTrait,
+    workspace::WorkspaceServiceTrait,
 };
 use std::sync::Arc;
 
@@ -23,6 +24,7 @@ pub struct AppState {
     pub attestation_service: Arc<dyn AttestationServiceTrait>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
+    pub files_service: Arc<dyn FileServiceTrait + Send + Sync>,
     pub config: Arc<config::ApiConfig>,
 }
 

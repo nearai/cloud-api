@@ -55,7 +55,7 @@ pub async fn usage_check_middleware(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(ErrorResponse::new(
                     "Internal error".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             )
         })?;
@@ -70,15 +70,14 @@ pub async fn usage_check_middleware(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     axum::Json(ErrorResponse::new(
                         "Failed to check API key spend".to_string(),
-                        "internal_error".to_string(),
+                        "internal_server_error".to_string(),
                     )),
                 )
             })?;
 
         if api_key_spend >= api_key_limit {
             warn!(
-                "API key {} exceeded spend limit. Spent: {}, Limit: {}",
-                api_key_id.0,
+                "API key exceeded spend limit. Spent: {}, Limit: {}",
                 format_amount(api_key_spend),
                 format_amount(api_key_limit)
             );
@@ -115,7 +114,7 @@ pub async fn usage_check_middleware(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(ErrorResponse::new(
                     "Failed to check usage limits".to_string(),
-                    "internal_error".to_string(),
+                    "internal_server_error".to_string(),
                 )),
             )
         })?;
@@ -131,8 +130,7 @@ pub async fn usage_check_middleware(
         }
         UsageCheckResult::LimitExceeded { spent, limit } => {
             warn!(
-                "Organization {} exceeded credit limit. Spent: {}, Limit: {}",
-                organization_id,
+                "Organization exceeded credit limit. Spent: {}, Limit: {}",
                 format_amount(spent),
                 format_amount(limit)
             );
@@ -149,10 +147,7 @@ pub async fn usage_check_middleware(
             ))
         }
         UsageCheckResult::NoCredits => {
-            warn!(
-                "Organization {} has no credits - denying request",
-                organization_id
-            );
+            warn!("Organization has no credits - denying request");
             Err((
                 StatusCode::PAYMENT_REQUIRED,
                 axum::Json(ErrorResponse::new(
@@ -162,10 +157,7 @@ pub async fn usage_check_middleware(
             ))
         }
         UsageCheckResult::NoLimitSet => {
-            warn!(
-                "Organization {} has no spending limit configured - denying request",
-                organization_id
-            );
+            warn!("Organization has no spending limit configured - denying request");
             Err((
                 StatusCode::PAYMENT_REQUIRED,
                 axum::Json(ErrorResponse::new(

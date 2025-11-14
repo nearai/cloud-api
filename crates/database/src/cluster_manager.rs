@@ -130,6 +130,7 @@ impl ClusterManager {
     /// Update read pools based on current replicas
     async fn update_read_pools(&self) -> Result<()> {
         let replicas = self.discovery.get_replicas().await;
+        debug!("Updating read pools for {} replicas", replicas.len());
         let mut read_pools = self.read_pools.write().await;
 
         // Remove pools for replicas that no longer exist
@@ -228,11 +229,8 @@ impl ClusterManager {
             if let Some(pool) = read_pools.get(&replica.host) {
                 match pool.get().await {
                     Ok(conn) => return Ok(conn),
-                    Err(e) => {
-                        warn!(
-                            "Failed to get connection from replica {}: {}",
-                            replica.name, e
-                        );
+                    Err(_) => {
+                        warn!("Failed to get connection from replica {}", replica.name);
                     }
                 }
             }
@@ -267,11 +265,8 @@ impl ClusterManager {
                         );
                         return Ok(conn);
                     }
-                    Err(e) => {
-                        warn!(
-                            "Failed to get connection from replica {}: {}",
-                            replica.name, e
-                        );
+                    Err(_) => {
+                        warn!("Failed to get connection from replica {}", replica.name);
                     }
                 }
             }

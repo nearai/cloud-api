@@ -26,7 +26,7 @@ pub struct ChatDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCall>>,
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,16 +41,49 @@ pub enum MessageRole {
 /// Tool call in a message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
-    pub id: String,
+    /// Tool call ID (optional in streaming mode where it may come in a later chunk)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Tool type (optional in streaming mode where it may come in a later chunk)
     #[serde(rename = "type")]
-    pub type_: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_: Option<String>,
     pub function: FunctionCall,
+    /// Index of the tool call in streaming responses (for tracking multiple parallel tool calls)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<i64>,
+}
+
+/// Delta tool call in streaming chat completions
+/// All fields are optional as they may not be present in every chunk
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub type_: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<FunctionCallDelta>,
 }
 
 /// Function call details
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCall {
-    pub name: String,
+    /// Function name (optional in streaming mode where it may come in a later chunk)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub arguments: Option<String>,
+}
+
+/// Delta function call in streaming chat completions
+/// All fields are optional as they may not be present in every chunk
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionCallDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<String>,
 }
 
@@ -296,6 +329,8 @@ pub enum FinishReason {
     Stop,
     Length,
     ContentFilter,
+    #[serde(alias = "function_call")]
+    ToolCalls,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -345,6 +380,10 @@ pub struct ChatCompletionChunk {
     /// Usage statistics (typically only in final chunk)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
+
+    /// Token IDs for the prompt (typically only in first chunk)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_token_ids: Option<Vec<i64>>,
 }
 
 /// Text completion streaming chunk (matches OpenAI legacy format)
@@ -393,6 +432,10 @@ pub struct ChatChoice {
     /// Reason why generation finished
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<FinishReason>,
+
+    /// Token IDs generated in this chunk (streaming responses)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ids: Option<Vec<i64>>,
 }
 
 /// Choice in a text completion response

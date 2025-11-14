@@ -350,6 +350,7 @@ impl EventEmitter {
             status: models::ResponseItemStatus::InProgress,
             summary: String::new(),
             content: String::new(),
+            model: ctx.model.clone(),
         };
         self.emit_item_added(ctx, item, reasoning_id.to_string())
             .await
@@ -388,7 +389,9 @@ impl EventEmitter {
         ctx: &mut ResponseStreamContext,
         reasoning_id: &str,
         content: &str,
-        response_items_repository: &std::sync::Arc<dyn crate::responses::ports::ResponseItemRepositoryTrait>,
+        response_items_repository: &std::sync::Arc<
+            dyn crate::responses::ports::ResponseItemRepositoryTrait,
+        >,
     ) -> Result<(), errors::ResponseError> {
         let item = models::ResponseOutputItem::Reasoning {
             id: reasoning_id.to_string(),
@@ -399,6 +402,7 @@ impl EventEmitter {
             status: models::ResponseItemStatus::Completed,
             summary: String::new(), // Summary can be populated later if needed
             content: content.to_string(),
+            model: ctx.model.clone(),
         };
 
         // Emit done event

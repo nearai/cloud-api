@@ -211,8 +211,12 @@ impl ResponseServiceImpl {
                     // Parse the SSE event for content and tool calls
                     if let Some(delta_text) = Self::extract_text_delta(&sse_event) {
                         // Process reasoning tags and extract clean text
-                        let (clean_text, reasoning_delta, tag_transition) = 
-                            Self::process_reasoning_tags(&delta_text, &mut reasoning_buffer, &mut inside_reasoning);
+                        let (clean_text, reasoning_delta, tag_transition) =
+                            Self::process_reasoning_tags(
+                                &delta_text,
+                                &mut reasoning_buffer,
+                                &mut inside_reasoning,
+                            );
 
                         // Handle reasoning tag transitions
                         match tag_transition {
@@ -238,13 +242,13 @@ impl ResponseServiceImpl {
                                         .await?;
 
                                     // Count reasoning tokens
-                                    let reasoning_token_count = 
+                                    let reasoning_token_count =
                                         crate::responses::service_helpers::ResponseStreamContext::estimate_tokens(&reasoning_buffer);
                                     ctx.add_reasoning_tokens(reasoning_token_count);
 
                                     // Move to next output index
                                     ctx.next_output_index();
-                                    
+
                                     // Reset reasoning state
                                     reasoning_buffer.clear();
                                     reasoning_item_emitted = false;
@@ -257,7 +261,11 @@ impl ResponseServiceImpl {
                         if let Some(reasoning_content) = reasoning_delta {
                             if reasoning_item_emitted {
                                 emitter
-                                    .emit_reasoning_delta(ctx, reasoning_item_id.clone(), reasoning_content)
+                                    .emit_reasoning_delta(
+                                        ctx,
+                                        reasoning_item_id.clone(),
+                                        reasoning_content,
+                                    )
                                     .await?;
                             }
                         }
@@ -654,9 +662,9 @@ impl ResponseServiceImpl {
 
         // Set usage from accumulated token counts
         final_response.usage = models::Usage::new_with_reasoning(
-            ctx.total_input_tokens, 
+            ctx.total_input_tokens,
             ctx.total_output_tokens,
-            ctx.reasoning_tokens
+            ctx.reasoning_tokens,
         );
         tracing::debug!(
             "Final response usage: input={}, output={}, reasoning={}, total={}",
@@ -1579,7 +1587,7 @@ impl ResponseServiceImpl {
 
     /// Process reasoning tags in text delta
     /// Returns (clean_text, reasoning_delta, tag_transition)
-    /// 
+    ///
     /// Handles common reasoning tags: <think>, <reasoning>, <thought>, <reflect>, <analysis>
     fn process_reasoning_tags(
         delta_text: &str,
@@ -1587,22 +1595,22 @@ impl ResponseServiceImpl {
         inside_reasoning: &mut bool,
     ) -> (String, Option<String>, TagTransition) {
         const REASONING_TAGS: &[&str] = &["think", "reasoning", "thought", "reflect", "analysis"];
-        
+
         let mut clean_text = String::new();
         let mut reasoning_delta = String::new();
         let mut tag_transition = TagTransition::None;
         let mut chars = delta_text.chars().peekable();
-        
+
         while let Some(ch) = chars.next() {
             if ch == '<' {
                 // Check if this is an opening or closing tag
                 let mut tag_candidate = String::new();
                 let is_closing = chars.peek() == Some(&'/');
-                
+
                 if is_closing {
                     chars.next(); // consume '/'
                 }
-                
+
                 // Collect tag name
                 while let Some(&next_ch) = chars.peek() {
                     if next_ch == '>' {
@@ -1615,9 +1623,9 @@ impl ResponseServiceImpl {
                         break;
                     }
                 }
-                
+
                 let tag_name = tag_candidate.to_lowercase();
-                
+
                 // Check if this is a known reasoning tag
                 if REASONING_TAGS.contains(&tag_name.as_str()) {
                     if is_closing && *inside_reasoning {
@@ -1634,14 +1642,14 @@ impl ResponseServiceImpl {
                     // Don't include the tag itself in any output
                     continue;
                 }
-                
+
                 // Not a reasoning tag, reconstruct the tag text
                 let reconstructed = if is_closing {
                     format!("</{tag_candidate}>")
                 } else {
                     format!("<{tag_candidate}>")
                 };
-                
+
                 if *inside_reasoning {
                     reasoning_delta.push_str(&reconstructed);
                     reasoning_buffer.push_str(&reconstructed);
@@ -1658,13 +1666,13 @@ impl ResponseServiceImpl {
                 }
             }
         }
-        
+
         let reasoning_result = if !reasoning_delta.is_empty() {
             Some(reasoning_delta)
         } else {
             None
         };
-        
+
         (clean_text, reasoning_result, tag_transition)
     }
 
@@ -2057,11 +2065,7 @@ impl ResponseServiceImpl {
 
         let workspace_id_domain = crate::workspace::WorkspaceId(workspace_id);
         conversation_service
-            .update_conversation(
-                conversation_id,
-                workspace_id_domain,
-                updated_metadata,
-            )
+            .update_conversation(conversation_id, workspace_id_domain, updated_metadata)
             .await
             .map_err(|e| {
                 errors::ResponseError::InternalError(format!(
@@ -2111,16 +2115,22 @@ mod tests {
         let mut inside_reasoning = false;
 
         // Test opening tag
-        let (clean, reasoning, transition) = 
-            ResponseServiceImpl::process_reasoning_tags("<think>", &mut reasoning_buffer, &mut inside_reasoning);
+        let (clean, reasoning, transition) = ResponseServiceImpl::process_reasoning_tags(
+            "<think>",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
         assert_eq!(clean, "");
         assert_eq!(reasoning, None);
         assert_eq!(transition, TagTransition::OpeningTag("think".to_string()));
         assert!(inside_reasoning);
 
         // Test content inside reasoning
-        let (clean, reasoning, transition) = 
-            ResponseServiceImpl::process_reasoning_tags("This is reasoning", &mut reasoning_buffer, &mut inside_reasoning);
+        let (clean, reasoning, transition) = ResponseServiceImpl::process_reasoning_tags(
+            "This is reasoning",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
         assert_eq!(clean, "");
         assert_eq!(reasoning, Some("This is reasoning".to_string()));
         assert_eq!(transition, TagTransition::None);
@@ -2128,8 +2138,11 @@ mod tests {
         assert_eq!(reasoning_buffer, "This is reasoning");
 
         // Test closing tag
-        let (clean, reasoning, transition) = 
-            ResponseServiceImpl::process_reasoning_tags("</think>", &mut reasoning_buffer, &mut inside_reasoning);
+        let (clean, reasoning, transition) = ResponseServiceImpl::process_reasoning_tags(
+            "</think>",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
         assert_eq!(clean, "");
         assert_eq!(reasoning, None);
         assert_eq!(transition, TagTransition::ClosingTag("think".to_string()));
@@ -2142,8 +2155,11 @@ mod tests {
         let mut inside_reasoning = false;
 
         // Test text before reasoning tag
-        let (clean, reasoning, _transition) = 
-            ResponseServiceImpl::process_reasoning_tags("Hello <think>reasoning content</think> world", &mut reasoning_buffer, &mut inside_reasoning);
+        let (clean, reasoning, _transition) = ResponseServiceImpl::process_reasoning_tags(
+            "Hello <think>reasoning content</think> world",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
         assert_eq!(clean, "Hello  world");
         assert!(reasoning.is_some());
         assert_eq!(reasoning_buffer, "reasoning content");
@@ -2153,15 +2169,18 @@ mod tests {
     #[test]
     fn test_process_reasoning_tags_multiple_tags() {
         let test_tags = vec!["think", "reasoning", "thought", "reflect", "analysis"];
-        
+
         for tag in test_tags {
             let mut reasoning_buffer = String::new();
             let mut inside_reasoning = false;
 
             let input = format!("<{tag}>test content</{tag}>");
-            let (clean, reasoning, _) = 
-                ResponseServiceImpl::process_reasoning_tags(&input, &mut reasoning_buffer, &mut inside_reasoning);
-            
+            let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+                &input,
+                &mut reasoning_buffer,
+                &mut inside_reasoning,
+            );
+
             assert_eq!(clean, "");
             assert!(reasoning.is_some() || reasoning_buffer.contains("test content"));
             assert!(!inside_reasoning);
@@ -2174,9 +2193,12 @@ mod tests {
         let mut inside_reasoning = false;
 
         let input = "The answer is <think>Let me think about this carefully</think> 42";
-        let (clean, _, _) = 
-            ResponseServiceImpl::process_reasoning_tags(input, &mut reasoning_buffer, &mut inside_reasoning);
-        
+        let (clean, _, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
         assert_eq!(clean, "The answer is  42");
         assert_eq!(reasoning_buffer, "Let me think about this carefully");
     }
@@ -2193,8 +2215,11 @@ mod tests {
         let mut all_clean = String::new();
 
         for chunk in chunks {
-            let (clean, reasoning, _) = 
-                ResponseServiceImpl::process_reasoning_tags(chunk, &mut reasoning_buffer, &mut inside_reasoning);
+            let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+                chunk,
+                &mut reasoning_buffer,
+                &mut inside_reasoning,
+            );
             all_clean.push_str(&clean);
             if let Some(r) = reasoning {
                 // Just accumulating
@@ -2212,9 +2237,12 @@ mod tests {
         let mut inside_reasoning = false;
 
         let input = "<think>Consider <b>this</b> carefully</think>";
-        let (clean, _, _) = 
-            ResponseServiceImpl::process_reasoning_tags(input, &mut reasoning_buffer, &mut inside_reasoning);
-        
+        let (clean, _, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
         assert_eq!(clean, "");
         assert_eq!(reasoning_buffer, "Consider <b>this</b> carefully");
     }
@@ -2224,9 +2252,12 @@ mod tests {
         let mut reasoning_buffer = String::new();
         let mut inside_reasoning = false;
 
-        let (clean, reasoning, _) = 
-            ResponseServiceImpl::process_reasoning_tags("<think>Never closed", &mut reasoning_buffer, &mut inside_reasoning);
-        
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            "<think>Never closed",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
         assert_eq!(clean, "");
         assert_eq!(reasoning, Some("Never closed".to_string()));
         assert!(inside_reasoning);
@@ -2235,10 +2266,13 @@ mod tests {
     #[test]
     fn test_estimate_tokens() {
         use crate::responses::service_helpers::ResponseStreamContext;
-        
+
         assert_eq!(ResponseStreamContext::estimate_tokens("test"), 1);
         assert_eq!(ResponseStreamContext::estimate_tokens("Hello world"), 2);
-        assert_eq!(ResponseStreamContext::estimate_tokens("This is a longer text"), 5);
+        assert_eq!(
+            ResponseStreamContext::estimate_tokens("This is a longer text"),
+            5
+        );
     }
 
     #[test]
@@ -2248,9 +2282,12 @@ mod tests {
 
         // Test that clean text before reasoning tag is correctly extracted
         let input = "Hello <think>";
-        let (clean, reasoning, transition) = 
-            ResponseServiceImpl::process_reasoning_tags(input, &mut reasoning_buffer, &mut inside_reasoning);
-        
+        let (clean, reasoning, transition) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
         assert_eq!(clean, "Hello ");
         assert_eq!(reasoning, None);
         assert_eq!(transition, TagTransition::OpeningTag("think".to_string()));
@@ -2263,15 +2300,21 @@ mod tests {
         let mut inside_reasoning = false;
 
         // First open the reasoning tag
-        let (clean, _, _) = 
-            ResponseServiceImpl::process_reasoning_tags("<think>reasoning", &mut reasoning_buffer, &mut inside_reasoning);
+        let (clean, _, _) = ResponseServiceImpl::process_reasoning_tags(
+            "<think>reasoning",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
         assert_eq!(clean, "");
         assert!(inside_reasoning);
 
         // Then close it and add clean text after
-        let (clean, _, transition) = 
-            ResponseServiceImpl::process_reasoning_tags("</think> world", &mut reasoning_buffer, &mut inside_reasoning);
-        
+        let (clean, _, transition) = ResponseServiceImpl::process_reasoning_tags(
+            "</think> world",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
         assert_eq!(clean, " world");
         assert_eq!(transition, TagTransition::ClosingTag("think".to_string()));
         assert!(!inside_reasoning);

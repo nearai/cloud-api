@@ -367,12 +367,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
         for item in items {
             let created_item = self
                 .response_items_repo
-                .create(
-                    response_id.clone(),
-                    api_key_id,
-                    Some(conversation_id),
-                    item,
-                )
+                .create(response_id.clone(), api_key_id, Some(conversation_id), item)
                 .await
                 .map_err(|e| {
                     errors::ConversationError::InternalError(format!(

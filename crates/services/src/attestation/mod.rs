@@ -14,7 +14,7 @@ use rand::RngCore;
 
 use crate::{
     attestation::{
-        models::{AttestationReport, DstackCpuQuote},
+        models::{AttestationReport, DstackCpuQuote, VpcInfo},
         ports::AttestationRepository,
     },
     inference_provider_pool::InferenceProviderPool,
@@ -27,6 +27,7 @@ pub struct AttestationService {
     pub repository: Arc<dyn AttestationRepository + Send + Sync>,
     pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub models_repository: Arc<dyn ModelsRepository>,
+    pub vpc_info: Option<VpcInfo>,
     ed25519_signing_key: Arc<SigningKey>,
     ed25519_verifying_key: Arc<VerifyingKey>,
     ecdsa_signing_key: Arc<EcdsaSigningKey>,
@@ -39,6 +40,8 @@ impl AttestationService {
         inference_provider_pool: Arc<InferenceProviderPool>,
         models_repository: Arc<dyn ModelsRepository>,
     ) -> Self {
+        // Load VPC info once during initialization
+        let vpc_info = load_vpc_info();
         let mut csprng = OsRng;
 
         // Generate ed25519 key pair on startup
@@ -71,6 +74,7 @@ impl AttestationService {
             repository,
             inference_provider_pool,
             models_repository,
+            vpc_info,
             ed25519_signing_key,
             ed25519_verifying_key,
             ecdsa_signing_key,
@@ -103,6 +107,33 @@ impl AttestationService {
     /// Get the default signing address with 0x prefix (ed25519) for backward compatibility
     pub fn get_default_signing_address_hex(&self) -> String {
         self.get_signing_address_hex("ed25519")
+    }
+}
+
+/// Load VPC (Virtual Private Cloud) information from environment variables
+pub fn load_vpc_info() -> Option<VpcInfo> {
+    // Read VPC server app ID from environment
+    let vpc_server_app_id = std::env::var("VPC_SERVER_APP_ID").ok();
+
+    // Read VPC hostname from file
+    let vpc_hostname = if let Ok(path) = std::env::var("VPC_HOSTNAME_FILE") {
+        std::fs::read_to_string(path)
+            .map_err(|e| tracing::warn!("Failed to read VPC hostname file: {e}"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+
+    // Only return Some if at least one field is present
+    if vpc_server_app_id.is_some() || vpc_hostname.is_some() {
+        Some(VpcInfo {
+            vpc_server_app_id,
+            vpc_hostname,
+        })
+    } else {
+        None
     }
 }
 
@@ -293,6 +324,9 @@ impl ports::AttestationServiceTrait for AttestationService {
                 .map_err(|e| AttestationError::ProviderError(e.to_string()))?;
         }
 
+        // Use VPC info loaded at initialization
+        let vpc = self.vpc_info.clone();
+
         // Determine which signing algorithm to use for report_data (default to ed25519)
         let algo = signing_algo
             .as_ref()
@@ -355,18 +389,19 @@ impl ports::AttestationServiceTrait for AttestationService {
                 report_data: hex::encode(&report_data),
                 request_nonce: nonce.clone(),
                 info: serde_json::json!({
-                "app_id": "dev-app-id",
-                "instance_id": "dev-instance-id",
-                "app_cert": "dev-app-cert",
-                "tcb_info": {},
-                "app_name": "dev-app-name",
-                "device_id": "dev-device-id",
-                "mr_aggregated": "dev-mr-aggregated",
-                "os_image_hash": "dev-os-image-hash",
-                "key_provider_info": "dev-key-provider-info",
-                "compose_hash": "dev-compose-hash",
-                "vm_config": {},
+                    "app_id": "dev-app-id",
+                    "instance_id": "dev-instance-id",
+                    "app_cert": "dev-app-cert",
+                    "tcb_info": {},
+                    "app_name": "dev-app-name",
+                    "device_id": "dev-device-id",
+                    "mr_aggregated": "dev-mr-aggregated",
+                    "os_image_hash": "dev-os-image-hash",
+                    "key_provider_info": "dev-key-provider-info",
+                    "compose_hash": "dev-compose-hash",
+                    "vm_config": {},
                 }),
+                vpc,
             };
         } else {
             let client = dstack_client::DstackClient::new(None);
@@ -384,7 +419,7 @@ impl ports::AttestationServiceTrait for AttestationService {
                 tracing::error!("Failed to get cloud API attestation, are you running in a CVM?");
                 AttestationError::InternalError("failed to get cloud API attestation".to_string())
             })?;
-            gateway_attestation = DstackCpuQuote::from_quote_and_nonce(info, cpu_quote, nonce);
+            gateway_attestation = DstackCpuQuote::from_quote_and_nonce(vpc, info, cpu_quote, nonce);
         }
 
         Ok(AttestationReport {

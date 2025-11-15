@@ -375,7 +375,7 @@ impl ports::AttestationServiceTrait for AttestationService {
 
         // Get signing address (public key) for report_data
         // Store in owned String to avoid lifetime issues
-        let signing_address_to_use = self.get_signing_address(&algo);
+        let signing_address_to_use = self.get_signing_address_hex(&algo);
 
         // Parse signing address from hex (remove 0x prefix if present)
         let signing_address_clean = signing_address_to_use

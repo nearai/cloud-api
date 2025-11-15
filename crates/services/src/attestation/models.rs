@@ -76,8 +76,8 @@ impl DstackCpuQuote {
         nonce: String,
     ) -> Self {
         Self {
-            signing_address: signing_address,
-            signing_algo: signing_algo,
+            signing_address,
+            signing_algo,
             intel_quote: quote.quote,
             event_log: quote.event_log,
             report_data: quote.report_data,
@@ -90,7 +90,7 @@ impl DstackCpuQuote {
 
 pub struct AttestationReport {
     pub gateway_attestation: DstackCpuQuote,
-    pub all_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
+    pub model_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
 }
 
 pub type DstackAppInfo = dstack_sdk::dstack_client::InfoResponse;

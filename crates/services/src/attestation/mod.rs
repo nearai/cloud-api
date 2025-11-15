@@ -275,7 +275,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         signing_address: Option<String>,
     ) -> Result<AttestationReport, AttestationError> {
         // Resolve model name (could be an alias) and get model details
-        let mut all_attestations = vec![];
+        let mut model_attestations = vec![];
         // Create a nonce if none was provided
         let nonce = match nonce {
             Some(n) => n,
@@ -332,7 +332,7 @@ impl ports::AttestationServiceTrait for AttestationService {
                 );
             }
 
-            all_attestations = self
+            model_attestations = self
                 .inference_provider_pool
                 .get_attestation_report(
                     canonical_name.clone(),
@@ -437,7 +437,7 @@ impl ports::AttestationServiceTrait for AttestationService {
 
         Ok(AttestationReport {
             gateway_attestation,
-            all_attestations,
+            model_attestations,
         })
     }
 }

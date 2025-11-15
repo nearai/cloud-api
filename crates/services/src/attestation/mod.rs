@@ -347,6 +347,18 @@ impl ports::AttestationServiceTrait for AttestationService {
             )));
         }
 
+        // Determine which signing algorithm to use for report_data (default to ed25519)
+        let algo = signing_algo
+            .as_ref()
+            .map(|s| s.to_lowercase())
+            .unwrap_or_else(|| "ed25519".to_string());
+
+        if algo != "ecdsa" && algo != "ed25519" {
+            return Err(AttestationError::InvalidParameter(format!(
+                "Invalid signing algorithm: {algo}, must be 'ecdsa' or 'ed25519'"
+            )));
+        }
+
         if let Some(model) = model {
             let resolved_model = self
                 .models_repository
@@ -386,12 +398,6 @@ impl ports::AttestationServiceTrait for AttestationService {
 
         // Use VPC info loaded at initialization
         let vpc = self.vpc_info.clone();
-
-        // Determine which signing algorithm to use for report_data (default to ed25519)
-        let algo = signing_algo
-            .as_ref()
-            .map(|s| s.to_lowercase())
-            .unwrap_or_else(|| "ed25519".to_string());
 
         // Get signing address (public key) for report_data
         // Store in owned String to avoid lifetime issues

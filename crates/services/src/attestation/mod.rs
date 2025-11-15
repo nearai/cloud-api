@@ -64,11 +64,10 @@ impl AttestationService {
         let ecdsa_signing_key = Arc::new(ecdsa_signing_key);
         let ecdsa_verifying_key = Arc::new(ecdsa_verifying_key);
 
-        // ECDSA public key is 33 bytes (compressed) or 65 bytes (uncompressed)
-        // We'll use the compressed format (33 bytes) and encode it
-        let ecdsa_address = hex::encode(ecdsa_verifying_key.to_sec1_bytes());
+        // Convert ECDSA public key to Ethereum address (20 bytes = 40 hex chars)
+        let ecdsa_address = Self::ecdsa_public_key_to_ethereum_address(&ecdsa_verifying_key);
         tracing::info!(
-            "Generated ECDSA (secp256k1) key pair for response signing. Public key (signing address): 0x{}",
+            "Generated ECDSA (secp256k1) key pair for response signing. Ethereum address (signing address): 0x{}",
             ecdsa_address
         );
 
@@ -84,11 +83,32 @@ impl AttestationService {
         }
     }
 
+    /// Convert ECDSA public key to Ethereum address (20 bytes)
+    /// Ethereum address is derived by: Keccak256(uncompressed_public_key)[12..32]
+    fn ecdsa_public_key_to_ethereum_address(verifying_key: &EcdsaVerifyingKey) -> String {
+        // Get uncompressed public key point (65 bytes: 0x04 + 32 bytes x + 32 bytes y)
+        let encoded_point = verifying_key.to_encoded_point(false);
+        let point_bytes = encoded_point.as_bytes();
+
+        // Extract x and y coordinates (skip the 0x04 prefix, take 64 bytes)
+        let uncompressed_pubkey = &point_bytes[1..65]; // Skip first byte (0x04), take 64 bytes
+
+        // Hash with Keccak256
+        let hash = Keccak256::digest(uncompressed_pubkey);
+
+        // Ethereum address is the last 20 bytes (bytes 12..32)
+        let address_bytes = &hash[12..32];
+
+        hex::encode(address_bytes)
+    }
+
     /// Get the signing address (public key) as a hex string for the specified algorithm
+    /// For ECDSA, returns Ethereum address (20 bytes = 40 hex chars)
+    /// For ed25519, returns the public key bytes
     pub fn get_signing_address(&self, algo: &str) -> String {
         match algo.to_lowercase().as_str() {
             "ed25519" => hex::encode(self.ed25519_verifying_key.as_bytes()),
-            "ecdsa" => hex::encode(self.ecdsa_verifying_key.to_sec1_bytes()),
+            "ecdsa" => Self::ecdsa_public_key_to_ethereum_address(&self.ecdsa_verifying_key),
             _ => {
                 tracing::warn!("Unknown signing algorithm: {}, defaulting to ed25519", algo);
                 hex::encode(self.ed25519_verifying_key.as_bytes())
@@ -367,10 +387,10 @@ impl ports::AttestationServiceTrait for AttestationService {
         })?;
 
         // For report_data, we need exactly 32 bytes for the signing address
-        // ECDSA keys are 33 bytes (compressed) or 65 bytes (uncompressed)
-        // We'll take the first 32 bytes for report_data
+        // ECDSA returns Ethereum address (20 bytes), ed25519 returns public key (32 bytes)
+        // We'll pad to 32 bytes if needed (left-justified with zeros)
         let signing_address_for_report = if signing_address_bytes.len() > 32 {
-            // Take first 32 bytes (e.g., for ECDSA compressed keys which are 33 bytes)
+            // Take first 32 bytes if longer (shouldn't happen with current implementation)
             signing_address_bytes[..32].to_vec()
         } else {
             signing_address_bytes

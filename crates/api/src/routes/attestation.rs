@@ -152,16 +152,12 @@ pub struct AttestationResponse {
     pub gateway_attestation: DstackCpuQuote,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub model_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
-    /// Prefer `model_attestations` over `all_attestations`
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub all_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl From<services::attestation::models::AttestationReport> for AttestationResponse {
     fn from(report: services::attestation::models::AttestationReport) -> Self {
         Self {
             gateway_attestation: report.gateway_attestation.into(),
-            all_attestations: report.model_attestations.clone(),
             model_attestations: report.model_attestations,
         }
     }

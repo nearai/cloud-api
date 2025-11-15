@@ -110,6 +110,8 @@ pub struct VpcInfo {
 /// Response for attestation report endpoint
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct DstackCpuQuote {
+    pub signing_address: String,
+    pub signing_algo: String,
     pub intel_quote: String,
     pub event_log: String,
     pub report_data: String,
@@ -123,6 +125,8 @@ pub struct DstackCpuQuote {
 impl From<services::attestation::models::DstackCpuQuote> for DstackCpuQuote {
     fn from(quote: services::attestation::models::DstackCpuQuote) -> Self {
         Self {
+            signing_address: quote.signing_address,
+            signing_algo: quote.signing_algo,
             intel_quote: quote.intel_quote,
             event_log: quote.event_log,
             report_data: quote.report_data,

@@ -388,6 +388,8 @@ impl ports::AttestationServiceTrait for AttestationService {
         let gateway_attestation;
         if let Ok(_dev) = std::env::var("DEV") {
             gateway_attestation = DstackCpuQuote {
+                signing_address: signing_address_to_use,
+                signing_algo: algo,
                 intel_quote: "0x1234567890abcdef".to_string(),
                 event_log: "0x1234567890abcdef".to_string(),
                 report_data: hex::encode(&report_data),
@@ -423,7 +425,14 @@ impl ports::AttestationServiceTrait for AttestationService {
                 tracing::error!("Failed to get cloud API attestation, are you running in a CVM?");
                 AttestationError::InternalError("failed to get cloud API attestation".to_string())
             })?;
-            gateway_attestation = DstackCpuQuote::from_quote_and_nonce(vpc, info, cpu_quote, nonce);
+            gateway_attestation = DstackCpuQuote::from_quote_and_nonce(
+                signing_address_to_use,
+                algo,
+                vpc,
+                info,
+                cpu_quote,
+                nonce,
+            );
         }
 
         Ok(AttestationReport {

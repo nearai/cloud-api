@@ -46,6 +46,10 @@ pub struct VpcInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DstackCpuQuote {
+    /// The signing address used for the attestation
+    pub signing_address: String,
+    /// The signing algorithm used for the attestation (ecdsa or ed25519)
+    pub signing_algo: String,
     /// The attestation quote in hexadecimal format
     pub intel_quote: String,
     /// The event log associated with the quote
@@ -64,12 +68,16 @@ pub struct DstackCpuQuote {
 
 impl DstackCpuQuote {
     pub fn from_quote_and_nonce(
+        signing_address: String,
+        signing_algo: String,
         vpc: Option<VpcInfo>,
         info: dstack_sdk::dstack_client::InfoResponse,
         quote: dstack_sdk::dstack_client::GetQuoteResponse,
         nonce: String,
     ) -> Self {
         Self {
+            signing_address: signing_address,
+            signing_algo: signing_algo,
             intel_quote: quote.quote,
             event_log: quote.event_log,
             report_data: quote.report_data,

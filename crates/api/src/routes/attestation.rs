@@ -110,10 +110,19 @@ pub struct VpcInfo {
 /// Response for attestation report endpoint
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct DstackCpuQuote {
+    /// The signing address used for the attestation
+    pub signing_address: String,
+    /// The signing algorithm used for the attestation (ecdsa or ed25519)
+    pub signing_algo: String,
+    /// The attestation quote in hexadecimal format
     pub intel_quote: String,
+    /// The event log associated with the quote
     pub event_log: String,
+    /// The report data that contains signing address and nonce
     pub report_data: String,
+    /// The nonce used in the attestation request
     pub request_nonce: String,
+    /// Application info from Dstack
     pub info: serde_json::Value,
     /// VPC information (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,6 +132,8 @@ pub struct DstackCpuQuote {
 impl From<services::attestation::models::DstackCpuQuote> for DstackCpuQuote {
     fn from(quote: services::attestation::models::DstackCpuQuote) -> Self {
         Self {
+            signing_address: quote.signing_address,
+            signing_algo: quote.signing_algo,
             intel_quote: quote.intel_quote,
             event_log: quote.event_log,
             report_data: quote.report_data,
@@ -140,9 +151,6 @@ impl From<services::attestation::models::DstackCpuQuote> for DstackCpuQuote {
 pub struct AttestationResponse {
     pub gateway_attestation: DstackCpuQuote,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub all_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
-    /// Deprecated: use `all_attestations` instead
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub model_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
 }
 
@@ -150,8 +158,7 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
     fn from(report: services::attestation::models::AttestationReport) -> Self {
         Self {
             gateway_attestation: report.gateway_attestation.into(),
-            all_attestations: report.all_attestations.clone(),
-            model_attestations: report.all_attestations,
+            model_attestations: report.model_attestations,
         }
     }
 }

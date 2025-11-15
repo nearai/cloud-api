@@ -458,7 +458,7 @@ impl InferenceProviderPool {
         signing_address: Option<String>,
     ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, CompletionError> {
         // Get all providers for this model
-        let mut all_attestations = vec![];
+        let mut model_attestations = vec![];
 
         if let Some(providers) = self.get_providers_for_model(&model).await {
             // Broadcast to all providers
@@ -475,7 +475,7 @@ impl InferenceProviderPool {
                     Ok(mut attestation) => {
                         // Remove 'all_attestations' field if present
                         attestation.remove("all_attestations");
-                        all_attestations.push(attestation);
+                        model_attestations.push(attestation);
                     }
                     Err(e) => {
                         // Log and continue to next provider (404 is expected when
@@ -490,13 +490,13 @@ impl InferenceProviderPool {
             }
         }
 
-        if all_attestations.is_empty() {
+        if model_attestations.is_empty() {
             return Err(CompletionError::CompletionError(format!(
                 "No provider found that supports attestation reports for model: {model}"
             )));
         }
 
-        Ok(all_attestations)
+        Ok(model_attestations)
     }
 
     pub async fn models(&self) -> Result<ModelsResponse, ListModelsError> {

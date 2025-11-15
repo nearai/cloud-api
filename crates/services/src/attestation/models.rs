@@ -46,11 +46,15 @@ pub struct VpcInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DstackCpuQuote {
+    /// The signing address used for the attestation
+    pub signing_address: String,
+    /// The signing algorithm used for the attestation (ecdsa or ed25519)
+    pub signing_algo: String,
     /// The attestation quote in hexadecimal format
     pub intel_quote: String,
     /// The event log associated with the quote
     pub event_log: String,
-    /// The report data
+    /// The report data that contains signing address and nonce
     #[serde(default)]
     pub report_data: String,
     /// The nonce used in the attestation request
@@ -64,12 +68,16 @@ pub struct DstackCpuQuote {
 
 impl DstackCpuQuote {
     pub fn from_quote_and_nonce(
+        signing_address: String,
+        signing_algo: String,
         vpc: Option<VpcInfo>,
         info: dstack_sdk::dstack_client::InfoResponse,
         quote: dstack_sdk::dstack_client::GetQuoteResponse,
         nonce: String,
     ) -> Self {
         Self {
+            signing_address,
+            signing_algo,
             intel_quote: quote.quote,
             event_log: quote.event_log,
             report_data: quote.report_data,
@@ -82,7 +90,7 @@ impl DstackCpuQuote {
 
 pub struct AttestationReport {
     pub gateway_attestation: DstackCpuQuote,
-    pub all_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
+    pub model_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
 }
 
 pub type DstackAppInfo = dstack_sdk::dstack_client::InfoResponse;

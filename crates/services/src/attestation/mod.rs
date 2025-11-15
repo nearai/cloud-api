@@ -64,11 +64,10 @@ impl AttestationService {
         let ecdsa_signing_key = Arc::new(ecdsa_signing_key);
         let ecdsa_verifying_key = Arc::new(ecdsa_verifying_key);
 
-        // ECDSA public key is 33 bytes (compressed) or 65 bytes (uncompressed)
-        // We'll use the compressed format (33 bytes) and encode it
-        let ecdsa_address = hex::encode(ecdsa_verifying_key.to_sec1_bytes());
+        // Convert ECDSA public key to Ethereum address (20 bytes = 40 hex chars)
+        let ecdsa_address = Self::ecdsa_public_key_to_ethereum_address(&ecdsa_verifying_key);
         tracing::info!(
-            "Generated ECDSA (secp256k1) key pair for response signing. Public key (signing address): 0x{}",
+            "Generated ECDSA (secp256k1) key pair for response signing. Ethereum address (signing address): 0x{}",
             ecdsa_address
         );
 
@@ -84,11 +83,32 @@ impl AttestationService {
         }
     }
 
+    /// Convert ECDSA public key to Ethereum address (20 bytes)
+    /// Ethereum address is derived by: Keccak256(uncompressed_public_key)[12..32]
+    fn ecdsa_public_key_to_ethereum_address(verifying_key: &EcdsaVerifyingKey) -> String {
+        // Get uncompressed public key point (65 bytes: 0x04 + 32 bytes x + 32 bytes y)
+        let encoded_point = verifying_key.to_encoded_point(false);
+        let point_bytes = encoded_point.as_bytes();
+
+        // Extract x and y coordinates (skip the 0x04 prefix, take 64 bytes)
+        let uncompressed_pubkey = &point_bytes[1..65]; // Skip first byte (0x04), take 64 bytes
+
+        // Hash with Keccak256
+        let hash = Keccak256::digest(uncompressed_pubkey);
+
+        // Ethereum address is the last 20 bytes (bytes 12..32)
+        let address_bytes = &hash[12..32];
+
+        hex::encode(address_bytes)
+    }
+
     /// Get the signing address (public key) as a hex string for the specified algorithm
+    /// For ECDSA, returns Ethereum address (20 bytes = 40 hex chars)
+    /// For ed25519, returns the public key bytes
     pub fn get_signing_address(&self, algo: &str) -> String {
         match algo.to_lowercase().as_str() {
             "ed25519" => hex::encode(self.ed25519_verifying_key.as_bytes()),
-            "ecdsa" => hex::encode(self.ecdsa_verifying_key.to_sec1_bytes()),
+            "ecdsa" => Self::ecdsa_public_key_to_ethereum_address(&self.ecdsa_verifying_key),
             _ => {
                 tracing::warn!("Unknown signing algorithm: {}, defaulting to ed25519", algo);
                 hex::encode(self.ed25519_verifying_key.as_bytes())
@@ -208,11 +228,26 @@ impl ports::AttestationServiceTrait for AttestationService {
             }
             "ecdsa" => {
                 // Sign using ECDSA with recovery ID
-                // Hash the message with Keccak256 (Ethereum-style)
-                let digest = Keccak256::new_with_prefix(signature_text.as_bytes());
+                // Use Ethereum signed message format
+                let message_bytes = signature_text.as_bytes();
+                let prefix = format!("\x19Ethereum Signed Message:\n{}", message_bytes.len());
+                let prefix_bytes = prefix.as_bytes();
+
+                // Concatenate prefix + message
+                let mut prefixed_message =
+                    Vec::with_capacity(prefix_bytes.len() + message_bytes.len());
+                prefixed_message.extend_from_slice(prefix_bytes);
+                prefixed_message.extend_from_slice(message_bytes);
+
+                // Hash with Keccak256 (manually hash the prefixed message)
+                let mut hasher = Keccak256::new();
+                hasher.update(&prefixed_message);
+                let message_hash = hasher.finalize();
+
+                // Use sign_prehash_recoverable with the pre-hashed message
                 let (signature, recid): (EcdsaSignature, RecoveryId) = self
                     .ecdsa_signing_key
-                    .sign_digest_recoverable(digest)
+                    .sign_prehash_recoverable(&message_hash)
                     .map_err(|e| {
                         tracing::error!("Failed to create recoverable ECDSA signature: {}", e);
                         AttestationError::InternalError(format!(
@@ -221,9 +256,14 @@ impl ports::AttestationServiceTrait for AttestationService {
                     })?;
 
                 // Convert signature to bytes and append recovery ID
-                // This creates a 65-byte signature (64 bytes r||s + 1 byte recovery ID)
+                // Convert k256 RecoveryId (0-3) to Ethereum v format (27-28)
+                // Ethereum v = 27 + (recovery_id & 1) where bit 0 is the y-coordinate parity
+                let recovery_byte = recid.to_byte();
+                let ethereum_v = 27u8 + (recovery_byte & 1);
+
+                // This creates a 65-byte signature (64 bytes r||s + 1 byte Ethereum v)
                 let mut signature_bytes = signature.to_bytes().to_vec();
-                signature_bytes.push(recid.to_byte());
+                signature_bytes.push(ethereum_v);
                 let sig_hex = hex::encode(signature_bytes);
 
                 let addr = self.get_signing_address_hex("ecdsa");
@@ -275,7 +315,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         signing_address: Option<String>,
     ) -> Result<AttestationReport, AttestationError> {
         // Resolve model name (could be an alias) and get model details
-        let mut all_attestations = vec![];
+        let mut model_attestations = vec![];
         // Create a nonce if none was provided
         let nonce = match nonce {
             Some(n) => n,
@@ -293,6 +333,32 @@ impl ports::AttestationServiceTrait for AttestationService {
                 generated_nonce
             }
         };
+
+        // Parse nonce: handle hex string or generate if needed
+        let nonce_bytes = hex::decode(&nonce).map_err(|e| {
+            tracing::error!("Failed to decode nonce hex string: {}", e);
+            AttestationError::InvalidParameter(format!("Invalid nonce format: {e}"))
+        })?;
+
+        if nonce_bytes.len() != 32 {
+            return Err(AttestationError::InvalidParameter(format!(
+                "Nonce must be exactly 32 bytes, got {} bytes",
+                nonce_bytes.len()
+            )));
+        }
+
+        // Determine which signing algorithm to use for report_data (default to ed25519)
+        let algo = signing_algo
+            .as_ref()
+            .map(|s| s.to_lowercase())
+            .unwrap_or_else(|| "ed25519".to_string());
+
+        if algo != "ecdsa" && algo != "ed25519" {
+            return Err(AttestationError::InvalidParameter(format!(
+                "Invalid signing algorithm: {algo}, must be 'ecdsa' or 'ed25519'"
+            )));
+        }
+
         if let Some(model) = model {
             let resolved_model = self
                 .models_repository
@@ -318,24 +384,13 @@ impl ports::AttestationServiceTrait for AttestationService {
                 );
             }
 
-            // Determine which signing algorithm to use (default to ed25519)
-            let algo = signing_algo
-                .as_ref()
-                .map(|s| s.to_lowercase())
-                .unwrap_or_else(|| "ed25519".to_string());
-
-            // Use the provided signing_address if given, otherwise use our generated one for the algorithm
-            let signing_address_for_provider = signing_address
-                .clone()
-                .or_else(|| Some(self.get_signing_address_hex(&algo)));
-
-            all_attestations = self
+            model_attestations = self
                 .inference_provider_pool
                 .get_attestation_report(
                     canonical_name.clone(),
                     signing_algo.clone(),
                     Some(nonce.clone()),
-                    signing_address_for_provider,
+                    signing_address,
                 )
                 .await
                 .map_err(|e| AttestationError::ProviderError(e.to_string()))?;
@@ -344,31 +399,9 @@ impl ports::AttestationServiceTrait for AttestationService {
         // Use VPC info loaded at initialization
         let vpc = self.vpc_info.clone();
 
-        // Determine which signing algorithm to use for report_data (default to ed25519)
-        let algo = signing_algo
-            .as_ref()
-            .map(|s| s.to_lowercase())
-            .unwrap_or_else(|| "ed25519".to_string());
-
         // Get signing address (public key) for report_data
-        // Use the provided signing_address if given, otherwise use our generated one for the algorithm
         // Store in owned String to avoid lifetime issues
-        let signing_address_to_use = signing_address
-            .clone()
-            .unwrap_or_else(|| self.get_signing_address(&algo));
-
-        // Parse nonce: handle hex string or generate if needed
-        let nonce_bytes = hex::decode(&nonce).map_err(|e| {
-            tracing::error!("Failed to decode nonce hex string: {}", e);
-            AttestationError::InvalidParameter(format!("Invalid nonce format: {e}"))
-        })?;
-
-        if nonce_bytes.len() != 32 {
-            return Err(AttestationError::InvalidParameter(format!(
-                "Nonce must be exactly 32 bytes, got {} bytes",
-                nonce_bytes.len()
-            )));
-        }
+        let signing_address_to_use = self.get_signing_address_hex(&algo);
 
         // Parse signing address from hex (remove 0x prefix if present)
         let signing_address_clean = signing_address_to_use
@@ -380,10 +413,10 @@ impl ports::AttestationServiceTrait for AttestationService {
         })?;
 
         // For report_data, we need exactly 32 bytes for the signing address
-        // ECDSA keys are 33 bytes (compressed) or 65 bytes (uncompressed)
-        // We'll take the first 32 bytes for report_data
+        // ECDSA returns Ethereum address (20 bytes), ed25519 returns public key (32 bytes)
+        // We'll pad to 32 bytes if needed (left-justified with zeros)
         let signing_address_for_report = if signing_address_bytes.len() > 32 {
-            // Take first 32 bytes (e.g., for ECDSA compressed keys which are 33 bytes)
+            // Take first 32 bytes if longer (shouldn't happen with current implementation)
             signing_address_bytes[..32].to_vec()
         } else {
             signing_address_bytes
@@ -401,6 +434,8 @@ impl ports::AttestationServiceTrait for AttestationService {
         let gateway_attestation;
         if let Ok(_dev) = std::env::var("DEV") {
             gateway_attestation = DstackCpuQuote {
+                signing_address: signing_address_to_use,
+                signing_algo: algo,
                 intel_quote: "0x1234567890abcdef".to_string(),
                 event_log: "0x1234567890abcdef".to_string(),
                 report_data: hex::encode(&report_data),
@@ -436,12 +471,19 @@ impl ports::AttestationServiceTrait for AttestationService {
                 tracing::error!("Failed to get cloud API attestation, are you running in a CVM?");
                 AttestationError::InternalError("failed to get cloud API attestation".to_string())
             })?;
-            gateway_attestation = DstackCpuQuote::from_quote_and_nonce(vpc, info, cpu_quote, nonce);
+            gateway_attestation = DstackCpuQuote::from_quote_and_nonce(
+                signing_address_to_use,
+                algo,
+                vpc,
+                info,
+                cpu_quote,
+                nonce,
+            );
         }
 
         Ok(AttestationReport {
             gateway_attestation,
-            all_attestations,
+            model_attestations,
         })
     }
 }

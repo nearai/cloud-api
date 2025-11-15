@@ -293,6 +293,20 @@ impl ports::AttestationServiceTrait for AttestationService {
                 generated_nonce
             }
         };
+
+        // Parse nonce: handle hex string or generate if needed
+        let nonce_bytes = hex::decode(&nonce).map_err(|e| {
+            tracing::error!("Failed to decode nonce hex string: {}", e);
+            AttestationError::InvalidParameter(format!("Invalid nonce format: {e}"))
+        })?;
+
+        if nonce_bytes.len() != 32 {
+            return Err(AttestationError::InvalidParameter(format!(
+                "Nonce must be exactly 32 bytes, got {} bytes",
+                nonce_bytes.len()
+            )));
+        }
+
         if let Some(model) = model {
             let resolved_model = self
                 .models_repository
@@ -318,24 +332,13 @@ impl ports::AttestationServiceTrait for AttestationService {
                 );
             }
 
-            // Determine which signing algorithm to use (default to ed25519)
-            let algo = signing_algo
-                .as_ref()
-                .map(|s| s.to_lowercase())
-                .unwrap_or_else(|| "ed25519".to_string());
-
-            // Use the provided signing_address if given, otherwise use our generated one for the algorithm
-            let signing_address_for_provider = signing_address
-                .clone()
-                .or_else(|| Some(self.get_signing_address_hex(&algo)));
-
             all_attestations = self
                 .inference_provider_pool
                 .get_attestation_report(
                     canonical_name.clone(),
                     signing_algo.clone(),
                     Some(nonce.clone()),
-                    signing_address_for_provider,
+                    signing_address,
                 )
                 .await
                 .map_err(|e| AttestationError::ProviderError(e.to_string()))?;
@@ -351,24 +354,8 @@ impl ports::AttestationServiceTrait for AttestationService {
             .unwrap_or_else(|| "ed25519".to_string());
 
         // Get signing address (public key) for report_data
-        // Use the provided signing_address if given, otherwise use our generated one for the algorithm
         // Store in owned String to avoid lifetime issues
-        let signing_address_to_use = signing_address
-            .clone()
-            .unwrap_or_else(|| self.get_signing_address(&algo));
-
-        // Parse nonce: handle hex string or generate if needed
-        let nonce_bytes = hex::decode(&nonce).map_err(|e| {
-            tracing::error!("Failed to decode nonce hex string: {}", e);
-            AttestationError::InvalidParameter(format!("Invalid nonce format: {e}"))
-        })?;
-
-        if nonce_bytes.len() != 32 {
-            return Err(AttestationError::InvalidParameter(format!(
-                "Nonce must be exactly 32 bytes, got {} bytes",
-                nonce_bytes.len()
-            )));
-        }
+        let signing_address_to_use = self.get_signing_address(&algo);
 
         // Parse signing address from hex (remove 0x prefix if present)
         let signing_address_clean = signing_address_to_use

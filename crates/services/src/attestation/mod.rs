@@ -228,11 +228,26 @@ impl ports::AttestationServiceTrait for AttestationService {
             }
             "ecdsa" => {
                 // Sign using ECDSA with recovery ID
-                // Hash the message with Keccak256 (Ethereum-style)
-                let digest = Keccak256::new_with_prefix(signature_text.as_bytes());
+                // Use Ethereum signed message format
+                let message_bytes = signature_text.as_bytes();
+                let prefix = format!("\x19Ethereum Signed Message:\n{}", message_bytes.len());
+                let prefix_bytes = prefix.as_bytes();
+
+                // Concatenate prefix + message
+                let mut prefixed_message =
+                    Vec::with_capacity(prefix_bytes.len() + message_bytes.len());
+                prefixed_message.extend_from_slice(prefix_bytes);
+                prefixed_message.extend_from_slice(message_bytes);
+
+                // Hash with Keccak256 (manually hash the prefixed message)
+                let mut hasher = Keccak256::new();
+                hasher.update(&prefixed_message);
+                let message_hash = hasher.finalize();
+
+                // Use sign_prehash_recoverable with the pre-hashed message
                 let (signature, recid): (EcdsaSignature, RecoveryId) = self
                     .ecdsa_signing_key
-                    .sign_digest_recoverable(digest)
+                    .sign_prehash_recoverable(&message_hash)
                     .map_err(|e| {
                         tracing::error!("Failed to create recoverable ECDSA signature: {}", e);
                         AttestationError::InternalError(format!(
@@ -241,9 +256,14 @@ impl ports::AttestationServiceTrait for AttestationService {
                     })?;
 
                 // Convert signature to bytes and append recovery ID
-                // This creates a 65-byte signature (64 bytes r||s + 1 byte recovery ID)
+                // Convert k256 RecoveryId (0-3) to Ethereum v format (27-28)
+                // Ethereum v = 27 + (recovery_id & 1) where bit 0 is the y-coordinate parity
+                let recovery_byte = recid.to_byte();
+                let ethereum_v = 27u8 + (recovery_byte & 1);
+
+                // This creates a 65-byte signature (64 bytes r||s + 1 byte Ethereum v)
                 let mut signature_bytes = signature.to_bytes().to_vec();
-                signature_bytes.push(recid.to_byte());
+                signature_bytes.push(ethereum_v);
                 let sig_hex = hex::encode(signature_bytes);
 
                 let addr = self.get_signing_address_hex("ecdsa");

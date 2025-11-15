@@ -54,7 +54,7 @@ pub struct DstackCpuQuote {
     pub intel_quote: String,
     /// The event log associated with the quote
     pub event_log: String,
-    /// The report data
+    /// The report data that contains signing address and nonce
     #[serde(default)]
     pub report_data: String,
     /// The nonce used in the attestation request

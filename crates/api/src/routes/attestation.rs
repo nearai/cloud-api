@@ -110,12 +110,19 @@ pub struct VpcInfo {
 /// Response for attestation report endpoint
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct DstackCpuQuote {
+    /// The signing address used for the attestation
     pub signing_address: String,
+    /// The signing algorithm used for the attestation (ecdsa or ed25519)
     pub signing_algo: String,
+    /// The attestation quote in hexadecimal format
     pub intel_quote: String,
+    /// The event log associated with the quote
     pub event_log: String,
+    /// The report data that contains signing address and nonce
     pub report_data: String,
+    /// The nonce used in the attestation request
     pub request_nonce: String,
+    /// Application info from Dstack
     pub info: serde_json::Value,
     /// VPC information (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -145,7 +152,7 @@ pub struct AttestationResponse {
     pub gateway_attestation: DstackCpuQuote,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub model_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
-    /// Prefer use `model_attestations` over `all_attestations`
+    /// Prefer `model_attestations` over `all_attestations`
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub all_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
 }

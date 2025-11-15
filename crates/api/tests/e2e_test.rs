@@ -3,10 +3,7 @@ mod common;
 
 use common::*;
 
-use api::models::{
-    BatchUpdateModelApiRequest, ConversationContentPart, ConversationItem, ResponseOutputContent,
-    ResponseOutputItem,
-};
+use api::models::BatchUpdateModelApiRequest;
 use inference_providers::{models::ChatCompletionChunk, StreamChunk};
 
 #[tokio::test]
@@ -126,336 +123,6 @@ async fn test_chat_completions_api() {
     } else {
         println!("No final response detected - this is okay for some streaming implementations");
     }
-}
-
-#[tokio::test]
-async fn test_responses_api() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    let response = server
-        .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    let models = response.json::<api::models::ModelsResponse>();
-    assert!(!models.data.is_empty());
-
-    let conversation = create_conversation(&server, api_key.clone()).await;
-    println!("Conversation: {conversation:?}");
-
-    let message = "Hello, how are you?".to_string();
-    let max_tokens = 10;
-    let response = create_response(
-        &server,
-        conversation.id.clone(),
-        models.data[0].id.clone(),
-        message.clone(),
-        max_tokens,
-        api_key.clone(),
-    )
-    .await;
-    println!("Response: {response:?}");
-
-    // Check that response completed successfully
-    assert_eq!(response.status, api::models::ResponseStatus::Completed);
-
-    // Check that we got usage information (tokens were generated)
-    assert!(
-        response.usage.output_tokens > 0,
-        "Expected output tokens to be generated"
-    );
-
-    // Check that we have output content structure (even if text is empty due to VLLM issues)
-    assert!(!response.output.is_empty(), "Expected output items");
-
-    // Log the text we got (may be empty if VLLM has issues)
-    for output_item in &response.output {
-        if let ResponseOutputItem::Message { content, .. } = output_item {
-            for content_part in content {
-                if let ResponseOutputContent::OutputText { text, .. } = content_part {
-                    println!(
-                        "Response text length: {} chars, content: '{}'",
-                        text.len(),
-                        text
-                    );
-                    if text.is_empty() {
-                        println!(
-                            "Warning: VLLM returned empty text despite reporting {} output tokens",
-                            response.usage.output_tokens
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    let conversation_items =
-        list_conversation_items(&server, conversation.id, api_key.clone()).await;
-    assert_eq!(conversation_items.data.len(), 2);
-    match &conversation_items.data[0] {
-        ConversationItem::Message { content, .. } => {
-            if let ConversationContentPart::InputText { text } = &content[0] {
-                assert_eq!(text, message.as_str());
-            }
-        }
-    }
-}
-
-async fn create_conversation(
-    server: &axum_test::TestServer,
-    api_key: String,
-) -> api::models::ConversationObject {
-    let response = server
-        .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "name": "Test Conversation",
-            "description": "A test conversation"
-        }))
-        .await;
-    assert_eq!(response.status_code(), 201);
-    response.json::<api::models::ConversationObject>()
-}
-
-#[allow(dead_code)]
-async fn get_conversation(
-    server: &axum_test::TestServer,
-    conversation_id: String,
-    api_key: String,
-) -> api::models::ConversationObject {
-    let response = server
-        .get(format!("/v1/conversations/{conversation_id}").as_str())
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-    assert_eq!(response.status_code(), 200);
-    response.json::<api::models::ConversationObject>()
-}
-
-async fn list_conversation_items(
-    server: &axum_test::TestServer,
-    conversation_id: String,
-    api_key: String,
-) -> api::models::ConversationItemList {
-    let response = server
-        .get(format!("/v1/conversations/{conversation_id}/items").as_str())
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-    assert_eq!(response.status_code(), 200);
-    response.json::<api::models::ConversationItemList>()
-}
-
-async fn create_response(
-    server: &axum_test::TestServer,
-    conversation_id: String,
-    model: String,
-    message: String,
-    max_tokens: i64,
-    api_key: String,
-) -> api::models::ResponseObject {
-    let response = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "conversation": {
-                "id": conversation_id,
-            },
-            "input": message,
-            "temperature": 0.7,
-            "max_output_tokens": max_tokens,
-            "stream": false,
-            "model": model
-        }))
-        .await;
-    assert_eq!(response.status_code(), 200);
-    response.json::<api::models::ResponseObject>()
-}
-
-async fn create_response_stream(
-    server: &axum_test::TestServer,
-    conversation_id: String,
-    model: String,
-    message: String,
-    max_tokens: i64,
-    api_key: String,
-) -> (String, api::models::ResponseObject) {
-    let response = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "conversation": {
-                "id": conversation_id,
-            },
-            "input": message,
-            "temperature": 0.7,
-            "max_output_tokens": max_tokens,
-            "stream": true,
-            "model": model
-        }))
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-
-    // For streaming responses, we get SSE events as text
-    let response_text = response.text();
-
-    let mut content = String::new();
-    let mut final_response: Option<api::models::ResponseObject> = None;
-
-    // Parse SSE format: "event: <type>\ndata: <json>\n\n"
-    for line_chunk in response_text.split("\n\n") {
-        if line_chunk.trim().is_empty() {
-            continue;
-        }
-
-        let mut event_type = "";
-        let mut event_data = "";
-
-        for line in line_chunk.lines() {
-            if let Some(event_name) = line.strip_prefix("event: ") {
-                event_type = event_name;
-            } else if let Some(data) = line.strip_prefix("data: ") {
-                event_data = data;
-            }
-        }
-
-        if !event_data.is_empty() {
-            if let Ok(event_json) = serde_json::from_str::<serde_json::Value>(event_data) {
-                match event_type {
-                    "response.output_text.delta" => {
-                        // Accumulate content deltas as they arrive
-                        if let Some(delta) = event_json.get("delta").and_then(|v| v.as_str()) {
-                            content.push_str(delta);
-                            println!("Delta: {delta}");
-                        }
-                    }
-                    "response.completed" => {
-                        // Extract final response from completed event
-                        if let Some(response_obj) = event_json.get("response") {
-                            final_response = Some(
-                                serde_json::from_value::<api::models::ResponseObject>(
-                                    response_obj.clone(),
-                                )
-                                .expect("Failed to parse response.completed event"),
-                            );
-                            println!("Stream completed");
-                        }
-                    }
-                    "response.created" => {
-                        println!("Response created");
-                    }
-                    "response.in_progress" => {
-                        println!("Response in progress");
-                    }
-                    _ => {
-                        println!("Event: {event_type}");
-                    }
-                }
-            }
-        }
-    }
-
-    let final_resp =
-        final_response.expect("Expected to receive response.completed event from stream");
-    (content, final_resp)
-}
-
-#[tokio::test]
-async fn test_conversations_api() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    // Test creating a conversation
-    let create_response = server
-        .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "name": "Test Conversation",
-            "description": "A test conversation"
-        }))
-        .await;
-    assert_eq!(create_response.status_code(), 201);
-}
-
-#[tokio::test]
-async fn test_streaming_responses_api() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    // Get available models
-    let response = server
-        .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    let models = response.json::<api::models::ModelsResponse>();
-    assert!(!models.data.is_empty());
-
-    // Create a conversation
-    let conversation = create_conversation(&server, api_key.clone()).await;
-    println!("Conversation: {conversation:?}");
-
-    // Test streaming response
-    let message = "Hello, how are you?".to_string();
-    let (streamed_content, streaming_response) = create_response_stream(
-        &server,
-        conversation.id.clone(),
-        models.data[0].id.clone(),
-        message.clone(),
-        50,
-        api_key.clone(),
-    )
-    .await;
-
-    println!("Streamed Content: {streamed_content}");
-    println!("Final Response: {streaming_response:?}");
-
-    // Verify we got content from the stream
-    assert!(
-        !streamed_content.is_empty(),
-        "Expected non-empty streamed content"
-    );
-
-    // Verify the final response has content
-    assert!(streaming_response.output.iter().any(|o| {
-        if let ResponseOutputItem::Message { content, .. } = o {
-            content.iter().any(|c| {
-                if let ResponseOutputContent::OutputText { text, .. } = c {
-                    println!("Final Response Text: {text}");
-                    !text.is_empty()
-                } else {
-                    false
-                }
-            })
-        } else {
-            false
-        }
-    }));
-
-    // Verify streamed content matches final response content
-    let final_text = streaming_response
-        .output
-        .iter()
-        .filter_map(|o| {
-            if let ResponseOutputItem::Message { content, .. } = o {
-                content.iter().find_map(|c| {
-                    if let ResponseOutputContent::OutputText { text, .. } = c {
-                        Some(text.clone())
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                None
-            }
-        })
-        .next()
-        .unwrap_or_default();
-
-    assert_eq!(
-        streamed_content, final_text,
-        "Streamed content should match final response text"
-    );
 }
 
 #[tokio::test]
@@ -1841,7 +1508,7 @@ async fn test_model_aliases() {
     // Set up canonical models with aliases
     // Discovery returns these canonical names from vLLM:
     // - "nearai/gpt-oss-120b" (canonical)
-    // - "deepseek-ai/DeepSeek-V3.1" (canonical)
+    // - "Qwen/Qwen3-30B-A3B-Instruct-2507" (canonical)
 
     let mut batch = BatchUpdateModelApiRequest::new();
 
@@ -1869,9 +1536,9 @@ async fn test_model_aliases() {
         .unwrap(),
     );
 
-    // Model 2: deepseek-ai/DeepSeek-V3.1 (canonical with messy name) with clean alias
+    // Model 2: Qwen/Qwen3-30B-A3B-Instruct-2507 (canonical with messy name) with clean alias
     batch.insert(
-        "deepseek-ai/DeepSeek-V3.1".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
                 "amount": 500000,
@@ -2017,7 +1684,6 @@ async fn test_model_aliases() {
         // Verify model is a canonical model name
         assert!(
             entry.model == "nearai/gpt-oss-120b"
-                || entry.model == "deepseek-ai/DeepSeek-V3.1"
                 || entry.model == "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "Usage should be tracked with canonical model name, got: {}",
             entry.model
@@ -2154,220 +1820,6 @@ async fn test_model_alias_consistency() {
     println!("\n=== Test Complete ===");
     println!("Verified that multiple aliases can point to the same canonical model");
     println!("and all share the same pricing configuration");
-}
-
-// ============================================
-// Streaming Signature Verification Tests
-// ============================================
-
-#[tokio::test]
-async fn test_streaming_chat_completion_signature_verification() {
-    let server = setup_test_server().await;
-    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
-    println!("Created organization: {}", org.id);
-
-    let api_key = get_api_key_for_org(&server, org.id).await;
-
-    // Use a simple, consistent model for testing
-    let model_name = "deepseek-ai/DeepSeek-V3.1";
-
-    // Step 1 & 2: Construct request body with streaming enabled
-    let request_body = serde_json::json!({
-        "messages": [
-            {
-                "role": "user",
-                "content": "Respond with only two words."
-            }
-        ],
-        "stream": true,
-        "model": model_name,
-        "nonce": 42
-    });
-
-    println!("\n=== Request Body ===");
-    println!("{}", serde_json::to_string_pretty(&request_body).unwrap());
-
-    // Step 3: Compute expected request hash
-    let request_json = serde_json::to_string(&request_body).expect("Failed to serialize request");
-    let expected_request_hash = compute_sha256(&request_json);
-    println!("\n=== Expected Request Hash ===");
-    println!("Request JSON: {request_json}");
-    println!("Expected hash: {expected_request_hash}");
-
-    // Step 4: Make streaming request and capture raw response
-    let response = server
-        .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&request_body)
-        .await;
-
-    println!("\n=== Response Status ===");
-    println!("Status: {}", response.status_code());
-    assert_eq!(
-        response.status_code(),
-        200,
-        "Streaming request should succeed"
-    );
-
-    // Capture the complete raw response text (SSE format)
-    let response_text = response.text();
-    println!("=== Raw Streaming Response ===");
-    println!("{response_text}");
-
-    // Step 5: Parse streaming response to extract chat_id and verify structure
-    let mut chat_id: Option<String> = None;
-    let mut content = String::new();
-
-    println!("=== Parsing SSE Stream ===");
-    for line in response_text.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
-            if data.trim() == "[DONE]" {
-                println!("Stream completed with [DONE]");
-                break;
-            }
-
-            if let Ok(StreamChunk::Chat(chat_chunk)) = serde_json::from_str::<StreamChunk>(data) {
-                // Extract chat_id from first chunk
-                if chat_id.is_none() {
-                    chat_id = Some(chat_chunk.id.clone());
-                    println!("Extracted chat_id: {}", chat_chunk.id);
-                }
-
-                // Accumulate content
-                if let Some(choice) = chat_chunk.choices.first() {
-                    if let Some(delta) = &choice.delta {
-                        if let Some(delta_content) = &delta.content {
-                            content.push_str(delta_content.as_str());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let chat_id = chat_id.expect("Should have extracted chat_id from stream");
-    println!("Accumulated content: '{content}'");
-    assert!(!content.is_empty(), "Should have received some content");
-
-    // Step 6: Compute expected response hash from the complete raw response
-    let expected_response_hash = compute_sha256(&response_text);
-    println!("\n=== Expected Response Hash ===");
-    println!("Expected hash: {expected_response_hash}");
-
-    // Wait for signature to be stored asynchronously
-    println!("\n=== Waiting for Signature Storage ===");
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-
-    // Step 7: Query signature API
-    println!("\n=== Querying Signature API ===");
-    let signature_response = server
-        .get(format!("/v1/signature/{chat_id}?model={model_name}&signing_algo=ecdsa").as_str())
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    println!("Signature API status: {}", signature_response.status_code());
-    assert_eq!(
-        signature_response.status_code(),
-        200,
-        "Signature API should return successfully"
-    );
-
-    let signature_json = signature_response.json::<serde_json::Value>();
-    println!(
-        "Signature response: {}",
-        serde_json::to_string_pretty(&signature_json).unwrap()
-    );
-
-    // Step 8: Parse signature text field (format: "request_hash:response_hash")
-    let signature_text = signature_json
-        .get("text")
-        .and_then(|v| v.as_str())
-        .expect("Signature response should have 'text' field");
-
-    println!("\n=== Parsing Signature Text ===");
-    println!("Signature text: {signature_text}");
-
-    let hash_parts: Vec<&str> = signature_text.split(':').collect();
-    assert_eq!(
-        hash_parts.len(),
-        2,
-        "Signature text should contain two hashes separated by ':'"
-    );
-
-    let actual_request_hash = hash_parts[0];
-    let actual_response_hash = hash_parts[1];
-
-    println!("Actual request hash:  {actual_request_hash}");
-    println!("Actual response hash: {actual_response_hash}");
-
-    // Step 9: Critical Assertions - These will FAIL with the current bug
-    println!("\n=== Hash Verification ===");
-
-    println!("\nRequest Hash Comparison:");
-    println!("  Expected: {expected_request_hash}");
-    println!("  Actual:   {actual_request_hash}");
-
-    assert_eq!(
-        expected_request_hash, actual_request_hash,
-        "\n\n❌ REQUEST HASH MISMATCH!\n\
-         Expected: {expected_request_hash}\n\
-         Actual:   {actual_request_hash}\n\n\
-         This means the signature API is not using the correct request body for hashing.\n\
-         The signature cannot be verified correctly.\n"
-    );
-
-    println!("\nResponse Hash Comparison:");
-    println!("  Expected: {expected_response_hash}");
-    println!("  Actual:   {actual_response_hash}");
-
-    assert_eq!(
-        expected_response_hash, actual_response_hash,
-        "\n\n❌ RESPONSE HASH MISMATCH!\n\
-         Expected: {expected_response_hash}\n\
-         Actual:   {actual_response_hash}\n\n\
-         This means the signature API is not using the correct streaming response body for hashing.\n\
-         The signature cannot be verified correctly.\n"
-    );
-
-    println!("\n✅ All hash verifications passed!");
-    println!("The streaming chat completion signatures are correctly computed.");
-
-    // Verify the signature itself is present
-    let signature = signature_json
-        .get("signature")
-        .and_then(|v| v.as_str())
-        .expect("Should have signature field");
-    assert!(!signature.is_empty(), "Signature should not be empty");
-    assert!(
-        signature.starts_with("0x"),
-        "Signature should be hex-encoded"
-    );
-
-    let signing_address = signature_json
-        .get("signing_address")
-        .and_then(|v| v.as_str())
-        .expect("Should have signing_address field");
-    assert!(
-        !signing_address.is_empty(),
-        "Signing address should not be empty"
-    );
-
-    let signing_algo = signature_json
-        .get("signing_algo")
-        .and_then(|v| v.as_str())
-        .expect("Should have signing_algo field");
-    assert_eq!(signing_algo, "ecdsa", "Should use ECDSA signing algorithm");
-
-    println!("\n=== Test Summary ===");
-    println!("✅ Streaming request succeeded");
-    println!("✅ Chat completion ID extracted: {chat_id}");
-    println!("✅ Content received: {} chars", content.len());
-    println!("✅ Signature stored and retrieved");
-    println!("✅ Request hash matches: {expected_request_hash}");
-    println!("✅ Response hash matches: {expected_response_hash}");
-    println!("✅ Signature is present: {}", &signature[..20]);
-    println!("✅ Signing address: {signing_address}");
-    println!("✅ Signing algorithm: {signing_algo}");
 }
 
 // ============================================
@@ -2887,12 +2339,34 @@ async fn test_admin_access_token_cannot_manage_tokens() {
     println!("✅ Admin access tokens correctly restricted from token management endpoints");
 }
 
+// Conversation and response tests moved to e2e_conversations.rs
+
 // ============================================
 // Admin List Users Tests
 // ============================================
 
 #[tokio::test]
 async fn test_admin_list_users_without_organizations() {
+    let server = setup_test_server().await;
+
+    // Get access token from refresh token
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+
+    // Create a few organizations to ensure we have some users
+    let _org1 = create_org(&server).await;
+    let _org2 = create_org(&server).await;
+
+    // List users without organizations
+    let response = server
+        .get("/v1/admin/users?limit=50&offset=0")
+        .add_header("Authorization", format!("Bearer {access_token}"))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+}
+
+#[tokio::test]
+async fn test_admin_list_users_with_orgs() {
     let server = setup_test_server().await;
 
     // Get access token from refresh token

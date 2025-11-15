@@ -7,7 +7,7 @@ license.workspace = true
 description.workspace = true
 
 [dependencies]
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "multipart"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
@@ -37,6 +37,9 @@ sha2 = "0.10"
 hex = "0.4"
 bytes = "1.5"
 http-body-util = "0.1"
+# AWS S3 for file storage
+aws-config = { version = "1.5", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.70"
 
 [dev-dependencies]
 axum-test = "18"

@@ -34,7 +34,7 @@ pub struct AdminAppState {
 /// The body should be an array of objects where each key is a model name and the value is the model data.
 #[utoipa::path(
     patch,
-    path = "/admin/models",
+    path = "/v1/admin/models",
     tag = "Admin",
     request_body = BatchUpdateModelApiRequest,
     responses(
@@ -140,6 +140,7 @@ pub async fn batch_upsert_models(
                 model_display_name: updated_model.model_display_name,
                 model_description: updated_model.model_description,
                 model_icon: updated_model.model_icon,
+                aliases: updated_model.aliases,
             },
         })
         .collect();
@@ -156,7 +157,7 @@ pub async fn batch_upsert_models(
 /// For example, use "Qwen%2FQwen3-30B-A3B-Instruct-2507" in the URL path.
 #[utoipa::path(
     get,
-    path = "/admin/models/{model_name}/history",
+    path = "/v1/admin/models/{model_name}/history",
     tag = "Admin",
     params(
         ("model_name" = String, Path, description = "Model name to get complete history for (URL-encode if it contains slashes)"),
@@ -261,7 +262,7 @@ pub async fn get_model_history(
 /// a billing service with an admin API key when a customer makes a purchase.
 #[utoipa::path(
     patch,
-    path = "/admin/organizations/{org_id}/limits",
+    path = "/v1/admin/organizations/{org_id}/limits",
     tag = "Admin",
     params(
         ("org_id" = String, Path, description = "Organization ID to update limits for")
@@ -369,7 +370,7 @@ pub async fn update_organization_limits(
 /// Returns the complete limits history for a specific organization, showing all limits changes over time.
 #[utoipa::path(
     get,
-    path = "/admin/organizations/{organization_id}/limits/history",
+    path = "/v1/admin/organizations/{organization_id}/limits/history",
     tag = "Admin",
     params(
         ("organization_id" = String, Path, description = "The organization's ID (as a UUID)"),
@@ -479,7 +480,7 @@ pub async fn get_organization_limits_history(
 /// For example, use "Qwen%2FQwen3-30B-A3B-Instruct-2507" in the URL path.
 #[utoipa::path(
     delete,
-    path = "/admin/models/{model_name}",
+    path = "/v1/admin/models/{model_name}",
     tag = "Admin",
     params(
         ("model_name" = String, Path, description = "Model name to delete (URL-encode if it contains slashes)")
@@ -541,7 +542,7 @@ pub async fn delete_model(
 /// Returns a paginated list of all users in the system. Only authenticated admins can perform this operation.
 #[utoipa::path(
     get,
-    path = "/admin/users",
+    path = "/v1/admin/users",
     tag = "Admin",
     params(
         ("limit" = Option<i64>, Query, description = "Maximum number of users to return (default: 100)"),
@@ -683,7 +684,7 @@ pub async fn list_users(
 /// Store them securely and rotate them regularly.
 #[utoipa::path(
     post,
-    path = "/admin/access-tokens",
+    path = "/v1/admin/access-tokens",
     tag = "Admin",
     request_body = CreateAdminAccessTokenRequest,
     responses(
@@ -762,7 +763,7 @@ pub async fn create_admin_access_token(
 /// Only authenticated admins can access this endpoint.
 #[utoipa::path(
     get,
-    path = "/admin/access-tokens",
+    path = "/v1/admin/access-tokens",
     tag = "Admin",
     params(
         ("limit" = Option<i64>, Query, description = "Number of records to return (default: 100)"),
@@ -829,7 +830,7 @@ pub async fn list_admin_access_tokens(
 /// Only authenticated admins can perform this operation.
 #[utoipa::path(
     delete,
-    path = "/admin/access-tokens/{token_id}",
+    path = "/v1/admin/access-tokens/{token_id}",
     tag = "Admin",
     request_body = DeleteAdminAccessTokenRequest,
     params(

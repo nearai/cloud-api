@@ -44,6 +44,10 @@ pub fn test_config() -> ApiConfig {
                 .ok()
                 .and_then(|t| t.parse().ok())
                 .unwrap_or(5),
+            inference_timeout: std::env::var("MODEL_INFERENCE_TIMEOUT")
+                .ok()
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(30 * 60), // 30 minutes
         },
         logging: config::LoggingConfig {
             level: "debug".to_string(),
@@ -62,6 +66,14 @@ pub fn test_config() -> ApiConfig {
             admin_domains: vec!["test.com".to_string()],
         },
         database: db_config_for_tests(),
+        s3: config::S3Config {
+            mock: true,
+            bucket: std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "test-bucket".to_string()),
+            region: std::env::var("AWS_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
+            encryption_key: std::env::var("S3_ENCRYPTION_KEY").unwrap_or_else(|_| {
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string()
+            }),
+        },
     }
 }
 

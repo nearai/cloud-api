@@ -43,7 +43,7 @@ pub struct UpdateUserProfileRequest {
 /// Returns the profile of the currently authenticated user, including their organizations and workspaces.
 #[utoipa::path(
     get,
-    path = "/users/me",
+    path = "/v1/users/me",
     tag = "Users",
     responses(
         (status = 200, description = "Current user profile", body = crate::models::UserResponse),
@@ -161,7 +161,7 @@ pub async fn get_current_user(
 /// Updates the profile information for the currently authenticated user.
 #[utoipa::path(
     patch,
-    path = "/users/me",
+    path = "/v1/users/me",
     tag = "Users",
     request_body = UpdateUserProfileRequest,
     responses(
@@ -213,7 +213,7 @@ pub async fn update_current_user_profile(
 /// Returns all active refresh tokens for the currently authenticated user.
 #[utoipa::path(
     get,
-    path = "/users/me/refresh-tokens",
+    path = "/v1/users/me/refresh-tokens",
     tag = "Users",
     responses(
         (status = 200, description = "List of user refresh tokens", body = Vec<crate::models::RefreshTokenResponse>),
@@ -258,7 +258,7 @@ pub async fn get_user_refresh_tokens(
 /// Revokes a specific refresh token for the currently authenticated user.
 #[utoipa::path(
     delete,
-    path = "/users/me/refresh-tokens/{refresh_token_id}",
+    path = "/v1/users/me/refresh-tokens/{refresh_token_id}",
     tag = "Users",
     params(
         ("refresh_token_id" = Uuid, Path, description = "Refresh token ID to revoke")
@@ -327,7 +327,7 @@ pub async fn revoke_user_refresh_token(
 /// by updating the user's tokens_revoked_at timestamp.
 #[utoipa::path(
     delete,
-    path = "/users/me/tokens",
+    path = "/v1/users/me/tokens",
     tag = "Users",
     responses(
         (status = 200, description = "All tokens revoked successfully", body = serde_json::Value),
@@ -369,7 +369,7 @@ pub async fn revoke_all_user_tokens(
 /// Creates a new short-lived access token using the current refresh token.
 #[utoipa::path(
     post,
-    path = "/users/me/access-tokens",
+    path = "/v1/users/me/access-tokens",
     tag = "Users",
     responses(
         (status = 200, description = "Access token created successfully", body = crate::models::AccessTokenResponse),
@@ -410,7 +410,7 @@ pub async fn create_access_token(
 /// Returns all pending organization invitations for the authenticated user's email.
 #[utoipa::path(
     get,
-    path = "/users/me/invitations",
+    path = "/v1/users/me/invitations",
     tag = "Users",
     responses(
         (status = 200, description = "List of pending invitations", body = Vec<crate::models::OrganizationInvitationResponse>),
@@ -460,7 +460,7 @@ pub async fn list_user_invitations(
 /// Accepts a pending invitation and adds the user as a member of the organization.
 #[utoipa::path(
     post,
-    path = "/users/me/invitations/{invitation_id}/accept",
+    path = "/v1/users/me/invitations/{invitation_id}/accept",
     tag = "Users",
     params(
         ("invitation_id" = Uuid, Path, description = "Invitation ID")
@@ -542,7 +542,7 @@ pub async fn accept_invitation(
 /// Declines a pending invitation to join an organization.
 #[utoipa::path(
     post,
-    path = "/users/me/invitations/{invitation_id}/decline",
+    path = "/v1/users/me/invitations/{invitation_id}/decline",
     tag = "Users",
     params(
         ("invitation_id" = Uuid, Path, description = "Invitation ID")
@@ -609,7 +609,7 @@ pub async fn decline_invitation(
 /// that allows users to view invitation details before logging in.
 #[utoipa::path(
     get,
-    path = "/invitations/{token}",
+    path = "/v1/invitations/{token}",
     tag = "Invitations",
     params(
         ("token" = String, Path, description = "Invitation token")
@@ -667,7 +667,7 @@ pub async fn get_invitation_by_token(
 /// must match the invitation email.
 #[utoipa::path(
     post,
-    path = "/invitations/{token}/accept",
+    path = "/v1/invitations/{token}/accept",
     tag = "Invitations",
     params(
         ("token" = String, Path, description = "Invitation token")

@@ -34,21 +34,25 @@ impl From<services::attestation::ChatSignature> for SignatureResponse {
     }
 }
 
+/// Get completion signature
+///
+/// Get cryptographic signature for a chat completion for verification.
 #[utoipa::path(
     get,
-    path = "/signature/{chat_id}",
+    path = "/v1/signature/{chat_id}",
     params(
         ("chat_id" = String, Path, description = "Chat completion ID"),
         SignatureQuery
     ),
     responses(
-        (status = 200, description = "Signature retrieved successfully", body = SignatureResponse),
-        (status = 404, description = "Signature not found"),
-        (status = 400, description = "Invalid parameters")
+        (status = 200, description = "Signature retrieved", body = SignatureResponse),
+        (status = 404, description = "Signature not found", body = ErrorResponse),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
-    )
+    ),
+    tag = "Attestation"
 )]
 pub async fn get_signature(
     Path(chat_id): Path<String>,
@@ -152,20 +156,21 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
     }
 }
 
+/// Get attestation report
+///
+/// Get hardware attestation report for TEE verification. Public endpoint.
 #[utoipa::path(
     get,
-    path = "/attestation/report",
+    path = "/v1/attestation/report",
     params(
         AttestationQuery
     ),
     responses(
-        (status = 200, description = "Attestation report retrieved successfully", body = AttestationResponse),
-        (status = 400, description = "Invalid nonce format"),
-        (status = 503, description = "Attestation service unavailable")
+        (status = 200, description = "Attestation report retrieved", body = AttestationResponse),
+        (status = 400, description = "Invalid nonce format", body = ErrorResponse),
+        (status = 503, description = "Service unavailable", body = ErrorResponse)
     ),
-    security(
-        ("api_key" = [])
-    )
+    tag = "Attestation"
 )]
 pub async fn get_attestation_report(
     Query(params): Query<AttestationQuery>,

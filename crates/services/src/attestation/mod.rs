@@ -7,10 +7,12 @@ use async_trait::async_trait;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use hex;
 use k256::ecdsa::{
-    Signature as EcdsaSignature, SigningKey as EcdsaSigningKey, VerifyingKey as EcdsaVerifyingKey,
+    RecoveryId, Signature as EcdsaSignature, SigningKey as EcdsaSigningKey,
+    VerifyingKey as EcdsaVerifyingKey,
 };
 use rand::rngs::OsRng;
 use rand::RngCore;
+use sha3::{Digest, Keccak256};
 
 use crate::{
     attestation::{
@@ -202,24 +204,39 @@ impl ports::AttestationServiceTrait for AttestationService {
                 let signature_bytes = self.ed25519_signing_key.sign(signature_text.as_bytes());
                 let sig_hex = hex::encode(signature_bytes.to_bytes());
                 let addr = self.get_signing_address_hex("ed25519");
-                (sig_hex, addr)
+                Ok((sig_hex, addr))
             }
             "ecdsa" => {
-                // Sign using ECDSA
-                let signature: EcdsaSignature =
-                    self.ecdsa_signing_key.sign(signature_text.as_bytes());
-                let sig_hex = hex::encode(signature.to_bytes());
+                // Sign using ECDSA with recovery ID
+                // Hash the message with Keccak256 (Ethereum-style)
+                let digest = Keccak256::new_with_prefix(signature_text.as_bytes());
+                let (signature, recid): (EcdsaSignature, RecoveryId) = self
+                    .ecdsa_signing_key
+                    .sign_digest_recoverable(digest)
+                    .map_err(|e| {
+                        tracing::error!("Failed to create recoverable ECDSA signature: {}", e);
+                        AttestationError::InternalError(format!(
+                            "Failed to create recoverable ECDSA signature: {e}"
+                        ))
+                    })?;
+
+                // Convert signature to bytes and append recovery ID
+                // This creates a 65-byte signature (64 bytes r||s + 1 byte recovery ID)
+                let mut signature_bytes = signature.to_bytes().to_vec();
+                signature_bytes.push(recid.to_byte());
+                let sig_hex = hex::encode(signature_bytes);
+
                 let addr = self.get_signing_address_hex("ecdsa");
-                (sig_hex, addr)
+                Ok((sig_hex, addr))
             }
             _ => {
                 tracing::warn!("Unknown signing algorithm: {}, defaulting to ed25519", algo);
                 let signature_bytes = self.ed25519_signing_key.sign(signature_text.as_bytes());
                 let sig_hex = hex::encode(signature_bytes.to_bytes());
                 let addr = self.get_signing_address_hex("ed25519");
-                (sig_hex, addr)
+                Ok((sig_hex, addr))
             }
-        };
+        }?;
 
         let signing_address_clone = signing_address.clone();
         let algo_clone = algo.clone();

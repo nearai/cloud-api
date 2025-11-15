@@ -13,6 +13,11 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 
+#[cfg(test)]
+use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey};
+#[cfg(test)]
+use sha3::Keccak256;
+
 // Global once cell to ensure migrations only run once across all tests
 static MIGRATIONS_INITIALIZED: OnceCell<()> = OnceCell::const_new();
 
@@ -365,6 +370,93 @@ pub fn compute_sha256(data: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// Verify an ECDSA signature with recovery ID
+///
+/// # Arguments
+/// * `signature_text` - The message that was signed (format: "request_hash:response_hash")
+/// * `signature_hex` - The hex-encoded signature (65 bytes: r || s || recovery_id)
+/// * `signing_address_hex` - The expected public key in hex format (with or without 0x prefix)
+///
+/// # Returns
+/// `true` if the signature is valid and matches the signing address, `false` otherwise
+#[cfg(test)]
+pub fn verify_ecdsa_signature(
+    signature_text: &str,
+    signature_hex: &str,
+    signing_address_hex: &str,
+) -> bool {
+    // Remove 0x prefix if present
+    let sig_clean = signature_hex.strip_prefix("0x").unwrap_or(signature_hex);
+    let addr_clean = signing_address_hex
+        .strip_prefix("0x")
+        .unwrap_or(signing_address_hex);
+
+    // Decode signature (should be 65 bytes = 130 hex chars)
+    let signature_bytes = match hex::decode(sig_clean) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+
+    if signature_bytes.len() != 65 {
+        eprintln!(
+            "Invalid signature length: expected 65 bytes, got {} bytes",
+            signature_bytes.len()
+        );
+        return false;
+    }
+
+    // Extract r, s, and recovery_id
+    let r_s: [u8; 64] = signature_bytes[..64]
+        .try_into()
+        .expect("Signature should be 64 bytes for r||s");
+    let recovery_id_byte = signature_bytes[64]; // Last byte: recovery_id
+
+    // Parse the signature
+    let signature = match EcdsaSignature::from_bytes(&r_s.into()) {
+        Ok(sig) => sig,
+        Err(e) => {
+            eprintln!("Failed to parse signature: {e}");
+            return false;
+        }
+    };
+
+    // Parse recovery ID
+    let recovery_id = match RecoveryId::try_from(recovery_id_byte) {
+        Ok(rid) => rid,
+        Err(e) => {
+            eprintln!("Invalid recovery ID: {e}");
+            return false;
+        }
+    };
+
+    // Hash the message with Keccak256 (matching the signing process)
+    let message_hash = Keccak256::new_with_prefix(signature_text.as_bytes()).finalize();
+
+    // Recover the public key from the signature
+    let recovered_key =
+        match VerifyingKey::recover_from_prehash(&message_hash, &signature, recovery_id) {
+            Ok(key) => key,
+            Err(e) => {
+                eprintln!("Failed to recover public key: {e}");
+                return false;
+            }
+        };
+
+    // Get the recovered public key in SEC1 format (compressed)
+    let recovered_pubkey_hex = hex::encode(recovered_key.to_sec1_bytes());
+
+    // Compare with the expected signing address
+    let addresses_match = recovered_pubkey_hex.eq_ignore_ascii_case(addr_clean);
+
+    if !addresses_match {
+        eprintln!(
+            "Public key mismatch:\n  Expected: {addr_clean}\n  Recovered: {recovered_pubkey_hex}"
+        );
+    }
+
+    addresses_match
 }
 
 pub fn decode_access_token_claims(token: &str) -> AccessTokenClaims {

@@ -11,7 +11,15 @@ use crate::conversations::ports::ConversationServiceTrait;
 use crate::files::FileServiceTrait;
 use crate::inference_provider_pool::InferenceProviderPool;
 use crate::responses::tools;
-use crate::responses::{errors, models, ports};
+use crate::responses::{citation_tracker, errors, models, ports};
+
+/// Result of tool execution including optional citation instruction
+struct ToolExecutionResult {
+    /// The tool result content to add as a tool message
+    content: String,
+    /// Optional citation instruction to add as a system message (for web_search)
+    citation_instruction: Option<String>,
+}
 
 /// Context for processing a response stream
 struct ProcessStreamContext {
@@ -28,6 +36,8 @@ struct ProcessStreamContext {
     web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
     file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
     file_service: Arc<dyn FileServiceTrait>,
+    /// Source registry for citation resolution
+    source_registry: Option<models::SourceRegistry>,
 }
 
 pub struct ResponseServiceImpl {
@@ -118,6 +128,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 web_search_provider,
                 file_search_provider,
                 file_service,
+                source_registry: None,
             };
 
             if let Err(e) = Self::process_response_stream(tx.clone(), context).await {
@@ -189,6 +200,7 @@ impl ResponseServiceImpl {
         emitter: &mut crate::responses::service_helpers::EventEmitter,
         ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
+        process_context: &ProcessStreamContext,
     ) -> Result<(String, Vec<crate::responses::service_helpers::ToolCallInfo>), errors::ResponseError>
     {
         use crate::responses::service_helpers::ToolCallAccumulator;
@@ -198,6 +210,7 @@ impl ResponseServiceImpl {
         let mut tool_call_accumulator: ToolCallAccumulator = std::collections::HashMap::new();
         let mut message_item_emitted = false;
         let message_item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+        let mut tracker = citation_tracker::CitationTracker::new();
 
         // Reasoning tracking state
         let mut reasoning_buffer = String::new();
@@ -210,13 +223,17 @@ impl ResponseServiceImpl {
                 Ok(sse_event) => {
                     // Parse the SSE event for content and tool calls
                     if let Some(delta_text) = Self::extract_text_delta(&sse_event) {
-                        // Process reasoning tags and extract clean text
-                        let (clean_text, reasoning_delta, tag_transition) =
+                        // Process reasoning tags and extract clean text (no reasoning tags)
+                        let (text_without_reasoning, reasoning_delta, tag_transition) =
                             Self::process_reasoning_tags(
                                 &delta_text,
                                 &mut reasoning_buffer,
                                 &mut inside_reasoning,
                             );
+
+                        // Feed text (without reasoning tags) to citation tracker for real-time processing
+                        // Returns clean text with citation tags also removed
+                        let clean_text = tracker.add_token(&text_without_reasoning);
 
                         // Handle reasoning tag transitions
                         match tag_transition {
@@ -310,8 +327,9 @@ impl ResponseServiceImpl {
                 emitter,
                 ctx,
                 &message_item_id,
-                &current_text,
                 response_items_repository,
+                process_context,
+                tracker,
             )
             .await?;
         }
@@ -362,21 +380,41 @@ impl ResponseServiceImpl {
         emitter: &mut crate::responses::service_helpers::EventEmitter,
         ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
         message_item_id: &str,
-        text: &str,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
+        context: &ProcessStreamContext,
+        citation_tracker: citation_tracker::CitationTracker,
     ) -> Result<(), errors::ResponseError> {
-        // Trim leading and trailing whitespace from the final text
-        let trimmed_text = text.trim();
+        // Finalize citation tracker to get clean text and citations
+        let (clean_text, citations) = citation_tracker.finalize();
+
+        // Convert citations to TextAnnotation::UrlCitation by looking up web sources
+        let annotations = if let Some(registry) = &context.source_registry {
+            citations
+                .into_iter()
+                .filter_map(|citation| {
+                    registry.web_sources.get(citation.source_id).map(|source| {
+                        models::TextAnnotation::UrlCitation {
+                            start_index: citation.start_index,
+                            end_index: citation.end_index,
+                            title: source.title.clone(),
+                            url: source.url.clone(),
+                        }
+                    })
+                })
+                .collect()
+        } else {
+            vec![]
+        };
 
         // Event: response.output_text.done
         emitter
-            .emit_text_done(ctx, message_item_id.to_string(), trimmed_text.to_string())
+            .emit_text_done(ctx, message_item_id.to_string(), clean_text.clone())
             .await?;
 
         // Event: response.content_part.done
         let part = models::ResponseOutputContent::OutputText {
-            text: trimmed_text.to_string(),
-            annotations: vec![],
+            text: clean_text.clone(),
+            annotations: annotations.clone(),
             logprobs: vec![],
         };
         emitter
@@ -393,8 +431,8 @@ impl ResponseServiceImpl {
             status: models::ResponseItemStatus::Completed,
             role: "assistant".to_string(),
             content: vec![models::ResponseOutputContent::OutputText {
-                text: trimmed_text.to_string(),
-                annotations: vec![],
+                text: clean_text,
+                annotations,
                 logprobs: vec![],
             }],
             model: ctx.model.clone(),
@@ -517,7 +555,7 @@ impl ResponseServiceImpl {
     /// Process the response stream - main logic
     async fn process_response_stream(
         tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
-        context: ProcessStreamContext,
+        mut context: ProcessStreamContext,
     ) -> Result<(), errors::ResponseError> {
         tracing::info!("Starting response stream processing");
 
@@ -619,20 +657,11 @@ impl ResponseServiceImpl {
             &mut emitter,
             &mut messages,
             &mut final_response_text,
-            &context.request,
-            context.user_id.clone(),
-            &context.api_key_id,
-            context.organization_id,
-            context.workspace_id,
-            &context.body_hash,
+            &mut context,
             &tools,
             &tool_choice,
             max_iterations,
             &mut iteration,
-            &context.response_items_repository,
-            &context.completion_service,
-            &context.web_search_provider,
-            &context.file_search_provider,
         )
         .await?;
 
@@ -722,26 +751,16 @@ impl ResponseServiceImpl {
     }
 
     /// Run the agent loop - repeatedly call completion API and execute tool calls
-    #[allow(clippy::too_many_arguments)]
     async fn run_agent_loop(
         ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
         emitter: &mut crate::responses::service_helpers::EventEmitter,
         messages: &mut Vec<crate::completions::ports::CompletionMessage>,
         final_response_text: &mut String,
-        request: &models::CreateResponseRequest,
-        user_id: crate::UserId,
-        api_key_id: &str,
-        organization_id: uuid::Uuid,
-        workspace_id: uuid::Uuid,
-        body_hash: &str,
+        process_context: &mut ProcessStreamContext,
         tools: &[inference_providers::ToolDefinition],
         tool_choice: &Option<inference_providers::ToolChoice>,
         max_iterations: usize,
         iteration: &mut usize,
-        response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
-        completion_service: &Arc<dyn CompletionServiceTrait>,
-        web_search_provider: &Option<Arc<dyn tools::WebSearchProviderTrait>>,
-        file_search_provider: &Option<Arc<dyn tools::FileSearchProviderTrait>>,
     ) -> Result<(), errors::ResponseError> {
         use crate::completions::ports::{CompletionMessage, CompletionRequest};
 
@@ -765,25 +784,25 @@ impl ResponseServiceImpl {
 
             // Create completion request
             let completion_request = CompletionRequest {
-                model: request.model.clone(),
+                model: process_context.request.model.clone(),
                 messages: messages.clone(),
-                max_tokens: request.max_output_tokens,
-                temperature: request.temperature,
-                top_p: request.top_p,
+                max_tokens: process_context.request.max_output_tokens,
+                temperature: process_context.request.temperature,
+                top_p: process_context.request.top_p,
                 stop: None,
                 stream: Some(true),
-                user_id: user_id.clone(),
-                api_key_id: api_key_id.to_string(),
-                organization_id,
-                workspace_id,
-                metadata: request.metadata.clone(),
-                body_hash: body_hash.to_string(),
+                user_id: process_context.user_id.clone(),
+                api_key_id: process_context.api_key_id.to_string(),
+                organization_id: process_context.organization_id,
+                workspace_id: process_context.workspace_id,
+                metadata: process_context.request.metadata.clone(),
+                body_hash: process_context.body_hash.to_string(),
                 n: None,
                 extra,
             };
 
             // Get completion stream
-            let mut completion_stream = completion_service
+            let mut completion_stream = process_context.completion_service
                 .create_chat_completion_stream(completion_request)
                 .await
                 .map_err(|e| {
@@ -795,7 +814,8 @@ impl ResponseServiceImpl {
                 &mut completion_stream,
                 emitter,
                 ctx,
-                response_items_repository,
+                &process_context.response_items_repository,
+                process_context,
             )
             .await?;
 
@@ -824,10 +844,7 @@ impl ResponseServiceImpl {
                     emitter,
                     &tool_call,
                     messages,
-                    request,
-                    response_items_repository,
-                    web_search_provider,
-                    file_search_provider,
+                    process_context,
                 )
                 .await?;
             }
@@ -837,16 +854,12 @@ impl ResponseServiceImpl {
     }
 
     /// Execute a tool call and emit appropriate events
-    #[allow(clippy::too_many_arguments)]
     async fn execute_and_emit_tool_call(
         ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
         emitter: &mut crate::responses::service_helpers::EventEmitter,
         tool_call: &crate::responses::service_helpers::ToolCallInfo,
         messages: &mut Vec<crate::completions::ports::CompletionMessage>,
-        request: &models::CreateResponseRequest,
-        response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
-        web_search_provider: &Option<Arc<dyn tools::WebSearchProviderTrait>>,
-        file_search_provider: &Option<Arc<dyn tools::FileSearchProviderTrait>>,
+        process_context: &mut ProcessStreamContext,
     ) -> Result<(), errors::ResponseError> {
         use crate::completions::ports::CompletionMessage;
 
@@ -874,9 +887,7 @@ impl ResponseServiceImpl {
         // Execute the tool and catch errors to provide feedback to the LLM
         let tool_result = match Self::execute_tool(
             tool_call,
-            web_search_provider,
-            file_search_provider,
-            request,
+            process_context,
         )
         .await
         {
@@ -889,7 +900,10 @@ impl ResponseServiceImpl {
                     tool_call.tool_type,
                     error_message
                 );
-                error_message
+                ToolExecutionResult {
+                    content: error_message,
+                    citation_instruction: None,
+                }
             }
         };
 
@@ -900,7 +914,7 @@ impl ResponseServiceImpl {
                 emitter,
                 &tool_call_id,
                 tool_call,
-                response_items_repository,
+                &process_context.response_items_repository,
             )
             .await?;
         }
@@ -908,8 +922,16 @@ impl ResponseServiceImpl {
         // Add tool result to message history
         messages.push(CompletionMessage {
             role: "tool".to_string(),
-            content: tool_result,
+            content: tool_result.content,
         });
+
+        // Add citation instruction if provided by the tool
+        if let Some(citation_instruction) = tool_result.citation_instruction {
+            messages.push(CompletionMessage {
+                role: "system".to_string(),
+                content: citation_instruction,
+            });
+        }
 
         Ok(())
     }
@@ -1746,10 +1768,8 @@ impl ResponseServiceImpl {
     /// Execute a tool call
     async fn execute_tool(
         tool_call: &crate::responses::service_helpers::ToolCallInfo,
-        web_search_provider: &Option<Arc<dyn tools::WebSearchProviderTrait>>,
-        file_search_provider: &Option<Arc<dyn tools::FileSearchProviderTrait>>,
-        request: &models::CreateResponseRequest,
-    ) -> Result<String, errors::ResponseError> {
+        context: &mut ProcessStreamContext,
+    ) -> Result<ToolExecutionResult, errors::ResponseError> {
         // Check for empty tool type
         if tool_call.tool_type.trim().is_empty() {
             return Err(errors::ResponseError::EmptyToolName);
@@ -1757,7 +1777,7 @@ impl ResponseServiceImpl {
 
         match tool_call.tool_type.as_str() {
             "web_search" => {
-                if let Some(provider) = web_search_provider {
+                if let Some(provider) = &context.web_search_provider {
                     // Build WebSearchParams from tool call parameters
                     let mut search_params = tools::WebSearchParams::new(tool_call.query.clone());
 
@@ -1811,25 +1831,45 @@ impl ResponseServiceImpl {
                     let results = provider.search(search_params).await.map_err(|e| {
                         errors::ResponseError::InternalError(format!("Web search failed: {e}"))
                     })?;
+                    
+                    // Store web search results in registry for citation resolution
+                    context.source_registry = Some(models::SourceRegistry::with_results(results.clone()));
+                    
                     let formatted = results
                         .iter()
-                        .map(|r| {
+                        .enumerate()
+                        .map(|(idx, r)| {
                             format!(
-                                "Title: {}\nURL: {}\nSnippet: {}\n",
-                                r.title, r.url, r.snippet
+                                "Source: {}\nTitle: {}\nURL: {}\nSnippet: {}\n",
+                                idx, r.title, r.url, r.snippet
                             )
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    Ok(formatted)
+
+                    let citation_instruction = r#"CITATION REQUIREMENT: Use [s:N]text[/s:N] for every source-based claim.
+
+FORMAT: [s:N]fact from source[/s:N]
+- N = source number (0, 1, 2, etc.)
+- BOTH opening and closing tags required
+- Opening and closing N must match
+- Wrap complete facts/sentences
+
+CORRECT: [s:0]Temperature is 72°F[/s:0]
+INCORRECT: [s:0]Temperature is 72°F (missing closing tag)"#;
+
+                    Ok(ToolExecutionResult {
+                        content: formatted,
+                        citation_instruction: Some(citation_instruction.to_string()),
+                    })
                 } else {
                     Err(errors::ResponseError::UnknownTool("web_search".to_string()))
                 }
             }
             "file_search" => {
-                if let Some(provider) = file_search_provider {
+                if let Some(provider) = &context.file_search_provider {
                     // Get conversation ID from request
-                    let conversation_id = match &request.conversation {
+                    let conversation_id = match &context.request.conversation {
                         Some(models::ConversationReference::Id(id)) => {
                             // Parse conversation ID
                             let uuid_str = id.strip_prefix("conv_").unwrap_or(id);
@@ -1848,7 +1888,10 @@ impl ResponseServiceImpl {
                             })?
                         }
                         None => {
-                            return Ok("File search requires a conversation context".to_string());
+                            return Ok(ToolExecutionResult {
+                                content: "File search requires a conversation context".to_string(),
+                                citation_instruction: None,
+                            });
                         }
                     };
 
@@ -1874,9 +1917,15 @@ impl ResponseServiceImpl {
                         .collect::<Vec<_>>()
                         .join("\n");
 
-                    Ok(formatted)
+                    Ok(ToolExecutionResult {
+                        content: formatted,
+                        citation_instruction: None,
+                    })
                 } else {
-                    Ok("File search not available (no provider configured)".to_string())
+                    Ok(ToolExecutionResult {
+                        content: "File search not available (no provider configured)".to_string(),
+                        citation_instruction: None,
+                    })
                 }
             }
             _ => Err(errors::ResponseError::UnknownTool(

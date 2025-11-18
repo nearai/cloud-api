@@ -232,8 +232,9 @@ impl ResponseServiceImpl {
                             );
 
                         // Feed text (without reasoning tags) to citation tracker for real-time processing
-                        // Returns clean text with citation tags also removed
-                        let clean_text = tracker.add_token(&text_without_reasoning);
+                        // Returns clean text with citation tags also removed, plus any completed citations
+                        let token_result = tracker.add_token(&text_without_reasoning);
+                        let clean_text = token_result.clean_text;
 
                         // Handle reasoning tag transitions
                         match tag_transition {
@@ -300,8 +301,35 @@ impl ResponseServiceImpl {
                             // Emit delta event for message content
                             if message_item_emitted {
                                 emitter
-                                    .emit_text_delta(ctx, message_item_id.clone(), clean_text)
+                                    .emit_text_delta(
+                                        ctx,
+                                        message_item_id.clone(),
+                                        clean_text.clone(),
+                                    )
                                     .await?;
+                            }
+                        }
+
+                        // If a citation just closed, emit annotation event immediately
+                        if let Some(completed_citation) = token_result.completed_citation {
+                            if let Some(registry) = &process_context.source_registry {
+                                if let Some(source) =
+                                    registry.web_sources.get(completed_citation.source_id)
+                                {
+                                    let annotation = models::TextAnnotation::UrlCitation {
+                                        start_index: completed_citation.start_index,
+                                        end_index: completed_citation.end_index,
+                                        title: source.title.clone(),
+                                        url: source.url.clone(),
+                                    };
+                                    emitter
+                                        .emit_citation_annotation(
+                                            ctx,
+                                            message_item_id.clone(),
+                                            annotation,
+                                        )
+                                        .await?;
+                                }
                             }
                         }
                     }

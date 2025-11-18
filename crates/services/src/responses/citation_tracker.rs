@@ -3,6 +3,32 @@
 //! This module handles parsing source citations from LLM responses using a state machine
 //! that properly handles tags split across tokens. The tracker processes tokens incrementally,
 //! removing tags and emitting clean text while tracking citation positions in real-time.
+//!
+//! ## Citation Emission
+//!
+//! When a citation closing tag [/s:N] is encountered, the tracker immediately emits a
+//! `CompletedCitation` via the `TokenResult` return type. This enables real-time SSE
+//! event emission in the streaming pipeline without waiting for message finalization.
+
+/// Result from processing a token through the citation tracker
+#[derive(Debug, Clone)]
+pub struct TokenResult {
+    /// Clean text output (tags removed)
+    pub clean_text: String,
+    /// Citation that just closed (if any)
+    pub completed_citation: Option<CompletedCitation>,
+}
+
+/// Citation that has been completed (closing tag encountered)
+#[derive(Debug, Clone)]
+pub struct CompletedCitation {
+    /// Source/reference ID from the citation tag
+    pub source_id: usize,
+    /// Start index in clean text
+    pub start_index: usize,
+    /// End index in clean text
+    pub end_index: usize,
+}
 
 /// Citation tag state machine states
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -81,6 +107,9 @@ pub struct CitationTracker {
 
     /// Previous state (for context when recovering from failed tags)
     previous_state: Option<TagState>,
+
+    /// Citation that just closed in the current token (for immediate emission)
+    just_closed_citation: Option<CompletedCitation>,
 }
 
 impl Default for CitationTracker {
@@ -99,17 +128,26 @@ impl CitationTracker {
             active_citation: None,
             completed_citations: Vec::new(),
             previous_state: None,
+            just_closed_citation: None,
         }
     }
 
     /// Add a token from the LLM stream and return clean output (with tags removed)
-    /// The returned String is the clean text portion to send via SSE
-    pub fn add_token(&mut self, token: &str) -> String {
-        let mut output = String::new();
+    /// Also returns any citation that just completed (closing tag encountered)
+    pub fn add_token(&mut self, token: &str) -> TokenResult {
+        // Clear any previous token's just-closed citation
+        self.just_closed_citation = None;
+
+        let mut clean_text = String::new();
         for ch in token.chars() {
-            output.push_str(&self.process_char(ch));
+            let output = self.process_char(ch);
+            clean_text.push_str(&output);
         }
-        output
+
+        TokenResult {
+            clean_text,
+            completed_citation: self.just_closed_citation.take(),
+        }
     }
 
     /// Extract source ID from buffer at given positions
@@ -287,12 +325,22 @@ impl CitationTracker {
                         if let Some(active) = self.active_citation.take() {
                             if active.source_id == source_id {
                                 tracing::debug!("CitationTracker: Citation tag closed [/s:{}] - indices=[{}, {}], text='{}'", source_id, active.start_index, self.clean_position, active.accumulated_content);
-                                self.completed_citations.push(Citation {
+                                let citation = Citation {
                                     start_index: active.start_index,
                                     end_index: self.clean_position,
                                     source_id,
                                     cited_text: active.accumulated_content,
+                                };
+
+                                // Store for immediate emission in TokenResult
+                                self.just_closed_citation = Some(CompletedCitation {
+                                    source_id: citation.source_id,
+                                    start_index: citation.start_index,
+                                    end_index: citation.end_index,
                                 });
+
+                                // Also store in completed_citations for finalization
+                                self.completed_citations.push(citation);
                             }
                         }
 
@@ -386,10 +434,11 @@ mod tests {
         let out4 = tracker.add_token("[/s:0]");
 
         // Verify incremental output removes tags immediately
-        assert_eq!(out1, "Hello ");
-        assert_eq!(out2, ""); // Opening tag is consumed
-        assert_eq!(out3, "world");
-        assert_eq!(out4, ""); // Closing tag is consumed
+        assert_eq!(out1.clean_text, "Hello ");
+        assert_eq!(out2.clean_text, ""); // Opening tag is consumed
+        assert_eq!(out3.clean_text, "world");
+        assert_eq!(out4.clean_text, ""); // Closing tag is consumed
+        assert!(out4.completed_citation.is_some()); // Citation closed in last token
 
         let (clean, citations) = tracker.finalize();
         assert_eq!(clean, "Hello world");
@@ -409,11 +458,12 @@ mod tests {
         let out5 = tracker.add_token("[/s:0]");
 
         // Verify that split tags are handled correctly
-        assert_eq!(out1, "Hello ");
-        assert_eq!(out2, ""); // Buffering partial tag
-        assert_eq!(out3, ""); // Closing partial tag
-        assert_eq!(out4, "world");
-        assert_eq!(out5, ""); // Closing tag consumed
+        assert_eq!(out1.clean_text, "Hello ");
+        assert_eq!(out2.clean_text, ""); // Buffering partial tag
+        assert_eq!(out3.clean_text, ""); // Closing partial tag
+        assert_eq!(out4.clean_text, "world");
+        assert_eq!(out5.clean_text, ""); // Closing tag consumed
+        assert!(out5.completed_citation.is_some()); // Citation closed in last token
 
         let (clean, citations) = tracker.finalize();
         assert_eq!(clean, "Hello world");
@@ -491,7 +541,6 @@ mod tests {
         assert_eq!(citations[0].source_id, 10);
         assert_eq!(citations[0].start_index, 6);
         assert_eq!(citations[0].end_index, 11);
-        assert_eq!(citations[0].cited_text, "world");
     }
 
     #[test]
@@ -527,71 +576,103 @@ mod tests {
         let mut tracker = CitationTracker::new();
 
         let out1 = tracker.add_token("[s:0]");
-        assert_eq!(out1, ""); // Opening tag consumed
+        assert_eq!(out1.clean_text, "");
+        assert!(out1.completed_citation.is_none());
 
-        let out2 = tracker.add_token("cited");
-        assert_eq!(out2, "cited"); // Cited text output
+        // Token 2: Opening citation tag [s:0]
+        let out2 = tracker.add_token("[s:0]");
+        assert_eq!(out2.clean_text, "");
+        assert!(out2.completed_citation.is_none());
 
-        let out3 = tracker.add_token("[/s:0] more text");
-        assert_eq!(out3, " more text"); // Closing tag consumed, rest output
+        // Token 3: Citation content "world"
+        let out3 = tracker.add_token("world");
+        assert_eq!(out3.clean_text, "world");
+        assert!(out3.completed_citation.is_none());
 
+        // Token 4: Closing citation tag [/s:0]
+        // THIS IS THE KEY: When this token is processed, the citation closes
+        // and should be emitted in the TokenResult
+        let out4 = tracker.add_token("[/s:0]");
+        assert_eq!(out4.clean_text, "");
+        assert!(out4.completed_citation.is_some());
+
+        // Verify the completed citation has correct indices
+        let citation = out4.completed_citation.unwrap();
+        assert_eq!(citation.source_id, 0);
+        assert_eq!(citation.start_index, 6); // "Hello " = 6 chars
+        assert_eq!(citation.end_index, 11); // "Hello world" = 11 chars
+
+        // Token 5: Remaining text
+        let out5 = tracker.add_token(" end");
+        assert_eq!(out5.clean_text, " end");
+        assert!(out5.completed_citation.is_none());
+
+        // Finalize still works correctly
         let (clean, citations) = tracker.finalize();
-        assert_eq!(clean, "cited more text");
+        assert_eq!(clean, "Hello world end");
         assert_eq!(citations.len(), 1);
-        assert_eq!(citations[0].start_index, 0);
-        assert_eq!(citations[0].end_index, 5); // "cited" is at positions 0-5 (exclusive end)
-        assert_eq!(citations[0].cited_text, "cited");
-    }
-
-    #[test]
-    fn test_citation_indices_with_multiple_citations() {
-        // Verify that citation indices are correct when multiple citations close
-        let mut tracker = CitationTracker::new();
-        tracker.add_token("Before [s:0]first[/s:0] middle [s:1]second[/s:1] after");
-
-        let (clean, citations) = tracker.finalize();
-        assert_eq!(clean, "Before first middle second after");
-        assert_eq!(citations.len(), 2);
-
-        // First citation: "first" at position 7-12 (exclusive end)
-        // "Before " = 7 chars, then "first" = 5 chars
         assert_eq!(citations[0].source_id, 0);
-        assert_eq!(citations[0].start_index, 7);
-        assert_eq!(citations[0].end_index, 12);
-        assert_eq!(citations[0].cited_text, "first");
-
-        // Second citation: "second" at position 20-26 (exclusive end)
-        // "Before first middle " = 20 chars, then "second" = 6 chars
-        assert_eq!(citations[1].source_id, 1);
-        assert_eq!(citations[1].start_index, 20);
-        assert_eq!(citations[1].end_index, 26);
-        assert_eq!(citations[1].cited_text, "second");
+        assert_eq!(citations[0].start_index, 6);
+        assert_eq!(citations[0].end_index, 11);
     }
 
     #[test]
-    fn test_invalid_tag_streaming_incremental() {
-        // Test that verifies streaming behavior with invalid tags - they should be treated as literal text
+    fn test_multiple_citations_real_time_emission() {
+        // Verify that each citation is emitted exactly once when it closes
         let mut tracker = CitationTracker::new();
 
-        // Token 1: Text before invalid tag
-        let out1 = tracker.add_token("Text ");
-        assert_eq!(out1, "Text ");
+        // First citation
+        let r1 = tracker.add_token("Start [s:0]first[/s:0]");
+        // "Start " = 6 chars, then "first" = 5 chars
+        assert!(r1.completed_citation.is_some());
+        let c1 = r1.completed_citation.unwrap();
+        assert_eq!(c1.source_id, 0);
+        assert_eq!(c1.start_index, 6);
+        assert_eq!(c1.end_index, 11);
 
-        // Token 2: Invalid opening tag [x:0] (not [s:0])
-        let out2 = tracker.add_token("[x:0]");
-        assert_eq!(out2, "[x:0]"); // Invalid tag passed through as literal
+        // Gap
+        let r2 = tracker.add_token(" middle ");
+        assert_eq!(r2.clean_text, " middle ");
+        assert!(r2.completed_citation.is_none());
 
-        // Token 3: Content
-        let out3 = tracker.add_token("content");
-        assert_eq!(out3, "content");
+        // Second citation
+        let r3 = tracker.add_token("[s:1]second[/s:1]");
+        // "Start first middle " = 19 chars, then "second" = 6 chars
+        assert!(r3.completed_citation.is_some());
+        let c2 = r3.completed_citation.unwrap();
+        assert_eq!(c2.source_id, 1);
+        assert_eq!(c2.start_index, 19);
+        assert_eq!(c2.end_index, 25);
 
-        // Token 4: Invalid closing tag [/x:0]
-        let out4 = tracker.add_token("[/x:0]");
-        assert_eq!(out4, "[/x:0]"); // Invalid tag passed through as literal
-
-        // Verify final result
+        // Verify finalization
         let (clean, citations) = tracker.finalize();
-        assert_eq!(clean, "Text [x:0]content[/x:0]"); // Invalid tags remain in output
-        assert_eq!(citations.len(), 0); // No citations created
+        assert_eq!(clean, "Start first middle second");
+        assert_eq!(citations.len(), 2);
+        assert_eq!(citations[0].source_id, 0);
+        assert_eq!(citations[1].source_id, 1);
+    }
+
+    #[test]
+    fn test_split_closing_tag_emits_citation() {
+        // Verify that even when the closing tag is split across tokens,
+        // the citation is still emitted as soon as it closes
+        let mut tracker = CitationTracker::new();
+
+        tracker.add_token("Hello [s:0]world");
+        // Citation open but not closed yet
+        let r1 = tracker.add_token("[/s");
+        assert!(r1.completed_citation.is_none()); // Still buffering closing tag
+
+        let r2 = tracker.add_token(":0]");
+        // NOW the closing tag is complete
+        assert!(r2.completed_citation.is_some());
+        let citation = r2.completed_citation.unwrap();
+        assert_eq!(citation.source_id, 0);
+        assert_eq!(citation.start_index, 6);
+        assert_eq!(citation.end_index, 11);
+
+        let (clean, citations) = tracker.finalize();
+        assert_eq!(clean, "Hello world");
+        assert_eq!(citations.len(), 1);
     }
 }

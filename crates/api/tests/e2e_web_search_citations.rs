@@ -331,6 +331,32 @@ async fn test_streaming_web_search_with_citations() {
         "Should have multiple delta events (token-by-token streaming)"
     );
 
+    // Count real-time citation annotation events (NEW)
+    let annotation_event_lines: Vec<_> = response_text
+        .lines()
+        .filter(|l| l.contains("response.output_text.annotation.added"))
+        .collect();
+
+    let annotation_event_count = annotation_event_lines.len();
+    println!("✓ Received {annotation_event_count} real-time citation annotation events");
+
+    // Parse the annotation events to collect their data
+    let mut streaming_annotations: Vec<serde_json::Value> = Vec::new();
+    for line in annotation_event_lines {
+        if let Some(json_str) = line.strip_prefix("data: ") {
+            if let Ok(event) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(annotation) = event.get("annotation") {
+                    streaming_annotations.push(annotation.clone());
+                }
+            }
+        }
+    }
+
+    println!(
+        "✓ Parsed {count} annotation payloads from streaming events",
+        count = streaming_annotations.len()
+    );
+
     // Extract the final message to check citations
     let final_line = response_text
         .lines()
@@ -392,6 +418,122 @@ async fn test_streaming_web_search_with_citations() {
         verify_citation_validity(annotation, text, idx);
     }
 
+    // Verify that streaming annotation events match final annotations
+    println!("\n=== Real-Time vs Final Annotation Comparison ===");
+    println!(
+        "Streaming annotation events: {}",
+        streaming_annotations.len()
+    );
+    println!("Final annotations: {}", annotations.len());
+
+    assert_eq!(
+        streaming_annotations.len(),
+        annotations.len(),
+        "Should receive one annotation event per citation. Got {s} streaming events but {f} final annotations",
+        s = streaming_annotations.len(),
+        f = annotations.len()
+    );
+
+    // Sort both by start_index for comparison
+    let mut sorted_streaming = streaming_annotations.clone();
+    let mut sorted_final = annotations.clone();
+
+    sorted_streaming.sort_by_key(|a| a.get("start_index").and_then(|s| s.as_u64()).unwrap_or(0));
+
+    sorted_final.sort_by_key(|a| a.get("start_index").and_then(|s| s.as_u64()).unwrap_or(0));
+
+    // Compare each annotation
+    for (idx, (streaming, final_)) in sorted_streaming.iter().zip(sorted_final.iter()).enumerate() {
+        println!("\n  Comparing annotation {}", idx + 1);
+
+        // Compare type
+        let stream_type = streaming
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("missing");
+        let final_type = final_
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("missing");
+
+        assert_eq!(
+            stream_type,
+            final_type,
+            "Annotation {}: type mismatch - streaming={}, final={}",
+            idx + 1,
+            stream_type,
+            final_type
+        );
+
+        // Compare indices
+        let stream_start = streaming
+            .get("start_index")
+            .and_then(|s| s.as_u64())
+            .unwrap_or(0);
+        let final_start = final_
+            .get("start_index")
+            .and_then(|s| s.as_u64())
+            .unwrap_or(0);
+
+        assert_eq!(
+            stream_start,
+            final_start,
+            "Annotation {}: start_index mismatch - streaming={}, final={}",
+            idx + 1,
+            stream_start,
+            final_start
+        );
+
+        let stream_end = streaming
+            .get("end_index")
+            .and_then(|e| e.as_u64())
+            .unwrap_or(0);
+        let final_end = final_
+            .get("end_index")
+            .and_then(|e| e.as_u64())
+            .unwrap_or(0);
+
+        assert_eq!(
+            stream_end,
+            final_end,
+            "Annotation {}: end_index mismatch - streaming={}, final={}",
+            idx + 1,
+            stream_end,
+            final_end
+        );
+
+        // Compare URL
+        let stream_url = streaming.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        let final_url = final_.get("url").and_then(|u| u.as_str()).unwrap_or("");
+
+        assert_eq!(
+            stream_url,
+            final_url,
+            "Annotation {}: URL mismatch - streaming={}, final={}",
+            idx + 1,
+            stream_url,
+            final_url
+        );
+
+        // Compare title
+        let stream_title = streaming
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        let final_title = final_.get("title").and_then(|t| t.as_str()).unwrap_or("");
+
+        assert_eq!(
+            stream_title,
+            final_title,
+            "Annotation {}: title mismatch - streaming={}, final={}",
+            idx + 1,
+            stream_title,
+            final_title
+        );
+
+        println!("    ✓ Annotation {} matches perfectly", idx + 1);
+    }
+
     // Verify that citation indices don't overlap
     let mut sorted_annotations: Vec<_> = annotations
         .iter()
@@ -422,4 +564,136 @@ async fn test_streaming_web_search_with_citations() {
         "\n✅ Streaming citation test PASSED with {c} citations verified",
         c = annotations.len()
     );
+}
+
+#[tokio::test]
+async fn capture_streaming_citations_to_file() {
+    use std::fs::File;
+    use std::io::Write;
+
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Create a conversation
+    let conversation_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "metadata": {
+                "title": "Streaming Citations Capture Test"
+            }
+        }))
+        .await;
+
+    assert_eq!(conversation_response.status_code(), 201);
+
+    let conversation_data = conversation_response.json::<serde_json::Value>();
+    let conversation_id = conversation_data
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("Conversation ID should be present");
+
+    println!("✓ Created conversation: {conversation_id}");
+
+    // Create streaming response with web search
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "conversation": conversation_id,
+            "model": "zai-org/GLM-4.6",
+            "input": "What are the latest developments in AI? Search the web and provide current information with citations.",
+            "stream": true,
+            "max_output_tokens": 256,
+            "temperature": 0.7,
+            "tools": [
+                {
+                    "type": "web_search"
+                }
+            ]
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    let response_text = response.text();
+
+    // Save to file
+    let mut file =
+        File::create("/tmp/streaming_citations_demo.sse").expect("Failed to create file");
+    file.write_all(response_text.as_bytes())
+        .expect("Failed to write file");
+
+    println!("\n✓ Saved streaming response to /tmp/streaming_citations_demo.sse");
+    println!("  File size: {} bytes", response_text.len());
+
+    // Print statistics
+    let delta_count = response_text
+        .lines()
+        .filter(|l| l.contains("response.output_text.delta"))
+        .count();
+    let annotation_count = response_text
+        .lines()
+        .filter(|l| l.contains("response.output_text.annotation.added"))
+        .count();
+    let web_search_count = response_text
+        .lines()
+        .filter(|l| l.contains("web_search_call"))
+        .count();
+
+    println!("\n=== Event Statistics ===");
+    println!("Text deltas: {delta_count}");
+    println!("Citation annotations: {annotation_count}");
+    println!("Web search events: {web_search_count}");
+
+    println!("\n=== Sample Events ===");
+
+    // Show first few deltas
+    println!("\nFirst 3 text deltas:");
+    for line in response_text
+        .lines()
+        .filter(|l| l.contains("response.output_text.delta"))
+        .take(3)
+    {
+        if let Some(json_str) = line.strip_prefix("data: ") {
+            if let Ok(event) = serde_json::from_str::<serde_json::Value>(json_str) {
+                println!(
+                    "  {}",
+                    event.get("delta").and_then(|d| d.as_str()).unwrap_or("")
+                );
+            }
+        }
+    }
+
+    // Show citations
+    if annotation_count > 0 {
+        println!("\nCitation annotations found:");
+        for line in response_text
+            .lines()
+            .filter(|l| l.contains("response.output_text.annotation.added"))
+        {
+            if let Some(json_str) = line.strip_prefix("data: ") {
+                if let Ok(event) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    if let Some(annotation) = event.get("annotation") {
+                        let title = annotation
+                            .get("title")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("N/A");
+                        let start = annotation
+                            .get("start_index")
+                            .and_then(|s| s.as_u64())
+                            .unwrap_or(0);
+                        let end = annotation
+                            .get("end_index")
+                            .and_then(|e| e.as_u64())
+                            .unwrap_or(0);
+                        println!("  [{start}, {end}] - {title}");
+                    }
+                }
+            }
+        }
+    }
+
+    println!("\n✅ Captured streaming response successfully");
 }

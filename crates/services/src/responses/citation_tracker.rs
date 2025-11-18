@@ -83,6 +83,12 @@ pub struct CitationTracker {
     previous_state: Option<TagState>,
 }
 
+impl Default for CitationTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CitationTracker {
     pub fn new() -> Self {
         Self {

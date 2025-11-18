@@ -9,7 +9,7 @@ use serde_json::json;
 
 /// Verify citation structure and validity
 fn verify_citation_validity(annotation: &serde_json::Value, text: &str, citation_num: usize) {
-    println!("\n--- Citation {} ---", citation_num + 1);
+    println!("\n--- Citation {num} ---", num = citation_num + 1);
 
     // Check annotation type
     let annotation_type = annotation
@@ -18,8 +18,7 @@ fn verify_citation_validity(annotation: &serde_json::Value, text: &str, citation
         .expect("Citation: Type field should be present");
     assert_eq!(
         annotation_type, "url_citation",
-        "Citation should be of type 'url_citation', got '{}'",
-        annotation_type
+        "Citation should be of type 'url_citation', got '{annotation_type}'"
     );
 
     // Get indices
@@ -47,19 +46,19 @@ fn verify_citation_validity(annotation: &serde_json::Value, text: &str, citation
     // Verify indices are valid
     assert!(
         start_index < end_index,
-        "Citation #{}: start_index ({}) should be less than end_index ({})",
-        citation_num + 1,
-        start_index,
-        end_index
+        "Citation #{n}: start_index ({s}) should be less than end_index ({e})",
+        n = citation_num + 1,
+        s = start_index,
+        e = end_index
     );
 
     assert!(
         end_index <= text.len(),
-        "Citation #{}: end_index ({}) exceeds text length ({}). Text: '{}'",
-        citation_num + 1,
-        end_index,
-        text.len(),
-        text
+        "Citation #{n}: end_index ({e}) exceeds text length ({l}). Text: '{t}'",
+        n = citation_num + 1,
+        e = end_index,
+        l = text.len(),
+        t = text
     );
 
     // Extract cited text (convert character indices to actual characters, handling UTF-8 properly)
@@ -69,52 +68,52 @@ fn verify_citation_validity(annotation: &serde_json::Value, text: &str, citation
         .take(end_index - start_index)
         .collect();
 
-    println!("  Indices: [{}, {}]", start_index, end_index);
-    println!("  Cited text: '{}'", cited_text);
-    println!("  Title: {}", title);
-    println!("  URL: {}", url);
+    println!("  Indices: [{start_index}, {end_index}]");
+    println!("  Cited text: '{cited_text}'");
+    println!("  Title: {title}");
+    println!("  URL: {url}");
 
     // Verify the cited text is not empty and meaningful
     assert!(
         !cited_text.trim().is_empty(),
-        "Citation #{}: Cited text should not be empty",
-        citation_num + 1
+        "Citation #{n}: Cited text should not be empty",
+        n = citation_num + 1
     );
 
     assert!(
         cited_text.len() > 2,
-        "Citation #{}: Cited text '{}' is too short (must be > 2 characters)",
-        citation_num + 1,
-        cited_text
+        "Citation #{n}: Cited text '{c}' is too short (must be > 2 characters)",
+        n = citation_num + 1,
+        c = cited_text
     );
 
     // Verify URL format
     assert!(
         url.starts_with("http://") || url.starts_with("https://"),
-        "Citation #{}: URL '{}' should start with http:// or https://",
-        citation_num + 1,
-        url
+        "Citation #{n}: URL '{u}' should start with http:// or https://",
+        n = citation_num + 1,
+        u = url
     );
 
     assert!(
         url.len() > 10,
-        "Citation #{}: URL '{}' appears to be too short",
-        citation_num + 1,
-        url
+        "Citation #{n}: URL '{u}' appears to be too short",
+        n = citation_num + 1,
+        u = url
     );
 
     // Verify title is not empty and reasonable length
     assert!(
         !title.is_empty(),
-        "Citation #{}: Title should not be empty",
-        citation_num + 1
+        "Citation #{n}: Title should not be empty",
+        n = citation_num + 1
     );
 
     assert!(
         title.len() > 3,
-        "Citation #{}: Title '{}' is too short",
-        citation_num + 1,
-        title
+        "Citation #{n}: Title '{t}' is too short",
+        n = citation_num + 1,
+        t = title
     );
 
     println!("  ✓ Citation format valid");
@@ -145,7 +144,7 @@ async fn test_non_streaming_web_search_with_citations() {
         .and_then(|v| v.as_str())
         .expect("Conversation ID should be present");
 
-    println!("✓ Created conversation: {}", conversation_id);
+    println!("✓ Created conversation: {conversation_id}");
 
     // Create non-streaming response with web search
     // Use a specific query that requires current information and citations
@@ -214,19 +213,25 @@ async fn test_non_streaming_web_search_with_citations() {
         .expect("Annotations should be present");
 
     println!("\n=== Non-Streaming Response ===");
-    println!("Text length: {} characters", text.len());
-    println!("Text (first 300 chars): {}", &text[..text.len().min(300)]);
+    println!("Text length: {len} characters", len = text.len());
+    println!(
+        "Text (first 300 chars): {txt}",
+        txt = &text[..text.len().min(300)]
+    );
 
-    println!("Annotations found: {}", annotations.len());
+    println!("Annotations found: {count}", count = annotations.len());
 
     // CRITICAL: Web search with citations MUST produce citations
     assert!(
         !annotations.is_empty(),
-        "Web search response should include at least one citation with URL. Got {} citations",
-        annotations.len()
+        "Web search response should include at least one citation with URL. Got {count} citations",
+        count = annotations.len()
     );
 
-    println!("✓ Found {} citations in response", annotations.len());
+    println!(
+        "✓ Found {count} citations in response",
+        count = annotations.len()
+    );
 
     // Verify each citation has correct structure and valid indices
     for (idx, annotation) in annotations.iter().enumerate() {
@@ -252,23 +257,18 @@ async fn test_non_streaming_web_search_with_citations() {
         let (idx2, start2, end2) = window[1];
 
         println!(
-            "Citation {} [{}-{}] vs Citation {} [{}-{}]",
-            idx1, start1, end1, idx2, start2, end2
+            "Citation {idx1} [{start1}-{end1}] vs Citation {idx2} [{start2}-{end2}]"
         );
 
         assert!(
             end1 <= start2,
-            "Citations should not overlap: Citation {} ends at {} but Citation {} starts at {}",
-            idx1,
-            end1,
-            idx2,
-            start2
+            "Citations should not overlap: Citation {idx1} ends at {end1} but Citation {idx2} starts at {start2}"
         );
     }
 
     println!(
-        "\n✅ Non-streaming test PASSED with {} citations verified",
-        annotations.len()
+        "\n✅ Non-streaming test PASSED with {c} citations verified",
+        c = annotations.len()
     );
 }
 
@@ -297,7 +297,7 @@ async fn test_streaming_web_search_with_citations() {
         .and_then(|v| v.as_str())
         .expect("Conversation ID should be present");
 
-    println!("✓ Created conversation: {}", conversation_id);
+    println!("✓ Created conversation: {conversation_id}");
 
     // Create streaming response with web search
     let response = server
@@ -328,7 +328,7 @@ async fn test_streaming_web_search_with_citations() {
         .filter(|l| l.contains("response.output_text.delta"))
         .count();
 
-    println!("✓ Received {} streaming delta events", delta_count);
+    println!("✓ Received {delta_count} streaming delta events");
 
     assert!(
         delta_count > 5,
@@ -339,7 +339,7 @@ async fn test_streaming_web_search_with_citations() {
     let final_line = response_text
         .lines()
         .filter(|l| l.contains("response.output_item.done"))
-        .last()
+        .next_back()
         .and_then(|l| {
             l.strip_prefix("data: ")
                 .and_then(|json_str| serde_json::from_str::<serde_json::Value>(json_str).ok())
@@ -371,21 +371,27 @@ async fn test_streaming_web_search_with_citations() {
         .expect("Annotations should be present");
 
     println!("\n=== Streaming Response ===");
-    println!("Text length: {} characters", text.len());
-    println!("Text (first 300 chars): {}", &text[..text.len().min(300)]);
+    println!("Text length: {len} characters", len = text.len());
+    println!(
+        "Text (first 300 chars): {txt}",
+        txt = &text[..text.len().min(300)]
+    );
 
-    println!("Annotations found in streaming: {}", annotations.len());
+    println!(
+        "Annotations found in streaming: {count}",
+        count = annotations.len()
+    );
 
     // CRITICAL: Web search with citations MUST produce citations
     assert!(
         !annotations.is_empty(),
-        "Streaming web search response should include at least one citation with URL. Got {} citations",
-        annotations.len()
+        "Streaming web search response should include at least one citation with URL. Got {count} citations",
+        count = annotations.len()
     );
 
     println!(
-        "✓ Found {} citations in streaming response",
-        annotations.len()
+        "✓ Found {count} citations in streaming response",
+        count = annotations.len()
     );
 
     for (idx, annotation) in annotations.iter().enumerate() {
@@ -411,22 +417,17 @@ async fn test_streaming_web_search_with_citations() {
         let (idx2, start2, end2) = window[1];
 
         println!(
-            "Citation {} [{}-{}] vs Citation {} [{}-{}]",
-            idx1, start1, end1, idx2, start2, end2
+            "Citation {idx1} [{start1}-{end1}] vs Citation {idx2} [{start2}-{end2}]"
         );
 
         assert!(
             end1 <= start2,
-            "Citations should not overlap: Citation {} ends at {} but Citation {} starts at {}",
-            idx1,
-            end1,
-            idx2,
-            start2
+            "Citations should not overlap: Citation {idx1} ends at {end1} but Citation {idx2} starts at {start2}"
         );
     }
 
     println!(
-        "\n✅ Streaming citation test PASSED with {} citations verified",
-        annotations.len()
+        "\n✅ Streaming citation test PASSED with {c} citations verified",
+        c = annotations.len()
     );
 }

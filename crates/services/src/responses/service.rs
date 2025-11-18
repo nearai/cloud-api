@@ -751,6 +751,7 @@ impl ResponseServiceImpl {
     }
 
     /// Run the agent loop - repeatedly call completion API and execute tool calls
+    #[allow(clippy::too_many_arguments)]
     async fn run_agent_loop(
         ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
         emitter: &mut crate::responses::service_helpers::EventEmitter,
@@ -2488,13 +2489,10 @@ mod tests {
 
         // Verify that searching for index 0 gets first result
         assert_eq!(
-            final_registry.web_sources.get(0).unwrap().url,
+            final_registry.web_sources.first().unwrap().url,
             "https://example.com/1"
         );
         // Verify that searching for index 3 gets fourth result
-        assert_eq!(
-            final_registry.web_sources.get(3).unwrap().url,
-            "https://example.com/4"
-        );
+        assert_eq!(final_registry.web_sources[3].url, "https://example.com/4");
     }
 }

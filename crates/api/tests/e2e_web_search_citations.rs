@@ -256,9 +256,7 @@ async fn test_non_streaming_web_search_with_citations() {
         let (idx1, start1, end1) = window[0];
         let (idx2, start2, end2) = window[1];
 
-        println!(
-            "Citation {idx1} [{start1}-{end1}] vs Citation {idx2} [{start2}-{end2}]"
-        );
+        println!("Citation {idx1} [{start1}-{end1}] vs Citation {idx2} [{start2}-{end2}]");
 
         assert!(
             end1 <= start2,
@@ -416,9 +414,7 @@ async fn test_streaming_web_search_with_citations() {
         let (idx1, start1, end1) = window[0];
         let (idx2, start2, end2) = window[1];
 
-        println!(
-            "Citation {idx1} [{start1}-{end1}] vs Citation {idx2} [{start2}-{end2}]"
-        );
+        println!("Citation {idx1} [{start1}-{end1}] vs Citation {idx2} [{start2}-{end2}]");
 
         assert!(
             end1 <= start2,

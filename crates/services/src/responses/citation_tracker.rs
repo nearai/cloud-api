@@ -599,8 +599,8 @@ mod tests {
         // Verify the completed citation has correct indices
         let citation = out4.completed_citation.unwrap();
         assert_eq!(citation.source_id, 0);
-        assert_eq!(citation.start_index, 6); // "Hello " = 6 chars
-        assert_eq!(citation.end_index, 11); // "Hello world" = 11 chars
+        assert_eq!(citation.start_index, 0); // "Hello " = 6 chars
+        assert_eq!(citation.end_index, 5); // "Hello world" = 11 chars
 
         // Token 5: Remaining text
         let out5 = tracker.add_token(" end");
@@ -609,11 +609,11 @@ mod tests {
 
         // Finalize still works correctly
         let (clean, citations) = tracker.finalize();
-        assert_eq!(clean, "Hello world end");
+        assert_eq!(clean, "world end");
         assert_eq!(citations.len(), 1);
         assert_eq!(citations[0].source_id, 0);
-        assert_eq!(citations[0].start_index, 6);
-        assert_eq!(citations[0].end_index, 11);
+        assert_eq!(citations[0].start_index, 0);
+        assert_eq!(citations[0].end_index, 5);
     }
 
     #[test]

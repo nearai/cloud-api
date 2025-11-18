@@ -94,7 +94,7 @@ impl CitationTracker {
         Self {
             clean_text: String::new(),
             current_state: TagState::Idle,
-            token_buffer: String::new(),
+            token_buffer: String::with_capacity(10),
             clean_position: 0,
             active_citation: None,
             completed_citations: Vec::new(),
@@ -107,16 +107,39 @@ impl CitationTracker {
     pub fn add_token(&mut self, token: &str) -> String {
         let mut output = String::new();
         for ch in token.chars() {
-            if let Some(clean_ch) = self.process_char(ch) {
-                output.push(clean_ch);
+            output.push_str(&self.process_char(ch));
+        }
+        output
+    }
+
+    /// Extract source ID from buffer at given positions
+    /// Parses digits between start_idx and end_idx as usize
+    fn parse_digits_from_buffer(&self, start_idx: usize, end_idx: usize) -> Option<usize> {
+        if start_idx < end_idx && end_idx <= self.token_buffer.len() {
+            self.token_buffer[start_idx..end_idx].parse::<usize>().ok()
+        } else {
+            None
+        }
+    }
+
+    /// Flush buffer contents to clean_text and update tracking
+    /// Returns the flushed content as a String
+    fn do_flush_to_clean_text(&mut self, buffer_content: &str) -> String {
+        let mut output = String::new();
+        for ch in buffer_content.chars() {
+            self.clean_text.push(ch);
+            if let Some(ref mut active) = self.active_citation {
+                active.accumulated_content.push(ch);
             }
+            self.clean_position += 1;
+            output.push(ch);
         }
         output
     }
 
     /// Process a single character through the state machine
-    /// Returns Some(ch) if a clean character should be output, None if it's part of a tag
-    fn process_char(&mut self, ch: char) -> Option<char> {
+    /// Returns String (empty if consumed by tag, otherwise the character(s) to output)
+    fn process_char(&mut self, ch: char) -> String {
         match self.current_state {
             TagState::Idle => {
                 if ch == '[' {
@@ -124,7 +147,7 @@ impl CitationTracker {
                     self.token_buffer.push(ch);
                     self.previous_state = Some(TagState::Idle);
                     self.current_state = TagState::PartialOpen;
-                    None // Don't output yet, wait for next char
+                    String::new() // Don't output yet, wait for next char
                 } else {
                     // Regular character - add to clean_text and output
                     self.clean_text.push(ch);
@@ -132,7 +155,7 @@ impl CitationTracker {
                         active.accumulated_content.push(ch);
                     }
                     self.clean_position += 1;
-                    Some(ch)
+                    ch.to_string()
                 }
             }
 
@@ -141,12 +164,12 @@ impl CitationTracker {
                     self.token_buffer.push(ch);
                     // Might be [s:N]
                     self.current_state = TagState::PartialOpenTag;
-                    None // Still buffering
+                    String::new() // Still buffering
                 } else if ch == '/' {
                     self.token_buffer.push(ch);
                     // Might be [/s:N]
                     self.current_state = TagState::PartialCloseTag;
-                    None // Still buffering
+                    String::new() // Still buffering
                 } else {
                     // Not a tag, flush buffer as literal text
                     self.token_buffer.push(ch);
@@ -158,7 +181,7 @@ impl CitationTracker {
                 self.token_buffer.push(ch);
                 if ch == ':' {
                     self.current_state = TagState::PartialOpenTagColon;
-                    None // Still buffering
+                    String::new() // Still buffering
                 } else {
                     // Invalid tag, flush as literal
                     self.flush_token_buffer_and_restore_state()
@@ -170,7 +193,7 @@ impl CitationTracker {
                 if ch.is_ascii_digit() {
                     // Accumulate digit, still waiting for ] or more digits
                     self.current_state = TagState::OpenTagDigit;
-                    None
+                    String::new()
                 } else {
                     // Invalid, flush as literal
                     self.flush_token_buffer_and_restore_state()
@@ -182,8 +205,9 @@ impl CitationTracker {
                 if ch == ']' {
                     // Complete opening tag [s:N+]
                     // Extract digits from token_buffer: "[s:" + digits + "]"
-                    let digits_part = &self.token_buffer[3..self.token_buffer.len() - 1];
-                    if let Ok(source_id) = digits_part.parse::<usize>() {
+                    if let Some(source_id) =
+                        self.parse_digits_from_buffer(3, self.token_buffer.len() - 1)
+                    {
                         tracing::debug!(
                             "CitationTracker: Citation tag opened [s:{}] at clean_position={}",
                             source_id,
@@ -200,7 +224,7 @@ impl CitationTracker {
 
                         self.token_buffer.clear();
                         self.previous_state = None;
-                        None // Tag consumed, don't output
+                        String::new() // Tag consumed, don't output
                     } else {
                         // Failed to parse source_id, flush as literal
                         self.flush_token_buffer_and_restore_state()
@@ -210,7 +234,7 @@ impl CitationTracker {
                     self.flush_token_buffer_and_restore_state()
                 } else {
                     // Another digit, keep buffering
-                    None
+                    String::new()
                 }
             }
 
@@ -219,7 +243,7 @@ impl CitationTracker {
                     self.token_buffer.push(ch);
                     // [/s found, waiting for :
                     self.current_state = TagState::PartialCloseTagS;
-                    None
+                    String::new()
                 } else {
                     // Invalid, flush as literal
                     self.token_buffer.push(ch);
@@ -231,7 +255,7 @@ impl CitationTracker {
                 if ch == ':' {
                     self.token_buffer.push(ch);
                     self.current_state = TagState::PartialCloseTagColon;
-                    None
+                    String::new()
                 } else {
                     // Invalid, flush as literal
                     self.token_buffer.push(ch);
@@ -244,7 +268,7 @@ impl CitationTracker {
                 if ch.is_ascii_digit() {
                     // Accumulate digit, still waiting for ] or more digits
                     self.current_state = TagState::CloseTagDigit;
-                    None
+                    String::new()
                 } else {
                     // Invalid, flush as literal
                     self.flush_token_buffer_and_restore_state()
@@ -256,8 +280,9 @@ impl CitationTracker {
                 if ch == ']' {
                     // Complete closing tag [/s:N+]
                     // Extract digits from token_buffer: "[/s:" + digits + "]"
-                    let digits_part = &self.token_buffer[4..self.token_buffer.len() - 1];
-                    if let Ok(source_id) = digits_part.parse::<usize>() {
+                    if let Some(source_id) =
+                        self.parse_digits_from_buffer(4, self.token_buffer.len() - 1)
+                    {
                         // Citation is closing - finalize it immediately with correct indices
                         if let Some(active) = self.active_citation.take() {
                             if active.source_id == source_id {
@@ -274,7 +299,7 @@ impl CitationTracker {
                         self.current_state = TagState::Idle;
                         self.token_buffer.clear();
                         self.previous_state = None;
-                        None // Tag consumed, don't output
+                        String::new() // Tag consumed, don't output
                     } else {
                         // Failed to parse source_id, flush as literal
                         self.flush_token_buffer_and_restore_state()
@@ -284,7 +309,7 @@ impl CitationTracker {
                     self.flush_token_buffer_and_restore_state()
                 } else {
                     // Another digit, keep buffering
-                    None
+                    String::new()
                 }
             }
 
@@ -294,7 +319,7 @@ impl CitationTracker {
                     self.token_buffer.push(ch);
                     self.previous_state = Some(TagState::InsideTag { source_id });
                     self.current_state = TagState::PartialOpen;
-                    None // Wait for next char before outputting
+                    String::new() // Wait for next char before outputting
                 } else {
                     // Regular character inside citation - output and track
                     self.clean_text.push(ch);
@@ -302,26 +327,18 @@ impl CitationTracker {
                         active.accumulated_content.push(ch);
                     }
                     self.clean_position += 1;
-                    Some(ch)
+                    ch.to_string()
                 }
             }
         }
     }
 
-    /// Flush token buffer and restore previous state, outputting each char
-    fn flush_token_buffer_and_restore_state(&mut self) -> Option<char> {
-        let mut last_char = None;
-        for ch in self.token_buffer.chars() {
-            self.clean_text.push(ch);
-            if let Some(ref mut active) = self.active_citation {
-                active.accumulated_content.push(ch);
-            }
-            self.clean_position += 1;
-            last_char = Some(ch);
-        }
+    /// Flush token buffer and restore previous state, returning all flushed content
+    fn flush_token_buffer_and_restore_state(&mut self) -> String {
+        let output = self.do_flush_to_clean_text(&self.token_buffer.clone());
         self.token_buffer.clear();
         self.current_state = self.previous_state.take().unwrap_or(TagState::Idle);
-        last_char // Return the last character from the flushed buffer
+        output // Return ALL characters from the flushed buffer
     }
 
     /// Finalize tracking and return clean text with citations
@@ -333,12 +350,8 @@ impl CitationTracker {
                 "CitationTracker: Flushing incomplete token_buffer at finalize: '{}'",
                 self.token_buffer
             );
-            for ch in self.token_buffer.chars() {
-                self.clean_text.push(ch);
-                if let Some(ref mut active) = self.active_citation {
-                    active.accumulated_content.push(ch);
-                }
-            }
+            let buffer_content = self.token_buffer.clone();
+            let _ = self.do_flush_to_clean_text(&buffer_content);
         }
 
         tracing::debug!(
@@ -512,19 +525,15 @@ mod tests {
     fn test_streaming_incremental_output() {
         // Test that verifies the streaming behavior: clean text is returned immediately
         let mut tracker = CitationTracker::new();
-        let mut accumulated = String::new();
 
-        let out = tracker.add_token("[s:0]");
-        accumulated.push_str(&out);
-        assert_eq!(accumulated, ""); // Opening tag consumed
+        let out1 = tracker.add_token("[s:0]");
+        assert_eq!(out1, ""); // Opening tag consumed
 
-        let out = tracker.add_token("cited");
-        accumulated.push_str(&out);
-        assert_eq!(accumulated, "cited"); // Cited text output
+        let out2 = tracker.add_token("cited");
+        assert_eq!(out2, "cited"); // Cited text output
 
-        let out = tracker.add_token("[/s:0] more text");
-        accumulated.push_str(&out);
-        assert_eq!(accumulated, "cited more text"); // Closing tag consumed, rest output
+        let out3 = tracker.add_token("[/s:0] more text");
+        assert_eq!(out3, " more text"); // Closing tag consumed, rest output
 
         let (clean, citations) = tracker.finalize();
         assert_eq!(clean, "cited more text");
@@ -557,5 +566,32 @@ mod tests {
         assert_eq!(citations[1].start_index, 20);
         assert_eq!(citations[1].end_index, 26);
         assert_eq!(citations[1].cited_text, "second");
+    }
+
+    #[test]
+    fn test_invalid_tag_streaming_incremental() {
+        // Test that verifies streaming behavior with invalid tags - they should be treated as literal text
+        let mut tracker = CitationTracker::new();
+
+        // Token 1: Text before invalid tag
+        let out1 = tracker.add_token("Text ");
+        assert_eq!(out1, "Text ");
+
+        // Token 2: Invalid opening tag [x:0] (not [s:0])
+        let out2 = tracker.add_token("[x:0]");
+        assert_eq!(out2, "[x:0]"); // Invalid tag passed through as literal
+
+        // Token 3: Content
+        let out3 = tracker.add_token("content");
+        assert_eq!(out3, "content");
+
+        // Token 4: Invalid closing tag [/x:0]
+        let out4 = tracker.add_token("[/x:0]");
+        assert_eq!(out4, "[/x:0]"); // Invalid tag passed through as literal
+
+        // Verify final result
+        let (clean, citations) = tracker.finalize();
+        assert_eq!(clean, "Text [x:0]content[/x:0]"); // Invalid tags remain in output
+        assert_eq!(citations.len(), 0); // No citations created
     }
 }

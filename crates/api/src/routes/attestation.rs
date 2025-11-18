@@ -34,21 +34,25 @@ impl From<services::attestation::ChatSignature> for SignatureResponse {
     }
 }
 
+/// Get completion signature
+///
+/// Get cryptographic signature for a chat completion for verification.
 #[utoipa::path(
     get,
-    path = "/signature/{chat_id}",
+    path = "/v1/signature/{chat_id}",
     params(
         ("chat_id" = String, Path, description = "Chat completion ID"),
         SignatureQuery
     ),
     responses(
-        (status = 200, description = "Signature retrieved successfully", body = SignatureResponse),
-        (status = 404, description = "Signature not found"),
-        (status = 400, description = "Invalid parameters")
+        (status = 200, description = "Signature retrieved", body = SignatureResponse),
+        (status = 404, description = "Signature not found", body = ErrorResponse),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
-    )
+    ),
+    tag = "Attestation"
 )]
 pub async fn get_signature(
     Path(chat_id): Path<String>,
@@ -94,24 +98,51 @@ pub struct NvidiaPayload {
     pub evidence_list: Vec<Evidence>,
 }
 
+/// VPC information in attestation
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct VpcInfo {
+    /// VPC server app ID
+    pub vpc_server_app_id: Option<String>,
+    /// VPC hostname of this node
+    pub vpc_hostname: Option<String>,
+}
+
 /// Response for attestation report endpoint
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct DstackCpuQuote {
+    /// The signing address used for the attestation
+    pub signing_address: String,
+    /// The signing algorithm used for the attestation (ecdsa or ed25519)
+    pub signing_algo: String,
+    /// The attestation quote in hexadecimal format
     pub intel_quote: String,
+    /// The event log associated with the quote
     pub event_log: String,
+    /// The report data that contains signing address and nonce
     pub report_data: String,
+    /// The nonce used in the attestation request
     pub request_nonce: String,
+    /// Application info from Dstack
     pub info: serde_json::Value,
+    /// VPC information (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vpc: Option<VpcInfo>,
 }
 
 impl From<services::attestation::models::DstackCpuQuote> for DstackCpuQuote {
     fn from(quote: services::attestation::models::DstackCpuQuote) -> Self {
         Self {
+            signing_address: quote.signing_address,
+            signing_algo: quote.signing_algo,
             intel_quote: quote.intel_quote,
             event_log: quote.event_log,
             report_data: quote.report_data,
             request_nonce: quote.request_nonce,
             info: quote.info,
+            vpc: quote.vpc.map(|v| VpcInfo {
+                vpc_server_app_id: v.vpc_server_app_id,
+                vpc_hostname: v.vpc_hostname,
+            }),
         }
     }
 }
@@ -120,9 +151,6 @@ impl From<services::attestation::models::DstackCpuQuote> for DstackCpuQuote {
 pub struct AttestationResponse {
     pub gateway_attestation: DstackCpuQuote,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub all_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
-    /// Deprecated: use `all_attestations` instead
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub model_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
 }
 
@@ -130,26 +158,26 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
     fn from(report: services::attestation::models::AttestationReport) -> Self {
         Self {
             gateway_attestation: report.gateway_attestation.into(),
-            all_attestations: report.all_attestations.clone(),
-            model_attestations: report.all_attestations,
+            model_attestations: report.model_attestations,
         }
     }
 }
 
+/// Get attestation report
+///
+/// Get hardware attestation report for TEE verification. Public endpoint.
 #[utoipa::path(
     get,
-    path = "/attestation/report",
+    path = "/v1/attestation/report",
     params(
         AttestationQuery
     ),
     responses(
-        (status = 200, description = "Attestation report retrieved successfully", body = AttestationResponse),
-        (status = 400, description = "Invalid nonce format"),
-        (status = 503, description = "Attestation service unavailable")
+        (status = 200, description = "Attestation report retrieved", body = AttestationResponse),
+        (status = 400, description = "Invalid nonce format", body = ErrorResponse),
+        (status = 503, description = "Service unavailable", body = ErrorResponse)
     ),
-    security(
-        ("api_key" = [])
-    )
+    tag = "Attestation"
 )]
 pub async fn get_attestation_report(
     Query(params): Query<AttestationQuery>,

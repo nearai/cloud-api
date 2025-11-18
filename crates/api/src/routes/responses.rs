@@ -1,21 +1,22 @@
 use crate::{
     middleware::{auth::AuthenticatedApiKey, RequestBodyHash},
-    models::ErrorResponse,
+    models::{ErrorResponse, ResponseInputItemList},
 };
 use axum::{
+    body::Body,
     extract::{Extension, Json, Path, Query, State},
-    http::StatusCode,
-    response::{
-        sse::{Event, Sse},
-        IntoResponse, Json as ResponseJson,
-    },
+    http::{header, Response, StatusCode},
+    response::{IntoResponse, Json as ResponseJson},
 };
+use bytes::Bytes;
 use futures::stream::StreamExt;
 use serde::Deserialize;
+use services::attestation::ports::AttestationServiceTrait;
 use services::responses::errors::ResponseError as ServiceResponseError;
 use services::responses::models::*;
 use services::responses::ports::ResponseServiceTrait;
 use services::responses::service::ResponseServiceImpl;
+use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::sync::Arc;
 use tracing::debug;
@@ -29,6 +30,13 @@ fn map_response_error_to_status(error: &ServiceResponseError) -> StatusCode {
         ServiceResponseError::UnknownTool(_) => StatusCode::BAD_REQUEST,
         ServiceResponseError::EmptyToolName => StatusCode::BAD_REQUEST,
     }
+}
+
+/// Compute SHA256 hash of data
+fn compute_sha256(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
 }
 
 impl From<ServiceResponseError> for ErrorResponse {
@@ -53,30 +61,39 @@ impl From<ServiceResponseError> for ErrorResponse {
     }
 }
 
-/// Create a new response
+// State for response routes
+#[derive(Clone)]
+pub struct ResponseRouteState {
+    pub response_service: Arc<ResponseServiceImpl>,
+    pub attestation_service: Arc<dyn AttestationServiceTrait>,
+}
+
+/// Create response
 ///
-/// Creates a new response for a conversation.
+/// Generate an AI response for a conversation with tool calling and streaming support.
 #[utoipa::path(
     post,
-    path = "/responses",
+    path = "/v1/responses",
     tag = "Responses",
     request_body = CreateResponseRequest,
     responses(
-        (status = 200, description = "Response created successfully", body = ResponseObject),
-        (status = 400, description = "Bad request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
+        (status = 200, description = "Response created", body = ResponseObject),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
     )
 )]
 pub async fn create_response(
-    State(service): State<Arc<ResponseServiceImpl>>,
+    State(state): State<ResponseRouteState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
     Json(mut request): Json<CreateResponseRequest>,
 ) -> axum::response::Response {
+    let service = state.response_service.clone();
+    let attestation_service = state.attestation_service.clone();
     debug!(
         "Create response request from api key: {:?}",
         api_key.api_key.id
@@ -108,6 +125,7 @@ pub async fn create_response(
 
     // Store model for logging before moving request
     let model = request.model.clone();
+    let signing_algo = request.signing_algo.clone();
 
     // Check if streaming is requested
     if request.stream.unwrap_or(false) {
@@ -132,21 +150,93 @@ pub async fn create_response(
             Ok(stream) => {
                 tracing::debug!(
                     user_id = %api_key.api_key.created_by_user_id.0,
-                    "Successfully created streaming response, returning SSE stream"
+                    "Successfully created streaming response, returning SSE stream with signature accumulation"
                 );
 
-                let sse_stream = stream.map(|event| {
-                    Ok::<_, Infallible>(
-                        Event::default()
-                            .event(event.event_type.clone())
-                            .data(serde_json::to_string(&event).unwrap_or_default()),
-                    )
+                // Shared state for accumulating bytes and tracking response_id
+                let accumulated_bytes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+                let response_id_state = Arc::new(tokio::sync::Mutex::new(None::<String>));
+                let request_hash = body_hash.hash.clone();
+
+                // Clone for closures
+                let accumulated_clone = accumulated_bytes.clone();
+                let response_id_clone = response_id_state.clone();
+                let attestation_clone = attestation_service.clone();
+
+                // Format events as SSE bytes and accumulate them
+                let byte_stream = stream.then(move |event| {
+                    let accumulated_inner = accumulated_clone.clone();
+                    let response_id_inner = response_id_clone.clone();
+                    let attestation_inner = attestation_clone.clone();
+                    let request_hash_inner = request_hash.clone();
+                    let signing_algo_inner = signing_algo.clone();
+                    async move {
+                        // Extract response_id from response.created event
+                        if event.event_type == "response.created" {
+                            if let Some(ref response) = event.response {
+                                let mut rid = response_id_inner.lock().await;
+                                if rid.is_none() {
+                                    *rid = Some(response.id.clone());
+                                    tracing::debug!("Extracted response_id: {}", response.id);
+                                }
+                            }
+                        }
+
+                        // Format as SSE: "event: {type}\ndata: {json}\n\n"
+                        let json = serde_json::to_string(&event).unwrap_or_default();
+                        let sse_bytes = format!("event: {}\ndata: {}\n\n", event.event_type, json);
+                        let bytes = Bytes::from(sse_bytes);
+
+                        // Accumulate bytes synchronously - this ensures all bytes are captured
+                        // before the stream chunk is yielded to the client
+                        accumulated_inner.lock().await.extend_from_slice(&bytes);
+
+                        // Check if stream is completing - store signature
+                        if event.event_type == "response.completed" {
+                            // At this point, all bytes have been accumulated synchronously
+                            // Now we can safely compute the hash and store the signature
+                            let bytes_accumulated = accumulated_inner.lock().await.clone();
+                            let response_hash = compute_sha256(&bytes_accumulated);
+                            if let Some(rid) = response_id_inner.lock().await.as_ref() {
+                                let rid = rid.clone();
+                                let req_hash = request_hash_inner.clone();
+                                let attest = attestation_inner.clone();
+                                let algo = signing_algo_inner.clone();
+                                tracing::debug!(
+                                    "Storing signature for response_id: {}, request_hash: {}, response_hash: {}, signing_algo: {:?}",
+                                    rid, req_hash, response_hash, algo
+                                );
+
+                                // Spawn task to store signature asynchronously (doesn't block stream)
+                                // but we've already computed the hash with complete data
+                                tokio::spawn(async move {
+                                    // Store the signature with the algorithm from the request (defaults to ed25519 if not specified)
+                                    if let Err(e) = attest.store_response_signature(
+                                        &rid,
+                                        req_hash.clone(),
+                                        response_hash.clone(),
+                                        algo,
+                                    ).await {
+                                        tracing::error!("Failed to store response signature: {}", e);
+                                    } else {
+                                        tracing::debug!("Successfully stored signature for response_id: {}", rid);
+                                    }
+                                });
+                            }
+                        }
+
+                        Ok::<Bytes, Infallible>(bytes)
+                    }
                 });
 
-                // Return SSE response
-                Sse::new(sse_stream)
-                    .keep_alive(axum::response::sse::KeepAlive::default())
-                    .into_response()
+                // Return as raw byte stream with SSE headers
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .header(header::CONNECTION, "keep-alive")
+                    .body(Body::from_stream(byte_stream))
+                    .unwrap()
             }
             Err(error) => {
                 tracing::error!(
@@ -291,8 +381,10 @@ pub async fn create_response(
                     // Fallback: Build response from collected data (for compatibility)
                     // Trim accumulated content to remove leading/trailing whitespace
                     let trimmed_content = content.trim().to_string();
+                    let resp_id =
+                        response_id.unwrap_or_else(|| format!("resp_{}", Uuid::new_v4().simple()));
                     ResponseObject {
-                        id: response_id.unwrap_or_else(|| format!("resp_{}", Uuid::new_v4())),
+                        id: resp_id.clone(),
                         object: "response".to_string(),
                         created_at: chrono::Utc::now().timestamp(),
                         status,
@@ -314,9 +406,13 @@ pub async fn create_response(
                         instructions: request.instructions,
                         max_output_tokens: request.max_output_tokens,
                         max_tool_calls: request.max_tool_calls,
-                        model: request.model,
+                        model: request.model.clone(),
                         output: vec![ResponseOutputItem::Message {
-                            id: format!("msg_{}", Uuid::new_v4()),
+                            id: format!("msg_{}", Uuid::new_v4().simple()),
+                            response_id: resp_id.clone(),
+                            previous_response_id: request.previous_response_id.clone(),
+                            next_response_ids: vec![],
+                            created_at: chrono::Utc::now().timestamp(),
                             status: ResponseItemStatus::Completed,
                             role: "assistant".to_string(),
                             content: vec![ResponseOutputContent::OutputText {
@@ -324,9 +420,11 @@ pub async fn create_response(
                                 annotations: vec![],
                                 logprobs: vec![],
                             }],
+                            model: request.model,
                         }],
                         parallel_tool_calls: request.parallel_tool_calls.unwrap_or(false),
-                        previous_response_id: request.previous_response_id,
+                        previous_response_id: request.previous_response_id.clone(),
+                        next_response_ids: vec![],
                         prompt_cache_key: request.prompt_cache_key,
                         prompt_cache_retention: None,
                         reasoning: None,
@@ -367,10 +465,29 @@ pub async fn create_response(
 }
 
 /// Get a response by ID
+///
+/// Retrieve details of a specific response.
+#[utoipa::path(
+    get,
+    path = "/v1/responses/{response_id}",
+    tag = "Responses",
+    params(
+        ("response_id" = String, Path, description = "Response ID")
+    ),
+    responses(
+        (status = 200, description = "Response details", body = ResponseObject),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 404, description = "Response not found", body = ErrorResponse),
+        (status = 501, description = "Not implemented", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
 pub async fn get_response(
     Path(_response_id): Path<String>,
     Query(_params): Query<GetResponseQuery>,
-    State(_service): State<Arc<ResponseServiceImpl>>,
+    State(_state): State<ResponseRouteState>,
     Extension(_api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ResponseObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement get_response method in ResponseService
@@ -384,9 +501,28 @@ pub async fn get_response(
 }
 
 /// Delete a response
+///
+/// Delete a specific response.
+#[utoipa::path(
+    delete,
+    path = "/v1/responses/{response_id}",
+    tag = "Responses",
+    params(
+        ("response_id" = String, Path, description = "Response ID")
+    ),
+    responses(
+        (status = 200, description = "Response deleted successfully"),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 404, description = "Response not found", body = ErrorResponse),
+        (status = 501, description = "Not implemented", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
 pub async fn delete_response(
     Path(_response_id): Path<String>,
-    State(_service): State<Arc<ResponseServiceImpl>>,
+    State(_state): State<ResponseRouteState>,
     Extension(_api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ResponseDeleteResult>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement delete_response method in ResponseService
@@ -400,9 +536,28 @@ pub async fn delete_response(
 }
 
 /// Cancel a response (for background responses)
+///
+/// Cancel an in-progress background response.
+#[utoipa::path(
+    post,
+    path = "/v1/responses/{response_id}/cancel",
+    tag = "Responses",
+    params(
+        ("response_id" = String, Path, description = "Response ID")
+    ),
+    responses(
+        (status = 200, description = "Response cancelled successfully", body = ResponseObject),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 404, description = "Response not found", body = ErrorResponse),
+        (status = 501, description = "Not implemented", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
 pub async fn cancel_response(
     Path(_response_id): Path<String>,
-    State(_service): State<Arc<ResponseServiceImpl>>,
+    State(_state): State<ResponseRouteState>,
     Extension(_api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ResponseObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement cancel_response method in ResponseService
@@ -415,21 +570,164 @@ pub async fn cancel_response(
     ))
 }
 
-/// List input items for a response (simplified implementation)
+/// List input items for a response
+///
+/// Retrieve all input items (user messages and files) for a specific response.
+#[utoipa::path(
+    get,
+    path = "/v1/responses/{response_id}/input_items",
+    tag = "Responses",
+    params(
+        ("response_id" = String, Path, description = "Response ID")
+    ),
+    responses(
+        (status = 200, description = "List of input items", body = ResponseInputItemList),
+        (status = 400, description = "Invalid response ID", body = ErrorResponse),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 404, description = "Response not found", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
 pub async fn list_input_items(
-    Path(_response_id): Path<String>,
-    Query(_params): Query<ListInputItemsQuery>,
-    State(_service): State<Arc<ResponseServiceImpl>>,
-    Extension(_api_key): Extension<services::workspace::ApiKey>,
+    Path(response_id): Path<String>,
+    Query(params): Query<ListInputItemsQuery>,
+    State(state): State<ResponseRouteState>,
+    Extension(auth): Extension<AuthenticatedApiKey>,
 ) -> Result<ResponseJson<ResponseInputItemList>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    // TODO: Implement get_response method in ResponseService to support listing input items
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        ResponseJson(ErrorResponse::new(
-            "List input items not yet implemented".to_string(),
-            "not_implemented".to_string(),
-        )),
-    ))
+    let service = state.response_service.clone();
+    debug!(
+        "List input items for response {} from workspace {}",
+        response_id, auth.workspace.id.0
+    );
+
+    // Parse response ID (format: "resp_{uuid}")
+    let response_uuid = response_id
+        .strip_prefix("resp_")
+        .unwrap_or(&response_id)
+        .parse::<Uuid>()
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "Invalid response ID format".to_string(),
+                    "invalid_request_error".to_string(),
+                )),
+            )
+        })?;
+
+    let parsed_response_id = ResponseId(response_uuid);
+
+    // Verify the response belongs to this workspace
+    match service
+        .response_repository
+        .get_by_id(parsed_response_id.clone(), auth.workspace.id.clone())
+        .await
+    {
+        Ok(Some(_)) => {
+            // Response exists and belongs to workspace, proceed
+        }
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    "Response not found".to_string(),
+                    "not_found".to_string(),
+                )),
+            ));
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to fetch response: {e}"),
+                    "internal_server_error".to_string(),
+                )),
+            ));
+        }
+    }
+
+    // Get all response items
+    let items = service
+        .response_items_repository
+        .list_by_response(parsed_response_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to fetch response items: {e}"),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    // Filter to only user input items and convert to API format
+    let mut input_items: Vec<crate::models::ResponseInputItem> = Vec::new();
+
+    for item in items {
+        if let ResponseOutputItem::Message { role, content, .. } = item {
+            if role == "user" {
+                // Convert content parts to API format
+                let api_content = content
+                    .into_iter()
+                    .map(|part| match part {
+                        ResponseOutputContent::OutputText { text, .. } => {
+                            // Check if this is a file reference: [File: file-{uuid}]
+                            if let Some(file_id) = text
+                                .strip_prefix("[File: ")
+                                .and_then(|s| s.strip_suffix("]"))
+                            {
+                                crate::models::ResponseContentPart::InputFile {
+                                    file_id: file_id.to_string(),
+                                    detail: None,
+                                }
+                            } else {
+                                crate::models::ResponseContentPart::InputText { text }
+                            }
+                        }
+                        ResponseOutputContent::ToolCalls { .. } => {
+                            // Tool calls shouldn't appear in user messages, but handle gracefully
+                            crate::models::ResponseContentPart::InputText {
+                                text: "[Tool calls]".to_string(),
+                            }
+                        }
+                    })
+                    .collect();
+
+                input_items.push(crate::models::ResponseInputItem {
+                    role,
+                    content: crate::models::ResponseContent::Parts(api_content),
+                });
+            }
+        }
+    }
+
+    // Apply pagination if needed (for now, return all)
+    let limit = params.limit.unwrap_or(100).min(1000);
+    let has_more = input_items.len() > limit as usize;
+    let input_items: Vec<_> = input_items.into_iter().take(limit as usize).collect();
+
+    let first_id = if input_items.is_empty() {
+        String::new()
+    } else {
+        "0".to_string()
+    };
+    let last_id = if input_items.is_empty() {
+        String::new()
+    } else {
+        (input_items.len() - 1).to_string()
+    };
+
+    Ok(ResponseJson(ResponseInputItemList {
+        object: "list".to_string(),
+        data: input_items,
+        first_id,
+        last_id,
+        has_more,
+    }))
 }
 
 // Query parameter structs

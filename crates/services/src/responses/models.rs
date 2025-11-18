@@ -74,6 +74,8 @@ pub struct CreateResponseRequest {
     pub safety_identifier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing_algo: Option<String>,
 }
 
 /// Input for a response - can be text, array of items, or single item
@@ -165,8 +167,6 @@ pub enum ResponseTool {
     CodeInterpreter {},
     #[serde(rename = "computer")]
     Computer {},
-    #[serde(rename = "current_date")]
-    CurrentDate {},
 }
 
 /// User location for web search
@@ -252,7 +252,9 @@ pub struct ResponseObject {
     pub output: Vec<ResponseOutputItem>,
     pub parallel_tool_calls: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_response_id: Option<String>,
+    pub previous_response_id: Option<String>, // Previous response ID (parent in thread)
+    #[serde(default)]
+    pub next_response_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -327,29 +329,57 @@ pub enum ResponseOutputItem {
     #[serde(rename = "message")]
     Message {
         id: String,
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        created_at: i64,
         status: ResponseItemStatus,
         role: String,
         content: Vec<ResponseOutputContent>,
+        model: String,
     },
     #[serde(rename = "tool_call")]
     ToolCall {
         id: String,
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        created_at: i64,
         status: ResponseItemStatus,
         tool_type: String,
         function: ResponseOutputFunction,
+        model: String,
     },
     #[serde(rename = "web_search_call")]
     WebSearchCall {
         id: String,
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        created_at: i64,
         status: ResponseItemStatus,
         action: WebSearchAction,
+        model: String,
     },
     #[serde(rename = "reasoning")]
     Reasoning {
         id: String,
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        created_at: i64,
         status: ResponseItemStatus,
         summary: String,
         content: String,
+        model: String,
     },
 }
 
@@ -698,6 +728,22 @@ impl Usage {
             output_tokens,
             output_tokens_details: Some(OutputTokensDetails {
                 reasoning_tokens: 0,
+            }),
+            total_tokens: input_tokens + output_tokens,
+        }
+    }
+
+    pub fn new_with_reasoning(
+        input_tokens: i32,
+        output_tokens: i32,
+        reasoning_tokens: i32,
+    ) -> Self {
+        Self {
+            input_tokens,
+            input_tokens_details: Some(InputTokensDetails { cached_tokens: 0 }),
+            output_tokens,
+            output_tokens_details: Some(OutputTokensDetails {
+                reasoning_tokens: reasoning_tokens as i64,
             }),
             total_tokens: input_tokens + output_tokens,
         }

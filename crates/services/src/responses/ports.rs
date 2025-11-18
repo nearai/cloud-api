@@ -63,6 +63,12 @@ pub trait ResponseRepositoryTrait: Send + Sync {
         response_id: models::ResponseId,
         workspace_id: WorkspaceId,
     ) -> anyhow::Result<Option<models::ResponseObject>>;
+
+    async fn get_latest_in_conversation(
+        &self,
+        conversation_id: ConversationId,
+        workspace_id: WorkspaceId,
+    ) -> anyhow::Result<Option<models::ResponseObject>>;
 }
 
 #[async_trait]

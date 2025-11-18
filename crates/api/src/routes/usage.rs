@@ -70,7 +70,7 @@ pub struct UsageHistoryQuery {
 /// Returns the current spending balance for an organization
 #[utoipa::path(
     get,
-    path = "/organizations/{org_id}/usage/balance",
+    path = "/v1/organizations/{org_id}/usage/balance",
     tag = "Usage",
     params(
         ("org_id" = String, Path, description = "Organization ID")
@@ -232,7 +232,7 @@ pub async fn get_organization_balance(
 /// Returns paginated usage history for an organization
 #[utoipa::path(
     get,
-    path = "/organizations/{org_id}/usage/history",
+    path = "/v1/organizations/{org_id}/usage/history",
     tag = "Usage",
     params(
         ("org_id" = String, Path, description = "Organization ID"),
@@ -351,7 +351,7 @@ pub async fn get_organization_usage_history(
 /// Returns paginated usage history for a specific API key
 #[utoipa::path(
     get,
-    path = "/workspaces/{workspace_id}/api-keys/{api_key_id}/usage/history",
+    path = "/v1/workspaces/{workspace_id}/api-keys/{api_key_id}/usage/history",
     tag = "Usage",
     params(
         ("workspace_id" = String, Path, description = "Workspace ID"),

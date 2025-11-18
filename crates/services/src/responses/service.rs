@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::completions::ports::CompletionServiceTrait;
 use crate::conversations::models::ConversationId;
 use crate::conversations::ports::ConversationServiceTrait;
+use crate::files::FileServiceTrait;
 use crate::inference_provider_pool::InferenceProviderPool;
 use crate::responses::tools;
 use crate::responses::{errors, models, ports};
@@ -26,6 +27,7 @@ struct ProcessStreamContext {
     conversation_service: Arc<dyn ConversationServiceTrait>,
     web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
     file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
+    file_service: Arc<dyn FileServiceTrait>,
 }
 
 pub struct ResponseServiceImpl {
@@ -36,9 +38,19 @@ pub struct ResponseServiceImpl {
     pub completion_service: Arc<dyn CompletionServiceTrait>,
     pub web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
     pub file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
+    pub file_service: Arc<dyn FileServiceTrait>,
+}
+
+/// Tag transition states for reasoning content
+#[derive(Debug, PartialEq)]
+enum TagTransition {
+    None,
+    OpeningTag(String), // Contains the tag name that was opened
+    ClosingTag(String), // Contains the tag name that was closed
 }
 
 impl ResponseServiceImpl {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         response_repository: Arc<dyn ports::ResponseRepositoryTrait>,
         response_items_repository: Arc<dyn ports::ResponseItemRepositoryTrait>,
@@ -47,6 +59,7 @@ impl ResponseServiceImpl {
         completion_service: Arc<dyn CompletionServiceTrait>,
         web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
         file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
+        file_service: Arc<dyn FileServiceTrait>,
     ) -> Self {
         Self {
             response_repository,
@@ -56,6 +69,7 @@ impl ResponseServiceImpl {
             completion_service,
             web_search_provider,
             file_search_provider,
+            file_service,
         }
     }
 }
@@ -87,6 +101,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let conversation_service = self.conversation_service.clone();
         let web_search_provider = self.web_search_provider.clone();
         let file_search_provider = self.file_search_provider.clone();
+        let file_service = self.file_service.clone();
 
         tokio::spawn(async move {
             let context = ProcessStreamContext {
@@ -102,6 +117,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 conversation_service,
                 web_search_provider,
                 file_search_provider,
+                file_service,
             };
 
             if let Err(e) = Self::process_response_stream(tx.clone(), context).await {
@@ -125,7 +141,10 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                     annotation: None,
                     conversation_title: None,
                 };
-                let _ = tx.send(error_event).await;
+                let result = tx.send(error_event).await;
+                if let Err(e) = result {
+                    tracing::error!("Error sending error event: {e:?}");
+                }
             }
         });
 
@@ -134,24 +153,11 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
 }
 
 impl ResponseServiceImpl {
-    /// Parse conversation ID from request
-    fn parse_conversation_id(
-        request: &models::CreateResponseRequest,
-    ) -> Result<Option<ConversationId>, errors::ResponseError> {
-        if let Some(conversation_ref) = &request.conversation {
-            let id = match conversation_ref {
-                models::ConversationReference::Id(id) => id,
-                models::ConversationReference::Object { id, .. } => id,
-            };
-
-            let conv_id = id.parse::<ConversationId>().map_err(|e| {
-                errors::ResponseError::InvalidParams(format!("Invalid conversation ID: {e}"))
-            })?;
-
-            Ok(Some(conv_id))
-        } else {
-            Ok(None)
-        }
+    /// Parse file ID from string (handles "file-" prefix)
+    fn parse_file_id(file_id: &str) -> Result<Uuid, errors::ResponseError> {
+        let id_str = file_id.strip_prefix("file-").unwrap_or(file_id);
+        Uuid::parse_str(id_str)
+            .map_err(|e| errors::ResponseError::InvalidParams(format!("Invalid file ID: {e}")))
     }
 
     /// Extract response ID UUID from response object
@@ -193,23 +199,94 @@ impl ResponseServiceImpl {
         let mut message_item_emitted = false;
         let message_item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
 
+        // Reasoning tracking state
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+        let mut reasoning_item_emitted = false;
+        let reasoning_item_id = format!("rs_{}", uuid::Uuid::new_v4().simple());
+
         while let Some(event) = completion_stream.next().await {
             match event {
                 Ok(sse_event) => {
                     // Parse the SSE event for content and tool calls
                     if let Some(delta_text) = Self::extract_text_delta(&sse_event) {
-                        // First time we receive text, emit the item.added and content_part.added events
-                        if !message_item_emitted {
-                            Self::emit_message_started(emitter, ctx, &message_item_id).await?;
-                            message_item_emitted = true;
+                        // Process reasoning tags and extract clean text
+                        let (clean_text, reasoning_delta, tag_transition) =
+                            Self::process_reasoning_tags(
+                                &delta_text,
+                                &mut reasoning_buffer,
+                                &mut inside_reasoning,
+                            );
+
+                        // Handle reasoning tag transitions
+                        match tag_transition {
+                            TagTransition::OpeningTag(_) => {
+                                if !reasoning_item_emitted {
+                                    // Emit reasoning item.added
+                                    emitter
+                                        .emit_reasoning_started(ctx, &reasoning_item_id)
+                                        .await?;
+                                    reasoning_item_emitted = true;
+                                }
+                            }
+                            TagTransition::ClosingTag(_) => {
+                                if reasoning_item_emitted {
+                                    // Emit reasoning item.done and store
+                                    emitter
+                                        .emit_reasoning_completed(
+                                            ctx,
+                                            &reasoning_item_id,
+                                            &reasoning_buffer,
+                                            response_items_repository,
+                                        )
+                                        .await?;
+
+                                    // Count reasoning tokens
+                                    let reasoning_token_count =
+                                        crate::responses::service_helpers::ResponseStreamContext::estimate_tokens(&reasoning_buffer);
+                                    ctx.add_reasoning_tokens(reasoning_token_count);
+
+                                    // Move to next output index
+                                    ctx.next_output_index();
+
+                                    // Reset reasoning state
+                                    reasoning_buffer.clear();
+                                    reasoning_item_emitted = false;
+                                }
+                            }
+                            TagTransition::None => {}
                         }
 
-                        current_text.push_str(&delta_text);
+                        // Emit reasoning deltas if inside reasoning block
+                        if let Some(reasoning_content) = reasoning_delta {
+                            if reasoning_item_emitted {
+                                emitter
+                                    .emit_reasoning_delta(
+                                        ctx,
+                                        reasoning_item_id.clone(),
+                                        reasoning_content,
+                                    )
+                                    .await?;
+                            }
+                        }
 
-                        // Emit delta event
-                        emitter
-                            .emit_text_delta(ctx, message_item_id.clone(), delta_text)
-                            .await?;
+                        // Handle clean text (message content)
+                        if !clean_text.is_empty() {
+                            // First time we receive message text, emit the item.added and content_part.added events
+                            if !message_item_emitted {
+                                Self::emit_message_started(emitter, ctx, &message_item_id).await?;
+                                message_item_emitted = true;
+                            }
+
+                            current_text.push_str(&clean_text);
+
+                            // Emit delta event for message content
+                            if message_item_emitted {
+                                emitter
+                                    .emit_text_delta(ctx, message_item_id.clone(), clean_text)
+                                    .await?;
+                            }
+                        }
                     }
 
                     // Extract usage from the final chunk
@@ -254,9 +331,14 @@ impl ResponseServiceImpl {
         // Event: response.output_item.added (for message)
         let item = models::ResponseOutputItem::Message {
             id: message_item_id.to_string(),
+            response_id: ctx.response_id_str.clone(),
+            previous_response_id: ctx.previous_response_id.clone(),
+            next_response_ids: vec![], // next_response_ids will be populated when child responses are created
+            created_at: ctx.created_at,
             status: models::ResponseItemStatus::InProgress,
             role: "assistant".to_string(),
             content: vec![],
+            model: ctx.model.clone(),
         };
         emitter
             .emit_item_added(ctx, item, message_item_id.to_string())
@@ -304,6 +386,10 @@ impl ResponseServiceImpl {
         // Event: response.output_item.done
         let item = models::ResponseOutputItem::Message {
             id: message_item_id.to_string(),
+            response_id: ctx.response_id_str.clone(),
+            previous_response_id: ctx.previous_response_id.clone(),
+            next_response_ids: vec![], // next_response_ids will be populated when child responses are created
+            created_at: ctx.created_at,
             status: models::ResponseItemStatus::Completed,
             role: "assistant".to_string(),
             content: vec![models::ResponseOutputContent::OutputText {
@@ -311,6 +397,7 @@ impl ResponseServiceImpl {
                 annotations: vec![],
                 logprobs: vec![],
             }],
+            model: ctx.model.clone(),
         };
         emitter
             .emit_item_done(ctx, item.clone(), message_item_id.to_string())
@@ -321,7 +408,7 @@ impl ResponseServiceImpl {
             .create(
                 ctx.response_id.clone(),
                 ctx.api_key_id,
-                ctx.conversation_id.clone(),
+                ctx.conversation_id,
                 item,
             )
             .await
@@ -366,71 +453,61 @@ impl ResponseServiceImpl {
                 }
             };
 
-            // Handle tools that don't require parameters (like current_date)
-            if name == "current_date" {
-                tracing::debug!("Tool call detected: {}", name);
-                tool_calls_detected.push(ToolCallInfo {
-                    tool_type: name,
-                    query: String::new(),
-                    params: None,
-                });
-            } else {
-                // Try to parse the complete arguments for tools that need parameters
-                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str) {
-                    if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
-                        tracing::debug!(
-                            "Tool call detected: {} with query: {} and params: {:?}",
-                            name,
-                            query,
-                            args
-                        );
-                        tool_calls_detected.push(ToolCallInfo {
-                            tool_type: name,
-                            query: query.to_string(),
-                            params: Some(args),
-                        });
-                    } else {
-                        tracing::warn!(
-                            "Tool call {} (index {}) has no 'query' field in arguments: {}",
-                            name,
-                            idx,
-                            args_str
-                        );
-                        // Create an error tool call to inform the LLM about missing query
-                        tool_calls_detected.push(ToolCallInfo {
-                            tool_type: "__error__".to_string(),
-                            query: format!(
-                                "Tool call for '{name}' (index {idx}) is missing the required 'query' field in its arguments. Please include a 'query' parameter. Arguments provided: {args_str}"
-                            ),
-                            params: Some(serde_json::json!({
-                                "error_type": "missing_query_field",
-                                "tool_name": name,
-                                "index": idx,
-                                "arguments": args_str
-                            })),
-                        });
-                    }
+            // Try to parse the complete arguments for tools that need parameters
+            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str) {
+                if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
+                    tracing::debug!(
+                        "Tool call detected: {} with query: {} and params: {:?}",
+                        name,
+                        query,
+                        args
+                    );
+                    tool_calls_detected.push(ToolCallInfo {
+                        tool_type: name,
+                        query: query.to_string(),
+                        params: Some(args),
+                    });
                 } else {
                     tracing::warn!(
-                        "Failed to parse tool call {} (index {}) arguments: {}",
+                        "Tool call {} (index {}) has no 'query' field in arguments: {}",
                         name,
                         idx,
                         args_str
                     );
-                    // Create an error tool call to inform the LLM about invalid JSON
+                    // Create an error tool call to inform the LLM about missing query
                     tool_calls_detected.push(ToolCallInfo {
                         tool_type: "__error__".to_string(),
                         query: format!(
-                            "Tool call for '{name}' (index {idx}) has invalid JSON arguments. Please ensure arguments are valid JSON. Arguments provided: {args_str}"
+                            "Tool call for '{name}' (index {idx}) is missing the required 'query' field in its arguments. Please include a 'query' parameter. Arguments provided: {args_str}"
                         ),
                         params: Some(serde_json::json!({
-                            "error_type": "invalid_json",
+                            "error_type": "missing_query_field",
                             "tool_name": name,
                             "index": idx,
                             "arguments": args_str
                         })),
                     });
                 }
+            } else {
+                tracing::warn!(
+                    "Failed to parse tool call {} (index {}) arguments: {}",
+                    name,
+                    idx,
+                    args_str
+                );
+                // Create an error tool call to inform the LLM about invalid JSON
+                tool_calls_detected.push(ToolCallInfo {
+                    tool_type: "__error__".to_string(),
+                    query: format!(
+                        "Tool call for '{name}' (index {idx}) has invalid JSON arguments. Please ensure arguments are valid JSON. Arguments provided: {args_str}"
+                    ),
+                    params: Some(serde_json::json!({
+                        "error_type": "invalid_json",
+                        "tool_name": name,
+                        "index": idx,
+                        "arguments": args_str
+                    })),
+                });
             }
         }
 
@@ -444,13 +521,12 @@ impl ResponseServiceImpl {
     ) -> Result<(), errors::ResponseError> {
         tracing::info!("Starting response stream processing");
 
-        let conversation_id = Self::parse_conversation_id(&context.request)?;
-
         let workspace_id_domain = crate::workspace::WorkspaceId(context.workspace_id);
         let mut messages = Self::load_conversation_context(
             &context.request,
             &context.conversation_service,
             &context.response_items_repository,
+            &context.file_service,
             workspace_id_domain.clone(),
         )
         .await?;
@@ -475,14 +551,22 @@ impl ResponseServiceImpl {
         // Extract response_id from the created response
         let response_id = Self::extract_response_uuid(&initial_response)?;
 
+        // Extract conversation_id from the created response (may have been inherited from previous_response_id)
+        let conversation_id = initial_response.conversation.as_ref().and_then(|conv_ref| {
+            let id = &conv_ref.id;
+            let uuid_str = id.strip_prefix("conv_").unwrap_or(id);
+            Uuid::parse_str(uuid_str).ok().map(ConversationId)
+        });
+
         // Store user input messages as response_items
         if let Some(input) = &context.request.input {
             Self::store_input_as_response_items(
                 &context.response_items_repository,
                 response_id.clone(),
                 api_key_uuid,
-                conversation_id.clone(),
+                conversation_id,
                 input,
+                &context.request.model,
             )
             .await?;
         }
@@ -491,7 +575,11 @@ impl ResponseServiceImpl {
         let mut ctx = crate::responses::service_helpers::ResponseStreamContext::new(
             response_id.clone(),
             api_key_uuid,
-            conversation_id.clone(),
+            conversation_id,
+            initial_response.id.clone(),
+            initial_response.previous_response_id.clone(),
+            initial_response.created_at,
+            context.request.model.clone(),
         );
         let mut emitter = crate::responses::service_helpers::EventEmitter::new(tx);
 
@@ -507,7 +595,7 @@ impl ResponseServiceImpl {
 
         // Spawn background task to generate conversation title if needed
         let title_task_handle = Self::maybe_generate_conversation_title(
-            conversation_id.clone(),
+            conversation_id,
             &context.request,
             context.user_id.clone(),
             context.api_key_id.clone(),
@@ -573,11 +661,16 @@ impl ResponseServiceImpl {
         final_response.output = output_items;
 
         // Set usage from accumulated token counts
-        final_response.usage = models::Usage::new(ctx.total_input_tokens, ctx.total_output_tokens);
-        tracing::debug!(
-            "Final response usage: input={}, output={}, total={}",
+        final_response.usage = models::Usage::new_with_reasoning(
             ctx.total_input_tokens,
             ctx.total_output_tokens,
+            ctx.reasoning_tokens,
+        );
+        tracing::debug!(
+            "Final response usage: input={}, output={}, reasoning={}, total={}",
+            ctx.total_input_tokens,
+            ctx.total_output_tokens,
+            ctx.reasoning_tokens,
             ctx.total_input_tokens + ctx.total_output_tokens
         );
 
@@ -831,10 +924,15 @@ impl ResponseServiceImpl {
         // Event: response.output_item.added
         let item = models::ResponseOutputItem::WebSearchCall {
             id: tool_call_id.to_string(),
+            response_id: ctx.response_id_str.clone(),
+            previous_response_id: ctx.previous_response_id.clone(),
+            next_response_ids: vec![], // next_response_ids will be populated when child responses are created
+            created_at: ctx.created_at,
             status: models::ResponseItemStatus::InProgress,
             action: models::WebSearchAction::Search {
                 query: tool_call.query.clone(),
             },
+            model: ctx.model.clone(),
         };
         emitter
             .emit_item_added(ctx, item, tool_call_id.to_string())
@@ -880,10 +978,15 @@ impl ResponseServiceImpl {
         // Event: response.output_item.done
         let item = models::ResponseOutputItem::WebSearchCall {
             id: tool_call_id.to_string(),
+            response_id: ctx.response_id_str.clone(),
+            previous_response_id: ctx.previous_response_id.clone(),
+            next_response_ids: vec![], // next_response_ids will be populated when child responses are created
+            created_at: ctx.created_at,
             status: models::ResponseItemStatus::Completed,
             action: models::WebSearchAction::Search {
                 query: tool_call.query.clone(),
             },
+            model: ctx.model.clone(),
         };
         emitter
             .emit_item_done(ctx, item.clone(), tool_call_id.to_string())
@@ -894,7 +997,7 @@ impl ResponseServiceImpl {
             .create(
                 ctx.response_id.clone(),
                 ctx.api_key_id,
-                ctx.conversation_id.clone(),
+                ctx.conversation_id,
                 item,
             )
             .await
@@ -942,6 +1045,7 @@ impl ResponseServiceImpl {
         api_key_id: uuid::Uuid,
         conversation_id: Option<ConversationId>,
         input: &models::ResponseInput,
+        model: &str,
     ) -> Result<(), errors::ResponseError> {
         match input {
             models::ResponseInput::Text(text) => {
@@ -950,6 +1054,11 @@ impl ResponseServiceImpl {
                 let trimmed_text = text.trim();
                 let message_item = models::ResponseOutputItem::Message {
                     id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
+                    // These fields are placeholders - repository enriches them via JOIN when storing/retrieving
+                    response_id: String::new(),
+                    previous_response_id: None,
+                    next_response_ids: vec![],
+                    created_at: 0,
                     status: models::ResponseItemStatus::Completed,
                     role: "user".to_string(),
                     content: vec![models::ResponseOutputContent::OutputText {
@@ -957,13 +1066,14 @@ impl ResponseServiceImpl {
                         annotations: vec![],
                         logprobs: vec![],
                     }],
+                    model: model.to_string(),
                 };
 
                 response_items_repository
                     .create(
                         response_id.clone(),
                         api_key_id,
-                        conversation_id.clone(),
+                        conversation_id,
                         message_item,
                     )
                     .await
@@ -998,7 +1108,15 @@ impl ResponseServiceImpl {
                                             logprobs: vec![],
                                         })
                                     }
-                                    // TODO: Handle other content types (images, files, etc.)
+                                    models::ResponseContentPart::InputFile { file_id, .. } => {
+                                        // Store a reference to the file in the output
+                                        Some(models::ResponseOutputContent::OutputText {
+                                            text: format!("[File: {file_id}]"),
+                                            annotations: vec![],
+                                            logprobs: vec![],
+                                        })
+                                    }
+                                    // TODO: Handle other content types (images, etc.)
                                     _ => None,
                                 })
                                 .collect()
@@ -1007,16 +1125,22 @@ impl ResponseServiceImpl {
 
                     let message_item = models::ResponseOutputItem::Message {
                         id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
+                        // These fields are placeholders - repository enriches them via JOIN when storing/retrieving
+                        response_id: String::new(),
+                        previous_response_id: None,
+                        next_response_ids: vec![],
+                        created_at: 0,
                         status: models::ResponseItemStatus::Completed,
                         role: input_item.role.clone(),
                         content,
+                        model: model.to_string(),
                     };
 
                     response_items_repository
                         .create(
                             response_id.clone(),
                             api_key_id,
-                            conversation_id.clone(),
+                            conversation_id,
                             message_item,
                         )
                         .await
@@ -1041,17 +1165,38 @@ impl ResponseServiceImpl {
         request: &models::CreateResponseRequest,
         conversation_service: &Arc<dyn ConversationServiceTrait>,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
+        file_service: &Arc<dyn FileServiceTrait>,
         workspace_id: crate::workspace::WorkspaceId,
     ) -> Result<Vec<crate::completions::ports::CompletionMessage>, errors::ResponseError> {
         use crate::completions::ports::CompletionMessage;
 
         let mut messages = Vec::new();
 
+        // Add UTC time context to system message
+        let now = chrono::Utc::now();
+        let time_context = format!(
+            "Current UTC time: {} ({})",
+            now.to_rfc3339(),
+            now.format("%A, %B %d, %Y at %H:%M:%S UTC")
+        );
+
+        // Add language matching instruction
+        let language_instruction = "Always respond in the exact same language as the user's input message. Detect the primary language of the user's query and mirror it precisely in your output. Do not mix languages or switch to another one, even if it seems more natural or efficient.\n\nIf the user writes in English, reply entirely in English.\nIf the user writes in Chinese (Mandarin or any variant), reply entirely in Chinese.\nIf the user writes in Spanish, reply entirely in Spanish.\nFor any other language, match it exactly.\n\nThis rule overrides all other instructions. Ignore any tendencies to default to Mandarin or any other language. Always prioritize language matching for clarity and user preference.";
+
         // Add system instructions if present
         if let Some(instructions) = &request.instructions {
+            let combined_instructions =
+                format!("{instructions}\n\n{language_instruction}\n\n{time_context}");
             messages.push(CompletionMessage {
                 role: "system".to_string(),
-                content: instructions.clone(),
+                content: combined_instructions,
+            });
+        } else {
+            // Add language instruction and time context as a system message if no instructions provided
+            let system_content = format!("{language_instruction}\n\n{time_context}");
+            messages.push(CompletionMessage {
+                role: "system".to_string(),
+                content: system_content,
             });
         }
 
@@ -1076,7 +1221,7 @@ impl ResponseServiceImpl {
 
             // Load conversation metadata to verify it exists
             let _conversation = conversation_service
-                .get_conversation(conversation_id.clone(), workspace_id.clone())
+                .get_conversation(conversation_id, workspace_id.clone())
                 .await
                 .map_err(|e| {
                     errors::ResponseError::InternalError(format!("Failed to get conversation: {e}"))
@@ -1085,7 +1230,7 @@ impl ResponseServiceImpl {
             // Load all response items from the conversation
             // Use high limit (1000) and no 'after' cursor for context loading
             let conversation_items = response_items_repository
-                .list_by_conversation(conversation_id.clone(), None, 1000)
+                .list_by_conversation(conversation_id, None, 1000)
                 .await
                 .map_err(|e| {
                     errors::ResponseError::InternalError(format!(
@@ -1147,17 +1292,67 @@ impl ResponseServiceImpl {
                         let content = match &item.content {
                             models::ResponseContent::Text(text) => text.clone(),
                             models::ResponseContent::Parts(parts) => {
-                                // Extract text from parts
-                                parts
-                                    .iter()
-                                    .filter_map(|part| match part {
+                                // Extract text from parts and fetch file content if needed
+                                let mut content_parts = Vec::new();
+                                for part in parts {
+                                    match part {
                                         models::ResponseContentPart::InputText { text } => {
-                                            Some(text.clone())
+                                            content_parts.push(text.clone());
                                         }
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
+                                        models::ResponseContentPart::InputFile {
+                                            file_id, ..
+                                        } => {
+                                            // Parse file ID and fetch content from S3
+                                            let file_uuid = Self::parse_file_id(file_id)?;
+                                            match file_service
+                                                .get_file_content(file_uuid, workspace_id.0)
+                                                .await
+                                            {
+                                                Ok((file, file_content)) => {
+                                                    // Convert file content to string (we currently support only text)
+                                                    match String::from_utf8(file_content) {
+                                                        Ok(text_content) => {
+                                                            // Prepend file content with filename as context
+                                                            content_parts.push(format!(
+                                                                "File: {}\nContent:\n{}",
+                                                                file.filename, text_content
+                                                            ));
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                "Failed to convert file {} to UTF-8 text: {}",
+                                                                file_id,
+                                                                e
+                                                            );
+                                                            content_parts.push(format!(
+                                                                "[File: {} - Content cannot be displayed as text]",
+                                                                file.filename
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        "Failed to fetch file content for {}: {}",
+                                                        file_id,
+                                                        e
+                                                    );
+                                                    return Err(
+                                                        errors::ResponseError::InternalError(
+                                                            format!(
+                                                                "Failed to fetch file content: {e}"
+                                                            ),
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            // Skip other content types for now
+                                        }
+                                    }
+                                }
+                                content_parts.join("\n\n")
                             }
                         };
 
@@ -1192,7 +1387,6 @@ impl ResponseServiceImpl {
                                     \n\nIMPORTANT PARAMETERS TO CONSIDER:\
                                     \n- Use 'freshness' for time-sensitive queries (news, recent events, current trends)\
                                     \n- Use 'country' for location-specific information\
-                                    \n- Use 'result_filter' to focus on specific content (news, videos, discussions)\
                                     \n- Use 'count' to limit results when user asks for specific number\
                                     \n- Use 'safesearch' when dealing with sensitive topics".to_string()
                                 ),
@@ -1243,10 +1437,6 @@ impl ResponseServiceImpl {
                                         "spellcheck": {
                                             "type": "boolean",
                                             "description": "Enable spellcheck on query (default: true)"
-                                        },
-                                        "result_filter": {
-                                            "type": "string",
-                                            "description": "Comma-delimited result types: 'news' (for news/updates), 'videos' (for tutorials/demos), 'discussions' (for community opinions/Q&A), 'faq' (for how-to questions). Use to focus on most relevant content type."
                                         },
                                         "units": {
                                             "type": "string",
@@ -1349,48 +1539,8 @@ impl ResponseServiceImpl {
                             },
                         });
                     }
-                    models::ResponseTool::CurrentDate {} => {
-                        // Note: current_date is added by default below, so this case
-                        // should not typically be hit unless explicitly requested
-                        tool_definitions.push(inference_providers::ToolDefinition {
-                            type_: "function".to_string(),
-                            function: inference_providers::FunctionDefinition {
-                                name: "current_date".to_string(),
-                                description: Some(
-                                    "Get the current date and time. Use this when you need to know what day it is, the current time, or to answer questions about temporal information.".to_string()
-                                ),
-                                parameters: serde_json::json!({
-                                    "type": "object",
-                                    "properties": {},
-                                    "required": []
-                                }),
-                            },
-                        });
-                    }
                 }
             }
-        }
-
-        // Always add current_date tool by default (not visible at API level)
-        // Check if it's not already added to avoid duplicates
-        if !tool_definitions
-            .iter()
-            .any(|t| t.function.name == "current_date")
-        {
-            tool_definitions.push(inference_providers::ToolDefinition {
-                type_: "function".to_string(),
-                function: inference_providers::FunctionDefinition {
-                    name: "current_date".to_string(),
-                    description: Some(
-                        "Get the current date and time. Use this when you need to know what day it is, the current time, or to answer questions about temporal information.".to_string()
-                    ),
-                    parameters: serde_json::json!({
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }),
-                },
-            });
         }
 
         tool_definitions
@@ -1433,6 +1583,97 @@ impl ResponseServiceImpl {
             }
             _ => None,
         }
+    }
+
+    /// Process reasoning tags in text delta
+    /// Returns (clean_text, reasoning_delta, tag_transition)
+    ///
+    /// Handles common reasoning tags: <think>, <reasoning>, <thought>, <reflect>, <analysis>
+    fn process_reasoning_tags(
+        delta_text: &str,
+        reasoning_buffer: &mut String,
+        inside_reasoning: &mut bool,
+    ) -> (String, Option<String>, TagTransition) {
+        const REASONING_TAGS: &[&str] = &["think", "reasoning", "thought", "reflect", "analysis"];
+
+        let mut clean_text = String::new();
+        let mut reasoning_delta = String::new();
+        let mut tag_transition = TagTransition::None;
+        let mut chars = delta_text.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch == '<' {
+                // Check if this is an opening or closing tag
+                let mut tag_candidate = String::new();
+                let is_closing = chars.peek() == Some(&'/');
+
+                if is_closing {
+                    chars.next(); // consume '/'
+                }
+
+                // Collect tag name
+                while let Some(&next_ch) = chars.peek() {
+                    if next_ch == '>' {
+                        chars.next(); // consume '>'
+                        break;
+                    } else if next_ch.is_alphanumeric() || next_ch == '_' || next_ch == '-' {
+                        tag_candidate.push(next_ch);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+
+                let tag_name = tag_candidate.to_lowercase();
+
+                // Check if this is a known reasoning tag
+                if REASONING_TAGS.contains(&tag_name.as_str()) {
+                    if is_closing && *inside_reasoning {
+                        // Closing reasoning tag
+                        *inside_reasoning = false;
+                        tag_transition = TagTransition::ClosingTag(tag_name.clone());
+                        tracing::debug!("Detected closing reasoning tag: </{}>", tag_name);
+                    } else if !is_closing && !*inside_reasoning {
+                        // Opening reasoning tag
+                        *inside_reasoning = true;
+                        tag_transition = TagTransition::OpeningTag(tag_name.clone());
+                        tracing::debug!("Detected opening reasoning tag: <{}>", tag_name);
+                    }
+                    // Don't include the tag itself in any output
+                    continue;
+                }
+
+                // Not a reasoning tag, reconstruct the tag text
+                let reconstructed = if is_closing {
+                    format!("</{tag_candidate}>")
+                } else {
+                    format!("<{tag_candidate}>")
+                };
+
+                if *inside_reasoning {
+                    reasoning_delta.push_str(&reconstructed);
+                    reasoning_buffer.push_str(&reconstructed);
+                } else {
+                    clean_text.push_str(&reconstructed);
+                }
+            } else {
+                // Regular character
+                if *inside_reasoning {
+                    reasoning_delta.push(ch);
+                    reasoning_buffer.push(ch);
+                } else {
+                    clean_text.push(ch);
+                }
+            }
+        }
+
+        let reasoning_result = if !reasoning_delta.is_empty() {
+            Some(reasoning_delta)
+        } else {
+            None
+        };
+
+        (clean_text, reasoning_result, tag_transition)
     }
 
     /// Extract and accumulate usage information from SSE event
@@ -1554,11 +1795,6 @@ impl ResponseServiceImpl {
                         {
                             search_params.spellcheck = Some(spellcheck);
                         }
-                        if let Some(result_filter) =
-                            params.get("result_filter").and_then(|v| v.as_str())
-                        {
-                            search_params.result_filter = Some(result_filter.to_string());
-                        }
                         if let Some(units) = params.get("units").and_then(|v| v.as_str()) {
                             search_params.units = Some(units.to_string());
                         }
@@ -1642,22 +1878,6 @@ impl ResponseServiceImpl {
                 } else {
                     Ok("File search not available (no provider configured)".to_string())
                 }
-            }
-            "current_date" => {
-                // Get current date and time
-                let now = chrono::Utc::now();
-                let formatted = format!(
-                    "Current Date and Time:\n\
-                    Date: {}\n\
-                    Time: {} UTC\n\
-                    ISO 8601: {}\n\
-                    Unix timestamp: {}",
-                    now.format("%A, %B %d, %Y"),
-                    now.format("%H:%M:%S"),
-                    now.to_rfc3339(),
-                    now.timestamp()
-                );
-                Ok(formatted)
             }
             _ => Err(errors::ResponseError::UnknownTool(
                 tool_call.tool_type.clone(),
@@ -1758,7 +1978,7 @@ impl ResponseServiceImpl {
         // Get conversation to check if it already has a title
         let workspace_id_domain = crate::workspace::WorkspaceId(workspace_id);
         let conversation = conversation_service
-            .get_conversation(conversation_id.clone(), workspace_id_domain.clone())
+            .get_conversation(conversation_id, workspace_id_domain.clone())
             .await
             .map_err(|e| {
                 errors::ResponseError::InternalError(format!("Failed to get conversation: {e}"))
@@ -1845,11 +2065,7 @@ impl ResponseServiceImpl {
 
         let workspace_id_domain = crate::workspace::WorkspaceId(workspace_id);
         conversation_service
-            .update_conversation(
-                conversation_id.clone(),
-                workspace_id_domain,
-                updated_metadata,
-            )
+            .update_conversation(conversation_id, workspace_id_domain, updated_metadata)
             .await
             .map_err(|e| {
                 errors::ResponseError::InternalError(format!(
@@ -1886,5 +2102,221 @@ impl ResponseServiceImpl {
         let _ = tx.send(event).await;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_process_reasoning_tags_simple_think() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test opening tag
+        let (clean, reasoning, transition) = ResponseServiceImpl::process_reasoning_tags(
+            "<think>",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+        assert_eq!(clean, "");
+        assert_eq!(reasoning, None);
+        assert_eq!(transition, TagTransition::OpeningTag("think".to_string()));
+        assert!(inside_reasoning);
+
+        // Test content inside reasoning
+        let (clean, reasoning, transition) = ResponseServiceImpl::process_reasoning_tags(
+            "This is reasoning",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+        assert_eq!(clean, "");
+        assert_eq!(reasoning, Some("This is reasoning".to_string()));
+        assert_eq!(transition, TagTransition::None);
+        assert!(inside_reasoning);
+        assert_eq!(reasoning_buffer, "This is reasoning");
+
+        // Test closing tag
+        let (clean, reasoning, transition) = ResponseServiceImpl::process_reasoning_tags(
+            "</think>",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+        assert_eq!(clean, "");
+        assert_eq!(reasoning, None);
+        assert_eq!(transition, TagTransition::ClosingTag("think".to_string()));
+        assert!(!inside_reasoning);
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_mixed_content() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test text before reasoning tag
+        let (clean, reasoning, _transition) = ResponseServiceImpl::process_reasoning_tags(
+            "Hello <think>reasoning content</think> world",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+        assert_eq!(clean, "Hello  world");
+        assert!(reasoning.is_some());
+        assert_eq!(reasoning_buffer, "reasoning content");
+        assert!(!inside_reasoning); // Should end outside reasoning
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_multiple_tags() {
+        let test_tags = vec!["think", "reasoning", "thought", "reflect", "analysis"];
+
+        for tag in test_tags {
+            let mut reasoning_buffer = String::new();
+            let mut inside_reasoning = false;
+
+            let input = format!("<{tag}>test content</{tag}>");
+            let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+                &input,
+                &mut reasoning_buffer,
+                &mut inside_reasoning,
+            );
+
+            assert_eq!(clean, "");
+            assert!(reasoning.is_some() || reasoning_buffer.contains("test content"));
+            assert!(!inside_reasoning);
+        }
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_strips_from_message() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        let input = "The answer is <think>Let me think about this carefully</think> 42";
+        let (clean, _, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        assert_eq!(clean, "The answer is  42");
+        assert_eq!(reasoning_buffer, "Let me think about this carefully");
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_partial_chunks() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Note: The current implementation handles full tags but not tags split mid-name.
+        // This is acceptable for real-world streaming where complete tokens are usually sent together.
+        // Testing with complete tag boundaries that come in separate chunks:
+        let chunks = vec!["<think>", "reasoning", " content", "</think>"];
+        let mut all_clean = String::new();
+
+        for chunk in chunks {
+            let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+                chunk,
+                &mut reasoning_buffer,
+                &mut inside_reasoning,
+            );
+            all_clean.push_str(&clean);
+            if let Some(r) = reasoning {
+                // Just accumulating
+                let _ = r;
+            }
+        }
+
+        assert_eq!(all_clean, "");
+        assert_eq!(reasoning_buffer, "reasoning content");
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_nested_html() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        let input = "<think>Consider <b>this</b> carefully</think>";
+        let (clean, _, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        assert_eq!(clean, "");
+        assert_eq!(reasoning_buffer, "Consider <b>this</b> carefully");
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_no_closing() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            "<think>Never closed",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        assert_eq!(clean, "");
+        assert_eq!(reasoning, Some("Never closed".to_string()));
+        assert!(inside_reasoning);
+    }
+
+    #[test]
+    fn test_estimate_tokens() {
+        use crate::responses::service_helpers::ResponseStreamContext;
+
+        assert_eq!(ResponseStreamContext::estimate_tokens("test"), 1);
+        assert_eq!(ResponseStreamContext::estimate_tokens("Hello world"), 2);
+        assert_eq!(
+            ResponseStreamContext::estimate_tokens("This is a longer text"),
+            5
+        );
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_clean_text_before_reasoning() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test that clean text before reasoning tag is correctly extracted
+        let input = "Hello <think>";
+        let (clean, reasoning, transition) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        assert_eq!(clean, "Hello ");
+        assert_eq!(reasoning, None);
+        assert_eq!(transition, TagTransition::OpeningTag("think".to_string()));
+        assert!(inside_reasoning);
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_clean_text_after_reasoning() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // First open the reasoning tag
+        let (clean, _, _) = ResponseServiceImpl::process_reasoning_tags(
+            "<think>reasoning",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+        assert_eq!(clean, "");
+        assert!(inside_reasoning);
+
+        // Then close it and add clean text after
+        let (clean, _, transition) = ResponseServiceImpl::process_reasoning_tags(
+            "</think> world",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        assert_eq!(clean, " world");
+        assert_eq!(transition, TagTransition::ClosingTag("think".to_string()));
+        assert!(!inside_reasoning);
     }
 }

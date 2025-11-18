@@ -374,6 +374,7 @@ impl From<ApiConfig> for DomainConfig {
 /// S3 configuration for file storage
 #[derive(Debug, Clone)]
 pub struct S3Config {
+    pub mock: bool,
     pub bucket: String,
     pub region: String,
     pub encryption_key: String,
@@ -382,6 +383,12 @@ pub struct S3Config {
 impl S3Config {
     /// Load from environment variables
     pub fn from_env() -> Result<Self, String> {
+        // Check if mock mode is enabled
+        let mock = env::var("S3_MOCK")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+
         // Encryption key is read from a file: S3_ENCRYPTION_KEY_FILE.
         // This file would be mounted as a secret in production deployments.
         let encryption_key = if let Ok(path) = env::var("S3_ENCRYPTION_KEY_FILE") {
@@ -401,6 +408,7 @@ impl S3Config {
         }
 
         Ok(Self {
+            mock,
             bucket: env::var("AWS_S3_BUCKET").map_err(|_| "AWS_S3_BUCKET not set".to_string())?,
             region: env::var("AWS_S3_REGION").map_err(|_| "AWS_S3_REGION not set".to_string())?,
             encryption_key,

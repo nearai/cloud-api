@@ -291,16 +291,6 @@ pub async fn init_domain_services(
     let web_search_provider =
         Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
 
-    let response_service = Arc::new(services::ResponseService::new(
-        response_repo,
-        response_items_repo.clone(),
-        inference_provider_pool.clone(),
-        conversation_service.clone(),
-        completion_service.clone(),
-        Some(web_search_provider), // web_search_provider
-        None,                      // file_search_provider
-    ));
-
     // Create session repository for user service
     let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
         as Arc<dyn services::auth::SessionRepository>;
@@ -309,14 +299,23 @@ pub async fn init_domain_services(
     let user_service = Arc::new(services::user::UserService::new(user_repo, session_repo))
         as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
 
-    // Create S3 storage and file service
-    let s3_config = aws_config::load_from_env().await;
-    let s3_client = aws_sdk_s3::Client::new(&s3_config);
-    let s3_storage = Arc::new(services::files::storage::S3Storage::new(
-        s3_client,
-        config.s3.bucket.clone(),
-        config.s3.encryption_key.clone(),
-    )) as Arc<dyn services::files::storage::StorageTrait>;
+    // Create S3 storage and file service (must be created before response service)
+    let s3_storage: Arc<dyn services::files::storage::StorageTrait> = if config.s3.mock {
+        tracing::info!("Using mock S3 storage for file uploads");
+        Arc::new(services::files::storage::MockStorage::new(
+            config.s3.encryption_key.clone(),
+        ))
+    } else {
+        tracing::info!("Using real S3 storage for file uploads");
+        let s3_config = aws_config::load_from_env().await;
+        let s3_client = aws_sdk_s3::Client::new(&s3_config);
+
+        Arc::new(services::files::storage::S3Storage::new(
+            s3_client,
+            config.s3.bucket.clone(),
+            config.s3.encryption_key.clone(),
+        ))
+    };
 
     let file_repository = Arc::new(database::repositories::FileRepository::new(
         database.pool().clone(),
@@ -326,6 +325,17 @@ pub async fn init_domain_services(
         file_repository,
         s3_storage,
     )) as Arc<dyn services::files::FileServiceTrait + Send + Sync>;
+
+    let response_service = Arc::new(services::ResponseService::new(
+        response_repo,
+        response_items_repo.clone(),
+        inference_provider_pool.clone(),
+        conversation_service.clone(),
+        completion_service.clone(),
+        Some(web_search_provider), // web_search_provider
+        None,                      // file_search_provider
+        files_service.clone(),     // file_service
+    ));
 
     DomainServices {
         conversation_service,
@@ -439,6 +449,7 @@ pub fn build_app_with_config(
 
     let response_routes = build_response_routes(
         domain_services.response_service,
+        domain_services.attestation_service.clone(),
         &auth_components.auth_state_middleware,
     );
 
@@ -586,8 +597,14 @@ pub fn build_completion_routes(
 /// Build response routes with auth
 pub fn build_response_routes(
     response_service: Arc<services::ResponseService>,
+    attestation_service: Arc<dyn services::attestation::ports::AttestationServiceTrait>,
     auth_state_middleware: &AuthState,
 ) -> Router {
+    let route_state = responses::ResponseRouteState {
+        response_service: response_service.clone(),
+        attestation_service,
+    };
+
     Router::new()
         .route("/responses", post(responses::create_response))
         .route("/responses/{response_id}", get(responses::get_response))
@@ -603,7 +620,7 @@ pub fn build_response_routes(
             "/responses/{response_id}/input_items",
             get(responses::list_input_items),
         )
-        .with_state(response_service)
+        .with_state(route_state)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
@@ -815,103 +832,49 @@ pub fn build_openapi_routes() -> Router {
     )
 }
 
-/// Serve Swagger UI HTML page
+/// Serve Scalar API Documentation UI
 async fn swagger_ui_handler() -> Html<String> {
-    Html(r#"<!DOCTYPE html>
+    Html(
+        r#"<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>NEAR AI Cloud API Documentation</title>
-    <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui.css" />
     <style>
-        html {
-            box-sizing: border-box;
-            overflow: -moz-scrollbars-vertical;
-            overflow-y: scroll;
-        }
-        *, *:before, *:after {
-            box-sizing: inherit;
-        }
         body {
-            margin:0;
-            background: #fafafa;
+            margin: 0;
+            padding: 0;
         }
     </style>
 </head>
 <body>
-    <div id="swagger-ui"></div>
-    <script src="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui-bundle.js"></script>
-    <script src="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui-standalone-preset.js"></script>
-    <script>
-    window.onload = function() {
-        // Dynamically determine the server URL based on current location
-        const protocol = window.location.protocol;
-        const host = window.location.host;
-        const baseUrl = `${protocol}//${host}/v1`;
-        
-        // Fetch the OpenAPI spec and modify it to include the dynamic server
-        fetch('/api-docs/openapi.json')
-            .then(response => response.json())
-            .then(spec => {
-                // Add the current server to the spec
-                spec.servers = [{ 
-                    url: baseUrl,
-                    description: 'Current Server'
-                }];
-                
-                SwaggerUIBundle({
-                    spec: spec,
-                    dom_id: '#swagger-ui',
-                    deepLinking: true,
-                    presets: [
-                        SwaggerUIBundle.presets.apis,
-                        SwaggerUIStandalonePreset
-                    ],
-                    plugins: [
-                        SwaggerUIBundle.plugins.DownloadUrl
-                    ],
-                    layout: "StandaloneLayout",
-                    // Make authorization more prominent
-                    persistAuthorization: true,
-                    // Show auth section by default
-                    docExpansion: 'list',
-                    // Configure request interceptor for debugging
-                    requestInterceptor: function(req) {
-                        console.log('Swagger UI Request:', req);
-                        return req;
-                    }
-                });
-            })
-            .catch(error => {
-                console.error('Failed to load OpenAPI spec:', error);
-                // Fallback to URL-based loading if fetch fails
-                SwaggerUIBundle({
-                    url: '/api-docs/openapi.json',
-                    dom_id: '#swagger-ui',
-                    deepLinking: true,
-                    presets: [
-                        SwaggerUIBundle.presets.apis,
-                        SwaggerUIStandalonePreset
-                    ],
-                    plugins: [
-                        SwaggerUIBundle.plugins.DownloadUrl
-                    ],
-                    layout: "StandaloneLayout",
-                    // Make authorization more prominent
-                    persistAuthorization: true,
-                    // Show auth section by default
-                    docExpansion: 'list',
-                    // Configure request interceptor for debugging
-                    requestInterceptor: function(req) {
-                        console.log('Swagger UI Request:', req);
-                        return req;
-                    }
-                });
-            });
-    };
+    <script
+        id="api-reference"
+        type="application/json"
+        data-url="/api-docs/openapi.json">
     </script>
+    <script>
+        var configuration = {
+            theme: 'default',
+            layout: 'modern',
+            defaultHttpClient: {
+                targetKey: 'javascript',
+                clientKey: 'fetch'
+            },
+            customCss: `
+                --scalar-color-accent: #00C08B;
+                --scalar-color-1: #00C08B;
+            `,
+            searchHotKey: 'k',
+            tagsSorter: 'as-is'
+        }
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
 </body>
-</html>"#.to_string())
+</html>"#
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -946,42 +909,6 @@ mod tests {
 
         // Verify servers are not hardcoded (will be set dynamically on client)
         assert!(spec.servers.is_none() || spec.servers.as_ref().unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_swagger_ui_html_contains_required_elements() {
-        // Test that the Swagger UI HTML contains the necessary elements
-        use axum::response::Html;
-
-        // Get the HTML response
-        let html = tokio_test::block_on(swagger_ui_handler());
-        let Html(html_content) = html;
-
-        // Verify essential Swagger UI elements are present
-        assert!(
-            html_content.contains("swagger-ui"),
-            "HTML should contain swagger-ui div"
-        );
-        assert!(
-            html_content.contains("swagger-ui-bundle.js"),
-            "HTML should include Swagger UI bundle"
-        );
-        assert!(
-            html_content.contains("swagger-ui-standalone-preset.js"),
-            "HTML should include standalone preset"
-        );
-        assert!(
-            html_content.contains("/api-docs/openapi.json"),
-            "HTML should reference our OpenAPI spec URL"
-        );
-        assert!(
-            html_content.contains("NEAR AI Cloud API Documentation"),
-            "HTML should have the correct title"
-        );
-        assert!(
-            html_content.contains("SwaggerUIBundle"),
-            "HTML should initialize SwaggerUIBundle"
-        );
     }
 
     /// Example of how to set up the application for E2E testing
@@ -1030,6 +957,7 @@ mod tests {
                 mock: false,
             },
             s3: config::S3Config {
+                mock: true,
                 bucket: "test-bucket".to_string(),
                 region: "us-east-1".to_string(),
                 encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -1121,6 +1049,7 @@ mod tests {
                 mock: false,
             },
             s3: config::S3Config {
+                mock: true,
                 bucket: "test-bucket".to_string(),
                 region: "us-east-1".to_string(),
                 encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

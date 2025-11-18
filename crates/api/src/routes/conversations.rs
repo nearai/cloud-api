@@ -34,19 +34,19 @@ fn map_conversation_error_to_status(error: &ConversationError) -> StatusCode {
     }
 }
 
-/// Create a new conversation
+/// Create conversation
 ///
-/// Creates a new conversation for the authenticated user.
+/// Create a new conversation to organize chat messages.
 #[utoipa::path(
     post,
-    path = "/conversations",
+    path = "/v1/conversations",
     tag = "Conversations",
     request_body = CreateConversationRequest,
     responses(
-        (status = 201, description = "Conversation created successfully", body = ConversationObject),
-        (status = 400, description = "Bad request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
+        (status = 201, description = "Conversation created", body = ConversationObject),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -104,12 +104,12 @@ pub async fn create_conversation(
     }
 }
 
-/// Get a conversation by ID
+/// Get conversation
 ///
-/// Returns details for a specific conversation.
+/// Retrieve conversation details by ID.
 #[utoipa::path(
     get,
-    path = "/conversations/{conversation_id}",
+    path = "/v1/conversations/{conversation_id}",
     tag = "Conversations",
     params(
         ("conversation_id" = String, Path, description = "Conversation ID")
@@ -167,12 +167,12 @@ pub async fn get_conversation(
     }
 }
 
-/// Update a conversation
+/// Update conversation
 ///
-/// Updates a conversation's metadata.
+/// Update conversation metadata.
 #[utoipa::path(
     post,
-    path = "/conversations/{conversation_id}",
+    path = "/v1/conversations/{conversation_id}",
     tag = "Conversations",
     params(
         ("conversation_id" = String, Path, description = "Conversation ID")
@@ -242,12 +242,12 @@ pub async fn update_conversation(
     }
 }
 
-/// Delete a conversation
+/// Delete conversation
 ///
-/// Deletes a conversation permanently.
+/// Delete a conversation and all its messages.
 #[utoipa::path(
     delete,
-    path = "/conversations/{conversation_id}",
+    path = "/v1/conversations/{conversation_id}",
     tag = "Conversations",
     params(
         ("conversation_id" = String, Path, description = "Conversation ID")
@@ -312,12 +312,12 @@ pub async fn delete_conversation(
     }
 }
 
-/// List items in a conversation (extracts from responses)
+/// List conversation messages
 ///
-/// Returns items (messages, responses, etc.) within a specific conversation.
+/// Get all messages and responses in a conversation, sorted by creation time.
 #[utoipa::path(
     get,
-    path = "/conversations/{conversation_id}/items",
+    path = "/v1/conversations/{conversation_id}/items",
     tag = "Conversations",
     params(
         ("conversation_id" = String, Path, description = "Conversation ID"),
@@ -418,7 +418,7 @@ pub async fn list_conversation_items(
 /// Adds items to a conversation, allowing API callers to backfill conversations.
 #[utoipa::path(
     post,
-    path = "/conversations/{conversation_id}/items",
+    path = "/v1/conversations/{conversation_id}/items",
     tag = "Conversations",
     params(
         ("conversation_id" = String, Path, description = "Conversation ID"),
@@ -591,9 +591,14 @@ fn convert_input_item_to_response_item(
 
             Ok(services::responses::models::ResponseOutputItem::Message {
                 id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
+                response_id: String::new(), // Will be enriched by repository
+                previous_response_id: None, // Will be enriched by repository
+                next_response_ids: vec![],  // Will be enriched by repository
+                created_at: 0,              // Will be enriched by repository
                 status: services::responses::models::ResponseItemStatus::Completed,
                 role,
                 content: response_content,
+                model: String::new(), // Will be enriched by repository
             })
         }
     }
@@ -607,9 +612,14 @@ fn convert_output_item_to_conversation_item(
     match item {
         ResponseOutputItem::Message {
             id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
             status,
             role,
             content,
+            model,
         } => {
             // Convert ResponseOutputContent to ConversationContentPart
             // For user messages, use input_text; for assistant/system, use output_text
@@ -645,47 +655,84 @@ fn convert_output_item_to_conversation_item(
 
             ConversationItem::Message {
                 id,
+                response_id,
+                previous_response_id,
+                next_response_ids,
+                created_at,
                 status: convert_response_item_status(status),
                 role,
                 content: conv_content,
                 metadata: None,
+                model,
             }
         }
         ResponseOutputItem::ToolCall {
             id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
             status,
             tool_type,
             function,
+            model,
         } => ConversationItem::ToolCall {
             id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
             status: convert_response_item_status(status),
             tool_type,
             function: ConversationItemFunction {
                 name: function.name,
                 arguments: function.arguments,
             },
+            model,
         },
-        ResponseOutputItem::WebSearchCall { id, status, action } => {
-            ConversationItem::WebSearchCall {
-                id,
-                status: convert_response_item_status(status),
-                action: match action {
-                    services::responses::models::WebSearchAction::Search { query } => {
-                        ConversationItemWebSearchAction::Search { query }
-                    }
-                },
-            }
-        }
+        ResponseOutputItem::WebSearchCall {
+            id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
+            status,
+            action,
+            model,
+        } => ConversationItem::WebSearchCall {
+            id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
+            status: convert_response_item_status(status),
+            action: match action {
+                services::responses::models::WebSearchAction::Search { query } => {
+                    ConversationItemWebSearchAction::Search { query }
+                }
+            },
+            model,
+        },
         ResponseOutputItem::Reasoning {
             id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
             status,
             summary,
             content,
+            model,
         } => ConversationItem::Reasoning {
             id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
             status: convert_response_item_status(status),
             summary,
             content,
+            model,
         },
     }
 }

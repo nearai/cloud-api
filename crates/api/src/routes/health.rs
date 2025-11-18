@@ -12,17 +12,16 @@ pub struct HealthResponse {
     pub version: Option<String>,
 }
 
-/// Health check endpoint
+/// Health check
 ///
-/// Returns the health status of the service.
-/// This endpoint requires no authentication and is useful for monitoring and load balancers.
+/// Check service health status. No authentication required.
 #[utoipa::path(
     get,
     path = "/v1/health",
     responses(
         (status = 200, description = "Service is healthy", body = HealthResponse),
     ),
-    tag = "health"
+    tag = "Health"
 )]
 pub async fn health_check() -> (StatusCode, ResponseJson<HealthResponse>) {
     (

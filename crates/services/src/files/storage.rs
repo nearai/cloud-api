@@ -96,7 +96,7 @@ impl StorageTrait for S3Storage {
             .await
             .map_err(|e| {
                 error!("Failed to download file from S3: {}", e);
-                FileServiceError::StorageError(format!("Failed to download file: {e}"))
+                FileServiceError::StorageError(format!("Failed to download file: {e:?}"))
             })?;
 
         let encrypted_data = response

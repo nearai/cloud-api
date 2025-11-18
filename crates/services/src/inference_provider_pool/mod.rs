@@ -206,12 +206,51 @@ impl InferenceProviderPool {
                 );
 
                 let provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
-                    url,
+                    url.clone(),
                     self.api_key.clone(),
                     Some(self.inference_timeout_secs),
                 ))) as Arc<InferenceProviderTrait>;
 
-                providers_for_model.push(provider);
+                match provider
+                    .get_attestation_report(
+                        model_name.clone(),
+                        Some("ecdsa".to_string()),
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(report) => {
+                        // Check if the response contains an error field
+                        if report.contains_key("error") {
+                            let error_msg = report
+                                .get("error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown error");
+                            tracing::warn!(
+                                model = %model_name,
+                                url = %url,
+                                error = %error_msg,
+                                "Provider returned attestation report with error field, excluding from pool"
+                            );
+                        } else {
+                            tracing::debug!(
+                                model = %model_name,
+                                url = %url,
+                                "Provider successfully returned attestation report, including in pool"
+                            );
+                            providers_for_model.push(provider);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            model = %model_name,
+                            url = %url,
+                            error = %e,
+                            "Provider failed to return attestation report, excluding from pool"
+                        );
+                    }
+                }
             }
 
             model_mapping.insert(model_name.clone(), providers_for_model);
@@ -473,9 +512,22 @@ impl InferenceProviderPool {
                     .await
                 {
                     Ok(mut attestation) => {
-                        // Remove 'all_attestations' field if present
-                        attestation.remove("all_attestations");
-                        model_attestations.push(attestation);
+                        // Check if the response contains an error field
+                        if attestation.contains_key("error") {
+                            let error_msg = attestation
+                                .get("error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown error");
+                            tracing::debug!(
+                                model = %model,
+                                error = %error_msg,
+                                "Provider returned attestation report with error field, skipping"
+                            );
+                        } else {
+                            // Remove 'all_attestations' field if present
+                            attestation.remove("all_attestations");
+                            model_attestations.push(attestation);
+                        }
                     }
                     Err(e) => {
                         // Log and continue to next provider (404 is expected when

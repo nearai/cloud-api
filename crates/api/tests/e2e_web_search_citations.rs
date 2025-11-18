@@ -213,9 +213,9 @@ async fn test_non_streaming_web_search_with_citations() {
         .expect("Annotations should be present");
 
     println!("\n=== Non-Streaming Response ===");
-    println!("Text length: {len} characters", len = text.len());
+    println!("Text length: {} characters", text.len());
     let truncated_text = text.chars().take(300).collect::<String>();
-    println!("Text (first 300 chars): {txt}", txt = truncated_text);
+    println!("Text (first 300 chars): {truncated_text}");
 
     println!("Annotations found: {count}", count = annotations.len());
 
@@ -367,9 +367,9 @@ async fn test_streaming_web_search_with_citations() {
         .expect("Annotations should be present");
 
     println!("\n=== Streaming Response ===");
-    println!("Text length: {len} characters", len = text.len());
+    println!("Text length: {} characters", text.len());
     let truncated_text = text.chars().take(300).collect::<String>();
-    println!("Text (first 300 chars): {txt}", txt = truncated_text);
+    println!("Text (first 300 chars): {truncated_text}");
 
     println!(
         "Annotations found in streaming: {count}",

@@ -385,7 +385,7 @@ pub async fn create_access_token(
     Extension((session, user)): Extension<(services::auth::Session, AuthenticatedUser)>,
 ) -> Result<Json<crate::models::AccessAndRefreshTokenResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!(
-        "Creating access token & refresh token for user: {}",
+        "Creating access token & rotating refresh token for user: {}",
         user.0.id
     );
 
@@ -403,19 +403,19 @@ pub async fn create_access_token(
         .await;
 
     match result {
-        Ok((access_token, _refresh_session, refresh_token)) => {
+        Ok((access_token, refresh_session, refresh_token)) => {
             Ok(Json(crate::models::AccessAndRefreshTokenResponse {
                 access_token,
                 refresh_token,
-                refresh_token_expiration: _refresh_session.expires_at,
+                refresh_token_expiration: refresh_session.expires_at,
             }))
         }
         Err(_) => {
-            error!("Failed to create access token and refresh token");
+            error!("Failed to create access token and rotate refresh token");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
-                    "Failed to create session (access + refresh)".to_string(),
+                    "Failed to create access token and rotate refresh token".to_string(),
                     "internal_server_error".to_string(),
                 )),
             ))

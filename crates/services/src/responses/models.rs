@@ -431,7 +431,9 @@ pub struct SourceRegistry {
 
 impl SourceRegistry {
     pub fn with_results(results: Vec<crate::responses::tools::WebSearchResult>) -> Self {
-        Self { web_sources: results }
+        Self {
+            web_sources: results,
+        }
     }
 }
 

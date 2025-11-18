@@ -802,7 +802,8 @@ impl ResponseServiceImpl {
             };
 
             // Get completion stream
-            let mut completion_stream = process_context.completion_service
+            let mut completion_stream = process_context
+                .completion_service
                 .create_chat_completion_stream(completion_request)
                 .await
                 .map_err(|e| {
@@ -885,12 +886,7 @@ impl ResponseServiceImpl {
         }
 
         // Execute the tool and catch errors to provide feedback to the LLM
-        let tool_result = match Self::execute_tool(
-            tool_call,
-            process_context,
-        )
-        .await
-        {
+        let tool_result = match Self::execute_tool(tool_call, process_context).await {
             Ok(result) => result,
             Err(e) => {
                 // Convert tool execution errors into error messages for the LLM
@@ -1831,10 +1827,11 @@ impl ResponseServiceImpl {
                     let results = provider.search(search_params).await.map_err(|e| {
                         errors::ResponseError::InternalError(format!("Web search failed: {e}"))
                     })?;
-                    
+
                     // Store web search results in registry for citation resolution
-                    context.source_registry = Some(models::SourceRegistry::with_results(results.clone()));
-                    
+                    context.source_registry =
+                        Some(models::SourceRegistry::with_results(results.clone()));
+
                     let formatted = results
                         .iter()
                         .enumerate()

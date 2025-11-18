@@ -63,7 +63,8 @@ fn verify_citation_validity(annotation: &serde_json::Value, text: &str, citation
     );
 
     // Extract cited text (convert character indices to actual characters, handling UTF-8 properly)
-    let cited_text: String = text.chars()
+    let cited_text: String = text
+        .chars()
         .skip(start_index)
         .take(end_index - start_index)
         .collect();
@@ -217,16 +218,16 @@ async fn test_non_streaming_web_search_with_citations() {
     println!("Text (first 300 chars): {}", &text[..text.len().min(300)]);
 
     println!("Annotations found: {}", annotations.len());
-    
+
     // CRITICAL: Web search with citations MUST produce citations
     assert!(
         !annotations.is_empty(),
         "Web search response should include at least one citation with URL. Got {} citations",
         annotations.len()
     );
-    
+
     println!("✓ Found {} citations in response", annotations.len());
-    
+
     // Verify each citation has correct structure and valid indices
     for (idx, annotation) in annotations.iter().enumerate() {
         verify_citation_validity(annotation, text, idx);
@@ -265,7 +266,10 @@ async fn test_non_streaming_web_search_with_citations() {
         );
     }
 
-    println!("\n✅ Non-streaming test PASSED with {} citations verified", annotations.len());
+    println!(
+        "\n✅ Non-streaming test PASSED with {} citations verified",
+        annotations.len()
+    );
 }
 
 #[tokio::test]
@@ -371,14 +375,14 @@ async fn test_streaming_web_search_with_citations() {
     println!("Text (first 300 chars): {}", &text[..text.len().min(300)]);
 
     println!("Annotations found in streaming: {}", annotations.len());
-    
+
     // CRITICAL: Web search with citations MUST produce citations
     assert!(
         !annotations.is_empty(),
         "Streaming web search response should include at least one citation with URL. Got {} citations",
         annotations.len()
     );
-    
+
     println!(
         "✓ Found {} citations in streaming response",
         annotations.len()
@@ -421,5 +425,8 @@ async fn test_streaming_web_search_with_citations() {
         );
     }
 
-    println!("\n✅ Streaming citation test PASSED with {} citations verified", annotations.len());
+    println!(
+        "\n✅ Streaming citation test PASSED with {} citations verified",
+        annotations.len()
+    );
 }

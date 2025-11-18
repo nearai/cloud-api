@@ -1,5 +1,5 @@
 //! Citation tracking with state machine for parsing [s:N] tags during LLM streaming
-//! 
+//!
 //! This module handles parsing source citations from LLM responses using a state machine
 //! that properly handles tags split across tokens. The tracker processes tokens incrementally,
 //! removing tags and emitting clean text while tracking citation positions in real-time.
@@ -9,31 +9,31 @@
 enum TagState {
     /// No tag in progress, accumulating normal text
     Idle,
-    
+
     /// Saw '[', waiting for 's' or '/'
     PartialOpen,
-    
+
     /// Saw '[s', waiting for ':'
     PartialOpenTag,
-    
+
     /// Saw '[s:', accumulating digits (waiting for ] or more digits)
     PartialOpenTagColon,
-    
+
     /// Saw '[s:N+', waiting for ']'
     OpenTagDigit,
-    
+
     /// Saw '[/', waiting for 's'
     PartialCloseTag,
-    
+
     /// Saw '[/s', waiting for ':'
     PartialCloseTagS,
-    
+
     /// Saw '[/s:', accumulating digits (waiting for ] or more digits)
     PartialCloseTagColon,
-    
+
     /// Saw '[/s:N+', waiting for ']'
     CloseTagDigit,
-    
+
     /// Inside a citation [s:N]...[/s:N]
     InsideTag { source_id: usize },
 }
@@ -56,29 +56,29 @@ pub struct Citation {
 }
 
 /// Citation tracker using state machine for robust tag parsing
-/// 
+///
 /// Processes tokens incrementally, removing citation tags and tracking positions in real-time.
 /// When a citation closes, it's immediately added to completed_citations with correct indices.
 #[derive(Debug, Clone)]
 pub struct CitationTracker {
     /// Clean accumulated text (tags removed)
     clean_text: String,
-    
+
     /// Current parsing state
     current_state: TagState,
-    
+
     /// Buffer for incomplete tokens (may contain partial tags)
     token_buffer: String,
-    
+
     /// Current character position in clean_text (incremented when clean chars added)
     clean_position: usize,
-    
+
     /// Active citation being accumulated
     active_citation: Option<ActiveCitation>,
-    
+
     /// Completed citations with correct indices (populated when citations close)
     completed_citations: Vec<Citation>,
-    
+
     /// Previous state (for context when recovering from failed tags)
     previous_state: Option<TagState>,
 }
@@ -118,7 +118,7 @@ impl CitationTracker {
                     self.token_buffer.push(ch);
                     self.previous_state = Some(TagState::Idle);
                     self.current_state = TagState::PartialOpen;
-                    None  // Don't output yet, wait for next char
+                    None // Don't output yet, wait for next char
                 } else {
                     // Regular character - add to clean_text and output
                     self.clean_text.push(ch);
@@ -135,12 +135,12 @@ impl CitationTracker {
                     self.token_buffer.push(ch);
                     // Might be [s:N]
                     self.current_state = TagState::PartialOpenTag;
-                    None  // Still buffering
+                    None // Still buffering
                 } else if ch == '/' {
                     self.token_buffer.push(ch);
                     // Might be [/s:N]
                     self.current_state = TagState::PartialCloseTag;
-                    None  // Still buffering
+                    None // Still buffering
                 } else {
                     // Not a tag, flush buffer as literal text
                     self.token_buffer.push(ch);
@@ -152,7 +152,7 @@ impl CitationTracker {
                 self.token_buffer.push(ch);
                 if ch == ':' {
                     self.current_state = TagState::PartialOpenTagColon;
-                    None  // Still buffering
+                    None // Still buffering
                 } else {
                     // Invalid tag, flush as literal
                     self.flush_token_buffer_and_restore_state()
@@ -176,21 +176,25 @@ impl CitationTracker {
                 if ch == ']' {
                     // Complete opening tag [s:N+]
                     // Extract digits from token_buffer: "[s:" + digits + "]"
-                    let digits_part = &self.token_buffer[3..self.token_buffer.len()-1];
+                    let digits_part = &self.token_buffer[3..self.token_buffer.len() - 1];
                     if let Ok(source_id) = digits_part.parse::<usize>() {
-                        tracing::debug!("CitationTracker: Citation tag opened [s:{}] at clean_position={}", source_id, self.clean_position);
+                        tracing::debug!(
+                            "CitationTracker: Citation tag opened [s:{}] at clean_position={}",
+                            source_id,
+                            self.clean_position
+                        );
                         self.current_state = TagState::InsideTag { source_id };
-                        
+
                         // Start new citation at current clean_position
                         self.active_citation = Some(ActiveCitation {
                             source_id,
                             start_index: self.clean_position,
                             accumulated_content: String::new(),
                         });
-                        
+
                         self.token_buffer.clear();
                         self.previous_state = None;
-                        None  // Tag consumed, don't output
+                        None // Tag consumed, don't output
                     } else {
                         // Failed to parse source_id, flush as literal
                         self.flush_token_buffer_and_restore_state()
@@ -246,7 +250,7 @@ impl CitationTracker {
                 if ch == ']' {
                     // Complete closing tag [/s:N+]
                     // Extract digits from token_buffer: "[/s:" + digits + "]"
-                    let digits_part = &self.token_buffer[4..self.token_buffer.len()-1];
+                    let digits_part = &self.token_buffer[4..self.token_buffer.len() - 1];
                     if let Ok(source_id) = digits_part.parse::<usize>() {
                         // Citation is closing - finalize it immediately with correct indices
                         if let Some(active) = self.active_citation.take() {
@@ -260,11 +264,11 @@ impl CitationTracker {
                                 });
                             }
                         }
-                        
+
                         self.current_state = TagState::Idle;
                         self.token_buffer.clear();
                         self.previous_state = None;
-                        None  // Tag consumed, don't output
+                        None // Tag consumed, don't output
                     } else {
                         // Failed to parse source_id, flush as literal
                         self.flush_token_buffer_and_restore_state()
@@ -284,7 +288,7 @@ impl CitationTracker {
                     self.token_buffer.push(ch);
                     self.previous_state = Some(TagState::InsideTag { source_id });
                     self.current_state = TagState::PartialOpen;
-                    None  // Wait for next char before outputting
+                    None // Wait for next char before outputting
                 } else {
                     // Regular character inside citation - output and track
                     self.clean_text.push(ch);
@@ -311,17 +315,18 @@ impl CitationTracker {
         }
         self.token_buffer.clear();
         self.current_state = self.previous_state.take().unwrap_or(TagState::Idle);
-        last_char  // Return the last character from the flushed buffer
+        last_char // Return the last character from the flushed buffer
     }
-
-
 
     /// Finalize tracking and return clean text with citations
     /// Any incomplete tags at the end are treated as literal text
     pub fn finalize(mut self) -> (String, Vec<Citation>) {
         // If there's pending token_buffer (incomplete tag at end), treat as literal
         if !self.token_buffer.is_empty() {
-            tracing::debug!("CitationTracker: Flushing incomplete token_buffer at finalize: '{}'", self.token_buffer);
+            tracing::debug!(
+                "CitationTracker: Flushing incomplete token_buffer at finalize: '{}'",
+                self.token_buffer
+            );
             for ch in self.token_buffer.chars() {
                 self.clean_text.push(ch);
                 if let Some(ref mut active) = self.active_citation {
@@ -330,9 +335,18 @@ impl CitationTracker {
             }
         }
 
-        tracing::debug!("CitationTracker: Finalizing with {} completed citations", self.completed_citations.len());
+        tracing::debug!(
+            "CitationTracker: Finalizing with {} completed citations",
+            self.completed_citations.len()
+        );
         for (idx, citation) in self.completed_citations.iter().enumerate() {
-            tracing::debug!("CitationTracker: Citation {}: source_id={}, indices=[{}, {}]", idx, citation.source_id, citation.start_index, citation.end_index);
+            tracing::debug!(
+                "CitationTracker: Citation {}: source_id={}, indices=[{}, {}]",
+                idx,
+                citation.source_id,
+                citation.start_index,
+                citation.end_index
+            );
         }
 
         // Return clean text and citations (already have correct indices from real-time tracking)
@@ -354,9 +368,9 @@ mod tests {
 
         // Verify incremental output removes tags immediately
         assert_eq!(out1, "Hello ");
-        assert_eq!(out2, "");  // Opening tag is consumed
+        assert_eq!(out2, ""); // Opening tag is consumed
         assert_eq!(out3, "world");
-        assert_eq!(out4, "");  // Closing tag is consumed
+        assert_eq!(out4, ""); // Closing tag is consumed
 
         let (clean, citations) = tracker.finalize();
         assert_eq!(clean, "Hello world");
@@ -370,17 +384,17 @@ mod tests {
     fn test_split_tag_across_tokens() {
         let mut tracker = CitationTracker::new();
         let out1 = tracker.add_token("Hello ");
-        let out2 = tracker.add_token("[s");      // Split: only "["
-        let out3 = tracker.add_token(":0]");     // Split: ":0]"
+        let out2 = tracker.add_token("[s"); // Split: only "["
+        let out3 = tracker.add_token(":0]"); // Split: ":0]"
         let out4 = tracker.add_token("world");
         let out5 = tracker.add_token("[/s:0]");
 
         // Verify that split tags are handled correctly
         assert_eq!(out1, "Hello ");
-        assert_eq!(out2, "");  // Buffering partial tag
-        assert_eq!(out3, "");  // Closing partial tag
+        assert_eq!(out2, ""); // Buffering partial tag
+        assert_eq!(out3, ""); // Closing partial tag
         assert_eq!(out4, "world");
-        assert_eq!(out5, "");  // Closing tag consumed
+        assert_eq!(out5, ""); // Closing tag consumed
 
         let (clean, citations) = tracker.finalize();
         assert_eq!(clean, "Hello world");
@@ -510,7 +524,7 @@ mod tests {
         assert_eq!(clean, "cited more text");
         assert_eq!(citations.len(), 1);
         assert_eq!(citations[0].start_index, 0);
-        assert_eq!(citations[0].end_index, 5);  // "cited" is at positions 0-5 (exclusive end)
+        assert_eq!(citations[0].end_index, 5); // "cited" is at positions 0-5 (exclusive end)
         assert_eq!(citations[0].cited_text, "cited");
     }
 

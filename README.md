@@ -124,6 +124,15 @@ The application uses YAML configuration files located in the `config/` directory
 4. Ensure database migrations work with test setup
 
 
+## API Documentation
+
+Interactive API documentation is available when running the server:
+
+- **Scalar UI**: `http://localhost:3000/docs` - Modern, beautiful API documentation with interactive playground
+- **OpenAPI Spec**: `http://localhost:3000/api-docs/openapi.json` - Machine-readable OpenAPI specification
+
+The documentation is generated from Rust code using [utoipa](https://github.com/juhaku/utoipa) and served via Scalar for an enhanced developer experience.
+
 ## License 
 
 Licensed under the [PolyForm Strict License 1.0.0](LICENSE).

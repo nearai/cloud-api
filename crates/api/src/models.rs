@@ -233,7 +233,7 @@ impl ChatCompletionRequest {
             if message.role.is_empty() {
                 return Err("message role is required".to_string());
             }
-            if !["system", "user", "assistant"].contains(&message.role.as_str()) {
+            if !["system", "user", "assistant", "tool"].contains(&message.role.as_str()) {
                 return Err(format!("invalid message role: {}", message.role));
             }
 
@@ -808,6 +808,7 @@ pub enum ConversationItem {
         content: Vec<ConversationContentPart>,
         #[serde(skip_serializing_if = "Option::is_none")]
         metadata: Option<serde_json::Value>,
+        model: String,
     },
     #[serde(rename = "tool_call")]
     ToolCall {
@@ -821,6 +822,7 @@ pub enum ConversationItem {
         status: ResponseItemStatus,
         tool_type: String,
         function: ConversationItemFunction,
+        model: String,
     },
     #[serde(rename = "web_search_call")]
     WebSearchCall {
@@ -833,6 +835,7 @@ pub enum ConversationItem {
         created_at: i64,
         status: ResponseItemStatus,
         action: ConversationItemWebSearchAction,
+        model: String,
     },
     #[serde(rename = "reasoning")]
     Reasoning {
@@ -846,6 +849,7 @@ pub enum ConversationItem {
         status: ResponseItemStatus,
         summary: String,
         content: String,
+        model: String,
     },
 }
 

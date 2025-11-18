@@ -13,7 +13,7 @@ type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
 /// Discovery entry returned by the discovery layer
 #[derive(Debug, Clone, Deserialize)]
 struct DiscoveryEntry {
-    /// Model identifier (e.g., "deepseek-ai/DeepSeek-V3.1")
+    /// Model identifier (e.g., "Qwen/Qwen3-30B-A3B-Instruct-2507")
     model: String,
     /// Tags for filtering/routing (e.g., ["prod", "dev"])
     #[serde(default)]
@@ -458,7 +458,7 @@ impl InferenceProviderPool {
         signing_address: Option<String>,
     ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, CompletionError> {
         // Get all providers for this model
-        let mut all_attestations = vec![];
+        let mut model_attestations = vec![];
 
         if let Some(providers) = self.get_providers_for_model(&model).await {
             // Broadcast to all providers
@@ -475,7 +475,7 @@ impl InferenceProviderPool {
                     Ok(mut attestation) => {
                         // Remove 'all_attestations' field if present
                         attestation.remove("all_attestations");
-                        all_attestations.push(attestation);
+                        model_attestations.push(attestation);
                     }
                     Err(e) => {
                         // Log and continue to next provider (404 is expected when
@@ -490,13 +490,13 @@ impl InferenceProviderPool {
             }
         }
 
-        if all_attestations.is_empty() {
+        if model_attestations.is_empty() {
             return Err(CompletionError::CompletionError(format!(
                 "No provider found that supports attestation reports for model: {model}"
             )));
         }
 
-        Ok(all_attestations)
+        Ok(model_attestations)
     }
 
     pub async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
@@ -636,7 +636,7 @@ mod tests {
         assert!(sanitized.contains("[URL_REDACTED]"));
 
         // Test complex error message (like the one from the screenshot)
-        let error = "Failed to perform completion: All 2 provider(s) failed for model 'deepseek-ai/DeepSeek-V3.1' during chat_completion: Provider 1: Failed to perform completion: error sending request for url (http://192.168.0.1:8000/v1/chat/completions): Provider 2: Failed to perform completion: HTTP 401 Unauthorized";
+        let error = "Failed to perform completion: All 2 provider(s) failed for model 'Qwen/Qwen3-30B-A3B-Instruct-2507' during chat_completion: Provider 1: Failed to perform completion: error sending request for url (http://192.168.0.1:8000/v1/chat/completions): Provider 2: Failed to perform completion: HTTP 401 Unauthorized";
         let sanitized = InferenceProviderPool::sanitize_error_message(error);
         assert!(!sanitized.contains("http://"));
         assert!(!sanitized.contains("192.168.0.1"));
@@ -646,7 +646,7 @@ mod tests {
         assert!(sanitized.contains("provider connection failed"));
 
         // Model name should still be present
-        assert!(sanitized.contains("deepseek-ai/DeepSeek-V3.1"));
+        assert!(sanitized.contains("Qwen/Qwen3-30B-A3B-Instruct-2507"));
 
         // HTTP status should still be present (not sensitive)
         assert!(sanitized.contains("401 Unauthorized"));

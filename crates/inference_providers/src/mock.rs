@@ -25,7 +25,7 @@ impl MockProvider {
     /// Create a new mock provider with default models
     pub fn new() -> Self {
         let models = vec![ModelInfo {
-            id: "deepseek-ai/DeepSeek-V3.1".to_string(),
+            id: "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
             object: "model".to_string(),
             created: 1762544256,
             owned_by: "vllm".to_string(),

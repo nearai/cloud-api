@@ -17,19 +17,30 @@ use utoipa::{Modify, OpenApi};
             name = "MIT",
         )
     ),
+    tags(
+        (name = "Chat", description = "Chat completion endpoints for AI model inference"),
+        (name = "Models", description = "Public model catalog and information"),
+        (name = "Conversations", description = "Conversation management"),
+        (name = "Responses", description = "Response handling and streaming"),
+        (name = "Organizations", description = "Organization management"),
+        (name = "Organization Members", description = "Organization member and invitation management"),
+        (name = "Workspaces", description = "Workspace and API key management"),
+        (name = "Files", description = "File upload and management"),
+        (name = "Users", description = "User profile and token management"),
+        (name = "Invitations", description = "Token-based invitation handling"),
+        (name = "Usage", description = "Usage tracking and billing information"),
+        (name = "Health", description = "Health check endpoints"),
+        (name = "Attestation", description = "Attestation and verification endpoints"),
+        (name = "Admin", description = "Administrative endpoints (admin access required)"),
+    ),
     paths(
-        // Health check endpoint
-        crate::routes::health::health_check,
-        // Chat completion endpoints
+        // Chat completion endpoints (most important for users)
         crate::routes::completions::chat_completions,
         // crate::routes::completions::completions,
         crate::routes::completions::models,
-        // Organization endpoints  
-        crate::routes::organizations::list_organizations,
-        crate::routes::organizations::create_organization,
-        crate::routes::organizations::get_organization,
-        crate::routes::organizations::update_organization,
-        crate::routes::organizations::delete_organization,
+        // Model endpoints (public model catalog)
+        crate::routes::models::list_models,
+        crate::routes::models::get_model_by_name,
         // Conversation endpoints
         crate::routes::conversations::create_conversation,
         crate::routes::conversations::get_conversation,
@@ -41,24 +52,25 @@ use utoipa::{Modify, OpenApi};
         crate::routes::conversations::unarchive_conversation,
         crate::routes::conversations::clone_conversation,
         crate::routes::conversations::list_conversation_items,
+        crate::routes::conversations::create_conversation_items,
         // Response endpoints
         crate::routes::responses::create_response,
-        // Attestation endpoints  
-        crate::routes::attestation::get_signature,
-        crate::routes::attestation::get_attestation_report,
-        // Model endpoints
-        crate::routes::models::list_models,
-        crate::routes::models::get_model_by_name,
-        // Admin endpoints
-        crate::routes::admin::batch_upsert_models,
-        crate::routes::admin::delete_model,
-        crate::routes::admin::get_model_history,
-        crate::routes::admin::update_organization_limits,
-        crate::routes::admin::get_organization_limits_history,
-        crate::routes::admin::list_users,
-        crate::routes::admin::create_admin_access_token,
-        crate::routes::admin::list_admin_access_tokens,
-        crate::routes::admin::delete_admin_access_token,
+        crate::routes::responses::get_response,
+        crate::routes::responses::delete_response,
+        crate::routes::responses::cancel_response,
+        crate::routes::responses::list_input_items,
+        // Organization endpoints
+        crate::routes::organizations::list_organizations,
+        crate::routes::organizations::create_organization,
+        crate::routes::organizations::get_organization,
+        crate::routes::organizations::update_organization,
+        crate::routes::organizations::delete_organization,
+        // Organization Members endpoints
+        crate::routes::organization_members::add_organization_member,
+        crate::routes::organization_members::invite_organization_member_by_email,
+        crate::routes::organization_members::update_organization_member,
+        crate::routes::organization_members::remove_organization_member,
+        crate::routes::organization_members::list_organization_members,
         // Workspace endpoints
         crate::routes::workspaces::create_workspace,
         crate::routes::workspaces::list_organization_workspaces,
@@ -70,12 +82,12 @@ use utoipa::{Modify, OpenApi};
         crate::routes::workspaces::revoke_workspace_api_key,
         crate::routes::workspaces::update_api_key_spend_limit,
         crate::routes::workspaces::update_workspace_api_key,
-        // Organization Members endpoints
-        crate::routes::organization_members::add_organization_member,
-        crate::routes::organization_members::invite_organization_member_by_email,
-        crate::routes::organization_members::update_organization_member,
-        crate::routes::organization_members::remove_organization_member,
-        crate::routes::organization_members::list_organization_members,
+        // Files endpoints
+        crate::routes::files::upload_file,
+        crate::routes::files::list_files,
+        crate::routes::files::get_file,
+        crate::routes::files::delete_file,
+        crate::routes::files::get_file_content,
         // Users endpoints
         crate::routes::users::get_current_user,
         crate::routes::users::update_current_user_profile,
@@ -93,12 +105,21 @@ use utoipa::{Modify, OpenApi};
         crate::routes::usage::get_organization_balance,
         crate::routes::usage::get_organization_usage_history,
         crate::routes::usage::get_api_key_usage_history,
-        // Files endpoints
-        crate::routes::files::upload_file,
-        crate::routes::files::list_files,
-        crate::routes::files::get_file,
-        crate::routes::files::delete_file,
-        crate::routes::files::get_file_content,
+        // Admin endpoints (less frequently used)
+        crate::routes::admin::batch_upsert_models,
+        crate::routes::admin::delete_model,
+        crate::routes::admin::get_model_history,
+        crate::routes::admin::update_organization_limits,
+        crate::routes::admin::get_organization_limits_history,
+        crate::routes::admin::list_users,
+        crate::routes::admin::create_admin_access_token,
+        crate::routes::admin::list_admin_access_tokens,
+        crate::routes::admin::delete_admin_access_token,
+        // Health check endpoint
+        crate::routes::health::health_check,
+        // Attestation endpoints
+        crate::routes::attestation::get_signature,
+        crate::routes::attestation::get_attestation_report,
     ),
     components(
         schemas(

@@ -844,103 +844,49 @@ pub fn build_openapi_routes() -> Router {
     )
 }
 
-/// Serve Swagger UI HTML page
+/// Serve Scalar API Documentation UI
 async fn swagger_ui_handler() -> Html<String> {
-    Html(r#"<!DOCTYPE html>
+    Html(
+        r#"<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>NEAR AI Cloud API Documentation</title>
-    <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui.css" />
     <style>
-        html {
-            box-sizing: border-box;
-            overflow: -moz-scrollbars-vertical;
-            overflow-y: scroll;
-        }
-        *, *:before, *:after {
-            box-sizing: inherit;
-        }
         body {
-            margin:0;
-            background: #fafafa;
+            margin: 0;
+            padding: 0;
         }
     </style>
 </head>
 <body>
-    <div id="swagger-ui"></div>
-    <script src="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui-bundle.js"></script>
-    <script src="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui-standalone-preset.js"></script>
-    <script>
-    window.onload = function() {
-        // Dynamically determine the server URL based on current location
-        const protocol = window.location.protocol;
-        const host = window.location.host;
-        const baseUrl = `${protocol}//${host}/v1`;
-        
-        // Fetch the OpenAPI spec and modify it to include the dynamic server
-        fetch('/api-docs/openapi.json')
-            .then(response => response.json())
-            .then(spec => {
-                // Add the current server to the spec
-                spec.servers = [{ 
-                    url: baseUrl,
-                    description: 'Current Server'
-                }];
-                
-                SwaggerUIBundle({
-                    spec: spec,
-                    dom_id: '#swagger-ui',
-                    deepLinking: true,
-                    presets: [
-                        SwaggerUIBundle.presets.apis,
-                        SwaggerUIStandalonePreset
-                    ],
-                    plugins: [
-                        SwaggerUIBundle.plugins.DownloadUrl
-                    ],
-                    layout: "StandaloneLayout",
-                    // Make authorization more prominent
-                    persistAuthorization: true,
-                    // Show auth section by default
-                    docExpansion: 'list',
-                    // Configure request interceptor for debugging
-                    requestInterceptor: function(req) {
-                        console.log('Swagger UI Request:', req);
-                        return req;
-                    }
-                });
-            })
-            .catch(error => {
-                console.error('Failed to load OpenAPI spec:', error);
-                // Fallback to URL-based loading if fetch fails
-                SwaggerUIBundle({
-                    url: '/api-docs/openapi.json',
-                    dom_id: '#swagger-ui',
-                    deepLinking: true,
-                    presets: [
-                        SwaggerUIBundle.presets.apis,
-                        SwaggerUIStandalonePreset
-                    ],
-                    plugins: [
-                        SwaggerUIBundle.plugins.DownloadUrl
-                    ],
-                    layout: "StandaloneLayout",
-                    // Make authorization more prominent
-                    persistAuthorization: true,
-                    // Show auth section by default
-                    docExpansion: 'list',
-                    // Configure request interceptor for debugging
-                    requestInterceptor: function(req) {
-                        console.log('Swagger UI Request:', req);
-                        return req;
-                    }
-                });
-            });
-    };
+    <script
+        id="api-reference"
+        type="application/json"
+        data-url="/api-docs/openapi.json">
     </script>
+    <script>
+        var configuration = {
+            theme: 'default',
+            layout: 'modern',
+            defaultHttpClient: {
+                targetKey: 'javascript',
+                clientKey: 'fetch'
+            },
+            customCss: `
+                --scalar-color-accent: #00C08B;
+                --scalar-color-1: #00C08B;
+            `,
+            searchHotKey: 'k',
+            tagsSorter: 'as-is'
+        }
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
 </body>
-</html>"#.to_string())
+</html>"#
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -975,42 +921,6 @@ mod tests {
 
         // Verify servers are not hardcoded (will be set dynamically on client)
         assert!(spec.servers.is_none() || spec.servers.as_ref().unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_swagger_ui_html_contains_required_elements() {
-        // Test that the Swagger UI HTML contains the necessary elements
-        use axum::response::Html;
-
-        // Get the HTML response
-        let html = tokio_test::block_on(swagger_ui_handler());
-        let Html(html_content) = html;
-
-        // Verify essential Swagger UI elements are present
-        assert!(
-            html_content.contains("swagger-ui"),
-            "HTML should contain swagger-ui div"
-        );
-        assert!(
-            html_content.contains("swagger-ui-bundle.js"),
-            "HTML should include Swagger UI bundle"
-        );
-        assert!(
-            html_content.contains("swagger-ui-standalone-preset.js"),
-            "HTML should include standalone preset"
-        );
-        assert!(
-            html_content.contains("/api-docs/openapi.json"),
-            "HTML should reference our OpenAPI spec URL"
-        );
-        assert!(
-            html_content.contains("NEAR AI Cloud API Documentation"),
-            "HTML should have the correct title"
-        );
-        assert!(
-            html_content.contains("SwaggerUIBundle"),
-            "HTML should initialize SwaggerUIBundle"
-        );
     }
 
     /// Example of how to set up the application for E2E testing

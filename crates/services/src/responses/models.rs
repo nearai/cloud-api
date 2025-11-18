@@ -340,6 +340,7 @@ pub enum ResponseOutputItem {
         status: ResponseItemStatus,
         role: String,
         content: Vec<ResponseOutputContent>,
+        model: String,
     },
     #[serde(rename = "tool_call")]
     ToolCall {
@@ -355,6 +356,7 @@ pub enum ResponseOutputItem {
         status: ResponseItemStatus,
         tool_type: String,
         function: ResponseOutputFunction,
+        model: String,
     },
     #[serde(rename = "web_search_call")]
     WebSearchCall {
@@ -369,6 +371,7 @@ pub enum ResponseOutputItem {
         created_at: i64,
         status: ResponseItemStatus,
         action: WebSearchAction,
+        model: String,
     },
     #[serde(rename = "reasoning")]
     Reasoning {
@@ -384,6 +387,7 @@ pub enum ResponseOutputItem {
         status: ResponseItemStatus,
         summary: String,
         content: String,
+        model: String,
     },
 }
 
@@ -732,6 +736,22 @@ impl Usage {
             output_tokens,
             output_tokens_details: Some(OutputTokensDetails {
                 reasoning_tokens: 0,
+            }),
+            total_tokens: input_tokens + output_tokens,
+        }
+    }
+
+    pub fn new_with_reasoning(
+        input_tokens: i32,
+        output_tokens: i32,
+        reasoning_tokens: i32,
+    ) -> Self {
+        Self {
+            input_tokens,
+            input_tokens_details: Some(InputTokensDetails { cached_tokens: 0 }),
+            output_tokens,
+            output_tokens_details: Some(OutputTokensDetails {
+                reasoning_tokens: reasoning_tokens as i64,
             }),
             total_tokens: input_tokens + output_tokens,
         }

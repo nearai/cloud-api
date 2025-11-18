@@ -13,6 +13,11 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 
+#[cfg(test)]
+use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey};
+#[cfg(test)]
+use sha3::Keccak256;
+
 // Global once cell to ensure migrations only run once across all tests
 static MIGRATIONS_INITIALIZED: OnceCell<()> = OnceCell::const_new();
 
@@ -365,6 +370,126 @@ pub fn compute_sha256(data: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// Verify an ECDSA signature with recovery ID using Ethereum signed message format
+///
+/// # Arguments
+/// * `signature_text` - The message that was signed (format: "request_hash:response_hash")
+/// * `signature_hex` - The hex-encoded signature (65 bytes: r || s || Ethereum v)
+/// * `signing_address_hex` - The expected Ethereum address in hex format (with or without 0x prefix)
+///
+/// # Returns
+/// `true` if the signature is valid and matches the signing address, `false` otherwise
+#[cfg(test)]
+pub fn verify_ecdsa_signature(
+    signature_text: &str,
+    signature_hex: &str,
+    signing_address_hex: &str,
+) -> bool {
+    // Remove 0x prefix if present
+    let sig_clean = signature_hex.strip_prefix("0x").unwrap_or(signature_hex);
+    let addr_clean = signing_address_hex
+        .strip_prefix("0x")
+        .unwrap_or(signing_address_hex);
+
+    // Decode signature (should be 65 bytes = 130 hex chars)
+    let signature_bytes = match hex::decode(sig_clean) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+
+    if signature_bytes.len() != 65 {
+        eprintln!(
+            "Invalid signature length: expected 65 bytes, got {} bytes",
+            signature_bytes.len()
+        );
+        return false;
+    }
+
+    // Extract r, s, and Ethereum v (recovery ID)
+    let r_s: [u8; 64] = signature_bytes[..64]
+        .try_into()
+        .expect("Signature should be 64 bytes for r||s");
+    let ethereum_v = signature_bytes[64]; // Last byte: Ethereum v (27 or 28)
+
+    // Validate Ethereum v format
+    if ethereum_v != 27 && ethereum_v != 28 {
+        eprintln!("Invalid Ethereum v: expected 27 or 28, got {ethereum_v}");
+        return false;
+    }
+
+    // Parse the signature
+    let signature = match EcdsaSignature::from_bytes(&r_s.into()) {
+        Ok(sig) => sig,
+        Err(e) => {
+            eprintln!("Failed to parse signature: {e}");
+            return false;
+        }
+    };
+
+    // Convert Ethereum v (27-28) to k256 RecoveryId (0-3)
+    // Ethereum v = 27 + recovery_bit, so recovery_bit = v - 27
+    let recovery_bit = ethereum_v - 27;
+    let recovery_id = match RecoveryId::try_from(recovery_bit) {
+        Ok(rid) => rid,
+        Err(e) => {
+            eprintln!("Invalid recovery ID: {e}");
+            return false;
+        }
+    };
+
+    // Hash the message with Ethereum signed message format (matching the signing process)
+    // Format: \x19Ethereum Signed Message:\n{length}{message}
+    let message_bytes = signature_text.as_bytes();
+    let prefix = format!("\x19Ethereum Signed Message:\n{}", message_bytes.len());
+    let prefix_bytes = prefix.as_bytes();
+
+    // Concatenate prefix + message
+    let mut prefixed_message = Vec::with_capacity(prefix_bytes.len() + message_bytes.len());
+    prefixed_message.extend_from_slice(prefix_bytes);
+    prefixed_message.extend_from_slice(message_bytes);
+
+    // Hash with Keccak256
+    let mut hasher = Keccak256::new();
+    hasher.update(&prefixed_message);
+    let message_hash = hasher.finalize();
+
+    // Recover the public key from the signature
+    let recovered_key =
+        match VerifyingKey::recover_from_prehash(&message_hash, &signature, recovery_id) {
+            Ok(key) => key,
+            Err(e) => {
+                eprintln!("Failed to recover public key: {e}");
+                return false;
+            }
+        };
+
+    // Convert recovered public key to Ethereum address
+    // Get uncompressed public key (65 bytes: 0x04 + 32 bytes x + 32 bytes y)
+    let encoded_point = recovered_key.to_encoded_point(false);
+    let point_bytes = encoded_point.as_bytes();
+
+    // Extract x and y coordinates (skip the 0x04 prefix, take 64 bytes)
+    let uncompressed_pubkey = &point_bytes[1..65];
+
+    // Hash with Keccak256
+    let addr_hash = Keccak256::digest(uncompressed_pubkey);
+
+    // Ethereum address is the last 20 bytes (bytes 12..32)
+    let recovered_address_bytes = &addr_hash[12..32];
+    let recovered_address_hex = hex::encode(recovered_address_bytes);
+
+    // Compare with the expected signing address (should be Ethereum address format)
+    let addresses_match = recovered_address_hex.eq_ignore_ascii_case(addr_clean);
+
+    if !addresses_match {
+        eprintln!(
+            "Address mismatch:\n  Expected: {addr_clean}\n  Recovered: {recovered_address_hex}"
+        );
+    }
+
+    addresses_match
 }
 
 pub fn decode_access_token_claims(token: &str) -> AccessTokenClaims {

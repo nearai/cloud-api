@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::{conversations::errors, workspace::WorkspaceId};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ConversationId(pub Uuid);
 
 impl std::str::FromStr for ConversationId {

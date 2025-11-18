@@ -1508,7 +1508,7 @@ async fn test_model_aliases() {
     // Set up canonical models with aliases
     // Discovery returns these canonical names from vLLM:
     // - "nearai/gpt-oss-120b" (canonical)
-    // - "deepseek-ai/DeepSeek-V3.1" (canonical)
+    // - "Qwen/Qwen3-30B-A3B-Instruct-2507" (canonical)
 
     let mut batch = BatchUpdateModelApiRequest::new();
 
@@ -1536,9 +1536,9 @@ async fn test_model_aliases() {
         .unwrap(),
     );
 
-    // Model 2: deepseek-ai/DeepSeek-V3.1 (canonical with messy name) with clean alias
+    // Model 2: Qwen/Qwen3-30B-A3B-Instruct-2507 (canonical with messy name) with clean alias
     batch.insert(
-        "deepseek-ai/DeepSeek-V3.1".to_string(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
                 "amount": 500000,
@@ -1684,7 +1684,6 @@ async fn test_model_aliases() {
         // Verify model is a canonical model name
         assert!(
             entry.model == "nearai/gpt-oss-120b"
-                || entry.model == "deepseek-ai/DeepSeek-V3.1"
                 || entry.model == "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "Usage should be tracked with canonical model name, got: {}",
             entry.model

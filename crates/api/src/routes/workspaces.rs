@@ -111,7 +111,7 @@ impl From<WorkspaceOrderDirection> for services::workspace::WorkspaceOrderDirect
 /// be a member of the organization to create workspaces.
 #[utoipa::path(
     post,
-    path = "/organizations/{org_id}/workspaces",
+    path = "/v1/organizations/{org_id}/workspaces",
     tag = "Workspaces",
     params(
         ("org_id" = Uuid, Path, description = "Organization ID")
@@ -217,7 +217,7 @@ pub async fn create_workspace(
 /// be a member of the organization to list workspaces.
 #[utoipa::path(
     get,
-    path = "/organizations/{org_id}/workspaces",
+    path = "/v1/organizations/{org_id}/workspaces",
     tag = "Workspaces",
     params(
         ("org_id" = Uuid, Path, description = "Organization ID"),
@@ -337,7 +337,7 @@ pub async fn list_organization_workspaces(
 /// Returns workspace details for a specific workspace ID.
 #[utoipa::path(
     get,
-    path = "/workspaces/{workspace_id}",
+    path = "/v1/workspaces/{workspace_id}",
     tag = "Workspaces",
     params(
         ("workspace_id" = Uuid, Path, description = "Workspace ID")
@@ -413,7 +413,7 @@ pub async fn get_workspace(
 /// Updates workspace details for a specific workspace ID.
 #[utoipa::path(
     put,
-    path = "/workspaces/{workspace_id}",
+    path = "/v1/workspaces/{workspace_id}",
     tag = "Workspaces",
     params(
         ("workspace_id" = Uuid, Path, description = "Workspace ID")
@@ -501,7 +501,7 @@ pub async fn update_workspace(
 /// Deletes (deactivates) a workspace. Only the workspace creator or organization admin/owner can delete.
 #[utoipa::path(
     delete,
-    path = "/workspaces/{workspace_id}",
+    path = "/v1/workspaces/{workspace_id}",
     tag = "Workspaces",
     params(
         ("workspace_id" = Uuid, Path, description = "Workspace ID")
@@ -576,7 +576,7 @@ pub async fn delete_workspace(
 /// Creates a new API key for a workspace.
 #[utoipa::path(
     post,
-    path = "/workspaces/{workspace_id}/api-keys",
+    path = "/v1/workspaces/{workspace_id}/api-keys",
     tag = "Workspaces",
     params(
         ("workspace_id" = Uuid, Path, description = "Workspace ID")
@@ -695,7 +695,7 @@ pub async fn create_workspace_api_key(
 /// Returns a paginated list of all API keys for a workspace with usage information.
 #[utoipa::path(
     get,
-    path = "/workspaces/{workspace_id}/api-keys",
+    path = "/v1/workspaces/{workspace_id}/api-keys",
     tag = "Workspaces",
     params(
         ("workspace_id" = Uuid, Path, description = "Workspace ID"),
@@ -817,7 +817,7 @@ pub async fn list_workspace_api_keys(
 /// Revokes a specific API key from a workspace.
 #[utoipa::path(
     delete,
-    path = "/workspaces/{workspace_id}/api-keys/{key_id}",
+    path = "/v1/workspaces/{workspace_id}/api-keys/{key_id}",
     tag = "Workspaces",
     params(
         ("workspace_id" = Uuid, Path, description = "Workspace ID"),
@@ -948,7 +948,7 @@ pub async fn revoke_api_key_with_context(
 /// organization that owns the workspace. Set spend_limit to null to remove the limit.
 #[utoipa::path(
     patch,
-    path = "/workspaces/{workspace_id}/api-keys/{key_id}/spend-limit",
+    path = "/v1/workspaces/{workspace_id}/api-keys/{key_id}/spend-limit",
     tag = "Workspaces",
     params(
         ("workspace_id" = Uuid, Path, description = "Workspace ID"),
@@ -1037,7 +1037,7 @@ pub async fn update_api_key_spend_limit(
 /// organization that owns the workspace. All fields are optional - only provided fields will be updated.
 #[utoipa::path(
     patch,
-    path = "/workspaces/{workspace_id}/api-keys/{key_id}",
+    path = "/v1/workspaces/{workspace_id}/api-keys/{key_id}",
     tag = "Workspaces",
     params(
         ("workspace_id" = Uuid, Path, description = "Workspace ID"),

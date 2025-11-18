@@ -1884,3 +1884,256 @@ async fn test_conversation_unauthorized_access() {
     assert_eq!(get_response.status_code(), 200);
     println!("✅ Original conversation still accessible with correct API key");
 }
+
+#[tokio::test]
+async fn test_conversation_items_include_model() {
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Create a conversation
+    let conversation = create_conversation(&server, api_key.clone()).await;
+
+    // Use a specific model
+    let model_name = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+
+    // Create a response with the specific model
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "input": "What is Rust?",
+            "temperature": 0.7,
+            "max_output_tokens": 100,
+            "stream": false,
+            "model": model_name,
+            "conversation": conversation.id
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    let response_obj = response.json::<api::models::ResponseObject>();
+    println!("Created response: {}", response_obj.id);
+
+    // List conversation items
+    let items_response = server
+        .get(format!("/v1/conversations/{}/items", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+
+    assert_eq!(items_response.status_code(), 200);
+    let items_list = items_response.json::<api::models::ConversationItemList>();
+
+    println!("Retrieved {} conversation items", items_list.data.len());
+
+    // Verify each item has the model field populated
+    for item in &items_list.data {
+        match item {
+            api::models::ConversationItem::Message {
+                id, model, role, ..
+            } => {
+                println!("  Message item {id}: role={role}, model={model}");
+
+                // Verify model field is populated and matches the model used for the response
+                assert!(!model.is_empty(), "Model field should not be empty");
+                assert_eq!(
+                    model, model_name,
+                    "Model field should match the model used for the response"
+                );
+            }
+            api::models::ConversationItem::ToolCall { id, model, .. } => {
+                println!("  ToolCall item {id}: model={model}");
+                assert!(!model.is_empty(), "Model field should not be empty");
+                assert_eq!(
+                    model, model_name,
+                    "Model field should match the model used for the response"
+                );
+            }
+            api::models::ConversationItem::WebSearchCall { id, model, .. } => {
+                println!("  WebSearchCall item {id}: model={model}");
+                assert!(!model.is_empty(), "Model field should not be empty");
+                assert_eq!(
+                    model, model_name,
+                    "Model field should match the model used for the response"
+                );
+            }
+            api::models::ConversationItem::Reasoning { id, model, .. } => {
+                println!("  Reasoning item {id}: model={model}");
+                assert!(!model.is_empty(), "Model field should not be empty");
+                assert_eq!(
+                    model, model_name,
+                    "Model field should match the model used for the response"
+                );
+            }
+        }
+    }
+
+    println!("✅ All conversation items include the model field");
+    println!("✅ Model field matches the model used for the response: {model_name}");
+}
+
+#[tokio::test]
+async fn test_conversation_items_model_with_streaming() {
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Create a conversation
+    let conversation = create_conversation(&server, api_key.clone()).await;
+
+    // Use a specific model
+    let model_name = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+
+    // Create a streaming response with the specific model
+    let (_, response_obj) = create_response_stream(
+        &server,
+        conversation.id.clone(),
+        model_name.to_string(),
+        "What is Rust?".to_string(),
+        100,
+        api_key.clone(),
+    )
+    .await;
+
+    println!("Created streaming response: {}", response_obj.id);
+
+    // List conversation items
+    let items_response = server
+        .get(format!("/v1/conversations/{}/items", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+
+    assert_eq!(items_response.status_code(), 200);
+    let items_list = items_response.json::<api::models::ConversationItemList>();
+
+    println!(
+        "Retrieved {} conversation items from streaming response",
+        items_list.data.len()
+    );
+
+    // Verify each item has the model field populated
+    let mut found_user_message = false;
+    let mut found_assistant_message = false;
+
+    for item in &items_list.data {
+        if let api::models::ConversationItem::Message {
+            id, model, role, ..
+        } = item
+        {
+            println!("  Message item {id}: role={role}, model={model}");
+
+            // Verify model field is populated and matches the model used for the response
+            assert!(!model.is_empty(), "Model field should not be empty");
+            assert_eq!(
+                model, model_name,
+                "Model field should match the model used for the response"
+            );
+
+            if role == "user" {
+                found_user_message = true;
+            } else if role == "assistant" {
+                found_assistant_message = true;
+            }
+        }
+    }
+
+    // Verify we found both user and assistant messages
+    assert!(
+        found_user_message,
+        "Should have found a user message with model field"
+    );
+    assert!(
+        found_assistant_message,
+        "Should have found an assistant message with model field"
+    );
+
+    println!("✅ All conversation items from streaming response include the model field");
+    println!("✅ Model field matches the model used for the response: {model_name}");
+}
+
+#[tokio::test]
+async fn test_backfilled_items_include_model() {
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Create a conversation
+    let conversation = create_conversation(&server, api_key.clone()).await;
+
+    // Use a specific model for backfilling
+    let model_name = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+
+    // Backfill some conversation items (this creates items directly without a response)
+    let create_items_response = server
+        .post(format!("/v1/conversations/{}/items", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "items": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Hello!"}]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "input_text", "text": "Hi there!"}]
+                }
+            ]
+        }))
+        .await;
+
+    assert_eq!(create_items_response.status_code(), 200);
+    let items_response = create_items_response.json::<api::models::ConversationItemList>();
+    assert_eq!(items_response.data.len(), 2);
+
+    // Now create a response in the same conversation with a specific model
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "input": "What is Rust?",
+            "temperature": 0.7,
+            "max_output_tokens": 100,
+            "stream": false,
+            "model": model_name,
+            "conversation": conversation.id
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    // List all conversation items
+    let items_list_response = server
+        .get(format!("/v1/conversations/{}/items", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+
+    assert_eq!(items_list_response.status_code(), 200);
+    let items_list = items_list_response.json::<api::models::ConversationItemList>();
+
+    println!(
+        "Retrieved {} total conversation items (backfilled + response)",
+        items_list.data.len()
+    );
+
+    // Verify all items have the model field populated
+    for item in &items_list.data {
+        if let api::models::ConversationItem::Message {
+            id, model, role, ..
+        } = item
+        {
+            println!("  Message item {id}: role={role}, model={model}");
+
+            // Verify model field is populated
+            // Note: Backfilled items get their model from the response they're associated with
+            // All items in this test should have the same model since they're all in the same response chain
+            assert!(
+                !model.is_empty(),
+                "Model field should not be empty for item {id}"
+            );
+        }
+    }
+
+    println!("✅ All conversation items (including backfilled) include the model field");
+}

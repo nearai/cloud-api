@@ -85,6 +85,10 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             id: db_conversation.id,
             workspace_id: db_conversation.workspace_id,
             api_key_id: db_conversation.api_key_id,
+            pinned_at: db_conversation.pinned_at,
+            archived_at: db_conversation.archived_at,
+            deleted_at: db_conversation.deleted_at,
+            cloned_from_id: db_conversation.cloned_from_id,
             metadata: db_conversation.metadata,
             created_at: db_conversation.created_at,
             updated_at: db_conversation.updated_at,
@@ -111,6 +115,10 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             id: c.id,
             workspace_id: c.workspace_id,
             api_key_id: c.api_key_id,
+            pinned_at: c.pinned_at,
+            archived_at: c.archived_at,
+            deleted_at: c.deleted_at,
+            cloned_from_id: c.cloned_from_id,
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,
@@ -138,6 +146,103 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             id: c.id,
             workspace_id: c.workspace_id,
             api_key_id: c.api_key_id,
+            pinned_at: c.pinned_at,
+            archived_at: c.archived_at,
+            deleted_at: c.deleted_at,
+            cloned_from_id: c.cloned_from_id,
+            metadata: c.metadata,
+            created_at: c.created_at,
+            updated_at: c.updated_at,
+        }))
+    }
+
+    /// Pin or unpin a conversation
+    async fn pin_conversation(
+        &self,
+        conversation_id: models::ConversationId,
+        workspace_id: WorkspaceId,
+        is_pinned: bool,
+    ) -> Result<Option<models::Conversation>, errors::ConversationError> {
+        let db_conversation = self
+            .conv_repo
+            .set_pinned(conversation_id, workspace_id.clone(), is_pinned)
+            .await
+            .map_err(|e| {
+                errors::ConversationError::InternalError(format!(
+                    "Failed to pin/unpin conversation: {e}"
+                ))
+            })?;
+
+        Ok(db_conversation.map(|c| models::Conversation {
+            id: c.id,
+            workspace_id: c.workspace_id,
+            api_key_id: c.api_key_id,
+            pinned_at: c.pinned_at,
+            archived_at: c.archived_at,
+            deleted_at: c.deleted_at,
+            cloned_from_id: c.cloned_from_id,
+            metadata: c.metadata,
+            created_at: c.created_at,
+            updated_at: c.updated_at,
+        }))
+    }
+
+    /// Archive or unarchive a conversation
+    async fn archive_conversation(
+        &self,
+        conversation_id: models::ConversationId,
+        workspace_id: WorkspaceId,
+        is_archived: bool,
+    ) -> Result<Option<models::Conversation>, errors::ConversationError> {
+        let db_conversation = self
+            .conv_repo
+            .set_archived(conversation_id, workspace_id.clone(), is_archived)
+            .await
+            .map_err(|e| {
+                errors::ConversationError::InternalError(format!(
+                    "Failed to archive/unarchive conversation: {e}"
+                ))
+            })?;
+
+        Ok(db_conversation.map(|c| models::Conversation {
+            id: c.id,
+            workspace_id: c.workspace_id,
+            api_key_id: c.api_key_id,
+            pinned_at: c.pinned_at,
+            archived_at: c.archived_at,
+            deleted_at: c.deleted_at,
+            cloned_from_id: c.cloned_from_id,
+            metadata: c.metadata,
+            created_at: c.created_at,
+            updated_at: c.updated_at,
+        }))
+    }
+
+    /// Clone a conversation
+    async fn clone_conversation(
+        &self,
+        conversation_id: models::ConversationId,
+        workspace_id: WorkspaceId,
+        api_key_id: uuid::Uuid,
+    ) -> Result<Option<models::Conversation>, errors::ConversationError> {
+        let db_conversation = self
+            .conv_repo
+            .clone_conversation(conversation_id, workspace_id.clone(), api_key_id)
+            .await
+            .map_err(|e| {
+                errors::ConversationError::InternalError(format!(
+                    "Failed to clone conversation: {e}"
+                ))
+            })?;
+
+        Ok(db_conversation.map(|c| models::Conversation {
+            id: c.id,
+            workspace_id: c.workspace_id,
+            api_key_id: c.api_key_id,
+            pinned_at: c.pinned_at,
+            archived_at: c.archived_at,
+            deleted_at: c.deleted_at,
+            cloned_from_id: c.cloned_from_id,
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,

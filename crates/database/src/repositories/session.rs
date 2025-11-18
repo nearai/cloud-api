@@ -174,7 +174,12 @@ impl SessionRepository {
         Ok(result > 0)
     }
 
-    /// Rotate a refresh token session
+    /// Rotates a refresh token session.
+    ///
+    /// This operation atomically updates the token hash and expiration time in the database,
+    /// invalidating the old token. This ensures that the previous token can no longer be used.
+    ///
+    /// Returns the updated session and the new plaintext token.
     pub async fn rotate(
         &self,
         session_id: Uuid,

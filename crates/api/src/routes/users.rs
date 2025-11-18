@@ -8,7 +8,7 @@ use crate::{
     routes::api::AppState,
 };
 use axum::{
-    extract::{Extension, Json, Path, Request, State},
+    extract::{Extension, Json, Path, State},
     http::StatusCode,
 };
 use serde::Deserialize;
@@ -383,7 +383,6 @@ pub async fn revoke_all_user_tokens(
 pub async fn create_access_token(
     State(app_state): State<AppState>,
     Extension((session, user)): Extension<(services::auth::Session, AuthenticatedUser)>,
-    _request: Request,
 ) -> Result<Json<crate::models::AccessAndRefreshTokenResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Creating access token & refresh token for user: {}",

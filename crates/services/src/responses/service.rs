@@ -1828,36 +1828,64 @@ impl ResponseServiceImpl {
                         errors::ResponseError::InternalError(format!("Web search failed: {e}"))
                     })?;
 
-                    // Store web search results in registry for citation resolution
-                    context.source_registry =
-                        Some(models::SourceRegistry::with_results(results.clone()));
+                    // Calculate cumulative offset from current registry size
+                    let search_start_index = context
+                        .source_registry
+                        .as_ref()
+                        .map(|r| r.web_sources.len())
+                        .unwrap_or(0);
 
+                    // Accumulate results into registry and generate citation instruction if first search
+                    let citation_instruction = if let Some(ref mut registry) =
+                        context.source_registry
+                    {
+                        registry.web_sources.extend(results.clone());
+                        None
+                    } else {
+                        context.source_registry =
+                            Some(models::SourceRegistry::with_results(results.clone()));
+                        Some(
+                            r#"CITATION REQUIREMENT: Use [s:N]text[/s:N] for EVERY fact from web search results.
+
+FORMAT: [s:N]fact from source N[/s:N]
+- N = source number (0, 1, 2, 3, etc. - cumulative across all searches)
+- ALWAYS use BOTH opening [s:N] and closing [/s:N] tags together
+- The number N MUST match in opening and closing tags
+- Cite specific facts, names, numbers, and statements from sources
+- Every factual claim must be wrapped
+
+CORRECT EXAMPLES:
+[s:0]San Francisco's top restaurant is The French Laundry[/s:0]
+[s:1]The app TikTok has over 2 billion downloads[/s:1]
+[s:2]Instagram was founded in 2010[/s:2]
+
+DO NOT USE THESE FORMATS:
+✗ [s:0]Missing closing tag
+✗ [s:0]Mismatched[/s:1] numbers
+✗ Statements without any citation tags"#
+                                .to_string(),
+                        )
+                    };
+
+                    // Format results with cumulative indices
                     let formatted = results
                         .iter()
                         .enumerate()
                         .map(|(idx, r)| {
                             format!(
                                 "Source: {}\nTitle: {}\nURL: {}\nSnippet: {}\n",
-                                idx, r.title, r.url, r.snippet
+                                search_start_index + idx,
+                                r.title,
+                                r.url,
+                                r.snippet
                             )
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
 
-                    let citation_instruction = r#"CITATION REQUIREMENT: Use [s:N]text[/s:N] for every source-based claim.
-
-FORMAT: [s:N]fact from source[/s:N]
-- N = source number (0, 1, 2, etc.)
-- BOTH opening and closing tags required
-- Opening and closing N must match
-- Wrap complete facts/sentences
-
-CORRECT: [s:0]Temperature is 72°F[/s:0]
-INCORRECT: [s:0]Temperature is 72°F (missing closing tag)"#;
-
                     Ok(ToolExecutionResult {
                         content: formatted,
-                        citation_instruction: Some(citation_instruction.to_string()),
+                        citation_instruction,
                     })
                 } else {
                     Err(errors::ResponseError::UnknownTool("web_search".to_string()))
@@ -2364,5 +2392,109 @@ mod tests {
         assert_eq!(clean, " world");
         assert_eq!(transition, TagTransition::ClosingTag("think".to_string()));
         assert!(!inside_reasoning);
+    }
+
+    #[test]
+    fn test_multiple_web_search_registry_accumulation() {
+        use crate::responses::models::SourceRegistry;
+        use crate::responses::tools::WebSearchResult;
+
+        // Simulate first web search with 3 results
+        let first_search_results = vec![
+            WebSearchResult {
+                title: "First Result".to_string(),
+                url: "https://example.com/1".to_string(),
+                snippet: "First snippet".to_string(),
+            },
+            WebSearchResult {
+                title: "Second Result".to_string(),
+                url: "https://example.com/2".to_string(),
+                snippet: "Second snippet".to_string(),
+            },
+            WebSearchResult {
+                title: "Third Result".to_string(),
+                url: "https://example.com/3".to_string(),
+                snippet: "Third snippet".to_string(),
+            },
+        ];
+
+        // Simulate second web search with 2 results
+        let second_search_results = vec![
+            WebSearchResult {
+                title: "Fourth Result".to_string(),
+                url: "https://example.com/4".to_string(),
+                snippet: "Fourth snippet".to_string(),
+            },
+            WebSearchResult {
+                title: "Fifth Result".to_string(),
+                url: "https://example.com/5".to_string(),
+                snippet: "Fifth snippet".to_string(),
+            },
+        ];
+
+        // First search: registry starts None, should create new registry
+        let mut registry: Option<SourceRegistry> = None;
+        let first_offset = registry.as_ref().map(|r| r.web_sources.len()).unwrap_or(0);
+        assert_eq!(first_offset, 0, "First search should have offset 0");
+
+        // Create registry with first search results
+        if let Some(ref mut reg) = registry {
+            reg.web_sources.extend(first_search_results.clone());
+        } else {
+            registry = Some(SourceRegistry::with_results(first_search_results.clone()));
+        }
+        assert_eq!(
+            registry.as_ref().unwrap().web_sources.len(),
+            3,
+            "Registry should have 3 results after first search"
+        );
+
+        // Second search: registry exists, should accumulate
+        let second_offset = registry.as_ref().map(|r| r.web_sources.len()).unwrap_or(0);
+        assert_eq!(second_offset, 3, "Second search should have offset 3");
+
+        // Accumulate second search results
+        if let Some(ref mut reg) = registry {
+            reg.web_sources.extend(second_search_results.clone());
+        }
+        assert_eq!(
+            registry.as_ref().unwrap().web_sources.len(),
+            5,
+            "Registry should have 5 results after second search"
+        );
+
+        // Verify correct indices
+        let final_registry = registry.unwrap();
+        assert_eq!(
+            final_registry.web_sources[0].title, "First Result",
+            "Index 0 should be first result"
+        );
+        assert_eq!(
+            final_registry.web_sources[1].title, "Second Result",
+            "Index 1 should be second result"
+        );
+        assert_eq!(
+            final_registry.web_sources[2].title, "Third Result",
+            "Index 2 should be third result"
+        );
+        assert_eq!(
+            final_registry.web_sources[3].title, "Fourth Result",
+            "Index 3 should be fourth result"
+        );
+        assert_eq!(
+            final_registry.web_sources[4].title, "Fifth Result",
+            "Index 4 should be fifth result"
+        );
+
+        // Verify that searching for index 0 gets first result
+        assert_eq!(
+            final_registry.web_sources.get(0).unwrap().url,
+            "https://example.com/1"
+        );
+        // Verify that searching for index 3 gets fourth result
+        assert_eq!(
+            final_registry.web_sources.get(3).unwrap().url,
+            "https://example.com/4"
+        );
     }
 }

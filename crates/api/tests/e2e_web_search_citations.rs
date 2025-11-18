@@ -148,14 +148,14 @@ async fn test_non_streaming_web_search_with_citations() {
     println!("✓ Created conversation: {}", conversation_id);
 
     // Create non-streaming response with web search
-    // Use a factual query that typically requires citations
+    // Use a specific query that requires current information and citations
     let response = server
         .post("/v1/responses")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&json!({
             "conversation": conversation_id,
             "model": "zai-org/GLM-4.6",
-            "input": "What is the weather like in NY? Search the web for information.",
+            "input": "What are the top 5 most popular restaurants in San Francisco right now? Search the web for the latest restaurant rankings and reviews.",
             "stream": false,
             "max_output_tokens": 512,
             "temperature": 0.7,
@@ -306,7 +306,7 @@ async fn test_streaming_web_search_with_citations() {
         .json(&json!({
             "conversation": conversation_id,
             "model": "zai-org/GLM-4.6",
-            "input": "What is the weather like in SF right now? Please search the web for current information.",
+            "input": "What are the most popular iOS apps in 2024? Search the web for the latest app store rankings and download statistics.",
             "stream": true,
             "max_output_tokens": 512,
             "temperature": 0.7,

@@ -214,9 +214,10 @@ async fn test_non_streaming_web_search_with_citations() {
 
     println!("\n=== Non-Streaming Response ===");
     println!("Text length: {len} characters", len = text.len());
+    let truncated_text = text.chars().take(300).collect::<String>();
     println!(
         "Text (first 300 chars): {txt}",
-        txt = &text[..text.len().min(300)]
+        txt = truncated_text
     );
 
     println!("Annotations found: {count}", count = annotations.len());
@@ -370,9 +371,10 @@ async fn test_streaming_web_search_with_citations() {
 
     println!("\n=== Streaming Response ===");
     println!("Text length: {len} characters", len = text.len());
+    let truncated_text = text.chars().take(300).collect::<String>();
     println!(
         "Text (first 300 chars): {txt}",
-        txt = &text[..text.len().min(300)]
+        txt = truncated_text
     );
 
     println!(

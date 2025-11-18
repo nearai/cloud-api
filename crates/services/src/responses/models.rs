@@ -772,7 +772,8 @@ mod tests {
             "id": "msg_123",
             "status": "completed",
             "role": "assistant",
-            "content": []
+            "content": [],
+            "model": "gpt-4"
         });
 
         // This should not panic and should deserialize with default values
@@ -822,7 +823,8 @@ mod tests {
             "function": {
                 "name": "test_function",
                 "arguments": "{}"
-            }
+            },
+            "model": "gpt-4"
         });
 
         let result: Result<ResponseOutputItem, _> = serde_json::from_value(old_json);
@@ -861,7 +863,8 @@ mod tests {
             "created_at": 1234567890,
             "status": "completed",
             "role": "assistant",
-            "content": []
+            "content": [],
+            "model": "gpt-4"
         });
 
         let result: Result<ResponseOutputItem, _> = serde_json::from_value(new_json);

@@ -1207,14 +1207,33 @@ async fn test_pin_unpin_conversation() {
     assert_eq!(conv.object, "conversation");
 
     // Test: Pin the conversation
+    let now = chrono::Utc::now().timestamp();
     let pin_response = server
         .post(format!("/v1/conversations/{}/pin", conversation.id).as_str())
         .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
     assert_eq!(pin_response.status_code(), 200);
     let pinned_conv = pin_response.json::<api::models::ConversationObject>();
+
+    // Verify pinned_at is present and valid
+    let pinned_at = pinned_conv
+        .metadata
+        .get("pinned_at")
+        .expect("pinned_at should be present in metadata")
+        .as_i64()
+        .expect("pinned_at should be a number");
+    assert!(
+        pinned_at >= now,
+        "pinned_at ({pinned_at}) should be >= now ({now})"
+    );
     assert_eq!(pinned_conv.id, conversation.id);
-    println!("✅ Conversation pinned successfully");
+
+    // Verify archived_at is not present when only pinned
+    assert!(
+        pinned_conv.metadata.get("archived_at").is_none(),
+        "archived_at should not be present for pinned-only conversation"
+    );
+    println!("✅ Conversation pinned successfully with pinned_at timestamp");
 
     // Test: Unpin the conversation
     let unpin_response = server
@@ -1224,15 +1243,35 @@ async fn test_pin_unpin_conversation() {
     assert_eq!(unpin_response.status_code(), 200);
     let unpinned_conv = unpin_response.json::<api::models::ConversationObject>();
     assert_eq!(unpinned_conv.id, conversation.id);
-    println!("✅ Conversation unpinned successfully");
+
+    // Verify pinned_at is removed after unpinning
+    assert!(
+        unpinned_conv.metadata.get("pinned_at").is_none(),
+        "pinned_at should not be present after unpinning"
+    );
+    println!("✅ Conversation unpinned successfully, pinned_at removed");
 
     // Test: Pinning again should be idempotent
+    let now2 = chrono::Utc::now().timestamp();
     let pin_again_response = server
         .post(format!("/v1/conversations/{}/pin", conversation.id).as_str())
         .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
     assert_eq!(pin_again_response.status_code(), 200);
-    println!("✅ Pin operation is idempotent");
+    let repinned_conv = pin_again_response.json::<api::models::ConversationObject>();
+
+    // Verify pinned_at is present again
+    let repinned_at = repinned_conv
+        .metadata
+        .get("pinned_at")
+        .expect("pinned_at should be present after re-pinning")
+        .as_i64()
+        .expect("pinned_at should be a number");
+    assert!(
+        repinned_at >= now2,
+        "pinned_at should be updated to current time on re-pin"
+    );
+    println!("✅ Pin operation is idempotent and updates pinned_at timestamp");
 }
 
 #[tokio::test]
@@ -1245,6 +1284,7 @@ async fn test_archive_unarchive_conversation() {
     println!("Created conversation: {}", conversation.id);
 
     // Test: Archive the conversation
+    let now = chrono::Utc::now().timestamp();
     let archive_response = server
         .post(format!("/v1/conversations/{}/archive", conversation.id).as_str())
         .add_header("Authorization", format!("Bearer {api_key}"))
@@ -1252,7 +1292,25 @@ async fn test_archive_unarchive_conversation() {
     assert_eq!(archive_response.status_code(), 200);
     let archived_conv = archive_response.json::<api::models::ConversationObject>();
     assert_eq!(archived_conv.id, conversation.id);
-    println!("✅ Conversation archived successfully");
+
+    // Verify archived_at is present and valid
+    let archived_at = archived_conv
+        .metadata
+        .get("archived_at")
+        .expect("archived_at should be present in metadata")
+        .as_i64()
+        .expect("archived_at should be a number");
+    assert!(
+        archived_at >= now,
+        "archived_at ({archived_at}) should be >= now ({now})"
+    );
+
+    // Verify pinned_at is not present when only archived
+    assert!(
+        archived_conv.metadata.get("pinned_at").is_none(),
+        "pinned_at should not be present for archived-only conversation"
+    );
+    println!("✅ Conversation archived successfully with archived_at timestamp");
 
     // Test: Unarchive the conversation
     let unarchive_response = server
@@ -1262,15 +1320,35 @@ async fn test_archive_unarchive_conversation() {
     assert_eq!(unarchive_response.status_code(), 200);
     let unarchived_conv = unarchive_response.json::<api::models::ConversationObject>();
     assert_eq!(unarchived_conv.id, conversation.id);
-    println!("✅ Conversation unarchived successfully");
+
+    // Verify archived_at is removed after unarchiving
+    assert!(
+        unarchived_conv.metadata.get("archived_at").is_none(),
+        "archived_at should not be present after unarchiving"
+    );
+    println!("✅ Conversation unarchived successfully, archived_at removed");
 
     // Test: Archiving again should be idempotent
+    let now2 = chrono::Utc::now().timestamp();
     let archive_again_response = server
         .post(format!("/v1/conversations/{}/archive", conversation.id).as_str())
         .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
     assert_eq!(archive_again_response.status_code(), 200);
-    println!("✅ Archive operation is idempotent");
+    let rearchived_conv = archive_again_response.json::<api::models::ConversationObject>();
+
+    // Verify archived_at is present again
+    let rearchived_at = rearchived_conv
+        .metadata
+        .get("archived_at")
+        .expect("archived_at should be present after re-archiving")
+        .as_i64()
+        .expect("archived_at should be a number");
+    assert!(
+        rearchived_at >= now2,
+        "archived_at should be updated to current time on re-archive"
+    );
+    println!("✅ Archive operation is idempotent and updates archived_at timestamp");
 }
 
 #[tokio::test]
@@ -1598,6 +1676,94 @@ async fn test_clone_conversation_with_responses_and_items() {
 }
 
 #[tokio::test]
+async fn test_clone_pinned_and_archived_conversation() {
+    let server = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    // Create a conversation
+    let create_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "metadata": {
+                "title": "Test Conversation",
+                "custom_field": "custom_value"
+            }
+        }))
+        .await;
+    assert_eq!(create_response.status_code(), 201);
+    let conversation = create_response.json::<api::models::ConversationObject>();
+    println!("Created conversation: {}", conversation.id);
+
+    // Pin the conversation
+    let pin_response = server
+        .post(format!("/v1/conversations/{}/pin", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(pin_response.status_code(), 200);
+    println!("✅ Pinned conversation");
+
+    // Archive the conversation
+    let archive_response = server
+        .post(format!("/v1/conversations/{}/archive", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(archive_response.status_code(), 200);
+    let pinned_archived_conv = archive_response.json::<api::models::ConversationObject>();
+
+    // Verify both pinned_at and archived_at are present
+    assert!(
+        pinned_archived_conv.metadata.get("pinned_at").is_some(),
+        "Original should have pinned_at"
+    );
+    assert!(
+        pinned_archived_conv.metadata.get("archived_at").is_some(),
+        "Original should have archived_at"
+    );
+    println!("✅ Conversation is both pinned and archived");
+
+    // Clone the pinned and archived conversation
+    let clone_response = server
+        .post(format!("/v1/conversations/{}/clone", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(clone_response.status_code(), 201);
+    let cloned_conv = clone_response.json::<api::models::ConversationObject>();
+
+    // Verify cloned conversation has different ID
+    assert_ne!(cloned_conv.id, conversation.id);
+    println!("✅ Cloned conversation has new ID: {}", cloned_conv.id);
+
+    // Verify cloned conversation does NOT inherit pinned_at or archived_at
+    assert!(
+        cloned_conv.metadata.get("pinned_at").is_none(),
+        "Clone should NOT inherit pinned_at from original"
+    );
+    assert!(
+        cloned_conv.metadata.get("archived_at").is_none(),
+        "Clone should NOT inherit archived_at from original"
+    );
+
+    // Verify other metadata is preserved
+    assert_eq!(
+        cloned_conv.metadata.get("title").and_then(|v| v.as_str()),
+        Some("Test Conversation (Copy)"),
+        "Clone should have title with (Copy) appended"
+    );
+    assert_eq!(
+        cloned_conv
+            .metadata
+            .get("custom_field")
+            .and_then(|v| v.as_str()),
+        Some("custom_value"),
+        "Clone should preserve other metadata fields"
+    );
+
+    println!("✅ Clone does not inherit pinned_at or archived_at");
+    println!("✅ Clone starts fresh without pin/archive state");
+}
+
+#[tokio::test]
 async fn test_delete_conversation() {
     let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
@@ -1692,6 +1858,101 @@ async fn test_clone_nonexistent_conversation() {
 }
 
 #[tokio::test]
+async fn test_pin_and_archive_together() {
+    let server = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    // Create a conversation
+    let conversation = create_conversation(&server, api_key.clone()).await;
+    println!("Created conversation: {}", conversation.id);
+
+    // Pin the conversation first
+    let pin_now = chrono::Utc::now().timestamp();
+    let pin_response = server
+        .post(format!("/v1/conversations/{}/pin", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(pin_response.status_code(), 200);
+    let pinned_conv = pin_response.json::<api::models::ConversationObject>();
+
+    // Verify pinned_at is present
+    assert!(pinned_conv.metadata.get("pinned_at").is_some());
+    assert!(pinned_conv.metadata.get("archived_at").is_none());
+    println!("✅ Conversation pinned");
+
+    // Archive the pinned conversation
+    let archive_now = chrono::Utc::now().timestamp();
+    let archive_response = server
+        .post(format!("/v1/conversations/{}/archive", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(archive_response.status_code(), 200);
+    let archived_pinned_conv = archive_response.json::<api::models::ConversationObject>();
+
+    // Verify both pinned_at and archived_at are present
+    let pinned_at = archived_pinned_conv
+        .metadata
+        .get("pinned_at")
+        .expect("pinned_at should still be present after archiving")
+        .as_i64()
+        .expect("pinned_at should be a number");
+    let archived_at = archived_pinned_conv
+        .metadata
+        .get("archived_at")
+        .expect("archived_at should be present")
+        .as_i64()
+        .expect("archived_at should be a number");
+
+    assert!(
+        pinned_at >= pin_now,
+        "pinned_at should be from when conversation was pinned"
+    );
+    assert!(
+        archived_at >= archive_now,
+        "archived_at should be from when conversation was archived"
+    );
+    println!("✅ Conversation can be both pinned and archived");
+
+    // Unpin the archived conversation
+    let unpin_response = server
+        .delete(format!("/v1/conversations/{}/pin", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(unpin_response.status_code(), 200);
+    let unpinned_archived_conv = unpin_response.json::<api::models::ConversationObject>();
+
+    // Verify pinned_at is removed but archived_at remains
+    assert!(
+        unpinned_archived_conv.metadata.get("pinned_at").is_none(),
+        "pinned_at should be removed after unpinning"
+    );
+    assert!(
+        unpinned_archived_conv.metadata.get("archived_at").is_some(),
+        "archived_at should still be present"
+    );
+    println!("✅ Unpinning removes pinned_at but keeps archived_at");
+
+    // Unarchive to clean up
+    let unarchive_response = server
+        .delete(format!("/v1/conversations/{}/archive", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(unarchive_response.status_code(), 200);
+    let unarchived_conv = unarchive_response.json::<api::models::ConversationObject>();
+
+    // Verify both are removed
+    assert!(
+        unarchived_conv.metadata.get("pinned_at").is_none(),
+        "pinned_at should not be present"
+    );
+    assert!(
+        unarchived_conv.metadata.get("archived_at").is_none(),
+        "archived_at should be removed after unarchiving"
+    );
+    println!("✅ Unarchiving removes archived_at");
+}
+
+#[tokio::test]
 async fn test_combined_conversation_operations() {
     let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
@@ -1717,7 +1978,14 @@ async fn test_combined_conversation_operations() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
     assert_eq!(pin_response.status_code(), 200);
-    println!("✅ Pinned conversation");
+    let pinned_conv = pin_response.json::<api::models::ConversationObject>();
+
+    // Verify pinned_at is present
+    assert!(
+        pinned_conv.metadata.get("pinned_at").is_some(),
+        "pinned_at should be present after pinning"
+    );
+    println!("✅ Pinned conversation with timestamp");
 
     // Update metadata (rename)
     let update_response = server
@@ -1754,7 +2022,19 @@ async fn test_combined_conversation_operations() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
     assert_eq!(archive_response.status_code(), 200);
-    println!("✅ Archived original conversation");
+    let archived_conv = archive_response.json::<api::models::ConversationObject>();
+
+    // Verify archived_at is present
+    assert!(
+        archived_conv.metadata.get("archived_at").is_some(),
+        "archived_at should be present after archiving"
+    );
+    // pinned_at should also still be present from earlier pin operation
+    assert!(
+        archived_conv.metadata.get("pinned_at").is_some(),
+        "pinned_at should still be present after archiving"
+    );
+    println!("✅ Archived original conversation with timestamp");
 
     // Delete the cloned conversation
     let delete_response = server

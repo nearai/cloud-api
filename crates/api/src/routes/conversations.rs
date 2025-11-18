@@ -1122,11 +1122,30 @@ fn convert_response_item_status(
 fn convert_domain_conversation_to_http(
     domain_conversation: services::conversations::models::Conversation,
 ) -> ConversationObject {
+    let mut metadata = domain_conversation
+        .metadata
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+
+    if let Some(pinned_at) = domain_conversation.pinned_at {
+        metadata.insert(
+            "pinned_at".to_string(),
+            serde_json::json!(pinned_at.timestamp()),
+        );
+    }
+    if let Some(archived_at) = domain_conversation.archived_at {
+        metadata.insert(
+            "archived_at".to_string(),
+            serde_json::json!(archived_at.timestamp()),
+        );
+    }
+
     ConversationObject {
         id: domain_conversation.id.to_string(),
         object: "conversation".to_string(),
         created_at: domain_conversation.created_at.timestamp(),
-        metadata: domain_conversation.metadata,
+        metadata: serde_json::Value::Object(metadata),
     }
 }
 

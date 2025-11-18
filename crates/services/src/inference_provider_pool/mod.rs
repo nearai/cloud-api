@@ -227,7 +227,7 @@ impl InferenceProviderPool {
                                 .get("error")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("unknown error");
-                            tracing::warn!(
+                            tracing::debug!(
                                 model = %model_name,
                                 url = %url,
                                 error = %error_msg,
@@ -243,7 +243,7 @@ impl InferenceProviderPool {
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        tracing::debug!(
                             model = %model_name,
                             url = %url,
                             error = %e,

@@ -896,6 +896,24 @@ pub struct ConversationItemList {
     pub has_more: bool,
 }
 
+/// Request for batch retrieving conversations
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BatchConversationsRequest {
+    /// Array of conversation IDs to retrieve (supports both prefixed "conv_" and raw UUID formats)
+    pub ids: Vec<String>,
+}
+
+/// Response for batch conversation retrieval
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ConversationBatchResponse {
+    /// Object type identifier: "list"
+    pub object: String,
+    /// Array of retrieved conversations
+    pub data: Vec<ConversationObject>,
+    /// Array of requested conversation IDs that were not found (always present, may be empty)
+    pub missing_ids: Vec<String>,
+}
+
 // ============================================
 // Validation implementations
 // ============================================

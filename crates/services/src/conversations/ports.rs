@@ -58,6 +58,13 @@ pub trait ConversationRepository: Send + Sync {
         id: conversations::models::ConversationId,
         workspace_id: WorkspaceId,
     ) -> Result<bool>;
+
+    /// Batch get conversations by IDs
+    async fn batch_get_by_ids(
+        &self,
+        ids: Vec<conversations::models::ConversationId>,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<conversations::models::Conversation>>;
 }
 
 #[async_trait]
@@ -130,4 +137,9 @@ pub trait ConversationServiceTrait: Send + Sync {
         Vec<crate::responses::models::ResponseOutputItem>,
         conversations::errors::ConversationError,
     >;
+    async fn batch_get_conversations(
+        &self,
+        conversation_ids: Vec<conversations::models::ConversationId>,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<conversations::models::Conversation>, conversations::errors::ConversationError>;
 }

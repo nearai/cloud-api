@@ -9,6 +9,7 @@ use services::{
     conversations::{errors::ConversationError, models::ConversationId},
     responses::models::TextAnnotation,
 };
+use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::debug;
 use uuid::Uuid;
@@ -96,6 +97,115 @@ pub async fn create_conversation(
                 http_conversation.id, api_key.workspace_id.0
             );
             Ok((StatusCode::CREATED, ResponseJson(http_conversation)))
+        }
+        Err(error) => Err((
+            map_conversation_error_to_status(&error),
+            ResponseJson(error.into()),
+        )),
+    }
+}
+
+/// Batch retrieve conversations
+///
+/// Retrieve multiple conversations in a single request using their IDs.
+#[utoipa::path(
+    get,
+    path = "/v1/conversations/batch",
+    tag = "Conversations",
+    request_body = BatchConversationsRequest,
+    responses(
+        (status = 200, description = "Conversations retrieved", body = ConversationBatchResponse),
+        (status = 400, description = "Bad request (empty IDs or invalid format)", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("api_key" = []))
+)]
+pub async fn batch_get_conversations(
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
+    Json(request): Json<BatchConversationsRequest>,
+) -> Result<ResponseJson<ConversationBatchResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    debug!(
+        "Batch get conversations for workspace: {}",
+        api_key.workspace_id.0
+    );
+
+    // Validate: at least one ID provided
+    if request.ids.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Must provide at least one conversation ID".to_string(),
+                "invalid_request_error".to_string(),
+            )),
+        ));
+    }
+
+    // Limit batch size (prevent abuse)
+    if request.ids.len() > 1000 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Maximum 1000 conversation IDs per request".to_string(),
+                "invalid_request_error".to_string(),
+            )),
+        ));
+    }
+
+    // Parse conversation IDs and track requested ID strings for missing_ids calculation
+    let conversation_ids: Vec<ConversationId> = request
+        .ids
+        .iter()
+        .map(|id| parse_conversation_id(id))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    format!("Invalid conversation ID: {e}"),
+                    "invalid_request_error".to_string(),
+                )),
+            )
+        })?;
+
+    // Create set of requested ID strings for missing_ids calculation
+    let requested_ids_set: HashSet<String> =
+        conversation_ids.iter().map(|id| id.to_string()).collect();
+
+    // Call service to batch retrieve
+    match service
+        .batch_get_conversations(conversation_ids, api_key.workspace_id.clone())
+        .await
+    {
+        Ok(conversations) => {
+            // Create set of found ID strings
+            let found_ids_set: HashSet<String> =
+                conversations.iter().map(|c| c.id.to_string()).collect();
+
+            // Calculate missing IDs
+            let missing_ids: Vec<String> = requested_ids_set
+                .difference(&found_ids_set)
+                .cloned()
+                .collect();
+
+            let http_conversations: Vec<ConversationObject> = conversations
+                .into_iter()
+                .map(convert_domain_conversation_to_http)
+                .collect();
+
+            debug!(
+                "Retrieved {} conversations (missing {}) for workspace {}",
+                http_conversations.len(),
+                missing_ids.len(),
+                api_key.workspace_id.0
+            );
+
+            Ok(ResponseJson(ConversationBatchResponse {
+                object: "list".to_string(),
+                data: http_conversations,
+                missing_ids,
+            }))
         }
         Err(error) => Err((
             map_conversation_error_to_status(&error),

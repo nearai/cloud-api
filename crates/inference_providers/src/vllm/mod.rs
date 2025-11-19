@@ -87,7 +87,7 @@ impl InferenceProvider for VLlmProvider {
         _signing_algo: Option<String>,
         nonce: Option<String>,
         signing_address: Option<String>,
-    ) -> Result<serde_json::Map<String, serde_json::Value>, CompletionError> {
+    ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
         // Build URL with optional query parameters
         let mut url = format!(
             "{}/v1/attestation/report?model={}",
@@ -98,33 +98,39 @@ impl InferenceProvider for VLlmProvider {
             url.push_str(&format!("&nonce={nonce}"));
         }
 
-        if let Some(signing_address) = signing_address {
+        if let Some(ref signing_address) = signing_address {
             url.push_str(&format!("&signing_address={signing_address}"));
         }
 
-        let headers = self
-            .build_headers()
-            .map_err(CompletionError::CompletionError)?;
+        let headers = self.build_headers().map_err(AttestationError::FetchError)?;
+
         let response = self
             .client
             .get(&url)
             .headers(headers)
             .send()
             .await
-            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+            .map_err(|e| AttestationError::FetchError(e.to_string()))?;
 
         // Handle 404 responses (expected when signing_address doesn't match)
         if response.status() == 404 {
-            return Err(CompletionError::CompletionError(format!(
-                "Signing address not found on this provider: {}",
-                response.status()
+            return Err(AttestationError::SigningAddressNotFound(
+                signing_address.unwrap_or_default().to_string(),
+            ));
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(AttestationError::FetchError(format!(
+                "HTTP {status}: {error_text}",
             )));
         }
 
         let attestation_report = response
             .json()
             .await
-            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+            .map_err(|e| AttestationError::InvalidResponse(e.to_string()))?;
         Ok(attestation_report)
     }
 

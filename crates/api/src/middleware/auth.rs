@@ -266,6 +266,7 @@ pub async fn admin_middleware(
                 }
                 Err(_) => {
                     debug!("Admin access token validation failed, trying session token");
+                    // Fall back to session token authentication
                     authenticate_session_access(&state, token.to_string()).await
                 }
             }
@@ -363,7 +364,7 @@ async fn authenticate_admin_access_token(
             Ok(admin_token)
         }
         Ok(None) => {
-            debug!("Invalid admin access token: not found, expired, or user agent mismatches");
+            debug!("Invalid admin access token: not found, expired, or User-Agent mismatches");
             Err((
                 StatusCode::UNAUTHORIZED,
                 axum::Json(crate::models::ErrorResponse::new(

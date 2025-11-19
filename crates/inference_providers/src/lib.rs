@@ -140,5 +140,5 @@ pub trait InferenceProvider {
         signing_algo: Option<String>,
         nonce: Option<String>,
         signing_address: Option<String>,
-    ) -> Result<serde_json::Map<String, serde_json::Value>, CompletionError>;
+    ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError>;
 }

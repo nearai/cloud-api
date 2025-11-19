@@ -1,5 +1,5 @@
 use inference_providers::{
-    models::{CompletionError, ListModelsError, ModelsResponse},
+    models::{AttestationError, CompletionError, ListModelsError, ModelsResponse},
     ChatCompletionParams, InferenceProvider, StreamingResult, StreamingResultExt, VLlmConfig,
     VLlmProvider,
 };
@@ -206,12 +206,32 @@ impl InferenceProviderPool {
                 );
 
                 let provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
-                    url,
+                    url.clone(),
                     self.api_key.clone(),
                     Some(self.inference_timeout_secs),
                 ))) as Arc<InferenceProviderTrait>;
 
-                providers_for_model.push(provider);
+                match provider
+                    .get_attestation_report(
+                        model_name.clone(),
+                        Some("ecdsa".to_string()),
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        providers_for_model.push(provider);
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            model = %model_name,
+                            url = %url,
+                            error = %e,
+                            "Provider failed to return attestation report, excluding from pool"
+                        );
+                    }
+                }
             }
 
             model_mapping.insert(model_name.clone(), providers_for_model);
@@ -456,7 +476,7 @@ impl InferenceProviderPool {
         signing_algo: Option<String>,
         nonce: Option<String>,
         signing_address: Option<String>,
-    ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, CompletionError> {
+    ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError> {
         // Get all providers for this model
         let mut model_attestations = vec![];
 
@@ -491,9 +511,7 @@ impl InferenceProviderPool {
         }
 
         if model_attestations.is_empty() {
-            return Err(CompletionError::CompletionError(format!(
-                "No provider found that supports attestation reports for model: {model}"
-            )));
+            return Err(AttestationError::ProviderNotFound(model));
         }
 
         Ok(model_attestations)

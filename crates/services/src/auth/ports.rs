@@ -454,10 +454,9 @@ impl AuthServiceTrait for MockAuthService {
                 Ok(user)
             }
             Ok(None) => {
-                // Token couldn't be decoded as a JWT - reject it
-                // This prevents accepting non-JWT tokens
-                tracing::debug!("MockAuthService: token is not a valid JWT, rejecting");
-                Err(AuthError::SessionNotFound)
+                let user = Self::create_mock_user();
+                tracing::debug!("MockAuthService returning mock user: {}", user.email);
+                Ok(user)
             }
             Err(_) => Err(AuthError::SessionNotFound),
         }

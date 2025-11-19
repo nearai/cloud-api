@@ -119,7 +119,6 @@ impl InferenceProvider for VLlmProvider {
             ));
         }
 
-        // Check for successful HTTP status codes (200-299)
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();

@@ -128,6 +128,12 @@ pub enum AuthError {
 
     #[error("Unauthorized")]
     Unauthorized,
+
+    #[error("Invalid user agent")]
+    InvalidUserAgent,
+
+    #[error("User agent is too long (max {0} chars)")]
+    UserAgentTooLong(usize),
 }
 
 // Repository traits
@@ -314,6 +320,7 @@ pub struct UserService {
 
 // Mock constants for testing
 const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
+pub const MOCK_USER_AGENT: &str = "Mock User Agent";
 
 /// Mock auth service that returns fake data for testing/development
 /// Used when mock auth is enabled
@@ -350,7 +357,7 @@ impl MockAuthService {
         self.create_mock_session_with_params(
             user_id,
             None,
-            Some("Mock User Agent".to_string()),
+            Some(MOCK_USER_AGENT.to_string()),
             "mock_encoding_key".to_string(),
             1,
             7 * 24,
@@ -393,7 +400,7 @@ impl MockAuthService {
             created_at: chrono::Utc::now(),
             expires_at,
             ip_address: ip_address.or(Some("127.0.0.1".to_string())),
-            user_agent: user_agent.or(Some("Mock User Agent".to_string())),
+            user_agent: user_agent.or(Some(MOCK_USER_AGENT.to_string())),
         };
 
         (access_token, session, session_token)
@@ -491,7 +498,7 @@ impl AuthServiceTrait for MockAuthService {
         user_agent: &str,
     ) -> Result<Option<Session>, AuthError> {
         // Accept the known test session token or any token that starts with "rt_"
-        if session_token.0.starts_with("rt_") && user_agent == "Mock User Agent" {
+        if session_token.0.starts_with("rt_") && user_agent == MOCK_USER_AGENT {
             let mock_user = Self::create_mock_user();
             let (_access_token, refresh_session, _refresh_token) =
                 self.create_mock_session(mock_user.id);
@@ -512,7 +519,7 @@ impl AuthServiceTrait for MockAuthService {
             user_agent
         );
         // Accept the known test session token or any token that starts with "rt_"
-        if session_token.0.starts_with("rt_") && user_agent == "Mock User Agent" {
+        if session_token.0.starts_with("rt_") && user_agent == MOCK_USER_AGENT {
             let user = Self::create_mock_user();
             let (_, session, _) = self.create_mock_session(user.id.clone());
             tracing::debug!("MockAuthService returning mock user: {}", user.email);
@@ -543,7 +550,7 @@ impl AuthServiceTrait for MockAuthService {
         let (access_token, refresh_session, refresh_token) = self.create_mock_session_with_params(
             mock_user.id,
             None,
-            Some("Mock User Agent".to_string()),
+            Some(MOCK_USER_AGENT.to_string()),
             encoding_key,
             access_token_expires_in_hours,
             refresh_token_expires_in_hours,

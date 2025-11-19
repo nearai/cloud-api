@@ -11,6 +11,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use std::sync::Arc;
 
+pub const MAX_USER_AGENT_LEN: usize = 512;
+
 #[async_trait]
 impl AuthServiceTrait for AuthService {
     async fn create_session(
@@ -22,6 +24,13 @@ impl AuthServiceTrait for AuthService {
         expires_in_hours: i64,
         refresh_expires_in_hours: i64,
     ) -> Result<(String, Session, String), AuthError> {
+        if user_agent.trim().is_empty() {
+            return Err(AuthError::InvalidUserAgent);
+        }
+        if user_agent.len() > MAX_USER_AGENT_LEN {
+            return Err(AuthError::UserAgentTooLong(MAX_USER_AGENT_LEN));
+        }
+
         let access_token =
             self.create_session_access_token(user_id.clone(), encoding_key, expires_in_hours)?;
 

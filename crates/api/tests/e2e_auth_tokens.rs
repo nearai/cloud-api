@@ -14,7 +14,7 @@ async fn test_create_access_token_from_refresh_token() {
     let response = server
         .post("/v1/users/me/access-tokens")
         .add_header("Authorization", format!("Bearer {refresh_token}"))
-        .add_header("User-Agent", "Mock User Agent")
+        .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
 
     assert_eq!(response.status_code(), 200);
@@ -34,7 +34,7 @@ async fn test_create_access_token_without_auth() {
 
     let response = server
         .post("/v1/users/me/access-tokens")
-        .add_header("User-Agent", "Mock User Agent")
+        .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
 
     assert_eq!(
@@ -53,7 +53,7 @@ async fn test_create_access_token_with_invalid_refresh_token() {
     let response = server
         .post("/v1/users/me/access-tokens")
         .add_header("Authorization", "Bearer invalid_token_xyz")
-        .add_header("User-Agent", "Mock User Agent")
+        .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
 
     assert_eq!(
@@ -77,7 +77,7 @@ async fn test_access_token_cannot_create_new_access_token() {
     let response = server
         .post("/v1/users/me/access-tokens")
         .add_header("Authorization", format!("Bearer {access_token}"))
-        .add_header("User-Agent", "Mock User Agent")
+        .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
 
     assert_eq!(
@@ -242,7 +242,7 @@ async fn test_revoke_all_tokens_prevents_refresh_token_use() {
     let response = server
         .post("/v1/users/me/access-tokens")
         .add_header("Authorization", format!("Bearer {refresh_token}"))
-        .add_header("User-Agent", "Mock User Agent")
+        .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
 
     assert_eq!(
@@ -299,7 +299,7 @@ async fn test_access_token_can_create_organization() {
     let response = server
         .post("/v1/organizations")
         .add_header("Authorization", format!("Bearer {access_token}"))
-        .add_header("User-Agent", "Mock User Agent")
+        .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&create_request)
         .await;
 
@@ -323,7 +323,7 @@ async fn test_create_access_token_success_user_agent_match() {
 
     // Simulate refresh token for user
     let refresh_token = "rt_mock_refresh_token";
-    let user_agent = "Mock User Agent";
+    let user_agent = MOCK_USER_AGENT;
 
     // Perform API request
     let response = server
@@ -375,7 +375,7 @@ async fn test_refresh_token_rotation_invalidates_old_token() {
     let response1 = server
         .post("/v1/users/me/access-tokens")
         .add_header("Authorization", format!("Bearer {old_refresh_token}"))
-        .add_header("User-Agent", "Mock User Agent")
+        .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
 
     assert_eq!(response1.status_code(), 200, "First request should succeed");
@@ -414,7 +414,7 @@ async fn test_refresh_token_rotation_invalidates_old_token() {
     let response2 = server
         .post("/v1/users/me/access-tokens")
         .add_header("Authorization", format!("Bearer {old_refresh_token}"))
-        .add_header("User-Agent", "Mock User Agent")
+        .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
 
     assert_eq!(
@@ -427,7 +427,7 @@ async fn test_refresh_token_rotation_invalidates_old_token() {
     let response3 = server
         .post("/v1/users/me/access-tokens")
         .add_header("Authorization", format!("Bearer {new_refresh_token}"))
-        .add_header("User-Agent", "Mock User Agent")
+        .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
 
     assert_eq!(

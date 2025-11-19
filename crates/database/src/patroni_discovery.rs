@@ -107,8 +107,11 @@ impl PatroniDiscovery {
         let mut leader = None;
         let mut replicas = Vec::new();
 
+        // Accept both "running" and "streaming" states as valid for member selection,
+        // since Patroni nodes may report "streaming" when actively replicating data,
+        // and both states indicate a healthy, participating cluster member.
         for member in cluster_info.members {
-            if member.state == "running" {
+            if member.state == "running" || member.state == "streaming" {
                 match member.role.as_str() {
                     "leader" | "master" => {
                         leader = Some(member);

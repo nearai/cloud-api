@@ -312,6 +312,357 @@ pub async fn delete_conversation(
     }
 }
 
+/// Pin a conversation
+///
+/// Pins a conversation to keep it at the top of the list.
+#[utoipa::path(
+    post,
+    path = "/conversations/{conversation_id}/pin",
+    tag = "Conversations",
+    params(
+        ("conversation_id" = String, Path, description = "Conversation ID")
+    ),
+    responses(
+        (status = 200, description = "Conversation pinned successfully", body = ConversationObject),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Conversation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn pin_conversation(
+    Path(conversation_id): Path<String>,
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
+) -> Result<ResponseJson<ConversationObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    debug!(
+        "Pin conversation {} for workspace {}",
+        conversation_id, api_key.workspace_id.0
+    );
+
+    let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
+        Ok(id) => id,
+        Err(error) => {
+            return Err((
+                map_conversation_error_to_status(&error),
+                ResponseJson(error.into()),
+            ))
+        }
+    };
+
+    match service
+        .pin_conversation(parsed_conversation_id, api_key.workspace_id.clone(), true)
+        .await
+    {
+        Ok(Some(domain_conversation)) => {
+            let http_conversation = convert_domain_conversation_to_http(domain_conversation);
+            debug!(
+                "Pinned conversation {} for workspace {}",
+                conversation_id, api_key.workspace_id.0
+            );
+            Ok(ResponseJson(http_conversation))
+        }
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            ResponseJson(ErrorResponse::new(
+                "Conversation not found".to_string(),
+                "not_found_error".to_string(),
+            )),
+        )),
+        Err(error) => Err((
+            map_conversation_error_to_status(&error),
+            ResponseJson(error.into()),
+        )),
+    }
+}
+
+/// Unpin a conversation
+///
+/// Unpins a conversation.
+#[utoipa::path(
+    delete,
+    path = "/conversations/{conversation_id}/pin",
+    tag = "Conversations",
+    params(
+        ("conversation_id" = String, Path, description = "Conversation ID")
+    ),
+    responses(
+        (status = 200, description = "Conversation unpinned successfully", body = ConversationObject),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Conversation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn unpin_conversation(
+    Path(conversation_id): Path<String>,
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
+) -> Result<ResponseJson<ConversationObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    debug!(
+        "Unpin conversation {} for workspace {}",
+        conversation_id, api_key.workspace_id.0
+    );
+
+    let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
+        Ok(id) => id,
+        Err(error) => {
+            return Err((
+                map_conversation_error_to_status(&error),
+                ResponseJson(error.into()),
+            ))
+        }
+    };
+
+    match service
+        .pin_conversation(parsed_conversation_id, api_key.workspace_id.clone(), false)
+        .await
+    {
+        Ok(Some(domain_conversation)) => {
+            let http_conversation = convert_domain_conversation_to_http(domain_conversation);
+            debug!(
+                "Unpinned conversation {} for workspace {}",
+                conversation_id, api_key.workspace_id.0
+            );
+            Ok(ResponseJson(http_conversation))
+        }
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            ResponseJson(ErrorResponse::new(
+                "Conversation not found".to_string(),
+                "not_found_error".to_string(),
+            )),
+        )),
+        Err(error) => Err((
+            map_conversation_error_to_status(&error),
+            ResponseJson(error.into()),
+        )),
+    }
+}
+
+/// Archive a conversation
+///
+/// Archives a conversation to hide it from the main list.
+#[utoipa::path(
+    post,
+    path = "/conversations/{conversation_id}/archive",
+    tag = "Conversations",
+    params(
+        ("conversation_id" = String, Path, description = "Conversation ID")
+    ),
+    responses(
+        (status = 200, description = "Conversation archived successfully", body = ConversationObject),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Conversation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn archive_conversation(
+    Path(conversation_id): Path<String>,
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
+) -> Result<ResponseJson<ConversationObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    debug!(
+        "Archive conversation {} for workspace {}",
+        conversation_id, api_key.workspace_id.0
+    );
+
+    let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
+        Ok(id) => id,
+        Err(error) => {
+            return Err((
+                map_conversation_error_to_status(&error),
+                ResponseJson(error.into()),
+            ))
+        }
+    };
+
+    match service
+        .archive_conversation(parsed_conversation_id, api_key.workspace_id.clone(), true)
+        .await
+    {
+        Ok(Some(domain_conversation)) => {
+            let http_conversation = convert_domain_conversation_to_http(domain_conversation);
+            debug!(
+                "Archived conversation {} for workspace {}",
+                conversation_id, api_key.workspace_id.0
+            );
+            Ok(ResponseJson(http_conversation))
+        }
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            ResponseJson(ErrorResponse::new(
+                "Conversation not found".to_string(),
+                "not_found_error".to_string(),
+            )),
+        )),
+        Err(error) => Err((
+            map_conversation_error_to_status(&error),
+            ResponseJson(error.into()),
+        )),
+    }
+}
+
+/// Unarchive a conversation
+///
+/// Unarchives a conversation to show it in the main list again.
+#[utoipa::path(
+    delete,
+    path = "/conversations/{conversation_id}/archive",
+    tag = "Conversations",
+    params(
+        ("conversation_id" = String, Path, description = "Conversation ID")
+    ),
+    responses(
+        (status = 200, description = "Conversation unarchived successfully", body = ConversationObject),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Conversation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn unarchive_conversation(
+    Path(conversation_id): Path<String>,
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
+) -> Result<ResponseJson<ConversationObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    debug!(
+        "Unarchive conversation {} for workspace {}",
+        conversation_id, api_key.workspace_id.0
+    );
+
+    let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
+        Ok(id) => id,
+        Err(error) => {
+            return Err((
+                map_conversation_error_to_status(&error),
+                ResponseJson(error.into()),
+            ))
+        }
+    };
+
+    match service
+        .archive_conversation(parsed_conversation_id, api_key.workspace_id.clone(), false)
+        .await
+    {
+        Ok(Some(domain_conversation)) => {
+            let http_conversation = convert_domain_conversation_to_http(domain_conversation);
+            debug!(
+                "Unarchived conversation {} for workspace {}",
+                conversation_id, api_key.workspace_id.0
+            );
+            Ok(ResponseJson(http_conversation))
+        }
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            ResponseJson(ErrorResponse::new(
+                "Conversation not found".to_string(),
+                "not_found_error".to_string(),
+            )),
+        )),
+        Err(error) => Err((
+            map_conversation_error_to_status(&error),
+            ResponseJson(error.into()),
+        )),
+    }
+}
+
+/// Clone a conversation
+///
+/// Creates a copy of an existing conversation with a new ID.
+#[utoipa::path(
+    post,
+    path = "/conversations/{conversation_id}/clone",
+    tag = "Conversations",
+    params(
+        ("conversation_id" = String, Path, description = "Conversation ID")
+    ),
+    responses(
+        (status = 201, description = "Conversation cloned successfully", body = ConversationObject),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Conversation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn clone_conversation(
+    Path(conversation_id): Path<String>,
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
+) -> Result<(StatusCode, ResponseJson<ConversationObject>), (StatusCode, ResponseJson<ErrorResponse>)>
+{
+    debug!(
+        "Clone conversation {} for workspace {}",
+        conversation_id, api_key.workspace_id.0
+    );
+
+    let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
+        Ok(id) => id,
+        Err(error) => {
+            return Err((
+                map_conversation_error_to_status(&error),
+                ResponseJson(error.into()),
+            ))
+        }
+    };
+
+    // Parse API key ID from string to UUID
+    let api_key_uuid = uuid::Uuid::parse_str(&api_key.id.0).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse::new(
+                format!("Invalid API key ID format: {e}"),
+                "internal_server_error".to_string(),
+            )),
+        )
+    })?;
+
+    match service
+        .clone_conversation(
+            parsed_conversation_id,
+            api_key.workspace_id.clone(),
+            api_key_uuid,
+        )
+        .await
+    {
+        Ok(Some(domain_conversation)) => {
+            let http_conversation = convert_domain_conversation_to_http(domain_conversation);
+            debug!(
+                "Cloned conversation {} -> {} for workspace {}",
+                conversation_id, http_conversation.id, api_key.workspace_id.0
+            );
+            Ok((StatusCode::CREATED, ResponseJson(http_conversation)))
+        }
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            ResponseJson(ErrorResponse::new(
+                "Conversation not found".to_string(),
+                "not_found_error".to_string(),
+            )),
+        )),
+        Err(error) => Err((
+            map_conversation_error_to_status(&error),
+            ResponseJson(error.into()),
+        )),
+    }
+}
+
 /// List conversation messages
 ///
 /// Get all messages and responses in a conversation, sorted by creation time.
@@ -598,6 +949,7 @@ fn convert_input_item_to_response_item(
                 status: services::responses::models::ResponseItemStatus::Completed,
                 role,
                 content: response_content,
+                model: String::new(), // Will be enriched by repository
             })
         }
     }
@@ -618,6 +970,7 @@ fn convert_output_item_to_conversation_item(
             status,
             role,
             content,
+            model,
         } => {
             // Convert ResponseOutputContent to ConversationContentPart
             // For user messages, use input_text; for assistant/system, use output_text
@@ -661,6 +1014,7 @@ fn convert_output_item_to_conversation_item(
                 role,
                 content: conv_content,
                 metadata: None,
+                model,
             }
         }
         ResponseOutputItem::ToolCall {
@@ -672,6 +1026,7 @@ fn convert_output_item_to_conversation_item(
             status,
             tool_type,
             function,
+            model,
         } => ConversationItem::ToolCall {
             id,
             response_id,
@@ -684,6 +1039,7 @@ fn convert_output_item_to_conversation_item(
                 name: function.name,
                 arguments: function.arguments,
             },
+            model,
         },
         ResponseOutputItem::WebSearchCall {
             id,
@@ -693,6 +1049,7 @@ fn convert_output_item_to_conversation_item(
             created_at,
             status,
             action,
+            model,
         } => ConversationItem::WebSearchCall {
             id,
             response_id,
@@ -705,6 +1062,7 @@ fn convert_output_item_to_conversation_item(
                     ConversationItemWebSearchAction::Search { query }
                 }
             },
+            model,
         },
         ResponseOutputItem::Reasoning {
             id,
@@ -715,6 +1073,7 @@ fn convert_output_item_to_conversation_item(
             status,
             summary,
             content,
+            model,
         } => ConversationItem::Reasoning {
             id,
             response_id,
@@ -724,6 +1083,7 @@ fn convert_output_item_to_conversation_item(
             status: convert_response_item_status(status),
             summary,
             content,
+            model,
         },
     }
 }
@@ -762,11 +1122,30 @@ fn convert_response_item_status(
 fn convert_domain_conversation_to_http(
     domain_conversation: services::conversations::models::Conversation,
 ) -> ConversationObject {
+    let mut metadata = domain_conversation
+        .metadata
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+
+    if let Some(pinned_at) = domain_conversation.pinned_at {
+        metadata.insert(
+            "pinned_at".to_string(),
+            serde_json::json!(pinned_at.timestamp()),
+        );
+    }
+    if let Some(archived_at) = domain_conversation.archived_at {
+        metadata.insert(
+            "archived_at".to_string(),
+            serde_json::json!(archived_at.timestamp()),
+        );
+    }
+
     ConversationObject {
         id: domain_conversation.id.to_string(),
         object: "conversation".to_string(),
         created_at: domain_conversation.created_at.timestamp(),
-        metadata: domain_conversation.metadata,
+        metadata: serde_json::Value::Object(metadata),
     }
 }
 

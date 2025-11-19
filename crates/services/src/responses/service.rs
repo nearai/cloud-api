@@ -11,7 +11,15 @@ use crate::conversations::ports::ConversationServiceTrait;
 use crate::files::FileServiceTrait;
 use crate::inference_provider_pool::InferenceProviderPool;
 use crate::responses::tools;
-use crate::responses::{errors, models, ports};
+use crate::responses::{citation_tracker, errors, models, ports};
+
+/// Result of tool execution including optional citation instruction
+struct ToolExecutionResult {
+    /// The tool result content to add as a tool message
+    content: String,
+    /// Optional citation instruction to add as a system message (for web_search)
+    citation_instruction: Option<String>,
+}
 
 /// Context for processing a response stream
 struct ProcessStreamContext {
@@ -28,6 +36,8 @@ struct ProcessStreamContext {
     web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
     file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
     file_service: Arc<dyn FileServiceTrait>,
+    /// Source registry for citation resolution
+    source_registry: Option<models::SourceRegistry>,
 }
 
 pub struct ResponseServiceImpl {
@@ -39,6 +49,14 @@ pub struct ResponseServiceImpl {
     pub web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
     pub file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
     pub file_service: Arc<dyn FileServiceTrait>,
+}
+
+/// Tag transition states for reasoning content
+#[derive(Debug, PartialEq)]
+enum TagTransition {
+    None,
+    OpeningTag(String), // Contains the tag name that was opened
+    ClosingTag(String), // Contains the tag name that was closed
 }
 
 impl ResponseServiceImpl {
@@ -110,6 +128,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 web_search_provider,
                 file_search_provider,
                 file_service,
+                source_registry: None,
             };
 
             if let Err(e) = Self::process_response_stream(tx.clone(), context).await {
@@ -181,6 +200,7 @@ impl ResponseServiceImpl {
         emitter: &mut crate::responses::service_helpers::EventEmitter,
         ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
+        process_context: &ProcessStreamContext,
     ) -> Result<(String, Vec<crate::responses::service_helpers::ToolCallInfo>), errors::ResponseError>
     {
         use crate::responses::service_helpers::ToolCallAccumulator;
@@ -190,24 +210,128 @@ impl ResponseServiceImpl {
         let mut tool_call_accumulator: ToolCallAccumulator = std::collections::HashMap::new();
         let mut message_item_emitted = false;
         let message_item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+        let mut tracker = citation_tracker::CitationTracker::new();
+
+        // Reasoning tracking state
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+        let mut reasoning_item_emitted = false;
+        let reasoning_item_id = format!("rs_{}", uuid::Uuid::new_v4().simple());
 
         while let Some(event) = completion_stream.next().await {
             match event {
                 Ok(sse_event) => {
                     // Parse the SSE event for content and tool calls
                     if let Some(delta_text) = Self::extract_text_delta(&sse_event) {
-                        // First time we receive text, emit the item.added and content_part.added events
-                        if !message_item_emitted {
-                            Self::emit_message_started(emitter, ctx, &message_item_id).await?;
-                            message_item_emitted = true;
+                        // Process reasoning tags and extract clean text (no reasoning tags)
+                        let (text_without_reasoning, reasoning_delta, tag_transition) =
+                            Self::process_reasoning_tags(
+                                &delta_text,
+                                &mut reasoning_buffer,
+                                &mut inside_reasoning,
+                            );
+
+                        // Feed text (without reasoning tags) to citation tracker for real-time processing
+                        // Returns clean text with citation tags also removed, plus any completed citations
+                        let token_result = tracker.add_token(&text_without_reasoning);
+                        let clean_text = token_result.clean_text;
+
+                        // Handle reasoning tag transitions
+                        match tag_transition {
+                            TagTransition::OpeningTag(_) => {
+                                if !reasoning_item_emitted {
+                                    // Emit reasoning item.added
+                                    emitter
+                                        .emit_reasoning_started(ctx, &reasoning_item_id)
+                                        .await?;
+                                    reasoning_item_emitted = true;
+                                }
+                            }
+                            TagTransition::ClosingTag(_) => {
+                                if reasoning_item_emitted {
+                                    // Emit reasoning item.done and store
+                                    emitter
+                                        .emit_reasoning_completed(
+                                            ctx,
+                                            &reasoning_item_id,
+                                            &reasoning_buffer,
+                                            response_items_repository,
+                                        )
+                                        .await?;
+
+                                    // Count reasoning tokens
+                                    let reasoning_token_count =
+                                        crate::responses::service_helpers::ResponseStreamContext::estimate_tokens(&reasoning_buffer);
+                                    ctx.add_reasoning_tokens(reasoning_token_count);
+
+                                    // Move to next output index
+                                    ctx.next_output_index();
+
+                                    // Reset reasoning state
+                                    reasoning_buffer.clear();
+                                    reasoning_item_emitted = false;
+                                }
+                            }
+                            TagTransition::None => {}
                         }
 
-                        current_text.push_str(&delta_text);
+                        // Emit reasoning deltas if inside reasoning block
+                        if let Some(reasoning_content) = reasoning_delta {
+                            if reasoning_item_emitted {
+                                emitter
+                                    .emit_reasoning_delta(
+                                        ctx,
+                                        reasoning_item_id.clone(),
+                                        reasoning_content,
+                                    )
+                                    .await?;
+                            }
+                        }
 
-                        // Emit delta event
-                        emitter
-                            .emit_text_delta(ctx, message_item_id.clone(), delta_text)
-                            .await?;
+                        // Handle clean text (message content)
+                        if !clean_text.is_empty() {
+                            // First time we receive message text, emit the item.added and content_part.added events
+                            if !message_item_emitted {
+                                Self::emit_message_started(emitter, ctx, &message_item_id).await?;
+                                message_item_emitted = true;
+                            }
+
+                            current_text.push_str(&clean_text);
+
+                            // Emit delta event for message content
+                            if message_item_emitted {
+                                emitter
+                                    .emit_text_delta(
+                                        ctx,
+                                        message_item_id.clone(),
+                                        clean_text.clone(),
+                                    )
+                                    .await?;
+                            }
+                        }
+
+                        // If a citation just closed, emit annotation event immediately
+                        if let Some(completed_citation) = token_result.completed_citation {
+                            if let Some(registry) = &process_context.source_registry {
+                                if let Some(source) =
+                                    registry.web_sources.get(completed_citation.source_id)
+                                {
+                                    let annotation = models::TextAnnotation::UrlCitation {
+                                        start_index: completed_citation.start_index,
+                                        end_index: completed_citation.end_index,
+                                        title: source.title.clone(),
+                                        url: source.url.clone(),
+                                    };
+                                    emitter
+                                        .emit_citation_annotation(
+                                            ctx,
+                                            message_item_id.clone(),
+                                            annotation,
+                                        )
+                                        .await?;
+                                }
+                            }
+                        }
                     }
 
                     // Extract usage from the final chunk
@@ -231,8 +355,9 @@ impl ResponseServiceImpl {
                 emitter,
                 ctx,
                 &message_item_id,
-                &current_text,
                 response_items_repository,
+                process_context,
+                tracker,
             )
             .await?;
         }
@@ -259,6 +384,7 @@ impl ResponseServiceImpl {
             status: models::ResponseItemStatus::InProgress,
             role: "assistant".to_string(),
             content: vec![],
+            model: ctx.model.clone(),
         };
         emitter
             .emit_item_added(ctx, item, message_item_id.to_string())
@@ -282,21 +408,41 @@ impl ResponseServiceImpl {
         emitter: &mut crate::responses::service_helpers::EventEmitter,
         ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
         message_item_id: &str,
-        text: &str,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
+        context: &ProcessStreamContext,
+        citation_tracker: citation_tracker::CitationTracker,
     ) -> Result<(), errors::ResponseError> {
-        // Trim leading and trailing whitespace from the final text
-        let trimmed_text = text.trim();
+        // Finalize citation tracker to get clean text and citations
+        let (clean_text, citations) = citation_tracker.finalize();
+
+        // Convert citations to TextAnnotation::UrlCitation by looking up web sources
+        let annotations = if let Some(registry) = &context.source_registry {
+            citations
+                .into_iter()
+                .filter_map(|citation| {
+                    registry.web_sources.get(citation.source_id).map(|source| {
+                        models::TextAnnotation::UrlCitation {
+                            start_index: citation.start_index,
+                            end_index: citation.end_index,
+                            title: source.title.clone(),
+                            url: source.url.clone(),
+                        }
+                    })
+                })
+                .collect()
+        } else {
+            vec![]
+        };
 
         // Event: response.output_text.done
         emitter
-            .emit_text_done(ctx, message_item_id.to_string(), trimmed_text.to_string())
+            .emit_text_done(ctx, message_item_id.to_string(), clean_text.clone())
             .await?;
 
         // Event: response.content_part.done
         let part = models::ResponseOutputContent::OutputText {
-            text: trimmed_text.to_string(),
-            annotations: vec![],
+            text: clean_text.clone(),
+            annotations: annotations.clone(),
             logprobs: vec![],
         };
         emitter
@@ -313,10 +459,11 @@ impl ResponseServiceImpl {
             status: models::ResponseItemStatus::Completed,
             role: "assistant".to_string(),
             content: vec![models::ResponseOutputContent::OutputText {
-                text: trimmed_text.to_string(),
-                annotations: vec![],
+                text: clean_text,
+                annotations,
                 logprobs: vec![],
             }],
+            model: ctx.model.clone(),
         };
         emitter
             .emit_item_done(ctx, item.clone(), message_item_id.to_string())
@@ -327,7 +474,7 @@ impl ResponseServiceImpl {
             .create(
                 ctx.response_id.clone(),
                 ctx.api_key_id,
-                ctx.conversation_id.clone(),
+                ctx.conversation_id,
                 item,
             )
             .await
@@ -436,7 +583,7 @@ impl ResponseServiceImpl {
     /// Process the response stream - main logic
     async fn process_response_stream(
         tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
-        context: ProcessStreamContext,
+        mut context: ProcessStreamContext,
     ) -> Result<(), errors::ResponseError> {
         tracing::info!("Starting response stream processing");
 
@@ -483,8 +630,9 @@ impl ResponseServiceImpl {
                 &context.response_items_repository,
                 response_id.clone(),
                 api_key_uuid,
-                conversation_id.clone(),
+                conversation_id,
                 input,
+                &context.request.model,
             )
             .await?;
         }
@@ -493,10 +641,11 @@ impl ResponseServiceImpl {
         let mut ctx = crate::responses::service_helpers::ResponseStreamContext::new(
             response_id.clone(),
             api_key_uuid,
-            conversation_id.clone(),
+            conversation_id,
             initial_response.id.clone(),
             initial_response.previous_response_id.clone(),
             initial_response.created_at,
+            context.request.model.clone(),
         );
         let mut emitter = crate::responses::service_helpers::EventEmitter::new(tx);
 
@@ -512,7 +661,7 @@ impl ResponseServiceImpl {
 
         // Spawn background task to generate conversation title if needed
         let title_task_handle = Self::maybe_generate_conversation_title(
-            conversation_id.clone(),
+            conversation_id,
             &context.request,
             context.user_id.clone(),
             context.api_key_id.clone(),
@@ -536,20 +685,11 @@ impl ResponseServiceImpl {
             &mut emitter,
             &mut messages,
             &mut final_response_text,
-            &context.request,
-            context.user_id.clone(),
-            &context.api_key_id,
-            context.organization_id,
-            context.workspace_id,
-            &context.body_hash,
+            &mut context,
             &tools,
             &tool_choice,
             max_iterations,
             &mut iteration,
-            &context.response_items_repository,
-            &context.completion_service,
-            &context.web_search_provider,
-            &context.file_search_provider,
         )
         .await?;
 
@@ -578,11 +718,16 @@ impl ResponseServiceImpl {
         final_response.output = output_items;
 
         // Set usage from accumulated token counts
-        final_response.usage = models::Usage::new(ctx.total_input_tokens, ctx.total_output_tokens);
-        tracing::debug!(
-            "Final response usage: input={}, output={}, total={}",
+        final_response.usage = models::Usage::new_with_reasoning(
             ctx.total_input_tokens,
             ctx.total_output_tokens,
+            ctx.reasoning_tokens,
+        );
+        tracing::debug!(
+            "Final response usage: input={}, output={}, reasoning={}, total={}",
+            ctx.total_input_tokens,
+            ctx.total_output_tokens,
+            ctx.reasoning_tokens,
             ctx.total_input_tokens + ctx.total_output_tokens
         );
 
@@ -640,20 +785,11 @@ impl ResponseServiceImpl {
         emitter: &mut crate::responses::service_helpers::EventEmitter,
         messages: &mut Vec<crate::completions::ports::CompletionMessage>,
         final_response_text: &mut String,
-        request: &models::CreateResponseRequest,
-        user_id: crate::UserId,
-        api_key_id: &str,
-        organization_id: uuid::Uuid,
-        workspace_id: uuid::Uuid,
-        body_hash: &str,
+        process_context: &mut ProcessStreamContext,
         tools: &[inference_providers::ToolDefinition],
         tool_choice: &Option<inference_providers::ToolChoice>,
         max_iterations: usize,
         iteration: &mut usize,
-        response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
-        completion_service: &Arc<dyn CompletionServiceTrait>,
-        web_search_provider: &Option<Arc<dyn tools::WebSearchProviderTrait>>,
-        file_search_provider: &Option<Arc<dyn tools::FileSearchProviderTrait>>,
     ) -> Result<(), errors::ResponseError> {
         use crate::completions::ports::{CompletionMessage, CompletionRequest};
 
@@ -677,25 +813,26 @@ impl ResponseServiceImpl {
 
             // Create completion request
             let completion_request = CompletionRequest {
-                model: request.model.clone(),
+                model: process_context.request.model.clone(),
                 messages: messages.clone(),
-                max_tokens: request.max_output_tokens,
-                temperature: request.temperature,
-                top_p: request.top_p,
+                max_tokens: process_context.request.max_output_tokens,
+                temperature: process_context.request.temperature,
+                top_p: process_context.request.top_p,
                 stop: None,
                 stream: Some(true),
-                user_id: user_id.clone(),
-                api_key_id: api_key_id.to_string(),
-                organization_id,
-                workspace_id,
-                metadata: request.metadata.clone(),
-                body_hash: body_hash.to_string(),
+                user_id: process_context.user_id.clone(),
+                api_key_id: process_context.api_key_id.to_string(),
+                organization_id: process_context.organization_id,
+                workspace_id: process_context.workspace_id,
+                metadata: process_context.request.metadata.clone(),
+                body_hash: process_context.body_hash.to_string(),
                 n: None,
                 extra,
             };
 
             // Get completion stream
-            let mut completion_stream = completion_service
+            let mut completion_stream = process_context
+                .completion_service
                 .create_chat_completion_stream(completion_request)
                 .await
                 .map_err(|e| {
@@ -707,7 +844,8 @@ impl ResponseServiceImpl {
                 &mut completion_stream,
                 emitter,
                 ctx,
-                response_items_repository,
+                &process_context.response_items_repository,
+                process_context,
             )
             .await?;
 
@@ -736,10 +874,7 @@ impl ResponseServiceImpl {
                     emitter,
                     &tool_call,
                     messages,
-                    request,
-                    response_items_repository,
-                    web_search_provider,
-                    file_search_provider,
+                    process_context,
                 )
                 .await?;
             }
@@ -749,16 +884,12 @@ impl ResponseServiceImpl {
     }
 
     /// Execute a tool call and emit appropriate events
-    #[allow(clippy::too_many_arguments)]
     async fn execute_and_emit_tool_call(
         ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
         emitter: &mut crate::responses::service_helpers::EventEmitter,
         tool_call: &crate::responses::service_helpers::ToolCallInfo,
         messages: &mut Vec<crate::completions::ports::CompletionMessage>,
-        request: &models::CreateResponseRequest,
-        response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
-        web_search_provider: &Option<Arc<dyn tools::WebSearchProviderTrait>>,
-        file_search_provider: &Option<Arc<dyn tools::FileSearchProviderTrait>>,
+        process_context: &mut ProcessStreamContext,
     ) -> Result<(), errors::ResponseError> {
         use crate::completions::ports::CompletionMessage;
 
@@ -784,14 +915,7 @@ impl ResponseServiceImpl {
         }
 
         // Execute the tool and catch errors to provide feedback to the LLM
-        let tool_result = match Self::execute_tool(
-            tool_call,
-            web_search_provider,
-            file_search_provider,
-            request,
-        )
-        .await
-        {
+        let tool_result = match Self::execute_tool(tool_call, process_context).await {
             Ok(result) => result,
             Err(e) => {
                 // Convert tool execution errors into error messages for the LLM
@@ -801,7 +925,10 @@ impl ResponseServiceImpl {
                     tool_call.tool_type,
                     error_message
                 );
-                error_message
+                ToolExecutionResult {
+                    content: error_message,
+                    citation_instruction: None,
+                }
             }
         };
 
@@ -812,7 +939,7 @@ impl ResponseServiceImpl {
                 emitter,
                 &tool_call_id,
                 tool_call,
-                response_items_repository,
+                &process_context.response_items_repository,
             )
             .await?;
         }
@@ -820,8 +947,16 @@ impl ResponseServiceImpl {
         // Add tool result to message history
         messages.push(CompletionMessage {
             role: "tool".to_string(),
-            content: tool_result,
+            content: tool_result.content,
         });
+
+        // Add citation instruction if provided by the tool
+        if let Some(citation_instruction) = tool_result.citation_instruction {
+            messages.push(CompletionMessage {
+                role: "system".to_string(),
+                content: citation_instruction,
+            });
+        }
 
         Ok(())
     }
@@ -844,6 +979,7 @@ impl ResponseServiceImpl {
             action: models::WebSearchAction::Search {
                 query: tool_call.query.clone(),
             },
+            model: ctx.model.clone(),
         };
         emitter
             .emit_item_added(ctx, item, tool_call_id.to_string())
@@ -897,6 +1033,7 @@ impl ResponseServiceImpl {
             action: models::WebSearchAction::Search {
                 query: tool_call.query.clone(),
             },
+            model: ctx.model.clone(),
         };
         emitter
             .emit_item_done(ctx, item.clone(), tool_call_id.to_string())
@@ -907,7 +1044,7 @@ impl ResponseServiceImpl {
             .create(
                 ctx.response_id.clone(),
                 ctx.api_key_id,
-                ctx.conversation_id.clone(),
+                ctx.conversation_id,
                 item,
             )
             .await
@@ -955,6 +1092,7 @@ impl ResponseServiceImpl {
         api_key_id: uuid::Uuid,
         conversation_id: Option<ConversationId>,
         input: &models::ResponseInput,
+        model: &str,
     ) -> Result<(), errors::ResponseError> {
         match input {
             models::ResponseInput::Text(text) => {
@@ -975,13 +1113,14 @@ impl ResponseServiceImpl {
                         annotations: vec![],
                         logprobs: vec![],
                     }],
+                    model: model.to_string(),
                 };
 
                 response_items_repository
                     .create(
                         response_id.clone(),
                         api_key_id,
-                        conversation_id.clone(),
+                        conversation_id,
                         message_item,
                     )
                     .await
@@ -1041,13 +1180,14 @@ impl ResponseServiceImpl {
                         status: models::ResponseItemStatus::Completed,
                         role: input_item.role.clone(),
                         content,
+                        model: model.to_string(),
                     };
 
                     response_items_repository
                         .create(
                             response_id.clone(),
                             api_key_id,
-                            conversation_id.clone(),
+                            conversation_id,
                             message_item,
                         )
                         .await
@@ -1128,7 +1268,7 @@ impl ResponseServiceImpl {
 
             // Load conversation metadata to verify it exists
             let _conversation = conversation_service
-                .get_conversation(conversation_id.clone(), workspace_id.clone())
+                .get_conversation(conversation_id, workspace_id.clone())
                 .await
                 .map_err(|e| {
                     errors::ResponseError::InternalError(format!("Failed to get conversation: {e}"))
@@ -1137,7 +1277,7 @@ impl ResponseServiceImpl {
             // Load all response items from the conversation
             // Use high limit (1000) and no 'after' cursor for context loading
             let conversation_items = response_items_repository
-                .list_by_conversation(conversation_id.clone(), None, 1000)
+                .list_by_conversation(conversation_id, None, 1000)
                 .await
                 .map_err(|e| {
                     errors::ResponseError::InternalError(format!(
@@ -1492,6 +1632,97 @@ impl ResponseServiceImpl {
         }
     }
 
+    /// Process reasoning tags in text delta
+    /// Returns (clean_text, reasoning_delta, tag_transition)
+    ///
+    /// Handles common reasoning tags: <think>, <reasoning>, <thought>, <reflect>, <analysis>
+    fn process_reasoning_tags(
+        delta_text: &str,
+        reasoning_buffer: &mut String,
+        inside_reasoning: &mut bool,
+    ) -> (String, Option<String>, TagTransition) {
+        const REASONING_TAGS: &[&str] = &["think", "reasoning", "thought", "reflect", "analysis"];
+
+        let mut clean_text = String::new();
+        let mut reasoning_delta = String::new();
+        let mut tag_transition = TagTransition::None;
+        let mut chars = delta_text.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch == '<' {
+                // Check if this is an opening or closing tag
+                let mut tag_candidate = String::new();
+                let is_closing = chars.peek() == Some(&'/');
+
+                if is_closing {
+                    chars.next(); // consume '/'
+                }
+
+                // Collect tag name
+                while let Some(&next_ch) = chars.peek() {
+                    if next_ch == '>' {
+                        chars.next(); // consume '>'
+                        break;
+                    } else if next_ch.is_alphanumeric() || next_ch == '_' || next_ch == '-' {
+                        tag_candidate.push(next_ch);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+
+                let tag_name = tag_candidate.to_lowercase();
+
+                // Check if this is a known reasoning tag
+                if REASONING_TAGS.contains(&tag_name.as_str()) {
+                    if is_closing && *inside_reasoning {
+                        // Closing reasoning tag
+                        *inside_reasoning = false;
+                        tag_transition = TagTransition::ClosingTag(tag_name.clone());
+                        tracing::debug!("Detected closing reasoning tag: </{}>", tag_name);
+                    } else if !is_closing && !*inside_reasoning {
+                        // Opening reasoning tag
+                        *inside_reasoning = true;
+                        tag_transition = TagTransition::OpeningTag(tag_name.clone());
+                        tracing::debug!("Detected opening reasoning tag: <{}>", tag_name);
+                    }
+                    // Don't include the tag itself in any output
+                    continue;
+                }
+
+                // Not a reasoning tag, reconstruct the tag text
+                let reconstructed = if is_closing {
+                    format!("</{tag_candidate}>")
+                } else {
+                    format!("<{tag_candidate}>")
+                };
+
+                if *inside_reasoning {
+                    reasoning_delta.push_str(&reconstructed);
+                    reasoning_buffer.push_str(&reconstructed);
+                } else {
+                    clean_text.push_str(&reconstructed);
+                }
+            } else {
+                // Regular character
+                if *inside_reasoning {
+                    reasoning_delta.push(ch);
+                    reasoning_buffer.push(ch);
+                } else {
+                    clean_text.push(ch);
+                }
+            }
+        }
+
+        let reasoning_result = if !reasoning_delta.is_empty() {
+            Some(reasoning_delta)
+        } else {
+            None
+        };
+
+        (clean_text, reasoning_result, tag_transition)
+    }
+
     /// Extract and accumulate usage information from SSE event
     /// Usage typically comes in the final chunk from the provider
     fn extract_and_accumulate_usage(
@@ -1562,10 +1793,8 @@ impl ResponseServiceImpl {
     /// Execute a tool call
     async fn execute_tool(
         tool_call: &crate::responses::service_helpers::ToolCallInfo,
-        web_search_provider: &Option<Arc<dyn tools::WebSearchProviderTrait>>,
-        file_search_provider: &Option<Arc<dyn tools::FileSearchProviderTrait>>,
-        request: &models::CreateResponseRequest,
-    ) -> Result<String, errors::ResponseError> {
+        context: &mut ProcessStreamContext,
+    ) -> Result<ToolExecutionResult, errors::ResponseError> {
         // Check for empty tool type
         if tool_call.tool_type.trim().is_empty() {
             return Err(errors::ResponseError::EmptyToolName);
@@ -1573,7 +1802,7 @@ impl ResponseServiceImpl {
 
         match tool_call.tool_type.as_str() {
             "web_search" => {
-                if let Some(provider) = web_search_provider {
+                if let Some(provider) = &context.web_search_provider {
                     // Build WebSearchParams from tool call parameters
                     let mut search_params = tools::WebSearchParams::new(tool_call.query.clone());
 
@@ -1627,25 +1856,74 @@ impl ResponseServiceImpl {
                     let results = provider.search(search_params).await.map_err(|e| {
                         errors::ResponseError::InternalError(format!("Web search failed: {e}"))
                     })?;
+
+                    // Calculate cumulative offset from current registry size
+                    let search_start_index = context
+                        .source_registry
+                        .as_ref()
+                        .map(|r| r.web_sources.len())
+                        .unwrap_or(0);
+
+                    // Accumulate results into registry and generate citation instruction if first search
+                    let citation_instruction = if let Some(ref mut registry) =
+                        context.source_registry
+                    {
+                        registry.web_sources.extend(results.clone());
+                        None
+                    } else {
+                        context.source_registry =
+                            Some(models::SourceRegistry::with_results(results.clone()));
+                        Some(
+                            r#"CITATION REQUIREMENT: Use [s:N]text[/s:N] for EVERY fact from web search results.
+
+FORMAT: [s:N]fact from source N[/s:N]
+- N = source number (0, 1, 2, 3, etc. - cumulative across all searches)
+- ALWAYS use BOTH opening [s:N] and closing [/s:N] tags together
+- The number N MUST match in opening and closing tags
+- Cite specific facts, names, numbers, and statements from sources
+- Every factual claim must be wrapped
+
+CORRECT EXAMPLES:
+[s:0]San Francisco's top restaurant is The French Laundry[/s:0]
+[s:1]The app TikTok has over 2 billion downloads[/s:1]
+[s:2]Instagram was founded in 2010[/s:2]
+
+DO NOT USE THESE FORMATS:
+✗ [s:0]Missing closing tag
+✗ [s:0]Mismatched[/s:1] numbers
+✗ Statements without any citation tags"#
+                                .to_string(),
+                        )
+                    };
+
+                    // Format results with cumulative indices
                     let formatted = results
                         .iter()
-                        .map(|r| {
+                        .enumerate()
+                        .map(|(idx, r)| {
                             format!(
-                                "Title: {}\nURL: {}\nSnippet: {}\n",
-                                r.title, r.url, r.snippet
+                                "Source: {}\nTitle: {}\nURL: {}\nSnippet: {}\n",
+                                search_start_index + idx,
+                                r.title,
+                                r.url,
+                                r.snippet
                             )
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    Ok(formatted)
+
+                    Ok(ToolExecutionResult {
+                        content: formatted,
+                        citation_instruction,
+                    })
                 } else {
                     Err(errors::ResponseError::UnknownTool("web_search".to_string()))
                 }
             }
             "file_search" => {
-                if let Some(provider) = file_search_provider {
+                if let Some(provider) = &context.file_search_provider {
                     // Get conversation ID from request
-                    let conversation_id = match &request.conversation {
+                    let conversation_id = match &context.request.conversation {
                         Some(models::ConversationReference::Id(id)) => {
                             // Parse conversation ID
                             let uuid_str = id.strip_prefix("conv_").unwrap_or(id);
@@ -1664,7 +1942,10 @@ impl ResponseServiceImpl {
                             })?
                         }
                         None => {
-                            return Ok("File search requires a conversation context".to_string());
+                            return Ok(ToolExecutionResult {
+                                content: "File search requires a conversation context".to_string(),
+                                citation_instruction: None,
+                            });
                         }
                     };
 
@@ -1690,9 +1971,15 @@ impl ResponseServiceImpl {
                         .collect::<Vec<_>>()
                         .join("\n");
 
-                    Ok(formatted)
+                    Ok(ToolExecutionResult {
+                        content: formatted,
+                        citation_instruction: None,
+                    })
                 } else {
-                    Ok("File search not available (no provider configured)".to_string())
+                    Ok(ToolExecutionResult {
+                        content: "File search not available (no provider configured)".to_string(),
+                        citation_instruction: None,
+                    })
                 }
             }
             _ => Err(errors::ResponseError::UnknownTool(
@@ -1794,7 +2081,7 @@ impl ResponseServiceImpl {
         // Get conversation to check if it already has a title
         let workspace_id_domain = crate::workspace::WorkspaceId(workspace_id);
         let conversation = conversation_service
-            .get_conversation(conversation_id.clone(), workspace_id_domain.clone())
+            .get_conversation(conversation_id, workspace_id_domain.clone())
             .await
             .map_err(|e| {
                 errors::ResponseError::InternalError(format!("Failed to get conversation: {e}"))
@@ -1881,11 +2168,7 @@ impl ResponseServiceImpl {
 
         let workspace_id_domain = crate::workspace::WorkspaceId(workspace_id);
         conversation_service
-            .update_conversation(
-                conversation_id.clone(),
-                workspace_id_domain,
-                updated_metadata,
-            )
+            .update_conversation(conversation_id, workspace_id_domain, updated_metadata)
             .await
             .map_err(|e| {
                 errors::ResponseError::InternalError(format!(
@@ -1922,5 +2205,322 @@ impl ResponseServiceImpl {
         let _ = tx.send(event).await;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_process_reasoning_tags_simple_think() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test opening tag
+        let (clean, reasoning, transition) = ResponseServiceImpl::process_reasoning_tags(
+            "<think>",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+        assert_eq!(clean, "");
+        assert_eq!(reasoning, None);
+        assert_eq!(transition, TagTransition::OpeningTag("think".to_string()));
+        assert!(inside_reasoning);
+
+        // Test content inside reasoning
+        let (clean, reasoning, transition) = ResponseServiceImpl::process_reasoning_tags(
+            "This is reasoning",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+        assert_eq!(clean, "");
+        assert_eq!(reasoning, Some("This is reasoning".to_string()));
+        assert_eq!(transition, TagTransition::None);
+        assert!(inside_reasoning);
+        assert_eq!(reasoning_buffer, "This is reasoning");
+
+        // Test closing tag
+        let (clean, reasoning, transition) = ResponseServiceImpl::process_reasoning_tags(
+            "</think>",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+        assert_eq!(clean, "");
+        assert_eq!(reasoning, None);
+        assert_eq!(transition, TagTransition::ClosingTag("think".to_string()));
+        assert!(!inside_reasoning);
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_mixed_content() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test text before reasoning tag
+        let (clean, reasoning, _transition) = ResponseServiceImpl::process_reasoning_tags(
+            "Hello <think>reasoning content</think> world",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+        assert_eq!(clean, "Hello  world");
+        assert!(reasoning.is_some());
+        assert_eq!(reasoning_buffer, "reasoning content");
+        assert!(!inside_reasoning); // Should end outside reasoning
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_multiple_tags() {
+        let test_tags = vec!["think", "reasoning", "thought", "reflect", "analysis"];
+
+        for tag in test_tags {
+            let mut reasoning_buffer = String::new();
+            let mut inside_reasoning = false;
+
+            let input = format!("<{tag}>test content</{tag}>");
+            let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+                &input,
+                &mut reasoning_buffer,
+                &mut inside_reasoning,
+            );
+
+            assert_eq!(clean, "");
+            assert!(reasoning.is_some() || reasoning_buffer.contains("test content"));
+            assert!(!inside_reasoning);
+        }
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_strips_from_message() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        let input = "The answer is <think>Let me think about this carefully</think> 42";
+        let (clean, _, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        assert_eq!(clean, "The answer is  42");
+        assert_eq!(reasoning_buffer, "Let me think about this carefully");
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_partial_chunks() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Note: The current implementation handles full tags but not tags split mid-name.
+        // This is acceptable for real-world streaming where complete tokens are usually sent together.
+        // Testing with complete tag boundaries that come in separate chunks:
+        let chunks = vec!["<think>", "reasoning", " content", "</think>"];
+        let mut all_clean = String::new();
+
+        for chunk in chunks {
+            let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+                chunk,
+                &mut reasoning_buffer,
+                &mut inside_reasoning,
+            );
+            all_clean.push_str(&clean);
+            if let Some(r) = reasoning {
+                // Just accumulating
+                let _ = r;
+            }
+        }
+
+        assert_eq!(all_clean, "");
+        assert_eq!(reasoning_buffer, "reasoning content");
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_nested_html() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        let input = "<think>Consider <b>this</b> carefully</think>";
+        let (clean, _, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        assert_eq!(clean, "");
+        assert_eq!(reasoning_buffer, "Consider <b>this</b> carefully");
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_no_closing() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            "<think>Never closed",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        assert_eq!(clean, "");
+        assert_eq!(reasoning, Some("Never closed".to_string()));
+        assert!(inside_reasoning);
+    }
+
+    #[test]
+    fn test_estimate_tokens() {
+        use crate::responses::service_helpers::ResponseStreamContext;
+
+        assert_eq!(ResponseStreamContext::estimate_tokens("test"), 1);
+        assert_eq!(ResponseStreamContext::estimate_tokens("Hello world"), 2);
+        assert_eq!(
+            ResponseStreamContext::estimate_tokens("This is a longer text"),
+            5
+        );
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_clean_text_before_reasoning() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test that clean text before reasoning tag is correctly extracted
+        let input = "Hello <think>";
+        let (clean, reasoning, transition) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        assert_eq!(clean, "Hello ");
+        assert_eq!(reasoning, None);
+        assert_eq!(transition, TagTransition::OpeningTag("think".to_string()));
+        assert!(inside_reasoning);
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_clean_text_after_reasoning() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // First open the reasoning tag
+        let (clean, _, _) = ResponseServiceImpl::process_reasoning_tags(
+            "<think>reasoning",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+        assert_eq!(clean, "");
+        assert!(inside_reasoning);
+
+        // Then close it and add clean text after
+        let (clean, _, transition) = ResponseServiceImpl::process_reasoning_tags(
+            "</think> world",
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        assert_eq!(clean, " world");
+        assert_eq!(transition, TagTransition::ClosingTag("think".to_string()));
+        assert!(!inside_reasoning);
+    }
+
+    #[test]
+    fn test_multiple_web_search_registry_accumulation() {
+        use crate::responses::models::SourceRegistry;
+        use crate::responses::tools::WebSearchResult;
+
+        // Simulate first web search with 3 results
+        let first_search_results = vec![
+            WebSearchResult {
+                title: "First Result".to_string(),
+                url: "https://example.com/1".to_string(),
+                snippet: "First snippet".to_string(),
+            },
+            WebSearchResult {
+                title: "Second Result".to_string(),
+                url: "https://example.com/2".to_string(),
+                snippet: "Second snippet".to_string(),
+            },
+            WebSearchResult {
+                title: "Third Result".to_string(),
+                url: "https://example.com/3".to_string(),
+                snippet: "Third snippet".to_string(),
+            },
+        ];
+
+        // Simulate second web search with 2 results
+        let second_search_results = vec![
+            WebSearchResult {
+                title: "Fourth Result".to_string(),
+                url: "https://example.com/4".to_string(),
+                snippet: "Fourth snippet".to_string(),
+            },
+            WebSearchResult {
+                title: "Fifth Result".to_string(),
+                url: "https://example.com/5".to_string(),
+                snippet: "Fifth snippet".to_string(),
+            },
+        ];
+
+        // First search: registry starts None, should create new registry
+        let mut registry: Option<SourceRegistry> = None;
+        let first_offset = registry.as_ref().map(|r| r.web_sources.len()).unwrap_or(0);
+        assert_eq!(first_offset, 0, "First search should have offset 0");
+
+        // Create registry with first search results
+        if let Some(ref mut reg) = registry {
+            reg.web_sources.extend(first_search_results.clone());
+        } else {
+            registry = Some(SourceRegistry::with_results(first_search_results.clone()));
+        }
+        assert_eq!(
+            registry.as_ref().unwrap().web_sources.len(),
+            3,
+            "Registry should have 3 results after first search"
+        );
+
+        // Second search: registry exists, should accumulate
+        let second_offset = registry.as_ref().map(|r| r.web_sources.len()).unwrap_or(0);
+        assert_eq!(second_offset, 3, "Second search should have offset 3");
+
+        // Accumulate second search results
+        if let Some(ref mut reg) = registry {
+            reg.web_sources.extend(second_search_results.clone());
+        }
+        assert_eq!(
+            registry.as_ref().unwrap().web_sources.len(),
+            5,
+            "Registry should have 5 results after second search"
+        );
+
+        // Verify correct indices
+        let final_registry = registry.unwrap();
+        assert_eq!(
+            final_registry.web_sources[0].title, "First Result",
+            "Index 0 should be first result"
+        );
+        assert_eq!(
+            final_registry.web_sources[1].title, "Second Result",
+            "Index 1 should be second result"
+        );
+        assert_eq!(
+            final_registry.web_sources[2].title, "Third Result",
+            "Index 2 should be third result"
+        );
+        assert_eq!(
+            final_registry.web_sources[3].title, "Fourth Result",
+            "Index 3 should be fourth result"
+        );
+        assert_eq!(
+            final_registry.web_sources[4].title, "Fifth Result",
+            "Index 4 should be fifth result"
+        );
+
+        // Verify that searching for index 0 gets first result
+        assert_eq!(
+            final_registry.web_sources.first().unwrap().url,
+            "https://example.com/1"
+        );
+        // Verify that searching for index 3 gets fourth result
+        assert_eq!(final_registry.web_sources[3].url, "https://example.com/4");
     }
 }

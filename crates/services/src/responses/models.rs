@@ -430,6 +430,21 @@ pub enum ResponseItemStatus {
     Cancelled,
 }
 
+/// Registry to track web search sources during response generation (request-scoped)
+/// Stores WebSearchResult from provider.search() for citation resolution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceRegistry {
+    pub web_sources: Vec<crate::responses::tools::WebSearchResult>,
+}
+
+impl SourceRegistry {
+    pub fn with_results(results: Vec<crate::responses::tools::WebSearchResult>) -> Self {
+        Self {
+            web_sources: results,
+        }
+    }
+}
+
 /// Annotation for output text (citations, etc.)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]

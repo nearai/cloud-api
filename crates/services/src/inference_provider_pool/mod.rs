@@ -1,5 +1,5 @@
 use inference_providers::{
-    models::{CompletionError, ListModelsError, ModelsResponse},
+    models::{AttestationError, CompletionError, ListModelsError, ModelsResponse},
     ChatCompletionParams, InferenceProvider, StreamingResult, StreamingResultExt, VLlmConfig,
     VLlmProvider,
 };
@@ -220,27 +220,8 @@ impl InferenceProviderPool {
                     )
                     .await
                 {
-                    Ok(report) => {
-                        // Check if the response contains an error field
-                        if report.contains_key("error") {
-                            let error_msg = report
-                                .get("error")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown error");
-                            tracing::debug!(
-                                model = %model_name,
-                                url = %url,
-                                error = %error_msg,
-                                "Provider returned attestation report with error field, excluding from pool"
-                            );
-                        } else {
-                            tracing::debug!(
-                                model = %model_name,
-                                url = %url,
-                                "Provider successfully returned attestation report, including in pool"
-                            );
-                            providers_for_model.push(provider);
-                        }
+                    Ok(_) => {
+                        providers_for_model.push(provider);
                     }
                     Err(e) => {
                         tracing::debug!(
@@ -495,7 +476,7 @@ impl InferenceProviderPool {
         signing_algo: Option<String>,
         nonce: Option<String>,
         signing_address: Option<String>,
-    ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, CompletionError> {
+    ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError> {
         // Get all providers for this model
         let mut model_attestations = vec![];
 
@@ -512,22 +493,9 @@ impl InferenceProviderPool {
                     .await
                 {
                     Ok(mut attestation) => {
-                        // Check if the response contains an error field
-                        if attestation.contains_key("error") {
-                            let error_msg = attestation
-                                .get("error")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown error");
-                            tracing::debug!(
-                                model = %model,
-                                error = %error_msg,
-                                "Provider returned attestation report with error field, skipping"
-                            );
-                        } else {
-                            // Remove 'all_attestations' field if present
-                            attestation.remove("all_attestations");
-                            model_attestations.push(attestation);
-                        }
+                        // Remove 'all_attestations' field if present
+                        attestation.remove("all_attestations");
+                        model_attestations.push(attestation);
                     }
                     Err(e) => {
                         // Log and continue to next provider (404 is expected when
@@ -543,9 +511,7 @@ impl InferenceProviderPool {
         }
 
         if model_attestations.is_empty() {
-            return Err(CompletionError::CompletionError(format!(
-                "No provider found that supports attestation reports for model: {model}"
-            )));
+            return Err(AttestationError::ProviderNotFound(model));
         }
 
         Ok(model_attestations)

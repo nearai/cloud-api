@@ -98,7 +98,7 @@ impl InferenceProvider for VLlmProvider {
             url.push_str(&format!("&nonce={nonce}"));
         }
 
-        if let Some(signing_address) = signing_address {
+        if let Some(ref signing_address) = signing_address {
             url.push_str(&format!("&signing_address={signing_address}"));
         }
 
@@ -115,7 +115,7 @@ impl InferenceProvider for VLlmProvider {
         // Handle 404 responses (expected when signing_address doesn't match)
         if response.status() == 404 {
             return Err(AttestationError::SigningAddressNotFound(
-                response.status().to_string(),
+                signing_address.unwrap_or_default().to_string(),
             ));
         }
 

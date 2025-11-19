@@ -210,7 +210,7 @@ pub async fn admin_middleware(
         .get("authorization")
         .and_then(|h| h.to_str().ok());
 
-    let user_agent_header: Option<String> = request
+    let user_agent = request
         .headers()
         .get("User-Agent")
         .and_then(|h| h.to_str().ok())
@@ -224,8 +224,7 @@ pub async fn admin_middleware(
             debug!("Extracted Bearer token for admin auth: {}", token);
 
             // Try admin access token first
-            match authenticate_admin_access_token(&state, token, user_agent_header.as_deref()).await
-            {
+            match authenticate_admin_access_token(&state, token, user_agent.as_deref()).await {
                 Ok(admin_token) => {
                     debug!("Authenticated via admin access token: {}", admin_token.name);
 
@@ -344,7 +343,7 @@ fn check_admin_access(state: &AuthState, user: &DbUser) -> bool {
 async fn authenticate_admin_access_token(
     state: &AuthState,
     token: &str,
-    current_user_agent: Option<&str>,
+    user_agent: Option<&str>,
 ) -> Result<
     database::models::AdminAccessToken,
     (StatusCode, axum::Json<crate::models::ErrorResponse>),
@@ -353,7 +352,7 @@ async fn authenticate_admin_access_token(
 
     match state
         .admin_access_token_repository
-        .validate(token, current_user_agent)
+        .validate(token, user_agent)
         .await
     {
         Ok(Some(admin_token)) => {
@@ -364,11 +363,11 @@ async fn authenticate_admin_access_token(
             Ok(admin_token)
         }
         Ok(None) => {
-            debug!("Admin access token not found, inactive, or User-Agent mismatch");
+            debug!("Invalid admin access token: not found, expired, or user agent mismatches");
             Err((
                 StatusCode::UNAUTHORIZED,
                 axum::Json(crate::models::ErrorResponse::new(
-                    "Admin access token not found or expired".to_string(),
+                    "Invalid admin access token".to_string(),
                     "unauthorized".to_string(),
                 )),
             ))

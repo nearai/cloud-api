@@ -99,7 +99,7 @@ impl AdminAccessTokenRepository {
     pub async fn validate(
         &self,
         token: &str,
-        current_user_agent: Option<&str>,
+        user_agent: Option<&str>,
     ) -> Result<Option<AdminAccessToken>> {
         let client = self
             .pool
@@ -117,37 +117,15 @@ impl AdminAccessTokenRepository {
                 WHERE token_hash = $1 
                 AND is_active = true 
                 AND expires_at > $2
+                AND (user_agent = $3 OR user_agent IS NULL)
                 "#,
-                &[&token_hash, &now],
+                &[&token_hash, &now, &user_agent],
             )
             .await
             .context("Failed to validate admin access token")?;
 
         match row {
             Some(row) => {
-                let stored_user_agent: Option<String> = row.get("user_agent");
-
-                // compare user_agent in request to db
-                if let Some(stored) = &stored_user_agent {
-                    match current_user_agent {
-                        None => {
-                            tracing::warn!(
-                                "User-Agent missing for admin access token {}",
-                                row.get::<_, Uuid>("id")
-                            );
-                            return Ok(None);
-                        }
-                        Some(current) if stored != current => {
-                            tracing::warn!(
-                                "User-Agent mismatch for admin access token {}.",
-                                row.get::<_, Uuid>("id")
-                            );
-                            return Ok(None);
-                        }
-                        _ => {}
-                    }
-                }
-
                 // Update last_used_at
                 if client
                     .execute(

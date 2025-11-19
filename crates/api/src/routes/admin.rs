@@ -704,14 +704,14 @@ pub async fn create_admin_access_token(
     headers: HeaderMap,
     Json(request_body): Json<CreateAdminAccessTokenRequest>,
 ) -> Result<ResponseJson<AdminAccessTokenResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    let user_agent_str: Option<String> = headers
+    let user_agent = headers
         .get("User-Agent")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
     debug!(
         "Creating admin access token for user: {} with {} hours expiration; (User-Agent: {:?})",
-        admin_user.0.email, request_body.expires_in_hours, user_agent_str
+        admin_user.0.email, request_body.expires_in_hours, user_agent
     );
 
     // Validate expiration time (must be positive)
@@ -735,7 +735,7 @@ pub async fn create_admin_access_token(
             request_body.name,
             request_body.reason,
             expires_at,
-            user_agent_str,
+            user_agent,
         )
         .await
     {

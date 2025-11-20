@@ -1535,6 +1535,8 @@ pub struct UpdateModelApiRequest {
     #[serde(rename = "isActive")]
     pub is_active: Option<bool>,
     pub aliases: Option<Vec<String>>,
+    #[serde(rename = "ownedBy")]
+    pub owned_by: Option<String>,
 }
 
 /// Batch update request format - Array of model name to update data

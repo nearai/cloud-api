@@ -72,6 +72,8 @@ pub async fn batch_upsert_models(
     }
 
     // Convert API request to service request
+    // Note: Default owned_by value is applied in the repository layer during INSERT,
+    // not here, so we can distinguish between CREATE (apply default) and UPDATE (preserve old)
     let models = batch_request
         .iter()
         .map(|(model_name, request)| {
@@ -87,6 +89,7 @@ pub async fn batch_upsert_models(
                     verifiable: request.verifiable,
                     is_active: request.is_active,
                     aliases: request.aliases.clone(),
+                    owned_by: request.owned_by.clone(),
                 },
             )
         })

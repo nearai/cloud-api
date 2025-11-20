@@ -487,7 +487,7 @@ impl ConversationRepository for PgConversationRepository {
         // Query with ANY() for efficient batch retrieval
         let rows = client
              .query(
-                 "SELECT * FROM conversations WHERE id = ANY($1) AND workspace_id = $2 AND deleted_at IS NULL ORDER BY created_at DESC",
+                 "SELECT * FROM conversations WHERE id = ANY($1) AND workspace_id = $2 AND deleted_at IS NULL",
                  &[&uuid_ids, &workspace_id.0],
              )
              .await

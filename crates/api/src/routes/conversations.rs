@@ -154,10 +154,9 @@ pub async fn batch_get_conversations(
     }
 
     // Parse conversation IDs while keeping track of original requested ID strings
-    let mut normalized_to_original: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    // Use IndexSet to store tuples of (normalized, original) to maintain order and mapping
+    let mut requested_ids: IndexSet<(String, String)> = IndexSet::new();
     let mut conversation_ids = Vec::new();
-    let mut requested_ids_order = IndexSet::new();
 
     for id_str in &request.ids {
         let parsed_id = parse_conversation_id(id_str).map_err(|e| {
@@ -170,8 +169,7 @@ pub async fn batch_get_conversations(
             )
         })?;
         let normalized = parsed_id.to_string();
-        normalized_to_original.insert(normalized.clone(), id_str.clone());
-        requested_ids_order.insert(normalized);
+        requested_ids.insert((normalized, id_str.clone()));
         conversation_ids.push(parsed_id);
     }
 
@@ -186,11 +184,11 @@ pub async fn batch_get_conversations(
                 conversations.iter().map(|c| c.id.to_string()).collect();
 
             // Calculate missing IDs, returning them in their original requested format
-            let missing_ids: Vec<String> = requested_ids_order
+            let missing_ids: Vec<String> = requested_ids
                 .iter()
-                .filter_map(|normalized_id| {
+                .filter_map(|(normalized_id, original_id)| {
                     if !found_ids_set.contains(normalized_id) {
-                        normalized_to_original.get(normalized_id).cloned()
+                        Some(original_id.clone())
                     } else {
                         None
                     }
@@ -209,9 +207,11 @@ pub async fn batch_get_conversations(
                     .collect();
 
             // Reorder conversations to match requested order
-            let http_conversations: Vec<ConversationObject> = requested_ids_order
+            let http_conversations: Vec<ConversationObject> = requested_ids
                 .iter()
-                .filter_map(|normalized_id| http_conversations_by_id.get(normalized_id).cloned())
+                .filter_map(|(normalized_id, _)| {
+                    http_conversations_by_id.get(normalized_id).cloned()
+                })
                 .collect();
 
             debug!(

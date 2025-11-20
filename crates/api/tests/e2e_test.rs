@@ -2021,6 +2021,94 @@ async fn test_admin_access_token_use_created_token() {
 }
 
 #[tokio::test]
+async fn test_admin_access_token_user_agent_match() {
+    let server = setup_test_server().await;
+
+    let create_request = serde_json::json!({
+        "expires_in_hours": 24,
+        "name": "UA Match Token",
+        "reason": "Testing User-Agent matching"
+    });
+
+    let user_agent = "TestClient/1.0";
+    let create_response = server
+        .post("/v1/admin/access-tokens")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", user_agent)
+        .json(&create_request)
+        .await;
+
+    assert_eq!(create_response.status_code(), 200);
+    let token_response = create_response.json::<api::models::AdminAccessTokenResponse>();
+    let admin_token = token_response.access_token;
+
+    let org = create_org(&server).await;
+    let update_request = serde_json::json!({
+        "spendLimit": {
+            "amount": 50000000000i64, // $50.00 USD
+            "currency": "USD"
+        },
+        "changedBy": "admin@test.com",
+        "changeReason": "Test UA Match"
+    });
+
+    let update_response = server
+        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {admin_token}"))
+        .add_header("User-Agent", user_agent)
+        .json(&update_request)
+        .await;
+
+    assert_eq!(update_response.status_code(), 200);
+    println!("✅ Admin access token validated successfully with matching User-Agent");
+}
+
+#[tokio::test]
+async fn test_admin_access_token_user_agent_mismatch() {
+    let server = setup_test_server().await;
+
+    let create_request = serde_json::json!({
+        "expires_in_hours": 24,
+        "name": "UA Mismatch Token whaaaaatttttt 2",
+        "reason": "Testing User-Agent mismatch"
+    });
+
+    let user_agent_create = "TestClient/1.0";
+    let user_agent_diff = "AnotherClient/2.0";
+
+    let create_response = server
+        .post("/v1/admin/access-tokens")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", user_agent_create)
+        .json(&create_request)
+        .await;
+
+    assert_eq!(create_response.status_code(), 200);
+    let token_response = create_response.json::<api::models::AdminAccessTokenResponse>();
+    let admin_token = token_response.access_token;
+
+    let org = create_org(&server).await;
+    let update_request = serde_json::json!({
+        "spendLimit": {
+            "amount": 50000000000i64, // $50.00 USD
+            "currency": "USD"
+        },
+        "changedBy": "admin@test.com",
+        "changeReason": "Test UA Mismatch"
+    });
+
+    let update_response = server
+        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {admin_token}"))
+        .add_header("User-Agent", user_agent_diff)
+        .json(&update_request)
+        .await;
+
+    assert_eq!(update_response.status_code(), 401);
+    println!("✅ Admin access token rejected with mismatched User-Agent");
+}
+
+#[tokio::test]
 async fn test_admin_access_token_create_and_list() {
     let server = setup_test_server().await;
 

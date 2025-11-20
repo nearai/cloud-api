@@ -513,14 +513,14 @@ pub async fn delete_model(
     State(app_state): State<AdminAppState>,
     Path(model_name): Path<String>,
     Extension(admin_user): Extension<AdminUser>,
-    ResponseJson(request): ResponseJson<Option<DeleteModelRequest>>,
+    request: Option<ResponseJson<DeleteModelRequest>>,
 ) -> Result<StatusCode, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!("Delete model request for: {}", model_name);
 
     // Extract admin user context for audit tracking
     let admin_user_id = admin_user.0.id;
     let admin_user_email = admin_user.0.email.clone();
-    let change_reason = request.and_then(|req| req.change_reason);
+    let change_reason = request.and_then(|ResponseJson(req)| req.change_reason);
 
     app_state
         .admin_service

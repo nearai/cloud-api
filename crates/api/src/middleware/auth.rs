@@ -451,16 +451,33 @@ pub async fn refresh_middleware(
         .get("authorization")
         .and_then(|h| h.to_str().ok());
 
+    // Try to get user agent from header
+    let user_agent = request
+        .headers()
+        .get("User-Agent")
+        .and_then(|h| h.to_str().ok());
+
     tracing::debug!(
-        "Auth middleware (session refresh token only): {:?}",
-        auth_header
+        "Auth middleware (refresh token): refresh token: {:?}, user agent: {:?}",
+        auth_header,
+        user_agent
     );
 
     let auth_result = if let Some(auth_value) = auth_header {
         debug!("Found Authorization header: {}", auth_value);
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
             debug!("Extracted Bearer token: {}", token);
-            authenticate_session_refresh(&state, SessionToken(token.to_string())).await
+            if let Some(user_agent_value) = user_agent {
+                authenticate_session_refresh(
+                    &state,
+                    SessionToken(token.to_string()),
+                    user_agent_value,
+                )
+                .await
+            } else {
+                debug!("Missing User-Agent header");
+                Err(StatusCode::UNAUTHORIZED)
+            }
         } else {
             debug!("Authorization header does not start with 'Bearer '");
             Err(StatusCode::UNAUTHORIZED)
@@ -470,30 +487,36 @@ pub async fn refresh_middleware(
     };
 
     match auth_result {
-        Ok(user) => {
+        Ok((session, user)) => {
             // Clone request to add extension
             let mut request = request;
-            request.extensions_mut().insert(AuthenticatedUser(user));
+            request
+                .extensions_mut()
+                .insert((session, AuthenticatedUser(user)));
             Ok(next.run(request).await)
         }
         Err(status) => Err(status),
     }
 }
 
-/// Authenticate using session token
+/// Authenticate using refresh token and user agent validation
 async fn authenticate_session_refresh(
     state: &AuthState,
     token: SessionToken,
-) -> Result<DbUser, StatusCode> {
+    user_agent: &str,
+) -> Result<(services::auth::Session, DbUser), StatusCode> {
     debug!("Authenticating session refresh token: {}", token);
-    // Use auth service
+    // Use auth service to validate session with refresh token and user agent
     {
         let auth_service = &state.auth_service;
-        debug!("Validating session via auth service with token");
-        match auth_service.validate_session_refresh(token).await {
-            Ok(user) => {
+        debug!("Validating session via auth service with refresh token and user agent");
+        match auth_service
+            .validate_session_refresh(token, user_agent)
+            .await
+        {
+            Ok((session, user)) => {
                 debug!("Authenticated user {} via session", user.email);
-                return Ok(convert_user_to_db_user(user));
+                return Ok((session, convert_user_to_db_user(user)));
             }
             Err(AuthError::SessionNotFound) | Err(AuthError::UserNotFound) => {
                 debug!("Session not found in auth service, trying OAuth manager");

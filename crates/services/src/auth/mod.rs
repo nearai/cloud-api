@@ -24,7 +24,8 @@ impl AuthServiceTrait for AuthService {
         expires_in_hours: i64,
         refresh_expires_in_hours: i64,
     ) -> Result<(String, Session, String), AuthError> {
-        if user_agent.trim().is_empty() {
+        let user_agent = user_agent.trim().to_string();
+        if user_agent.is_empty() {
             return Err(AuthError::InvalidUserAgent);
         }
         if user_agent.len() > MAX_USER_AGENT_LEN {

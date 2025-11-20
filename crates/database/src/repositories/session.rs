@@ -218,11 +218,10 @@ impl SessionRepository {
             .await
             .context("Failed to rotate refresh token session")?;
 
-        debug!(
-            "Rotated refresh token session: {} to {}",
-            session_id, new_session_token
-        );
+        debug!("Rotated refresh token session: {session_id}",);
+
         let session = self.row_to_session(row)?;
+
         Ok((session, new_session_token))
     }
 

@@ -11,17 +11,27 @@ use async_trait::async_trait;
 use chrono::Utc;
 use std::sync::Arc;
 
+pub const MAX_USER_AGENT_LEN: usize = 4096; // 4KB
+
 #[async_trait]
 impl AuthServiceTrait for AuthService {
     async fn create_session(
         &self,
         user_id: UserId,
         ip_address: Option<String>,
-        user_agent: Option<String>,
+        user_agent: String,
         encoding_key: String,
         expires_in_hours: i64,
         refresh_expires_in_hours: i64,
     ) -> Result<(String, Session, String), AuthError> {
+        let user_agent = user_agent.trim().to_string();
+        if user_agent.is_empty() {
+            return Err(AuthError::InvalidUserAgent);
+        }
+        if user_agent.len() > MAX_USER_AGENT_LEN {
+            return Err(AuthError::UserAgentTooLong(MAX_USER_AGENT_LEN));
+        }
+
         let access_token =
             self.create_session_access_token(user_id.clone(), encoding_key, expires_in_hours)?;
 
@@ -114,9 +124,18 @@ impl AuthServiceTrait for AuthService {
     async fn validate_session_refresh_token(
         &self,
         refresh_token: SessionToken,
+        user_agent: &str,
     ) -> Result<Option<Session>, AuthError> {
+        let user_agent = user_agent.trim();
+        if user_agent.is_empty() {
+            return Err(AuthError::InvalidUserAgent);
+        }
+        if user_agent.len() > MAX_USER_AGENT_LEN {
+            return Err(AuthError::UserAgentTooLong(MAX_USER_AGENT_LEN));
+        }
+
         self.session_repository
-            .validate(refresh_token)
+            .validate(refresh_token, user_agent)
             .await
             .map_err(|e| AuthError::InternalError(format!("Failed to validate session: {e}")))
     }
@@ -124,9 +143,10 @@ impl AuthServiceTrait for AuthService {
     async fn validate_session_refresh(
         &self,
         refresh_token: SessionToken,
-    ) -> Result<User, AuthError> {
+        user_agent: &str,
+    ) -> Result<(Session, User), AuthError> {
         let session = self
-            .validate_session_refresh_token(refresh_token)
+            .validate_session_refresh_token(refresh_token, user_agent)
             .await?
             .ok_or(AuthError::SessionNotFound)?;
 
@@ -137,11 +157,14 @@ impl AuthServiceTrait for AuthService {
         }
 
         // Get the user
-        self.user_repository
-            .get_by_id(session.user_id)
+        let user = self
+            .user_repository
+            .get_by_id(session.user_id.clone())
             .await
             .map_err(|e| AuthError::InternalError(format!("Failed to get user: {e}")))?
-            .ok_or(AuthError::UserNotFound)
+            .ok_or(AuthError::UserNotFound)?;
+
+        Ok((session, user))
     }
 
     async fn get_user_by_id(&self, user_id: UserId) -> Result<User, AuthError> {
@@ -157,6 +180,40 @@ impl AuthServiceTrait for AuthService {
             .revoke(session_id)
             .await
             .map_err(|e| AuthError::InternalError(format!("Failed to revoke session: {e}")))
+    }
+
+    async fn rotate_session(
+        &self,
+        user_id: UserId,
+        session_id: SessionId,
+        old_token_hash: &str,
+        encoding_key: String,
+        access_token_expires_in_hours: i64,
+        refresh_token_expires_in_hours: i64,
+    ) -> Result<(String, Session, String), AuthError> {
+        // Create a new access token
+        let access_token = self.create_session_access_token(
+            user_id.clone(),
+            encoding_key,
+            access_token_expires_in_hours,
+        )?;
+
+        // Rotate the refresh token
+        let (rotated_session, new_refresh_token) = self
+            .session_repository
+            .rotate(session_id, old_token_hash, refresh_token_expires_in_hours)
+            .await
+            .map_err(|e| {
+                let error_msg = e.to_string();
+                // Check if the error indicates the token was already rotated or session not found
+                if error_msg.contains("already rotated") || error_msg.contains("not found") {
+                    AuthError::Unauthorized
+                } else {
+                    AuthError::InternalError(format!("Failed to rotate session: {e}"))
+                }
+            })?;
+
+        Ok((access_token, rotated_session, new_refresh_token))
     }
 
     async fn get_or_create_oauth_user(&self, oauth_info: OAuthUserInfo) -> Result<User, AuthError> {

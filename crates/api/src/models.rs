@@ -1171,13 +1171,15 @@ pub struct RefreshTokenResponse {
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub ip_address: Option<String>,
-    pub user_agent: Option<String>,
+    pub user_agent: String,
 }
 
-/// Access token response model
+/// Access token + refresh token response model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AccessTokenResponse {
+pub struct AccessAndRefreshTokenResponse {
     pub access_token: String,
+    pub refresh_token: String,
+    pub refresh_token_expiration: DateTime<Utc>,
 }
 
 /// Organization member response model (non-sensitive)

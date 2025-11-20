@@ -2427,8 +2427,6 @@ async fn test_admin_access_token_cannot_manage_tokens() {
     println!("✅ Admin access tokens correctly restricted from token management endpoints");
 }
 
-// Conversation and response tests moved to e2e_conversations.rs
-
 // ============================================
 // Admin List Users Tests
 // ============================================

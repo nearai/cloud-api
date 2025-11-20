@@ -148,7 +148,7 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub ip_address: Option<String>,
-    pub user_agent: Option<String>,
+    pub user_agent: String,
 }
 
 /// Admin access token for tracking and managing admin access tokens

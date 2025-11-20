@@ -18,7 +18,7 @@ async fn get_model_history_from_db(
     // We'll use the API endpoint to get history instead of direct DB query
     // This is more realistic for E2E testing
     let response = server
-        .get(format!("/v1/admin/models/{}/history", model_name).as_str())
+        .get(format!("/v1/admin/models/{model_name}/history").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .await;
 
@@ -250,7 +250,7 @@ async fn test_soft_delete_creates_history_record() {
 
     // Soft delete the model
     let delete_response = server
-        .delete(format!("/v1/admin/models/{}", model_name).as_str())
+        .delete(format!("/v1/admin/models/{model_name}").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .await;
 
@@ -355,7 +355,7 @@ async fn test_history_progression_multiple_updates() {
     let server = setup_test_server().await;
     let model_name = format!("test-model-progression-{}", uuid::Uuid::new_v4());
 
-    let update_reasons = vec![
+    let update_reasons = [
         "Initial creation",
         "Pricing adjustment v1",
         "Pricing adjustment v2",
@@ -404,15 +404,13 @@ async fn test_history_progression_multiple_updates() {
         assert_eq!(
             reason.as_ref().unwrap(),
             expected_reason,
-            "Record {} should have correct reason",
-            i
+            "Record {i} should have correct reason"
         );
-        assert!(user_id.is_some(), "Record {} should have user ID", i);
+        assert!(user_id.is_some(), "Record {i} should have user ID");
         assert_eq!(
             user_email.as_ref().unwrap(),
             "admin@test.com",
-            "Record {} should have correct user email",
-            i
+            "Record {i} should have correct user email"
         );
     }
 }
@@ -449,7 +447,7 @@ async fn test_soft_delete_with_custom_reason() {
 
     // Soft delete with custom reason
     let delete_response = server
-        .delete(format!("/v1/admin/models/{}", model_name).as_str())
+        .delete(format!("/v1/admin/models/{model_name}").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .json(&serde_json::json!({
             "changeReason": "Superceded by newer model version"
@@ -508,7 +506,7 @@ async fn test_soft_delete_without_reason_backward_compatibility() {
 
     // Soft delete without providing any reason (backward compatible - empty body)
     let delete_response = server
-        .delete(format!("/v1/admin/models/{}", model_name).as_str())
+        .delete(format!("/v1/admin/models/{model_name}").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .await;
 

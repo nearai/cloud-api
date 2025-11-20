@@ -4,8 +4,8 @@ use crate::models::{
     BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, DecimalPrice,
     DeleteAdminAccessTokenRequest, DeleteModelRequest, ErrorResponse, ListUsersResponse,
     ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
-    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, SpendLimit,
-    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
+    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, SpendLimit, UpdateOrganizationLimitsRequest,
+    UpdateOrganizationLimitsResponse,
 };
 use axum::{
     extract::{Json, Path, State},
@@ -524,7 +524,12 @@ pub async fn delete_model(
 
     app_state
         .admin_service
-        .delete_model(&model_name, change_reason, Some(admin_user_id), Some(admin_user_email))
+        .delete_model(
+            &model_name,
+            change_reason,
+            Some(admin_user_id),
+            Some(admin_user_email),
+        )
         .await
         .map_err(|e| {
             error!("Failed to delete model");

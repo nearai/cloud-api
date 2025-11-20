@@ -366,10 +366,7 @@ impl ModelRepository {
     }
 
     /// Get history for a specific model
-    pub async fn get_model_history(
-        &self,
-        model_id: &uuid::Uuid,
-    ) -> Result<Vec<ModelHistory>> {
+    pub async fn get_model_history(&self, model_id: &uuid::Uuid) -> Result<Vec<ModelHistory>> {
         let client = self
             .pool
             .get()
@@ -753,7 +750,6 @@ impl ModelRepository {
             created_at: row.get("created_at"),
         }
     }
-
 }
 
 // Implement ModelsRepository trait from services

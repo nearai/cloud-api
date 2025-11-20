@@ -24,8 +24,7 @@ async fn get_model_history_from_db(
 
     assert_eq!(response.status_code(), 200, "Failed to get model history");
 
-    let history_response =
-        response.json::<api::models::ModelHistoryResponse>();
+    let history_response = response.json::<api::models::ModelHistoryResponse>();
 
     // Map to (id, changed_by_user_id, changed_by_user_email, change_reason, is_active)
     history_response
@@ -82,7 +81,11 @@ async fn test_upsert_model_creates_history_record() {
     let history = get_model_history_from_db(&server, &model_name).await;
 
     // Should have exactly 1 history record
-    assert_eq!(history.len(), 1, "Expected 1 history record after initial upsert");
+    assert_eq!(
+        history.len(),
+        1,
+        "Expected 1 history record after initial upsert"
+    );
 
     let (id, user_id, user_email, reason, is_active) = &history[0];
 
@@ -142,7 +145,11 @@ async fn test_second_upsert_closes_previous_history() {
 
     // Get initial history
     let history_v1 = get_model_history_from_db(&server, &model_name).await;
-    assert_eq!(history_v1.len(), 1, "Should have 1 history record after first upsert");
+    assert_eq!(
+        history_v1.len(),
+        1,
+        "Should have 1 history record after first upsert"
+    );
 
     // Second upsert - update pricing
     let mut batch2 = HashMap::new();
@@ -264,7 +271,10 @@ async fn test_soft_delete_creates_history_record() {
     );
 
     // Most recent record should have is_active=false
-    assert!(!history_after[0].4, "Latest history should show is_active=false");
+    assert!(
+        !history_after[0].4,
+        "Latest history should show is_active=false"
+    );
 
     // Should have change_reason for deletion
     assert!(
@@ -278,7 +288,10 @@ async fn test_soft_delete_creates_history_record() {
     );
 
     // Original record should still be active
-    assert!(history_after[1].4, "Original history should show is_active=true");
+    assert!(
+        history_after[1].4,
+        "Original history should show is_active=true"
+    );
 }
 
 /// Test 4: Verify user tracking is correctly recorded

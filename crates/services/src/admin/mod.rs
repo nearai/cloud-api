@@ -86,7 +86,12 @@ impl AdminService for AdminServiceImpl {
 
         let deleted = self
             .repository
-            .soft_delete_model(model_name, change_reason, changed_by_user_id, changed_by_user_email)
+            .soft_delete_model(
+                model_name,
+                change_reason,
+                changed_by_user_id,
+                changed_by_user_email,
+            )
             .await
             .map_err(|e| AdminError::InternalError(e.to_string()))?;
 

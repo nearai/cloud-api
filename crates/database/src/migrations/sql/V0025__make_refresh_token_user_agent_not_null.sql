@@ -1,7 +1,7 @@
 -- Make user_agent NOT NULL in refresh_tokens table
--- First, update any existing NULL values to an empty string as a default
+-- First, update any existing NULL values to a default value 'unknown'
 UPDATE refresh_tokens
-SET user_agent = ''
+SET user_agent = 'unknown'
 WHERE user_agent IS NULL;
 
 -- Now add the NOT NULL constraint

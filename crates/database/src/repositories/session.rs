@@ -2,7 +2,9 @@ use crate::models::Session;
 use crate::pool::DbPool;
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
+use regex::Regex;
 use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -27,6 +29,27 @@ impl SessionRepository {
         format!("{:x}", hasher.finalize())
     }
 
+    /// Normalize User-Agent string by removing version numbers.
+    ///
+    /// This removes version numbers (e.g., "/129.0.6668.92") to prevent
+    /// session invalidation when browsers update. Examples:
+    /// - "Chrome/129.0.6668.92" -> "Chrome"
+    /// - "Safari/605.1.15" -> "Safari"
+    /// - "Firefox/131.0" -> "Firefox"
+    /// - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+    ///   -> "Mozilla (Windows NT 10.0; Win64; x64) AppleWebKit (KHTML, like Gecko) Chrome Safari"
+    fn normalize_user_agent(user_agent: &str) -> String {
+        // Remove version patterns: "/" followed by digits and dots
+        // This matches patterns like "/129.0.6668.92", "/605.1.15", "/131.0", "/537.36"
+        static VERSION_PATTERN: OnceLock<Regex> = OnceLock::new();
+
+        let pattern = VERSION_PATTERN.get_or_init(|| {
+            Regex::new(r"/[\d.]+").expect("Failed to compile version pattern regex")
+        });
+
+        pattern.replace_all(user_agent, "").trim().to_string()
+    }
+
     /// Create a new refresh token session
     pub async fn create(
         &self,
@@ -47,6 +70,9 @@ impl SessionRepository {
         let now = Utc::now();
         let expires_at = now + Duration::hours(expires_in_hours);
 
+        // Normalize user agent to remove version numbers before storing
+        let normalized_user_agent = Self::normalize_user_agent(&user_agent);
+
         let row = client
             .query_one(
                 r#"
@@ -64,7 +90,7 @@ impl SessionRepository {
                     &now,
                     &expires_at,
                     &ip_address,
-                    &user_agent,
+                    &normalized_user_agent,
                 ],
             )
             .await
@@ -80,7 +106,6 @@ impl SessionRepository {
     }
 
     /// Validate a refresh token and return the associated session
-    /// Validates that user_agent matches the stored user_agent
     pub async fn validate(&self, session_token: &str, user_agent: &str) -> Result<Option<Session>> {
         let client = self
             .pool
@@ -92,19 +117,30 @@ impl SessionRepository {
         let token_hash = Self::hash_session_token(session_token);
         let now = Utc::now();
 
+        // Normalize the incoming user agent
+        let normalized_user_agent = Self::normalize_user_agent(user_agent);
+
         let row = client
             .query_opt(
                 r#"
             SELECT * FROM refresh_tokens 
-            WHERE token_hash = $1 AND expires_at > $2 AND user_agent = $3
+            WHERE token_hash = $1 AND expires_at > $2
             "#,
-                &[&token_hash, &now, &user_agent],
+                &[&token_hash, &now],
             )
             .await
             .context("Failed to validate refresh token")?;
 
         match row {
-            Some(row) => Ok(Some(self.row_to_session(row)?)),
+            Some(row) => {
+                let session = self.row_to_session(row)?;
+                let stored_normalized = Self::normalize_user_agent(&session.user_agent);
+                if stored_normalized == normalized_user_agent {
+                    Ok(Some(session))
+                } else {
+                    Ok(None)
+                }
+            }
             None => Ok(None),
         }
     }

@@ -468,19 +468,12 @@ pub async fn refresh_middleware(
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
             debug!("Extracted Bearer token: {}", token);
             if let Some(user_agent_value) = user_agent {
-                if user_agent_value.is_empty()
-                    || user_agent_value.len() > services::auth::MAX_USER_AGENT_LEN
-                {
-                    debug!("Invalid User-Agent header");
-                    Err(StatusCode::UNAUTHORIZED)
-                } else {
-                    authenticate_session_refresh(
-                        &state,
-                        SessionToken(token.to_string()),
-                        user_agent_value,
-                    )
-                    .await
-                }
+                authenticate_session_refresh(
+                    &state,
+                    SessionToken(token.to_string()),
+                    user_agent_value,
+                )
+                .await
             } else {
                 debug!("Missing User-Agent header");
                 Err(StatusCode::UNAUTHORIZED)

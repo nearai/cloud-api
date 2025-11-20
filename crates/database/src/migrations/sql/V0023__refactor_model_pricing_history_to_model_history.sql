@@ -11,12 +11,14 @@ ALTER TABLE model_history ADD COLUMN verifiable BOOLEAN;
 ALTER TABLE model_history ADD COLUMN is_active BOOLEAN;
 
 -- Step 3: Backfill missing fields from current models table
+-- Note: verifiable and is_active are set to true as safe defaults for historical records
+-- (we don't have the actual historical state, so we assume active/verifiable)
 UPDATE model_history mh
 SET
     model_name = m.model_name,
     model_icon = m.model_icon,
-    verifiable = m.verifiable,
-    is_active = m.is_active
+    verifiable = true,
+    is_active = true
 FROM models m
 WHERE mh.model_id = m.id;
 

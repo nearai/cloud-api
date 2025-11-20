@@ -2433,9 +2433,9 @@ async fn test_batch_get_conversations() {
         conv1.id, conv2.id, conv3.id
     );
 
-    // Create 2 fake conversation IDs that don't exist
-    let fake_conv1_id = "conv_00000000000000000000000000000000";
-    let fake_conv2_id = "conv_11111111111111111111111111111111";
+    // Create 2 fake conversation IDs that don't exist (using hyphenated UUID format for consistency)
+    let fake_conv1_id = "conv_00000000-0000-0000-0000-000000000000";
+    let fake_conv2_id = "conv_11111111-1111-1111-1111-111111111111";
 
     println!("📝 Using 2 missing conversation IDs: {fake_conv1_id}, {fake_conv2_id}");
 
@@ -2451,7 +2451,7 @@ async fn test_batch_get_conversations() {
     });
 
     let response = server
-        .get("/v1/conversations/batch")
+        .post("/v1/conversations/batch")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&batch_request)
         .await;
@@ -2520,19 +2520,50 @@ async fn test_batch_get_conversations() {
         conv1.id, conv2.id, conv3.id
     );
 
-    // Verify the missing IDs are correct
+    // Verify ordering: returned conversations should match the order of requested IDs
+    // Expected order in request: conv1, conv2, conv3 (then 2 missing)
+    // So returned conversations should be in that same order
+    assert_eq!(
+        batch_response.data[0].id, conv1.id,
+        "First returned conversation should be conv1 (requested first)"
+    );
+    assert_eq!(
+        batch_response.data[1].id, conv2.id,
+        "Second returned conversation should be conv2 (requested second)"
+    );
+    assert_eq!(
+        batch_response.data[2].id, conv3.id,
+        "Third returned conversation should be conv3 (requested third)"
+    );
+    println!("✅ Returned conversations are in the same order as requested");
+
+    // Verify the missing IDs are correct and returned in original format
     let missing_ids_set: std::collections::HashSet<String> =
         batch_response.missing_ids.iter().cloned().collect();
 
     assert!(
         missing_ids_set.contains(fake_conv1_id),
-        "fake_conv1 ({fake_conv1_id}) should be in missing_ids"
+        "fake_conv1 ({fake_conv1_id}) should be in missing_ids, got: {:?}",
+        batch_response.missing_ids
     );
     assert!(
         missing_ids_set.contains(fake_conv2_id),
-        "fake_conv2 ({fake_conv2_id}) should be in missing_ids"
+        "fake_conv2 ({fake_conv2_id}) should be in missing_ids, got: {:?}",
+        batch_response.missing_ids
     );
-    println!("✅ Both missing IDs are correctly listed: {fake_conv1_id}, {fake_conv2_id}");
+    println!("✅ Both missing IDs are correctly listed in original format: {fake_conv1_id}, {fake_conv2_id}");
+
+    // Verify missing_ids ordering is preserved from request
+    // Expected order in request: fake_conv1_id, fake_conv2_id (after the 3 real ones)
+    assert_eq!(
+        batch_response.missing_ids[0], fake_conv1_id,
+        "First missing ID should be fake_conv1 (requested 4th)"
+    );
+    assert_eq!(
+        batch_response.missing_ids[1], fake_conv2_id,
+        "Second missing ID should be fake_conv2 (requested 5th)"
+    );
+    println!("✅ Missing IDs are in the same order as requested and in original format");
 
     // Verify each conversation object has required fields
     for (idx, conv) in batch_response.data.iter().enumerate() {

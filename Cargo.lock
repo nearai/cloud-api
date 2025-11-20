@@ -493,6 +493,7 @@ dependencies = [
  "headers",
  "hex",
  "http-body-util",
+ "indexmap 2.12.0",
  "inference_providers",
  "k256",
  "serde",

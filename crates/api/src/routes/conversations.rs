@@ -4,12 +4,12 @@ use axum::{
     http::StatusCode,
     response::Json as ResponseJson,
 };
+use indexmap::IndexSet;
 use serde::Deserialize;
 use services::{
     conversations::{errors::ConversationError, models::ConversationId},
     responses::models::TextAnnotation,
 };
-use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::debug;
 use uuid::Uuid;
@@ -109,7 +109,7 @@ pub async fn create_conversation(
 ///
 /// Retrieve multiple conversations in a single request using their IDs.
 #[utoipa::path(
-    get,
+    post,
     path = "/v1/conversations/batch",
     tag = "Conversations",
     request_body = BatchConversationsRequest,
@@ -153,13 +153,14 @@ pub async fn batch_get_conversations(
         ));
     }
 
-    // Parse conversation IDs and track requested ID strings for missing_ids calculation
-    let conversation_ids: Vec<ConversationId> = request
-        .ids
-        .iter()
-        .map(|id| parse_conversation_id(id))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| {
+    // Parse conversation IDs while keeping track of original requested ID strings
+    let mut normalized_to_original: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut conversation_ids = Vec::new();
+    let mut requested_ids_order = IndexSet::new();
+
+    for id_str in &request.ids {
+        let parsed_id = parse_conversation_id(id_str).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
                 ResponseJson(ErrorResponse::new(
@@ -168,10 +169,11 @@ pub async fn batch_get_conversations(
                 )),
             )
         })?;
-
-    // Create set of requested ID strings for missing_ids calculation
-    let requested_ids_set: HashSet<String> =
-        conversation_ids.iter().map(|id| id.to_string()).collect();
+        let normalized = parsed_id.to_string();
+        normalized_to_original.insert(normalized.clone(), id_str.clone());
+        requested_ids_order.insert(normalized);
+        conversation_ids.push(parsed_id);
+    }
 
     // Call service to batch retrieve
     match service
@@ -179,19 +181,37 @@ pub async fn batch_get_conversations(
         .await
     {
         Ok(conversations) => {
-            // Create set of found ID strings
-            let found_ids_set: HashSet<String> =
+            // Create set of found conversation IDs (normalized)
+            let found_ids_set: IndexSet<String> =
                 conversations.iter().map(|c| c.id.to_string()).collect();
 
-            // Calculate missing IDs
-            let missing_ids: Vec<String> = requested_ids_set
-                .difference(&found_ids_set)
-                .cloned()
+            // Calculate missing IDs, returning them in their original requested format
+            let missing_ids: Vec<String> = requested_ids_order
+                .iter()
+                .filter_map(|normalized_id| {
+                    if !found_ids_set.contains(normalized_id) {
+                        normalized_to_original.get(normalized_id).cloned()
+                    } else {
+                        None
+                    }
+                })
                 .collect();
 
-            let http_conversations: Vec<ConversationObject> = conversations
-                .into_iter()
-                .map(convert_domain_conversation_to_http)
+            // Convert to HTTP format first, indexed by normalized ID
+            let http_conversations_by_id: std::collections::HashMap<String, ConversationObject> =
+                conversations
+                    .into_iter()
+                    .map(|c| {
+                        let id = c.id.to_string();
+                        let obj = convert_domain_conversation_to_http(c);
+                        (id, obj)
+                    })
+                    .collect();
+
+            // Reorder conversations to match requested order
+            let http_conversations: Vec<ConversationObject> = requested_ids_order
+                .iter()
+                .filter_map(|normalized_id| http_conversations_by_id.get(normalized_id).cloned())
                 .collect();
 
             debug!(

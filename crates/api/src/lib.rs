@@ -637,7 +637,7 @@ pub fn build_conversation_routes(
         .route("/conversations", post(conversations::create_conversation))
         .route(
             "/conversations/batch",
-            get(conversations::batch_get_conversations),
+            post(conversations::batch_get_conversations),
         )
         .route(
             "/conversations/{conversation_id}",

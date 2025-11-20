@@ -179,10 +179,15 @@ impl SessionRepository {
     /// This operation atomically updates the token hash and expiration time in the database,
     /// invalidating the old token. This ensures that the previous token can no longer be used.
     ///
+    /// The old_token_hash is included in the WHERE clause to prevent race conditions where
+    /// two requests try to rotate the same token simultaneously. If the token was already
+    /// rotated, no row will be updated and an error will be returned.
+    ///
     /// Returns the updated session and the new plaintext token.
     pub async fn rotate(
         &self,
         session_id: Uuid,
+        old_token_hash: &str,
         expires_in_hours: i64,
     ) -> Result<(Session, String)> {
         let client = self
@@ -197,8 +202,18 @@ impl SessionRepository {
 
         let row = client
             .query_one(
-                "UPDATE refresh_tokens SET token_hash = $1, expires_at = $2 WHERE id = $3 RETURNING *",
-                &[&new_token_hash, &new_expires_at, &session_id],
+                r#"
+                UPDATE refresh_tokens
+                SET token_hash = $1, expires_at = $2
+                WHERE id = $3 AND token_hash = $4
+                RETURNING *
+                "#,
+                &[
+                    &new_token_hash,
+                    &new_expires_at,
+                    &session_id,
+                    &old_token_hash,
+                ],
             )
             .await
             .context("Failed to rotate refresh token session")?;
@@ -374,10 +389,11 @@ impl services::auth::SessionRepository for SessionRepository {
     async fn rotate(
         &self,
         session_id: services::auth::SessionId,
+        old_token_hash: &str,
         expires_in_hours: i64,
     ) -> anyhow::Result<(services::auth::Session, String)> {
         let (db_session, token) =
-            SessionRepository::rotate(self, session_id.0, expires_in_hours).await?;
+            SessionRepository::rotate(self, session_id.0, old_token_hash, expires_in_hours).await?;
 
         let service_session = services::auth::Session {
             id: services::auth::SessionId(db_session.id),

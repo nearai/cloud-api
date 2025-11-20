@@ -177,6 +177,7 @@ impl AuthServiceTrait for AuthService {
         &self,
         user_id: UserId,
         session_id: SessionId,
+        old_token_hash: &str,
         encoding_key: String,
         access_token_expires_in_hours: i64,
         refresh_token_expires_in_hours: i64,
@@ -191,7 +192,7 @@ impl AuthServiceTrait for AuthService {
         // Rotate the refresh token
         let (rotated_session, new_refresh_token) = self
             .session_repository
-            .rotate(session_id, refresh_token_expires_in_hours)
+            .rotate(session_id, old_token_hash, refresh_token_expires_in_hours)
             .await
             .map_err(|e| AuthError::InternalError(format!("Failed to rotate session: {e}")))?;
 

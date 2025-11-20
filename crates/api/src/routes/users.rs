@@ -396,6 +396,7 @@ pub async fn create_access_token(
         .rotate_session(
             session.user_id,
             session.id,
+            &session.token_hash,
             app_state.config.auth.encoding_key.to_string(),
             1,                // access token expires in 1 hour
             expires_in_hours, // refresh token expires in 7 days

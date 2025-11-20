@@ -126,6 +126,14 @@ impl AuthServiceTrait for AuthService {
         refresh_token: SessionToken,
         user_agent: &str,
     ) -> Result<Option<Session>, AuthError> {
+        let user_agent = user_agent.trim();
+        if user_agent.is_empty() {
+            return Err(AuthError::InvalidUserAgent);
+        }
+        if user_agent.len() > MAX_USER_AGENT_LEN {
+            return Err(AuthError::UserAgentTooLong(MAX_USER_AGENT_LEN));
+        }
+
         self.session_repository
             .validate(refresh_token, user_agent)
             .await

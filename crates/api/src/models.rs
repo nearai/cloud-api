@@ -1766,10 +1766,19 @@ pub struct UpdateModelApiRequest {
     pub aliases: Option<Vec<String>>,
     #[serde(rename = "ownedBy")]
     pub owned_by: Option<String>,
+    #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
+    pub change_reason: Option<String>,
 }
 
 /// Batch update request format - Array of model name to update data
 pub type BatchUpdateModelApiRequest = std::collections::HashMap<String, UpdateModelApiRequest>;
+
+/// Delete model request - optional reason for deletion
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct DeleteModelRequest {
+    #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
+    pub change_reason: Option<String>,
+}
 
 /// Model history entry - includes pricing, context length, and other model attributes
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -1783,16 +1792,25 @@ pub struct ModelHistoryEntry {
     pub output_cost_per_token: DecimalPrice,
     #[serde(rename = "contextLength")]
     pub context_length: i32,
+    #[serde(rename = "modelName")]
+    pub model_name: String,
     #[serde(rename = "modelDisplayName")]
     pub model_display_name: String,
     #[serde(rename = "modelDescription")]
     pub model_description: String,
+    #[serde(rename = "modelIcon")]
+    pub model_icon: Option<String>,
+    pub verifiable: bool,
+    #[serde(rename = "isActive")]
+    pub is_active: bool,
     #[serde(rename = "effectiveFrom")]
     pub effective_from: String,
     #[serde(rename = "effectiveUntil")]
     pub effective_until: Option<String>,
-    #[serde(rename = "changedBy")]
-    pub changed_by: Option<String>,
+    #[serde(rename = "changedByUserId")]
+    pub changed_by_user_id: Option<String>,
+    #[serde(rename = "changedByUserEmail")]
+    pub changed_by_user_email: Option<String>,
     #[serde(rename = "changeReason")]
     pub change_reason: Option<String>,
     #[serde(rename = "createdAt")]

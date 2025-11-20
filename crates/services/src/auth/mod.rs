@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use std::sync::Arc;
 
-pub const MAX_USER_AGENT_LEN: usize = 512;
+pub const MAX_USER_AGENT_LEN: usize = 4096; // 4KB
 
 #[async_trait]
 impl AuthServiceTrait for AuthService {
@@ -203,7 +203,15 @@ impl AuthServiceTrait for AuthService {
             .session_repository
             .rotate(session_id, old_token_hash, refresh_token_expires_in_hours)
             .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to rotate session: {e}")))?;
+            .map_err(|e| {
+                let error_msg = e.to_string();
+                // Check if the error indicates the token was already rotated or session not found
+                if error_msg.contains("already rotated") || error_msg.contains("not found") {
+                    AuthError::Unauthorized
+                } else {
+                    AuthError::InternalError(format!("Failed to rotate session: {e}"))
+                }
+            })?;
 
         Ok((access_token, rotated_session, new_refresh_token))
     }

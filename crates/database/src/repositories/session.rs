@@ -201,7 +201,7 @@ impl SessionRepository {
         let new_expires_at = Utc::now() + Duration::hours(expires_in_hours);
 
         let row = client
-            .query_one(
+            .query_opt(
                 r#"
                 UPDATE refresh_tokens
                 SET token_hash = $1, expires_at = $2
@@ -217,6 +217,10 @@ impl SessionRepository {
             )
             .await
             .context("Failed to rotate refresh token session")?;
+
+        let row = row.ok_or_else(|| {
+            anyhow::anyhow!("Token rotation failed: token not found or already rotated")
+        })?;
 
         debug!("Rotated refresh token session: {session_id}",);
 

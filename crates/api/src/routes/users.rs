@@ -12,7 +12,9 @@ use axum::{
     http::StatusCode,
 };
 use serde::Deserialize;
-use services::{auth::UserId, organization::OrganizationError, user::UserServiceError};
+use services::{
+    auth::AuthError, auth::UserId, organization::OrganizationError, user::UserServiceError,
+};
 use tracing::{debug, error};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -411,8 +413,18 @@ pub async fn create_access_token(
                 refresh_token_expiration: refresh_session.expires_at,
             }))
         }
-        Err(_) => {
-            error!("Failed to create access token and rotate refresh token");
+        Err(AuthError::Unauthorized) => {
+            error!("Token rotation failed: invalid or already rotated token");
+            Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse::new(
+                    "Invalid or expired refresh token".to_string(),
+                    "unauthorized".to_string(),
+                )),
+            ))
+        }
+        Err(e) => {
+            error!("Failed to create access token and rotate refresh token: {e}");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(

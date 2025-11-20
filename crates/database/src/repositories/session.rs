@@ -44,7 +44,7 @@ impl SessionRepository {
         static VERSION_PATTERN: OnceLock<Regex> = OnceLock::new();
 
         let pattern = VERSION_PATTERN.get_or_init(|| {
-            Regex::new(r"/[\d.]+").expect("Failed to compile version pattern regex")
+            Regex::new(r"/[A-Za-z0-9._-]+").expect("Failed to compile version pattern regex")
         });
 
         pattern.replace_all(user_agent, "").trim().to_string()

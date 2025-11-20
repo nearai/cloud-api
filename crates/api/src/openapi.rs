@@ -46,6 +46,11 @@ use utoipa::{Modify, OpenApi};
         crate::routes::conversations::get_conversation,
         crate::routes::conversations::update_conversation,
         crate::routes::conversations::delete_conversation,
+        crate::routes::conversations::pin_conversation,
+        crate::routes::conversations::unpin_conversation,
+        crate::routes::conversations::archive_conversation,
+        crate::routes::conversations::unarchive_conversation,
+        crate::routes::conversations::clone_conversation,
         crate::routes::conversations::list_conversation_items,
         crate::routes::conversations::create_conversation_items,
         // Response endpoints

@@ -46,7 +46,11 @@ pub struct Conversation {
     pub id: ConversationId,
     pub workspace_id: WorkspaceId,
     pub api_key_id: uuid::Uuid,
-    pub metadata: serde_json::Value, // JSONB storing conversation metadata
+    pub pinned_at: Option<DateTime<Utc>>, // Timestamp when pinned, NULL if not pinned
+    pub archived_at: Option<DateTime<Utc>>, // Timestamp when archived, NULL if not archived
+    pub deleted_at: Option<DateTime<Utc>>, // Timestamp when soft-deleted, NULL if not deleted
+    pub cloned_from_id: Option<ConversationId>, // ID of conversation this was cloned from
+    pub metadata: serde_json::Value, // JSONB storing conversation metadata (includes title/name)
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

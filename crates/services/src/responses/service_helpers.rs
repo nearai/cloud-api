@@ -335,6 +335,33 @@ impl EventEmitter {
         self.send(event).await
     }
 
+    /// Emit output_text.annotation.added event for a citation
+    pub async fn emit_citation_annotation(
+        &mut self,
+        ctx: &mut ResponseStreamContext,
+        item_id: String,
+        annotation: models::TextAnnotation,
+    ) -> Result<(), errors::ResponseError> {
+        let event = models::ResponseStreamEvent {
+            event_type: "response.output_text.annotation.added".to_string(),
+            sequence_number: Some(ctx.next_sequence()),
+            response: None,
+            output_index: Some(ctx.output_item_index),
+            content_index: Some(0),
+            item: None,
+            item_id: Some(item_id),
+            part: None,
+            delta: None,
+            text: None,
+            logprobs: None,
+            obfuscation: None,
+            annotation_index: Some(0), // Start with index 0 for first annotation
+            annotation: Some(annotation),
+            conversation_title: None,
+        };
+        self.send(event).await
+    }
+
     /// Emit reasoning item.added event
     pub async fn emit_reasoning_started(
         &mut self,

@@ -166,6 +166,7 @@ pub struct AdminAccessToken {
     pub revoked_at: Option<DateTime<Utc>>,
     pub revoked_by_user_id: Option<Uuid>,
     pub revocation_reason: Option<String>,
+    pub user_agent: Option<String>,
 }
 
 /// Request/Response DTOs
@@ -381,7 +382,11 @@ pub struct Conversation {
     pub id: Uuid,
     pub workspace_id: Uuid,
     pub api_key_id: Uuid,
-    pub metadata: serde_json::Value, // JSONB storing conversation metadata
+    pub pinned_at: Option<DateTime<Utc>>, // Timestamp when pinned, NULL if not pinned
+    pub archived_at: Option<DateTime<Utc>>, // Timestamp when archived, NULL if not archived
+    pub deleted_at: Option<DateTime<Utc>>, // Timestamp when soft-deleted, NULL if not deleted
+    pub cloned_from_id: Option<Uuid>,     // ID of conversation this was cloned from
+    pub metadata: serde_json::Value, // JSONB storing conversation metadata (includes title/name)
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

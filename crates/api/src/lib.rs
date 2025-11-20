@@ -648,6 +648,18 @@ pub fn build_conversation_routes(
             axum::routing::delete(conversations::delete_conversation),
         )
         .route(
+            "/conversations/{conversation_id}/pin",
+            post(conversations::pin_conversation).delete(conversations::unpin_conversation),
+        )
+        .route(
+            "/conversations/{conversation_id}/archive",
+            post(conversations::archive_conversation).delete(conversations::unarchive_conversation),
+        )
+        .route(
+            "/conversations/{conversation_id}/clone",
+            post(conversations::clone_conversation),
+        )
+        .route(
             "/conversations/{conversation_id}/items",
             get(conversations::list_conversation_items),
         )

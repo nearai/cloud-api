@@ -732,7 +732,7 @@ pub struct CreateConversationItemsRequest {
     pub items: Vec<ConversationInputItem>,
 }
 
-/// Conversation object
+/// Conversation object (follows OpenAI spec)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ConversationObject {
     pub id: String,

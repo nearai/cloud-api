@@ -210,6 +210,12 @@ pub async fn admin_middleware(
         .get("authorization")
         .and_then(|h| h.to_str().ok());
 
+    let user_agent = request
+        .headers()
+        .get("User-Agent")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
     tracing::debug!("Admin auth middleware: {:?}", auth_header);
 
     let auth_result = if let Some(auth_value) = auth_header {
@@ -217,52 +223,60 @@ pub async fn admin_middleware(
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
             debug!("Extracted Bearer token for admin auth: {}", token);
 
-            // Try admin access token first
-            match authenticate_admin_access_token(&state, token.to_string()).await {
-                Ok(admin_token) => {
-                    debug!("Authenticated via admin access token: {}", admin_token.name);
+            // Check if this looks like an admin access token (starts with "adm_")
+            // Admin access tokens should ONLY be validated as admin tokens, no fallback
+            if token.starts_with("adm_") {
+                match authenticate_admin_access_token(&state, token, user_agent.as_deref()).await {
+                    Ok(admin_token) => {
+                        debug!("Authenticated via admin access token: {}", admin_token.name);
 
-                    // Check if this is an admin access token management endpoint
-                    let path = request.uri().path();
-                    let is_access_token_management = path.starts_with("/admin/access-tokens");
-                    // For access token management endpoints, only allow session-based authentication
-                    if is_access_token_management {
-                        debug!("Access token management endpoint detected. Forbidden.");
-                        return Err((
-                            StatusCode::FORBIDDEN,
-                            axum::Json(crate::models::ErrorResponse::new(
-                                "Access token management endpoint detected".to_string(),
-                                "forbidden".to_string(),
-                            )),
-                        ));
-                    }
-
-                    // Query the actual admin user from database
-                    match get_admin_user_by_id(&state, admin_token.created_by_user_id).await {
-                        Ok(admin_user) => {
-                            debug!(
-                                "Retrieved admin user: {} for access token: {}",
-                                admin_user.email, admin_token.name
-                            );
-                            Ok(admin_user)
-                        }
-                        Err(_) => {
-                            error!("Failed to get admin user for access token");
-                            Err((
-                                StatusCode::INTERNAL_SERVER_ERROR,
+                        // Check if this is an admin access token management endpoint
+                        let path = request.uri().path();
+                        let is_access_token_management = path.starts_with("/admin/access-tokens");
+                        // For access token management endpoints, only allow session-based authentication
+                        if is_access_token_management {
+                            debug!("Access token management endpoint detected. Forbidden.");
+                            return Err((
+                                StatusCode::FORBIDDEN,
                                 axum::Json(crate::models::ErrorResponse::new(
-                                    "Failed to get admin user for access token".to_string(),
-                                    "internal_server_error".to_string(),
+                                    "Access token management endpoint detected".to_string(),
+                                    "forbidden".to_string(),
                                 )),
-                            ))
+                            ));
+                        }
+
+                        // Query the actual admin user from database
+                        match get_admin_user_by_id(&state, admin_token.created_by_user_id).await {
+                            Ok(admin_user) => {
+                                debug!(
+                                    "Retrieved admin user: {} for access token: {}",
+                                    admin_user.email, admin_token.name
+                                );
+                                Ok(admin_user)
+                            }
+                            Err(_) => {
+                                error!("Failed to get admin user for access token");
+                                Err((
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    axum::Json(crate::models::ErrorResponse::new(
+                                        "Failed to get admin user for access token".to_string(),
+                                        "internal_server_error".to_string(),
+                                    )),
+                                ))
+                            }
                         }
                     }
+                    Err(err) => {
+                        debug!("Admin access token validation failed: {:?}", err);
+                        // Don't fall back to session token for admin access tokens
+                        // If it looks like an admin token but validation fails, reject it
+                        Err(err)
+                    }
                 }
-                Err(_) => {
-                    // Fall back to session token authentication
-                    debug!("Admin access token validation failed, trying session token");
-                    authenticate_session_access(&state, token.to_string()).await
-                }
+            } else {
+                // Not an admin access token, try as session token
+                debug!("Token does not appear to be an admin access token, trying session token");
+                authenticate_session_access(&state, token.to_string()).await
             }
         } else {
             debug!("Authorization header does not start with 'Bearer '");
@@ -337,14 +351,19 @@ fn check_admin_access(state: &AuthState, user: &DbUser) -> bool {
 /// Authenticate admin access token
 async fn authenticate_admin_access_token(
     state: &AuthState,
-    token: String,
+    token: &str,
+    user_agent: Option<&str>,
 ) -> Result<
     database::models::AdminAccessToken,
     (StatusCode, axum::Json<crate::models::ErrorResponse>),
 > {
     debug!("Authenticating admin access token: {}", token);
 
-    match state.admin_access_token_repository.validate(&token).await {
+    match state
+        .admin_access_token_repository
+        .validate(token, user_agent)
+        .await
+    {
         Ok(Some(admin_token)) => {
             debug!(
                 "Admin access token validated successfully: {}",
@@ -353,11 +372,11 @@ async fn authenticate_admin_access_token(
             Ok(admin_token)
         }
         Ok(None) => {
-            debug!("Admin access token not found or expired");
+            debug!("Invalid admin access token: not found, expired, or User-Agent mismatches");
             Err((
                 StatusCode::UNAUTHORIZED,
                 axum::Json(crate::models::ErrorResponse::new(
-                    "Admin access token not found or expired".to_string(),
+                    "Invalid admin access token".to_string(),
                     "unauthorized".to_string(),
                 )),
             ))

@@ -4,11 +4,11 @@
 //! without requiring external dependencies like VLLM.
 
 use crate::{
-    ChatChoice, ChatCompletionChunk, ChatCompletionParams, ChatCompletionResponse,
-    ChatCompletionResponseChoice, ChatCompletionResponseWithBytes, ChatDelta, ChatResponseMessage,
-    ChatSignature, CompletionChunk, CompletionError, CompletionParams, FinishReason,
-    FunctionCallDelta, ListModelsError, MessageRole, ModelInfo, ModelsResponse, SSEEvent,
-    StreamChunk, StreamingResult, TokenUsage, ToolCallDelta,
+    AttestationError, ChatChoice, ChatCompletionChunk, ChatCompletionParams,
+    ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseWithBytes,
+    ChatDelta, ChatResponseMessage, ChatSignature, CompletionChunk, CompletionError,
+    CompletionParams, FinishReason, FunctionCallDelta, ListModelsError, MessageRole, ModelInfo,
+    ModelsResponse, SSEEvent, StreamChunk, StreamingResult, TokenUsage, ToolCallDelta,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -408,7 +408,7 @@ impl crate::InferenceProvider for MockProvider {
         _signing_algo: Option<String>,
         _nonce: Option<String>,
         _signing_address: Option<String>,
-    ) -> Result<serde_json::Map<String, serde_json::Value>, CompletionError> {
+    ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
         let mut report = serde_json::Map::new();
         report.insert("model".to_string(), serde_json::Value::String(model));
         report.insert(

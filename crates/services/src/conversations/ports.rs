@@ -28,6 +28,30 @@ pub trait ConversationRepository: Send + Sync {
         metadata: serde_json::Value,
     ) -> Result<Option<conversations::models::Conversation>>;
 
+    /// Pin or unpin a conversation
+    async fn set_pinned(
+        &self,
+        id: conversations::models::ConversationId,
+        workspace_id: WorkspaceId,
+        is_pinned: bool,
+    ) -> Result<Option<conversations::models::Conversation>>;
+
+    /// Archive or unarchive a conversation
+    async fn set_archived(
+        &self,
+        id: conversations::models::ConversationId,
+        workspace_id: WorkspaceId,
+        is_archived: bool,
+    ) -> Result<Option<conversations::models::Conversation>>;
+
+    /// Clone a conversation (deep copy with new ID)
+    async fn clone_conversation(
+        &self,
+        id: conversations::models::ConversationId,
+        workspace_id: WorkspaceId,
+        api_key_id: uuid::Uuid,
+    ) -> Result<Option<conversations::models::Conversation>>;
+
     /// Delete a conversation (will cascade delete associated responses)
     async fn delete(
         &self,
@@ -52,6 +76,24 @@ pub trait ConversationServiceTrait: Send + Sync {
         conversation_id: conversations::models::ConversationId,
         workspace_id: WorkspaceId,
         metadata: serde_json::Value,
+    ) -> Result<Option<conversations::models::Conversation>, conversations::errors::ConversationError>;
+    async fn pin_conversation(
+        &self,
+        conversation_id: conversations::models::ConversationId,
+        workspace_id: WorkspaceId,
+        is_pinned: bool,
+    ) -> Result<Option<conversations::models::Conversation>, conversations::errors::ConversationError>;
+    async fn archive_conversation(
+        &self,
+        conversation_id: conversations::models::ConversationId,
+        workspace_id: WorkspaceId,
+        is_archived: bool,
+    ) -> Result<Option<conversations::models::Conversation>, conversations::errors::ConversationError>;
+    async fn clone_conversation(
+        &self,
+        conversation_id: conversations::models::ConversationId,
+        workspace_id: WorkspaceId,
+        api_key_id: uuid::Uuid,
     ) -> Result<Option<conversations::models::Conversation>, conversations::errors::ConversationError>;
     async fn delete_conversation(
         &self,

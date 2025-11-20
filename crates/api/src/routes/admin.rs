@@ -9,6 +9,7 @@ use crate::models::{
 };
 use axum::{
     extract::{Json, Path, State},
+    http::HeaderMap,
     http::StatusCode,
     response::Json as ResponseJson,
     Extension,
@@ -700,15 +701,21 @@ pub async fn list_users(
 pub async fn create_admin_access_token(
     State(app_state): State<AdminAppState>,
     Extension(admin_user): Extension<AdminUser>, // Require admin auth
-    Json(request): Json<CreateAdminAccessTokenRequest>,
+    headers: HeaderMap,
+    Json(request_body): Json<CreateAdminAccessTokenRequest>,
 ) -> Result<ResponseJson<AdminAccessTokenResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let user_agent = headers
+        .get("User-Agent")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
     debug!(
-        "Creating admin access token for user: {} with {} hours expiration",
-        admin_user.0.email, request.expires_in_hours
+        "Creating admin access token for user: {} with {} hours expiration; (User-Agent: {:?})",
+        admin_user.0.email, request_body.expires_in_hours, user_agent
     );
 
     // Validate expiration time (must be positive)
-    if request.expires_in_hours <= 0 {
+    if request_body.expires_in_hours <= 0 {
         return Err((
             StatusCode::BAD_REQUEST,
             ResponseJson(ErrorResponse::new(
@@ -719,11 +726,17 @@ pub async fn create_admin_access_token(
     }
 
     // Create admin access token directly in database
-    let expires_at = Utc::now() + chrono::Duration::hours(request.expires_in_hours);
+    let expires_at = Utc::now() + chrono::Duration::hours(request_body.expires_in_hours);
 
     match app_state
         .admin_access_token_repository
-        .create(admin_user.0.id, request.name, request.reason, expires_at)
+        .create(
+            admin_user.0.id,
+            request_body.name,
+            request_body.reason,
+            expires_at,
+            user_agent,
+        )
         .await
     {
         Ok((admin_token, access_token)) => {

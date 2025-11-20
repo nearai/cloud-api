@@ -640,13 +640,14 @@ pub struct ModelInfo {
     pub owned_by: String,
 }
 
-// vLLM returns OpenAI-compatible models response
+/// vLLM returns OpenAI-compatible models response
 #[derive(Deserialize)]
 pub struct ModelsResponse {
     pub object: String,
     pub data: Vec<ModelInfo>,
 }
 
+/// List models errors
 #[derive(Debug, Error)]
 pub enum ListModelsError {
     #[error("Failed to fetch models: {0}")]
@@ -655,6 +656,32 @@ pub enum ListModelsError {
     InvalidResponse,
     #[error("Unknown error")]
     Unknown,
+}
+
+/// Chat completions errors
+#[derive(Debug, Error, Clone, Serialize, Deserialize)]
+pub enum CompletionError {
+    #[error("Failed to perform completion: {0}")]
+    CompletionError(String),
+    #[error("Invalid response format")]
+    InvalidResponse(String),
+    #[error("Unknown error")]
+    Unknown(String),
+}
+
+/// Attestation report errors
+#[derive(Debug, Error, Clone, Serialize, Deserialize)]
+pub enum AttestationError {
+    #[error("Failed to fetch attestation report: {0}")]
+    FetchError(String),
+    #[error("Invalid response format")]
+    InvalidResponse(String),
+    #[error("Signing address not found on this provider: {0}")]
+    SigningAddressNotFound(String),
+    #[error("No provider found that supports attestation reports for model: {0}")]
+    ProviderNotFound(String),
+    #[error("Unknown error")]
+    Unknown(String),
 }
 
 /// Chat signature for cryptographic verification
@@ -776,14 +803,4 @@ mod tests {
         assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
         assert!(choice.message.content.is_some());
     }
-}
-
-#[derive(Debug, Error, Clone, Serialize, Deserialize)]
-pub enum CompletionError {
-    #[error("Failed to perform completion: {0}")]
-    CompletionError(String),
-    #[error("Invalid response format")]
-    InvalidResponse(String),
-    #[error("Unknown error")]
-    Unknown(String),
 }

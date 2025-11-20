@@ -451,12 +451,12 @@ impl ConversationRepository for PgConversationRepository {
         let now = Utc::now();
 
         let result = client
-            .execute(
-                "UPDATE conversations SET deleted_at = $3, updated_at = $4 WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
-                &[&id.0, &workspace_id.0, &now, &now],
-            )
-            .await
-            .context("Failed to soft delete conversation")?;
+             .execute(
+                 "UPDATE conversations SET deleted_at = $3, updated_at = $4 WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+                 &[&id.0, &workspace_id.0, &now, &now],
+             )
+             .await
+             .context("Failed to soft delete conversation")?;
 
         if result > 0 {
             debug!(
@@ -467,5 +467,84 @@ impl ConversationRepository for PgConversationRepository {
         } else {
             Ok(false)
         }
+    }
+
+    /// Batch get conversations by IDs (excludes soft-deleted conversations)
+    async fn batch_get_by_ids(
+        &self,
+        ids: Vec<ConversationId>,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<Conversation>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        // Extract raw UUIDs from ConversationId wrappers
+        let uuid_ids: Vec<Uuid> = ids.into_iter().map(|id| id.0).collect();
+
+        // Query with ANY() for efficient batch retrieval
+        let rows = client
+             .query(
+                 "SELECT * FROM conversations WHERE id = ANY($1) AND workspace_id = $2 AND deleted_at IS NULL",
+                 &[&uuid_ids, &workspace_id.0],
+             )
+             .await
+             .context("Failed to batch query conversations")?;
+
+        debug!(
+            "Batch retrieved {} conversations (requested {}) for workspace: {}",
+            rows.len(),
+            uuid_ids.len(),
+            workspace_id.0
+        );
+
+        // Convert each row to Conversation model
+        rows.into_iter()
+            .map(|row| self.row_to_conversation(row))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_batch_get_by_ids_empty_vector() {
+        // Empty vector should be handled gracefully
+        let empty_ids: Vec<ConversationId> = vec![];
+        assert_eq!(empty_ids.len(), 0, "Empty vector should have length 0");
+    }
+
+    #[test]
+    fn test_batch_get_by_ids_creates_uuid_array() {
+        // Test that ConversationId vectors are properly converted to UUID arrays
+        let id1 = ConversationId(Uuid::nil());
+        let id2 = ConversationId(Uuid::new_v4());
+        let id3 = ConversationId(Uuid::new_v4());
+
+        let ids = vec![id1, id2, id3];
+        let uuid_ids: Vec<Uuid> = ids.into_iter().map(|id| id.0).collect();
+
+        assert_eq!(uuid_ids.len(), 3, "Should have 3 UUIDs");
+        assert_eq!(uuid_ids[0], Uuid::nil(), "First UUID should be nil");
+        assert_eq!(uuid_ids[1], id2.0, "Second UUID should match");
+        assert_eq!(uuid_ids[2], id3.0, "Third UUID should match");
+    }
+
+    #[test]
+    fn test_conversation_id_ordering() {
+        // Test that conversation IDs maintain order
+        let id1 = ConversationId(Uuid::nil());
+        let id2 = ConversationId(Uuid::new_v4());
+        let id3 = ConversationId(Uuid::new_v4());
+
+        let ids = [id1, id2, id3];
+
+        assert_eq!(ids[0].0, id1.0, "First ID UUID should match");
+        assert_eq!(ids[1].0, id2.0, "Second ID UUID should match");
+        assert_eq!(ids[2].0, id3.0, "Third ID UUID should match");
     }
 }

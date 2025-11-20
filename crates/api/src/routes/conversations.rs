@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
     response::Json as ResponseJson,
 };
+use indexmap::IndexSet;
 use serde::Deserialize;
 use services::{
     conversations::{errors::ConversationError, models::ConversationId},
@@ -96,6 +97,135 @@ pub async fn create_conversation(
                 http_conversation.id, api_key.workspace_id.0
             );
             Ok((StatusCode::CREATED, ResponseJson(http_conversation)))
+        }
+        Err(error) => Err((
+            map_conversation_error_to_status(&error),
+            ResponseJson(error.into()),
+        )),
+    }
+}
+
+/// Batch retrieve conversations
+///
+/// Retrieve multiple conversations in a single request using their IDs.
+#[utoipa::path(
+    post,
+    path = "/v1/conversations/batch",
+    tag = "Conversations",
+    request_body = BatchConversationsRequest,
+    responses(
+        (status = 200, description = "Conversations retrieved", body = ConversationBatchResponse),
+        (status = 400, description = "Bad request (empty IDs or invalid format)", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("api_key" = []))
+)]
+pub async fn batch_get_conversations(
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
+    Json(request): Json<BatchConversationsRequest>,
+) -> Result<ResponseJson<ConversationBatchResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    debug!(
+        "Batch get conversations for workspace: {}",
+        api_key.workspace_id.0
+    );
+
+    // Validate: at least one ID provided
+    if request.ids.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Must provide at least one conversation ID".to_string(),
+                "invalid_request_error".to_string(),
+            )),
+        ));
+    }
+
+    // Limit batch size (prevent abuse)
+    if request.ids.len() > 1000 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Maximum 1000 conversation IDs per request".to_string(),
+                "invalid_request_error".to_string(),
+            )),
+        ));
+    }
+
+    // Parse conversation IDs while keeping track of original requested ID strings
+    // Use IndexSet to store tuples of (normalized, original) to maintain order and mapping
+    let mut requested_ids: IndexSet<(String, String)> = IndexSet::new();
+    let mut conversation_ids = Vec::new();
+
+    for id_str in &request.ids {
+        let parsed_id = parse_conversation_id(id_str).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    format!("Invalid conversation ID: {e}"),
+                    "invalid_request_error".to_string(),
+                )),
+            )
+        })?;
+        let normalized = parsed_id.to_string();
+        requested_ids.insert((normalized, id_str.clone()));
+        conversation_ids.push(parsed_id);
+    }
+
+    // Call service to batch retrieve
+    match service
+        .batch_get_conversations(conversation_ids, api_key.workspace_id.clone())
+        .await
+    {
+        Ok(conversations) => {
+            // Create set of found conversation IDs (normalized)
+            let found_ids_set: IndexSet<String> =
+                conversations.iter().map(|c| c.id.to_string()).collect();
+
+            // Calculate missing IDs, returning them in their original requested format
+            let missing_ids: Vec<String> = requested_ids
+                .iter()
+                .filter_map(|(normalized_id, original_id)| {
+                    if !found_ids_set.contains(normalized_id) {
+                        Some(original_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Convert to HTTP format first, indexed by normalized ID
+            let http_conversations_by_id: std::collections::HashMap<String, ConversationObject> =
+                conversations
+                    .into_iter()
+                    .map(|c| {
+                        let id = c.id.to_string();
+                        let obj = convert_domain_conversation_to_http(c);
+                        (id, obj)
+                    })
+                    .collect();
+
+            // Reorder conversations to match requested order
+            let http_conversations: Vec<ConversationObject> = requested_ids
+                .iter()
+                .filter_map(|(normalized_id, _)| {
+                    http_conversations_by_id.get(normalized_id).cloned()
+                })
+                .collect();
+
+            debug!(
+                "Retrieved {} conversations (missing {}) for workspace {}",
+                http_conversations.len(),
+                missing_ids.len(),
+                api_key.workspace_id.0
+            );
+
+            Ok(ResponseJson(ConversationBatchResponse {
+                object: "list".to_string(),
+                data: http_conversations,
+                missing_ids,
+            }))
         }
         Err(error) => Err((
             map_conversation_error_to_status(&error),

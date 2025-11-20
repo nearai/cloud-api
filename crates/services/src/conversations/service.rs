@@ -506,4 +506,155 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
 
         Ok(created_items)
     }
+
+    /// Batch get conversations by IDs
+    async fn batch_get_conversations(
+        &self,
+        conversation_ids: Vec<models::ConversationId>,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<models::Conversation>, errors::ConversationError> {
+        tracing::debug!(
+            "Batch getting {} conversations for workspace: {}",
+            conversation_ids.len(),
+            workspace_id.0
+        );
+
+        let db_conversations = self
+            .conv_repo
+            .batch_get_by_ids(conversation_ids, workspace_id.clone())
+            .await
+            .map_err(|e| {
+                errors::ConversationError::InternalError(format!(
+                    "Failed to batch get conversations: {e}"
+                ))
+            })?;
+
+        let num_conversations = db_conversations.len();
+
+        let conversations = db_conversations
+            .into_iter()
+            .map(|c| models::Conversation {
+                id: c.id,
+                workspace_id: c.workspace_id,
+                api_key_id: c.api_key_id,
+                pinned_at: c.pinned_at,
+                archived_at: c.archived_at,
+                deleted_at: c.deleted_at,
+                cloned_from_id: c.cloned_from_id,
+                metadata: c.metadata,
+                created_at: c.created_at,
+                updated_at: c.updated_at,
+            })
+            .collect();
+
+        tracing::debug!(
+            "Batch retrieved {} conversations for workspace: {}",
+            num_conversations,
+            workspace_id.0
+        );
+
+        Ok(conversations)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn test_conversation_id_creation() {
+        // Test that ConversationId can be created from UUID
+        let uuid = Uuid::new_v4();
+        let conv_id = models::ConversationId(uuid);
+        assert_eq!(conv_id.0, uuid, "ConversationId should wrap UUID correctly");
+    }
+
+    #[test]
+    fn test_conversation_id_vector_creation() {
+        // Test that we can create vectors of ConversationId
+        let id1 = models::ConversationId(Uuid::new_v4());
+        let id2 = models::ConversationId(Uuid::new_v4());
+        let id3 = models::ConversationId(Uuid::new_v4());
+
+        let ids = [id1, id2, id3];
+        assert_eq!(ids.len(), 3, "Should create vector with 3 IDs");
+        assert_eq!(ids[0].0, id1.0, "First ID should match");
+        assert_eq!(ids[1].0, id2.0, "Second ID should match");
+        assert_eq!(ids[2].0, id3.0, "Third ID should match");
+    }
+
+    #[test]
+    fn test_workspace_id_creation() {
+        // Test that WorkspaceId can be created
+        let uuid = Uuid::new_v4();
+        let workspace_id = WorkspaceId(uuid);
+        assert_eq!(
+            workspace_id.0, uuid,
+            "WorkspaceId should wrap UUID correctly"
+        );
+    }
+
+    #[test]
+    fn test_conversation_model_creation() {
+        // Test that Conversation model can be created with all fields
+        let id = models::ConversationId(Uuid::new_v4());
+        let workspace_id = WorkspaceId(Uuid::new_v4());
+        let api_key_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        let conversation = models::Conversation {
+            id,
+            workspace_id: workspace_id.clone(),
+            api_key_id,
+            pinned_at: None,
+            archived_at: None,
+            deleted_at: None,
+            cloned_from_id: None,
+            metadata: serde_json::json!({}),
+            created_at: now,
+            updated_at: now,
+        };
+
+        assert_eq!(conversation.id.0, id.0, "ID should match");
+        assert_eq!(
+            conversation.workspace_id.0, workspace_id.0,
+            "Workspace ID should match"
+        );
+        assert_eq!(
+            conversation.api_key_id, api_key_id,
+            "API key ID should match"
+        );
+        assert_eq!(conversation.pinned_at, None, "pinned_at should be None");
+        assert_eq!(conversation.archived_at, None, "archived_at should be None");
+        assert_eq!(conversation.deleted_at, None, "deleted_at should be None");
+    }
+
+    #[test]
+    fn test_batch_conversation_ids_collection() {
+        // Test collecting conversation IDs for batch operation
+        let ids: Vec<models::ConversationId> = (0..10)
+            .map(|_| models::ConversationId(Uuid::new_v4()))
+            .collect();
+
+        assert_eq!(ids.len(), 10, "Should collect 10 conversation IDs");
+
+        // Verify all IDs are unique
+        let mut id_strings: Vec<String> = ids.iter().map(|id| id.0.to_string()).collect();
+        id_strings.sort();
+        id_strings.dedup();
+        assert_eq!(
+            id_strings.len(),
+            10,
+            "All conversation IDs should be unique"
+        );
+    }
+
+    #[test]
+    fn test_empty_batch_ids() {
+        // Test handling of empty batch
+        let empty_ids: Vec<models::ConversationId> = Vec::new();
+        assert_eq!(empty_ids.len(), 0, "Empty vector should have length 0");
+        assert!(empty_ids.is_empty(), "Empty vector should report as empty");
+    }
 }

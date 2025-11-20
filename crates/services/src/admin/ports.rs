@@ -13,6 +13,10 @@ pub struct UpdateModelAdminRequest {
     pub verifiable: Option<bool>,
     pub is_active: Option<bool>,
     pub aliases: Option<Vec<String>>,
+    // User audit tracking for history
+    pub change_reason: Option<String>,
+    pub changed_by_user_id: Option<uuid::Uuid>,
+    pub changed_by_user_email: Option<String>,
 }
 
 /// Batch update request format - Map of model name to update data
@@ -45,11 +49,16 @@ pub struct ModelHistoryEntry {
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
     pub context_length: i32,
+    pub model_name: String,
     pub model_display_name: String,
     pub model_description: String,
+    pub model_icon: Option<String>,
+    pub verifiable: bool,
+    pub is_active: bool,
     pub effective_from: chrono::DateTime<chrono::Utc>,
     pub effective_until: Option<chrono::DateTime<chrono::Utc>>,
-    pub changed_by: Option<String>,
+    pub changed_by_user_id: Option<uuid::Uuid>,
+    pub changed_by_user_email: Option<String>,
     pub change_reason: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -147,7 +156,13 @@ pub trait AdminRepository: Send + Sync {
     ) -> Result<(Vec<ModelHistoryEntry>, i64), anyhow::Error>;
 
     /// Soft delete a model by setting is_active to false
-    async fn soft_delete_model(&self, model_name: &str) -> Result<bool, anyhow::Error>;
+    async fn soft_delete_model(
+        &self,
+        model_name: &str,
+        change_reason: Option<String>,
+        changed_by_user_id: Option<uuid::Uuid>,
+        changed_by_user_email: Option<String>,
+    ) -> Result<bool, anyhow::Error>;
 
     /// Update organization limits (creates new history entry, closes previous)
     async fn update_organization_limits(
@@ -208,7 +223,13 @@ pub trait AdminService: Send + Sync {
     ) -> Result<(Vec<ModelHistoryEntry>, i64), AdminError>;
 
     /// Soft delete a model by setting is_active to false (admin only)
-    async fn delete_model(&self, model_name: &str) -> Result<(), AdminError>;
+    async fn delete_model(
+        &self,
+        model_name: &str,
+        change_reason: Option<String>,
+        changed_by_user_id: Option<uuid::Uuid>,
+        changed_by_user_email: Option<String>,
+    ) -> Result<(), AdminError>;
 
     /// Update organization limits (admin only)
     async fn update_organization_limits(

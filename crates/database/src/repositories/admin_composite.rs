@@ -131,7 +131,12 @@ impl AdminRepository for AdminCompositeRepository {
         changed_by_user_email: Option<String>,
     ) -> Result<bool> {
         self.model_repo
-            .soft_delete_model(model_name, change_reason, changed_by_user_id, changed_by_user_email)
+            .soft_delete_model(
+                model_name,
+                change_reason,
+                changed_by_user_id,
+                changed_by_user_email,
+            )
             .await
     }
 

@@ -186,7 +186,7 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub ip_address: Option<String>,
-    pub user_agent: Option<String>,
+    pub user_agent: String,
 }
 
 #[async_trait]
@@ -357,7 +357,7 @@ impl MockAuthService {
         self.create_mock_session_with_params(
             user_id,
             None,
-            Some(MOCK_USER_AGENT.to_string()),
+            MOCK_USER_AGENT.to_string(),
             "mock_encoding_key".to_string(),
             1,
             7 * 24,
@@ -368,7 +368,7 @@ impl MockAuthService {
         &self,
         user_id: UserId,
         ip_address: Option<String>,
-        user_agent: Option<String>,
+        user_agent: String,
         encoding_key: String,
         expires_in_hours: i64,
         refresh_expires_in_hours: i64,
@@ -400,7 +400,7 @@ impl MockAuthService {
             created_at: chrono::Utc::now(),
             expires_at,
             ip_address: ip_address.or(Some("127.0.0.1".to_string())),
-            user_agent: user_agent.or(Some(MOCK_USER_AGENT.to_string())),
+            user_agent,
         };
 
         (access_token, session, session_token)
@@ -421,7 +421,7 @@ impl AuthServiceTrait for MockAuthService {
         Ok(self.create_mock_session_with_params(
             user_id,
             ip_address,
-            Some(user_agent),
+            user_agent,
             encoding_key,
             expires_in_hours,
             refresh_expires_in_hours,
@@ -550,7 +550,7 @@ impl AuthServiceTrait for MockAuthService {
         let (access_token, refresh_session, refresh_token) = self.create_mock_session_with_params(
             mock_user.id,
             None,
-            Some(MOCK_USER_AGENT.to_string()),
+            MOCK_USER_AGENT.to_string(),
             encoding_key,
             access_token_expires_in_hours,
             refresh_token_expires_in_hours,

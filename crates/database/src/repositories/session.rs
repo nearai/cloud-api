@@ -64,7 +64,7 @@ impl SessionRepository {
                     &now,
                     &expires_at,
                     &ip_address,
-                    &Some(user_agent),
+                    &user_agent,
                 ],
             )
             .await

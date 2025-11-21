@@ -36,6 +36,7 @@ struct ProcessStreamContext {
     web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
     file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
     file_service: Arc<dyn FileServiceTrait>,
+    organization_repository: Arc<dyn crate::organization::OrganizationRepository>,
     /// Source registry for citation resolution
     source_registry: Option<models::SourceRegistry>,
 }
@@ -49,6 +50,7 @@ pub struct ResponseServiceImpl {
     pub web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
     pub file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
     pub file_service: Arc<dyn FileServiceTrait>,
+    pub organization_repository: Arc<dyn crate::organization::OrganizationRepository>,
 }
 
 /// Tag transition states for reasoning content
@@ -70,6 +72,7 @@ impl ResponseServiceImpl {
         web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
         file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
         file_service: Arc<dyn FileServiceTrait>,
+        organization_repository: Arc<dyn crate::organization::OrganizationRepository>,
     ) -> Self {
         Self {
             response_repository,
@@ -80,6 +83,7 @@ impl ResponseServiceImpl {
             web_search_provider,
             file_search_provider,
             file_service,
+            organization_repository,
         }
     }
 }
@@ -112,6 +116,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let web_search_provider = self.web_search_provider.clone();
         let file_search_provider = self.file_search_provider.clone();
         let file_service = self.file_service.clone();
+        let organization_repository = self.organization_repository.clone();
 
         tokio::spawn(async move {
             let context = ProcessStreamContext {
@@ -128,6 +133,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 web_search_provider,
                 file_search_provider,
                 file_service,
+                organization_repository,
                 source_registry: None,
             };
 
@@ -594,6 +600,8 @@ impl ResponseServiceImpl {
             &context.response_items_repository,
             &context.file_service,
             workspace_id_domain.clone(),
+            context.organization_id,
+            &context.organization_repository,
         )
         .await?;
 
@@ -1214,10 +1222,40 @@ impl ResponseServiceImpl {
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
         file_service: &Arc<dyn FileServiceTrait>,
         workspace_id: crate::workspace::WorkspaceId,
+        organization_id: uuid::Uuid,
+        organization_repository: &Arc<dyn crate::organization::OrganizationRepository>,
     ) -> Result<Vec<crate::completions::ports::CompletionMessage>, errors::ResponseError> {
         use crate::completions::ports::CompletionMessage;
 
         let mut messages = Vec::new();
+
+        // Fetch organization system prompt if available
+        let org_system_prompt = match organization_repository.get_by_id(organization_id).await {
+            Ok(Some(org)) => org
+                .settings
+                .get("system_prompt")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            Ok(None) => {
+                tracing::warn!("Organization {} not found", organization_id);
+                None
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch organization: {}", e);
+                None
+            }
+        };
+
+        // Prepend organization system prompt if it exists
+        if let Some(prompt) = org_system_prompt {
+            if !prompt.is_empty() {
+                messages.push(CompletionMessage {
+                    role: "system".to_string(),
+                    content: prompt,
+                });
+                tracing::debug!("Prepended organization system prompt to messages");
+            }
+        }
 
         // Add UTC time context to system message
         let now = chrono::Utc::now();

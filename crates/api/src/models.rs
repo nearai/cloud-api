@@ -1051,6 +1051,26 @@ pub struct UpdateOrganizationMemberRequest {
     pub role: MemberRole,
 }
 
+/// Organization settings structure
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OrganizationSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+}
+
+/// Request to patch organization settings (PATCH endpoint)
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PatchOrganizationSettingsRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+}
+
+/// Response containing organization settings
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct OrganizationSettingsResponse {
+    pub settings: OrganizationSettings,
+}
+
 /// Result of a single invitation attempt
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct InvitationResult {

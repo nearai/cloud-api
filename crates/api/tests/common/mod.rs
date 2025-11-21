@@ -335,6 +335,25 @@ pub fn generate_model() -> BatchUpdateModelApiRequest {
         }))
         .unwrap(),
     );
+    batch.insert(
+        "zai-org/GLM-4.6".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 1000000,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 2000000,
+                "currency": "USD"
+            },
+            "modelDisplayName": "GLM-4.6",
+            "modelDescription": "GLM 4.6 model for testing",
+            "contextLength": 128000,
+            "verifiable": true,
+            "isActive": true
+        }))
+        .unwrap(),
+    );
     batch
 }
 

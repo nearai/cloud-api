@@ -305,16 +305,8 @@ pub async fn create_org_and_api_key(
 }
 
 /// Setup a test model with pricing
-/// Returns the model name
-pub async fn setup_test_model(server: &axum_test::TestServer) -> String {
-    let batch = generate_model();
-    let model_name = batch.keys().next().unwrap().clone();
-    admin_batch_upsert_models(server, batch, get_session_id()).await;
-    model_name
-}
-
-/// Generate a test model with standard pricing
-pub fn generate_model() -> BatchUpdateModelApiRequest {
+/// Setup Qwen model for tests
+pub async fn setup_qwen_model(server: &axum_test::TestServer) -> String {
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
         "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
@@ -335,6 +327,13 @@ pub fn generate_model() -> BatchUpdateModelApiRequest {
         }))
         .unwrap(),
     );
+    admin_batch_upsert_models(server, batch, get_session_id()).await;
+    "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string()
+}
+
+/// Setup GLM model for tests (e.g., citation tests)
+pub async fn setup_glm_model(server: &axum_test::TestServer) -> String {
+    let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
         "zai-org/GLM-4.6".to_string(),
         serde_json::from_value(serde_json::json!({
@@ -354,7 +353,8 @@ pub fn generate_model() -> BatchUpdateModelApiRequest {
         }))
         .unwrap(),
     );
-    batch
+    admin_batch_upsert_models(server, batch, get_session_id()).await;
+    "zai-org/GLM-4.6".to_string()
 }
 
 /// Admin batch upsert models

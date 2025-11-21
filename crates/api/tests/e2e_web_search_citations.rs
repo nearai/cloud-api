@@ -124,8 +124,7 @@ async fn test_non_streaming_web_search_with_citations() {
     let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
-    let _models = setup_test_model(&server).await;
-    let model = "zai-org/GLM-4.6".to_string();
+    let model = setup_glm_model(&server).await;
 
     // Create a conversation
     let conversation_response = server
@@ -275,8 +274,7 @@ async fn test_streaming_web_search_with_citations() {
     let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
-    let _models = setup_test_model(&server).await;
-    let model = "zai-org/GLM-4.6".to_string();
+    let model = setup_glm_model(&server).await;
 
     // Create a conversation
     let conversation_response = server
@@ -578,8 +576,7 @@ async fn capture_streaming_citations_to_file() {
     let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
-    let _models = setup_test_model(&server).await;
-    let model = "zai-org/GLM-4.6".to_string();
+    let model = setup_glm_model(&server).await;
 
     // Create a conversation
     let conversation_response = server

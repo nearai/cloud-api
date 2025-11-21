@@ -129,38 +129,42 @@ async fn test_chat_completions_api() {
 async fn test_admin_update_model() {
     let server = setup_test_server().await;
 
-    // Upsert models (using session token with admin domain email)
-    let batch = generate_model();
-    let batch_for_comparison = generate_model();
-    let updated_models = admin_batch_upsert_models(&server, batch, get_session_id()).await;
-    println!("Updated models: {updated_models:?}");
-    assert_eq!(updated_models.len(), 1);
-    let updated_model = &updated_models[0];
-    // model_id should be the canonical model_name (the key in the batch HashMap)
+    // Setup and upsert Qwen model (using session token with admin domain email)
+    let model_name = setup_qwen_model(&server).await;
+
+    // Verify the model was upserted with correct properties
+    assert_eq!(model_name, "Qwen/Qwen3-30B-A3B-Instruct-2507");
+
+    // Retrieve the model to verify the update
+    let response = server
+        .get(
+            format!(
+                "/v1/model/{}",
+                url::form_urlencoded::byte_serialize(model_name.as_bytes()).collect::<String>()
+            )
+            .as_str(),
+        )
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    let retrieved_model = response.json::<api::models::ModelWithPricing>();
+
+    assert_eq!(retrieved_model.model_id, "Qwen/Qwen3-30B-A3B-Instruct-2507");
     assert_eq!(
-        updated_model.model_id,
-        *batch_for_comparison.keys().next().unwrap()
-    );
-    assert_eq!(
-        updated_model.metadata.model_display_name,
+        retrieved_model.metadata.model_display_name,
         "Updated Model Name"
     );
-    assert_eq!(updated_model.input_cost_per_token.amount, 1000000);
+    assert_eq!(retrieved_model.input_cost_per_token.amount, 1000000);
+    assert_eq!(retrieved_model.output_cost_per_token.amount, 2000000);
 }
 
 #[tokio::test]
 async fn test_get_model_by_name() {
     let server = setup_test_server().await;
 
-    // Upsert a model with a name containing forward slashes
-    let batch = generate_model();
-    let model_name = batch.keys().next().unwrap().clone();
-    let model_request = batch.get(&model_name).unwrap().clone();
-
-    let upserted_models = admin_batch_upsert_models(&server, batch, get_session_id()).await;
-
-    println!("Upserted models: {upserted_models:?}");
-    assert_eq!(upserted_models.len(), 1);
+    // Setup Qwen model with a name containing forward slashes
+    let model_name = setup_qwen_model(&server).await;
+    assert_eq!(model_name, "Qwen/Qwen3-30B-A3B-Instruct-2507");
 
     // Test retrieving the model by name (public endpoint - no auth required)
     // Model names may contain forward slashes (e.g., "Qwen/Qwen3-30B-A3B-Instruct-2507")
@@ -181,56 +185,20 @@ async fn test_get_model_by_name() {
     println!("Retrieved model: {model_resp:?}");
 
     // Verify the model details match what we upserted
-    // The model_id should be the canonical model_name
-    assert_eq!(model_resp.model_id, model_name);
-    assert_eq!(
-        model_resp.metadata.model_display_name,
-        model_request.model_display_name.as_deref().unwrap()
-    );
+    assert_eq!(model_resp.model_id, "Qwen/Qwen3-30B-A3B-Instruct-2507");
+    assert_eq!(model_resp.metadata.model_display_name, "Updated Model Name");
     assert_eq!(
         model_resp.metadata.model_description,
-        model_request.model_description.as_deref().unwrap()
+        "Updated model description"
     );
-    assert_eq!(
-        model_resp.metadata.context_length,
-        model_request.context_length.unwrap()
-    );
-    assert_eq!(
-        model_resp.metadata.verifiable,
-        model_request.verifiable.unwrap()
-    );
-    assert_eq!(
-        model_resp.input_cost_per_token.amount,
-        model_request.input_cost_per_token.as_ref().unwrap().amount
-    );
-    assert_eq!(
-        model_resp.input_cost_per_token.scale,
-        9 // Scale is always 9 (nano-dollars)
-    );
-    assert_eq!(
-        model_resp.input_cost_per_token.currency,
-        model_request
-            .input_cost_per_token
-            .as_ref()
-            .unwrap()
-            .currency
-    );
-    assert_eq!(
-        model_resp.output_cost_per_token.amount,
-        model_request.output_cost_per_token.as_ref().unwrap().amount
-    );
-    assert_eq!(
-        model_resp.output_cost_per_token.scale,
-        9 // Scale is always 9 (nano-dollars)
-    );
-    assert_eq!(
-        model_resp.output_cost_per_token.currency,
-        model_request
-            .output_cost_per_token
-            .as_ref()
-            .unwrap()
-            .currency
-    );
+    assert_eq!(model_resp.metadata.context_length, 128000);
+    assert!(model_resp.metadata.verifiable);
+    assert_eq!(model_resp.input_cost_per_token.amount, 1000000);
+    assert_eq!(model_resp.input_cost_per_token.scale, 9);
+    assert_eq!(model_resp.input_cost_per_token.currency, "USD");
+    assert_eq!(model_resp.output_cost_per_token.amount, 2000000);
+    assert_eq!(model_resp.output_cost_per_token.scale, 9);
+    assert_eq!(model_resp.output_cost_per_token.currency, "USD");
 
     // Test retrieving the same model again by canonical name to verify consistency
     let response_by_name_again = server
@@ -991,7 +959,7 @@ async fn test_completion_cost_calculation() {
     println!("Created organization: {}", org.id);
 
     // Setup test model with known pricing
-    let model_name = setup_test_model(&server).await;
+    let model_name = setup_qwen_model(&server).await;
     println!("Setup model: {model_name}");
 
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
@@ -1204,7 +1172,7 @@ async fn test_organization_balance_with_limit_and_usage() {
 
     // Make a completion to record some usage
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
-    let model_name = setup_test_model(&server).await;
+    let model_name = setup_qwen_model(&server).await;
 
     let response = server
         .post("/v1/chat/completions")

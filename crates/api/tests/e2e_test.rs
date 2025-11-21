@@ -133,7 +133,7 @@ async fn test_admin_update_model() {
     let model_name = setup_qwen_model(&server).await;
 
     // Verify the model was upserted with correct properties
-    assert_eq!(model_name, "Qwen/Qwen3-30B-A3B-Instruct-2507");
+    assert_eq!("Qwen/Qwen3-30B-A3B-Instruct-2507", model_name);
 
     // Retrieve the model to verify the update
     let response = server
@@ -146,16 +146,16 @@ async fn test_admin_update_model() {
         )
         .await;
 
-    assert_eq!(response.status_code(), 200);
+    assert_eq!(200, response.status_code());
     let retrieved_model = response.json::<api::models::ModelWithPricing>();
 
-    assert_eq!(retrieved_model.model_id, "Qwen/Qwen3-30B-A3B-Instruct-2507");
+    assert_eq!("Qwen/Qwen3-30B-A3B-Instruct-2507", retrieved_model.model_id);
     assert_eq!(
-        retrieved_model.metadata.model_display_name,
-        "Updated Model Name"
+        "Updated Model Name",
+        retrieved_model.metadata.model_display_name
     );
-    assert_eq!(retrieved_model.input_cost_per_token.amount, 1000000);
-    assert_eq!(retrieved_model.output_cost_per_token.amount, 2000000);
+    assert_eq!(1000000, retrieved_model.input_cost_per_token.amount);
+    assert_eq!(2000000, retrieved_model.output_cost_per_token.amount);
 }
 
 #[tokio::test]
@@ -164,7 +164,7 @@ async fn test_get_model_by_name() {
 
     // Setup Qwen model with a name containing forward slashes
     let model_name = setup_qwen_model(&server).await;
-    assert_eq!(model_name, "Qwen/Qwen3-30B-A3B-Instruct-2507");
+    assert_eq!("Qwen/Qwen3-30B-A3B-Instruct-2507", model_name);
 
     // Test retrieving the model by name (public endpoint - no auth required)
     // Model names may contain forward slashes (e.g., "Qwen/Qwen3-30B-A3B-Instruct-2507")
@@ -179,26 +179,26 @@ async fn test_get_model_by_name() {
         .await;
 
     println!("Response status: {}", response.status_code());
-    assert_eq!(response.status_code(), 200);
+    assert_eq!(200, response.status_code());
 
     let model_resp = response.json::<api::models::ModelWithPricing>();
     println!("Retrieved model: {model_resp:?}");
 
     // Verify the model details match what we upserted
-    assert_eq!(model_resp.model_id, "Qwen/Qwen3-30B-A3B-Instruct-2507");
-    assert_eq!(model_resp.metadata.model_display_name, "Updated Model Name");
+    assert_eq!("Qwen/Qwen3-30B-A3B-Instruct-2507", model_resp.model_id);
+    assert_eq!("Updated Model Name", model_resp.metadata.model_display_name);
     assert_eq!(
-        model_resp.metadata.model_description,
-        "Updated model description"
+        "Updated model description",
+        model_resp.metadata.model_description
     );
-    assert_eq!(model_resp.metadata.context_length, 128000);
+    assert_eq!(128000, model_resp.metadata.context_length);
     assert!(model_resp.metadata.verifiable);
-    assert_eq!(model_resp.input_cost_per_token.amount, 1000000);
-    assert_eq!(model_resp.input_cost_per_token.scale, 9);
-    assert_eq!(model_resp.input_cost_per_token.currency, "USD");
-    assert_eq!(model_resp.output_cost_per_token.amount, 2000000);
-    assert_eq!(model_resp.output_cost_per_token.scale, 9);
-    assert_eq!(model_resp.output_cost_per_token.currency, "USD");
+    assert_eq!(1000000, model_resp.input_cost_per_token.amount);
+    assert_eq!(9, model_resp.input_cost_per_token.scale);
+    assert_eq!("USD", model_resp.input_cost_per_token.currency);
+    assert_eq!(2000000, model_resp.output_cost_per_token.amount);
+    assert_eq!(9, model_resp.output_cost_per_token.scale);
+    assert_eq!("USD", model_resp.output_cost_per_token.currency);
 
     // Test retrieving the same model again by canonical name to verify consistency
     let response_by_name_again = server
@@ -209,7 +209,7 @@ async fn test_get_model_by_name() {
         "Second canonical name response status: {}",
         response_by_name_again.status_code()
     );
-    assert_eq!(response_by_name_again.status_code(), 200);
+    assert_eq!(200, response_by_name_again.status_code());
 
     let model_resp_by_name_again = response_by_name_again.json::<api::models::ModelWithPricing>();
     println!("Retrieved model again by canonical name: {model_resp_by_name_again:?}");

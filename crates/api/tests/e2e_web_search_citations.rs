@@ -147,8 +147,8 @@ async fn test_non_streaming_web_search_with_citations() {
     println!("✓ Created conversation: {conversation_id}");
 
     // Create non-streaming response with web search
-     // Use a specific query that requires current information and citations
-     let response = server
+    // Use a specific query that requires current information and citations
+    let response = server
          .post("/v1/responses")
          .add_header("Authorization", format!("Bearer {api_key}"))
          .json(&json!({
@@ -295,8 +295,8 @@ async fn test_streaming_web_search_with_citations() {
 
     println!("✓ Created conversation: {conversation_id}");
 
-     // Create streaming response with web search
-     let response = server
+    // Create streaming response with web search
+    let response = server
          .post("/v1/responses")
          .add_header("Authorization", format!("Bearer {api_key}"))
          .json(&json!({

@@ -498,4 +498,19 @@ pub trait OrganizationServiceTrait: Send + Sync {
         requester_id: UserId,
         status: Option<InvitationStatus>,
     ) -> Result<Vec<OrganizationInvitation>, OrganizationError>;
+
+    /// Get organization system prompt
+    async fn get_system_prompt(
+        &self,
+        organization_id: OrganizationId,
+        user_id: UserId,
+    ) -> Result<Option<String>, OrganizationError>;
+
+    /// Update organization system prompt
+    async fn update_system_prompt(
+        &self,
+        organization_id: OrganizationId,
+        user_id: UserId,
+        system_prompt: Option<String>,
+    ) -> Result<Option<String>, OrganizationError>;
 }

@@ -50,6 +50,13 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
                 .put(update_organization)
                 .delete(delete_organization),
         )
+        // Organization settings management
+        .route(
+            "/{id}/settings",
+            get(get_organization_settings)
+                .patch(patch_organization_settings)
+                .delete(delete_organization_settings_field),
+        )
         // Organization member management
         .route(
             "/{id}/members",

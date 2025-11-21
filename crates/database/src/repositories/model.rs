@@ -449,11 +449,11 @@ impl ModelRepository {
                     INSERT INTO models (
                         model_name, model_display_name, model_description, model_icon,
                         input_cost_per_token, output_cost_per_token,
-                        context_length, verifiable, is_active
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        context_length, verifiable, is_active, owned_by
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token,
-                              context_length, verifiable, is_active, created_at, updated_at
+                              context_length, verifiable, is_active, owned_by, created_at, updated_at
                     "#,
                     &[
                         &model.model_name,
@@ -465,6 +465,7 @@ impl ModelRepository {
                         &model.context_length,
                         &model.verifiable,
                         &model.is_active,
+                        &model.owned_by,
                     ],
                 )
                 .await

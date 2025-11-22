@@ -417,6 +417,7 @@ pub struct Model {
 
     // Tracking fields
     pub is_active: bool,
+    pub owned_by: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -434,6 +435,7 @@ pub struct UpdateModelPricingRequest {
     pub verifiable: Option<bool>,
     pub is_active: Option<bool>,
     pub aliases: Option<Vec<String>>,
+    pub owned_by: Option<String>,
 }
 
 /// Model pricing history - stores historical pricing data for models

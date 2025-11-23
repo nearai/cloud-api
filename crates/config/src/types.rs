@@ -9,6 +9,7 @@ pub struct ApiConfig {
     pub auth: AuthConfig,
     pub database: DatabaseConfig,
     pub s3: S3Config,
+    pub otlp: OtlpConfig,
 }
 
 impl ApiConfig {
@@ -22,6 +23,7 @@ impl ApiConfig {
             auth: AuthConfig::from_env()?,
             database: DatabaseConfig::from_env()?,
             s3: S3Config::from_env()?,
+            otlp: OtlpConfig::from_env()?,
         })
     }
 }
@@ -454,5 +456,28 @@ mod tests {
 
         // Should return false when no admin domains configured
         assert!(!config.is_admin_email("admin@near.ai"));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OtlpConfig {
+    pub endpoint: String,
+    pub protocol: String,
+}
+
+impl OtlpConfig {
+    pub fn from_env() -> Result<Self, String> {
+        Ok(Self::default())
+    }
+}
+
+impl Default for OtlpConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://localhost:4317".to_string()),
+            protocol: env::var("OTEL_EXPORTER_OTLP_PROTOCOL")
+                .unwrap_or_else(|_| "grpc".to_string()),
+        }
     }
 }

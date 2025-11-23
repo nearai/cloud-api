@@ -23,6 +23,9 @@ struct ToolExecutionResult {
 
 /// Context for processing a response stream
 struct ProcessStreamContext {
+    organization_name: String,
+    workspace_name: String,
+    api_key_name: String,
     request: models::CreateResponseRequest,
     user_id: crate::UserId,
     api_key_id: String,
@@ -94,6 +97,9 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
         body_hash: String,
+        api_key_name: String,
+        workspace_name: String,
+        organization_name: String,
     ) -> Result<
         Pin<Box<dyn Stream<Item = models::ResponseStreamEvent> + Send>>,
         errors::ResponseError,
@@ -115,6 +121,9 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
 
         tokio::spawn(async move {
             let context = ProcessStreamContext {
+                organization_name,
+                workspace_name,
+                api_key_name,
                 request,
                 user_id,
                 api_key_id,
@@ -813,6 +822,9 @@ impl ResponseServiceImpl {
 
             // Create completion request
             let completion_request = CompletionRequest {
+                organization_name: process_context.organization_name.clone(),
+                workspace_name: process_context.workspace_name.clone(),
+                api_key_name: process_context.api_key_name.clone(),
                 model: process_context.request.model.clone(),
                 messages: messages.clone(),
                 max_tokens: process_context.request.max_output_tokens,
@@ -2134,6 +2146,9 @@ DO NOT USE THESE FORMATS:
             workspace_id,
             metadata: None,
             body_hash: String::new(),
+            api_key_name: "internal-title-generation".to_string(),
+            workspace_name: "internal".to_string(),
+            organization_name: "internal".to_string(),
             n: None,
             extra: std::collections::HashMap::new(),
         };

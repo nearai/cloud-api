@@ -203,6 +203,7 @@ pub async fn init_domain_services(
     database: Arc<Database>,
     config: &ApiConfig,
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
+    metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
     // Create shared repositories
     let conversation_repo = Arc::new(database::PgConversationRepository::new(
@@ -237,6 +238,7 @@ pub async fn init_domain_services(
         attestation_repo,
         inference_provider_pool.clone(),
         models_repo.clone(),
+        metrics_service.clone(),
     ));
 
     // Create models service
@@ -285,6 +287,7 @@ pub async fn init_domain_services(
         inference_provider_pool.clone(),
         attestation_service.clone(),
         usage_service.clone(),
+        metrics_service.clone(),
         models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
     ));
 
@@ -979,15 +982,21 @@ mod tests {
                 encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_string(), // Mock 256-bit hex key
             },
+            otlp: config::OtlpConfig {
+                endpoint: "http://localhost:4317".to_string(),
+                protocol: "grpc".to_string(),
+            },
         };
 
         // Initialize services
         let database = init_database(&config.database).await;
         let auth_components = init_auth_services(database.clone(), &config);
+        let metrics_service = Arc::new(services::metrics::MockMetricsService) as Arc<dyn services::metrics::MetricsServiceTrait>;
         let domain_services = init_domain_services(
             database.clone(),
             &config,
             auth_components.organization_service.clone(),
+            metrics_service,
         )
         .await;
 
@@ -1071,13 +1080,19 @@ mod tests {
                 encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_string(), // Mock 256-bit hex key
             },
+            otlp: config::OtlpConfig {
+                endpoint: "http://localhost:4317".to_string(),
+                protocol: "grpc".to_string(),
+            },
         };
 
         let auth_components = init_auth_services(database.clone(), &config);
+        let metrics_service = Arc::new(services::metrics::MockMetricsService) as Arc<dyn services::metrics::MetricsServiceTrait>;
         let domain_services = init_domain_services(
             database.clone(),
             &config,
             auth_components.organization_service.clone(),
+            metrics_service,
         )
         .await;
 

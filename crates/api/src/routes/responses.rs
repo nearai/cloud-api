@@ -144,6 +144,9 @@ pub async fn create_response(
                 api_key.organization.id.0,
                 api_key.workspace.id.0,
                 body_hash.hash.clone(),
+                api_key.api_key.name.clone(),
+                api_key.workspace.name.clone(),
+                api_key.organization.name.clone(),
             )
             .await
         {
@@ -265,6 +268,9 @@ pub async fn create_response(
                 api_key.organization.id.0,
                 api_key.workspace.id.0,
                 body_hash.hash.clone(),
+                api_key.api_key.name.clone(),
+                api_key.workspace.name.clone(),
+                api_key.organization.name.clone(),
             )
             .await
         {

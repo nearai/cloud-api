@@ -20,6 +20,7 @@ use crate::{
         ports::AttestationRepository,
     },
     inference_provider_pool::InferenceProviderPool,
+    metrics::{consts::*, MetricsServiceTrait},
     models::ModelsRepository,
 };
 
@@ -29,6 +30,7 @@ pub struct AttestationService {
     pub repository: Arc<dyn AttestationRepository + Send + Sync>,
     pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub models_repository: Arc<dyn ModelsRepository>,
+    pub metrics_service: Arc<dyn MetricsServiceTrait>,
     pub vpc_info: Option<VpcInfo>,
     ed25519_signing_key: Arc<SigningKey>,
     ed25519_verifying_key: Arc<VerifyingKey>,
@@ -41,6 +43,7 @@ impl AttestationService {
         repository: Arc<dyn AttestationRepository + Send + Sync>,
         inference_provider_pool: Arc<InferenceProviderPool>,
         models_repository: Arc<dyn ModelsRepository>,
+        metrics_service: Arc<dyn MetricsServiceTrait>,
     ) -> Self {
         // Load VPC info once during initialization
         let vpc_info = load_vpc_info();
@@ -75,6 +78,7 @@ impl AttestationService {
             repository,
             inference_provider_pool,
             models_repository,
+            metrics_service,
             vpc_info,
             ed25519_signing_key,
             ed25519_verifying_key,
@@ -169,6 +173,8 @@ impl ports::AttestationServiceTrait for AttestationService {
         &self,
         chat_id: &str,
     ) -> Result<(), AttestationError> {
+        let start_time = std::time::Instant::now();
+
         // Get the provider for this chat
         let provider = self
             .inference_provider_pool
@@ -181,6 +187,14 @@ impl ports::AttestationServiceTrait for AttestationService {
         // Fetch signature from provider
         let provider_signature = provider.get_signature(chat_id).await.map_err(|e| {
             tracing::error!("Failed to get chat signature from provider");
+            let duration = start_time.elapsed();
+            self.metrics_service.record_count(
+                METRIC_VERIFICATION_FAILURE,
+                1,
+                &[&format!("{}:{}", TAG_REASON, REASON_PROVIDER_ERROR)],
+            );
+            self.metrics_service
+                .record_latency(METRIC_VERIFICATION_DURATION, duration, &[]);
             AttestationError::ProviderError(e.to_string())
         })?;
 
@@ -197,8 +211,23 @@ impl ports::AttestationServiceTrait for AttestationService {
             .await
             .map_err(|e| {
                 tracing::error!("Failed to store chat signature in repository");
+                let duration = start_time.elapsed();
+                self.metrics_service.record_count(
+                    METRIC_VERIFICATION_FAILURE,
+                    1,
+                    &[&format!("{}:{}", TAG_REASON, REASON_REPOSITORY_ERROR)],
+                );
+                self.metrics_service
+                    .record_latency(METRIC_VERIFICATION_DURATION, duration, &[]);
                 AttestationError::RepositoryError(e.to_string())
             })?;
+
+        // Record successful verification
+        let duration = start_time.elapsed();
+        self.metrics_service
+            .record_count(METRIC_VERIFICATION_SUCCESS, 1, &[]);
+        self.metrics_service
+            .record_latency(METRIC_VERIFICATION_DURATION, duration, &[]);
 
         Ok(())
     }
@@ -210,6 +239,8 @@ impl ports::AttestationServiceTrait for AttestationService {
         response_hash: String,
         signing_algo: Option<String>,
     ) -> Result<(), AttestationError> {
+        let start_time = std::time::Instant::now();
+
         // Create signature text in format "request_hash:response_hash"
         let signature_text = format!("{request_hash}:{response_hash}");
 
@@ -294,6 +325,14 @@ impl ports::AttestationServiceTrait for AttestationService {
             .await
             .map_err(|e| {
                 tracing::error!("Failed to store response signature in repository");
+                let duration = start_time.elapsed();
+                self.metrics_service.record_count(
+                    METRIC_VERIFICATION_FAILURE,
+                    1,
+                    &[&format!("{}:{}", TAG_REASON, REASON_REPOSITORY_ERROR)],
+                );
+                self.metrics_service
+                    .record_latency(METRIC_VERIFICATION_DURATION, duration, &[]);
                 AttestationError::RepositoryError(e.to_string())
             })?;
 
@@ -303,6 +342,13 @@ impl ports::AttestationServiceTrait for AttestationService {
             signing_address_clone,
             algo_clone
         );
+
+        // Record successful verification
+        let duration = start_time.elapsed();
+        self.metrics_service
+            .record_count(METRIC_VERIFICATION_SUCCESS, 1, &[]);
+        self.metrics_service
+            .record_latency(METRIC_VERIFICATION_DURATION, duration, &[]);
 
         Ok(())
     }

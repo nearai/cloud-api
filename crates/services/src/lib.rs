@@ -2,6 +2,7 @@ pub mod admin;
 pub mod attestation;
 pub mod auth;
 pub mod common;
+pub mod metrics;
 pub mod completions;
 pub mod conversations;
 pub mod files;
@@ -18,3 +19,6 @@ pub use auth::UserId;
 pub use completions::CompletionServiceImpl;
 pub use conversations::service::ConversationServiceImpl as ConversationService;
 pub use responses::service::ResponseServiceImpl as ResponseService;
+
+#[cfg(test)]
+mod test_utils;

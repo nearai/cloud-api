@@ -116,6 +116,9 @@ pub trait ResponseServiceTrait: Send + Sync {
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
         body_hash: String,
+        api_key_name: String,
+        workspace_name: String,
+        organization_name: String,
     ) -> Result<
         Pin<Box<dyn Stream<Item = models::ResponseStreamEvent> + Send>>,
         errors::ResponseError,

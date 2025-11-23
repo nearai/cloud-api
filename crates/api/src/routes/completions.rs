@@ -45,6 +45,9 @@ fn convert_chat_request_to_service(
     organization_id: Uuid,
     workspace_id: Uuid,
     body_hash: RequestBodyHash,
+    api_key_name: String,
+    workspace_name: String,
+    organization_name: String,
 ) -> ServiceCompletionRequest {
     ServiceCompletionRequest {
         model: request.model.clone(),
@@ -68,6 +71,9 @@ fn convert_chat_request_to_service(
         workspace_id,
         metadata: None,
         body_hash: body_hash.hash.clone(),
+        api_key_name,
+        workspace_name,
+        organization_name,
         extra: request.extra.clone(),
     }
 }
@@ -80,6 +86,9 @@ fn convert_text_request_to_service(
     organization_id: Uuid,
     workspace_id: Uuid,
     body_hash: RequestBodyHash,
+    api_key_name: String,
+    workspace_name: String,
+    organization_name: String,
 ) -> ServiceCompletionRequest {
     ServiceCompletionRequest {
         model: request.model.clone(),
@@ -99,6 +108,9 @@ fn convert_text_request_to_service(
         workspace_id,
         metadata: None,
         body_hash: body_hash.hash.clone(),
+        api_key_name,
+        workspace_name,
+        organization_name,
         extra: request.extra.clone(),
     }
 }
@@ -161,6 +173,9 @@ pub async fn chat_completions(
         api_key.organization.id.0,
         api_key.workspace.id.0,
         body_hash,
+        api_key.api_key.name.clone(),
+        api_key.workspace.name.clone(),
+        api_key.organization.name.clone(),
     );
 
     // Check if streaming is requested
@@ -310,6 +325,9 @@ pub async fn completions(
         api_key.organization.id.0,
         api_key.workspace.id.0,
         body_hash,
+        api_key.api_key.name.clone(),
+        api_key.workspace.name.clone(),
+        api_key.organization.name.clone(),
     );
 
     // Call the completion service - it handles usage tracking internally

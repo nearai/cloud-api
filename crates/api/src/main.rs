@@ -1,6 +1,14 @@
 use api::{build_app_with_config, init_auth_services, init_database, init_domain_services};
 use config::{ApiConfig, LoggingConfig};
 use std::sync::Arc;
+use services::metrics::{MetricsServiceTrait, OtlpMetricsService};
+use opentelemetry::global;
+use opentelemetry_sdk::{
+    metrics::{MeterProvider, PeriodicReader},
+    runtime,
+    Resource,
+};
+use opentelemetry_otlp::WithExportConfig;
 
 #[tokio::main]
 async fn main() {
@@ -12,10 +20,42 @@ async fn main() {
     // Initialize core services
     let database = init_database(&config.database).await;
     let auth_components = init_auth_services(database.clone(), &config);
+
+    // Initialize OpenTelemetry pipeline
+    let exporter = opentelemetry_otlp::new_exporter()
+        .tonic()
+        .with_endpoint(&config.otlp.endpoint)
+        .build_metrics_exporter(
+            Box::new(opentelemetry_sdk::metrics::reader::DefaultAggregationSelector::new()),
+            Box::new(opentelemetry_sdk::metrics::reader::DefaultTemporalitySelector::new()),
+        )
+        .expect("Failed to build OTLP metrics exporter");
+
+    let reader = PeriodicReader::builder(exporter, runtime::Tokio).build();
+    
+    // Get environment from env var (local, dev, staging, prod)
+    let environment = std::env::var("ENVIRONMENT").unwrap_or_else(|_| "local".to_string());
+    
+    let meter_provider = MeterProvider::builder()
+        .with_reader(reader)
+        .with_resource(Resource::new(vec![
+            opentelemetry::KeyValue::new("service.name", "cloud-api"),
+            opentelemetry::KeyValue::new("environment", environment.clone()),
+        ]))
+        .build();
+    
+    tracing::info!("OpenTelemetry metrics initialized for environment: {}", environment);
+
+    global::set_meter_provider(meter_provider.clone());
+
+    // Initialize metrics service
+    let metrics_service = Arc::new(OtlpMetricsService::new(&meter_provider)) as Arc<dyn MetricsServiceTrait>;
+
     let domain_services = init_domain_services(
         database.clone(),
         &config,
         auth_components.organization_service.clone(),
+        metrics_service,
     )
     .await;
 

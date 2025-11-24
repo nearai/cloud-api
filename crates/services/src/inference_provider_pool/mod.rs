@@ -36,6 +36,8 @@ pub struct InferenceProviderPool {
     load_balancer_index: Arc<RwLock<HashMap<String, usize>>>,
     /// Map of chat_id -> provider for sticky routing
     chat_id_mapping: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
+    /// Map of chat_id -> (request_hash, response_hash) for MockProvider signature generation
+    signature_hashes: Arc<RwLock<HashMap<String, (String, String)>>>,
 }
 
 impl InferenceProviderPool {
@@ -54,6 +56,27 @@ impl InferenceProviderPool {
             model_mapping: Arc::new(RwLock::new(HashMap::new())),
             load_balancer_index: Arc::new(RwLock::new(HashMap::new())),
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
+            signature_hashes: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Register a provider for a model manually (useful for testing with mock providers)
+    pub async fn register_provider(&self, model_id: String, provider: Arc<InferenceProviderTrait>) {
+        let mut model_mapping = self.model_mapping.write().await;
+        model_mapping
+            .entry(model_id)
+            .or_insert_with(Vec::new)
+            .push(provider);
+    }
+
+    /// Register multiple providers for multiple models (useful for testing)
+    pub async fn register_providers(&self, providers: Vec<(String, Arc<InferenceProviderTrait>)>) {
+        let mut model_mapping = self.model_mapping.write().await;
+        for (model_id, provider) in providers {
+            model_mapping
+                .entry(model_id)
+                .or_insert_with(Vec::new)
+                .push(provider);
         }
     }
 
@@ -283,6 +306,25 @@ impl InferenceProviderPool {
     ) -> Option<Arc<dyn InferenceProvider + Send + Sync>> {
         let mapping = self.chat_id_mapping.read().await;
         mapping.get(chat_id).cloned()
+    }
+
+    /// Register signature hashes for a chat_id
+    /// MockProvider will check this when get_signature is called
+    pub async fn register_signature_hashes_for_chat(
+        &self,
+        chat_id: &str,
+        request_hash: String,
+        response_hash: String,
+    ) {
+        let mut hashes = self.signature_hashes.write().await;
+        hashes.insert(chat_id.to_string(), (request_hash, response_hash));
+        tracing::debug!("Registered signature hashes for chat_id: {}", chat_id);
+    }
+
+    /// Get signature hashes for a chat_id (used by MockProvider)
+    pub async fn get_signature_hashes_for_chat(&self, chat_id: &str) -> Option<(String, String)> {
+        let hashes = self.signature_hashes.read().await;
+        hashes.get(chat_id).cloned()
     }
 
     /// Get providers for a model in priority order for fallback

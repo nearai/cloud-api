@@ -15,6 +15,7 @@ pub mod organization_limits_repository_impl;
 pub mod organization_usage;
 pub mod response;
 pub mod response_item;
+pub mod retry;
 pub mod session;
 pub mod usage_repository_impl;
 pub mod user;

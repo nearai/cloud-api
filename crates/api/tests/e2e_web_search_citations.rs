@@ -125,6 +125,7 @@ async fn test_non_streaming_web_search_with_citations() {
     let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
+    let model = setup_glm_model(&server).await;
 
     // Create a conversation
     let conversation_response = server
@@ -150,22 +151,22 @@ async fn test_non_streaming_web_search_with_citations() {
     // Create non-streaming response with web search
     // Use a specific query that requires current information and citations
     let response = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&json!({
-            "conversation": conversation_id,
-            "model": "zai-org/GLM-4.6",
-            "input": "What are the top 5 most popular restaurants in San Francisco right now? Search the web for the latest restaurant rankings and reviews.",
-            "stream": false,
-            "max_output_tokens": 512,
-            "temperature": 0.7,
-            "tools": [
-                {
-                    "type": "web_search"
-                }
-            ]
-        }))
-        .await;
+         .post("/v1/responses")
+         .add_header("Authorization", format!("Bearer {api_key}"))
+         .json(&json!({
+             "conversation": conversation_id,
+             "model": model,
+             "input": "What is the weather in San Francisco today? Search the web for current weather conditions.",
+             "stream": false,
+             "max_output_tokens": 512,
+             "temperature": 0.7,
+             "tools": [
+                 {
+                     "type": "web_search"
+                 }
+             ]
+         }))
+         .await;
 
     assert_eq!(response.status_code(), 200);
 
@@ -274,6 +275,7 @@ async fn test_streaming_web_search_with_citations() {
     let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
+    let model = setup_glm_model(&server).await;
 
     // Create a conversation
     let conversation_response = server
@@ -298,22 +300,22 @@ async fn test_streaming_web_search_with_citations() {
 
     // Create streaming response with web search
     let response = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&json!({
-            "conversation": conversation_id,
-            "model": "zai-org/GLM-4.6",
-            "input": "What are the most popular iOS apps in 2024? Search the web for the latest app store rankings and download statistics.",
-            "stream": true,
-            "max_output_tokens": 512,
-            "temperature": 0.7,
-            "tools": [
-                {
-                    "type": "web_search"
-                }
-            ]
-        }))
-        .await;
+         .post("/v1/responses")
+         .add_header("Authorization", format!("Bearer {api_key}"))
+         .json(&json!({
+             "conversation": conversation_id,
+             "model": model,
+             "input": "What is the current weather in New York City? Search the web for real-time weather conditions.",
+             "stream": true,
+             "max_output_tokens": 512,
+             "temperature": 0.7,
+             "tools": [
+                 {
+                     "type": "web_search"
+                 }
+             ]
+         }))
+         .await;
 
     assert_eq!(response.status_code(), 200);
 
@@ -575,6 +577,7 @@ async fn capture_streaming_citations_to_file() {
     let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
+    let model = setup_glm_model(&server).await;
 
     // Create a conversation
     let conversation_response = server
@@ -599,12 +602,12 @@ async fn capture_streaming_citations_to_file() {
 
     // Create streaming response with web search
     let response = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&json!({
-            "conversation": conversation_id,
-            "model": "zai-org/GLM-4.6",
-            "input": "What are the latest developments in AI? Search the web and provide current information with citations.",
+         .post("/v1/responses")
+         .add_header("Authorization", format!("Bearer {api_key}"))
+         .json(&json!({
+             "conversation": conversation_id,
+             "model": model,
+             "input": "What are the latest developments in AI? Search the web and provide current information with citations.",
             "stream": true,
             "max_output_tokens": 256,
             "temperature": 0.7,

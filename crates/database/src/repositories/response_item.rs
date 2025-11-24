@@ -35,9 +35,12 @@
 //! ```
 
 use crate::pool::DbPool;
+use crate::repositories::utils::map_db_error;
+use crate::retry_db;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
+use services::common::RepositoryError;
 use services::conversations::models::ConversationId;
 use services::responses::models::*;
 use services::responses::ports::*;
@@ -191,46 +194,49 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
         conversation_id: Option<ConversationId>,
         item: ResponseOutputItem,
     ) -> Result<ResponseOutputItem> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
         // Extract UUID from the item's ID string
         let item_id = item.id();
         let id = Self::extract_uuid_from_item_id(item_id)?;
-        let now = Utc::now();
 
         // Serialize the item to JSON for storage
         let item_json = serde_json::to_value(&item).context("Failed to serialize response item")?;
 
         let conversation_uuid = conversation_id.map(|cid| cid.0);
 
-        let row = client
-            .query_one(
-                r#"
-                INSERT INTO response_items (id, response_id, api_key_id, conversation_id, item, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                RETURNING 
-                    response_items.*,
-                    (SELECT previous_response_id FROM responses WHERE id = $2) as previous_response_id,
-                    (SELECT next_response_ids FROM responses WHERE id = $2) as next_response_ids,
-                    (SELECT created_at FROM responses WHERE id = $2) as response_created_at,
-                    (SELECT model FROM responses WHERE id = $2) as model
-                "#,
-                &[
-                    &id,
-                    &response_id.0,
-                    &api_key_id,
-                    &conversation_uuid,
-                    &item_json,
-                    &now,
-                    &now,
-                ],
-            )
-            .await
-            .context("Failed to insert response item")?;
+        let row = retry_db!("create_response_item", {
+            let now = Utc::now();
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_one(
+                    r#"
+                    INSERT INTO response_items (id, response_id, api_key_id, conversation_id, item, created_at, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    RETURNING
+                        response_items.*,
+                        (SELECT previous_response_id FROM responses WHERE id = $2) as previous_response_id,
+                        (SELECT next_response_ids FROM responses WHERE id = $2) as next_response_ids,
+                        (SELECT created_at FROM responses WHERE id = $2) as response_created_at,
+                        (SELECT model FROM responses WHERE id = $2) as model
+                    "#,
+                    &[
+                        &id,
+                        &response_id.0,
+                        &api_key_id,
+                        &conversation_uuid,
+                        &item_json,
+                        &now,
+                        &now,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         debug!(
             "Created response item: {} for response: {} api_key: {}",
@@ -242,16 +248,19 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
 
     /// Get a response item by its ID
     async fn get_by_id(&self, id: ResponseItemId) -> Result<Option<ResponseOutputItem>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("get_response_item_by_id", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_opt("SELECT * FROM response_items WHERE id = $1", &[&id.0])
-            .await
-            .context("Failed to query response item")?;
+            client
+                .query_opt("SELECT * FROM response_items WHERE id = $1", &[&id.0])
+                .await
+                .map_err(map_db_error)
+        })?;
 
         match row {
             Some(row) => Ok(Some(self.row_to_item(row)?)),
@@ -265,29 +274,31 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
         id: ResponseItemId,
         item: ResponseOutputItem,
     ) -> Result<ResponseOutputItem> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
-        let now = Utc::now();
-
         // Serialize the updated item to JSON
         let item_json = serde_json::to_value(&item).context("Failed to serialize response item")?;
 
-        let row = client
-            .query_opt(
-                r#"
-                UPDATE response_items
-                SET item = $2, updated_at = $3
-                WHERE id = $1
-                RETURNING *
-                "#,
-                &[&id.0, &item_json, &now],
-            )
-            .await
-            .context("Failed to update response item")?;
+        let row = retry_db!("update_response_item", {
+            let now = Utc::now();
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_opt(
+                    r#"
+                    UPDATE response_items
+                    SET item = $2, updated_at = $3
+                    WHERE id = $1
+                    RETURNING *
+                    "#,
+                    &[&id.0, &item_json, &now],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         match row {
             Some(row) => {
@@ -300,16 +311,19 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
 
     /// Delete a response item
     async fn delete(&self, id: ResponseItemId) -> Result<bool> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let result = retry_db!("delete_response_item", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let result = client
-            .execute("DELETE FROM response_items WHERE id = $1", &[&id.0])
-            .await
-            .context("Failed to delete response item")?;
+            client
+                .execute("DELETE FROM response_items WHERE id = $1", &[&id.0])
+                .await
+                .map_err(map_db_error)
+        })?;
 
         if result > 0 {
             debug!("Deleted response item: {}", id.0);
@@ -321,60 +335,66 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
 
     /// List all items for a specific response
     async fn list_by_response(&self, response_id: ResponseId) -> Result<Vec<ResponseOutputItem>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let rows = retry_db!("list_response_items_by_response", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let rows = client
-            .query(
-                r#"
-                SELECT 
-                    ri.*,
-                    r.previous_response_id,
-                    r.next_response_ids,
-                    r.created_at as response_created_at,
-                    r.model
-                FROM response_items ri
-                JOIN responses r ON ri.response_id = r.id
-                WHERE ri.response_id = $1
-                ORDER BY ri.created_at ASC
-                "#,
-                &[&response_id.0],
-            )
-            .await
-            .context("Failed to query response items by response")?;
+            client
+                .query(
+                    r#"
+                    SELECT
+                        ri.*,
+                        r.previous_response_id,
+                        r.next_response_ids,
+                        r.created_at as response_created_at,
+                        r.model
+                    FROM response_items ri
+                    JOIN responses r ON ri.response_id = r.id
+                    WHERE ri.response_id = $1
+                    ORDER BY ri.created_at ASC
+                    "#,
+                    &[&response_id.0],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         rows.into_iter().map(|row| self.row_to_item(row)).collect()
     }
 
     /// List all items for a specific API key
     async fn list_by_api_key(&self, api_key_id: uuid::Uuid) -> Result<Vec<ResponseOutputItem>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let rows = retry_db!("list_response_items_by_api_key", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let rows = client
-            .query(
-                r#"
-                SELECT 
-                    ri.*,
-                    r.previous_response_id,
-                    r.next_response_ids,
-                    r.created_at as response_created_at,
-                    r.model
-                FROM response_items ri
-                JOIN responses r ON ri.response_id = r.id
-                WHERE ri.api_key_id = $1
-                ORDER BY ri.created_at DESC
-                "#,
-                &[&api_key_id],
-            )
-            .await
-            .context("Failed to query response items by API key")?;
+            client
+                .query(
+                    r#"
+                    SELECT
+                        ri.*,
+                        r.previous_response_id,
+                        r.next_response_ids,
+                        r.created_at as response_created_at,
+                        r.model
+                    FROM response_items ri
+                    JOIN responses r ON ri.response_id = r.id
+                    WHERE ri.api_key_id = $1
+                    ORDER BY ri.created_at DESC
+                    "#,
+                    &[&api_key_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         rows.into_iter().map(|row| self.row_to_item(row)).collect()
     }
@@ -387,63 +407,70 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
         after: Option<String>,
         limit: i64,
     ) -> Result<Vec<ResponseOutputItem>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
-        let rows = if let Some(after_id) = after {
-            // Extract UUID from the after item ID
-            let after_uuid = Self::extract_uuid_from_item_id(&after_id)?;
-
-            // Query items after the reference item using composite (created_at, id) comparison
-            // This handles cases where multiple items have the same created_at timestamp
-            // We fetch limit + 1 to determine if there are more items
-            client
-                .query(
-                    r#"
-                    SELECT 
-                        ri.*,
-                        r.previous_response_id,
-                        r.next_response_ids,
-                        r.created_at as response_created_at,
-                        r.model
-                    FROM response_items ri
-                    JOIN responses r ON ri.response_id = r.id
-                    WHERE ri.conversation_id = $1
-                      AND (ri.created_at, ri.id) > (
-                          SELECT created_at, id FROM response_items WHERE id = $2
-                      )
-                    ORDER BY ri.created_at ASC, ri.id ASC
-                    LIMIT $3
-                    "#,
-                    &[&conversation_id.0, &after_uuid, &limit],
-                )
-                .await
-                .context("Failed to query response items by conversation with pagination")?
+        // Extract UUID from the after item ID if provided (validation happens outside retry block)
+        let after_uuid = if let Some(ref after_id) = after {
+            Some(Self::extract_uuid_from_item_id(after_id)?)
         } else {
-            // No pagination cursor, fetch from the beginning
-            client
-                .query(
-                    r#"
-                    SELECT 
-                        ri.*,
-                        r.previous_response_id,
-                        r.next_response_ids,
-                        r.created_at as response_created_at,
-                        r.model
-                    FROM response_items ri
-                    JOIN responses r ON ri.response_id = r.id
-                    WHERE ri.conversation_id = $1
-                    ORDER BY ri.created_at ASC, ri.id ASC
-                    LIMIT $2
-                    "#,
-                    &[&conversation_id.0, &limit],
-                )
-                .await
-                .context("Failed to query response items by conversation")?
+            None
         };
+
+        let rows = retry_db!("list_response_items_by_conversation", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            if let Some(after_uuid) = after_uuid {
+                // Query items after the reference item using composite (created_at, id) comparison
+                // This handles cases where multiple items have the same created_at timestamp
+                // We fetch limit + 1 to determine if there are more items
+                client
+                    .query(
+                        r#"
+                        SELECT
+                            ri.*,
+                            r.previous_response_id,
+                            r.next_response_ids,
+                            r.created_at as response_created_at,
+                            r.model
+                        FROM response_items ri
+                        JOIN responses r ON ri.response_id = r.id
+                        WHERE ri.conversation_id = $1
+                          AND (ri.created_at, ri.id) > (
+                              SELECT created_at, id FROM response_items WHERE id = $2
+                          )
+                        ORDER BY ri.created_at ASC, ri.id ASC
+                        LIMIT $3
+                        "#,
+                        &[&conversation_id.0, &after_uuid, &limit],
+                    )
+                    .await
+                    .map_err(map_db_error)
+            } else {
+                // No pagination cursor, fetch from the beginning
+                client
+                    .query(
+                        r#"
+                        SELECT
+                            ri.*,
+                            r.previous_response_id,
+                            r.next_response_ids,
+                            r.created_at as response_created_at,
+                            r.model
+                        FROM response_items ri
+                        JOIN responses r ON ri.response_id = r.id
+                        WHERE ri.conversation_id = $1
+                        ORDER BY ri.created_at ASC, ri.id ASC
+                        LIMIT $2
+                        "#,
+                        &[&conversation_id.0, &limit],
+                    )
+                    .await
+                    .map_err(map_db_error)
+            }
+        })?;
 
         rows.into_iter().map(|row| self.row_to_item(row)).collect()
     }

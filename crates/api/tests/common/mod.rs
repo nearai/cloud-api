@@ -1,9 +1,6 @@
 #![allow(dead_code)]
 
-use api::{
-    build_app_with_config, init_auth_services, init_domain_services,
-    models::BatchUpdateModelApiRequest,
-};
+use api::{build_app_with_config, init_auth_services, models::BatchUpdateModelApiRequest};
 use base64::Engine;
 use chrono::Utc;
 use config::ApiConfig;
@@ -164,10 +161,15 @@ pub async fn setup_test_server() -> axum_test::TestServer {
     assert_mock_user_in_db(&database).await;
 
     let auth_components = init_auth_services(database.clone(), &config);
-    let domain_services = init_domain_services(
+
+    // Use mock inference providers instead of real VLLM to avoid flakiness
+    // This leverages the existing MockProvider from inference_providers::mock
+    let inference_provider_pool = api::init_inference_providers_with_mocks(&config).await;
+    let domain_services = api::init_domain_services_with_pool(
         database.clone(),
         &config,
         auth_components.organization_service.clone(),
+        inference_provider_pool,
     )
     .await;
 

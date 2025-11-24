@@ -178,7 +178,43 @@ impl ports::AttestationServiceTrait for AttestationService {
                 AttestationError::ProviderError(format!("No provider found for chat_id: {chat_id}"))
             })?;
 
-        // Fetch signature from provider
+        // For MockProvider: Check if hashes are registered in the pool first
+        // This allows the route handler to register hashes before InterceptStream stores the signature
+        if let Some((request_hash, response_hash)) = self
+            .inference_provider_pool
+            .get_signature_hashes_for_chat(chat_id)
+            .await
+        {
+            // Use the registered hashes to create signature in correct format
+            let signature_text = format!("{request_hash}:{response_hash}");
+
+            // Generate a deterministic mock signature based on the hashes
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            signature_text.hash(&mut hasher);
+            let sig_hash = format!("{:x}", hasher.finish());
+
+            let signature = ChatSignature {
+                text: signature_text,
+                signature: format!("0x{sig_hash}"),
+                signing_address: "mock-address".to_string(),
+                signing_algo: "ecdsa".to_string(),
+            };
+
+            // Store in repository
+            self.repository
+                .add_chat_signature(chat_id, signature)
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to store chat signature in repository");
+                    AttestationError::RepositoryError(e.to_string())
+                })?;
+
+            return Ok(());
+        }
+
+        // Fallback: Fetch signature from provider (for non-MockProvider or if hashes not registered)
         let provider_signature = provider.get_signature(chat_id).await.map_err(|e| {
             tracing::error!("Failed to get chat signature from provider");
             AttestationError::ProviderError(e.to_string())

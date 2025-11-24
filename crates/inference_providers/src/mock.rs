@@ -13,12 +13,23 @@ use crate::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
+
+/// Hash pair for signature generation
+#[derive(Clone, Debug)]
+struct SignatureHashes {
+    request_hash: String,
+    response_hash: String,
+}
 
 /// Mock provider that implements InferenceProvider for testing
 pub struct MockProvider {
     /// List of available mock models
     models: Vec<ModelInfo>,
+    /// Map of chat_id to (request_hash, response_hash) for signature generation
+    signature_hashes: Arc<RwLock<std::collections::HashMap<String, SignatureHashes>>>,
 }
 
 impl MockProvider {
@@ -30,7 +41,46 @@ impl MockProvider {
             created: 1762544256,
             owned_by: "vllm".to_string(),
         }];
-        Self { models }
+        Self {
+            models,
+            signature_hashes: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Create a new mock provider that accepts any model (useful for tests)
+    /// This bypasses model validation to accept any model name
+    pub fn new_accept_all() -> Self {
+        // Return empty models list - we'll override is_valid_model to always return true
+        Self {
+            models: vec![],
+            signature_hashes: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Create a mock provider with custom model list
+    pub fn with_models(models: Vec<ModelInfo>) -> Self {
+        Self {
+            models,
+            signature_hashes: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Register request and response hashes for a chat_id
+    /// This allows MockProvider to return signatures in the correct format "request_hash:response_hash"
+    pub async fn register_signature_hashes(
+        &self,
+        chat_id: String,
+        request_hash: String,
+        response_hash: String,
+    ) {
+        let mut hashes = self.signature_hashes.write().await;
+        hashes.insert(
+            chat_id,
+            SignatureHashes {
+                request_hash,
+                response_hash,
+            },
+        );
     }
 
     /// Generate a completion ID
@@ -61,6 +111,10 @@ impl MockProvider {
 
     /// Check if a model is valid
     fn is_valid_model(&self, model: &str) -> bool {
+        // If models list is empty, accept all models (for accept_all mode)
+        if self.models.is_empty() {
+            return true;
+        }
         self.models.iter().any(|m| m.id == model)
     }
 
@@ -394,12 +448,34 @@ impl crate::InferenceProvider for MockProvider {
     }
 
     async fn get_signature(&self, chat_id: &str) -> Result<ChatSignature, CompletionError> {
-        Ok(ChatSignature {
-            text: format!("mock-signature-text-{chat_id}"),
-            signature: format!("mock-signature-{chat_id}"),
-            signing_address: "mock-address".to_string(),
-            signing_algo: "ecdsa".to_string(),
-        })
+        // Check if we have registered hashes for this chat_id
+        let hashes = self.signature_hashes.read().await;
+        if let Some(sig_hashes) = hashes.get(chat_id) {
+            // Return signature in the correct format "request_hash:response_hash"
+            let signature_text =
+                format!("{}:{}", sig_hashes.request_hash, sig_hashes.response_hash);
+            // Generate a deterministic mock signature based on the hashes
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            signature_text.hash(&mut hasher);
+            let sig_hash = format!("{:x}", hasher.finish());
+
+            Ok(ChatSignature {
+                text: signature_text,
+                signature: format!("0x{sig_hash}"),
+                signing_address: "mock-address".to_string(),
+                signing_algo: "ecdsa".to_string(),
+            })
+        } else {
+            // Fallback to old mock signature format if hashes not registered
+            Ok(ChatSignature {
+                text: format!("mock-signature-text-{chat_id}"),
+                signature: format!("mock-signature-{chat_id}"),
+                signing_address: "mock-address".to_string(),
+                signing_algo: "ecdsa".to_string(),
+            })
+        }
     }
 
     async fn get_attestation_report(

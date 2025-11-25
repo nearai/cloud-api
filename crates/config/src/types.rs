@@ -474,10 +474,9 @@ impl OtlpConfig {
 impl Default for OtlpConfig {
     fn default() -> Self {
         Self {
-            endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+            endpoint: env::var("TELEMETRY_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://localhost:4317".to_string()),
-            protocol: env::var("OTEL_EXPORTER_OTLP_PROTOCOL")
-                .unwrap_or_else(|_| "grpc".to_string()),
+            protocol: env::var("TELEMETRY_OTLP_PROTOCOL").unwrap_or_else(|_| "grpc".to_string()),
         }
     }
 }

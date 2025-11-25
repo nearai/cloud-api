@@ -60,8 +60,8 @@ services:
       RUST_LOG: debug
       RUST_BACKTRACE: "1"
       # OTLP configuration to send metrics to Datadog agent
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://datadog-agent:4317
-      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      TELEMETRY_OTLP_ENDPOINT: http://datadog-agent:4317
+      TELEMETRY_OTLP_PROTOCOL: grpc
       # Environment tag for metrics
       ENVIRONMENT: ${ENVIRONMENT:-local}
     volumes:

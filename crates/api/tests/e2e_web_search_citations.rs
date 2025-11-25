@@ -120,7 +120,6 @@ fn verify_citation_validity(annotation: &serde_json::Value, text: &str, citation
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_non_streaming_web_search_with_citations() {
     let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;

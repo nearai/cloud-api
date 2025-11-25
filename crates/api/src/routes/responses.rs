@@ -125,7 +125,6 @@ pub async fn create_response(
 
     // Store model for logging before moving request
     let model = request.model.clone();
-    let signing_algo = request.signing_algo.clone();
 
     // Check if streaming is requested
     if request.stream.unwrap_or(false) {
@@ -169,7 +168,6 @@ pub async fn create_response(
                     let response_id_inner = response_id_clone.clone();
                     let attestation_inner = attestation_clone.clone();
                     let request_hash_inner = request_hash.clone();
-                    let signing_algo_inner = signing_algo.clone();
                     async move {
                         // Extract response_id from response.created event
                         if event.event_type == "response.created" {
@@ -201,21 +199,19 @@ pub async fn create_response(
                                 let rid = rid.clone();
                                 let req_hash = request_hash_inner.clone();
                                 let attest = attestation_inner.clone();
-                                let algo = signing_algo_inner.clone();
                                 tracing::debug!(
-                                    "Storing signature for response_id: {}, request_hash: {}, response_hash: {}, signing_algo: {:?}",
-                                    rid, req_hash, response_hash, algo
+                                    "Storing signature for response_id: {}, request_hash: {}, response_hash: {}",
+                                    rid, req_hash, response_hash
                                 );
 
                                 // Spawn task to store signature asynchronously (doesn't block stream)
                                 // but we've already computed the hash with complete data
                                 tokio::spawn(async move {
-                                    // Store the signature with the algorithm from the request (defaults to ed25519 if not specified)
+                                    // Store both ECDSA and ED25519 signatures
                                     if let Err(e) = attest.store_response_signature(
                                         &rid,
                                         req_hash.clone(),
                                         response_hash.clone(),
-                                        algo,
                                     ).await {
                                         tracing::error!("Failed to store response signature: {}", e);
                                     } else {

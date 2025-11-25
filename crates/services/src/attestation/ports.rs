@@ -20,13 +20,12 @@ pub trait AttestationServiceTrait: Send + Sync {
 
     /// Store a response signature directly (for response streams)
     /// Creates a signature with text format "request_hash:response_hash"
-    /// signing_algo: Optional signing algorithm ("ed25519" or "ecdsa"), defaults to "ed25519"
+    /// Stores both ECDSA and ED25519 signatures
     async fn store_response_signature(
         &self,
         response_id: &str,
         request_hash: String,
         response_hash: String,
-        signing_algo: Option<String>,
     ) -> Result<(), AttestationError>;
 
     async fn get_attestation_report(

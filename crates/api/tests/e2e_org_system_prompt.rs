@@ -16,7 +16,7 @@ async fn test_organization_system_prompt_crud() {
     // Get organization settings (system_prompt should be None initially)
     let response = server
         .get(&format!("/v1/organizations/{}/settings", org.id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
     assert_eq!(response.status_code(), 200);
@@ -28,7 +28,7 @@ async fn test_organization_system_prompt_crud() {
     let test_prompt = "You are a helpful assistant that always responds in a professional manner.";
     let response = server
         .patch(&format!("/v1/organizations/{}/settings", org.id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&json!({
             "system_prompt": test_prompt
         }))
@@ -44,7 +44,7 @@ async fn test_organization_system_prompt_crud() {
     // Get organization settings (should return the set prompt)
     let response = server
         .get(&format!("/v1/organizations/{}/settings", org.id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
     assert_eq!(response.status_code(), 200);
@@ -60,7 +60,7 @@ async fn test_organization_system_prompt_crud() {
             "/v1/organizations/{}/settings?field=system_prompt",
             org.id
         ))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
     assert_eq!(response.status_code(), 200);
@@ -75,7 +75,7 @@ async fn test_system_prompt_used_in_responses() {
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
-    setup_test_model(&server).await;
+    setup_glm_model(&server).await;
 
     // Create a user access token to set the system prompt
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
@@ -84,7 +84,7 @@ async fn test_system_prompt_used_in_responses() {
     let test_prompt = "You are a test assistant with a specific system prompt.";
     let response = server
         .patch(&format!("/v1/organizations/{}/settings", org.id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&json!({
             "system_prompt": test_prompt
         }))
@@ -95,7 +95,7 @@ async fn test_system_prompt_used_in_responses() {
     // Create a conversation
     let conversation_response = server
         .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&json!({
             "metadata": {
@@ -110,7 +110,7 @@ async fn test_system_prompt_used_in_responses() {
     // Make a response in the conversation - the system prompt should be applied
     let response = server
         .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&json!({
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
@@ -146,14 +146,14 @@ async fn test_system_prompt_isolation_between_orgs() {
 
     let response1 = server
         .patch(&format!("/v1/organizations/{}/settings", org1.id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&json!({ "system_prompt": prompt1 }))
         .await;
     assert_eq!(response1.status_code(), 200);
 
     let response2 = server
         .patch(&format!("/v1/organizations/{}/settings", org2.id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&json!({ "system_prompt": prompt2 }))
         .await;
     assert_eq!(response2.status_code(), 200);
@@ -161,7 +161,7 @@ async fn test_system_prompt_isolation_between_orgs() {
     // Verify org1 has prompt1
     let settings1 = server
         .get(&format!("/v1/organizations/{}/settings", org1.id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await
         .json::<OrganizationSettingsResponse>();
 
@@ -170,7 +170,7 @@ async fn test_system_prompt_isolation_between_orgs() {
     // Verify org2 has prompt2
     let settings2 = server
         .get(&format!("/v1/organizations/{}/settings", org2.id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await
         .json::<OrganizationSettingsResponse>();
 
@@ -223,7 +223,7 @@ async fn test_system_prompt_validation_empty_string() {
     // Set empty string (should be allowed and treated as unset)
     let response = server
         .patch(&format!("/v1/organizations/{}/settings", org.id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&json!({ "system_prompt": "" }))
         .await;
 
@@ -240,7 +240,7 @@ async fn test_system_prompt_validation_long_text() {
     let long_prompt = "A".repeat(10000);
     let response = server
         .patch(&format!("/v1/organizations/{}/settings", org.id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&json!({ "system_prompt": long_prompt }))
         .await;
 
@@ -261,7 +261,7 @@ async fn test_system_prompt_validation_unicode() {
     let unicode_prompt = "你好 🌍 مرحبا Здравствуй";
     let response = server
         .patch(&format!("/v1/organizations/{}/settings", org.id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&json!({ "system_prompt": unicode_prompt }))
         .await;
 
@@ -285,7 +285,7 @@ async fn test_system_prompt_delete_when_not_set() {
             "/v1/organizations/{}/settings?field=system_prompt",
             org.id
         ))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
     // Should succeed (idempotent operation)
@@ -306,7 +306,7 @@ async fn test_system_prompt_delete_nonexistent_field() {
             "/v1/organizations/{}/settings?field=nonexistent_field",
             org.id
         ))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
     // Should succeed - DELETE is idempotent and accepts any field name
@@ -322,14 +322,14 @@ async fn test_system_prompt_delete_without_field_param() {
     // Set a system prompt first
     server
         .patch(&format!("/v1/organizations/{}/settings", org.id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&json!({ "system_prompt": "Test" }))
         .await;
 
     // Try to delete without field parameter
     let response = server
         .delete(&format!("/v1/organizations/{}/settings", org.id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
     // Should return an error
@@ -349,7 +349,7 @@ async fn test_system_prompt_clear_with_delete() {
     // Set a prompt first
     server
         .patch(&format!("/v1/organizations/{}/settings", org.id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&json!({ "system_prompt": "Initial prompt" }))
         .await;
 
@@ -359,7 +359,7 @@ async fn test_system_prompt_clear_with_delete() {
             "/v1/organizations/{}/settings?field=system_prompt",
             org.id
         ))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
     assert_eq!(response.status_code(), 200);
@@ -386,7 +386,7 @@ async fn test_system_prompt_multiple_updates() {
     for prompt in &prompts {
         let response = server
             .patch(&format!("/v1/organizations/{}/settings", org.id))
-            .add_header("Authorization", format!("Bearer {}", access_token))
+            .add_header("Authorization", format!("Bearer {access_token}"))
             .json(&json!({ "system_prompt": prompt }))
             .await;
 
@@ -398,7 +398,7 @@ async fn test_system_prompt_multiple_updates() {
     // Final check
     let response = server
         .get(&format!("/v1/organizations/{}/settings", org.id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
     let settings = response.json::<OrganizationSettingsResponse>();
@@ -418,7 +418,7 @@ async fn test_system_prompt_persists_in_settings() {
     let test_prompt = "Persistent system prompt";
     let response = server
         .patch(&format!("/v1/organizations/{}/settings", org.id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .json(&json!({ "system_prompt": test_prompt }))
         .await;
     assert_eq!(response.status_code(), 200);
@@ -426,7 +426,7 @@ async fn test_system_prompt_persists_in_settings() {
     // Verify it's stored correctly (first read)
     let settings1 = server
         .get(&format!("/v1/organizations/{}/settings", org.id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await
         .json::<OrganizationSettingsResponse>();
     assert_eq!(
@@ -437,7 +437,7 @@ async fn test_system_prompt_persists_in_settings() {
     // Read again to verify persistence (second read)
     let settings2 = server
         .get(&format!("/v1/organizations/{}/settings", org.id))
-        .add_header("Authorization", format!("Bearer {}", access_token))
+        .add_header("Authorization", format!("Bearer {access_token}"))
         .await
         .json::<OrganizationSettingsResponse>();
     assert_eq!(

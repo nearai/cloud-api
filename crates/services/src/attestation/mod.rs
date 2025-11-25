@@ -161,8 +161,14 @@ pub fn load_vpc_info() -> Option<VpcInfo> {
 
 #[async_trait]
 impl ports::AttestationServiceTrait for AttestationService {
-    async fn get_chat_signature(&self, chat_id: &str) -> Result<ChatSignature, AttestationError> {
-        self.repository.get_chat_signature(chat_id).await
+    async fn get_chat_signature(
+        &self,
+        chat_id: &str,
+        signing_algo: Option<String>,
+    ) -> Result<ChatSignature, AttestationError> {
+        self.repository
+            .get_chat_signature(chat_id, signing_algo)
+            .await
     }
 
     async fn store_chat_signature_from_provider(
@@ -178,27 +184,38 @@ impl ports::AttestationServiceTrait for AttestationService {
                 AttestationError::ProviderError(format!("No provider found for chat_id: {chat_id}"))
             })?;
 
-        // Fetch signature from provider
-        let provider_signature = provider.get_signature(chat_id, None).await.map_err(|e| {
-            tracing::error!("Failed to get chat signature from provider");
-            AttestationError::ProviderError(e.to_string())
-        })?;
+        // Fetch and store both ECDSA and ED25519 signatures from provider
+        for algo in ["ecdsa", "ed25519"] {
+            let provider_signature = provider
+                .get_signature(chat_id, Some(algo.to_string()))
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        "Failed to get chat signature from provider for algorithm: {}",
+                        algo
+                    );
+                    AttestationError::ProviderError(e.to_string())
+                })?;
 
-        let signature = ChatSignature {
-            text: provider_signature.text,
-            signature: provider_signature.signature,
-            signing_address: provider_signature.signing_address,
-            signing_algo: provider_signature.signing_algo,
-        };
+            let signature = ChatSignature {
+                text: provider_signature.text,
+                signature: provider_signature.signature,
+                signing_address: provider_signature.signing_address,
+                signing_algo: provider_signature.signing_algo,
+            };
 
-        // Store in repository
-        self.repository
-            .add_chat_signature(chat_id, signature)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to store chat signature in repository");
-                AttestationError::RepositoryError(e.to_string())
-            })?;
+            // Store in repository
+            self.repository
+                .add_chat_signature(chat_id, signature)
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        "Failed to store chat signature in repository for algorithm: {}",
+                        algo
+                    );
+                    AttestationError::RepositoryError(e.to_string())
+                })?;
+        }
 
         Ok(())
     }

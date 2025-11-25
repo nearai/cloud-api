@@ -4,7 +4,12 @@ use async_trait::async_trait;
 #[async_trait]
 pub trait AttestationServiceTrait: Send + Sync {
     /// Get a chat signature from the database only
-    async fn get_chat_signature(&self, chat_id: &str) -> Result<ChatSignature, AttestationError>;
+    /// signing_algo: Optional signing algorithm ("ed25519" or "ecdsa"), defaults to "ed25519" if None
+    async fn get_chat_signature(
+        &self,
+        chat_id: &str,
+        signing_algo: Option<String>,
+    ) -> Result<ChatSignature, AttestationError>;
 
     /// Fetch signature from provider and store it in the database
     /// This should be called when a completion finishes
@@ -40,5 +45,9 @@ pub trait AttestationRepository: Send + Sync {
         chat_id: &str,
         signature: ChatSignature,
     ) -> Result<(), AttestationError>;
-    async fn get_chat_signature(&self, chat_id: &str) -> Result<ChatSignature, AttestationError>;
+    async fn get_chat_signature(
+        &self,
+        chat_id: &str,
+        signing_algo: Option<String>,
+    ) -> Result<ChatSignature, AttestationError>;
 }

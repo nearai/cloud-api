@@ -29,9 +29,13 @@ A Rust-based cloud API for AI model inference, conversation management, and orga
 
 3. **Run without Docker**:
    ```bash
-   # Set up PostgreSQL database first, then:
-   cargo run --bin api
+   make dev
    ```
+
+   This automatically:
+   - Runs all database migrations
+   - Seeds the database with development data
+   - Starts the API server on http://localhost:3000
 
 ## Testing
 
@@ -141,11 +145,21 @@ Known advisories without available fixes are documented and ignored in `.cargo/a
 
 ## Contributing
 
-1. Ensure all tests pass: `cargo test`
-2. Check code formatting: `cargo fmt --check`
-3. Run linting: `cargo clippy`
-4. Ensure database migrations work with test setup
-5. Ensure no security vulnerabilities: `cargo audit`
+Before committing code:
+
+Run all checks with a single command:
+
+```bash
+make preflight
+```
+
+This runs:
+- Clippy linter (strict mode with `-D warnings`)
+- Code formatting check and fix
+- Unit tests
+- Full build
+
+Once all checks pass, you're ready to commit!
 
 
 ## API Documentation

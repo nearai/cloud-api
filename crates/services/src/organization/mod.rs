@@ -1286,17 +1286,25 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
         user_id: UserId,
         system_prompt: Option<String>,
     ) -> Result<Option<String>, OrganizationError> {
-        // Check if user is a member of the organization
-        let is_member = self
+        // Check if user has permission to manage the organization
+        let member = self
             .repository
             .get_member(organization_id.0, user_id.0)
             .await
-            .map_err(Self::map_repository_error)?
-            .is_some();
+            .map_err(Self::map_repository_error)?;
 
-        if !is_member {
+        let role = match member {
+            Some(m) => m.role,
+            None => {
+                return Err(OrganizationError::Unauthorized(
+                    "User is not a member of this organization".to_string(),
+                ))
+            }
+        };
+
+        if !role.can_manage_organization() {
             return Err(OrganizationError::Unauthorized(
-                "User is not a member of this organization".to_string(),
+                "Insufficient permissions to manage organization settings".to_string(),
             ));
         }
 

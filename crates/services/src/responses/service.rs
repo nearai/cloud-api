@@ -36,7 +36,7 @@ struct ProcessStreamContext {
     web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
     file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
     file_service: Arc<dyn FileServiceTrait>,
-    organization_repository: Arc<dyn crate::organization::OrganizationRepository>,
+    organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
     /// Source registry for citation resolution
     source_registry: Option<models::SourceRegistry>,
 }
@@ -50,7 +50,7 @@ pub struct ResponseServiceImpl {
     pub web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
     pub file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
     pub file_service: Arc<dyn FileServiceTrait>,
-    pub organization_repository: Arc<dyn crate::organization::OrganizationRepository>,
+    pub organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
 }
 
 /// Tag transition states for reasoning content
@@ -72,7 +72,7 @@ impl ResponseServiceImpl {
         web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
         file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
         file_service: Arc<dyn FileServiceTrait>,
-        organization_repository: Arc<dyn crate::organization::OrganizationRepository>,
+        organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
     ) -> Self {
         Self {
             response_repository,
@@ -83,7 +83,7 @@ impl ResponseServiceImpl {
             web_search_provider,
             file_search_provider,
             file_service,
-            organization_repository,
+            organization_service,
         }
     }
 }
@@ -116,7 +116,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let web_search_provider = self.web_search_provider.clone();
         let file_search_provider = self.file_search_provider.clone();
         let file_service = self.file_service.clone();
-        let organization_repository = self.organization_repository.clone();
+        let organization_service = self.organization_service.clone();
 
         tokio::spawn(async move {
             let context = ProcessStreamContext {
@@ -133,7 +133,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 web_search_provider,
                 file_search_provider,
                 file_service,
-                organization_repository,
+                organization_service,
                 source_registry: None,
             };
 
@@ -601,7 +601,8 @@ impl ResponseServiceImpl {
             &context.file_service,
             workspace_id_domain.clone(),
             context.organization_id,
-            &context.organization_repository,
+            context.user_id.clone(),
+            &context.organization_service,
         )
         .await?;
 
@@ -1223,25 +1224,24 @@ impl ResponseServiceImpl {
         file_service: &Arc<dyn FileServiceTrait>,
         workspace_id: crate::workspace::WorkspaceId,
         organization_id: uuid::Uuid,
-        organization_repository: &Arc<dyn crate::organization::OrganizationRepository>,
+        user_id: crate::UserId,
+        organization_service: &Arc<dyn crate::organization::OrganizationServiceTrait>,
     ) -> Result<Vec<crate::completions::ports::CompletionMessage>, errors::ResponseError> {
         use crate::completions::ports::CompletionMessage;
 
         let mut messages = Vec::new();
 
         // Fetch organization system prompt if available
-        let org_system_prompt = match organization_repository.get_by_id(organization_id).await {
-            Ok(Some(org)) => org
-                .settings
-                .get("system_prompt")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            Ok(None) => {
-                tracing::warn!("Organization {} not found", organization_id);
-                None
-            }
+        let org_system_prompt = match organization_service
+            .get_system_prompt(
+                crate::organization::OrganizationId(organization_id),
+                user_id,
+            )
+            .await
+        {
+            Ok(prompt) => prompt,
             Err(e) => {
-                tracing::warn!("Failed to fetch organization: {}", e);
+                tracing::warn!("Failed to fetch organization system prompt: {}", e);
                 None
             }
         };

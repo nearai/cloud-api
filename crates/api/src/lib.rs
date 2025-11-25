@@ -326,11 +326,6 @@ pub async fn init_domain_services(
         s3_storage,
     )) as Arc<dyn services::files::FileServiceTrait + Send + Sync>;
 
-    // Create organization repository
-    let org_repo = Arc::new(database::PgOrganizationRepository::new(
-        database.pool().clone(),
-    )) as Arc<dyn services::organization::OrganizationRepository>;
-
     let response_service = Arc::new(services::ResponseService::new(
         response_repo,
         response_items_repo.clone(),
@@ -340,7 +335,7 @@ pub async fn init_domain_services(
         Some(web_search_provider), // web_search_provider
         None,                      // file_search_provider
         files_service.clone(),     // file_service
-        org_repo.clone(),          // organization_repository
+        organization_service.clone(),
     ));
 
     DomainServices {

@@ -1058,11 +1058,33 @@ pub struct OrganizationSettings {
     pub system_prompt: Option<String>,
 }
 
+/// Wrapper type to distinguish between "field not provided" and "field explicitly set to null"
+/// - Outer None = field not in request body (don't modify)
+/// - Some(None) = field explicitly set to null (delete/clear)
+/// - Some(Some(value)) = field set to a value (update)
+pub type Nullable<T> = Option<Option<T>>;
+
+/// Deserialize a field that can be absent, null, or a value
+fn deserialize_nullable<'de, D, T>(deserializer: D) -> Result<Nullable<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    // If the field is present, deserialize it as Option<T>
+    Ok(Some(Option::deserialize(deserializer)?))
+}
+
 /// Request to patch organization settings (PATCH endpoint)
+/// Supports three states per field:
+/// - Omit field: no change
+/// - Set to null: delete/clear the field
+/// - Set to value: update the field
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct PatchOrganizationSettingsRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system_prompt: Option<String>,
+    /// System prompt for the organization
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    #[schema(value_type = Option<String>)]
+    pub system_prompt: Nullable<String>,
 }
 
 /// Response containing organization settings

@@ -179,7 +179,7 @@ impl ports::AttestationServiceTrait for AttestationService {
             })?;
 
         // Fetch signature from provider
-        let provider_signature = provider.get_signature(chat_id).await.map_err(|e| {
+        let provider_signature = provider.get_signature(chat_id, None).await.map_err(|e| {
             tracing::error!("Failed to get chat signature from provider");
             AttestationError::ProviderError(e.to_string())
         })?;

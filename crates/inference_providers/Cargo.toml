@@ -20,6 +20,7 @@ futures-util = "0.3"
 tracing = "0.1"
 dstack-sdk = "0.1.2"
 dstack-sdk-types = "0.1.2"
+serde_urlencoded = "0.7.1"
 
 # Dev dependencies for testing and examples
 [dev-dependencies]

@@ -1,6 +1,7 @@
 use crate::{models::StreamOptions, sse_parser::SSEParser, *};
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
+use serde::Serialize;
 
 /// Configuration for vLLM provider
 #[derive(Debug, Clone)]
@@ -84,23 +85,33 @@ impl InferenceProvider for VLlmProvider {
     async fn get_attestation_report(
         &self,
         model: String,
-        _signing_algo: Option<String>,
+        signing_algo: Option<String>,
         nonce: Option<String>,
         signing_address: Option<String>,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
+        #[derive(Serialize)]
+        struct Query {
+            model: String,
+            signing_algo: Option<String>,
+            nonce: Option<String>,
+            signing_address: Option<String>,
+        }
+
+        let query = Query {
+            model,
+            signing_algo,
+            nonce,
+            signing_address,
+        };
+
         // Build URL with optional query parameters
-        let mut url = format!(
-            "{}/v1/attestation/report?model={}",
-            self.config.base_url, model
+        let url = format!(
+            "{}/v1/attestation/report?{}",
+            self.config.base_url,
+            serde_urlencoded::to_string(&query).map_err(|_| AttestationError::Unknown(
+                "Failed to serialize query string".to_string()
+            ))?
         );
-
-        if let Some(nonce) = nonce {
-            url.push_str(&format!("&nonce={nonce}"));
-        }
-
-        if let Some(ref signing_address) = signing_address {
-            url.push_str(&format!("&signing_address={signing_address}"));
-        }
 
         let headers = self.build_headers().map_err(AttestationError::FetchError)?;
 
@@ -115,7 +126,7 @@ impl InferenceProvider for VLlmProvider {
         // Handle 404 responses (expected when signing_address doesn't match)
         if response.status() == 404 {
             return Err(AttestationError::SigningAddressNotFound(
-                signing_address.unwrap_or_default().to_string(),
+                query.signing_address.unwrap_or_default().to_string(),
             ));
         }
 

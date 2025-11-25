@@ -214,7 +214,7 @@ impl InferenceProviderPool {
                 match provider
                     .get_attestation_report(
                         model_name.clone(),
-                        Some("ecdsa".to_string()),
+                        None,
                         None,
                         None,
                     )

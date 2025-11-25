@@ -3340,6 +3340,7 @@ dependencies = [
  "reqwest 0.12.24",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "thiserror 2.0.17",
  "tokio",
  "tokio-stream",

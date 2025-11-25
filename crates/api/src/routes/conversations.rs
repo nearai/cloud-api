@@ -1054,6 +1054,16 @@ fn convert_input_item_to_response_item(
                                 // TODO: Handle image content
                                 None
                             }
+                            ConversationContentPart::InputFile { file_id, .. } => {
+                                // Store file reference as stringified text
+                                Some(
+                                    services::responses::models::ResponseOutputContent::OutputText {
+                                        text: format!("[File: {file_id}]"),
+                                        annotations: vec![],
+                                        logprobs: vec![],
+                                    },
+                                )
+                            }
                             ConversationContentPart::OutputText { text, .. } => Some(
                                 services::responses::models::ResponseOutputContent::OutputText {
                                     text: text.trim().to_string(),
@@ -1114,8 +1124,18 @@ fn convert_output_item_to_conversation_item(
                         logprobs: _,
                     } => {
                         if is_user_message {
-                            // User messages should use input_text format
-                            Some(ConversationContentPart::InputText { text })
+                            // Check if this is a file reference: [File: file-{uuid}]
+                            if let Some(file_id) = text
+                                .strip_prefix("[File: ")
+                                .and_then(|s| s.strip_suffix("]"))
+                            {
+                                Some(ConversationContentPart::InputFile {
+                                    file_id: file_id.to_string(),
+                                    detail: None,
+                                })
+                            } else {
+                                Some(ConversationContentPart::InputText { text })
+                            }
                         } else {
                             // Assistant/system messages use output_text format
                             Some(ConversationContentPart::OutputText {

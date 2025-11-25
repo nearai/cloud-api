@@ -153,8 +153,11 @@ impl ClusterManager {
                         read_pools.insert(replica.host.clone(), pool);
                         debug!("Read pool created for replica {}", replica.name);
                     }
-                    Err(_) => {
-                        error!("Failed to create pool for replica {}", replica.name);
+                    Err(e) => {
+                        error!(
+                            "Failed to create pool for replica {}: {:?}",
+                            replica.name, e
+                        );
                     }
                 }
             }
@@ -229,8 +232,11 @@ impl ClusterManager {
             if let Some(pool) = read_pools.get(&replica.host) {
                 match pool.get().await {
                     Ok(conn) => return Ok(conn),
-                    Err(_) => {
-                        warn!("Failed to get connection from replica {}", replica.name);
+                    Err(e) => {
+                        warn!(
+                            "Failed to get connection from replica {}: {:?}",
+                            replica.name, e
+                        );
                     }
                 }
             }
@@ -265,8 +271,11 @@ impl ClusterManager {
                         );
                         return Ok(conn);
                     }
-                    Err(_) => {
-                        warn!("Failed to get connection from replica {}", replica.name);
+                    Err(e) => {
+                        warn!(
+                            "Failed to get connection from replica {}: {:?}",
+                            replica.name, e
+                        );
                     }
                 }
             }

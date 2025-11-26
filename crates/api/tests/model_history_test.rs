@@ -450,7 +450,7 @@ async fn test_soft_delete_with_custom_reason() {
         .delete(format!("/v1/admin/models/{model_name}").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .json(&serde_json::json!({
-            "changeReason": "Superceded by newer model version"
+            "changeReason": "Replaced by newer model version"
         }))
         .await;
 
@@ -469,7 +469,7 @@ async fn test_soft_delete_with_custom_reason() {
     assert!(!is_active, "Latest record should show is_active=false");
     assert_eq!(
         reason.as_ref().unwrap(),
-        "Superceded by newer model version",
+        "Replaced by newer model version",
         "Should use provided custom reason"
     );
 }

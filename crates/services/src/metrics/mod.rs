@@ -1,5 +1,5 @@
-pub mod consts;
 pub mod capturing;
+pub mod consts;
 
 use async_trait::async_trait;
 use opentelemetry::{
@@ -55,13 +55,18 @@ impl MetricsServiceTrait for OtlpMetricsService {
         let mut histograms = self.latency_histograms.lock().unwrap();
         let histogram = histograms.entry(name.to_string()).or_insert_with(|| {
             let description = match name {
-                consts::METRIC_LATENCY_TTFT => "Time from request arrival to first token generation",
+                consts::METRIC_LATENCY_TTFT => {
+                    "Time from request arrival to first token generation"
+                }
                 consts::METRIC_LATENCY_TOTAL => "Total request processing time",
-                consts::METRIC_LATENCY_DECODING_TIME => "Time from first token to last token (decoding phase)",
+                consts::METRIC_LATENCY_DECODING_TIME => {
+                    "Time from first token to last token (decoding phase)"
+                }
                 consts::METRIC_VERIFICATION_DURATION => "Time to complete verification operation",
+                consts::METRIC_HTTP_DURATION => "HTTP request processing time",
                 _ => "Latency measurement",
             };
-            
+
             self.meter
                 .u64_histogram(name.to_string())
                 .with_description(description)
@@ -82,9 +87,14 @@ impl MetricsServiceTrait for OtlpMetricsService {
                 consts::METRIC_TOKENS_OUTPUT => "Output tokens generated",
                 consts::METRIC_VERIFICATION_SUCCESS => "Successful verification operations",
                 consts::METRIC_VERIFICATION_FAILURE => "Failed verification operations",
+                consts::METRIC_HTTP_REQUESTS => {
+                    "Total HTTP requests by endpoint, method, and status"
+                }
+                consts::METRIC_REQUEST_ERRORS => "API request errors by error type",
+                consts::METRIC_COST_USD => "Total cost in micro-dollars (USD) by model",
                 _ => "Count",
             };
-            
+
             self.meter
                 .u64_counter(name.to_string())
                 .with_description(description)
@@ -102,17 +112,18 @@ impl MetricsServiceTrait for OtlpMetricsService {
                 consts::METRIC_TOKENS_PER_SECOND => ("Token generation throughput", "tokens/sec"),
                 _ => ("Value distribution", ""),
             };
-            
-            let builder = self.meter
+
+            let builder = self
+                .meter
                 .f64_histogram(name.to_string())
                 .with_description(description);
-            
+
             let builder = if !unit.is_empty() {
                 builder.with_unit(opentelemetry::metrics::Unit::new(unit))
             } else {
                 builder
             };
-            
+
             builder.init()
         });
 

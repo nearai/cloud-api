@@ -1,5 +1,10 @@
+pub mod analytics;
 pub mod ports;
 
+pub use analytics::{
+    AnalyticsRepository, AnalyticsService, ApiKeyMetrics, MetricsSummary, ModelMetrics,
+    OrganizationMetrics, WorkspaceMetrics,
+};
 pub use ports::*;
 use std::sync::Arc;
 

@@ -535,6 +535,10 @@ pub struct OrganizationUsageLog {
     pub total_cost: i64,
     pub request_type: String,
     pub created_at: DateTime<Utc>,
+    /// Time to first token in milliseconds
+    pub ttft_ms: Option<i32>,
+    /// Average inter-token latency in milliseconds
+    pub avg_itl_ms: Option<f64>,
 }
 
 /// Organization balance summary - cached aggregate spending
@@ -565,6 +569,10 @@ pub struct RecordUsageRequest {
     pub output_cost: i64,
     pub total_cost: i64,
     pub request_type: String,
+    /// Time to first token in milliseconds
+    pub ttft_ms: Option<i32>,
+    /// Average inter-token latency in milliseconds
+    pub avg_itl_ms: Option<f64>,
 }
 
 // ============================================

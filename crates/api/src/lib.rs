@@ -69,6 +69,7 @@ pub struct DomainServices {
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
+    pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 }
 
 /// Initialize database connection and run migrations
@@ -280,6 +281,7 @@ pub async fn init_domain_services(
         models_repo.clone() as Arc<dyn services::usage::ModelRepository>,
         limits_repository_for_usage as Arc<dyn services::usage::OrganizationLimitsRepository>,
         workspace_service.clone(),
+        metrics_service.clone(),
     )) as Arc<dyn services::usage::UsageServiceTrait + Send + Sync>;
 
     // Create completion service with usage tracking (needs usage_service)
@@ -353,6 +355,7 @@ pub async fn init_domain_services(
         usage_service,
         user_service,
         files_service,
+        metrics_service,
     }
 }
 
@@ -492,6 +495,11 @@ pub fn build_app_with_config(
     // Build health check route (public, no auth required)
     let health_routes = Router::new().route("/health", get(health_check));
 
+    // Create metrics state for HTTP metrics middleware
+    let metrics_state = middleware::MetricsState {
+        metrics_service: domain_services.metrics_service.clone(),
+    };
+
     Router::new()
         .nest(
             "/v1",
@@ -510,6 +518,11 @@ pub fn build_app_with_config(
                 .merge(health_routes),
         )
         .merge(openapi_routes)
+        // Add HTTP metrics middleware to track all requests
+        .layer(from_fn_with_state(
+            metrics_state,
+            middleware::http_metrics_middleware,
+        ))
 }
 
 /// Build invitation routes with selective auth
@@ -779,11 +792,13 @@ pub fn build_admin_routes(
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
         batch_upsert_models, create_admin_access_token, delete_admin_access_token, delete_model,
-        get_model_history, get_organization_limits_history, list_admin_access_tokens, list_users,
-        update_organization_limits, AdminAppState,
+        get_model_history, get_organization_limits_history, get_organization_metrics,
+        list_admin_access_tokens, list_users, update_organization_limits, AdminAppState,
     };
-    use database::repositories::{AdminAccessTokenRepository, AdminCompositeRepository};
-    use services::admin::AdminServiceImpl;
+    use database::repositories::{
+        AdminAccessTokenRepository, AdminCompositeRepository, PgAnalyticsRepository,
+    };
+    use services::admin::{AdminServiceImpl, AnalyticsService};
 
     // Create composite admin repository (handles models, organization limits, and users)
     let admin_repository = Arc::new(AdminCompositeRepository::new(database.pool().clone()));
@@ -792,6 +807,12 @@ pub fn build_admin_routes(
     let admin_access_token_repository =
         Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
 
+    // Create analytics repository and service
+    let analytics_repository = Arc::new(PgAnalyticsRepository::new(database.pool().clone()));
+    let analytics_service = Arc::new(AnalyticsService::new(
+        analytics_repository as Arc<dyn services::admin::AnalyticsRepository>,
+    ));
+
     // Create admin service with composite repository
     let admin_service = Arc::new(AdminServiceImpl::new(
         admin_repository as Arc<dyn services::admin::AdminRepository>,
@@ -799,6 +820,7 @@ pub fn build_admin_routes(
 
     let admin_app_state = AdminAppState {
         admin_service,
+        analytics_service,
         auth_service: auth_state_middleware.auth_service.clone(),
         config,
         admin_access_token_repository,
@@ -821,6 +843,10 @@ pub fn build_admin_routes(
         .route(
             "/admin/organizations/{organization_id}/limits/history",
             axum::routing::get(get_organization_limits_history),
+        )
+        .route(
+            "/admin/organizations/{org_id}/metrics",
+            axum::routing::get(get_organization_metrics),
         )
         .route("/admin/users", axum::routing::get(list_users))
         .route(
@@ -991,7 +1017,8 @@ mod tests {
         // Initialize services
         let database = init_database(&config.database).await;
         let auth_components = init_auth_services(database.clone(), &config);
-        let metrics_service = Arc::new(services::metrics::MockMetricsService) as Arc<dyn services::metrics::MetricsServiceTrait>;
+        let metrics_service = Arc::new(services::metrics::MockMetricsService)
+            as Arc<dyn services::metrics::MetricsServiceTrait>;
         let domain_services = init_domain_services(
             database.clone(),
             &config,
@@ -1087,7 +1114,8 @@ mod tests {
         };
 
         let auth_components = init_auth_services(database.clone(), &config);
-        let metrics_service = Arc::new(services::metrics::MockMetricsService) as Arc<dyn services::metrics::MetricsServiceTrait>;
+        let metrics_service = Arc::new(services::metrics::MockMetricsService)
+            as Arc<dyn services::metrics::MetricsServiceTrait>;
         let domain_services = init_domain_services(
             database.clone(),
             &config,

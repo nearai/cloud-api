@@ -23,8 +23,12 @@ struct ToolExecutionResult {
 
 /// Context for processing a response stream
 struct ProcessStreamContext {
+    // Names kept for potential future logging/debugging, not used in metrics
+    #[allow(dead_code)]
     organization_name: String,
+    #[allow(dead_code)]
     workspace_name: String,
+    #[allow(dead_code)]
     api_key_name: String,
     request: models::CreateResponseRequest,
     user_id: crate::UserId,
@@ -820,11 +824,8 @@ impl ResponseServiceImpl {
                 extra.insert("tool_choice".to_string(), serde_json::to_value(tc).unwrap());
             }
 
-            // Create completion request
+            // Create completion request (names not included - tracked via database analytics)
             let completion_request = CompletionRequest {
-                organization_name: process_context.organization_name.clone(),
-                workspace_name: process_context.workspace_name.clone(),
-                api_key_name: process_context.api_key_name.clone(),
                 model: process_context.request.model.clone(),
                 messages: messages.clone(),
                 max_tokens: process_context.request.max_output_tokens,
@@ -2128,7 +2129,7 @@ DO NOT USE THESE FORMATS:
             Only respond with the title, nothing else.\n\nMessage: {truncated_message}"
         );
 
-        // Generate title using completion service
+        // Generate title using completion service (names not included - tracked via database)
         let completion_request = crate::completions::ports::CompletionRequest {
             model, // Use the same model as the user's request
             messages: vec![crate::completions::ports::CompletionMessage {
@@ -2146,9 +2147,6 @@ DO NOT USE THESE FORMATS:
             workspace_id,
             metadata: None,
             body_hash: String::new(),
-            api_key_name: "internal-title-generation".to_string(),
-            workspace_name: "internal".to_string(),
-            organization_name: "internal".to_string(),
             n: None,
             extra: std::collections::HashMap::new(),
         };

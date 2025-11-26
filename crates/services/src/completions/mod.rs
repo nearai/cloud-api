@@ -23,19 +23,26 @@ where
     attestation_service: Arc<dyn AttestationServiceTrait>,
     usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     metrics_service: Arc<dyn MetricsServiceTrait>,
+    // IDs for usage tracking (database)
     organization_id: Uuid,
-    organization_name: String,
     workspace_id: Uuid,
-    workspace_name: String,
     api_key_id: Uuid,
-    api_key_name: String,
     model_id: Uuid,
+    #[allow(dead_code)] // Kept for potential debugging/logging use
     model_name: String,
     request_type: String,
     start_time: Instant,
     first_token_received: bool,
     first_token_time: Option<Instant>,
-    // Pre-allocated metric tags to avoid recreating them multiple times
+    /// Time to first token in milliseconds (captured for DB storage)
+    ttft_ms: Option<i32>,
+    /// Token count for ITL calculation
+    token_count: i32,
+    /// Last token time for ITL calculation
+    last_token_time: Option<Instant>,
+    /// Accumulated inter-token latency for average calculation
+    total_itl_ms: f64,
+    // Pre-allocated low-cardinality metric tags (for Datadog/OTLP)
     metric_tags: Vec<String>,
 }
 
@@ -48,15 +55,25 @@ where
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(ref event))) => {
+                let now = Instant::now();
+
                 if !self.first_token_received {
                     self.first_token_received = true;
-                    let now = Instant::now();
                     self.first_token_time = Some(now);
                     let duration = self.start_time.elapsed();
+                    // Capture TTFT in milliseconds for DB storage
+                    self.ttft_ms = Some(duration.as_millis() as i32);
+                    self.last_token_time = Some(now);
                     // Reuse pre-allocated tags
                     let tags_str: Vec<&str> = self.metric_tags.iter().map(|s| s.as_str()).collect();
                     self.metrics_service
                         .record_latency(METRIC_LATENCY_TTFT, duration, &tags_str);
+                } else if let Some(last_time) = self.last_token_time {
+                    // Calculate inter-token latency
+                    let itl = now.duration_since(last_time);
+                    self.total_itl_ms += itl.as_secs_f64() * 1000.0;
+                    self.token_count += 1;
+                    self.last_token_time = Some(now);
                 }
 
                 if let StreamChunk::Chat(ref chat_chunk) = event.chunk {
@@ -76,7 +93,14 @@ where
                             }
                         });
 
-                        // Record usage
+                        // Calculate average ITL
+                        let avg_itl_ms = if self.token_count > 0 {
+                            Some(self.total_itl_ms / self.token_count as f64)
+                        } else {
+                            None
+                        };
+
+                        // Record usage with latency metrics
                         let usage_service = self.usage_service.clone();
                         let organization_id = self.organization_id;
                         let workspace_id = self.workspace_id;
@@ -85,6 +109,7 @@ where
                         let request_type = self.request_type.clone();
                         let input_tokens = usage.prompt_tokens;
                         let output_tokens = usage.completion_tokens;
+                        let ttft_ms = self.ttft_ms;
 
                         tokio::spawn(async move {
                             if usage_service
@@ -97,6 +122,8 @@ where
                                     input_tokens,
                                     output_tokens,
                                     request_type,
+                                    ttft_ms,
+                                    avg_itl_ms,
                                 })
                                 .await
                                 .is_err()
@@ -104,11 +131,12 @@ where
                                 tracing::error!("Failed to record usage in completion service");
                             } else {
                                 tracing::debug!(
-                                    "Recorded usage for org {}: {} input, {} output tokens (api_key: {})",
+                                    "Recorded usage for org {}: {} input, {} output tokens (api_key: {}, ttft: {:?}ms)",
                                     organization_id,
                                     input_tokens,
                                     output_tokens,
-                                    api_key_id
+                                    api_key_id,
+                                    ttft_ms
                                 );
                             }
                         });
@@ -195,25 +223,43 @@ impl CompletionServiceImpl {
         }
     }
 
-    /// Create standard metric tags for a request
-    fn create_metric_tags(
-        model_name: &str,
-        org_id: &Uuid,
-        org_name: &str,
-        workspace_id: &Uuid,
-        workspace_name: &str,
-        api_key_id: &Uuid,
-        api_key_name: &str,
-    ) -> Vec<String> {
+    /// Create low-cardinality metric tags for a request
+    ///
+    /// These tags are used for OTLP/Datadog metrics and should only include
+    /// low-cardinality values to minimize costs (~98% savings vs high-cardinality).
+    /// High-cardinality data (org/workspace/key) is tracked via database analytics.
+    fn create_metric_tags(model_name: &str) -> Vec<String> {
+        let environment = get_environment();
         vec![
             format!("{}:{}", TAG_MODEL, model_name),
-            format!("{}:{}", TAG_ORG, org_id),
-            format!("org_name:{}", org_name),
-            format!("{}:{}", TAG_WORKSPACE, workspace_id),
-            format!("workspace_name:{}", workspace_name),
-            format!("{}:{}", TAG_API_KEY, api_key_id),
-            format!("api_key_name:{}", api_key_name),
+            format!("{}:{}", TAG_ENVIRONMENT, environment),
         ]
+    }
+
+    /// Record an error metric with the appropriate error type tag
+    fn record_error(&self, error: &ports::CompletionError, model_name: Option<&str>) {
+        let error_type = match error {
+            ports::CompletionError::InvalidModel(_) => ERROR_TYPE_INVALID_MODEL,
+            ports::CompletionError::InvalidParams(_) => ERROR_TYPE_INVALID_PARAMS,
+            ports::CompletionError::RateLimitExceeded => ERROR_TYPE_RATE_LIMIT,
+            ports::CompletionError::ProviderError(_) => ERROR_TYPE_INFERENCE_ERROR,
+            ports::CompletionError::InternalError(_) => ERROR_TYPE_INTERNAL_ERROR,
+        };
+
+        let environment = get_environment();
+        let mut tags = vec![
+            format!("{}:{}", TAG_ERROR_TYPE, error_type),
+            format!("{}:{}", TAG_ENVIRONMENT, environment),
+        ];
+
+        // Add model tag if available (for model-specific errors)
+        if let Some(model) = model_name {
+            tags.push(format!("{}:{}", TAG_MODEL, model));
+        }
+
+        let tags_str: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
+        self.metrics_service
+            .record_count(METRIC_REQUEST_ERRORS, 1, &tags_str);
     }
 
     /// Convert completion messages to chat messages for inference providers
@@ -239,25 +285,15 @@ impl CompletionServiceImpl {
         &self,
         llm_stream: StreamingResult,
         organization_id: Uuid,
-        organization_name: String,
         workspace_id: Uuid,
-        workspace_name: String,
         api_key_id: Uuid,
-        api_key_name: String,
         model_id: Uuid,
         model_name: String,
         request_type: &str,
+        request_start_time: Instant,
     ) -> StreamingResult {
-        // Create metric tags once for the entire request lifecycle
-        let metric_tags = Self::create_metric_tags(
-            &model_name,
-            &organization_id,
-            &organization_name,
-            &workspace_id,
-            &workspace_name,
-            &api_key_id,
-            &api_key_name,
-        );
+        // Create low-cardinality metric tags (no org/workspace/key - those go to database)
+        let metric_tags = Self::create_metric_tags(&model_name);
 
         // Record request count metric
         let tags_str: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
@@ -270,17 +306,18 @@ impl CompletionServiceImpl {
             usage_service: self.usage_service.clone(),
             metrics_service: self.metrics_service.clone(),
             organization_id,
-            organization_name,
             workspace_id,
-            workspace_name,
             api_key_id,
-            api_key_name,
             model_id,
             model_name,
             request_type: request_type.to_string(),
-            start_time: Instant::now(),
+            start_time: request_start_time,
             first_token_received: false,
             first_token_time: None,
+            ttft_ms: None,
+            token_count: 0,
+            last_token_time: None,
+            total_itl_ms: 0.0,
             metric_tags,
         };
         Box::pin(intercepted_stream)
@@ -296,9 +333,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // Extract context for usage tracking
         let organization_id = request.organization_id;
         let workspace_id = request.workspace_id;
-        let api_key_id = uuid::Uuid::parse_str(&request.api_key_id).map_err(|e| {
-            ports::CompletionError::InvalidParams(format!("Invalid API key ID: {e}"))
-        })?;
+        let api_key_id = match uuid::Uuid::parse_str(&request.api_key_id) {
+            Ok(id) => id,
+            Err(e) => {
+                let err = ports::CompletionError::InvalidParams(format!("Invalid API key ID: {e}"));
+                self.record_error(&err, Some(&request.model));
+                return Err(err);
+            }
+        };
         let is_streaming = request.stream.unwrap_or(false);
 
         let chat_messages = Self::prepare_chat_messages(&request.messages);
@@ -332,19 +374,27 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // Resolve model name (could be an alias) and get model details in a single DB call
         // This also validates that the model exists and is active
-        let model = self
+        let model = match self
             .models_repository
             .resolve_and_get_model(&request.model)
             .await
-            .map_err(|e| {
-                ports::CompletionError::InternalError(format!("Failed to resolve model: {e}"))
-            })?
-            .ok_or_else(|| {
-                ports::CompletionError::InvalidModel(format!(
+        {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                let err = ports::CompletionError::InvalidModel(format!(
                     "Model '{}' not found. It's not a valid model name or alias.",
                     request.model
-                ))
-            })?;
+                ));
+                self.record_error(&err, Some(&request.model));
+                return Err(err);
+            }
+            Err(e) => {
+                let err =
+                    ports::CompletionError::InternalError(format!("Failed to resolve model: {e}"));
+                self.record_error(&err, Some(&request.model));
+                return Err(err);
+            }
+        };
 
         let canonical_name = &model.model_name;
 
@@ -358,15 +408,20 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             chat_params.model = canonical_name.clone();
         }
 
+        // Capture start time BEFORE making the request to provider (for accurate TTFT)
+        let request_start_time = Instant::now();
+
         // Get the LLM stream
-        let llm_stream = self
+        let llm_stream = match self
             .inference_provider_pool
             .chat_completion_stream(chat_params, request.body_hash.clone())
             .await
-            .map_err(|e| {
+        {
+            Ok(stream) => stream,
+            Err(e) => {
                 // Check if this is a client error (HTTP 4xx) from the provider
                 let error_str = e.to_string();
-                if error_str.contains("HTTP 4") || error_str.contains("Bad Request") {
+                let err = if error_str.contains("HTTP 4") || error_str.contains("Bad Request") {
                     // For client errors (4xx), return detailed message to help user fix their request
                     ports::CompletionError::InvalidParams(format!(
                         "Invalid request parameters: {e}"
@@ -380,8 +435,11 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     ports::CompletionError::ProviderError(
                         "The model is currently unavailable. Please try again later.".to_string(),
                     )
-                }
-            })?;
+                };
+                self.record_error(&err, Some(&canonical_name));
+                return Err(err);
+            }
+        };
 
         // Determine request type
         let request_type = if is_streaming {
@@ -391,19 +449,17 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         };
 
         // Create the completion event stream with usage tracking
-        // Use model UUID for usage tracking, model name for metrics
+        // Use model UUID for usage tracking, model name for low-cardinality metrics
         let event_stream = self
             .handle_stream_with_context(
                 llm_stream,
                 organization_id,
-                request.organization_name.clone(),
                 workspace_id,
-                request.workspace_name.clone(),
                 api_key_id,
-                request.api_key_name.clone(),
                 model.id,
                 model.model_name.clone(),
                 request_type,
+                request_start_time,
             )
             .await;
 
@@ -415,7 +471,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         request: ports::CompletionRequest,
     ) -> Result<inference_providers::ChatCompletionResponseWithBytes, ports::CompletionError> {
         let start_time = Instant::now();
-        let request_start = Instant::now(); // For TTFT measurement
         let chat_messages = Self::prepare_chat_messages(&request.messages);
 
         let mut chat_params = inference_providers::ChatCompletionParams {
@@ -447,19 +502,27 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // Resolve model name (could be an alias) and get model details in a single DB call
         // This also validates that the model exists and is active
-        let model = self
+        let model = match self
             .models_repository
             .resolve_and_get_model(&request.model)
             .await
-            .map_err(|e| {
-                ports::CompletionError::InternalError(format!("Failed to resolve model: {e}"))
-            })?
-            .ok_or_else(|| {
-                ports::CompletionError::InvalidModel(format!(
+        {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                let err = ports::CompletionError::InvalidModel(format!(
                     "Model '{}' not found. It's not a valid model name or alias.",
                     request.model
-                ))
-            })?;
+                ));
+                self.record_error(&err, Some(&request.model));
+                return Err(err);
+            }
+            Err(e) => {
+                let err =
+                    ports::CompletionError::InternalError(format!("Failed to resolve model: {e}"));
+                self.record_error(&err, Some(&request.model));
+                return Err(err);
+            }
+        };
 
         let canonical_name = &model.model_name;
 
@@ -473,14 +536,16 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             chat_params.model = canonical_name.clone();
         }
 
-        let response_with_bytes = self
+        let response_with_bytes = match self
             .inference_provider_pool
             .chat_completion(chat_params, request.body_hash.clone())
             .await
-            .map_err(|e| {
+        {
+            Ok(response) => response,
+            Err(e) => {
                 // Check if this is a client error (HTTP 4xx) from the provider
                 let error_str = e.to_string();
-                if error_str.contains("HTTP 4") || error_str.contains("Bad Request") {
+                let err = if error_str.contains("HTTP 4") || error_str.contains("Bad Request") {
                     // For client errors (4xx), return detailed message to help user fix their request
                     ports::CompletionError::InvalidParams(format!(
                         "Invalid request parameters: {e}"
@@ -494,11 +559,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     ports::CompletionError::ProviderError(
                         "The model is currently unavailable. Please try again later.".to_string(),
                     )
-                }
-            })?;
+                };
+                self.record_error(&err, Some(canonical_name));
+                return Err(err);
+            }
+        };
 
-        // Record TTFT for non-streaming (time until first response received)
-        let ttft_duration = request_start.elapsed();
+        // For non-streaming, total latency = time until full response received
+        let total_latency = start_time.elapsed();
 
         // Store attestation signature
         let attestation_service = self.attestation_service.clone();
@@ -515,48 +583,28 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             }
         });
 
-        // Parse API key for metrics
-        let api_key_uuid_for_metrics = uuid::Uuid::parse_str(&request.api_key_id).map_err(|e| {
-            ports::CompletionError::InvalidParams(format!("Invalid API key ID: {e}"))
-        })?;
-
-        // Record metrics
+        // Record metrics with low-cardinality tags only
         let metrics_service = self.metrics_service.clone();
-        let duration = start_time.elapsed();
         let total_tokens = response_with_bytes.response.usage.completion_tokens;
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
         let output_tokens = response_with_bytes.response.usage.completion_tokens;
         let model_name = model.model_name.clone();
-        let organization_id = request.organization_id;
-        let organization_name = request.organization_name.clone();
-        let workspace_id = request.workspace_id;
-        let workspace_name = request.workspace_name.clone();
-        let api_key_name = request.api_key_name.clone();
 
         tokio::spawn(async move {
-            let tags = CompletionServiceImpl::create_metric_tags(
-                &model_name,
-                &organization_id,
-                &organization_name,
-                &workspace_id,
-                &workspace_name,
-                &api_key_uuid_for_metrics,
-                &api_key_name,
-            );
+            // Create low-cardinality tags (model + environment only)
+            let tags = CompletionServiceImpl::create_metric_tags(&model_name);
             let tags_str: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
 
             // Request count
             metrics_service.record_count(METRIC_REQUEST_COUNT, 1, &tags_str);
 
-            // TTFT (for non-streaming, this is the full response time since we get everything at once)
-            metrics_service.record_latency(METRIC_LATENCY_TTFT, ttft_duration, &tags_str);
-
-            // Total latency
-            metrics_service.record_latency(METRIC_LATENCY_TOTAL, duration, &tags_str);
+            // For non-streaming, TTFT = total latency (all tokens arrive together)
+            metrics_service.record_latency(METRIC_LATENCY_TTFT, total_latency, &tags_str);
+            metrics_service.record_latency(METRIC_LATENCY_TOTAL, total_latency, &tags_str);
 
             // Tokens per second
-            if duration.as_secs_f64() > 0.0 {
-                let tps = total_tokens as f64 / duration.as_secs_f64();
+            if total_latency.as_secs_f64() > 0.0 {
+                let tps = total_tokens as f64 / total_latency.as_secs_f64();
                 metrics_service.record_histogram(METRIC_TOKENS_PER_SECOND, tps, &tags_str);
             }
 
@@ -566,12 +614,18 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         });
 
         // Record usage with model UUID
+        // Note: TTFT doesn't apply to non-streaming (you get all tokens at once)
         let usage_service = self.usage_service.clone();
         let organization_id = request.organization_id;
         let workspace_id = request.workspace_id;
-        let api_key_id = uuid::Uuid::parse_str(&request.api_key_id).map_err(|e| {
-            ports::CompletionError::InvalidParams(format!("Invalid API key ID: {e}"))
-        })?;
+        let api_key_id = match uuid::Uuid::parse_str(&request.api_key_id) {
+            Ok(id) => id,
+            Err(e) => {
+                let err = ports::CompletionError::InvalidParams(format!("Invalid API key ID: {e}"));
+                self.record_error(&err, Some(canonical_name));
+                return Err(err);
+            }
+        };
         let model_id = model.id;
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
         let output_tokens = response_with_bytes.response.usage.completion_tokens;
@@ -587,6 +641,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     input_tokens,
                     output_tokens,
                     request_type: "chat_completion".to_string(),
+                    ttft_ms: None,    // N/A for non-streaming
+                    avg_itl_ms: None, // N/A for non-streaming
                 })
                 .await
                 .is_err()
@@ -666,15 +722,7 @@ mod tests {
 
         let stream = stream::iter(vec![Ok(content_chunk), Ok(usage_chunk)]);
 
-        let metric_tags = CompletionServiceImpl::create_metric_tags(
-            "test-model",
-            &organization_id,
-            "test-org",
-            &workspace_id,
-            "test-workspace",
-            &api_key_id,
-            "test-api-key",
-        );
+        let metric_tags = CompletionServiceImpl::create_metric_tags("test-model");
 
         let intercept_stream = InterceptStream {
             inner: stream,
@@ -682,17 +730,18 @@ mod tests {
             usage_service,
             metrics_service: metrics_service.clone(),
             organization_id,
-            organization_name: "test-org".to_string(),
             workspace_id,
-            workspace_name: "test-workspace".to_string(),
             api_key_id,
-            api_key_name: "test-api-key".to_string(),
             model_id,
             model_name: "test-model".to_string(),
             request_type: "chat_completion_stream".to_string(),
             start_time: Instant::now(),
             first_token_received: false,
             first_token_time: None,
+            ttft_ms: None,
+            token_count: 0,
+            last_token_time: None,
+            total_itl_ms: 0.0,
             metric_tags,
         };
 
@@ -739,5 +788,211 @@ mod tests {
         } else {
             panic!("TPS should be a histogram");
         }
+    }
+
+    #[tokio::test]
+    async fn test_intercept_stream_captures_ttft_and_itl() {
+        use crate::test_utils::CapturingUsageService;
+
+        let metrics_service = Arc::new(CapturingMetricsService::new());
+        let attestation_service = Arc::new(MockAttestationService);
+        let usage_service = Arc::new(CapturingUsageService::new());
+
+        let organization_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let api_key_id = Uuid::new_v4();
+        let model_id = Uuid::new_v4();
+
+        // Create multiple content chunks to test ITL calculation
+        let chunk1 = SSEEvent {
+            raw_bytes: Bytes::from("data: chunk1"),
+            chunk: StreamChunk::Chat(ChatCompletionChunk {
+                id: "chat-1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1234567890,
+                model: "test-model".to_string(),
+                choices: vec![],
+                usage: None,
+                prompt_token_ids: None,
+                system_fingerprint: None,
+            }),
+        };
+
+        let chunk2 = SSEEvent {
+            raw_bytes: Bytes::from("data: chunk2"),
+            chunk: StreamChunk::Chat(ChatCompletionChunk {
+                id: "chat-1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1234567890,
+                model: "test-model".to_string(),
+                choices: vec![],
+                usage: None,
+                prompt_token_ids: None,
+                system_fingerprint: None,
+            }),
+        };
+
+        let usage_chunk = SSEEvent {
+            raw_bytes: Bytes::from("data: usage"),
+            chunk: StreamChunk::Chat(ChatCompletionChunk {
+                id: "chat-1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1234567890,
+                model: "test-model".to_string(),
+                choices: vec![],
+                usage: Some(TokenUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 20,
+                    total_tokens: 30,
+                    prompt_tokens_details: None,
+                }),
+                prompt_token_ids: None,
+                system_fingerprint: None,
+            }),
+        };
+
+        // Simulate a stream with delays between chunks
+        let stream = stream::iter(vec![Ok(chunk1), Ok(chunk2), Ok(usage_chunk)]);
+
+        let metric_tags = CompletionServiceImpl::create_metric_tags("test-model");
+
+        // Use a start time from "before" to simulate real TTFT
+        let start_time = Instant::now() - Duration::from_millis(50);
+
+        let intercept_stream = InterceptStream {
+            inner: stream,
+            attestation_service,
+            usage_service: usage_service.clone(),
+            metrics_service: metrics_service.clone(),
+            organization_id,
+            workspace_id,
+            api_key_id,
+            model_id,
+            model_name: "test-model".to_string(),
+            request_type: "chat_completion_stream".to_string(),
+            start_time,
+            first_token_received: false,
+            first_token_time: None,
+            ttft_ms: None,
+            token_count: 0,
+            last_token_time: None,
+            total_itl_ms: 0.0,
+            metric_tags,
+        };
+
+        // Consume the stream
+        let _ = intercept_stream.collect::<Vec<_>>().await;
+
+        // Wait for async usage recording to complete
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Verify usage was recorded with latency metrics
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1, "Expected exactly one usage request");
+
+        let req = &requests[0];
+        assert_eq!(req.input_tokens, 10);
+        assert_eq!(req.output_tokens, 20);
+
+        // TTFT should be captured (>= 50ms since we set start_time 50ms in the past)
+        assert!(
+            req.ttft_ms.is_some(),
+            "TTFT should be captured for streaming"
+        );
+        assert!(
+            req.ttft_ms.unwrap() >= 50,
+            "TTFT should be at least 50ms, got {:?}",
+            req.ttft_ms
+        );
+
+        // ITL should be captured (we had 2 chunks after first token)
+        assert!(
+            req.avg_itl_ms.is_some(),
+            "avg_itl_ms should be captured for streaming with multiple chunks"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_metric_tags_includes_model_and_environment() {
+        let tags = CompletionServiceImpl::create_metric_tags("gpt-4");
+
+        assert_eq!(tags.len(), 2);
+        assert!(tags.iter().any(|t| t.starts_with("model:")));
+        assert!(tags.iter().any(|t| t.starts_with("environment:")));
+        assert!(tags.iter().any(|t| t == "model:gpt-4"));
+    }
+
+    #[tokio::test]
+    async fn test_intercept_stream_single_chunk_no_itl() {
+        use crate::test_utils::CapturingUsageService;
+
+        let metrics_service = Arc::new(CapturingMetricsService::new());
+        let attestation_service = Arc::new(MockAttestationService);
+        let usage_service = Arc::new(CapturingUsageService::new());
+
+        let organization_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let api_key_id = Uuid::new_v4();
+        let model_id = Uuid::new_v4();
+
+        // Single chunk with usage (no inter-token latency to measure)
+        let usage_chunk = SSEEvent {
+            raw_bytes: Bytes::from("data: usage"),
+            chunk: StreamChunk::Chat(ChatCompletionChunk {
+                id: "chat-1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1234567890,
+                model: "test-model".to_string(),
+                choices: vec![],
+                usage: Some(TokenUsage {
+                    prompt_tokens: 5,
+                    completion_tokens: 1,
+                    total_tokens: 6,
+                    prompt_tokens_details: None,
+                }),
+                prompt_token_ids: None,
+                system_fingerprint: None,
+            }),
+        };
+
+        let stream = stream::iter(vec![Ok(usage_chunk)]);
+        let metric_tags = CompletionServiceImpl::create_metric_tags("test-model");
+
+        let intercept_stream = InterceptStream {
+            inner: stream,
+            attestation_service,
+            usage_service: usage_service.clone(),
+            metrics_service: metrics_service.clone(),
+            organization_id,
+            workspace_id,
+            api_key_id,
+            model_id,
+            model_name: "test-model".to_string(),
+            request_type: "chat_completion_stream".to_string(),
+            start_time: Instant::now(),
+            first_token_received: false,
+            first_token_time: None,
+            ttft_ms: None,
+            token_count: 0,
+            last_token_time: None,
+            total_itl_ms: 0.0,
+            metric_tags,
+        };
+
+        let _ = intercept_stream.collect::<Vec<_>>().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+
+        let req = &requests[0];
+        // TTFT should still be captured
+        assert!(req.ttft_ms.is_some(), "TTFT should be captured");
+        // ITL should be None since there's only one chunk (no inter-token gaps)
+        assert!(
+            req.avg_itl_ms.is_none(),
+            "avg_itl_ms should be None for single chunk, got {:?}",
+            req.avg_itl_ms
+        );
     }
 }

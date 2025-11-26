@@ -51,15 +51,11 @@ pub struct CompletionRequest {
     pub stream: Option<bool>,
     pub n: Option<i64>,
     pub user_id: UserId,    // For provider user field
-    pub api_key_id: String, // For usage tracking
+    pub api_key_id: String, // For usage tracking (ID only, no name)
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
     pub metadata: Option<serde_json::Value>,
     pub body_hash: String,
-    // Human-readable names for metrics
-    pub api_key_name: String,
-    pub workspace_name: String,
-    pub organization_name: String,
 
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }

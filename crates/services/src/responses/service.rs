@@ -23,13 +23,6 @@ struct ToolExecutionResult {
 
 /// Context for processing a response stream
 struct ProcessStreamContext {
-    // Names kept for potential future logging/debugging, not used in metrics
-    #[allow(dead_code)]
-    organization_name: String,
-    #[allow(dead_code)]
-    workspace_name: String,
-    #[allow(dead_code)]
-    api_key_name: String,
     request: models::CreateResponseRequest,
     user_id: crate::UserId,
     api_key_id: String,
@@ -101,9 +94,6 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
         body_hash: String,
-        api_key_name: String,
-        workspace_name: String,
-        organization_name: String,
     ) -> Result<
         Pin<Box<dyn Stream<Item = models::ResponseStreamEvent> + Send>>,
         errors::ResponseError,
@@ -125,9 +115,6 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
 
         tokio::spawn(async move {
             let context = ProcessStreamContext {
-                organization_name,
-                workspace_name,
-                api_key_name,
                 request,
                 user_id,
                 api_key_id,

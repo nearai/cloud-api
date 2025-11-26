@@ -999,8 +999,10 @@ pub async fn get_organization_metrics(
     Path(org_id): Path<String>,
     Query(params): Query<MetricsQueryParams>,
     Extension(_admin_user): Extension<AdminUser>,
-) -> Result<ResponseJson<services::admin::OrganizationMetrics>, (StatusCode, ResponseJson<ErrorResponse>)>
-{
+) -> Result<
+    ResponseJson<services::admin::OrganizationMetrics>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
     debug!(
         "Get organization metrics request for org_id: {}, start: {:?}, end: {:?}",
         org_id, params.start, params.end
@@ -1036,7 +1038,7 @@ pub async fn get_organization_metrics(
         .get_organization_metrics(organization_id, start, end)
         .await
         .map_err(|e| {
-            error!("Failed to get organization metrics");
+            error!("Failed to get organization metrics, error: {:?}", e);
             match e {
                 services::admin::AdminError::OrganizationNotFound(msg) => (
                     StatusCode::NOT_FOUND,

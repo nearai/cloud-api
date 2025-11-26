@@ -526,6 +526,15 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         let canonical_name = &model.model_name;
 
+        let api_key_id = match uuid::Uuid::parse_str(&request.api_key_id) {
+            Ok(id) => id,
+            Err(e) => {
+                let err = ports::CompletionError::InvalidParams(format!("Invalid API key ID: {e}"));
+                self.record_error(&err, Some(canonical_name));
+                return Err(err);
+            }
+        };
+
         // Update params with canonical name if it's different
         if canonical_name != &request.model {
             tracing::debug!(
@@ -618,14 +627,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let usage_service = self.usage_service.clone();
         let organization_id = request.organization_id;
         let workspace_id = request.workspace_id;
-        let api_key_id = match uuid::Uuid::parse_str(&request.api_key_id) {
-            Ok(id) => id,
-            Err(e) => {
-                let err = ports::CompletionError::InvalidParams(format!("Invalid API key ID: {e}"));
-                self.record_error(&err, Some(canonical_name));
-                return Err(err);
-            }
-        };
         let model_id = model.id;
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
         let output_tokens = response_with_bytes.response.usage.completion_tokens;

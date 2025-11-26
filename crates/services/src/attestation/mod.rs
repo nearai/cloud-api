@@ -185,16 +185,21 @@ impl ports::AttestationServiceTrait for AttestationService {
             })?;
 
         // Fetch signature from provider
+        let environment = get_environment();
+        let env_tag = format!("{TAG_ENVIRONMENT}:{environment}");
         let provider_signature = provider.get_signature(chat_id).await.map_err(|e| {
             tracing::error!("Failed to get chat signature from provider");
             let duration = start_time.elapsed();
             self.metrics_service.record_count(
                 METRIC_VERIFICATION_FAILURE,
                 1,
-                &[&format!("{TAG_REASON}:{REASON_INFERENCE_ERROR}")],
+                &[
+                    &format!("{TAG_REASON}:{REASON_INFERENCE_ERROR}"),
+                    &env_tag,
+                ],
             );
             self.metrics_service
-                .record_latency(METRIC_VERIFICATION_DURATION, duration, &[]);
+                .record_latency(METRIC_VERIFICATION_DURATION, duration, &[&env_tag]);
             AttestationError::ProviderError(e.to_string())
         })?;
 
@@ -215,19 +220,22 @@ impl ports::AttestationServiceTrait for AttestationService {
                 self.metrics_service.record_count(
                     METRIC_VERIFICATION_FAILURE,
                     1,
-                    &[&format!("{TAG_REASON}:{REASON_REPOSITORY_ERROR}")],
+                    &[
+                        &format!("{TAG_REASON}:{REASON_REPOSITORY_ERROR}"),
+                        &env_tag,
+                    ],
                 );
                 self.metrics_service
-                    .record_latency(METRIC_VERIFICATION_DURATION, duration, &[]);
+                    .record_latency(METRIC_VERIFICATION_DURATION, duration, &[&env_tag]);
                 AttestationError::RepositoryError(e.to_string())
             })?;
 
         // Record successful verification
         let duration = start_time.elapsed();
         self.metrics_service
-            .record_count(METRIC_VERIFICATION_SUCCESS, 1, &[]);
+            .record_count(METRIC_VERIFICATION_SUCCESS, 1, &[&env_tag]);
         self.metrics_service
-            .record_latency(METRIC_VERIFICATION_DURATION, duration, &[]);
+            .record_latency(METRIC_VERIFICATION_DURATION, duration, &[&env_tag]);
 
         Ok(())
     }
@@ -240,6 +248,8 @@ impl ports::AttestationServiceTrait for AttestationService {
         signing_algo: Option<String>,
     ) -> Result<(), AttestationError> {
         let start_time = std::time::Instant::now();
+        let environment = get_environment();
+        let env_tag = format!("{TAG_ENVIRONMENT}:{environment}");
 
         // Create signature text in format "request_hash:response_hash"
         let signature_text = format!("{request_hash}:{response_hash}");
@@ -329,10 +339,13 @@ impl ports::AttestationServiceTrait for AttestationService {
                 self.metrics_service.record_count(
                     METRIC_VERIFICATION_FAILURE,
                     1,
-                    &[&format!("{TAG_REASON}:{REASON_REPOSITORY_ERROR}")],
+                    &[
+                        &format!("{TAG_REASON}:{REASON_REPOSITORY_ERROR}"),
+                        &env_tag,
+                    ],
                 );
                 self.metrics_service
-                    .record_latency(METRIC_VERIFICATION_DURATION, duration, &[]);
+                    .record_latency(METRIC_VERIFICATION_DURATION, duration, &[&env_tag]);
                 AttestationError::RepositoryError(e.to_string())
             })?;
 
@@ -346,9 +359,9 @@ impl ports::AttestationServiceTrait for AttestationService {
         // Record successful verification
         let duration = start_time.elapsed();
         self.metrics_service
-            .record_count(METRIC_VERIFICATION_SUCCESS, 1, &[]);
+            .record_count(METRIC_VERIFICATION_SUCCESS, 1, &[&env_tag]);
         self.metrics_service
-            .record_latency(METRIC_VERIFICATION_DURATION, duration, &[]);
+            .record_latency(METRIC_VERIFICATION_DURATION, duration, &[&env_tag]);
 
         Ok(())
     }

@@ -1217,6 +1217,7 @@ impl ResponseServiceImpl {
     }
 
     /// Load conversation context based on conversation_id or previous_response_id
+    #[allow(clippy::too_many_arguments)]
     async fn load_conversation_context(
         request: &models::CreateResponseRequest,
         conversation_service: &Arc<dyn ConversationServiceTrait>,

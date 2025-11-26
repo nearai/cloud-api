@@ -759,6 +759,8 @@ pub enum ConversationInputItem {
         content: ConversationContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         metadata: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
 }
 

@@ -96,7 +96,6 @@ jobs:
         BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
         RUST_LOG: debug
         DEV: "true"
-        RUST_TEST_THREADS: 15
 
     - name: Run vLLM integration tests
       run: cargo test --test integration_tests -- --nocapture

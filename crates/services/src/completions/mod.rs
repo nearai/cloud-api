@@ -144,7 +144,7 @@ where
                         // Record metrics
                         let metrics_service = self.metrics_service.clone();
                         let duration = self.start_time.elapsed();
-                        let total_tokens = usage.completion_tokens;
+                        let total_tokens = usage.total_tokens;
                         let input_tokens = usage.prompt_tokens;
                         let output_tokens = usage.completion_tokens;
                         let first_token_time = self.first_token_time;
@@ -599,7 +599,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // Record metrics with low-cardinality tags only
         let metrics_service = self.metrics_service.clone();
-        let total_tokens = response_with_bytes.response.usage.completion_tokens;
+        let total_tokens = response_with_bytes.response.usage.total_tokens;
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
         let output_tokens = response_with_bytes.response.usage.completion_tokens;
         let model_name = model.model_name.clone();

@@ -1027,7 +1027,12 @@ fn convert_input_item_to_response_item(
     item: ConversationInputItem,
 ) -> Result<services::responses::models::ResponseOutputItem, String> {
     match item {
-        ConversationInputItem::Message { role, content, .. } => {
+        ConversationInputItem::Message {
+            role,
+            content,
+            model,
+            ..
+        } => {
             // Convert ConversationContent to ResponseOutputContent
             let response_content = match content {
                 ConversationContent::Text(text) => {
@@ -1079,7 +1084,7 @@ fn convert_input_item_to_response_item(
                 status: services::responses::models::ResponseItemStatus::Completed,
                 role,
                 content: response_content,
-                model: String::new(), // Will be enriched by repository
+                model: model.unwrap_or_default(), // Will be enriched by repository if empty
             })
         }
     }

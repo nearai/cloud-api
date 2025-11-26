@@ -191,7 +191,7 @@ impl ports::AttestationServiceTrait for AttestationService {
             self.metrics_service.record_count(
                 METRIC_VERIFICATION_FAILURE,
                 1,
-                &[&format!("{}:{}", TAG_REASON, REASON_INFERENCE_ERROR)],
+                &[&format!("{TAG_REASON}:{REASON_INFERENCE_ERROR}")],
             );
             self.metrics_service
                 .record_latency(METRIC_VERIFICATION_DURATION, duration, &[]);
@@ -215,7 +215,7 @@ impl ports::AttestationServiceTrait for AttestationService {
                 self.metrics_service.record_count(
                     METRIC_VERIFICATION_FAILURE,
                     1,
-                    &[&format!("{}:{}", TAG_REASON, REASON_REPOSITORY_ERROR)],
+                    &[&format!("{TAG_REASON}:{REASON_REPOSITORY_ERROR}")],
                 );
                 self.metrics_service
                     .record_latency(METRIC_VERIFICATION_DURATION, duration, &[]);
@@ -329,7 +329,7 @@ impl ports::AttestationServiceTrait for AttestationService {
                 self.metrics_service.record_count(
                     METRIC_VERIFICATION_FAILURE,
                     1,
-                    &[&format!("{}:{}", TAG_REASON, REASON_REPOSITORY_ERROR)],
+                    &[&format!("{TAG_REASON}:{REASON_REPOSITORY_ERROR}")],
                 );
                 self.metrics_service
                     .record_latency(METRIC_VERIFICATION_DURATION, duration, &[]);

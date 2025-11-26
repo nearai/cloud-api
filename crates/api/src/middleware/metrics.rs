@@ -41,12 +41,10 @@ pub async fn http_metrics_middleware(
     let endpoint = normalize_path(&path);
     let environment = get_environment();
 
-    let tags = vec![
-        format!("{}:{}", TAG_METHOD, method),
-        format!("{}:{}", TAG_ENDPOINT, endpoint),
-        format!("{}:{}", TAG_STATUS_CODE, status),
-        format!("{}:{}", TAG_ENVIRONMENT, environment),
-    ];
+    let tags = [format!("{TAG_METHOD}:{method}"),
+        format!("{TAG_ENDPOINT}:{endpoint}"),
+        format!("{TAG_STATUS_CODE}:{status}"),
+        format!("{TAG_ENVIRONMENT}:{environment}")];
     let tags_str: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
 
     state

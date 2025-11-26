@@ -254,7 +254,7 @@ impl CompletionServiceImpl {
 
         // Add model tag if available (for model-specific errors)
         if let Some(model) = model_name {
-            tags.push(format!("{}:{}", TAG_MODEL, model));
+            tags.push(format!("{TAG_MODEL}:{model}"));
         }
 
         let tags_str: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
@@ -436,7 +436,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                         "The model is currently unavailable. Please try again later.".to_string(),
                     )
                 };
-                self.record_error(&err, Some(&canonical_name));
+                self.record_error(&err, Some(canonical_name));
                 return Err(err);
             }
         };

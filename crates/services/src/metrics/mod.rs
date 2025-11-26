@@ -135,7 +135,7 @@ impl MetricsServiceTrait for OtlpMetricsService {
 // Helper functions for creating properly formatted tags
 /// Create a tag in the "key:value" format
 pub fn tag(key: &str, value: impl std::fmt::Display) -> String {
-    format!("{}:{}", key, value)
+    format!("{key}:{value}")
 }
 
 /// Create multiple tags from key-value pairs

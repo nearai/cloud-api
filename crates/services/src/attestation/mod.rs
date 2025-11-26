@@ -161,8 +161,12 @@ impl ports::AttestationServiceTrait for AttestationService {
         chat_id: &str,
         signing_algo: Option<String>,
     ) -> Result<ChatSignature, AttestationError> {
+        let signing_algo = signing_algo
+            .map(|s| s.to_lowercase())
+            .unwrap_or_else(|| "ecdsa".to_string());
+
         self.repository
-            .get_chat_signature(chat_id, signing_algo)
+            .get_chat_signature(chat_id, &signing_algo)
             .await
     }
 

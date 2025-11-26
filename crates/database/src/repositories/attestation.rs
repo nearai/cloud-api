@@ -63,7 +63,7 @@ impl AttestationRepository for PgAttestationRepository {
     async fn get_chat_signature(
         &self,
         chat_id: &str,
-        signing_algo: Option<String>,
+        signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
         let client = self
             .pool
@@ -71,15 +71,10 @@ impl AttestationRepository for PgAttestationRepository {
             .await
             .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
 
-        // Default to ed25519 if signing_algo is not specified
-        let algo = signing_algo
-            .map(|s| s.to_lowercase())
-            .unwrap_or_else(|| "ed25519".to_string());
-
         let row = client
             .query_one(
                 "SELECT * FROM chat_signatures WHERE chat_id = $1 AND signing_algo = $2",
-                &[&chat_id, &algo],
+                &[&chat_id, &signing_algo],
             )
             .await
             .map_err(|e| {
@@ -87,7 +82,9 @@ impl AttestationRepository for PgAttestationRepository {
                 if e.to_string()
                     .contains("query returned an unexpected number of rows")
                 {
-                    return AttestationError::SignatureNotFound(format!("{chat_id}:{algo}"));
+                    return AttestationError::SignatureNotFound(format!(
+                        "{chat_id}:{signing_algo}"
+                    ));
                 }
                 AttestationError::RepositoryError(e.to_string())
             })?;

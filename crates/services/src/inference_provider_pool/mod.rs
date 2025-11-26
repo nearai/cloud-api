@@ -212,12 +212,7 @@ impl InferenceProviderPool {
                 ))) as Arc<InferenceProviderTrait>;
 
                 match provider
-                    .get_attestation_report(
-                        model_name.clone(),
-                        None,
-                        None,
-                        None,
-                    )
+                    .get_attestation_report(model_name.clone(), None, None, None)
                     .await
                 {
                     Ok(_) => {

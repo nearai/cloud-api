@@ -47,6 +47,6 @@ pub trait AttestationRepository: Send + Sync {
     async fn get_chat_signature(
         &self,
         chat_id: &str,
-        signing_algo: Option<String>,
+        signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError>;
 }

@@ -278,20 +278,16 @@ impl ports::AttestationServiceTrait for AttestationService {
                     let sig_hex = hex::encode(signature_bytes);
 
                     let addr = self.get_signing_address_hex("ecdsa");
-                    Ok((sig_hex, addr))
+                    Ok((format!("0x{sig_hex}"), addr))
                 }
                 _ => {
-                    tracing::warn!("Unknown signing algorithm: {}, defaulting to ed25519", algo);
-                    let signature_bytes = self.ed25519_signing_key.sign(signature_text.as_bytes());
-                    let sig_hex = hex::encode(signature_bytes.to_bytes());
-                    let addr = self.get_signing_address_hex("ed25519");
-                    Ok((sig_hex, addr))
+                    unreachable!("Unknown signing algorithm: {}", algo)
                 }
             }?;
 
             let signature = ChatSignature {
                 text: signature_text.clone(),
-                signature: format!("0x{signature_hex}"),
+                signature: signature_hex,
                 signing_address,
                 signing_algo: algo.to_string(),
             };

@@ -1129,10 +1129,17 @@ fn convert_output_item_to_conversation_item(
                                 .strip_prefix("[File: ")
                                 .and_then(|s| s.strip_suffix("]"))
                             {
-                                Some(ConversationContentPart::InputFile {
-                                    file_id: file_id.to_string(),
-                                    detail: None,
-                                })
+                                // Validate it's a valid UUID format
+                                let uuid_str = file_id.strip_prefix("file-").unwrap_or(file_id);
+                                if uuid::Uuid::parse_str(uuid_str).is_ok() {
+                                    Some(ConversationContentPart::InputFile {
+                                        file_id: file_id.to_string(),
+                                        detail: None,
+                                    })
+                                } else {
+                                    // Invalid UUID format, treat as text
+                                    Some(ConversationContentPart::InputText { text })
+                                }
                             } else {
                                 Some(ConversationContentPart::InputText { text })
                             }

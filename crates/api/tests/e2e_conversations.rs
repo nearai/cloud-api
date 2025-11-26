@@ -649,7 +649,8 @@ async fn test_create_conversation_items_with_file_content() {
                     "role": "user",
                     "content": [
                         {"type": "input_text", "text": "Could you read the file?"},
-                        {"type": "input_file", "file_id": "file-32af7670-f5b9-47a0-a952-20d5d3831e67"}
+                        {"type": "input_file", "file_id": "file-32af7670-f5b9-47a0-a952-20d5d3831e67"},
+                        {"type": "input_text", "text": "Discussion about [File: file-hello world] in text"}
                     ]
                 }
             ]
@@ -664,7 +665,7 @@ async fn test_create_conversation_items_with_file_content() {
     match &items_response.data[0] {
         ConversationItem::Message { role, content, .. } => {
             assert_eq!(role, "user");
-            assert_eq!(content.len(), 2);
+            assert_eq!(content.len(), 3);
 
             // First content part should be text
             match &content[0] {
@@ -674,13 +675,24 @@ async fn test_create_conversation_items_with_file_content() {
                 _ => panic!("Expected InputText content part"),
             }
 
-            // Second content part should be file (this is the fix!)
+            // Second content part should be file (valid UUID)
             match &content[1] {
                 ConversationContentPart::InputFile { file_id, detail } => {
                     assert_eq!(file_id, "file-32af7670-f5b9-47a0-a952-20d5d3831e67");
                     assert_eq!(detail, &None);
                 }
                 _ => panic!("Expected InputFile content part but got: {:?}", &content[1]),
+            }
+
+            // Third content part should be text (invalid UUID format)
+            match &content[2] {
+                ConversationContentPart::InputText { text } => {
+                    assert_eq!(text, "Discussion about [File: file-hello world] in text");
+                }
+                _ => panic!(
+                    "Expected InputText for invalid file ID but got: {:?}",
+                    &content[2]
+                ),
             }
         }
         _ => panic!("Expected Message item type"),

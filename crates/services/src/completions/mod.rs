@@ -337,7 +337,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             Ok(id) => id,
             Err(e) => {
                 let err = ports::CompletionError::InvalidParams(format!("Invalid API key ID: {e}"));
-                self.record_error(&err, Some(&request.model));
+                self.record_error(&err, None);
                 return Err(err);
             }
         };
@@ -385,13 +385,15 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     "Model '{}' not found. It's not a valid model name or alias.",
                     request.model
                 ));
-                self.record_error(&err, Some(&request.model));
+                // Do not record the invalid model name in metrics to avoid high cardinality
+                self.record_error(&err, None);
                 return Err(err);
             }
             Err(e) => {
                 let err =
                     ports::CompletionError::InternalError(format!("Failed to resolve model: {e}"));
-                self.record_error(&err, Some(&request.model));
+                // Do not record the possibly invalid model name in metrics
+                self.record_error(&err, None);
                 return Err(err);
             }
         };
@@ -513,13 +515,15 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     "Model '{}' not found. It's not a valid model name or alias.",
                     request.model
                 ));
-                self.record_error(&err, Some(&request.model));
+                // Do not record the invalid model name in metrics to avoid high cardinality
+                self.record_error(&err, None);
                 return Err(err);
             }
             Err(e) => {
                 let err =
                     ports::CompletionError::InternalError(format!("Failed to resolve model: {e}"));
-                self.record_error(&err, Some(&request.model));
+                // Do not record the possibly invalid model name in metrics
+                self.record_error(&err, None);
                 return Err(err);
             }
         };

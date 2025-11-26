@@ -281,6 +281,7 @@ impl CompletionServiceImpl {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_stream_with_context(
         &self,
         llm_stream: StreamingResult,

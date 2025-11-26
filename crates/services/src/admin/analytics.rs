@@ -110,4 +110,3 @@ impl AnalyticsService {
             .map_err(|e| super::AdminError::InternalError(e.to_string()))
     }
 }
-

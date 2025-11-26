@@ -1,6 +1,4 @@
 // Test utilities for services crate
-#![cfg(test)]
-
 use crate::{
     attestation::{
         models::{AttestationReport, ChatSignature},

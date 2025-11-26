@@ -1,14 +1,13 @@
 use api::{build_app_with_config, init_auth_services, init_database, init_domain_services};
 use config::{ApiConfig, LoggingConfig};
-use std::sync::Arc;
-use services::metrics::{MetricsServiceTrait, OtlpMetricsService};
 use opentelemetry::global;
+use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
     metrics::{MeterProvider, PeriodicReader},
-    runtime,
-    Resource,
+    runtime, Resource,
 };
-use opentelemetry_otlp::WithExportConfig;
+use services::metrics::{MetricsServiceTrait, OtlpMetricsService};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
@@ -32,10 +31,10 @@ async fn main() {
         .expect("Failed to build OTLP metrics exporter");
 
     let reader = PeriodicReader::builder(exporter, runtime::Tokio).build();
-    
+
     // Get environment from env var (local, dev, staging, prod)
     let environment = std::env::var("ENVIRONMENT").unwrap_or_else(|_| "local".to_string());
-    
+
     let meter_provider = MeterProvider::builder()
         .with_reader(reader)
         .with_resource(Resource::new(vec![
@@ -43,13 +42,17 @@ async fn main() {
             opentelemetry::KeyValue::new("environment", environment.clone()),
         ]))
         .build();
-    
-    tracing::info!("OpenTelemetry metrics initialized for environment: {}", environment);
+
+    tracing::info!(
+        "OpenTelemetry metrics initialized for environment: {}",
+        environment
+    );
 
     global::set_meter_provider(meter_provider.clone());
 
     // Initialize metrics service
-    let metrics_service = Arc::new(OtlpMetricsService::new(&meter_provider)) as Arc<dyn MetricsServiceTrait>;
+    let metrics_service =
+        Arc::new(OtlpMetricsService::new(&meter_provider)) as Arc<dyn MetricsServiceTrait>;
 
     let domain_services = init_domain_services(
         database.clone(),

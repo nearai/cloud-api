@@ -1,6 +1,6 @@
-use std::time::Duration;
 use crate::metrics::MetricsServiceTrait;
 use async_trait::async_trait;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct RecordedMetric {

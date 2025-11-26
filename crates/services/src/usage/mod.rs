@@ -1,10 +1,10 @@
 pub mod ports;
 
-pub use ports::*;
 use crate::metrics::{
     consts::{get_environment, METRIC_COST_USD, TAG_ENVIRONMENT, TAG_MODEL},
     MetricsServiceTrait,
 };
+pub use ports::*;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -113,8 +113,10 @@ impl UsageServiceTrait for UsageServiceImpl {
         let cost_micro = total_cost / 1000; // Convert nano to micro-dollars
         if cost_micro > 0 {
             let environment = get_environment();
-            let tags = [format!("{}:{}", TAG_MODEL, model.model_name),
-                format!("{TAG_ENVIRONMENT}:{environment}")];
+            let tags = [
+                format!("{}:{}", TAG_MODEL, model.model_name),
+                format!("{TAG_ENVIRONMENT}:{environment}"),
+            ];
             let tags_str: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
             self.metrics_service
                 .record_count(METRIC_COST_USD, cost_micro, &tags_str);

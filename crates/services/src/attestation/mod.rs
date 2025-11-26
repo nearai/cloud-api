@@ -193,13 +193,13 @@ impl ports::AttestationServiceTrait for AttestationService {
             self.metrics_service.record_count(
                 METRIC_VERIFICATION_FAILURE,
                 1,
-                &[
-                    &format!("{TAG_REASON}:{REASON_INFERENCE_ERROR}"),
-                    &env_tag,
-                ],
+                &[&format!("{TAG_REASON}:{REASON_INFERENCE_ERROR}"), &env_tag],
             );
-            self.metrics_service
-                .record_latency(METRIC_VERIFICATION_DURATION, duration, &[&env_tag]);
+            self.metrics_service.record_latency(
+                METRIC_VERIFICATION_DURATION,
+                duration,
+                &[&env_tag],
+            );
             AttestationError::ProviderError(e.to_string())
         })?;
 
@@ -220,13 +220,13 @@ impl ports::AttestationServiceTrait for AttestationService {
                 self.metrics_service.record_count(
                     METRIC_VERIFICATION_FAILURE,
                     1,
-                    &[
-                        &format!("{TAG_REASON}:{REASON_REPOSITORY_ERROR}"),
-                        &env_tag,
-                    ],
+                    &[&format!("{TAG_REASON}:{REASON_REPOSITORY_ERROR}"), &env_tag],
                 );
-                self.metrics_service
-                    .record_latency(METRIC_VERIFICATION_DURATION, duration, &[&env_tag]);
+                self.metrics_service.record_latency(
+                    METRIC_VERIFICATION_DURATION,
+                    duration,
+                    &[&env_tag],
+                );
                 AttestationError::RepositoryError(e.to_string())
             })?;
 
@@ -339,13 +339,13 @@ impl ports::AttestationServiceTrait for AttestationService {
                 self.metrics_service.record_count(
                     METRIC_VERIFICATION_FAILURE,
                     1,
-                    &[
-                        &format!("{TAG_REASON}:{REASON_REPOSITORY_ERROR}"),
-                        &env_tag,
-                    ],
+                    &[&format!("{TAG_REASON}:{REASON_REPOSITORY_ERROR}"), &env_tag],
                 );
-                self.metrics_service
-                    .record_latency(METRIC_VERIFICATION_DURATION, duration, &[&env_tag]);
+                self.metrics_service.record_latency(
+                    METRIC_VERIFICATION_DURATION,
+                    duration,
+                    &[&env_tag],
+                );
                 AttestationError::RepositoryError(e.to_string())
             })?;
 

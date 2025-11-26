@@ -409,6 +409,15 @@ impl ResponseOutputItem {
             ResponseOutputItem::Reasoning { status, .. } => status,
         }
     }
+
+    pub fn model(&self) -> &str {
+        match self {
+            ResponseOutputItem::Message { model, .. } => model,
+            ResponseOutputItem::ToolCall { model, .. } => model,
+            ResponseOutputItem::WebSearchCall { model, .. } => model,
+            ResponseOutputItem::Reasoning { model, .. } => model,
+        }
+    }
 }
 
 /// Web search action details

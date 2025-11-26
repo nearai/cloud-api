@@ -465,17 +465,21 @@ impl ports::AttestationServiceTrait for AttestationService {
         } else {
             let client = dstack_client::DstackClient::new(None);
 
-            let info = client.info().await.map_err(|_| {
+            let info = client.info().await.map_err(|e| {
                 tracing::error!(
-                    "Failed to get cloud API attestation info, are you running in a CVM?"
+                    "Failed to get cloud API attestation info, are you running in a CVM?: {:?}",
+                    e
                 );
                 AttestationError::InternalError(
                     "failed to get cloud API attestation info".to_string(),
                 )
             })?;
 
-            let cpu_quote = client.get_quote(report_data).await.map_err(|_| {
-                tracing::error!("Failed to get cloud API attestation, are you running in a CVM?");
+            let cpu_quote = client.get_quote(report_data).await.map_err(|e| {
+                tracing::error!(
+                    "Failed to get cloud API attestation, are you running in a CVM?: {:?}",
+                    e
+                );
                 AttestationError::InternalError("failed to get cloud API attestation".to_string())
             })?;
             gateway_attestation = DstackCpuQuote::from_quote_and_nonce(

@@ -4,7 +4,7 @@ mod common;
 use common::*;
 
 use api::models::{
-    ConversationContentPart, ConversationItem, ResponseContentItem, ResponseOutputItem,
+    ConversationContentPart, ConversationItem, ResponseOutputContent, ResponseOutputItem,
 };
 
 // Helper functions for conversation and response tests
@@ -215,7 +215,7 @@ async fn test_responses_api() {
     for output_item in &response.output {
         if let ResponseOutputItem::Message { content, .. } = output_item {
             for content_part in content {
-                if let ResponseContentItem::OutputText { text, .. } = content_part {
+                if let ResponseOutputContent::OutputText { text, .. } = content_part {
                     println!(
                         "Response text length: {} chars, content: '{}'",
                         text.len(),
@@ -288,7 +288,7 @@ async fn test_streaming_responses_api() {
     assert!(streaming_response.output.iter().any(|item| {
         if let ResponseOutputItem::Message { content, .. } = item {
             content.iter().any(|part| {
-                if let ResponseContentItem::OutputText { text, .. } = part {
+                if let ResponseOutputContent::OutputText { text, .. } = part {
                     !text.is_empty()
                 } else {
                     false

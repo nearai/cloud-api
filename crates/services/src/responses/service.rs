@@ -391,7 +391,7 @@ impl ResponseServiceImpl {
             .await?;
 
         // Event: response.content_part.added
-        let part = models::ResponseContentItem::OutputText {
+        let part = models::ResponseOutputContent::OutputText {
             text: String::new(),
             annotations: vec![],
             logprobs: vec![],
@@ -440,7 +440,7 @@ impl ResponseServiceImpl {
             .await?;
 
         // Event: response.content_part.done
-        let part = models::ResponseContentItem::OutputText {
+        let part = models::ResponseOutputContent::OutputText {
             text: clean_text.clone(),
             annotations: annotations.clone(),
             logprobs: vec![],

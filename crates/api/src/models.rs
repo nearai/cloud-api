@@ -592,7 +592,7 @@ pub enum ResponseOutputItem {
         id: String,
         status: ResponseItemStatus,
         role: String,
-        content: Vec<ResponseContentItem>,
+        content: Vec<ResponseOutputContent>,
     },
     #[serde(rename = "tool_call")]
     ToolCall {
@@ -619,54 +619,11 @@ pub enum ResponseItemStatus {
     Cancelled,
 }
 
-/// Unified content item that can represent both user inputs and assistant outputs.
-///
-/// This type is used for:
-/// - Database serialization (stores all variants in JSONB)
-/// - ResponseOutputItem::Message.content (unified storage)
-/// - Internal conversions between input/output types
-///
-/// For type-safe operations on specific variants, convert to:
-/// - ResponseContentPart (input-only operations)
-/// - ResponseOutputContent (output-only operations)
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type")]
-pub enum ResponseContentItem {
-    // ===== INPUT VARIANTS (from user) =====
-    #[serde(rename = "input_text")]
-    InputText { text: String },
-
-    #[serde(rename = "input_image")]
-    InputImage {
-        image_url: ResponseImageUrl,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
-    },
-
-    #[serde(rename = "input_file")]
-    InputFile {
-        file_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
-    },
-
-    // ===== OUTPUT VARIANTS (from assistant) =====
-    #[serde(rename = "output_text")]
-    OutputText {
-        text: String,
-        annotations: Vec<serde_json::Value>,
-    },
-
-    #[serde(rename = "tool_calls")]
-    ToolCalls {
-        tool_calls: Vec<ResponseOutputToolCall>,
-    },
-}
-
 /// Output content from assistant (output-only variants).
 ///
 /// This type is used for type-safe operations on assistant outputs only.
 /// It cannot contain input variants, providing compile-time safety.
+/// Used in streaming events and response output items in the API layer.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
 pub enum ResponseOutputContent {
@@ -679,66 +636,6 @@ pub enum ResponseOutputContent {
     ToolCalls {
         tool_calls: Vec<ResponseOutputToolCall>,
     },
-}
-
-// ============================================
-// ResponseContentItem Conversion Methods
-// ============================================
-
-impl ResponseContentItem {
-    /// Convert to input-only variant (ResponseContentPart).
-    ///
-    /// Returns Some if this is an input variant, None if output variant.
-    /// For backward compatibility, OutputText is checked for legacy file references.
-    pub fn try_into_input(self) -> Option<ResponseContentPart> {
-        match self {
-            Self::InputText { text } => Some(ResponseContentPart::InputText { text }),
-            Self::InputImage { image_url, detail } => {
-                Some(ResponseContentPart::InputImage { image_url, detail })
-            }
-            Self::InputFile { file_id, detail } => {
-                Some(ResponseContentPart::InputFile { file_id, detail })
-            }
-            Self::OutputText { text, .. } => {
-                // Backward compatibility: check for legacy file reference
-                match crate::routes::common::parse_legacy_file_reference(&text) {
-                    Ok(Some(file_id)) => Some(ResponseContentPart::InputFile {
-                        file_id,
-                        detail: None,
-                    }),
-                    Ok(None) | Err(_) => Some(ResponseContentPart::InputText { text }),
-                }
-            }
-            Self::ToolCalls { .. } => None,
-        }
-    }
-
-    /// Convert to output-only variant (ResponseOutputContent).
-    ///
-    /// Returns Some if this is an output variant, None if input variant.
-    pub fn try_into_output(self) -> Option<ResponseOutputContent> {
-        match self {
-            Self::OutputText { text, annotations } => {
-                Some(ResponseOutputContent::OutputText { text, annotations })
-            }
-            Self::ToolCalls { tool_calls } => Some(ResponseOutputContent::ToolCalls { tool_calls }),
-            // Input variants are filtered out
-            _ => None,
-        }
-    }
-
-    /// Check if this is an input variant.
-    pub fn is_input(&self) -> bool {
-        matches!(
-            self,
-            Self::InputText { .. } | Self::InputImage { .. } | Self::InputFile { .. }
-        )
-    }
-
-    /// Check if this is an output variant.
-    pub fn is_output(&self) -> bool {
-        matches!(self, Self::OutputText { .. } | Self::ToolCalls { .. })
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -802,7 +699,7 @@ pub struct ResponseStreamEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub item_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub part: Option<ResponseContentItem>,
+    pub part: Option<ResponseOutputContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2070,138 +1967,5 @@ mod tests {
 
         // String content should pass validation
         assert!(request.validate().is_ok());
-    }
-
-    #[test]
-    fn test_response_content_item_try_into_input() {
-        // Test InputText conversion
-        let item = ResponseContentItem::InputText {
-            text: "Hello".to_string(),
-        };
-        let result = item.try_into_input();
-        assert!(result.is_some());
-        assert!(matches!(
-            result.unwrap(),
-            ResponseContentPart::InputText { .. }
-        ));
-
-        // Test InputFile conversion
-        let item = ResponseContentItem::InputFile {
-            file_id: "file-123".to_string(),
-            detail: None,
-        };
-        let result = item.try_into_input();
-        assert!(result.is_some());
-        assert!(matches!(
-            result.unwrap(),
-            ResponseContentPart::InputFile { .. }
-        ));
-
-        // Test InputImage conversion
-        let item = ResponseContentItem::InputImage {
-            image_url: ResponseImageUrl::String("https://example.com/image.jpg".to_string()),
-            detail: Some("high".to_string()),
-        };
-        let result = item.try_into_input();
-        assert!(result.is_some());
-        assert!(matches!(
-            result.unwrap(),
-            ResponseContentPart::InputImage { .. }
-        ));
-
-        // Test OutputText conversion (should convert to InputText)
-        let item = ResponseContentItem::OutputText {
-            text: "Response text".to_string(),
-            annotations: vec![],
-        };
-        let result = item.try_into_input();
-        assert!(result.is_some());
-        assert!(matches!(
-            result.unwrap(),
-            ResponseContentPart::InputText { .. }
-        ));
-
-        // Test OutputText with legacy file reference
-        let item = ResponseContentItem::OutputText {
-            text: "[File: file-32af7670-f5b9-47a0-a952-20d5d3831e67]".to_string(),
-            annotations: vec![],
-        };
-        let result = item.try_into_input();
-        assert!(result.is_some());
-        if let Some(ResponseContentPart::InputFile { file_id, .. }) = result {
-            assert_eq!(file_id, "file-32af7670-f5b9-47a0-a952-20d5d3831e67");
-        } else {
-            panic!("Expected InputFile for legacy file reference");
-        }
-
-        // Test ToolCalls conversion (should return None)
-        let item = ResponseContentItem::ToolCalls { tool_calls: vec![] };
-        let result = item.try_into_input();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_response_content_item_try_into_output() {
-        // Test OutputText conversion
-        let item = ResponseContentItem::OutputText {
-            text: "Response".to_string(),
-            annotations: vec![],
-        };
-        let result = item.try_into_output();
-        assert!(result.is_some());
-        assert!(matches!(
-            result.unwrap(),
-            ResponseOutputContent::OutputText { .. }
-        ));
-
-        // Test ToolCalls conversion
-        let item = ResponseContentItem::ToolCalls { tool_calls: vec![] };
-        let result = item.try_into_output();
-        assert!(result.is_some());
-        assert!(matches!(
-            result.unwrap(),
-            ResponseOutputContent::ToolCalls { .. }
-        ));
-
-        // Test InputText conversion (should return None)
-        let item = ResponseContentItem::InputText {
-            text: "User input".to_string(),
-        };
-        let result = item.try_into_output();
-        assert!(result.is_none());
-
-        // Test InputFile conversion (should return None)
-        let item = ResponseContentItem::InputFile {
-            file_id: "file-123".to_string(),
-            detail: None,
-        };
-        let result = item.try_into_output();
-        assert!(result.is_none());
-
-        // Test InputImage conversion (should return None)
-        let item = ResponseContentItem::InputImage {
-            image_url: ResponseImageUrl::String("https://example.com/image.jpg".to_string()),
-            detail: None,
-        };
-        let result = item.try_into_output();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_response_content_item_is_input_is_output() {
-        // Test is_input
-        let item = ResponseContentItem::InputText {
-            text: "Hello".to_string(),
-        };
-        assert!(item.is_input());
-        assert!(!item.is_output());
-
-        // Test is_output
-        let item = ResponseContentItem::OutputText {
-            text: "Response".to_string(),
-            annotations: vec![],
-        };
-        assert!(!item.is_input());
-        assert!(item.is_output());
     }
 }

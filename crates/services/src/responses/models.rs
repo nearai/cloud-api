@@ -571,6 +571,27 @@ impl ResponseContentItem {
     }
 }
 
+/// Output content from assistant (output-only variants).
+///
+/// This type is used for type-safe operations on assistant outputs only.
+/// It cannot contain input variants, providing compile-time safety.
+/// Used in streaming events and response output items.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type")]
+pub enum ResponseOutputContent {
+    #[serde(rename = "output_text")]
+    OutputText {
+        text: String,
+        annotations: Vec<TextAnnotation>,
+        #[serde(default)]
+        logprobs: Vec<serde_json::Value>,
+    },
+    #[serde(rename = "tool_calls")]
+    ToolCalls {
+        tool_calls: Vec<ResponseOutputToolCall>,
+    },
+}
+
 /// Response deletion result
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResponseDeleteResult {
@@ -601,7 +622,7 @@ pub struct ResponseStreamEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub item_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub part: Option<ResponseContentItem>,
+    pub part: Option<ResponseOutputContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

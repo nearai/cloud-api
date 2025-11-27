@@ -232,7 +232,7 @@ impl EventEmitter {
         &mut self,
         ctx: &mut ResponseStreamContext,
         item_id: String,
-        part: models::ResponseContentItem,
+        part: models::ResponseOutputContent,
     ) -> Result<(), errors::ResponseError> {
         let event = models::ResponseStreamEvent {
             event_type: "response.content_part.added".to_string(),
@@ -259,7 +259,7 @@ impl EventEmitter {
         &mut self,
         ctx: &mut ResponseStreamContext,
         item_id: String,
-        part: models::ResponseContentItem,
+        part: models::ResponseOutputContent,
     ) -> Result<(), errors::ResponseError> {
         let event = models::ResponseStreamEvent {
             event_type: "response.content_part.done".to_string(),

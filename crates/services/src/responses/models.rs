@@ -339,7 +339,7 @@ pub enum ResponseOutputItem {
         created_at: i64,
         status: ResponseItemStatus,
         role: String,
-        content: Vec<ResponseOutputContent>,
+        content: Vec<ResponseContentItem>,
         model: String,
     },
     #[serde(rename = "tool_call")]
@@ -467,10 +467,30 @@ pub enum TextAnnotation {
     },
 }
 
-/// Output content part
+/// Unified content item that can represent both user inputs and assistant outputs
+/// This replaces ResponseOutputContent and correctly represents semantic types
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
-pub enum ResponseOutputContent {
+pub enum ResponseContentItem {
+    // ===== INPUT VARIANTS (from user) =====
+    #[serde(rename = "input_text")]
+    InputText { text: String },
+
+    #[serde(rename = "input_image")]
+    InputImage {
+        image_url: ResponseImageUrl,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
+    #[serde(rename = "input_file")]
+    InputFile {
+        file_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
+    // ===== OUTPUT VARIANTS (from assistant) =====
     #[serde(rename = "output_text")]
     OutputText {
         text: String,
@@ -478,6 +498,7 @@ pub enum ResponseOutputContent {
         #[serde(default)]
         logprobs: Vec<serde_json::Value>,
     },
+
     #[serde(rename = "tool_calls")]
     ToolCalls {
         tool_calls: Vec<ResponseOutputToolCall>,
@@ -517,6 +538,39 @@ pub enum ResponseToolChoiceOutput {
     },
 }
 
+// ============================================
+// ResponseContentItem Implementations
+// ============================================
+
+impl ResponseContentItem {
+    /// Check if this content item is an input (from user)
+    pub fn is_input(&self) -> bool {
+        matches!(
+            self,
+            ResponseContentItem::InputText { .. }
+                | ResponseContentItem::InputImage { .. }
+                | ResponseContentItem::InputFile { .. }
+        )
+    }
+
+    /// Check if this content item is an output (from assistant)
+    pub fn is_output(&self) -> bool {
+        matches!(
+            self,
+            ResponseContentItem::OutputText { .. } | ResponseContentItem::ToolCalls { .. }
+        )
+    }
+
+    /// Get text content if available
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            ResponseContentItem::InputText { text } => Some(text),
+            ResponseContentItem::OutputText { text, .. } => Some(text),
+            _ => None,
+        }
+    }
+}
+
 /// Response deletion result
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResponseDeleteResult {
@@ -547,7 +601,7 @@ pub struct ResponseStreamEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub item_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub part: Option<ResponseOutputContent>,
+    pub part: Option<ResponseContentItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

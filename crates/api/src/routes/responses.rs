@@ -22,6 +22,34 @@ use std::sync::Arc;
 use tracing::debug;
 use uuid::Uuid;
 
+// Helper function to convert service ResponseContentItem to API ResponseContentPart (input-only)
+fn convert_to_input_part(
+    item: services::responses::models::ResponseContentItem,
+) -> Option<crate::models::ResponseContentPart> {
+    match item {
+        ResponseContentItem::InputText { text } => {
+            Some(crate::models::ResponseContentPart::InputText { text })
+        }
+        ResponseContentItem::InputImage { image_url, detail } => {
+            Some(crate::models::ResponseContentPart::InputImage { image_url, detail })
+        }
+        ResponseContentItem::InputFile { file_id, detail } => {
+            Some(crate::models::ResponseContentPart::InputFile { file_id, detail })
+        }
+        ResponseContentItem::OutputText { text, .. } => {
+            // Backward compatibility: check for legacy file reference
+            match crate::routes::common::parse_legacy_file_reference(&text) {
+                Ok(Some(file_id)) => Some(crate::models::ResponseContentPart::InputFile {
+                    file_id,
+                    detail: None,
+                }),
+                Ok(None) | Err(_) => Some(crate::models::ResponseContentPart::InputText { text }),
+            }
+        }
+        ResponseContentItem::ToolCalls { .. } => None,
+    }
+}
+
 // Helper functions for error mapping
 fn map_response_error_to_status(error: &ServiceResponseError) -> StatusCode {
     match error {
@@ -341,7 +369,7 @@ pub async fn create_response(
                                             for (cidx, content_part) in
                                                 msg_content.iter().enumerate()
                                             {
-                                                if let ResponseOutputContent::OutputText {
+                                                if let ResponseContentItem::OutputText {
                                                     text,
                                                     ..
                                                 } = content_part
@@ -415,7 +443,7 @@ pub async fn create_response(
                             created_at: chrono::Utc::now().timestamp(),
                             status: ResponseItemStatus::Completed,
                             role: "assistant".to_string(),
-                            content: vec![ResponseOutputContent::OutputText {
+                            content: vec![ResponseContentItem::OutputText {
                                 text: trimmed_content,
                                 annotations: vec![],
                                 logprobs: vec![],
@@ -670,31 +698,11 @@ pub async fn list_input_items(
     for item in items {
         if let ResponseOutputItem::Message { role, content, .. } = item {
             if role == "user" {
-                // Convert content parts to API format
-                let api_content = content
+                // Convert service ResponseContentItem to API ResponseContentPart (input-only)
+                // This provides type safety - only input variants can exist here
+                let api_content: Vec<crate::models::ResponseContentPart> = content
                     .into_iter()
-                    .map(|part| match part {
-                        ResponseOutputContent::OutputText { text, .. } => {
-                            // Check if this is a file reference: [File: file-{uuid}]
-                            if let Some(file_id) = text
-                                .strip_prefix("[File: ")
-                                .and_then(|s| s.strip_suffix("]"))
-                            {
-                                crate::models::ResponseContentPart::InputFile {
-                                    file_id: file_id.to_string(),
-                                    detail: None,
-                                }
-                            } else {
-                                crate::models::ResponseContentPart::InputText { text }
-                            }
-                        }
-                        ResponseOutputContent::ToolCalls { .. } => {
-                            // Tool calls shouldn't appear in user messages, but handle gracefully
-                            crate::models::ResponseContentPart::InputText {
-                                text: "[Tool calls]".to_string(),
-                            }
-                        }
-                    })
+                    .filter_map(convert_to_input_part)
                     .collect();
 
                 input_items.push(crate::models::ResponseInputItem {

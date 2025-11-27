@@ -1,6 +1,7 @@
 use crate::models::ErrorResponse;
 use axum::{http::StatusCode, response::Json as ResponseJson};
 use services::completions::CompletionError;
+use uuid::Uuid;
 
 /// Map domain errors to HTTP status codes
 pub fn map_domain_error_to_status(error: &CompletionError) -> StatusCode {
@@ -56,4 +57,108 @@ pub fn validate_limit_offset(
 
 pub fn default_limit() -> i64 {
     100
+}
+
+/// Validates and parses a file ID reference from legacy text format.
+///
+/// Legacy format: "[File: file-{uuid}]" or "[File: {uuid}]"
+///
+/// Returns:
+/// - Ok(Some(file_id)) if valid file reference with proper UUID format
+/// - Ok(None) if text doesn't match the file reference pattern
+/// - Err(msg) if pattern matches but UUID validation fails
+///
+/// This allows the caller to distinguish between:
+/// - Regular text that should be treated as-is (Ok(None))
+/// - Malformed file references that might indicate data issues (Err)
+pub fn parse_legacy_file_reference(text: &str) -> Result<Option<String>, String> {
+    // Check if text matches the legacy file reference pattern
+    let file_id = match text
+        .strip_prefix("[File: ")
+        .and_then(|s| s.strip_suffix("]"))
+    {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+
+    // Extract UUID string (with or without "file-" prefix for backward compatibility)
+    let uuid_str = file_id.strip_prefix("file-").unwrap_or(file_id);
+
+    // Validate UUID format - if invalid, return error
+    Uuid::parse_str(uuid_str).map_err(|_| format!("Invalid UUID in file reference: {uuid_str}"))?;
+
+    // Return the full file ID (preserving original format with or without prefix)
+    Ok(Some(file_id.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_legacy_file_reference_valid_with_prefix() {
+        let result =
+            parse_legacy_file_reference("[File: file-32af7670-f5b9-47a0-a952-20d5d3831e67]");
+        assert_eq!(
+            result.unwrap(),
+            Some("file-32af7670-f5b9-47a0-a952-20d5d3831e67".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_legacy_file_reference_valid_no_prefix() {
+        // Backward compatibility: accept UUID without "file-" prefix
+        let result = parse_legacy_file_reference("[File: 32af7670-f5b9-47a0-a952-20d5d3831e67]");
+        assert_eq!(
+            result.unwrap(),
+            Some("32af7670-f5b9-47a0-a952-20d5d3831e67".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_legacy_file_reference_invalid_uuid() {
+        // Invalid UUID should return Err
+        let result = parse_legacy_file_reference("[File: file-invalid]");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid UUID"));
+    }
+
+    #[test]
+    fn test_parse_legacy_file_reference_not_file() {
+        let result = parse_legacy_file_reference("Just some text");
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn test_parse_legacy_file_reference_looks_like_file() {
+        // Doesn't match exact pattern (missing space or brackets)
+        let result = parse_legacy_file_reference(
+            "Discussion about [file-32af7670f5b947a0a95220d5d3831e67] in text",
+        );
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn test_parse_legacy_file_reference_missing_brackets() {
+        let result = parse_legacy_file_reference("file-32af7670-f5b9-47a0-a952-20d5d3831e67");
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn test_parse_legacy_file_reference_malformed_uuid() {
+        // UUID without hyphens is actually accepted by Uuid::parse_str (simple format)
+        let result = parse_legacy_file_reference("[File: 32af7670f5b947a0a95220d5d3831e67]");
+        assert_eq!(
+            result.unwrap(),
+            Some("32af7670f5b947a0a95220d5d3831e67".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_legacy_file_reference_truly_invalid_uuid() {
+        // Truly invalid UUID should fail
+        let result = parse_legacy_file_reference("[File: not-a-uuid-at-all]");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid UUID"));
+    }
 }

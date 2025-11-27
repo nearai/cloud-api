@@ -335,6 +335,7 @@ pub async fn init_domain_services(
         Some(web_search_provider), // web_search_provider
         None,                      // file_search_provider
         files_service.clone(),     // file_service
+        organization_service.clone(),
     ));
 
     DomainServices {

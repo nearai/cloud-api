@@ -1,5 +1,6 @@
 use crate::models::{
     CreateOrganizationRequest, ErrorResponse, ListOrganizationsResponse, OrganizationResponse,
+    OrganizationSettings, OrganizationSettingsResponse, PatchOrganizationSettingsRequest,
     UpdateOrganizationRequest,
 };
 use crate::{middleware::AuthenticatedUser, routes::api::AppState};
@@ -12,7 +13,6 @@ use services::organization::{OrganizationError, OrganizationId};
 use tracing::{debug, error};
 use utoipa;
 use utoipa::ToSchema;
-use uuid::Uuid;
 
 /// List organizations
 ///
@@ -265,11 +265,13 @@ pub async fn create_organization(
 pub async fn get_organization(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
-    Path(org_id): Path<Uuid>,
+    Path(organization_id): Path<OrganizationId>,
 ) -> Result<Json<OrganizationResponse>, (StatusCode, Json<ErrorResponse>)> {
-    debug!("Getting organization: {} by user: {}", org_id, user.0.id);
+    debug!(
+        "Getting organization: {} by user: {}",
+        organization_id.0, user.0.id
+    );
 
-    let organization_id = OrganizationId(org_id);
     let user_id = crate::conversions::authenticated_user_to_user_id(user);
 
     // Check if user is a member or can access the organization
@@ -335,6 +337,108 @@ pub async fn get_organization(
     }
 }
 
+/// Get organization settings
+///
+/// Retrieve organization settings including system prompt and other configuration.
+#[utoipa::path(
+    get,
+    path = "/v1/organizations/{org_id}/settings",
+    tag = "Organizations",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID")
+    ),
+    responses(
+        (status = 200, description = "Organization settings", body = OrganizationSettingsResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_organization_settings(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(organization_id): Path<OrganizationId>,
+) -> Result<Json<OrganizationSettingsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    debug!(
+        "Getting organization settings: {} by user: {}",
+        organization_id.0, user.0.id
+    );
+
+    let user_id = crate::conversions::authenticated_user_to_user_id(user);
+
+    let system_prompt = app_state
+        .organization_service
+        .get_system_prompt(organization_id, user_id)
+        .await
+        .map_err(crate::routes::common::map_organization_error)?;
+
+    Ok(Json(OrganizationSettingsResponse {
+        settings: OrganizationSettings { system_prompt },
+    }))
+}
+
+/// Patch organization settings
+///
+/// Update organization settings. Supports three states per field:
+/// - Omit field: no change
+/// - Set to null: delete/clear the field
+/// - Set to value: update the field
+#[utoipa::path(
+    patch,
+    path = "/v1/organizations/{org_id}/settings",
+    tag = "Organizations",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID")
+    ),
+    request_body = PatchOrganizationSettingsRequest,
+    responses(
+        (status = 200, description = "Settings updated", body = OrganizationSettingsResponse),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn patch_organization_settings(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(organization_id): Path<OrganizationId>,
+    Json(request): Json<PatchOrganizationSettingsRequest>,
+) -> Result<Json<OrganizationSettingsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    debug!(
+        "Patching organization settings: {} by user: {}",
+        organization_id.0, user.0.id
+    );
+
+    let user_id = crate::conversions::authenticated_user_to_user_id(user);
+
+    // Handle system_prompt based on request state
+    let system_prompt = match request.system_prompt {
+        // Field not provided in request - get current value (read-only check)
+        None => app_state
+            .organization_service
+            .get_system_prompt(organization_id, user_id)
+            .await
+            .map_err(crate::routes::common::map_organization_error)?,
+
+        // Field provided (either null to delete or value to set)
+        Some(new_value) => app_state
+            .organization_service
+            .update_system_prompt(organization_id, user_id, new_value)
+            .await
+            .map_err(crate::routes::common::map_organization_error)?,
+    };
+
+    Ok(Json(OrganizationSettingsResponse {
+        settings: OrganizationSettings { system_prompt },
+    }))
+}
+
 /// Update organization
 ///
 /// Updates organization details for a specific organization ID.
@@ -361,12 +465,14 @@ pub async fn get_organization(
 pub async fn update_organization(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
-    Path(org_id): Path<Uuid>,
+    Path(organization_id): Path<OrganizationId>,
     Json(request): Json<UpdateOrganizationRequest>,
 ) -> Result<Json<OrganizationResponse>, (StatusCode, Json<ErrorResponse>)> {
-    debug!("Updating organization: {} by user: {}", org_id, user.0.id);
+    debug!(
+        "Updating organization: {} by user: {}",
+        organization_id.0, user.0.id
+    );
 
-    let organization_id = OrganizationId(org_id);
     let user_id = crate::conversions::authenticated_user_to_user_id(user);
 
     match app_state
@@ -436,27 +542,29 @@ pub async fn update_organization(
 pub async fn delete_organization(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
-    Path(org_id): Path<Uuid>,
+    Path(organization_id): Path<OrganizationId>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    debug!("Deleting organization: {} by user: {}", org_id, user.0.id);
+    debug!(
+        "Deleting organization: {} by user: {}",
+        organization_id.0, user.0.id
+    );
 
-    let organization_id = OrganizationId(org_id);
     let user_id = crate::conversions::authenticated_user_to_user_id(user);
 
     match app_state
         .organization_service
-        .delete_organization(organization_id, user_id)
+        .delete_organization(organization_id.clone(), user_id)
         .await
     {
         Ok(true) => {
-            debug!("Organization {} deleted successfully", org_id);
+            debug!("Organization {} deleted successfully", organization_id.0);
             Ok(Json(serde_json::json!({
-                "id": org_id.to_string(),
+                "id": organization_id.0.to_string(),
                 "deleted": true
             })))
         }
         Ok(false) | Err(OrganizationError::NotFound) => {
-            error!("Organization not found {}", org_id);
+            error!("Organization not found {}", organization_id.0);
             Err((
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse::new(

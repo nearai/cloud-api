@@ -64,8 +64,8 @@ impl OrganizationUsageRepository {
                     id, organization_id, workspace_id, api_key_id, response_id,
                     model_id, model_name, input_tokens, output_tokens, total_tokens,
                     input_cost, output_cost, total_cost,
-                    request_type, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                    request_type, created_at, ttft_ms, avg_itl_ms
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
                 RETURNING *
                 "#,
                 &[
@@ -84,6 +84,8 @@ impl OrganizationUsageRepository {
                     &request.total_cost,
                     &request.request_type,
                     &now,
+                    &request.ttft_ms,
+                    &request.avg_itl_ms,
                 ],
             )
             .await
@@ -197,7 +199,7 @@ impl OrganizationUsageRepository {
                     id, organization_id, workspace_id, api_key_id, response_id,
                     model_id, model_name, input_tokens, output_tokens, total_tokens,
                     input_cost, output_cost, total_cost,
-                    request_type, created_at
+                    request_type, created_at, ttft_ms, avg_itl_ms
                 FROM organization_usage_log
                 WHERE organization_id = $1
                 ORDER BY created_at DESC
@@ -257,7 +259,7 @@ impl OrganizationUsageRepository {
                     id, organization_id, workspace_id, api_key_id, response_id,
                     model_id, model_name, input_tokens, output_tokens, total_tokens,
                     input_cost, output_cost, total_cost,
-                    request_type, created_at
+                    request_type, created_at, ttft_ms, avg_itl_ms
                 FROM organization_usage_log
                 WHERE api_key_id = $1
                 ORDER BY created_at DESC
@@ -325,6 +327,8 @@ impl OrganizationUsageRepository {
             total_cost: row.get("total_cost"),
             request_type: row.get("request_type"),
             created_at: row.get("created_at"),
+            ttft_ms: row.get("ttft_ms"),
+            avg_itl_ms: row.get("avg_itl_ms"),
         }
     }
 

@@ -2,6 +2,7 @@
 mod common;
 
 use common::*;
+use services::id_prefixes::PREFIX_FILE;
 
 /// Helper function to upload a file
 async fn upload_file(
@@ -74,7 +75,7 @@ async fn test_upload_file_success() {
 
     assert_eq!(response.status_code(), 201);
     let file: api::models::FileUploadResponse = response.json();
-    assert!(file.id.starts_with("file-"));
+    assert!(file.id.starts_with(PREFIX_FILE));
     assert_eq!(file.object, "file");
     assert_eq!(file.bytes, content.len() as i64);
     assert_eq!(file.filename, "test.txt");
@@ -736,15 +737,15 @@ async fn test_file_id_formats() {
     assert_eq!(upload_response.status_code(), 201);
     let uploaded_file: api::models::FileUploadResponse = upload_response.json();
 
-    // Test with "file-" prefix
+    // Test with file prefix
     let response = server
         .get(&format!("/v1/files/{}", uploaded_file.id))
         .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
     assert_eq!(response.status_code(), 200);
 
-    // Test without "file-" prefix (strip prefix from ID)
-    let id_without_prefix = uploaded_file.id.strip_prefix("file-").unwrap();
+    // Test without file prefix (strip prefix from ID)
+    let id_without_prefix = uploaded_file.id.strip_prefix(PREFIX_FILE).unwrap();
     let response = server
         .get(&format!("/v1/files/{id_without_prefix}"))
         .add_header("Authorization", format!("Bearer {api_key}"))

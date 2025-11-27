@@ -8,6 +8,7 @@ use indexmap::IndexSet;
 use serde::Deserialize;
 use services::{
     conversations::{errors::ConversationError, models::ConversationId},
+    id_prefixes::PREFIX_CONV,
     responses::models::TextAnnotation,
 };
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use uuid::Uuid;
 // Helper functions for ID conversion
 fn parse_conversation_id(id_str: &str) -> Result<ConversationId, ConversationError> {
     // Handle both prefixed (conv_*) and raw UUID formats
-    let uuid = if let Some(stripped) = id_str.strip_prefix("conv_") {
+    let uuid = if let Some(stripped) = id_str.strip_prefix(PREFIX_CONV) {
         Uuid::parse_str(stripped)
     } else {
         Uuid::parse_str(id_str)

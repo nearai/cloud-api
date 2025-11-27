@@ -80,6 +80,11 @@ pub fn test_config() -> ApiConfig {
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string()
             }),
         },
+        otlp: config::OtlpConfig {
+            endpoint: std::env::var("TELEMETRY_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://localhost:4317".to_string()),
+            protocol: std::env::var("TELEMETRY_OTLP_PROTOCOL").unwrap_or("grpc".to_string()),
+        },
     }
 }
 
@@ -164,10 +169,12 @@ pub async fn setup_test_server() -> axum_test::TestServer {
     assert_mock_user_in_db(&database).await;
 
     let auth_components = init_auth_services(database.clone(), &config);
+    let metrics_service = Arc::new(services::metrics::MockMetricsService);
     let domain_services = init_domain_services(
         database.clone(),
         &config,
         auth_components.organization_service.clone(),
+        metrics_service,
     )
     .await;
 

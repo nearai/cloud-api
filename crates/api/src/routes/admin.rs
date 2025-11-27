@@ -8,15 +8,15 @@ use crate::models::{
     UpdateOrganizationLimitsResponse,
 };
 use axum::{
-    extract::{Json, Path, State},
+    extract::{Json, Path, Query, State},
     http::HeaderMap,
     http::StatusCode,
     response::Json as ResponseJson,
     Extension,
 };
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use config::ApiConfig;
-use services::admin::{AdminService, UpdateModelAdminRequest};
+use services::admin::{AdminService, AnalyticsService, UpdateModelAdminRequest};
 use services::auth::AuthServiceTrait;
 use std::sync::Arc;
 use tracing::{debug, error};
@@ -24,6 +24,7 @@ use tracing::{debug, error};
 #[derive(Clone)]
 pub struct AdminAppState {
     pub admin_service: Arc<dyn AdminService + Send + Sync>,
+    pub analytics_service: Arc<AnalyticsService>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub config: Arc<ApiConfig>,
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
@@ -952,4 +953,109 @@ pub struct OrgLimitsHistoryQueryParams {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct MetricsQueryParams {
+    /// Start of time range (ISO 8601 format). Defaults to 30 days ago.
+    pub start: Option<String>,
+    /// End of time range (ISO 8601 format). Defaults to now.
+    pub end: Option<String>,
+}
+
+/// Get organization metrics for enterprise dashboards (Admin only)
+///
+/// Returns comprehensive usage metrics for an organization including:
+/// - Summary totals (requests, tokens, cost)
+/// - Breakdown by workspace
+/// - Breakdown by API key
+/// - Breakdown by model
+///
+/// This endpoint uses database queries instead of metrics services to provide
+/// high-cardinality data (per-org, per-workspace, per-key) without the cost
+/// of storing all combinations in Datadog/OTLP.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations/{org_id}/metrics",
+    tag = "Admin",
+    params(
+        ("org_id" = String, Path, description = "Organization ID to get metrics for"),
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now.")
+    ),
+    responses(
+        (status = 200, description = "Organization metrics retrieved successfully"),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_organization_metrics(
+    State(app_state): State<AdminAppState>,
+    Path(org_id): Path<String>,
+    Query(params): Query<MetricsQueryParams>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<
+    ResponseJson<services::admin::OrganizationMetrics>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    debug!(
+        "Get organization metrics request for org_id: {}, start: {:?}, end: {:?}",
+        org_id, params.start, params.end
+    );
+
+    // Parse organization ID
+    let organization_id = uuid::Uuid::parse_str(&org_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Invalid organization ID format".to_string(),
+                "invalid_id".to_string(),
+            )),
+        )
+    })?;
+
+    // Parse time range with defaults
+    let end = params
+        .end
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now);
+
+    let start = params
+        .start
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|| end - Duration::days(30));
+
+    // Get metrics from analytics service
+    let metrics = app_state
+        .analytics_service
+        .get_organization_metrics(organization_id, start, end)
+        .await
+        .map_err(|e| {
+            error!("Failed to get organization metrics, error: {:?}", e);
+            match e {
+                services::admin::AdminError::OrganizationNotFound(msg) => (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        msg,
+                        "organization_not_found".to_string(),
+                    )),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        format!("Failed to retrieve metrics: {e}"),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+
+    Ok(ResponseJson(metrics))
 }

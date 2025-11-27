@@ -9,7 +9,7 @@ use axum::{
     response::{Json, Response},
     Extension,
 };
-use services::files::calculate_expires_at;
+use services::{files::calculate_expires_at, id_prefixes::PREFIX_FILE};
 use tracing::{debug, error};
 use uuid::Uuid;
 
@@ -239,7 +239,7 @@ pub async fn upload_file(
 
     // Build response with OpenAI-compatible format
     let response = FileUploadResponse {
-        id: format!("file-{}", file.id),
+        id: format!("{PREFIX_FILE}{}", file.id),
         object: "file".to_string(),
         bytes: file.bytes,
         created_at: file.created_at.timestamp(),
@@ -280,8 +280,8 @@ pub async fn list_files(
 
     // Parse query parameters
     let after = params.get("after").and_then(|s| {
-        // Remove "file-" prefix if present
-        let id_str = s.strip_prefix("file-").unwrap_or(s);
+        // Remove file prefix if present
+        let id_str = s.strip_prefix(PREFIX_FILE).unwrap_or(s);
         uuid::Uuid::parse_str(id_str).ok()
     });
 
@@ -343,7 +343,7 @@ pub async fn list_files(
     let data: Vec<crate::models::FileUploadResponse> = files_to_return
         .iter()
         .map(|file| crate::models::FileUploadResponse {
-            id: format!("file-{}", file.id),
+            id: format!("{PREFIX_FILE}{}", file.id),
             object: "file".to_string(),
             bytes: file.bytes,
             created_at: file.created_at.timestamp(),
@@ -392,8 +392,8 @@ pub async fn get_file(
         file_id, api_key.workspace_id.0
     );
 
-    // Parse file ID (remove "file-" prefix if present)
-    let id_str = file_id.strip_prefix("file-").unwrap_or(&file_id);
+    // Parse file ID (remove prefix if present)
+    let id_str = file_id.strip_prefix(PREFIX_FILE).unwrap_or(&file_id);
     let file_uuid = uuid::Uuid::parse_str(id_str).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
@@ -428,7 +428,7 @@ pub async fn get_file(
 
     // Build response
     let response = FileUploadResponse {
-        id: format!("file-{}", file.id),
+        id: format!("{PREFIX_FILE}{}", file.id),
         object: "file".to_string(),
         bytes: file.bytes,
         created_at: file.created_at.timestamp(),
@@ -465,8 +465,8 @@ pub async fn delete_file(
         file_id, api_key.workspace_id.0
     );
 
-    // Parse file ID (remove "file-" prefix if present)
-    let id_str = file_id.strip_prefix("file-").unwrap_or(&file_id);
+    // Parse file ID (remove prefix if present)
+    let id_str = file_id.strip_prefix(PREFIX_FILE).unwrap_or(&file_id);
     let file_uuid = uuid::Uuid::parse_str(id_str).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
@@ -513,7 +513,7 @@ pub async fn delete_file(
 
     // Build response
     let response = FileDeleteResponse {
-        id: format!("file-{file_uuid}"),
+        id: format!("{PREFIX_FILE}{file_uuid}"),
         object: "file".to_string(),
         deleted: true,
     };
@@ -546,8 +546,8 @@ pub async fn get_file_content(
         file_id, api_key.workspace_id.0
     );
 
-    // Parse file ID (remove "file-" prefix if present)
-    let id_str = file_id.strip_prefix("file-").unwrap_or(&file_id);
+    // Parse file ID (remove prefix if present)
+    let id_str = file_id.strip_prefix(PREFIX_FILE).unwrap_or(&file_id);
     let file_uuid = uuid::Uuid::parse_str(id_str).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,

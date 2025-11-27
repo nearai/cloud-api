@@ -170,9 +170,11 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
 }
 
 impl ResponseServiceImpl {
-    /// Parse file ID from string (handles "file-" prefix)
+    /// Parse file ID from string (handles prefix)
     fn parse_file_id(file_id: &str) -> Result<Uuid, errors::ResponseError> {
-        let id_str = file_id.strip_prefix("file-").unwrap_or(file_id);
+        let id_str = file_id
+            .strip_prefix(crate::id_prefixes::PREFIX_FILE)
+            .unwrap_or(file_id);
         Uuid::parse_str(id_str)
             .map_err(|e| errors::ResponseError::InvalidParams(format!("Invalid file ID: {e}")))
     }
@@ -181,11 +183,15 @@ impl ResponseServiceImpl {
     fn extract_response_uuid(
         response: &models::ResponseObject,
     ) -> Result<models::ResponseId, errors::ResponseError> {
-        let response_uuid =
-            uuid::Uuid::parse_str(response.id.strip_prefix("resp_").unwrap_or(&response.id))
-                .map_err(|e| {
-                    errors::ResponseError::InternalError(format!("Invalid response ID format: {e}"))
-                })?;
+        let response_uuid = uuid::Uuid::parse_str(
+            response
+                .id
+                .strip_prefix(crate::id_prefixes::PREFIX_RESP)
+                .unwrap_or(&response.id),
+        )
+        .map_err(|e| {
+            errors::ResponseError::InternalError(format!("Invalid response ID format: {e}"))
+        })?;
 
         Ok(models::ResponseId(response_uuid))
     }
@@ -629,7 +635,9 @@ impl ResponseServiceImpl {
         // Extract conversation_id from the created response (may have been inherited from previous_response_id)
         let conversation_id = initial_response.conversation.as_ref().and_then(|conv_ref| {
             let id = &conv_ref.id;
-            let uuid_str = id.strip_prefix("conv_").unwrap_or(id);
+            let uuid_str = id
+                .strip_prefix(crate::id_prefixes::PREFIX_CONV)
+                .unwrap_or(id);
             Uuid::parse_str(uuid_str).ok().map(ConversationId)
         });
 
@@ -820,7 +828,7 @@ impl ResponseServiceImpl {
                 extra.insert("tool_choice".to_string(), serde_json::to_value(tc).unwrap());
             }
 
-            // Create completion request
+            // Create completion request (names not included - tracked via database analytics)
             let completion_request = CompletionRequest {
                 model: process_context.request.model.clone(),
                 messages: messages.clone(),
@@ -1965,7 +1973,9 @@ DO NOT USE THESE FORMATS:
                     let conversation_id = match &context.request.conversation {
                         Some(models::ConversationReference::Id(id)) => {
                             // Parse conversation ID
-                            let uuid_str = id.strip_prefix("conv_").unwrap_or(id);
+                            let uuid_str = id
+                                .strip_prefix(crate::id_prefixes::PREFIX_CONV)
+                                .unwrap_or(id);
                             uuid::Uuid::parse_str(uuid_str).map_err(|e| {
                                 errors::ResponseError::InvalidParams(format!(
                                     "Invalid conversation ID: {e}"
@@ -1973,7 +1983,9 @@ DO NOT USE THESE FORMATS:
                             })?
                         }
                         Some(models::ConversationReference::Object { id, .. }) => {
-                            let uuid_str = id.strip_prefix("conv_").unwrap_or(id);
+                            let uuid_str = id
+                                .strip_prefix(crate::id_prefixes::PREFIX_CONV)
+                                .unwrap_or(id);
                             uuid::Uuid::parse_str(uuid_str).map_err(|e| {
                                 errors::ResponseError::InvalidParams(format!(
                                     "Invalid conversation ID: {e}"
@@ -2155,7 +2167,7 @@ DO NOT USE THESE FORMATS:
             Only respond with the title, nothing else.\n\nMessage: {truncated_message}"
         );
 
-        // Generate title using completion service
+        // Generate title using completion service (names not included - tracked via database)
         let completion_request = crate::completions::ports::CompletionRequest {
             model, // Use the same model as the user's request
             messages: vec![crate::completions::ports::CompletionMessage {

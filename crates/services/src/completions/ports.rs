@@ -51,7 +51,7 @@ pub struct CompletionRequest {
     pub stream: Option<bool>,
     pub n: Option<i64>,
     pub user_id: UserId,    // For provider user field
-    pub api_key_id: String, // For usage tracking
+    pub api_key_id: String, // For usage tracking (ID only, no name)
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
     pub metadata: Option<serde_json::Value>,

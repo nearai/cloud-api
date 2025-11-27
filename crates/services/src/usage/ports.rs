@@ -134,6 +134,10 @@ pub struct RecordUsageServiceRequest {
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub request_type: String, // 'chat_completion', 'text_completion', 'response'
+    /// Time to first token in milliseconds
+    pub ttft_ms: Option<i32>,
+    /// Average inter-token latency in milliseconds
+    pub avg_itl_ms: Option<f64>,
 }
 
 /// Request to record usage (database layer)
@@ -152,6 +156,10 @@ pub struct RecordUsageDbRequest {
     pub output_cost: i64,
     pub total_cost: i64,
     pub request_type: String,
+    /// Time to first token in milliseconds
+    pub ttft_ms: Option<i32>,
+    /// Average inter-token latency in milliseconds
+    pub avg_itl_ms: Option<f64>,
 }
 
 /// Model pricing information
@@ -221,6 +229,10 @@ pub struct UsageLogEntry {
     pub total_cost: i64,
     pub request_type: String,
     pub created_at: DateTime<Utc>,
+    /// Time to first token in milliseconds
+    pub ttft_ms: Option<i32>,
+    /// Average inter-token latency in milliseconds
+    pub avg_itl_ms: Option<f64>,
 }
 
 // ============================================

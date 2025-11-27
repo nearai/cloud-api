@@ -91,7 +91,7 @@ impl MetricsServiceTrait for OtlpMetricsService {
                     "Total HTTP requests by endpoint, method, and status"
                 }
                 consts::METRIC_REQUEST_ERRORS => "API request errors by error type",
-                consts::METRIC_COST_USD => "Total cost in micro-dollars (USD) by model",
+                consts::METRIC_COST_USD => "Total cost in nano-dollars (USD) by model",
                 _ => "Count",
             };
 

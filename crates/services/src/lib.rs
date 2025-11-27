@@ -5,6 +5,7 @@ pub mod common;
 pub mod completions;
 pub mod conversations;
 pub mod files;
+pub mod id_prefixes;
 pub mod inference_provider_pool;
 pub mod mcp;
 pub mod metrics;

@@ -107,11 +107,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             .map_err(|e| UsageError::InternalError(format!("Failed to record usage: {e}")))?;
 
         // Record cost metric (low-cardinality: model + environment only)
-        // Cost is in nano-dollars (scale 9), convert to micro-dollars for metric
-        // Using i64 count for micro-dollars to avoid floating point precision issues
-        // 1 nano-dollar = 0.001 micro-dollars, so divide by 1000
-        let cost_micro = total_cost / 1000; // Convert nano to micro-dollars
-        if cost_micro > 0 {
+        if total_cost > 0 {
             let environment = get_environment();
             let tags = [
                 format!("{}:{}", TAG_MODEL, model.model_name),
@@ -119,7 +115,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             ];
             let tags_str: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
             self.metrics_service
-                .record_count(METRIC_COST_USD, cost_micro, &tags_str);
+                .record_count(METRIC_COST_USD, total_cost, &tags_str);
         }
 
         Ok(())

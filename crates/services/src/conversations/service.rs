@@ -460,7 +460,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
         // Extract response_id from the created response
         let response_id_str = backfill_response
             .id
-            .strip_prefix("resp_")
+            .strip_prefix(crate::id_prefixes::PREFIX_RESP)
             .unwrap_or(&backfill_response.id);
         let response_uuid = Uuid::parse_str(response_id_str).map_err(|e| {
             errors::ConversationError::InternalError(format!("Failed to parse response ID: {e}"))

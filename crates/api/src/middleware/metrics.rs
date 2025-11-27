@@ -7,12 +7,15 @@
 //! Endpoints are normalized to replace UUIDs with `{id}` to reduce cardinality.
 
 use axum::{body::Body, extract::State, http::Request, middleware::Next, response::Response};
-use services::metrics::{
-    consts::{
-        get_environment, METRIC_HTTP_DURATION, METRIC_HTTP_REQUESTS, TAG_ENDPOINT, TAG_ENVIRONMENT,
-        TAG_METHOD, TAG_STATUS_CODE,
+use services::{
+    id_prefixes::ALL_PREFIXES,
+    metrics::{
+        consts::{
+            get_environment, METRIC_HTTP_DURATION, METRIC_HTTP_REQUESTS, TAG_ENDPOINT,
+            TAG_ENVIRONMENT, TAG_METHOD, TAG_STATUS_CODE,
+        },
+        MetricsServiceTrait,
     },
-    MetricsServiceTrait,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -95,19 +98,7 @@ fn is_uuid(s: &str) -> bool {
 
 /// Check if a string looks like a dynamic ID (e.g., chatcmpl-xxx, resp_xxx, sk-xxx)
 fn is_dynamic_id(s: &str) -> bool {
-    // Common prefixes for dynamic IDs
-    let prefixes = [
-        "chatcmpl-",
-        "resp_",
-        "file-",
-        "msg_",
-        "run_",
-        "thread_",
-        "asst_",
-        "conv_",
-        "sk-",
-    ];
-    prefixes.iter().any(|prefix| s.starts_with(prefix))
+    ALL_PREFIXES.iter().any(|prefix| s.starts_with(prefix))
 }
 
 #[cfg(test)]

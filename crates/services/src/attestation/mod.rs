@@ -467,8 +467,11 @@ impl ports::AttestationServiceTrait for AttestationService {
                 )
             })?;
 
-            let cpu_quote = client.get_quote(report_data).await.map_err(|_| {
-                tracing::error!("Failed to get cloud API attestation, are you running in a CVM?");
+            let cpu_quote = client.get_quote(report_data).await.map_err(|e| {
+                tracing::error!(
+                    "Failed to get cloud API attestation, are you running in a CVM?: {:?}",
+                    e
+                );
                 AttestationError::InternalError("failed to get cloud API attestation".to_string())
             })?;
             gateway_attestation = DstackCpuQuote::from_quote_and_nonce(

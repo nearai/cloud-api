@@ -105,24 +105,34 @@ impl AttestationService {
     /// Get the signing address (public key) as a hex string for the specified algorithm
     /// For ECDSA, returns Ethereum address (20 bytes = 40 hex chars)
     /// For ed25519, returns the public key bytes
-    pub fn get_signing_address(&self, algo: &str) -> Vec<u8> {
+    pub fn get_signing_address(&self, algo: &str) -> Result<Vec<u8>, AttestationError> {
         match algo.to_lowercase().as_str() {
-            "ed25519" => self.ed25519_verifying_key.as_bytes().to_vec(),
-            "ecdsa" => Self::ecdsa_public_key_to_ethereum_address(&self.ecdsa_verifying_key),
-            signing_algo => {
-                unreachable!("Unknown signing algorithm: {}", signing_algo)
-            }
+            "ed25519" => Ok(self.ed25519_verifying_key.as_bytes().to_vec()),
+            "ecdsa" => Ok(Self::ecdsa_public_key_to_ethereum_address(
+                &self.ecdsa_verifying_key,
+            )),
+            signing_algo => Err(AttestationError::InvalidParameter(format!(
+                "Unknown signing algorithm: {}",
+                signing_algo
+            ))),
         }
     }
 
     /// Get the signing address hex for the specified algorithm
-    pub fn get_signing_address_hex(&self, algo: &str) -> String {
+    pub fn get_signing_address_hex(&self, algo: &str) -> Result<String, AttestationError> {
         match algo.to_lowercase().as_str() {
-            "ecdsa" => format!("0x{}", hex::encode(self.get_signing_address(algo))),
-            "ed25519" => hex::encode(self.get_signing_address(algo)),
-            signing_algo => {
-                unreachable!("Unknown signing algorithm: {}", signing_algo)
+            "ecdsa" => {
+                let addr = self.get_signing_address(algo)?;
+                Ok(format!("0x{}", hex::encode(addr)))
             }
+            "ed25519" => {
+                let addr = self.get_signing_address(algo)?;
+                Ok(hex::encode(addr))
+            }
+            signing_algo => Err(AttestationError::InvalidParameter(format!(
+                "Unknown signing algorithm: {}",
+                signing_algo
+            ))),
         }
     }
 }
@@ -234,7 +244,7 @@ impl ports::AttestationServiceTrait for AttestationService {
                 "ed25519" => {
                     let signature_bytes = self.ed25519_signing_key.sign(signature_text.as_bytes());
                     let sig_hex = hex::encode(signature_bytes.to_bytes());
-                    let addr = self.get_signing_address_hex("ed25519");
+                    let addr = self.get_signing_address_hex("ed25519")?;
                     Ok((sig_hex, addr))
                 }
                 "ecdsa" => {
@@ -277,12 +287,13 @@ impl ports::AttestationServiceTrait for AttestationService {
                     signature_bytes.push(ethereum_v);
                     let sig_hex = hex::encode(signature_bytes);
 
-                    let addr = self.get_signing_address_hex("ecdsa");
+                    let addr = self.get_signing_address_hex("ecdsa")?;
                     Ok((format!("0x{sig_hex}"), addr))
                 }
-                _ => {
-                    unreachable!("Unknown signing algorithm: {}", algo)
-                }
+                _ => Err(AttestationError::InvalidParameter(format!(
+                    "Unknown signing algorithm: {}",
+                    algo
+                ))),
             }?;
 
             let signature = ChatSignature {
@@ -408,7 +419,7 @@ impl ports::AttestationServiceTrait for AttestationService {
 
         // Get signing address (public key) for report_data
         // Store in owned String to avoid lifetime issues
-        let signing_address_to_use = self.get_signing_address_hex(&algo);
+        let signing_address_to_use = self.get_signing_address_hex(&algo)?;
 
         // Parse signing address from hex (remove 0x prefix if present)
         let signing_address_clean = signing_address_to_use

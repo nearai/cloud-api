@@ -460,8 +460,7 @@ impl ports::AttestationServiceTrait for AttestationService {
 
             let info = client.info().await.map_err(|e| {
                 tracing::error!(
-                    "Failed to get cloud API attestation info, are you running in a CVM?: {:?}",
-                    e
+                    "Failed to get cloud API attestation info, are you running in a CVM?: {e:?}"
                 );
                 AttestationError::InternalError(
                     "failed to get cloud API attestation info".to_string(),

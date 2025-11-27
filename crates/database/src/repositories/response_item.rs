@@ -88,8 +88,12 @@ impl PgResponseItemsRepository {
         let item_created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
         let created_at_timestamp = item_created_at.timestamp();
 
-        // Get model from joined responses table
-        let model: String = row.try_get("model")?;
+        let model = if !item.model().is_empty() {
+            item.model().to_string()
+        } else {
+            // Get model from joined responses table
+            row.try_get("model")?
+        };
 
         // Enrich the item with response metadata
         match &mut item {

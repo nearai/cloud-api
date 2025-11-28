@@ -31,6 +31,13 @@ pub trait AttestationServiceTrait: Send + Sync {
         nonce: Option<String>,
         signing_address: Option<String>,
     ) -> Result<AttestationReport, AttestationError>;
+
+    /// Verify a VPC shared secret signature
+    async fn verify_vpc_signature(
+        &self,
+        timestamp: i64,
+        signature: String,
+    ) -> Result<bool, AttestationError>;
 }
 
 #[async_trait]

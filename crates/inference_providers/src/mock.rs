@@ -393,12 +393,16 @@ impl crate::InferenceProvider for MockProvider {
         Ok(Box::pin(stream))
     }
 
-    async fn get_signature(&self, chat_id: &str) -> Result<ChatSignature, CompletionError> {
+    async fn get_signature(
+        &self,
+        chat_id: &str,
+        signing_algo: Option<String>,
+    ) -> Result<ChatSignature, CompletionError> {
         Ok(ChatSignature {
             text: format!("mock-signature-text-{chat_id}"),
             signature: format!("mock-signature-{chat_id}"),
             signing_address: "mock-address".to_string(),
-            signing_algo: "ecdsa".to_string(),
+            signing_algo: signing_algo.unwrap_or_else(|| "ecdsa".to_string()),
         })
     }
 

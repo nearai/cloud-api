@@ -444,7 +444,6 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             })),
             safety_identifier: None,
             prompt_cache_key: None,
-            signing_algo: None,
         };
 
         let backfill_response = self

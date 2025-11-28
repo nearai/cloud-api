@@ -63,8 +63,17 @@ impl VLlmProvider {
 
 #[async_trait]
 impl InferenceProvider for VLlmProvider {
-    async fn get_signature(&self, chat_id: &str) -> Result<ChatSignature, CompletionError> {
-        let url = format!("{}/v1/signature/{}", self.config.base_url, chat_id);
+    async fn get_signature(
+        &self,
+        chat_id: &str,
+        signing_algo: Option<String>,
+    ) -> Result<ChatSignature, CompletionError> {
+        let url = format!(
+            "{}/v1/signature/{}?signing_algo={}",
+            self.config.base_url,
+            chat_id,
+            signing_algo.unwrap_or_else(|| "ecdsa".to_string())
+        );
         let headers = self
             .build_headers()
             .map_err(CompletionError::CompletionError)?;

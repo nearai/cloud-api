@@ -4,6 +4,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use utoipa::ToSchema;
 
+// Re-export ResponseImageUrl from services to avoid duplication
+pub use services::responses::models::ResponseImageUrl;
+
 // Streaming response models
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StreamChunkResponse {
@@ -411,7 +414,15 @@ pub enum ResponseContent {
     Parts(Vec<ResponseContentPart>),
 }
 
-/// Content part (text, image, etc.)
+/// Content part from user inputs (input-only variants).
+///
+/// This type is used for type-safe operations on user inputs only.
+/// It cannot contain output variants, providing compile-time safety.
+///
+/// Used in:
+/// - ResponseContent::Parts (for input listing)
+/// - list_input_items endpoint
+/// - Input validation operations
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
 pub enum ResponseContentPart {
@@ -429,13 +440,6 @@ pub enum ResponseContentPart {
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum ResponseImageUrl {
-    String(String),
-    Object { url: String },
 }
 
 /// Conversation reference
@@ -615,7 +619,11 @@ pub enum ResponseItemStatus {
     Cancelled,
 }
 
-/// Output content part
+/// Output content from assistant (output-only variants).
+///
+/// This type is used for type-safe operations on assistant outputs only.
+/// It cannot contain input variants, providing compile-time safety.
+/// Used in streaming events and response output items in the API layer.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
 pub enum ResponseOutputContent {
@@ -781,6 +789,12 @@ pub enum ConversationContentPart {
     #[serde(rename = "input_image")]
     InputImage {
         image_url: ResponseImageUrl,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    #[serde(rename = "input_file")]
+    InputFile {
+        file_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },

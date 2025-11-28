@@ -464,7 +464,7 @@ impl ResponseServiceImpl {
             created_at: ctx.created_at,
             status: models::ResponseItemStatus::Completed,
             role: "assistant".to_string(),
-            content: vec![models::ResponseOutputContent::OutputText {
+            content: vec![models::ResponseContentItem::OutputText {
                 text: clean_text,
                 annotations,
                 logprobs: vec![],
@@ -1117,10 +1117,8 @@ impl ResponseServiceImpl {
                     created_at: 0,
                     status: models::ResponseItemStatus::Completed,
                     role: "user".to_string(),
-                    content: vec![models::ResponseOutputContent::OutputText {
+                    content: vec![models::ResponseContentItem::InputText {
                         text: trimmed_text.to_string(),
-                        annotations: vec![],
-                        logprobs: vec![],
                     }],
                     model: model.to_string(),
                 };
@@ -1145,35 +1143,38 @@ impl ResponseServiceImpl {
                     let content = match &input_item.content {
                         models::ResponseContent::Text(text) => {
                             // Trim leading and trailing whitespace
-                            vec![models::ResponseOutputContent::OutputText {
+                            vec![models::ResponseContentItem::InputText {
                                 text: text.trim().to_string(),
-                                annotations: vec![],
-                                logprobs: vec![],
                             }]
                         }
                         models::ResponseContent::Parts(parts) => {
-                            // Convert parts to output content
+                            // Convert parts to ResponseContentItem - preserving semantic types
                             parts
                                 .iter()
-                                .filter_map(|part| match part {
+                                .map(|part| match part {
                                     models::ResponseContentPart::InputText { text } => {
                                         // Trim leading and trailing whitespace
-                                        Some(models::ResponseOutputContent::OutputText {
+                                        models::ResponseContentItem::InputText {
                                             text: text.trim().to_string(),
-                                            annotations: vec![],
-                                            logprobs: vec![],
-                                        })
+                                        }
                                     }
-                                    models::ResponseContentPart::InputFile { file_id, .. } => {
-                                        // Store a reference to the file in the output
-                                        Some(models::ResponseOutputContent::OutputText {
-                                            text: format!("[File: {file_id}]"),
-                                            annotations: vec![],
-                                            logprobs: vec![],
-                                        })
+                                    models::ResponseContentPart::InputFile { file_id, detail } => {
+                                        // Store as InputFile to preserve semantic type
+                                        models::ResponseContentItem::InputFile {
+                                            file_id: file_id.clone(),
+                                            detail: detail.clone(),
+                                        }
                                     }
-                                    // TODO: Handle other content types (images, etc.)
-                                    _ => None,
+                                    models::ResponseContentPart::InputImage {
+                                        image_url,
+                                        detail,
+                                    } => {
+                                        // Store as InputImage to preserve semantic type
+                                        models::ResponseContentItem::InputImage {
+                                            image_url: image_url.clone(),
+                                            detail: detail.clone(),
+                                        }
+                                    }
                                 })
                                 .collect()
                         }
@@ -1332,7 +1333,8 @@ impl ResponseServiceImpl {
                     let text = content
                         .iter()
                         .filter_map(|part| match part {
-                            models::ResponseOutputContent::OutputText { text, .. } => {
+                            models::ResponseContentItem::InputText { text } => Some(text.clone()),
+                            models::ResponseContentItem::OutputText { text, .. } => {
                                 Some(text.clone())
                             }
                             _ => None,

@@ -6,10 +6,7 @@ use axum::{
 };
 use indexmap::IndexSet;
 use serde::Deserialize;
-use services::{
-    conversations::{errors::ConversationError, models::ConversationId},
-    responses::models::TextAnnotation,
-};
+use services::conversations::{errors::ConversationError, models::ConversationId};
 use std::sync::Arc;
 use tracing::debug;
 use uuid::Uuid;
@@ -1033,42 +1030,44 @@ fn convert_input_item_to_response_item(
             model,
             ..
         } => {
-            // Convert ConversationContent to ResponseOutputContent
+            // Convert ConversationContent to ResponseContentItem
             let response_content = match content {
                 ConversationContent::Text(text) => {
                     vec![
-                        services::responses::models::ResponseOutputContent::OutputText {
+                        services::responses::models::ResponseContentItem::InputText {
                             text: text.trim().to_string(),
-                            annotations: vec![],
-                            logprobs: vec![],
                         },
                     ]
                 }
-                ConversationContent::Parts(parts) => {
-                    parts
-                        .into_iter()
-                        .filter_map(|part| match part {
-                            ConversationContentPart::InputText { text } => Some(
-                                services::responses::models::ResponseOutputContent::OutputText {
-                                    text: text.trim().to_string(),
-                                    annotations: vec![],
-                                    logprobs: vec![],
-                                },
-                            ),
-                            ConversationContentPart::InputImage { .. } => {
-                                // TODO: Handle image content
-                                None
+                ConversationContent::Parts(parts) => parts
+                    .into_iter()
+                    .map(|part| match part {
+                        ConversationContentPart::InputText { text } => {
+                            services::responses::models::ResponseContentItem::InputText {
+                                text: text.trim().to_string(),
                             }
-                            ConversationContentPart::OutputText { text, .. } => Some(
-                                services::responses::models::ResponseOutputContent::OutputText {
-                                    text: text.trim().to_string(),
-                                    annotations: vec![],
-                                    logprobs: vec![],
-                                },
-                            ),
-                        })
-                        .collect()
-                }
+                        }
+                        ConversationContentPart::InputImage { image_url, detail } => {
+                            services::responses::models::ResponseContentItem::InputImage {
+                                image_url,
+                                detail,
+                            }
+                        }
+                        ConversationContentPart::InputFile { file_id, detail } => {
+                            services::responses::models::ResponseContentItem::InputFile {
+                                file_id,
+                                detail,
+                            }
+                        }
+                        ConversationContentPart::OutputText { text, annotations } => {
+                            services::responses::models::ResponseContentItem::OutputText {
+                                text: text.trim().to_string(),
+                                annotations: convert_annotations_to_service(annotations),
+                                logprobs: vec![],
+                            }
+                        }
+                    })
+                    .collect(),
             };
 
             if response_content.is_empty() {
@@ -1107,20 +1106,40 @@ fn convert_output_item_to_conversation_item(
             content,
             model,
         } => {
-            // Convert ResponseOutputContent to ConversationContentPart
-            // For user messages, use input_text; for assistant/system, use output_text
+            // Convert ResponseContentItem to ConversationContentPart
+            // For user messages, preserve input types; for assistant/system, use output_text
             let is_user_message = role == "user";
             let conv_content: Vec<ConversationContentPart> = content
                 .into_iter()
                 .filter_map(|c| match c {
-                    services::responses::models::ResponseOutputContent::OutputText {
+                    services::responses::models::ResponseContentItem::InputText { text } => {
+                        Some(ConversationContentPart::InputText { text })
+                    }
+                    services::responses::models::ResponseContentItem::InputImage {
+                        image_url,
+                        detail,
+                    } => Some(ConversationContentPart::InputImage { image_url, detail }),
+                    services::responses::models::ResponseContentItem::InputFile {
+                        file_id,
+                        detail,
+                    } => Some(ConversationContentPart::InputFile { file_id, detail }),
+                    services::responses::models::ResponseContentItem::OutputText {
                         text,
                         annotations,
                         logprobs: _,
                     } => {
                         if is_user_message {
-                            // User messages should use input_text format
-                            Some(ConversationContentPart::InputText { text })
+                            // For backward compatibility: check if this is a file reference
+                            match crate::routes::common::parse_legacy_file_reference(&text) {
+                                Ok(Some(file_id)) => Some(ConversationContentPart::InputFile {
+                                    file_id,
+                                    detail: None,
+                                }),
+                                Ok(None) | Err(_) => {
+                                    // Either not a file reference, or malformed - treat as text
+                                    Some(ConversationContentPart::InputText { text })
+                                }
+                            }
                         } else {
                             // Assistant/system messages use output_text format
                             Some(ConversationContentPart::OutputText {
@@ -1128,14 +1147,13 @@ fn convert_output_item_to_conversation_item(
                                 annotations: Some(
                                     annotations
                                         .into_iter()
-                                        .map(convert_text_annotation)
                                         .map(|a| serde_json::to_value(a).unwrap())
                                         .collect(),
                                 ),
                             })
                         }
                     }
-                    _ => None,
+                    services::responses::models::ResponseContentItem::ToolCalls { .. } => None,
                 })
                 .collect();
 
@@ -1223,22 +1241,14 @@ fn convert_output_item_to_conversation_item(
     }
 }
 
-fn convert_text_annotation(
-    annotation: services::responses::models::TextAnnotation,
-) -> TextAnnotation {
-    match annotation {
-        services::responses::models::TextAnnotation::UrlCitation {
-            start_index,
-            end_index,
-            title,
-            url,
-        } => TextAnnotation::UrlCitation {
-            start_index,
-            end_index,
-            title,
-            url,
-        },
-    }
+fn convert_annotations_to_service(
+    annotations: Option<Vec<serde_json::Value>>,
+) -> Vec<services::responses::models::TextAnnotation> {
+    annotations
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect()
 }
 
 fn convert_response_item_status(

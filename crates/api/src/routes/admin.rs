@@ -146,6 +146,7 @@ pub async fn batch_upsert_models(
                 model_display_name: updated_model.model_display_name,
                 model_description: updated_model.model_description,
                 model_icon: updated_model.model_icon,
+                owned_by: updated_model.owned_by,
                 aliases: updated_model.aliases,
             },
         })

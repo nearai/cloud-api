@@ -1511,6 +1511,8 @@ pub struct ModelMetadata {
     pub model_description: String,
     #[serde(rename = "modelIcon", skip_serializing_if = "Option::is_none")]
     pub model_icon: Option<String>,
+    #[serde(rename = "ownedBy")]
+    pub owned_by: String,
 
     #[serde(rename = "aliases", skip_serializing_if = "Vec::is_empty", default)]
     pub aliases: Vec<String>,

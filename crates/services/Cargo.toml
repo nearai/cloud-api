@@ -47,6 +47,9 @@ aws-config = { version = "1.5", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.70"
 # Encryption for file storage
 aes-gcm = "0.10"
+# HMAC for VPC signature verification
+hmac = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio-test = "0.4"

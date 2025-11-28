@@ -1,7 +1,9 @@
-use crate::models::AdminAccessToken;
 use crate::pool::DbPool;
+use crate::retry_db;
+use crate::{models::AdminAccessToken, repositories::utils::map_db_error};
 use anyhow::{Context, Result};
 use chrono::Utc;
+use services::common::RepositoryError;
 use sha2::{Digest, Sha256};
 use tracing::debug;
 use uuid::Uuid;
@@ -36,40 +38,43 @@ impl AdminAccessTokenRepository {
         expires_at: chrono::DateTime<Utc>,
         user_agent: Option<String>,
     ) -> Result<(AdminAccessToken, String)> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
         let id = Uuid::new_v4();
         let admin_access_token = Self::generate_admin_access_token();
         let token_hash = Self::hash_admin_access_token(&admin_access_token);
-        let now = Utc::now();
 
-        let row = client
-            .query_one(
-                r#"
+        let row = retry_db!("create_new_admin_access", {
+            let now = Utc::now();
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_one(
+                    r#"
                 INSERT INTO admin_access_token (
                     id, token_hash, created_by_user_id, name, creation_reason,
                     created_at, expires_at, is_active, user_agent
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 RETURNING *
                 "#,
-                &[
-                    &id,
-                    &token_hash,
-                    &created_by_user_id,
-                    &name,
-                    &creation_reason,
-                    &now,
-                    &expires_at,
-                    &true,
-                    &user_agent,
-                ],
-            )
-            .await
-            .context("Failed to create admin access token")?;
+                    &[
+                        &id,
+                        &token_hash,
+                        &created_by_user_id,
+                        &name,
+                        &creation_reason,
+                        &now,
+                        &expires_at,
+                        &true,
+                        &user_agent,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         let admin_token = AdminAccessToken {
             id: row.get("id"),
@@ -101,31 +106,42 @@ impl AdminAccessTokenRepository {
         token: &str,
         user_agent: Option<&str>,
     ) -> Result<Option<AdminAccessToken>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
         let token_hash = Self::hash_admin_access_token(token);
-        let now = Utc::now();
 
-        let row = client
-            .query_opt(
-                r#"
+        let row = retry_db!("validate_admin_access_token", {
+            let now = Utc::now();
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_opt(
+                    r#"
                 SELECT * FROM admin_access_token 
                 WHERE token_hash = $1 
                 AND is_active = true 
                 AND expires_at > $2
                 AND (user_agent = $3 OR user_agent IS NULL)
                 "#,
-                &[&token_hash, &now, &user_agent],
-            )
-            .await
-            .context("Failed to validate admin access token")?;
+                    &[&token_hash, &now, &user_agent],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         match row {
             Some(row) => {
+                let now = Utc::now();
+                let client = self
+                    .pool
+                    .get()
+                    .await
+                    .context("Failed to get database connection")
+                    .map_err(RepositoryError::PoolError)?;
+
                 // Update last_used_at
                 if client
                     .execute(
@@ -164,16 +180,19 @@ impl AdminAccessTokenRepository {
 
     /// Get admin access token by ID
     pub async fn get_by_id(&self, id: Uuid) -> Result<Option<AdminAccessToken>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("get_admin_access_by_id", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_opt("SELECT * FROM admin_access_token WHERE id = $1", &[&id])
-            .await
-            .context("Failed to get admin access token by ID")?;
+            client
+                .query_opt("SELECT * FROM admin_access_token WHERE id = $1", &[&id])
+                .await
+                .map_err(map_db_error)
+        })?;
 
         match row {
             Some(row) => {
@@ -200,19 +219,22 @@ impl AdminAccessTokenRepository {
 
     /// List admin access tokens with pagination
     pub async fn list(&self, limit: i64, offset: i64) -> Result<Vec<AdminAccessToken>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let rows = retry_db!("list_admin_access_tokens_with_pagination", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let rows = client
-            .query(
-                "SELECT * FROM admin_access_token ORDER BY created_at DESC LIMIT $1 OFFSET $2",
-                &[&limit, &offset],
-            )
-            .await
-            .context("Failed to list admin access tokens")?;
+            client
+                .query(
+                    "SELECT * FROM admin_access_token ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+                    &[&limit, &offset],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         let mut admin_tokens = Vec::new();
         for row in rows {
@@ -244,14 +266,16 @@ impl AdminAccessTokenRepository {
         revoked_by_user_id: Uuid,
         revocation_reason: String,
     ) -> Result<bool> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let result = retry_db!("revoke_admin_access", {
+            let now = Utc::now();
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let now = Utc::now();
-        let result = client
+            client
             .execute(
                 r#"
                 UPDATE admin_access_token 
@@ -261,43 +285,50 @@ impl AdminAccessTokenRepository {
                 &[&now, &revoked_by_user_id, &revocation_reason, &id],
             )
             .await
-            .context("Failed to revoke admin access token")?;
+            .map_err(map_db_error)
+        })?;
 
         Ok(result > 0)
     }
 
     /// Count total admin access tokens
     pub async fn count(&self) -> Result<i64> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("count_total_admin_access_tokens", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_one("SELECT COUNT(*) FROM admin_access_token", &[])
-            .await
-            .context("Failed to count admin access tokens")?;
+            client
+                .query_one("SELECT COUNT(*) FROM admin_access_token", &[])
+                .await
+                .map_err(map_db_error)
+        })?;
 
         Ok(row.get(0))
     }
 
     /// Clean up expired tokens
     pub async fn cleanup_expired(&self) -> Result<usize> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let result = retry_db!("clean_up_expired_tokens", {
+            let now = Utc::now();
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let now = Utc::now();
-        let result = client
+            client
             .execute(
                 "UPDATE admin_access_token SET is_active = false WHERE expires_at <= $1 AND is_active = true",
                 &[&now],
             )
             .await
-            .context("Failed to cleanup expired admin access tokens")?;
+            .map_err(map_db_error)
+        })?;
 
         Ok(result as usize)
     }

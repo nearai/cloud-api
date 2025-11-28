@@ -2,6 +2,7 @@ use crate::{
     models::{CreateWorkspaceRequest, UpdateWorkspaceRequest, Workspace},
     pool::DbPool,
     repositories::utils::map_db_error,
+    retry_db,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -27,19 +28,20 @@ impl WorkspaceRepository {
         organization_id: Uuid,
         created_by_user_id: Uuid,
     ) -> Result<Workspace, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")
-            .map_err(RepositoryError::PoolError)?;
-
         let id = Uuid::new_v4();
         let now = Utc::now();
 
-        let row = client
-            .query_one(
-                r#"
+        let row = retry_db!("create_workspace", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_one(
+                    r#"
                 INSERT INTO workspaces (
                     id, name, display_name, description, organization_id, 
                     created_by_user_id, created_at, updated_at, is_active
@@ -47,19 +49,20 @@ impl WorkspaceRepository {
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)
                 RETURNING *
                 "#,
-                &[
-                    &id,
-                    &request.name,
-                    &request.display_name,
-                    &request.description,
-                    &organization_id,
-                    &created_by_user_id,
-                    &now,
-                    &now,
-                ],
-            )
-            .await
-            .map_err(map_db_error)?;
+                    &[
+                        &id,
+                        &request.name,
+                        &request.display_name,
+                        &request.description,
+                        &organization_id,
+                        &created_by_user_id,
+                        &now,
+                        &now,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         debug!(
             "Created workspace: {} for org: {} by user: {}",
@@ -72,20 +75,22 @@ impl WorkspaceRepository {
 
     /// Get a workspace by ID
     pub async fn get_by_id(&self, id: Uuid) -> Result<Option<Workspace>, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")
-            .map_err(RepositoryError::PoolError)?;
+        let row = retry_db!("get_workspace_by_id", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_opt(
-                "SELECT * FROM workspaces WHERE id = $1 AND is_active = true",
-                &[&id],
-            )
-            .await
-            .map_err(map_db_error)?;
+            client
+                .query_opt(
+                    "SELECT * FROM workspaces WHERE id = $1 AND is_active = true",
+                    &[&id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         match row {
             Some(row) => Ok(Some(
@@ -102,20 +107,22 @@ impl WorkspaceRepository {
         organization_id: Uuid,
         name: &str,
     ) -> Result<Option<Workspace>, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")
-            .map_err(RepositoryError::PoolError)?;
+        let row = retry_db!("get_workspace_by_name_within_organization", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
+            client
             .query_opt(
                 "SELECT * FROM workspaces WHERE organization_id = $1 AND name = $2 AND is_active = true",
                 &[&organization_id, &name],
             )
             .await
-            .map_err(map_db_error)?;
+            .map_err(map_db_error)
+        })?;
 
         match row {
             Some(row) => Ok(Some(
@@ -131,20 +138,22 @@ impl WorkspaceRepository {
         &self,
         organization_id: Uuid,
     ) -> Result<i64, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")
-            .map_err(RepositoryError::PoolError)?;
+        let row = retry_db!("count_workspaces_for_organization", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
+            client
             .query_one(
                 "SELECT COUNT(*) as count FROM workspaces WHERE organization_id = $1 AND is_active = true",
                 &[&organization_id],
             )
             .await
-            .map_err(map_db_error)?;
+            .map_err(map_db_error)
+        })?;
 
         Ok(row.get::<_, i64>("count"))
     }
@@ -154,20 +163,22 @@ impl WorkspaceRepository {
         &self,
         organization_id: Uuid,
     ) -> Result<Vec<Workspace>, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")
-            .map_err(RepositoryError::PoolError)?;
+        let rows = retry_db!("list_workspaces_for_organization", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let rows = client
+            client
             .query(
                 "SELECT * FROM workspaces WHERE organization_id = $1 AND is_active = true ORDER BY created_at ASC",
                 &[&organization_id],
             )
             .await
-            .map_err(map_db_error)?;
+            .map_err(map_db_error)
+        })?;
 
         rows.into_iter()
             .map(|row| {
@@ -198,20 +209,22 @@ impl WorkspaceRepository {
             WorkspaceOrderDirection::Desc => "DESC",
         };
 
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")
-            .map_err(RepositoryError::PoolError)?;
+        let rows = retry_db!("list_workspaces_for_organization_with_pagination", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let rows = client
+            client
             .query(
                 &format!("SELECT * FROM workspaces WHERE organization_id = $1 ORDER BY {order_by_column} {order_dir} LIMIT $2 OFFSET $3"),
                 &[&organization_id, &limit, &offset],
             )
             .await
-            .map_err(map_db_error)?;
+            .map_err(map_db_error)
+        })?;
 
         rows.into_iter()
             .map(|row| {
@@ -223,19 +236,22 @@ impl WorkspaceRepository {
 
     /// List workspaces created by a user
     pub async fn list_by_user(&self, user_id: Uuid) -> Result<Vec<Workspace>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let rows = retry_db!("list_wrokspaces_created_by_user", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let rows = client
+            client
             .query(
                 "SELECT * FROM workspaces WHERE created_by_user_id = $1 AND is_active = true ORDER BY created_at ASC",
                 &[&user_id],
             )
             .await
-            .context("Failed to list user's workspaces")?;
+            .map_err(map_db_error)
+        })?;
 
         rows.into_iter()
             .map(|row| self.row_to_workspace(row))
@@ -248,13 +264,6 @@ impl WorkspaceRepository {
         id: Uuid,
         request: UpdateWorkspaceRequest,
     ) -> Result<Option<Workspace>, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")
-            .map_err(RepositoryError::PoolError)?;
-
         // Build dynamic update query
         let mut query = String::from("UPDATE workspaces SET updated_at = NOW()");
         let mut param_index = 2; // Start from $2, $1 is the ID
@@ -279,10 +288,19 @@ impl WorkspaceRepository {
 
         query.push_str(" WHERE id = $1 AND is_active = true RETURNING *");
 
-        let row = client
-            .query_opt(&query, &params)
-            .await
-            .map_err(map_db_error)?;
+        let row = retry_db!("update_workspace", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_opt(&query, &params)
+                .await
+                .map_err(map_db_error)
+        })?;
 
         match row {
             Some(row) => Ok(Some(
@@ -295,20 +313,22 @@ impl WorkspaceRepository {
 
     /// Delete (deactivate) a workspace
     pub async fn delete(&self, id: Uuid) -> Result<bool, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")
-            .map_err(RepositoryError::PoolError)?;
+        let rows_affected = retry_db!("deactivate_workspace", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let rows_affected = client
-            .execute(
-                "UPDATE workspaces SET is_active = false, updated_at = NOW() WHERE id = $1",
-                &[&id],
-            )
-            .await
-            .map_err(map_db_error)?;
+            client
+                .execute(
+                    "UPDATE workspaces SET is_active = false, updated_at = NOW() WHERE id = $1",
+                    &[&id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         Ok(rows_affected > 0)
     }
@@ -335,16 +355,17 @@ impl WorkspaceRepository {
         &self,
         workspace_id: Uuid,
     ) -> Result<Option<(Workspace, crate::models::Organization)>, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")
-            .map_err(RepositoryError::PoolError)?;
+        let row = retry_db!("get_workspace_with_organization", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_opt(
-                r#"
+            client
+                .query_opt(
+                    r#"
                 SELECT 
                     w.*,
                     o.id as org_id, o.name as org_name, o.display_name as org_display_name,
@@ -355,10 +376,11 @@ impl WorkspaceRepository {
                 JOIN organizations o ON w.organization_id = o.id
                 WHERE w.id = $1 AND w.is_active = true AND o.is_active = true
                 "#,
-                &[&workspace_id],
-            )
-            .await
-            .map_err(map_db_error)?;
+                    &[&workspace_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         match row {
             Some(row) => {

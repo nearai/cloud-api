@@ -2,9 +2,9 @@ use crate::middleware::AdminUser;
 use crate::models::{
     AdminAccessTokenResponse, AdminUserOrganizationDetails, AdminUserResponse,
     BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, DecimalPrice,
-    DeleteAdminAccessTokenRequest, ErrorResponse, ListUsersResponse, ModelHistoryEntry,
-    ModelHistoryResponse, ModelMetadata, ModelWithPricing, OrgLimitsHistoryEntry,
-    OrgLimitsHistoryResponse, SpendLimit, UpdateOrganizationLimitsRequest,
+    DeleteAdminAccessTokenRequest, DeleteModelRequest, ErrorResponse, ListUsersResponse,
+    ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
+    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, SpendLimit, UpdateOrganizationLimitsRequest,
     UpdateOrganizationLimitsResponse,
 };
 use axum::{
@@ -50,7 +50,7 @@ pub struct AdminAppState {
 )]
 pub async fn batch_upsert_models(
     State(app_state): State<AdminAppState>,
-    Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    Extension(admin_user): Extension<AdminUser>, // Require admin auth
     ResponseJson(batch_request): ResponseJson<BatchUpdateModelApiRequest>,
 ) -> Result<ResponseJson<Vec<ModelWithPricing>>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
@@ -69,6 +69,10 @@ pub async fn batch_upsert_models(
         ));
     }
 
+    // Extract admin user context for audit tracking
+    let admin_user_id = admin_user.0.id;
+    let admin_user_email = admin_user.0.email.clone();
+
     // Convert API request to service request
     let models = batch_request
         .iter()
@@ -85,6 +89,9 @@ pub async fn batch_upsert_models(
                     verifiable: request.verifiable,
                     is_active: request.is_active,
                     aliases: request.aliases.clone(),
+                    change_reason: request.change_reason.clone(),
+                    changed_by_user_id: Some(admin_user_id),
+                    changed_by_user_email: Some(admin_user_email.clone()),
                 },
             )
         })
@@ -236,11 +243,16 @@ pub async fn get_model_history(
                 currency: "USD".to_string(),
             },
             context_length: h.context_length,
+            model_name: h.model_name,
             model_display_name: h.model_display_name,
             model_description: h.model_description,
+            model_icon: h.model_icon,
+            verifiable: h.verifiable,
+            is_active: h.is_active,
             effective_from: h.effective_from.to_rfc3339(),
             effective_until: h.effective_until.map(|dt| dt.to_rfc3339()),
-            changed_by: h.changed_by,
+            changed_by_user_id: h.changed_by_user_id.map(|id| id.to_string()),
+            changed_by_user_email: h.changed_by_user_email,
             change_reason: h.change_reason,
             created_at: h.created_at.to_rfc3339(),
         })
@@ -486,6 +498,7 @@ pub async fn get_organization_limits_history(
     params(
         ("model_name" = String, Path, description = "Model name to delete (URL-encode if it contains slashes)")
     ),
+    request_body = DeleteModelRequest,
     responses(
         (status = 204, description = "Model deleted successfully"),
         (status = 404, description = "Model not found", body = ErrorResponse),
@@ -499,13 +512,24 @@ pub async fn get_organization_limits_history(
 pub async fn delete_model(
     State(app_state): State<AdminAppState>,
     Path(model_name): Path<String>,
-    Extension(_admin_user): Extension<AdminUser>,
+    Extension(admin_user): Extension<AdminUser>,
+    request: Option<ResponseJson<DeleteModelRequest>>,
 ) -> Result<StatusCode, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!("Delete model request for: {}", model_name);
 
+    // Extract admin user context for audit tracking
+    let admin_user_id = admin_user.0.id;
+    let admin_user_email = admin_user.0.email.clone();
+    let change_reason = request.and_then(|ResponseJson(req)| req.change_reason);
+
     app_state
         .admin_service
-        .delete_model(&model_name)
+        .delete_model(
+            &model_name,
+            change_reason,
+            Some(admin_user_id),
+            Some(admin_user_email),
+        )
         .await
         .map_err(|e| {
             error!("Failed to delete model");

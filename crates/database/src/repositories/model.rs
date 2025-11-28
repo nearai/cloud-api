@@ -333,6 +333,8 @@ impl ModelRepository {
             (None, None, None)
         };
 
+        let owned_by = update_request.owned_by.as_ref().cloned();
+
         let row = retry_db!("upsert_model_pricing", {
             let client = self
                 .pool
@@ -379,13 +381,6 @@ impl ModelRepository {
                     .map_err(map_db_error)
             } else {
                 // Model doesn't exist - do INSERT with ON CONFLICT to handle race conditions
-                // Apply default owned_by only for new models (CREATE), not for updates
-                let owned_by = update_request
-                    .owned_by
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| services::admin::DEFAULT_MODEL_OWNED_BY.to_string());
-
                 // Use INSERT ... ON CONFLICT to handle race conditions where another
                 // transaction inserts the same model between our check and insert
                 client
@@ -406,7 +401,7 @@ impl ModelRepository {
                             context_length = EXCLUDED.context_length,
                             verifiable = EXCLUDED.verifiable,
                             is_active = EXCLUDED.is_active,
-                            owned_by = EXCLUDED.owned_by,
+                            owned_by = COALESCE(EXCLUDED.owned_by, models.owned_by),
                             updated_at = NOW()
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token,

@@ -9,3 +9,5 @@ ALTER TABLE chat_signatures ADD UNIQUE (chat_id, signing_algo);
 
 -- Add explicit composite index for query performance optimization
 CREATE INDEX IF NOT EXISTS idx_chat_signatures_chat_id_signing_algo ON chat_signatures(chat_id, signing_algo);
+-- Drop the old single-column index as it is now redundant
+DROP INDEX IF EXISTS idx_chat_signatures_chat_id;

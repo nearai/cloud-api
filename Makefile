@@ -1,4 +1,4 @@
-.PHONY: help seed api dev build test lint fmt check-fmt preflight clean
+.PHONY: help seed api dev build test test-unit test-integration lint fmt check-fmt preflight clean
 
 help:
 	@echo "NEAR AI Cloud API - Development Commands"
@@ -13,9 +13,11 @@ help:
 	@echo "  make api           Run the API server (port 3000)"
 	@echo ""
 	@echo "Code Quality:"
-	@echo "  make preflight     Run all checks before committing (lint, fmt, test, build)"
+	@echo "  make preflight     Run all checks before committing (lint, fmt, test-unit, build)"
 	@echo "  make build         Build all crates"
-	@echo "  make test          Run all unit tests"
+	@echo "  make test          Run both unit and integration tests"
+	@echo "  make test-unit     Run unit tests only"
+	@echo "  make test-integration Run integration tests only"
 	@echo "  make lint          Run clippy linter (strict mode)"
 	@echo "  make fmt           Format code with rustfmt"
 	@echo "  make check-fmt     Check formatting without fixing"
@@ -55,9 +57,17 @@ build:
 	@echo "Building all crates..."
 	cargo build
 
-test:
-	@echo "Running unit and integration tests..."
+test-unit:
+	@echo "Running unit tests..."
 	cargo test --lib --bins
+
+test-integration:
+	@echo "Running integration tests..."
+	cargo test --test e2e_test
+
+test: test-unit test-integration
+	@echo ""
+	@echo "✅ All tests completed successfully!"
 
 lint:
 	@echo "Running clippy linter (strict mode)..."
@@ -71,7 +81,7 @@ check-fmt:
 	@echo "Checking code formatting (without fixing)..."
 	cargo fmt --check
 
-preflight: lint fmt test build
+preflight: lint fmt test-unit build
 	@echo ""
 	@echo "✅ All preflight checks passed! Ready to commit."
 

@@ -9,9 +9,9 @@ pub mod repositories;
 pub use models::*;
 pub use pool::DbPool;
 pub use repositories::{
-    ApiKeyRepository, McpConnectorRepository, PgAttestationRepository, PgConversationRepository,
-    PgOrganizationInvitationRepository, PgOrganizationRepository, PgResponseItemsRepository,
-    PgResponseRepository, SessionRepository, UserRepository,
+    ApiKeyRepository, McpConnectorRepository, OAuthStateRepository, PgAttestationRepository,
+    PgConversationRepository, PgOrganizationInvitationRepository, PgOrganizationRepository,
+    PgResponseItemsRepository, PgResponseRepository, SessionRepository, UserRepository,
 };
 
 use anyhow::Result;

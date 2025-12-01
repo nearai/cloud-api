@@ -15,10 +15,7 @@ CREATE TABLE oauth_states (
 
     -- Timestamps
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at TIMESTAMPTZ NOT NULL,
-
-    -- Ensure provider is valid
-    CONSTRAINT oauth_states_valid_provider CHECK (provider IN ('github', 'google'))
+    expires_at TIMESTAMPTZ NOT NULL
 );
 
 -- Index for efficient expiration checks in queries

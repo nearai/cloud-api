@@ -96,6 +96,24 @@ impl OAuthStateRepository {
         }
     }
 
+    /// Clean up expired OAuth states
+    pub async fn cleanup_expired(&self) -> Result<usize> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+
+        let now = Utc::now();
+        let result = client
+            .execute("DELETE FROM oauth_states WHERE expires_at <= $1", &[&now])
+            .await
+            .context("Failed to cleanup expired OAuth states")?;
+
+        debug!("Cleaned up {} expired OAuth states", result);
+        Ok(result as usize)
+    }
+
     /// Helper method to convert database row to OAuthStateRow
     fn row_to_oauth_state(&self, row: &tokio_postgres::Row) -> OAuthStateRow {
         OAuthStateRow {

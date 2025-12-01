@@ -1,4 +1,4 @@
-.PHONY: help seed api dev build test lint fmt check-clippy check-fmt preflight clean
+.PHONY: help seed api dev build test lint fmt check-fmt preflight clean
 
 help:
 	@echo "NEAR AI Cloud API - Development Commands"
@@ -18,7 +18,6 @@ help:
 	@echo "  make test          Run all unit tests"
 	@echo "  make lint          Run clippy linter (strict mode)"
 	@echo "  make fmt           Format code with rustfmt"
-	@echo "  make check-clippy  Check clippy without fixing"
 	@echo "  make check-fmt     Check formatting without fixing"
 	@echo ""
 	@echo "Cleanup:"
@@ -67,10 +66,6 @@ lint:
 fmt:
 	@echo "Formatting code with rustfmt..."
 	cargo fmt
-
-check-clippy:
-	@echo "Checking clippy (without fixing)..."
-	cargo clippy --lib --bins -- -D warnings
 
 check-fmt:
 	@echo "Checking code formatting (without fixing)..."

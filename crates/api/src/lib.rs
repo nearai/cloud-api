@@ -40,8 +40,7 @@ use services::{
     auth::{AuthService, AuthServiceTrait, MockAuthService, OAuthManager},
     models::ModelsServiceTrait,
 };
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::RwLock;
+use std::sync::Arc;
 use utoipa::OpenApi;
 
 /// Service initialization components
@@ -157,10 +156,15 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
     let workspace_repository = Arc::new(WorkspaceRepository::new(database.pool().clone()))
         as Arc<dyn services::workspace::WorkspaceRepository>;
 
-    // Create OAuth manager
+    // Create OAuth manager and state repository
     tracing::info!("Setting up OAuth providers");
     let oauth_manager = create_oauth_manager(config);
-    let state_store: StateStore = Arc::new(RwLock::new(HashMap::new()));
+
+    // Create OAuth state repository for cross-instance OAuth state sharing
+    let oauth_state_repository = Arc::new(database::repositories::OAuthStateRepository::new(
+        database.pool().clone(),
+    ));
+    let state_store: StateStore = oauth_state_repository;
 
     // Create admin access token repository
     let admin_access_token_repository =
@@ -559,6 +563,8 @@ pub fn build_app_with_config(
     let invitation_routes =
         build_invitation_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
+    let auth_vpc_routes = build_auth_vpc_routes(app_state.clone());
+
     let files_routes =
         build_files_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
@@ -582,10 +588,21 @@ pub fn build_app_with_config(
                 .merge(model_routes)
                 .merge(admin_routes)
                 .merge(invitation_routes)
+                .merge(auth_vpc_routes)
                 .merge(files_routes)
                 .merge(health_routes),
         )
         .merge(openapi_routes)
+}
+
+/// Build VPC authentication routes
+pub fn build_auth_vpc_routes(app_state: AppState) -> Router {
+    use crate::routes::auth_vpc::vpc_login;
+    use axum::routing::post;
+
+    Router::new()
+        .route("/auth/vpc/login", post(vpc_login))
+        .with_state(app_state)
 }
 
 /// Build invitation routes with selective auth

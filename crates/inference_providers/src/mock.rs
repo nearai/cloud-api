@@ -447,25 +447,32 @@ impl crate::InferenceProvider for MockProvider {
         Ok(Box::pin(stream))
     }
 
-    async fn get_signature(&self, chat_id: &str) -> Result<ChatSignature, CompletionError> {
+    async fn get_signature(
+        &self,
+        chat_id: &str,
+        signing_algo: Option<String>,
+    ) -> Result<ChatSignature, CompletionError> {
+        let signing_algo = signing_algo.unwrap_or_else(|| "ecdsa".to_string());
+
         // Check if we have registered hashes for this chat_id
         let hashes = self.signature_hashes.read().await;
         if let Some(sig_hashes) = hashes.get(chat_id) {
             // Return signature in the correct format "request_hash:response_hash"
             let signature_text =
                 format!("{}:{}", sig_hashes.request_hash, sig_hashes.response_hash);
-            // Generate a deterministic mock signature based on the hashes
+            // Generate a deterministic mock signature based on the hashes and algorithm
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
             let mut hasher = DefaultHasher::new();
             signature_text.hash(&mut hasher);
+            signing_algo.hash(&mut hasher);
             let sig_hash = format!("{:x}", hasher.finish());
 
             Ok(ChatSignature {
                 text: signature_text,
                 signature: format!("0x{sig_hash}"),
                 signing_address: "mock-address".to_string(),
-                signing_algo: "ecdsa".to_string(),
+                signing_algo,
             })
         } else {
             // Fallback to old mock signature format if hashes not registered
@@ -473,7 +480,7 @@ impl crate::InferenceProvider for MockProvider {
                 text: format!("mock-signature-text-{chat_id}"),
                 signature: format!("mock-signature-{chat_id}"),
                 signing_address: "mock-address".to_string(),
-                signing_algo: "ecdsa".to_string(),
+                signing_algo,
             })
         }
     }

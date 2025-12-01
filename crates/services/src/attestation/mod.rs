@@ -23,6 +23,10 @@ use crate::{
     models::ModelsRepository,
 };
 
+use chrono;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
 pub mod ports;
 
 pub struct AttestationService {
@@ -30,6 +34,7 @@ pub struct AttestationService {
     pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub models_repository: Arc<dyn ModelsRepository>,
     pub vpc_info: Option<VpcInfo>,
+    pub vpc_shared_secret: Option<String>,
     ed25519_signing_key: Arc<SigningKey>,
     ed25519_verifying_key: Arc<VerifyingKey>,
     ecdsa_signing_key: Arc<EcdsaSigningKey>,
@@ -44,6 +49,15 @@ impl AttestationService {
     ) -> Self {
         // Load VPC info once during initialization
         let vpc_info = load_vpc_info();
+
+        // Load VPC shared secret from environment
+        let vpc_shared_secret = load_vpc_shared_secret();
+        if vpc_shared_secret.is_none() {
+            tracing::warn!(
+                "Cannot load VPC shared secret. VPC-based authentication will be disabled"
+            );
+        }
+
         let mut csprng = OsRng;
 
         // Generate ed25519 key pair on startup
@@ -54,7 +68,7 @@ impl AttestationService {
 
         let ed25519_address = hex::encode(ed25519_verifying_key.as_bytes());
         tracing::info!(
-            "Generated ed25519 key pair for response signing. Public key (signing address): 0x{}",
+            "Generated ed25519 key pair for response signing. Public key (signing address): {}",
             ed25519_address
         );
 
@@ -65,10 +79,10 @@ impl AttestationService {
         let ecdsa_verifying_key = Arc::new(ecdsa_verifying_key);
 
         // Convert ECDSA public key to Ethereum address (20 bytes = 40 hex chars)
-        let ecdsa_address = Self::ecdsa_public_key_to_ethereum_address(&ecdsa_verifying_key);
+        let ecdsa_address_raw = Self::ecdsa_public_key_to_ethereum_address(&ecdsa_verifying_key);
         tracing::info!(
             "Generated ECDSA (secp256k1) key pair for response signing. Ethereum address (signing address): 0x{}",
-            ecdsa_address
+            hex::encode(ecdsa_address_raw)
         );
 
         Self {
@@ -76,6 +90,7 @@ impl AttestationService {
             inference_provider_pool,
             models_repository,
             vpc_info,
+            vpc_shared_secret,
             ed25519_signing_key,
             ed25519_verifying_key,
             ecdsa_signing_key,
@@ -85,7 +100,7 @@ impl AttestationService {
 
     /// Convert ECDSA public key to Ethereum address (20 bytes)
     /// Ethereum address is derived by: Keccak256(uncompressed_public_key)[12..32]
-    fn ecdsa_public_key_to_ethereum_address(verifying_key: &EcdsaVerifyingKey) -> String {
+    fn ecdsa_public_key_to_ethereum_address(verifying_key: &EcdsaVerifyingKey) -> Vec<u8> {
         // Get uncompressed public key point (65 bytes: 0x04 + 32 bytes x + 32 bytes y)
         let encoded_point = verifying_key.to_encoded_point(false);
         let point_bytes = encoded_point.as_bytes();
@@ -99,36 +114,39 @@ impl AttestationService {
         // Ethereum address is the last 20 bytes (bytes 12..32)
         let address_bytes = &hash[12..32];
 
-        hex::encode(address_bytes)
+        address_bytes.to_vec()
     }
 
     /// Get the signing address (public key) as a hex string for the specified algorithm
     /// For ECDSA, returns Ethereum address (20 bytes = 40 hex chars)
     /// For ed25519, returns the public key bytes
-    pub fn get_signing_address(&self, algo: &str) -> String {
+    pub fn get_signing_address(&self, algo: &str) -> Result<Vec<u8>, AttestationError> {
         match algo.to_lowercase().as_str() {
-            "ed25519" => hex::encode(self.ed25519_verifying_key.as_bytes()),
-            "ecdsa" => Self::ecdsa_public_key_to_ethereum_address(&self.ecdsa_verifying_key),
-            _ => {
-                tracing::warn!("Unknown signing algorithm: {}, defaulting to ed25519", algo);
-                hex::encode(self.ed25519_verifying_key.as_bytes())
-            }
+            "ed25519" => Ok(self.ed25519_verifying_key.as_bytes().to_vec()),
+            "ecdsa" => Ok(Self::ecdsa_public_key_to_ethereum_address(
+                &self.ecdsa_verifying_key,
+            )),
+            signing_algo => Err(AttestationError::InvalidParameter(format!(
+                "Unknown signing algorithm: {signing_algo}"
+            ))),
         }
     }
 
-    /// Get the signing address with 0x prefix for the specified algorithm
-    pub fn get_signing_address_hex(&self, algo: &str) -> String {
-        format!("0x{}", self.get_signing_address(algo))
-    }
-
-    /// Get the default signing address (ed25519) for backward compatibility
-    pub fn get_default_signing_address(&self) -> String {
-        self.get_signing_address("ed25519")
-    }
-
-    /// Get the default signing address with 0x prefix (ed25519) for backward compatibility
-    pub fn get_default_signing_address_hex(&self) -> String {
-        self.get_signing_address_hex("ed25519")
+    /// Get the signing address hex for the specified algorithm
+    pub fn get_signing_address_hex(&self, algo: &str) -> Result<String, AttestationError> {
+        match algo.to_lowercase().as_str() {
+            "ecdsa" => {
+                let addr = self.get_signing_address(algo)?;
+                Ok(format!("0x{}", hex::encode(addr)))
+            }
+            "ed25519" => {
+                let addr = self.get_signing_address(algo)?;
+                Ok(hex::encode(addr))
+            }
+            signing_algo => Err(AttestationError::InvalidParameter(format!(
+                "Unknown signing algorithm: {signing_algo}"
+            ))),
+        }
     }
 }
 
@@ -159,10 +177,32 @@ pub fn load_vpc_info() -> Option<VpcInfo> {
     }
 }
 
+/// Load VPC shared secret from file
+pub fn load_vpc_shared_secret() -> Option<String> {
+    if let Ok(path) = std::env::var("VPC_SHARED_SECRET_FILE") {
+        std::fs::read_to_string(path)
+            .map_err(|_| tracing::warn!("Failed to read VPC shared secret file"))
+            .ok()
+            .map(|s| s.trim().to_string())
+    } else {
+        None
+    }
+}
+
 #[async_trait]
 impl ports::AttestationServiceTrait for AttestationService {
-    async fn get_chat_signature(&self, chat_id: &str) -> Result<ChatSignature, AttestationError> {
-        self.repository.get_chat_signature(chat_id).await
+    async fn get_chat_signature(
+        &self,
+        chat_id: &str,
+        signing_algo: Option<String>,
+    ) -> Result<ChatSignature, AttestationError> {
+        let signing_algo = signing_algo
+            .map(|s| s.to_lowercase())
+            .unwrap_or_else(|| "ecdsa".to_string());
+
+        self.repository
+            .get_chat_signature(chat_id, &signing_algo)
+            .await
     }
 
     async fn store_chat_signature_from_provider(
@@ -188,18 +228,58 @@ impl ports::AttestationServiceTrait for AttestationService {
             // Use the registered hashes to create signature in correct format
             let signature_text = format!("{request_hash}:{response_hash}");
 
-            // Generate a deterministic mock signature based on the hashes
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            signature_text.hash(&mut hasher);
-            let sig_hash = format!("{:x}", hasher.finish());
+            // Generate and store both ECDSA and ED25519 signatures for MockProvider
+            for algo in ["ecdsa", "ed25519"] {
+                // Generate a deterministic mock signature based on the hashes
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                signature_text.hash(&mut hasher);
+                algo.hash(&mut hasher);
+                let sig_hash = format!("{:x}", hasher.finish());
+
+                let signature = ChatSignature {
+                    text: signature_text.clone(),
+                    signature: format!("0x{sig_hash}"),
+                    signing_address: "mock-address".to_string(),
+                    signing_algo: algo.to_string(),
+                };
+
+                // Store in repository
+                self.repository
+                    .add_chat_signature(chat_id, signature)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(
+                            "Failed to store chat signature in repository for algorithm: {}",
+                            algo
+                        );
+                        AttestationError::RepositoryError(e.to_string())
+                    })?;
+            }
+
+            return Ok(());
+        }
+
+        // Fallback: Fetch and store both ECDSA and ED25519 signatures from provider
+        // (for non-MockProvider or if hashes not registered)
+        for algo in ["ecdsa", "ed25519"] {
+            let provider_signature = provider
+                .get_signature(chat_id, Some(algo.to_string()))
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        "Failed to get chat signature from provider for algorithm: {}",
+                        algo
+                    );
+                    AttestationError::ProviderError(e.to_string())
+                })?;
 
             let signature = ChatSignature {
-                text: signature_text,
-                signature: format!("0x{sig_hash}"),
-                signing_address: "mock-address".to_string(),
-                signing_algo: "ecdsa".to_string(),
+                text: provider_signature.text,
+                signature: provider_signature.signature,
+                signing_address: provider_signature.signing_address,
+                signing_algo: provider_signature.signing_algo,
             };
 
             // Store in repository
@@ -207,34 +287,13 @@ impl ports::AttestationServiceTrait for AttestationService {
                 .add_chat_signature(chat_id, signature)
                 .await
                 .map_err(|e| {
-                    tracing::error!("Failed to store chat signature in repository");
+                    tracing::error!(
+                        "Failed to store chat signature in repository for algorithm: {}",
+                        algo
+                    );
                     AttestationError::RepositoryError(e.to_string())
                 })?;
-
-            return Ok(());
         }
-
-        // Fallback: Fetch signature from provider (for non-MockProvider or if hashes not registered)
-        let provider_signature = provider.get_signature(chat_id).await.map_err(|e| {
-            tracing::error!("Failed to get chat signature from provider");
-            AttestationError::ProviderError(e.to_string())
-        })?;
-
-        let signature = ChatSignature {
-            text: provider_signature.text,
-            signature: provider_signature.signature,
-            signing_address: provider_signature.signing_address,
-            signing_algo: provider_signature.signing_algo,
-        };
-
-        // Store in repository
-        self.repository
-            .add_chat_signature(chat_id, signature)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to store chat signature in repository");
-                AttestationError::RepositoryError(e.to_string())
-            })?;
 
         Ok(())
     }
@@ -244,101 +303,92 @@ impl ports::AttestationServiceTrait for AttestationService {
         response_id: &str,
         request_hash: String,
         response_hash: String,
-        signing_algo: Option<String>,
     ) -> Result<(), AttestationError> {
         // Create signature text in format "request_hash:response_hash"
         let signature_text = format!("{request_hash}:{response_hash}");
 
-        // Determine signing algorithm (default to ed25519)
-        let algo = signing_algo
-            .as_ref()
-            .map(|s| s.to_lowercase())
-            .unwrap_or_else(|| "ed25519".to_string());
+        // Generate and store both ECDSA and ED25519 signatures
+        for algo in ["ecdsa", "ed25519"] {
+            let (signature_hex, signing_address) = match algo {
+                "ed25519" => {
+                    let signature_bytes = self.ed25519_signing_key.sign(signature_text.as_bytes());
+                    let sig_hex = hex::encode(signature_bytes.to_bytes());
+                    let addr = self.get_signing_address_hex("ed25519")?;
+                    Ok((sig_hex, addr))
+                }
+                "ecdsa" => {
+                    // Sign using ECDSA with recovery ID
+                    // Use Ethereum signed message format
+                    let message_bytes = signature_text.as_bytes();
+                    let prefix = format!("\x19Ethereum Signed Message:\n{}", message_bytes.len());
+                    let prefix_bytes = prefix.as_bytes();
 
-        let (signature_hex, signing_address) = match algo.as_str() {
-            "ed25519" => {
-                let signature_bytes = self.ed25519_signing_key.sign(signature_text.as_bytes());
-                let sig_hex = hex::encode(signature_bytes.to_bytes());
-                let addr = self.get_signing_address_hex("ed25519");
-                Ok((sig_hex, addr))
-            }
-            "ecdsa" => {
-                // Sign using ECDSA with recovery ID
-                // Use Ethereum signed message format
-                let message_bytes = signature_text.as_bytes();
-                let prefix = format!("\x19Ethereum Signed Message:\n{}", message_bytes.len());
-                let prefix_bytes = prefix.as_bytes();
+                    // Concatenate prefix + message
+                    let mut prefixed_message =
+                        Vec::with_capacity(prefix_bytes.len() + message_bytes.len());
+                    prefixed_message.extend_from_slice(prefix_bytes);
+                    prefixed_message.extend_from_slice(message_bytes);
 
-                // Concatenate prefix + message
-                let mut prefixed_message =
-                    Vec::with_capacity(prefix_bytes.len() + message_bytes.len());
-                prefixed_message.extend_from_slice(prefix_bytes);
-                prefixed_message.extend_from_slice(message_bytes);
+                    // Hash with Keccak256 (manually hash the prefixed message)
+                    let mut hasher = Keccak256::new();
+                    hasher.update(&prefixed_message);
+                    let message_hash = hasher.finalize();
 
-                // Hash with Keccak256 (manually hash the prefixed message)
-                let mut hasher = Keccak256::new();
-                hasher.update(&prefixed_message);
-                let message_hash = hasher.finalize();
+                    // Use sign_prehash_recoverable with the pre-hashed message
+                    let (signature, recid): (EcdsaSignature, RecoveryId) = self
+                        .ecdsa_signing_key
+                        .sign_prehash_recoverable(&message_hash)
+                        .map_err(|e| {
+                            tracing::error!("Failed to create recoverable ECDSA signature: {}", e);
+                            AttestationError::InternalError(format!(
+                                "Failed to create recoverable ECDSA signature: {e}"
+                            ))
+                        })?;
 
-                // Use sign_prehash_recoverable with the pre-hashed message
-                let (signature, recid): (EcdsaSignature, RecoveryId) = self
-                    .ecdsa_signing_key
-                    .sign_prehash_recoverable(&message_hash)
-                    .map_err(|e| {
-                        tracing::error!("Failed to create recoverable ECDSA signature: {}", e);
-                        AttestationError::InternalError(format!(
-                            "Failed to create recoverable ECDSA signature: {e}"
-                        ))
-                    })?;
+                    // Convert signature to bytes and append recovery ID
+                    // Convert k256 RecoveryId (0-3) to Ethereum v format (27-28)
+                    // Ethereum v = 27 + (recovery_id & 1) where bit 0 is the y-coordinate parity
+                    let recovery_byte = recid.to_byte();
+                    let ethereum_v = 27u8 + (recovery_byte & 1);
 
-                // Convert signature to bytes and append recovery ID
-                // Convert k256 RecoveryId (0-3) to Ethereum v format (27-28)
-                // Ethereum v = 27 + (recovery_id & 1) where bit 0 is the y-coordinate parity
-                let recovery_byte = recid.to_byte();
-                let ethereum_v = 27u8 + (recovery_byte & 1);
+                    // This creates a 65-byte signature (64 bytes r||s + 1 byte Ethereum v)
+                    let mut signature_bytes = signature.to_bytes().to_vec();
+                    signature_bytes.push(ethereum_v);
+                    let sig_hex = hex::encode(signature_bytes);
 
-                // This creates a 65-byte signature (64 bytes r||s + 1 byte Ethereum v)
-                let mut signature_bytes = signature.to_bytes().to_vec();
-                signature_bytes.push(ethereum_v);
-                let sig_hex = hex::encode(signature_bytes);
+                    let addr = self.get_signing_address_hex("ecdsa")?;
+                    Ok((format!("0x{sig_hex}"), addr))
+                }
+                _ => Err(AttestationError::InvalidParameter(format!(
+                    "Unknown signing algorithm: {algo}"
+                ))),
+            }?;
 
-                let addr = self.get_signing_address_hex("ecdsa");
-                Ok((sig_hex, addr))
-            }
-            _ => {
-                tracing::warn!("Unknown signing algorithm: {}, defaulting to ed25519", algo);
-                let signature_bytes = self.ed25519_signing_key.sign(signature_text.as_bytes());
-                let sig_hex = hex::encode(signature_bytes.to_bytes());
-                let addr = self.get_signing_address_hex("ed25519");
-                Ok((sig_hex, addr))
-            }
-        }?;
+            let signature = ChatSignature {
+                text: signature_text.clone(),
+                signature: signature_hex,
+                signing_address,
+                signing_algo: algo.to_string(),
+            };
 
-        let signing_address_clone = signing_address.clone();
-        let algo_clone = algo.clone();
+            // Store in repository using response_id as the key
+            self.repository
+                .add_chat_signature(response_id, signature)
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        "Failed to store response signature in repository for algorithm: {}",
+                        algo
+                    );
+                    AttestationError::RepositoryError(e.to_string())
+                })?;
 
-        let signature = ChatSignature {
-            text: signature_text.clone(),
-            signature: format!("0x{signature_hex}"),
-            signing_address,
-            signing_algo: algo,
-        };
-
-        // Store in repository using response_id as the key
-        self.repository
-            .add_chat_signature(response_id, signature)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to store response signature in repository");
-                AttestationError::RepositoryError(e.to_string())
-            })?;
-
-        tracing::info!(
-            "Stored response signature for response_id: {} with signing_address: {} using algorithm: {}",
-            response_id,
-            signing_address_clone,
-            algo_clone
-        );
+            tracing::info!(
+                "Stored response signature for response_id: {} with algorithm: {}",
+                response_id,
+                algo
+            );
+        }
 
         Ok(())
     }
@@ -437,7 +487,7 @@ impl ports::AttestationServiceTrait for AttestationService {
 
         // Get signing address (public key) for report_data
         // Store in owned String to avoid lifetime issues
-        let signing_address_to_use = self.get_signing_address_hex(&algo);
+        let signing_address_to_use = self.get_signing_address_hex(&algo)?;
 
         // Parse signing address from hex (remove 0x prefix if present)
         let signing_address_clean = signing_address_to_use
@@ -524,5 +574,49 @@ impl ports::AttestationServiceTrait for AttestationService {
             gateway_attestation,
             model_attestations,
         })
+    }
+
+    async fn verify_vpc_signature(
+        &self,
+        timestamp: i64,
+        signature: String,
+    ) -> Result<bool, AttestationError> {
+        let secret = self.vpc_shared_secret.as_ref().ok_or_else(|| {
+            AttestationError::InternalError("Failed to load VPC shared secret".to_string())
+        })?;
+
+        // Check timestamp freshness (within 30 seconds)
+        let now = chrono::Utc::now().timestamp();
+        let diff = (now - timestamp).abs();
+        if diff > 30 {
+            tracing::warn!(
+                "VPC signature timestamp expired: current={now}, provided={timestamp}, diff={diff}"
+            );
+            return Ok(false);
+        }
+
+        // Decode provided signature from hex
+        let provided_bytes = match hex::decode(&signature) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                tracing::warn!("Invalid hex in VPC signature");
+                return Ok(false);
+            }
+        };
+
+        // Verify signature: HMAC-SHA256(timestamp, secret)
+        let message = timestamp.to_string();
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+            .map_err(|e| AttestationError::InternalError(format!("Failed to create HMAC: {e}")))?;
+        mac.update(message.as_bytes());
+
+        // Constant-time comparison
+        match mac.verify_slice(&provided_bytes) {
+            Ok(_) => Ok(true),
+            Err(_) => {
+                tracing::warn!("VPC signature mismatch");
+                Ok(false)
+            }
+        }
     }
 }

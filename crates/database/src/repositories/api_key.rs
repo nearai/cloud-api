@@ -1,6 +1,7 @@
 use crate::models::ApiKey;
 use crate::pool::DbPool;
 use crate::repositories::utils::map_db_error;
+use crate::retry_db;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -43,22 +44,23 @@ impl ApiKeyRepository {
         &self,
         request: CreateApiKeyRequest,
     ) -> Result<(String, ApiKey), RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")
-            .map_err(RepositoryError::PoolError)?;
-
         let id = Uuid::new_v4();
         let key = Self::generate_api_key();
         let key_hash = Self::hash_api_key(&key);
         let key_prefix = Self::extract_key_prefix(&key);
-        let now = Utc::now();
 
-        let _row = client
-            .query_one(
-                r#"
+        let _row = retry_db!("create_api_key", {
+            let now = Utc::now();
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_one(
+                    r#"
                 INSERT INTO api_keys (
                     id, key_hash, key_prefix, name, workspace_id, created_by_user_id,
                     created_at, expires_at, last_used_at, is_active, deleted_at, spend_limit
@@ -66,20 +68,21 @@ impl ApiKeyRepository {
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true, NULL, $9)
                 RETURNING *
                 "#,
-                &[
-                    &id,
-                    &key_hash,
-                    &key_prefix,
-                    &request.name,
-                    &request.workspace_id.0,
-                    &request.created_by_user_id.0,
-                    &now,
-                    &request.expires_at,
-                    &request.spend_limit,
-                ],
-            )
-            .await
-            .map_err(map_db_error)?;
+                    &[
+                        &id,
+                        &key_hash,
+                        &key_prefix,
+                        &request.name,
+                        &request.workspace_id.0,
+                        &request.created_by_user_id.0,
+                        &now,
+                        &request.expires_at,
+                        &request.spend_limit,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         debug!(
             "Created API key: {} for workspace: {} by user: {}",
@@ -93,7 +96,7 @@ impl ApiKeyRepository {
                 key_hash,
                 key_prefix,
                 name: request.name,
-                created_at: now,
+                created_at: _row.get("created_at"),
                 expires_at: request.expires_at,
                 last_used_at: None,
                 is_active: true,
@@ -108,20 +111,22 @@ impl ApiKeyRepository {
 
     /// Get an API key by ID
     pub async fn get_by_id(&self, id: Uuid) -> Result<Option<ApiKey>, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")
-            .map_err(RepositoryError::PoolError)?;
+        let row = retry_db!("get_api_key_by_id", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_opt(
-                "SELECT * FROM api_keys WHERE id = $1 AND deleted_at IS NULL",
-                &[&id],
-            )
-            .await
-            .map_err(map_db_error)?;
+            client
+                .query_opt(
+                    "SELECT * FROM api_keys WHERE id = $1 AND deleted_at IS NULL",
+                    &[&id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         match row {
             Some(row) => Ok(Some(
@@ -137,26 +142,28 @@ impl ApiKeyRepository {
     pub async fn validate(&self, key: &str) -> Result<Option<ApiKey>, RepositoryError> {
         let key_hash = Self::hash_api_key(key);
 
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")
-            .map_err(RepositoryError::PoolError)?;
+        let row = retry_db!("validate_api_key", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_opt(
-                r#"
+            client
+                .query_opt(
+                    r#"
             SELECT * FROM api_keys 
             WHERE key_hash = $1 
               AND is_active = true 
               AND deleted_at IS NULL
               AND (expires_at IS NULL OR expires_at > NOW())
             "#,
-                &[&key_hash],
-            )
-            .await
-            .map_err(map_db_error)?;
+                    &[&key_hash],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         match row {
             Some(row) => {
@@ -173,20 +180,22 @@ impl ApiKeyRepository {
 
     /// Update the last used timestamp for an API key
     async fn update_last_used(&self, id: Uuid) -> Result<(), RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")
-            .map_err(RepositoryError::PoolError)?;
+        retry_db!("update_last_used_timestamp", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        client
-            .execute(
-                "UPDATE api_keys SET last_used_at = NOW() WHERE id = $1",
-                &[&id],
-            )
-            .await
-            .map_err(map_db_error)?;
+            client
+                .execute(
+                    "UPDATE api_keys SET last_used_at = NOW() WHERE id = $1",
+                    &[&id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         Ok(())
     }
@@ -196,43 +205,47 @@ impl ApiKeyRepository {
         workspace_id: &Uuid,
         name: &String,
     ) -> Result<i64, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")
-            .map_err(RepositoryError::PoolError)?;
+        let row = retry_db!("count_duplication", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_one(
-                r#"
+            client
+                .query_one(
+                    r#"
                 SELECT COUNT(*) as count FROM api_keys 
                 WHERE workspace_id = $1 AND name = $2 AND deleted_at IS NULL
             "#,
-                &[workspace_id, name],
-            )
-            .await
-            .map_err(map_db_error)?;
+                    &[workspace_id, name],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         Ok(row.get::<_, i64>("count"))
     }
 
     /// Count API keys for a workspace
     pub async fn count_by_workspace(&self, workspace_id: Uuid) -> Result<i64, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")
-            .map_err(RepositoryError::PoolError)?;
+        let row = retry_db!("count_api_keys_by_workspace", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
+            client
             .query_one(
                 "SELECT COUNT(*) as count FROM api_keys WHERE workspace_id = $1 AND deleted_at IS NULL",
                 &[&workspace_id],
             )
             .await
-            .map_err(map_db_error)?;
+            .map_err(map_db_error)
+        })?;
 
         Ok(row.get::<_, i64>("count"))
     }
@@ -245,16 +258,17 @@ impl ApiKeyRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<ApiKey>, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")
-            .map_err(RepositoryError::PoolError)?;
+        let rows = retry_db!("list_api_keys_by_workspace_paginated", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let rows = client
-            .query(
-                r#"
+            client
+                .query(
+                    r#"
                 SELECT 
                     ak.id,
                     ak.key_hash,
@@ -276,10 +290,11 @@ impl ApiKeyRepository {
                 ORDER BY ak.created_at DESC
                 LIMIT $2 OFFSET $3
                 "#,
-                &[&workspace_id, &limit, &offset],
-            )
-            .await
-            .map_err(map_db_error)?;
+                    &[&workspace_id, &limit, &offset],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         rows.into_iter()
             .map(|row| {
@@ -291,19 +306,22 @@ impl ApiKeyRepository {
 
     /// List API keys created by a user
     pub async fn list_by_user(&self, user_id: Uuid) -> Result<Vec<ApiKey>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let rows = retry_db!("list_keys_created_by_user", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let rows = client
-            .query(
-                "SELECT * FROM api_keys WHERE created_by_user_id = $1 ORDER BY created_at DESC",
-                &[&user_id],
-            )
-            .await
-            .context("Failed to list user's API keys")?;
+            client
+                .query(
+                    "SELECT * FROM api_keys WHERE created_by_user_id = $1 ORDER BY created_at DESC",
+                    &[&user_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         rows.into_iter()
             .map(|row| self.row_to_api_key(row))
@@ -312,36 +330,41 @@ impl ApiKeyRepository {
 
     /// Soft delete an API key (sets deleted_at timestamp)
     pub async fn revoke(&self, id: Uuid) -> Result<bool, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")
-            .map_err(RepositoryError::PoolError)?;
+        let rows_affected = retry_db!("revoke_api_key", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let rows_affected = client
-            .execute(
-                "UPDATE api_keys SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL",
-                &[&id],
-            )
-            .await
-            .map_err(map_db_error)?;
+            client
+                .execute(
+                    "UPDATE api_keys SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL",
+                    &[&id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         Ok(rows_affected > 0)
     }
 
     /// Delete expired API keys
     pub async fn cleanup_expired(&self) -> Result<i64> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let rows_affected = retry_db!("delete_expried_api_keys", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let rows_affected = client.execute(
-            "UPDATE api_keys SET is_active = false WHERE expires_at < NOW() AND is_active = true",
-            &[],
-        ).await.context("Failed to cleanup expired API keys")?;
+            client.execute(
+                "UPDATE api_keys SET is_active = false WHERE expires_at < NOW() AND is_active = true",
+                &[],
+            ).await.map_err(map_db_error)
+        })?;
 
         Ok(rows_affected as i64)
     }
@@ -351,19 +374,22 @@ impl ApiKeyRepository {
         &self,
         api_key: &ApiKey,
     ) -> Result<Option<crate::models::Workspace>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("get_workspace_info_for_api_key", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_opt(
-                "SELECT * FROM workspaces WHERE id = $1 AND is_active = true",
-                &[&api_key.workspace_id],
-            )
-            .await
-            .context("Failed to query workspace for API key")?;
+            client
+                .query_opt(
+                    "SELECT * FROM workspaces WHERE id = $1 AND is_active = true",
+                    &[&api_key.workspace_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         match row {
             Some(row) => Ok(Some(crate::models::Workspace {
@@ -388,20 +414,22 @@ impl ApiKeyRepository {
         id: Uuid,
         spend_limit: Option<i64>,
     ) -> Result<ApiKey, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")
-            .map_err(RepositoryError::PoolError)?;
+        let row = retry_db!("update_api_key_spend_limit", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_one(
-                "UPDATE api_keys SET spend_limit = $1 WHERE id = $2 RETURNING *",
-                &[&spend_limit, &id],
-            )
-            .await
-            .map_err(map_db_error)?;
+            client
+                .query_one(
+                    "UPDATE api_keys SET spend_limit = $1 WHERE id = $2 RETURNING *",
+                    &[&spend_limit, &id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         debug!("Updated spend limit for API key: {}", id);
         self.row_to_api_key(row)
@@ -417,13 +445,6 @@ impl ApiKeyRepository {
         spend_limit: Option<Option<i64>>,
         is_active: Option<bool>,
     ) -> Result<ApiKey, RepositoryError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")
-            .map_err(RepositoryError::PoolError)?;
-
         // Build dynamic UPDATE query based on provided fields
         let mut updates = Vec::new();
         let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
@@ -469,10 +490,19 @@ impl ApiKeyRepository {
 
         params.push(&id);
 
-        let row = client
-            .query_one(&query, &params[..])
-            .await
-            .map_err(map_db_error)?;
+        let row = retry_db!("update_api_key", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_one(&query, &params[..])
+                .await
+                .map_err(map_db_error)
+        })?;
 
         debug!("Updated API key: {}", id);
         self.row_to_api_key(row)

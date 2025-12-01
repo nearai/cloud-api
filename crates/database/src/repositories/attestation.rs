@@ -51,7 +51,7 @@ impl AttestationRepository for PgAttestationRepository {
             .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
         client
             .execute(
-                "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo) VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (chat_id, signing_algo) DO UPDATE SET text = EXCLUDED.text, signature = EXCLUDED.signature, signing_address = EXCLUDED.signing_address, updated_at = NOW()",
                 &[&chat_id, &signature.text, &signature.signature, &signature.signing_address, &signature.signing_algo],
             )
             .await
@@ -60,16 +60,21 @@ impl AttestationRepository for PgAttestationRepository {
         Ok(())
     }
 
-    async fn get_chat_signature(&self, chat_id: &str) -> Result<ChatSignature, AttestationError> {
+    async fn get_chat_signature(
+        &self,
+        chat_id: &str,
+        signing_algo: &str,
+    ) -> Result<ChatSignature, AttestationError> {
         let client = self
             .pool
             .get()
             .await
             .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
+
         let row = client
             .query_one(
-                "SELECT * FROM chat_signatures WHERE chat_id = $1",
-                &[&chat_id],
+                "SELECT * FROM chat_signatures WHERE chat_id = $1 AND signing_algo = $2",
+                &[&chat_id, &signing_algo],
             )
             .await
             .map_err(|e| {
@@ -77,7 +82,9 @@ impl AttestationRepository for PgAttestationRepository {
                 if e.to_string()
                     .contains("query returned an unexpected number of rows")
                 {
-                    return AttestationError::SignatureNotFound(chat_id.to_string());
+                    return AttestationError::SignatureNotFound(format!(
+                        "{chat_id}:{signing_algo}"
+                    ));
                 }
                 AttestationError::RepositoryError(e.to_string())
             })?;

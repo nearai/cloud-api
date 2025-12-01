@@ -1,7 +1,10 @@
 use crate::models::{OrganizationBalance, OrganizationUsageLog, RecordUsageRequest};
 use crate::pool::DbPool;
+use crate::repositories::utils::map_db_error;
+use crate::retry_db;
 use anyhow::{Context, Result};
 use chrono::Utc;
+use services::common::RepositoryError;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
@@ -17,23 +20,26 @@ impl OrganizationUsageRepository {
 
     /// Get total spend for a specific API key
     pub async fn get_api_key_spend(&self, api_key_id: Uuid) -> Result<i64> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("get_api_key_spend", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_one(
-                r#"
-                SELECT COALESCE(SUM(total_cost), 0)::BIGINT as total_spend
-                FROM organization_usage_log
-                WHERE api_key_id = $1
-                "#,
-                &[&api_key_id],
-            )
-            .await
-            .context("Failed to get API key spend")?;
+            client
+                .query_one(
+                    r#"
+                    SELECT COALESCE(SUM(total_cost), 0)::BIGINT as total_spend
+                    FROM organization_usage_log
+                    WHERE api_key_id = $1
+                    "#,
+                    &[&api_key_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         let total_spend: i64 = row.get("total_spend");
         Ok(total_spend)
@@ -41,137 +47,142 @@ impl OrganizationUsageRepository {
 
     /// Record usage and update balance atomically
     pub async fn record_usage(&self, request: RecordUsageRequest) -> Result<OrganizationUsageLog> {
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("record_organization_usage", {
+            let mut client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let transaction = client
-            .transaction()
-            .await
-            .context("Failed to start transaction")?;
+            let transaction = client.transaction().await.map_err(map_db_error)?;
 
-        let id = Uuid::new_v4();
-        let now = Utc::now();
-        let total_tokens = request.input_tokens + request.output_tokens;
+            let id = Uuid::new_v4();
+            let now = Utc::now();
+            let total_tokens = request.input_tokens + request.output_tokens;
 
-        // Insert usage log entry (model_name is denormalized for performance)
-        let row = transaction
-            .query_one(
-                r#"
-                INSERT INTO organization_usage_log (
-                    id, organization_id, workspace_id, api_key_id, response_id,
-                    model_id, model_name, input_tokens, output_tokens, total_tokens,
-                    input_cost, output_cost, total_cost,
-                    request_type, created_at, ttft_ms, avg_itl_ms
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-                RETURNING *
-                "#,
-                &[
-                    &id,
-                    &request.organization_id,
-                    &request.workspace_id,
-                    &request.api_key_id,
-                    &request.response_id,
-                    &request.model_id,
-                    &request.model_name,
-                    &request.input_tokens,
-                    &request.output_tokens,
-                    &total_tokens,
-                    &request.input_cost,
-                    &request.output_cost,
-                    &request.total_cost,
-                    &request.request_type,
-                    &now,
-                    &request.ttft_ms,
-                    &request.avg_itl_ms,
-                ],
-            )
-            .await
-            .context("Failed to insert usage log")?;
+            // Insert usage log entry (model_name is denormalized for performance)
+            let row = transaction
+                .query_one(
+                    r#"
+                    INSERT INTO organization_usage_log (
+                        id, organization_id, workspace_id, api_key_id, response_id,
+                        model_id, model_name, input_tokens, output_tokens, total_tokens,
+                        input_cost, output_cost, total_cost,
+                        request_type, created_at, ttft_ms, avg_itl_ms
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                    RETURNING *
+                    "#,
+                    &[
+                        &id,
+                        &request.organization_id,
+                        &request.workspace_id,
+                        &request.api_key_id,
+                        &request.response_id,
+                        &request.model_id,
+                        &request.model_name,
+                        &request.input_tokens,
+                        &request.output_tokens,
+                        &total_tokens,
+                        &request.input_cost,
+                        &request.output_cost,
+                        &request.total_cost,
+                        &request.request_type,
+                        &now,
+                        &request.ttft_ms,
+                        &request.avg_itl_ms,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)?;
 
-        // Update organization balance (all costs use fixed scale 9)
-        transaction
-            .execute(
-                r#"
-                INSERT INTO organization_balance (
-                    organization_id,
-                    total_spent,
-                    last_usage_at,
-                    total_requests,
-                    total_tokens,
-                    updated_at
-                ) VALUES ($1, $2, $3, 1, $4, $5)
-                ON CONFLICT (organization_id) DO UPDATE SET
-                    total_spent = organization_balance.total_spent + $2,
-                    total_requests = organization_balance.total_requests + 1,
-                    total_tokens = organization_balance.total_tokens + $4,
-                    last_usage_at = $3,
-                    updated_at = $5
-                "#,
-                &[
-                    &request.organization_id,
-                    &request.total_cost,
-                    &now,
-                    &(total_tokens as i64),
-                    &now,
-                ],
-            )
-            .await
-            .context("Failed to update organization balance")?;
+            // Update organization balance (all costs use fixed scale 9)
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO organization_balance (
+                        organization_id,
+                        total_spent,
+                        last_usage_at,
+                        total_requests,
+                        total_tokens,
+                        updated_at
+                    ) VALUES ($1, $2, $3, 1, $4, $5)
+                    ON CONFLICT (organization_id) DO UPDATE SET
+                        total_spent = organization_balance.total_spent + $2,
+                        total_requests = organization_balance.total_requests + 1,
+                        total_tokens = organization_balance.total_tokens + $4,
+                        last_usage_at = $3,
+                        updated_at = $5
+                    "#,
+                    &[
+                        &request.organization_id,
+                        &request.total_cost,
+                        &now,
+                        &(total_tokens as i64),
+                        &now,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)?;
 
-        transaction
-            .commit()
-            .await
-            .context("Failed to commit transaction")?;
+            transaction.commit().await.map_err(map_db_error)?;
+
+            Ok::<tokio_postgres::Row, RepositoryError>(row)
+        })?;
 
         Ok(self.row_to_usage_log(&row))
     }
 
     /// Get current balance for an organization
     pub async fn get_balance(&self, organization_id: Uuid) -> Result<Option<OrganizationBalance>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row_opt = retry_db!("get_organization_balance", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row_opt = client
-            .query_opt(
-                r#"
-                SELECT organization_id, total_spent, last_usage_at, 
-                       total_requests, total_tokens, updated_at
-                FROM organization_balance
-                WHERE organization_id = $1
-                "#,
-                &[&organization_id],
-            )
-            .await
-            .context("Failed to query organization balance")?;
+            client
+                .query_opt(
+                    r#"
+                    SELECT organization_id, total_spent, last_usage_at,
+                           total_requests, total_tokens, updated_at
+                    FROM organization_balance
+                    WHERE organization_id = $1
+                    "#,
+                    &[&organization_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         Ok(row_opt.map(|row| self.row_to_balance(&row)))
     }
 
     /// Count total usage history records for an organization
     pub async fn count_usage_history(&self, organization_id: Uuid) -> Result<i64> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("count_organization_usage_history", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_one(
-                r#"
-                SELECT COUNT(*) as count
-                FROM organization_usage_log
-                WHERE organization_id = $1
-                "#,
-                &[&organization_id],
-            )
-            .await
-            .context("Failed to count usage history")?;
+            client
+                .query_one(
+                    r#"
+                    SELECT COUNT(*) as count
+                    FROM organization_usage_log
+                    WHERE organization_id = $1
+                    "#,
+                    &[&organization_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         Ok(row.get::<_, i64>("count"))
     }
@@ -183,55 +194,61 @@ impl OrganizationUsageRepository {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<Vec<OrganizationUsageLog>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
         let limit = limit.unwrap_or(100);
         let offset = offset.unwrap_or(0);
 
-        let rows = client
-            .query(
-                r#"
-                SELECT 
-                    id, organization_id, workspace_id, api_key_id, response_id,
-                    model_id, model_name, input_tokens, output_tokens, total_tokens,
-                    input_cost, output_cost, total_cost,
-                    request_type, created_at, ttft_ms, avg_itl_ms
-                FROM organization_usage_log
-                WHERE organization_id = $1
-                ORDER BY created_at DESC
-                LIMIT $2 OFFSET $3
-                "#,
-                &[&organization_id, &limit, &offset],
-            )
-            .await
-            .context("Failed to query usage history")?;
+        let rows = retry_db!("get_organization_usage_history", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query(
+                    r#"
+                    SELECT
+                        id, organization_id, workspace_id, api_key_id, response_id,
+                        model_id, model_name, input_tokens, output_tokens, total_tokens,
+                        input_cost, output_cost, total_cost,
+                        request_type, created_at, ttft_ms, avg_itl_ms
+                    FROM organization_usage_log
+                    WHERE organization_id = $1
+                    ORDER BY created_at DESC
+                    LIMIT $2 OFFSET $3
+                    "#,
+                    &[&organization_id, &limit, &offset],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         Ok(rows.iter().map(|row| self.row_to_usage_log(row)).collect())
     }
 
     /// Count total usage history records for an API key
     pub async fn count_usage_history_by_api_key(&self, api_key_id: Uuid) -> Result<i64> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("count_usage_history_by_api_key", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_one(
-                r#"
-                SELECT COUNT(*) as count
-                FROM organization_usage_log
-                WHERE api_key_id = $1
-                "#,
-                &[&api_key_id],
-            )
-            .await
-            .context("Failed to count usage history by API key")?;
+            client
+                .query_one(
+                    r#"
+                    SELECT COUNT(*) as count
+                    FROM organization_usage_log
+                    WHERE api_key_id = $1
+                    "#,
+                    &[&api_key_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         Ok(row.get::<_, i64>("count"))
     }
@@ -243,32 +260,35 @@ impl OrganizationUsageRepository {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<Vec<OrganizationUsageLog>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
         let limit = limit.unwrap_or(100);
         let offset = offset.unwrap_or(0);
 
-        let rows = client
-            .query(
-                r#"
-                SELECT 
-                    id, organization_id, workspace_id, api_key_id, response_id,
-                    model_id, model_name, input_tokens, output_tokens, total_tokens,
-                    input_cost, output_cost, total_cost,
-                    request_type, created_at, ttft_ms, avg_itl_ms
-                FROM organization_usage_log
-                WHERE api_key_id = $1
-                ORDER BY created_at DESC
-                LIMIT $2 OFFSET $3
-                "#,
-                &[&api_key_id, &limit, &offset],
-            )
-            .await
-            .context("Failed to query usage history by API key")?;
+        let rows = retry_db!("get_usage_history_by_api_key", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query(
+                    r#"
+                    SELECT
+                        id, organization_id, workspace_id, api_key_id, response_id,
+                        model_id, model_name, input_tokens, output_tokens, total_tokens,
+                        input_cost, output_cost, total_cost,
+                        request_type, created_at, ttft_ms, avg_itl_ms
+                    FROM organization_usage_log
+                    WHERE api_key_id = $1
+                    ORDER BY created_at DESC
+                    LIMIT $2 OFFSET $3
+                    "#,
+                    &[&api_key_id, &limit, &offset],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         Ok(rows.iter().map(|row| self.row_to_usage_log(row)).collect())
     }
@@ -280,28 +300,31 @@ impl OrganizationUsageRepository {
         start_date: chrono::DateTime<Utc>,
         end_date: chrono::DateTime<Utc>,
     ) -> Result<UsageStats> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("get_organization_usage_stats", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_one(
-                r#"
-                SELECT 
-                    COUNT(*) as request_count,
-                    SUM(total_tokens) as total_tokens,
-                    SUM(total_cost) as total_cost
-                FROM organization_usage_log
-                WHERE organization_id = $1
-                  AND created_at >= $2
-                  AND created_at <= $3
-                "#,
-                &[&organization_id, &start_date, &end_date],
-            )
-            .await
-            .context("Failed to query usage statistics")?;
+            client
+                .query_one(
+                    r#"
+                    SELECT
+                        COUNT(*) as request_count,
+                        SUM(total_tokens) as total_tokens,
+                        SUM(total_cost) as total_cost
+                    FROM organization_usage_log
+                    WHERE organization_id = $1
+                      AND created_at >= $2
+                      AND created_at <= $3
+                    "#,
+                    &[&organization_id, &start_date, &end_date],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         Ok(UsageStats {
             request_count: row.get::<_, i64>(0),

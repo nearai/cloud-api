@@ -25,6 +25,7 @@ pub struct AppState {
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub files_service: Arc<dyn FileServiceTrait + Send + Sync>,
+    pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub config: Arc<config::ApiConfig>,
 }
 
@@ -49,6 +50,11 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
             get(get_organization)
                 .put(update_organization)
                 .delete(delete_organization),
+        )
+        // Organization settings management
+        .route(
+            "/{id}/settings",
+            get(get_organization_settings).patch(patch_organization_settings),
         )
         // Organization member management
         .route(

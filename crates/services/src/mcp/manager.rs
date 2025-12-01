@@ -338,59 +338,6 @@ impl McpClientManager {
         Ok(result)
     }
 
-    /// Call a tool with smart retry logic
-    pub async fn call_tool_with_retry(
-        &self,
-        connector_id: &McpConnectorId,
-        name: String,
-        arguments: Option<serde_json::Value>,
-        max_retries: i64,
-    ) -> Result<CallToolResult, McpError> {
-        let mut last_error = None;
-
-        for attempt in 0..=max_retries {
-            match self
-                .call_tool(connector_id, name.clone(), arguments.clone())
-                .await
-            {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    last_error = Some(e.clone());
-
-                    // Only retry if error is retryable
-                    if attempt < max_retries && Self::is_retryable_error(&e) {
-                        let delay = Duration::from_millis(100 * (1 << attempt));
-                        debug!(
-                            "Retrying tool call '{}' after {:?} (attempt {}/{})",
-                            name,
-                            delay,
-                            attempt + 1,
-                            max_retries + 1
-                        );
-                        tokio::time::sleep(delay).await;
-                    } else if !Self::is_retryable_error(&e) {
-                        // Don't retry non-retryable errors
-                        debug!(
-                            "Tool call '{}' failed with non-retryable error: {}",
-                            name, e
-                        );
-                        break;
-                    }
-                }
-            }
-        }
-
-        Err(last_error.unwrap())
-    }
-
-    /// Check if an error is retryable
-    fn is_retryable_error(error: &McpError) -> bool {
-        matches!(
-            error,
-            McpError::NetworkError(_) | McpError::ConnectionTimeout { .. }
-        )
-    }
-
     /// List resources from a connector
     pub async fn list_resources(
         &self,

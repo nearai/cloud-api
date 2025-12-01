@@ -1,6 +1,9 @@
 use crate::models::ModelAlias;
 use crate::pool::DbPool;
+use crate::repositories::utils::map_db_error;
+use crate::retry_db;
 use anyhow::{Context, Result};
+use services::common::RepositoryError;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
@@ -20,50 +23,49 @@ impl ModelAliasRepository {
         canonical_model_id: &Uuid,
         alias_names: &[String],
     ) -> Result<Vec<ModelAlias>> {
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let aliases = retry_db!("upsert_model_aliases", {
+            let mut client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let transaction = client
-            .transaction()
-            .await
-            .context("Failed to start transaction")?;
+            let transaction = client.transaction().await.map_err(map_db_error)?;
 
-        // Delete existing aliases for this model
-        transaction
-            .execute(
-                "DELETE FROM model_aliases WHERE canonical_model_id = $1",
-                &[&canonical_model_id],
-            )
-            .await
-            .context("Failed to delete existing aliases")?;
-
-        // Insert new aliases
-        let mut aliases = Vec::new();
-        for alias_name in alias_names {
-            let row = transaction
-                .query_one(
-                    r#"
-                    INSERT INTO model_aliases (
-                        alias_name, canonical_model_id, is_active
-                    ) VALUES ($1, $2, true)
-                    RETURNING id, alias_name, canonical_model_id, 
-                              is_active, created_at, updated_at
-                    "#,
-                    &[&alias_name, &canonical_model_id],
+            // Delete existing aliases for this model
+            transaction
+                .execute(
+                    "DELETE FROM model_aliases WHERE canonical_model_id = $1",
+                    &[&canonical_model_id],
                 )
                 .await
-                .context("Failed to insert model alias")?;
+                .map_err(map_db_error)?;
 
-            aliases.push(self.row_to_alias(&row));
-        }
+            // Insert new aliases
+            let mut aliases = Vec::new();
+            for alias_name in alias_names {
+                let row = transaction
+                    .query_one(
+                        r#"
+                        INSERT INTO model_aliases (
+                            alias_name, canonical_model_id, is_active
+                        ) VALUES ($1, $2, true)
+                        RETURNING id, alias_name, canonical_model_id,
+                                  is_active, created_at, updated_at
+                        "#,
+                        &[&alias_name, &canonical_model_id],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
 
-        transaction
-            .commit()
-            .await
-            .context("Failed to commit transaction")?;
+                aliases.push(self.row_to_alias(&row));
+            }
+
+            transaction.commit().await.map_err(map_db_error)?;
+
+            Ok::<Vec<ModelAlias>, RepositoryError>(aliases)
+        })?;
 
         Ok(aliases)
     }

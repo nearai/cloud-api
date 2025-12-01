@@ -40,8 +40,7 @@ use services::{
     auth::{AuthService, AuthServiceTrait, MockAuthService, OAuthManager},
     models::ModelsServiceTrait,
 };
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::RwLock;
+use std::sync::Arc;
 use utoipa::OpenApi;
 
 /// Service initialization components
@@ -87,6 +86,22 @@ pub async fn init_database(db_config: &config::DatabaseConfig) -> Arc<Database> 
         .await
         .expect("Failed to run database migrations");
     tracing::info!("Database migrations completed.");
+
+    // Start periodic pool status logging
+    let pool = database.pool().clone();
+    tokio::spawn(async move {
+        use std::time::Duration;
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            tracing::info!(
+                pool = "database",
+                size = pool.status().size,
+                available = pool.status().available,
+                waiting = pool.status().waiting,
+                "Pool status"
+            );
+        }
+    });
 
     database
 }
@@ -142,10 +157,15 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
     let workspace_repository = Arc::new(WorkspaceRepository::new(database.pool().clone()))
         as Arc<dyn services::workspace::WorkspaceRepository>;
 
-    // Create OAuth manager
+    // Create OAuth manager and state repository
     tracing::info!("Setting up OAuth providers");
     let oauth_manager = create_oauth_manager(config);
-    let state_store: StateStore = Arc::new(RwLock::new(HashMap::new()));
+
+    // Create OAuth state repository for cross-instance OAuth state sharing
+    let oauth_state_repository = Arc::new(database::repositories::OAuthStateRepository::new(
+        database.pool().clone(),
+    ));
+    let state_store: StateStore = oauth_state_repository;
 
     // Create admin access token repository
     let admin_access_token_repository =
@@ -206,6 +226,24 @@ pub async fn init_domain_services(
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
+    let inference_provider_pool = init_inference_providers(config).await;
+    init_domain_services_with_pool(
+        database,
+        config,
+        organization_service,
+        inference_provider_pool,
+    )
+    .await
+}
+
+/// Initialize domain services with a provided inference provider pool
+/// This allows tests to inject mock providers without changing core implementations
+pub async fn init_domain_services_with_pool(
+    database: Arc<Database>,
+    config: &ApiConfig,
+    organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
+    inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+) -> DomainServices {
     // Create shared repositories
     let conversation_repo = Arc::new(database::PgConversationRepository::new(
         database.pool().clone(),
@@ -230,9 +268,6 @@ pub async fn init_domain_services(
         response_repo.clone(),
         response_items_repo.clone(),
     ));
-
-    // Create inference provider pool
-    let inference_provider_pool = init_inference_providers(config).await;
 
     // Create attestation service
     let attestation_service = Arc::new(services::attestation::AttestationService::new(
@@ -340,6 +375,7 @@ pub async fn init_domain_services(
         Some(web_search_provider), // web_search_provider
         None,                      // file_search_provider
         files_service.clone(),     // file_service
+        organization_service.clone(),
     ));
 
     DomainServices {
@@ -402,6 +438,52 @@ pub async fn init_inference_providers(
     pool
 }
 
+/// Initialize inference provider pool with mock providers for testing
+/// This function uses the existing MockProvider from inference_providers::mock
+/// and registers it for common test models without changing any implementations
+pub async fn init_inference_providers_with_mocks(
+    _config: &ApiConfig,
+) -> Arc<services::inference_provider_pool::InferenceProviderPool> {
+    use inference_providers::MockProvider;
+    use std::sync::Arc;
+
+    // Create pool with dummy discovery URL (won't be used since we're registering providers directly)
+    let pool = Arc::new(
+        services::inference_provider_pool::InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30 * 60,
+        ),
+    );
+
+    // Create a MockProvider that accepts all models (using new_accept_all)
+    let mock_provider = Arc::new(MockProvider::new_accept_all())
+        as Arc<dyn inference_providers::InferenceProvider + Send + Sync>;
+
+    // Register providers for models commonly used in tests
+    let test_models = vec![
+        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        "zai-org/GLM-4.6".to_string(),
+        "nearai/gpt-oss-120b".to_string(),
+        "dphn/Dolphin-Mistral-24B-Venice-Edition".to_string(),
+    ];
+
+    let providers: Vec<(
+        String,
+        Arc<dyn inference_providers::InferenceProvider + Send + Sync>,
+    )> = test_models
+        .into_iter()
+        .map(|model_id| (model_id, mock_provider.clone()))
+        .collect();
+
+    pool.register_providers(providers).await;
+
+    tracing::info!("Initialized inference provider pool with MockProvider for testing");
+
+    pool
+}
+
 /// Build the complete application router with config
 pub fn build_app_with_config(
     database: Arc<Database>,
@@ -421,6 +503,7 @@ pub fn build_app_with_config(
         usage_service: domain_services.usage_service.clone(),
         user_service: domain_services.user_service.clone(),
         files_service: domain_services.files_service.clone(),
+        inference_provider_pool: domain_services.inference_provider_pool.clone(),
         config: config.clone(),
     };
 
@@ -486,6 +569,8 @@ pub fn build_app_with_config(
     let invitation_routes =
         build_invitation_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
+    let auth_vpc_routes = build_auth_vpc_routes(app_state.clone());
+
     let files_routes =
         build_files_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
@@ -514,6 +599,7 @@ pub fn build_app_with_config(
                 .merge(model_routes)
                 .merge(admin_routes)
                 .merge(invitation_routes)
+                .merge(auth_vpc_routes)
                 .merge(files_routes)
                 .merge(health_routes),
         )
@@ -523,6 +609,16 @@ pub fn build_app_with_config(
             metrics_state,
             middleware::http_metrics_middleware,
         ))
+}
+
+/// Build VPC authentication routes
+pub fn build_auth_vpc_routes(app_state: AppState) -> Router {
+    use crate::routes::auth_vpc::vpc_login;
+    use axum::routing::post;
+
+    Router::new()
+        .route("/auth/vpc/login", post(vpc_login))
+        .with_state(app_state)
 }
 
 /// Build invitation routes with selective auth

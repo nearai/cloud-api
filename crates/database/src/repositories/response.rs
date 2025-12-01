@@ -1,7 +1,10 @@
 use crate::pool::DbPool;
+use crate::repositories::utils::map_db_error;
+use crate::retry_db;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use services::common::RepositoryError;
 use services::responses::models::*;
 use services::responses::ports::*;
 use services::workspace::WorkspaceId;
@@ -25,16 +28,9 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         api_key_id: uuid::Uuid,
         request: CreateResponseRequest,
     ) -> Result<ResponseObject, anyhow::Error> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
         // Generate new response ID
         let response_uuid = Uuid::new_v4();
         let response_id = format!("resp_{}", response_uuid.simple());
-        let now = Utc::now();
 
         // Extract conversation_id if present in request
         let mut conversation_uuid = if let Some(conv_ref) = &request.conversation {
@@ -67,17 +63,26 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             // If conversation_uuid is not explicitly set, inherit it from the previous response
             if conversation_uuid.is_none() {
                 // Fetch the previous response to get its conversation_id
-                let prev_response = client
-                    .query_opt(
-                        r#"
-                        SELECT conversation_id
-                        FROM responses
-                        WHERE id = $1 AND workspace_id = $2
-                        "#,
-                        &[&prev_uuid, &workspace_id.0],
-                    )
-                    .await
-                    .context("Failed to fetch previous response")?;
+                let prev_response = retry_db!("fetch_previous_response_conversation", {
+                    let client = self
+                        .pool
+                        .get()
+                        .await
+                        .context("Failed to get database connection")
+                        .map_err(RepositoryError::PoolError)?;
+
+                    client
+                        .query_opt(
+                            r#"
+                            SELECT conversation_id
+                            FROM responses
+                            WHERE id = $1 AND workspace_id = $2
+                            "#,
+                            &[&prev_uuid, &workspace_id.0],
+                        )
+                        .await
+                        .map_err(map_db_error)
+                })?;
 
                 if let Some(row) = prev_response {
                     let prev_conversation_id: Option<Uuid> = row.get("conversation_id");
@@ -129,62 +134,77 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         let metadata_json = request.metadata.unwrap_or_else(|| serde_json::json!({}));
         let next_response_ids_json = serde_json::json!([]);
 
-        // Insert response into database (without input_messages or output_message)
-        // Messages are stored separately as response_items
-        client
-            .execute(
-                r#"
-                INSERT INTO responses (
-                    id, workspace_id, api_key_id, model, status, instructions, conversation_id, 
-                    previous_response_id, next_response_ids, usage, metadata, 
-                    created_at, updated_at
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-                "#,
-                &[
-                    &response_uuid,
-                    &workspace_id.0,
-                    &api_key_id,
-                    &request.model,
-                    &status,
-                    &request.instructions,
-                    &conversation_uuid,
-                    &previous_response_uuid,
-                    &next_response_ids_json,
-                    &usage_json,
-                    &metadata_json,
-                    &now,
-                    &now,
-                ],
-            )
-            .await
-            .context("Failed to insert response")?;
+        // Insert response and update previous response in a single retry_db! block
+        // This ensures all queries are retried together if needed
+        retry_db!("insert_response_and_update_parent", {
+            let now = Utc::now();
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        // If previous_response_id is present, update the previous response's next_response_ids array
-        if let Some(parent_uuid) = previous_response_uuid {
+            // Insert the new response
             client
                 .execute(
                     r#"
-                    UPDATE responses
-                    SET next_response_ids = next_response_ids || $1::jsonb,
-                        updated_at = $2
-                    WHERE id = $3 AND workspace_id = $4
+                    INSERT INTO responses (
+                        id, workspace_id, api_key_id, model, status, instructions, conversation_id,
+                        previous_response_id, next_response_ids, usage, metadata,
+                        created_at, updated_at
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                     "#,
                     &[
-                        &serde_json::json!([response_uuid.to_string()]),
-                        &now,
-                        &parent_uuid,
+                        &response_uuid,
                         &workspace_id.0,
+                        &api_key_id,
+                        &request.model,
+                        &status,
+                        &request.instructions,
+                        &conversation_uuid,
+                        &previous_response_uuid,
+                        &next_response_ids_json,
+                        &usage_json,
+                        &metadata_json,
+                        &now,
+                        &now,
                     ],
                 )
                 .await
-                .context("Failed to update previous response's next_response_ids")?;
-        }
+                .map_err(map_db_error)?;
+
+            // If previous_response_id is present, update the previous response's next_response_ids array
+            if let Some(parent_uuid) = previous_response_uuid {
+                client
+                    .execute(
+                        r#"
+                        UPDATE responses
+                        SET next_response_ids = next_response_ids || $1::jsonb,
+                            updated_at = $2
+                        WHERE id = $3 AND workspace_id = $4
+                        "#,
+                        &[
+                            &serde_json::json!([response_uuid.to_string()]),
+                            &now,
+                            &parent_uuid,
+                            &workspace_id.0,
+                        ],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+            }
+
+            Ok(())
+        })?;
 
         // Build conversation reference if conversation_id is present
         let conversation_ref = conversation_uuid.map(|uuid| ConversationResponseReference {
             id: format!("conv_{}", uuid.simple()),
         });
+
+        let now = Utc::now();
 
         // Build ResponseObject from the database row
         let response_obj = ResponseObject {
@@ -251,28 +271,31 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         response_id: ResponseId,
         workspace_id: WorkspaceId,
     ) -> Result<Option<ResponseObject>, anyhow::Error> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
         let response_uuid = response_id.0;
 
         // Fetch the response
-        let row_result = client
-            .query_opt(
-                r#"
-                SELECT id, workspace_id, api_key_id, model, status, instructions, 
-                       conversation_id, previous_response_id, next_response_ids, 
-                       usage, metadata, created_at, updated_at
-                FROM responses
-                WHERE id = $1 AND workspace_id = $2
-                "#,
-                &[&response_uuid, &workspace_id.0],
-            )
-            .await
-            .context("Failed to fetch response")?;
+        let row_result = retry_db!("get_response_by_id", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_opt(
+                    r#"
+                    SELECT id, workspace_id, api_key_id, model, status, instructions,
+                           conversation_id, previous_response_id, next_response_ids,
+                           usage, metadata, created_at, updated_at
+                    FROM responses
+                    WHERE id = $1 AND workspace_id = $2
+                    "#,
+                    &[&response_uuid, &workspace_id.0],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         let Some(row) = row_result else {
             return Ok(None);
@@ -372,12 +395,6 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         status: ResponseStatus,
         usage: Option<serde_json::Value>,
     ) -> Result<Option<ResponseObject>, anyhow::Error> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
         let response_uuid = response_id.0;
         let status_str = match status {
             ResponseStatus::InProgress => "in_progress",
@@ -387,24 +404,33 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             ResponseStatus::Queued => "queued",
             ResponseStatus::Incomplete => "incomplete",
         };
-        let now = Utc::now();
 
         // Update the response in the database
         // Note: output_message column was removed in migration V0021
         // Messages are now stored as response_items instead
-        let rows_affected = client
-            .execute(
-                r#"
-                UPDATE responses
-                SET status = $1,
-                    usage = COALESCE($2, usage),
-                    updated_at = $3
-                WHERE id = $4 AND workspace_id = $5
-                "#,
-                &[&status_str, &usage, &now, &response_uuid, &workspace_id.0],
-            )
-            .await
-            .context("Failed to update response")?;
+        let rows_affected = retry_db!("update_response", {
+            let now = Utc::now();
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .execute(
+                    r#"
+                    UPDATE responses
+                    SET status = $1,
+                        usage = COALESCE($2, usage),
+                        updated_at = $3
+                    WHERE id = $4 AND workspace_id = $5
+                    "#,
+                    &[&status_str, &usage, &now, &response_uuid, &workspace_id.0],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         if rows_affected == 0 {
             // Response not found or doesn't belong to this workspace
@@ -412,19 +438,28 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         }
 
         // Fetch the updated response
-        let row = client
-            .query_one(
-                r#"
-                SELECT id, workspace_id, api_key_id, model, status, instructions, 
-                       conversation_id, previous_response_id, next_response_ids, 
-                       usage, metadata, created_at, updated_at
-                FROM responses
-                WHERE id = $1 AND workspace_id = $2
-                "#,
-                &[&response_uuid, &workspace_id.0],
-            )
-            .await
-            .context("Failed to fetch updated response")?;
+        let row = retry_db!("fetch_updated_response", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_one(
+                    r#"
+                    SELECT id, workspace_id, api_key_id, model, status, instructions,
+                           conversation_id, previous_response_id, next_response_ids,
+                           usage, metadata, created_at, updated_at
+                    FROM responses
+                    WHERE id = $1 AND workspace_id = $2
+                    "#,
+                    &[&response_uuid, &workspace_id.0],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         // Parse usage from JSONB
         let usage_value: Option<serde_json::Value> = row.get(9);
@@ -570,28 +605,31 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         conversation_id: services::conversations::models::ConversationId,
         workspace_id: WorkspaceId,
     ) -> Result<Option<ResponseObject>, anyhow::Error> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
         // Fetch the most recent response in this conversation
-        let row_result = client
-            .query_opt(
-                r#"
-                SELECT id, workspace_id, api_key_id, model, status, instructions, 
-                       conversation_id, previous_response_id, next_response_ids, 
-                       usage, metadata, created_at, updated_at
-                FROM responses
-                WHERE conversation_id = $1 AND workspace_id = $2
-                ORDER BY created_at DESC
-                LIMIT 1
-                "#,
-                &[&conversation_id.0, &workspace_id.0],
-            )
-            .await
-            .context("Failed to fetch latest response in conversation")?;
+        let row_result = retry_db!("get_latest_response_in_conversation", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_opt(
+                    r#"
+                    SELECT id, workspace_id, api_key_id, model, status, instructions,
+                           conversation_id, previous_response_id, next_response_ids,
+                           usage, metadata, created_at, updated_at
+                    FROM responses
+                    WHERE conversation_id = $1 AND workspace_id = $2
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    "#,
+                    &[&conversation_id.0, &workspace_id.0],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         let Some(row) = row_result else {
             return Ok(None);

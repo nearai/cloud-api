@@ -1248,4 +1248,102 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
         self.list_organization_invitations_impl(organization_id, requester_id, status)
             .await
     }
+
+    async fn get_system_prompt(
+        &self,
+        organization_id: OrganizationId,
+        user_id: UserId,
+    ) -> Result<Option<String>, OrganizationError> {
+        // Check if user is a member of the organization
+        let is_member = self
+            .repository
+            .get_member(organization_id.0, user_id.0)
+            .await
+            .map_err(Self::map_repository_error)?
+            .is_some();
+
+        if !is_member {
+            return Err(OrganizationError::Unauthorized(
+                "User is not a member of this organization".to_string(),
+            ));
+        }
+
+        // Get organization and extract system prompt from settings
+        let org = self.get_organization_impl(organization_id).await?;
+
+        let system_prompt = org
+            .settings
+            .get("system_prompt")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        Ok(system_prompt)
+    }
+
+    async fn update_system_prompt(
+        &self,
+        organization_id: OrganizationId,
+        user_id: UserId,
+        system_prompt: Option<String>,
+    ) -> Result<Option<String>, OrganizationError> {
+        // Check if user has permission to manage the organization
+        let member = self
+            .repository
+            .get_member(organization_id.0, user_id.0)
+            .await
+            .map_err(Self::map_repository_error)?;
+
+        let role = match member {
+            Some(m) => m.role,
+            None => {
+                return Err(OrganizationError::Unauthorized(
+                    "User is not a member of this organization".to_string(),
+                ))
+            }
+        };
+
+        if !role.can_manage_organization() {
+            return Err(OrganizationError::Unauthorized(
+                "Insufficient permissions to manage organization settings".to_string(),
+            ));
+        }
+
+        // Get current organization
+        let org = self.get_organization_impl(organization_id.clone()).await?;
+
+        // Update settings with new system prompt
+        let mut settings = if org.settings.is_object() {
+            org.settings.clone()
+        } else {
+            // Initialize as empty object if not already an object
+            serde_json::json!({})
+        };
+
+        if let Some(ref prompt) = system_prompt {
+            // Set system prompt if provided
+            if let Some(obj) = settings.as_object_mut() {
+                obj.insert("system_prompt".to_string(), serde_json::json!(prompt));
+            }
+        } else {
+            // Remove system prompt if None
+            if let Some(obj) = settings.as_object_mut() {
+                obj.remove("system_prompt");
+            }
+        }
+
+        // Update organization with new settings
+        let request = UpdateOrganizationRequest {
+            display_name: None,
+            description: None,
+            rate_limit: None,
+            settings: Some(settings),
+        };
+
+        self.repository
+            .update(organization_id.0, request)
+            .await
+            .map_err(Self::map_repository_error)?;
+
+        Ok(system_prompt)
+    }
 }

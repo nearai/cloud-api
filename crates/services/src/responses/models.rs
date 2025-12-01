@@ -74,8 +74,6 @@ pub struct CreateResponseRequest {
     pub safety_identifier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signing_algo: Option<String>,
 }
 
 /// Input for a response - can be text, array of items, or single item
@@ -339,7 +337,7 @@ pub enum ResponseOutputItem {
         created_at: i64,
         status: ResponseItemStatus,
         role: String,
-        content: Vec<ResponseOutputContent>,
+        content: Vec<ResponseContentItem>,
         model: String,
     },
     #[serde(rename = "tool_call")]
@@ -467,10 +465,30 @@ pub enum TextAnnotation {
     },
 }
 
-/// Output content part
+/// Unified content item that can represent both user inputs and assistant outputs
+/// This replaces ResponseOutputContent and correctly represents semantic types
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
-pub enum ResponseOutputContent {
+pub enum ResponseContentItem {
+    // ===== INPUT VARIANTS (from user) =====
+    #[serde(rename = "input_text")]
+    InputText { text: String },
+
+    #[serde(rename = "input_image")]
+    InputImage {
+        image_url: ResponseImageUrl,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
+    #[serde(rename = "input_file")]
+    InputFile {
+        file_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
+    // ===== OUTPUT VARIANTS (from assistant) =====
     #[serde(rename = "output_text")]
     OutputText {
         text: String,
@@ -478,6 +496,7 @@ pub enum ResponseOutputContent {
         #[serde(default)]
         logprobs: Vec<serde_json::Value>,
     },
+
     #[serde(rename = "tool_calls")]
     ToolCalls {
         tool_calls: Vec<ResponseOutputToolCall>,
@@ -514,6 +533,60 @@ pub enum ResponseToolChoiceOutput {
         #[serde(rename = "type")]
         type_: String,
         function: ResponseToolChoiceFunction,
+    },
+}
+
+// ============================================
+// ResponseContentItem Implementations
+// ============================================
+
+impl ResponseContentItem {
+    /// Check if this content item is an input (from user)
+    pub fn is_input(&self) -> bool {
+        matches!(
+            self,
+            ResponseContentItem::InputText { .. }
+                | ResponseContentItem::InputImage { .. }
+                | ResponseContentItem::InputFile { .. }
+        )
+    }
+
+    /// Check if this content item is an output (from assistant)
+    pub fn is_output(&self) -> bool {
+        matches!(
+            self,
+            ResponseContentItem::OutputText { .. } | ResponseContentItem::ToolCalls { .. }
+        )
+    }
+
+    /// Get text content if available
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            ResponseContentItem::InputText { text } => Some(text),
+            ResponseContentItem::OutputText { text, .. } => Some(text),
+            _ => None,
+        }
+    }
+}
+
+/// Output content from assistant (output-only variants).
+///
+/// This type is used for type-safe operations on assistant outputs only.
+/// It cannot contain input variants, providing compile-time safety.
+/// Used in streaming events and response output items.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type")]
+pub enum ResponseOutputContent {
+    #[serde(rename = "output_text")]
+    OutputText {
+        text: String,
+        annotations: Vec<TextAnnotation>,
+        #[serde(default)]
+        logprobs: Vec<serde_json::Value>,
+    },
+    #[serde(rename = "tool_calls")]
+    ToolCalls {
+        tool_calls: Vec<ResponseOutputToolCall>,
     },
 }
 

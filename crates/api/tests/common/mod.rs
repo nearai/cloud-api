@@ -1,9 +1,6 @@
 #![allow(dead_code)]
 
-use api::{
-    build_app_with_config, init_auth_services, init_domain_services,
-    models::BatchUpdateModelApiRequest,
-};
+use api::{build_app_with_config, init_auth_services, models::BatchUpdateModelApiRequest};
 use base64::Engine;
 use chrono::Utc;
 use config::ApiConfig;
@@ -169,11 +166,16 @@ pub async fn setup_test_server() -> axum_test::TestServer {
     assert_mock_user_in_db(&database).await;
 
     let auth_components = init_auth_services(database.clone(), &config);
+
+    // Use mock inference providers instead of real VLLM to avoid flakiness
+    // This leverages the existing MockProvider from inference_providers::mock
+    let inference_provider_pool = api::init_inference_providers_with_mocks(&config).await;
     let metrics_service = Arc::new(services::metrics::MockMetricsService);
-    let domain_services = init_domain_services(
+    let domain_services = api::init_domain_services_with_pool(
         database.clone(),
         &config,
         auth_components.organization_service.clone(),
+        inference_provider_pool,
         metrics_service,
     )
     .await;
@@ -334,7 +336,20 @@ pub async fn setup_qwen_model(server: &axum_test::TestServer) -> String {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(server, batch, get_session_id()).await;
+    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    // Verify that the model was updated with the correct pricing
+    assert_eq!(updated.len(), 1, "Should have updated 1 model");
+    assert_eq!(
+        updated[0].input_cost_per_token.amount, 1000000,
+        "Input cost per token should be 1000000"
+    );
+    assert_eq!(
+        updated[0].output_cost_per_token.amount, 2000000,
+        "Output cost per token should be 2000000"
+    );
+    // Delay to ensure database writes are fully committed and visible on other connections
+    // This is necessary because tests share the same database but may use different connection pool instances
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string()
 }
 

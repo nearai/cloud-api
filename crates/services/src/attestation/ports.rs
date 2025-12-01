@@ -4,7 +4,12 @@ use async_trait::async_trait;
 #[async_trait]
 pub trait AttestationServiceTrait: Send + Sync {
     /// Get a chat signature from the database only
-    async fn get_chat_signature(&self, chat_id: &str) -> Result<ChatSignature, AttestationError>;
+    /// signing_algo: Optional signing algorithm ("ed25519" or "ecdsa"), defaults to "ecdsa" if None
+    async fn get_chat_signature(
+        &self,
+        chat_id: &str,
+        signing_algo: Option<String>,
+    ) -> Result<ChatSignature, AttestationError>;
 
     /// Fetch signature from provider and store it in the database
     /// This should be called when a completion finishes
@@ -15,13 +20,12 @@ pub trait AttestationServiceTrait: Send + Sync {
 
     /// Store a response signature directly (for response streams)
     /// Creates a signature with text format "request_hash:response_hash"
-    /// signing_algo: Optional signing algorithm ("ed25519" or "ecdsa"), defaults to "ed25519"
+    /// Stores both ECDSA and ED25519 signatures
     async fn store_response_signature(
         &self,
         response_id: &str,
         request_hash: String,
         response_hash: String,
-        signing_algo: Option<String>,
     ) -> Result<(), AttestationError>;
 
     async fn get_attestation_report(
@@ -31,6 +35,13 @@ pub trait AttestationServiceTrait: Send + Sync {
         nonce: Option<String>,
         signing_address: Option<String>,
     ) -> Result<AttestationReport, AttestationError>;
+
+    /// Verify a VPC shared secret signature
+    async fn verify_vpc_signature(
+        &self,
+        timestamp: i64,
+        signature: String,
+    ) -> Result<bool, AttestationError>;
 }
 
 #[async_trait]
@@ -40,5 +51,9 @@ pub trait AttestationRepository: Send + Sync {
         chat_id: &str,
         signature: ChatSignature,
     ) -> Result<(), AttestationError>;
-    async fn get_chat_signature(&self, chat_id: &str) -> Result<ChatSignature, AttestationError>;
+    async fn get_chat_signature(
+        &self,
+        chat_id: &str,
+        signing_algo: &str,
+    ) -> Result<ChatSignature, AttestationError>;
 }

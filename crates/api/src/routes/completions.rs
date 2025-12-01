@@ -14,6 +14,7 @@ use services::completions::ports::{
     CompletionMessage, CompletionRequest as ServiceCompletionRequest,
 };
 use std::convert::Infallible;
+use std::sync::Arc;
 use tracing::debug;
 use utoipa;
 use uuid::Uuid;
@@ -153,6 +154,9 @@ pub async fn chat_completions(
             .into_response();
     }
 
+    // Clone request_hash before moving body_hash
+    let request_hash = body_hash.hash.clone();
+
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
     let service_request = convert_chat_request_to_service(
@@ -166,6 +170,9 @@ pub async fn chat_completions(
 
     // Check if streaming is requested
     if request.stream == Some(true) {
+        let inference_provider_pool = app_state.inference_provider_pool.clone();
+        let attestation_service = app_state.attestation_service.clone();
+
         // Call the streaming completion service
         match app_state
             .completion_service
@@ -173,29 +180,137 @@ pub async fn chat_completions(
             .await
         {
             Ok(stream) => {
+                // Accumulate all SSE bytes for response hash computation
+                let accumulated_bytes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+                let chat_id_state = Arc::new(tokio::sync::Mutex::new(None::<String>));
+
+                let accumulated_clone = accumulated_bytes.clone();
+                let chat_id_clone = chat_id_state.clone();
+
                 // Convert to raw bytes stream with proper SSE formatting
+                let pool_clone = inference_provider_pool.clone();
+                let req_hash_clone = request_hash.clone();
+                let pool_clone2 = pool_clone.clone();
+                let req_hash_clone2 = req_hash_clone.clone();
+                let attestation_clone = attestation_service.clone();
                 let byte_stream = stream
-                    .map(|result| match result {
-                        Ok(event) => {
-                            // raw_bytes contains "data: {...}\n", extract just the JSON part
-                            let raw_str = String::from_utf8_lossy(&event.raw_bytes);
-                            let json_data = raw_str
-                                .trim()
-                                .strip_prefix("data: ")
-                                .unwrap_or(raw_str.trim())
-                                .to_string();
-                            tracing::debug!("Completion stream event: {}", json_data);
-                            // Format as SSE event with proper newlines
-                            Ok::<Bytes, Infallible>(Bytes::from(format!("data: {json_data}\n\n")))
-                        }
-                        Err(e) => {
-                            tracing::error!("Completion stream error");
-                            Ok::<Bytes, Infallible>(Bytes::from(format!("data: error: {e}\n\n")))
+                    .then(move |result| {
+                        let accumulated_inner = accumulated_clone.clone();
+                        let chat_id_inner = chat_id_clone.clone();
+                        let pool_inner = pool_clone.clone();
+                        let req_hash_inner = req_hash_clone.clone();
+                        async move {
+                            match result {
+                                Ok(event) => {
+                                    // Extract chat_id from the first chunk if available
+                                    if let Ok(chunk_str) =
+                                        String::from_utf8(event.raw_bytes.to_vec())
+                                    {
+                                        if let Some(data) = chunk_str.strip_prefix("data: ") {
+                                            if let Ok(serde_json::Value::Object(obj)) =
+                                                serde_json::from_str::<serde_json::Value>(
+                                                    data.trim(),
+                                                )
+                                            {
+                                                if let Some(serde_json::Value::String(id)) =
+                                                    obj.get("id")
+                                                {
+                                                    let id_clone = id.clone();
+                                                    let mut cid = chat_id_inner.lock().await;
+                                                    if cid.is_none() {
+                                                        *cid = Some(id_clone.clone());
+                                                        // Register request hash immediately (response hash will be registered later)
+                                                        // This ensures InterceptStream can find the hashes when it stores the signature
+                                                        let pool_reg = pool_inner.clone();
+                                                        let req_hash_reg = req_hash_inner.clone();
+                                                        tokio::spawn(async move {
+                                                            // Register with empty response hash for now, will update later
+                                                            pool_reg
+                                                                .register_signature_hashes_for_chat(
+                                                                    &id_clone,
+                                                                    req_hash_reg,
+                                                                    "pending".to_string(),
+                                                                )
+                                                                .await;
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // raw_bytes contains "data: {...}\n", extract just the JSON part
+                                    let raw_str = String::from_utf8_lossy(&event.raw_bytes);
+                                    let json_data = raw_str
+                                        .trim()
+                                        .strip_prefix("data: ")
+                                        .unwrap_or(raw_str.trim())
+                                        .to_string();
+                                    tracing::debug!("Completion stream event: {}", json_data);
+                                    // Format as SSE event with proper newlines
+                                    let sse_bytes = Bytes::from(format!("data: {json_data}\n\n"));
+                                    accumulated_inner.lock().await.extend_from_slice(&sse_bytes);
+                                    Ok::<Bytes, Infallible>(sse_bytes)
+                                }
+                                Err(e) => {
+                                    tracing::error!("Completion stream error");
+                                    Ok::<Bytes, Infallible>(Bytes::from(format!(
+                                        "data: error: {e}\n\n"
+                                    )))
+                                }
+                            }
                         }
                     })
                     .chain(futures::stream::once(async move {
-                        // Send [DONE] with 3 newlines total (1 after [DONE], then 2 more for proper SSE termination)
-                        Ok::<Bytes, Infallible>(Bytes::from_static(b"data: [DONE]\n\n"))
+                        let done_bytes = Bytes::from_static(b"data: [DONE]\n\n");
+                        accumulated_bytes
+                            .lock()
+                            .await
+                            .extend_from_slice(&done_bytes);
+
+                        // Compute response hash from accumulated bytes
+                        let bytes_accumulated = accumulated_bytes.lock().await.clone();
+                        let response_hash = {
+                            use sha2::{Digest, Sha256};
+                            let mut hasher = Sha256::new();
+                            hasher.update(&bytes_accumulated);
+                            format!("{:x}", hasher.finalize())
+                        };
+
+                        // Update response hash in InferenceProviderPool and database
+                        if let Some(chat_id) = chat_id_state.lock().await.clone() {
+                            let pool_final = pool_clone2.clone();
+                            let req_hash_final = req_hash_clone2.clone();
+                            let resp_hash_final = response_hash.clone();
+                            let attestation_final = attestation_clone.clone();
+
+                            // Update the hashes in the pool
+                            pool_final
+                                .register_signature_hashes_for_chat(
+                                    &chat_id,
+                                    req_hash_final.clone(),
+                                    resp_hash_final.clone(),
+                                )
+                                .await;
+
+                            // Update the signature in the database using store_response_signature
+                            // This ensures the correct signature overwrites any "pending" signature stored by InterceptStream
+                            // The database has ON CONFLICT DO UPDATE, so this will update the existing signature
+                            let chat_id_for_update = chat_id.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = attestation_final.store_response_signature(
+                                    &chat_id_for_update,
+                                    req_hash_final,
+                                    resp_hash_final,
+                                ).await {
+                                    tracing::error!("Failed to update signature with real response hash: {}", e);
+                                } else {
+                                    tracing::debug!("Successfully updated signature with real response hash for chat_id: {}", chat_id_for_update);
+                                }
+                            });
+                        }
+
+                        Ok::<Bytes, Infallible>(done_bytes)
                     }));
 
                 // Return raw streaming response with SSE headers

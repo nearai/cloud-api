@@ -36,6 +36,7 @@ struct ProcessStreamContext {
     web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
     file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
     file_service: Arc<dyn FileServiceTrait>,
+    organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
     /// Source registry for citation resolution
     source_registry: Option<models::SourceRegistry>,
 }
@@ -49,6 +50,7 @@ pub struct ResponseServiceImpl {
     pub web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
     pub file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
     pub file_service: Arc<dyn FileServiceTrait>,
+    pub organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
 }
 
 /// Tag transition states for reasoning content
@@ -70,6 +72,7 @@ impl ResponseServiceImpl {
         web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
         file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
         file_service: Arc<dyn FileServiceTrait>,
+        organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
     ) -> Self {
         Self {
             response_repository,
@@ -80,6 +83,7 @@ impl ResponseServiceImpl {
             web_search_provider,
             file_search_provider,
             file_service,
+            organization_service,
         }
     }
 }
@@ -112,6 +116,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let web_search_provider = self.web_search_provider.clone();
         let file_search_provider = self.file_search_provider.clone();
         let file_service = self.file_service.clone();
+        let organization_service = self.organization_service.clone();
 
         tokio::spawn(async move {
             let context = ProcessStreamContext {
@@ -128,6 +133,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 web_search_provider,
                 file_search_provider,
                 file_service,
+                organization_service,
                 source_registry: None,
             };
 
@@ -464,7 +470,7 @@ impl ResponseServiceImpl {
             created_at: ctx.created_at,
             status: models::ResponseItemStatus::Completed,
             role: "assistant".to_string(),
-            content: vec![models::ResponseOutputContent::OutputText {
+            content: vec![models::ResponseContentItem::OutputText {
                 text: clean_text,
                 annotations,
                 logprobs: vec![],
@@ -600,6 +606,9 @@ impl ResponseServiceImpl {
             &context.response_items_repository,
             &context.file_service,
             workspace_id_domain.clone(),
+            context.organization_id,
+            context.user_id.clone(),
+            &context.organization_service,
         )
         .await?;
 
@@ -1116,10 +1125,8 @@ impl ResponseServiceImpl {
                     created_at: 0,
                     status: models::ResponseItemStatus::Completed,
                     role: "user".to_string(),
-                    content: vec![models::ResponseOutputContent::OutputText {
+                    content: vec![models::ResponseContentItem::InputText {
                         text: trimmed_text.to_string(),
-                        annotations: vec![],
-                        logprobs: vec![],
                     }],
                     model: model.to_string(),
                 };
@@ -1144,35 +1151,38 @@ impl ResponseServiceImpl {
                     let content = match &input_item.content {
                         models::ResponseContent::Text(text) => {
                             // Trim leading and trailing whitespace
-                            vec![models::ResponseOutputContent::OutputText {
+                            vec![models::ResponseContentItem::InputText {
                                 text: text.trim().to_string(),
-                                annotations: vec![],
-                                logprobs: vec![],
                             }]
                         }
                         models::ResponseContent::Parts(parts) => {
-                            // Convert parts to output content
+                            // Convert parts to ResponseContentItem - preserving semantic types
                             parts
                                 .iter()
-                                .filter_map(|part| match part {
+                                .map(|part| match part {
                                     models::ResponseContentPart::InputText { text } => {
                                         // Trim leading and trailing whitespace
-                                        Some(models::ResponseOutputContent::OutputText {
+                                        models::ResponseContentItem::InputText {
                                             text: text.trim().to_string(),
-                                            annotations: vec![],
-                                            logprobs: vec![],
-                                        })
+                                        }
                                     }
-                                    models::ResponseContentPart::InputFile { file_id, .. } => {
-                                        // Store a reference to the file in the output
-                                        Some(models::ResponseOutputContent::OutputText {
-                                            text: format!("[File: {file_id}]"),
-                                            annotations: vec![],
-                                            logprobs: vec![],
-                                        })
+                                    models::ResponseContentPart::InputFile { file_id, detail } => {
+                                        // Store as InputFile to preserve semantic type
+                                        models::ResponseContentItem::InputFile {
+                                            file_id: file_id.clone(),
+                                            detail: detail.clone(),
+                                        }
                                     }
-                                    // TODO: Handle other content types (images, etc.)
-                                    _ => None,
+                                    models::ResponseContentPart::InputImage {
+                                        image_url,
+                                        detail,
+                                    } => {
+                                        // Store as InputImage to preserve semantic type
+                                        models::ResponseContentItem::InputImage {
+                                            image_url: image_url.clone(),
+                                            detail: detail.clone(),
+                                        }
+                                    }
                                 })
                                 .collect()
                         }
@@ -1216,16 +1226,46 @@ impl ResponseServiceImpl {
     }
 
     /// Load conversation context based on conversation_id or previous_response_id
+    #[allow(clippy::too_many_arguments)]
     async fn load_conversation_context(
         request: &models::CreateResponseRequest,
         conversation_service: &Arc<dyn ConversationServiceTrait>,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
         file_service: &Arc<dyn FileServiceTrait>,
         workspace_id: crate::workspace::WorkspaceId,
+        organization_id: uuid::Uuid,
+        user_id: crate::UserId,
+        organization_service: &Arc<dyn crate::organization::OrganizationServiceTrait>,
     ) -> Result<Vec<crate::completions::ports::CompletionMessage>, errors::ResponseError> {
         use crate::completions::ports::CompletionMessage;
 
         let mut messages = Vec::new();
+
+        // Fetch organization system prompt if available
+        let org_system_prompt = match organization_service
+            .get_system_prompt(
+                crate::organization::OrganizationId(organization_id),
+                user_id,
+            )
+            .await
+        {
+            Ok(prompt) => prompt,
+            Err(e) => {
+                tracing::warn!("Failed to fetch organization system prompt: {}", e);
+                None
+            }
+        };
+
+        // Prepend organization system prompt if it exists
+        if let Some(prompt) = org_system_prompt {
+            if !prompt.is_empty() {
+                messages.push(CompletionMessage {
+                    role: "system".to_string(),
+                    content: prompt,
+                });
+                tracing::debug!("Prepended organization system prompt to messages");
+            }
+        }
 
         // Add UTC time context to system message
         let now = chrono::Utc::now();
@@ -1301,7 +1341,8 @@ impl ResponseServiceImpl {
                     let text = content
                         .iter()
                         .filter_map(|part| match part {
-                            models::ResponseOutputContent::OutputText { text, .. } => {
+                            models::ResponseContentItem::InputText { text } => Some(text.clone()),
+                            models::ResponseContentItem::OutputText { text, .. } => {
                                 Some(text.clone())
                             }
                             _ => None,

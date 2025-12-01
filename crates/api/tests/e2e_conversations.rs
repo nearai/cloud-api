@@ -631,6 +631,96 @@ async fn test_create_conversation_items_text_content() {
 }
 
 #[tokio::test]
+async fn test_create_conversation_items_with_file_content() {
+    let server = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    // Create a conversation
+    let conversation = create_conversation(&server, api_key.clone()).await;
+
+    // Test: Create item with file content
+    let create_items_response = server
+        .post(format!("/v1/conversations/{}/items", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "items": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Could you read the file?"},
+                        {"type": "input_file", "file_id": "32af7670-f5b9-47a0-a952-20d5d3831e67"},
+                        {"type": "input_text", "text": "Discussion about [file-32af7670f5b947a0a95220d5d3831e67] in text"}
+                    ]
+                }
+            ]
+        }))
+        .await;
+
+    assert_eq!(create_items_response.status_code(), 200);
+    let items_response = create_items_response.json::<api::models::ConversationItemList>();
+    assert_eq!(items_response.data.len(), 1);
+
+    // Verify the item content - this is the key test
+    match &items_response.data[0] {
+        ConversationItem::Message { role, content, .. } => {
+            assert_eq!(role, "user");
+            assert_eq!(content.len(), 3);
+
+            // First content part should be text
+            match &content[0] {
+                ConversationContentPart::InputText { text } => {
+                    assert_eq!(text, "Could you read the file?");
+                }
+                _ => panic!("Expected InputText content part"),
+            }
+
+            // Second content part should be file (valid UUID)
+            match &content[1] {
+                ConversationContentPart::InputFile { file_id, detail } => {
+                    assert_eq!(file_id, "32af7670-f5b9-47a0-a952-20d5d3831e67");
+                    assert_eq!(detail, &None);
+                }
+                _ => panic!("Expected InputFile content part but got: {:?}", &content[1]),
+            }
+
+            // Third content part should be text (invalid UUID format)
+            match &content[2] {
+                ConversationContentPart::InputText { text } => {
+                    assert_eq!(
+                        text,
+                        "Discussion about [file-32af7670f5b947a0a95220d5d3831e67] in text"
+                    );
+                }
+                _ => panic!(
+                    "Expected InputText for invalid file ID but got: {:?}",
+                    &content[2]
+                ),
+            }
+        }
+        _ => panic!("Expected Message item type"),
+    }
+
+    // Verify items can be retrieved via list endpoint
+    let list_response =
+        list_conversation_items(&server, conversation.id.clone(), api_key.clone()).await;
+
+    // Find our backfilled item with file content
+    let file_item = list_response.data.iter().find(|item| match item {
+        ConversationItem::Message { content, .. } => content
+            .iter()
+            .any(|part| matches!(part, ConversationContentPart::InputFile { .. })),
+        _ => false,
+    });
+    assert!(
+        file_item.is_some(),
+        "Backfilled item with file should be retrievable"
+    );
+
+    println!("✅ File content parsing test passed");
+}
+
+#[tokio::test]
 async fn test_create_conversation_items_different_roles() {
     let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;

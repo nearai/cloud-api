@@ -301,7 +301,6 @@ pub async fn chat_completions(
                                     &chat_id_for_update,
                                     req_hash_final,
                                     resp_hash_final,
-                                    Some("ecdsa".to_string()),
                                 ).await {
                                     tracing::error!("Failed to update signature with real response hash: {}", e);
                                 } else {

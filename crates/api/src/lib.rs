@@ -40,8 +40,7 @@ use services::{
     auth::{AuthService, AuthServiceTrait, MockAuthService, OAuthManager},
     models::ModelsServiceTrait,
 };
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::RwLock;
+use std::sync::Arc;
 use utoipa::OpenApi;
 
 /// Service initialization components
@@ -141,10 +140,15 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
     let workspace_repository = Arc::new(WorkspaceRepository::new(database.pool().clone()))
         as Arc<dyn services::workspace::WorkspaceRepository>;
 
-    // Create OAuth manager
+    // Create OAuth manager and state repository
     tracing::info!("Setting up OAuth providers");
     let oauth_manager = create_oauth_manager(config);
-    let state_store: StateStore = Arc::new(RwLock::new(HashMap::new()));
+
+    // Create OAuth state repository for cross-instance OAuth state sharing
+    let oauth_state_repository = Arc::new(database::repositories::OAuthStateRepository::new(
+        database.pool().clone(),
+    ));
+    let state_store: StateStore = oauth_state_repository;
 
     // Create admin access token repository
     let admin_access_token_repository =

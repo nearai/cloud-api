@@ -4,6 +4,8 @@ use api::routes::auth_vpc::VpcLoginResponse;
 use common::*;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use std::fs;
+use std::path::PathBuf;
 
 // ============================================
 // VPC Login Tests
@@ -19,10 +21,29 @@ fn generate_vpc_signature(timestamp: i64, secret: &str) -> String {
     hex::encode(result.into_bytes())
 }
 
+/// Set up VPC shared secret for testing by creating a temporary file
+/// Returns the path to the temporary file (which will be cleaned up after the test)
+fn setup_vpc_shared_secret(secret: &str) -> PathBuf {
+    // Create a temporary file in the system temp directory
+    let temp_dir = std::env::temp_dir();
+    let file_path = temp_dir.join(format!(
+        "vpc_shared_secret_test_{}.txt",
+        uuid::Uuid::new_v4()
+    ));
+
+    // Write the secret to the file
+    fs::write(&file_path, secret).expect("Failed to write VPC shared secret to temp file");
+
+    // Set the environment variable to point to the file
+    std::env::set_var("VPC_SHARED_SECRET_FILE", file_path.to_str().unwrap());
+
+    file_path
+}
+
 #[tokio::test]
 async fn test_vpc_login_success() {
     // Set the VPC shared secret for this test
-    std::env::set_var("VPC_SHARED_SECRET", "test_vpc_secret_123");
+    setup_vpc_shared_secret("test_vpc_secret_123");
 
     let server = setup_test_server().await;
 
@@ -69,7 +90,7 @@ async fn test_vpc_login_success() {
 
 #[tokio::test]
 async fn test_vpc_login_expired_timestamp() {
-    std::env::set_var("VPC_SHARED_SECRET", "test_vpc_secret_123");
+    setup_vpc_shared_secret("test_vpc_secret_123");
 
     let server = setup_test_server().await;
 
@@ -96,7 +117,7 @@ async fn test_vpc_login_expired_timestamp() {
 
 #[tokio::test]
 async fn test_vpc_login_future_timestamp() {
-    std::env::set_var("VPC_SHARED_SECRET", "test_vpc_secret_123");
+    setup_vpc_shared_secret("test_vpc_secret_123");
 
     let server = setup_test_server().await;
 
@@ -123,7 +144,7 @@ async fn test_vpc_login_future_timestamp() {
 
 #[tokio::test]
 async fn test_vpc_login_invalid_signature() {
-    std::env::set_var("VPC_SHARED_SECRET", "test_vpc_secret_123");
+    setup_vpc_shared_secret("test_vpc_secret_123");
 
     let server = setup_test_server().await;
 
@@ -150,7 +171,7 @@ async fn test_vpc_login_invalid_signature() {
 
 #[tokio::test]
 async fn test_vpc_login_invalid_hex_signature() {
-    std::env::set_var("VPC_SHARED_SECRET", "test_vpc_secret_123");
+    setup_vpc_shared_secret("test_vpc_secret_123");
 
     let server = setup_test_server().await;
 
@@ -175,7 +196,7 @@ async fn test_vpc_login_invalid_hex_signature() {
 
 #[tokio::test]
 async fn test_vpc_login_creates_user_and_resources() {
-    std::env::set_var("VPC_SHARED_SECRET", "test_vpc_secret_123");
+    setup_vpc_shared_secret("test_vpc_secret_123");
 
     let server = setup_test_server().await;
 
@@ -223,7 +244,7 @@ async fn test_vpc_login_creates_user_and_resources() {
 
 #[tokio::test]
 async fn test_vpc_login_api_key_works() {
-    std::env::set_var("VPC_SHARED_SECRET", "test_vpc_secret_123");
+    setup_vpc_shared_secret("test_vpc_secret_123");
 
     let server = setup_test_server().await;
 
@@ -260,7 +281,7 @@ async fn test_vpc_login_api_key_works() {
 
 #[tokio::test]
 async fn test_vpc_login_access_token_works() {
-    std::env::set_var("VPC_SHARED_SECRET", "test_vpc_secret_123");
+    setup_vpc_shared_secret("test_vpc_secret_123");
 
     let server = setup_test_server().await;
 
@@ -302,7 +323,7 @@ async fn test_vpc_login_access_token_works() {
 
 #[tokio::test]
 async fn test_vpc_login_missing_fields() {
-    std::env::set_var("VPC_SHARED_SECRET", "test_vpc_secret_123");
+    setup_vpc_shared_secret("test_vpc_secret_123");
 
     let server = setup_test_server().await;
 

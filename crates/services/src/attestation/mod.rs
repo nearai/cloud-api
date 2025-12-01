@@ -51,9 +51,11 @@ impl AttestationService {
         let vpc_info = load_vpc_info();
 
         // Load VPC shared secret from environment
-        let vpc_shared_secret = std::env::var("VPC_SHARED_SECRET").ok();
+        let vpc_shared_secret = load_vpc_shared_secret();
         if vpc_shared_secret.is_none() {
-            tracing::warn!("VPC_SHARED_SECRET not set, VPC-based authentication will be disabled");
+            tracing::warn!(
+                "Cannot load VPC shared secret. VPC-based authentication will be disabled"
+            );
         }
 
         let mut csprng = OsRng;
@@ -170,6 +172,18 @@ pub fn load_vpc_info() -> Option<VpcInfo> {
             vpc_server_app_id,
             vpc_hostname,
         })
+    } else {
+        None
+    }
+}
+
+/// Load VPC shared secret from file
+pub fn load_vpc_shared_secret() -> Option<String> {
+    if let Ok(path) = std::env::var("VPC_SHARED_SECRET_FILE") {
+        std::fs::read_to_string(path)
+            .map_err(|_| tracing::warn!("Failed to read VPC shared secret file"))
+            .ok()
+            .map(|s| s.trim().to_string())
     } else {
         None
     }
@@ -524,7 +538,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         signature: String,
     ) -> Result<bool, AttestationError> {
         let secret = self.vpc_shared_secret.as_ref().ok_or_else(|| {
-            AttestationError::InternalError("VPC_SHARED_SECRET not configured".to_string())
+            AttestationError::InternalError("Failed to load VPC shared secret".to_string())
         })?;
 
         // Check timestamp freshness (within 30 seconds)

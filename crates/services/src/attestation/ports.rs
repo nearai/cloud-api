@@ -4,7 +4,7 @@ use async_trait::async_trait;
 #[async_trait]
 pub trait AttestationServiceTrait: Send + Sync {
     /// Get a chat signature from the database only
-    /// signing_algo: Optional signing algorithm ("ed25519" or "ecdsa"), defaults to "ed25519" if None
+    /// signing_algo: Optional signing algorithm ("ed25519" or "ecdsa"), defaults to "ecdsa" if None
     async fn get_chat_signature(
         &self,
         chat_id: &str,

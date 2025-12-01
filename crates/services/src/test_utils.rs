@@ -17,7 +17,11 @@ pub struct MockAttestationService;
 
 #[async_trait]
 impl AttestationServiceTrait for MockAttestationService {
-    async fn get_chat_signature(&self, _chat_id: &str) -> Result<ChatSignature, AttestationError> {
+    async fn get_chat_signature(
+        &self,
+        _chat_id: &str,
+        _signing_algo: Option<String>,
+    ) -> Result<ChatSignature, AttestationError> {
         Err(AttestationError::InternalError(
             "Not implemented".to_string(),
         ))
@@ -35,7 +39,6 @@ impl AttestationServiceTrait for MockAttestationService {
         _response_id: &str,
         _request_hash: String,
         _response_hash: String,
-        _signing_algo: Option<String>,
     ) -> Result<(), AttestationError> {
         Ok(())
     }
@@ -50,6 +53,14 @@ impl AttestationServiceTrait for MockAttestationService {
         Err(AttestationError::InternalError(
             "Not implemented".to_string(),
         ))
+    }
+
+    async fn verify_vpc_signature(
+        &self,
+        _timestamp: i64,
+        _signature: String,
+    ) -> Result<bool, AttestationError> {
+        Ok(false)
     }
 }
 

@@ -9,7 +9,6 @@ use serde::Deserialize;
 use services::{
     conversations::{errors::ConversationError, models::ConversationId},
     id_prefixes::PREFIX_CONV,
-    responses::models::TextAnnotation,
 };
 use std::sync::Arc;
 use tracing::debug;

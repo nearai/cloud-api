@@ -232,6 +232,7 @@ pub async fn init_domain_services(
         config,
         organization_service,
         inference_provider_pool,
+        metrics_service,
     )
     .await
 }
@@ -243,6 +244,7 @@ pub async fn init_domain_services_with_pool(
     config: &ApiConfig,
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+    metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
     // Create shared repositories
     let conversation_repo = Arc::new(database::PgConversationRepository::new(

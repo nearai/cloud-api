@@ -282,8 +282,11 @@ impl ports::AttestationServiceTrait for AttestationService {
             let duration = start_time.elapsed();
             self.metrics_service
                 .record_count(METRIC_VERIFICATION_SUCCESS, 1, &[&env_tag]);
-            self.metrics_service
-                .record_latency(METRIC_VERIFICATION_DURATION, duration, &[&env_tag]);
+            self.metrics_service.record_latency(
+                METRIC_VERIFICATION_DURATION,
+                duration,
+                &[&env_tag],
+            );
 
             return Ok(());
         }

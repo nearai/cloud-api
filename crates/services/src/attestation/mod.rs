@@ -112,8 +112,7 @@ impl AttestationService {
                 &self.ecdsa_verifying_key,
             )),
             signing_algo => Err(AttestationError::InvalidParameter(format!(
-                "Unknown signing algorithm: {}",
-                signing_algo
+                "Unknown signing algorithm: {signing_algo}"
             ))),
         }
     }
@@ -130,8 +129,7 @@ impl AttestationService {
                 Ok(hex::encode(addr))
             }
             signing_algo => Err(AttestationError::InvalidParameter(format!(
-                "Unknown signing algorithm: {}",
-                signing_algo
+                "Unknown signing algorithm: {signing_algo}"
             ))),
         }
     }
@@ -291,8 +289,7 @@ impl ports::AttestationServiceTrait for AttestationService {
                     Ok((format!("0x{sig_hex}"), addr))
                 }
                 _ => Err(AttestationError::InvalidParameter(format!(
-                    "Unknown signing algorithm: {}",
-                    algo
+                    "Unknown signing algorithm: {algo}"
                 ))),
             }?;
 

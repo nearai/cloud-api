@@ -485,6 +485,8 @@ pub fn build_app_with_config(
     let invitation_routes =
         build_invitation_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
+    let auth_vpc_routes = build_auth_vpc_routes(app_state.clone());
+
     let files_routes =
         build_files_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
@@ -508,10 +510,21 @@ pub fn build_app_with_config(
                 .merge(model_routes)
                 .merge(admin_routes)
                 .merge(invitation_routes)
+                .merge(auth_vpc_routes)
                 .merge(files_routes)
                 .merge(health_routes),
         )
         .merge(openapi_routes)
+}
+
+/// Build VPC authentication routes
+pub fn build_auth_vpc_routes(app_state: AppState) -> Router {
+    use crate::routes::auth_vpc::vpc_login;
+    use axum::routing::post;
+
+    Router::new()
+        .route("/auth/vpc/login", post(vpc_login))
+        .with_state(app_state)
 }
 
 /// Build invitation routes with selective auth

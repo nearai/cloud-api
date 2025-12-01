@@ -132,7 +132,11 @@ pub trait InferenceProvider {
         params: CompletionParams,
     ) -> Result<StreamingResult, CompletionError>;
 
-    async fn get_signature(&self, chat_id: &str) -> Result<ChatSignature, CompletionError>;
+    async fn get_signature(
+        &self,
+        chat_id: &str,
+        signing_algo: Option<String>,
+    ) -> Result<ChatSignature, CompletionError>;
 
     async fn get_attestation_report(
         &self,

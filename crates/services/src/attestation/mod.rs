@@ -218,7 +218,51 @@ impl ports::AttestationServiceTrait for AttestationService {
                 AttestationError::ProviderError(format!("No provider found for chat_id: {chat_id}"))
             })?;
 
-        // Fetch and store both ECDSA and ED25519 signatures from provider
+        // For MockProvider: Check if hashes are registered in the pool first
+        // This allows the route handler to register hashes before InterceptStream stores the signature
+        if let Some((request_hash, response_hash)) = self
+            .inference_provider_pool
+            .get_signature_hashes_for_chat(chat_id)
+            .await
+        {
+            // Use the registered hashes to create signature in correct format
+            let signature_text = format!("{request_hash}:{response_hash}");
+
+            // Generate and store both ECDSA and ED25519 signatures for MockProvider
+            for algo in ["ecdsa", "ed25519"] {
+                // Generate a deterministic mock signature based on the hashes
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                signature_text.hash(&mut hasher);
+                algo.hash(&mut hasher);
+                let sig_hash = format!("{:x}", hasher.finish());
+
+                let signature = ChatSignature {
+                    text: signature_text.clone(),
+                    signature: format!("0x{sig_hash}"),
+                    signing_address: "mock-address".to_string(),
+                    signing_algo: algo.to_string(),
+                };
+
+                // Store in repository
+                self.repository
+                    .add_chat_signature(chat_id, signature)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(
+                            "Failed to store chat signature in repository for algorithm: {}",
+                            algo
+                        );
+                        AttestationError::RepositoryError(e.to_string())
+                    })?;
+            }
+
+            return Ok(());
+        }
+
+        // Fallback: Fetch and store both ECDSA and ED25519 signatures from provider
+        // (for non-MockProvider or if hashes not registered)
         for algo in ["ecdsa", "ed25519"] {
             let provider_signature = provider
                 .get_signature(chat_id, Some(algo.to_string()))

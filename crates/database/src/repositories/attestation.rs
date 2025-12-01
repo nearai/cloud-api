@@ -51,7 +51,7 @@ impl AttestationRepository for PgAttestationRepository {
             .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
         client
             .execute(
-                "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo) VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (chat_id, signing_algo) DO UPDATE SET text = EXCLUDED.text, signature = EXCLUDED.signature, signing_address = EXCLUDED.signing_address, updated_at = NOW()",
                 &[&chat_id, &signature.text, &signature.signature, &signature.signing_address, &signature.signing_algo],
             )
             .await

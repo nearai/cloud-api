@@ -1,7 +1,10 @@
 use crate::pool::DbPool;
+use crate::repositories::utils::map_db_error;
+use crate::retry_db;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
+use services::common::RepositoryError;
 use services::conversations::models::{Conversation, ConversationId};
 use services::conversations::ports::ConversationRepository;
 use services::workspace::WorkspaceId;
@@ -48,16 +51,18 @@ impl ConversationRepository for PgConversationRepository {
         api_key_id: uuid::Uuid,
         metadata: serde_json::Value,
     ) -> Result<Conversation> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
         let id = Uuid::new_v4();
-        let now = Utc::now();
 
-        let row = client
+        let row = retry_db!("create_new_conversation", {
+            let now = Utc::now();
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
             .query_one(
                 r#"
             INSERT INTO conversations (id, workspace_id, api_key_id, metadata, created_at, updated_at)
@@ -67,7 +72,8 @@ impl ConversationRepository for PgConversationRepository {
                 &[&id, &workspace_id.0, &api_key_id, &metadata, &now, &now],
             )
             .await
-            .context("Failed to create conversation")?;
+            .map_err(map_db_error)
+        })?;
 
         debug!(
             "Created conversation: {} for workspace: {} with api_key: {}",
@@ -82,19 +88,22 @@ impl ConversationRepository for PgConversationRepository {
         id: ConversationId,
         workspace_id: WorkspaceId,
     ) -> Result<Option<Conversation>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("get_conversation_by_id", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
+            client
             .query_opt(
                 "SELECT * FROM conversations WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
                 &[&id.0, &workspace_id.0],
             )
             .await
-            .context("Failed to query conversation")?;
+            .map_err(map_db_error)
+        })?;
 
         match row {
             Some(row) => Ok(Some(self.row_to_conversation(row)?)),
@@ -109,26 +118,28 @@ impl ConversationRepository for PgConversationRepository {
         workspace_id: WorkspaceId,
         metadata: serde_json::Value,
     ) -> Result<Option<Conversation>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("update_conversation_metadata", {
+            let now = Utc::now();
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let now = Utc::now();
-
-        let row = client
-            .query_opt(
-                r#"
-            UPDATE conversations 
+            client
+                .query_opt(
+                    r#"
+            UPDATE conversations
             SET metadata = $3, updated_at = $4
             WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL
             RETURNING *
             "#,
-                &[&id.0, &workspace_id.0, &metadata, &now],
-            )
-            .await
-            .context("Failed to update conversation")?;
+                    &[&id.0, &workspace_id.0, &metadata, &now],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         match row {
             Some(row) => {
@@ -149,27 +160,29 @@ impl ConversationRepository for PgConversationRepository {
         workspace_id: WorkspaceId,
         is_pinned: bool,
     ) -> Result<Option<Conversation>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("set_conversation_pinned", {
+            let now = Utc::now();
+            let pinned_at = if is_pinned { Some(now) } else { None };
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let now = Utc::now();
-        let pinned_at = if is_pinned { Some(now) } else { None };
-
-        let row = client
-            .query_opt(
-                r#"
-            UPDATE conversations 
+            client
+                .query_opt(
+                    r#"
+            UPDATE conversations
             SET pinned_at = $3, updated_at = $4
             WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL
             RETURNING *
             "#,
-                &[&id.0, &workspace_id.0, &pinned_at, &now],
-            )
-            .await
-            .context("Failed to update conversation pinned status")?;
+                    &[&id.0, &workspace_id.0, &pinned_at, &now],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         match row {
             Some(row) => {
@@ -190,27 +203,29 @@ impl ConversationRepository for PgConversationRepository {
         workspace_id: WorkspaceId,
         is_archived: bool,
     ) -> Result<Option<Conversation>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("set_conversation_archived", {
+            let now = Utc::now();
+            let archived_at = if is_archived { Some(now) } else { None };
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let now = Utc::now();
-        let archived_at = if is_archived { Some(now) } else { None };
-
-        let row = client
-            .query_opt(
-                r#"
-            UPDATE conversations 
+            client
+                .query_opt(
+                    r#"
+            UPDATE conversations
             SET archived_at = $3, updated_at = $4
             WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL
             RETURNING *
             "#,
-                &[&id.0, &workspace_id.0, &archived_at, &now],
-            )
-            .await
-            .context("Failed to update conversation archived status")?;
+                    &[&id.0, &workspace_id.0, &archived_at, &now],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         match row {
             Some(row) => {
@@ -232,14 +247,17 @@ impl ConversationRepository for PgConversationRepository {
         workspace_id: WorkspaceId,
         api_key_id: uuid::Uuid,
     ) -> Result<Option<Conversation>> {
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
         let new_conv_id = Uuid::new_v4();
         let now = Utc::now();
+
+        // Get database client with retry
+        let mut client = retry_db!("get_db_client_for_clone", {
+            self.pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)
+        })?;
 
         // Start a transaction for atomic cloning
         let transaction = client
@@ -442,21 +460,23 @@ impl ConversationRepository for PgConversationRepository {
 
     /// Soft delete a conversation (sets deleted_at timestamp)
     async fn delete(&self, id: ConversationId, workspace_id: WorkspaceId) -> Result<bool> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let result = retry_db!("delete_conversation", {
+            let now = Utc::now();
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let now = Utc::now();
-
-        let result = client
+            client
              .execute(
                  "UPDATE conversations SET deleted_at = $3, updated_at = $4 WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
                  &[&id.0, &workspace_id.0, &now, &now],
              )
              .await
-             .context("Failed to soft delete conversation")?;
+             .map_err(map_db_error)
+        })?;
 
         if result > 0 {
             debug!(
@@ -475,23 +495,26 @@ impl ConversationRepository for PgConversationRepository {
         ids: Vec<ConversationId>,
         workspace_id: WorkspaceId,
     ) -> Result<Vec<Conversation>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
         // Extract raw UUIDs from ConversationId wrappers
         let uuid_ids: Vec<Uuid> = ids.into_iter().map(|id| id.0).collect();
 
         // Query with ANY() for efficient batch retrieval
-        let rows = client
+        let rows = retry_db!("batch_get_conversations_by_ids", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
              .query(
                  "SELECT * FROM conversations WHERE id = ANY($1) AND workspace_id = $2 AND deleted_at IS NULL",
                  &[&uuid_ids, &workspace_id.0],
              )
              .await
-             .context("Failed to batch query conversations")?;
+             .map_err(map_db_error)
+        })?;
 
         debug!(
             "Batch retrieved {} conversations (requested {}) for workspace: {}",

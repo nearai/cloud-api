@@ -1,8 +1,11 @@
 use crate::models::{InvitationStatus, OrganizationInvitation, OrganizationRole};
 use crate::pool::DbPool;
+use crate::repositories::utils::map_db_error;
+use crate::retry_db;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
+use services::common::RepositoryError;
 use services::organization::ports::{
     CreateInvitationRequest, InvitationStatus as ServicesInvitationStatus,
     OrganizationInvitation as ServicesInvitation, OrganizationInvitationRepository,
@@ -90,12 +93,6 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
         request: CreateInvitationRequest,
         invited_by: Uuid,
     ) -> Result<ServicesInvitation> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
         let token = Self::generate_token();
         let role = self.domain_to_db_role(request.role);
         let expires_at = Utc::now() + Duration::hours(request.expires_in_hours);
@@ -105,36 +102,45 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
             request.email, org_id, role
         );
 
-        // First, cancel any existing pending invitations for this email+org
-        client
-            .execute(
-                "UPDATE organization_invitations 
-                 SET status = 'expired' 
-                 WHERE organization_id = $1 AND email = $2 AND status = 'pending'",
-                &[&org_id, &request.email],
-            )
-            .await
-            .context("Failed to expire existing invitations")?;
+        let row = retry_db!("create_organization_invitation", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        // Create new invitation
-        let row = client
-            .query_one(
-                "INSERT INTO organization_invitations 
-                 (organization_id, email, role, invited_by_user_id, token, expires_at)
-                 VALUES ($1, $2, $3, $4, $5, $6)
-                 RETURNING id, organization_id, email, role, invited_by_user_id, status, token, 
-                           created_at, expires_at, responded_at",
-                &[
-                    &org_id,
-                    &request.email,
-                    &role.to_string(),
-                    &invited_by,
-                    &token,
-                    &expires_at,
-                ],
-            )
-            .await
-            .context("Failed to insert invitation")?;
+            // First, cancel any existing pending invitations for this email+org
+            client
+                .execute(
+                    "UPDATE organization_invitations
+                     SET status = 'expired'
+                     WHERE organization_id = $1 AND email = $2 AND status = 'pending'",
+                    &[&org_id, &request.email],
+                )
+                .await
+                .map_err(map_db_error)?;
+
+            // Create new invitation
+            client
+                .query_one(
+                    "INSERT INTO organization_invitations
+                     (organization_id, email, role, invited_by_user_id, token, expires_at)
+                     VALUES ($1, $2, $3, $4, $5, $6)
+                     RETURNING id, organization_id, email, role, invited_by_user_id, status, token,
+                               created_at, expires_at, responded_at",
+                    &[
+                        &org_id,
+                        &request.email,
+                        &role.to_string(),
+                        &invited_by,
+                        &token,
+                        &expires_at,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         let db_inv = OrganizationInvitation {
             id: row.get("id"),
@@ -153,22 +159,25 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
     }
 
     async fn get_by_id(&self, id: Uuid) -> Result<Option<ServicesInvitation>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("get_organization_invitation_by_id", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_opt(
-                "SELECT id, organization_id, email, role, invited_by_user_id, status, token, 
-                        created_at, expires_at, responded_at
-                 FROM organization_invitations
-                 WHERE id = $1",
-                &[&id],
-            )
-            .await
-            .context("Failed to query invitation")?;
+            client
+                .query_opt(
+                    "SELECT id, organization_id, email, role, invited_by_user_id, status, token,
+                            created_at, expires_at, responded_at
+                     FROM organization_invitations
+                     WHERE id = $1",
+                    &[&id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         match row {
             Some(r) => {
@@ -193,22 +202,25 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
     }
 
     async fn get_by_token(&self, token: &str) -> Result<Option<ServicesInvitation>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("get_organization_invitation_by_token", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_opt(
-                "SELECT id, organization_id, email, role, invited_by_user_id, status, token, 
-                        created_at, expires_at, responded_at
-                 FROM organization_invitations
-                 WHERE token = $1",
-                &[&token],
-            )
-            .await
-            .context("Failed to query invitation by token")?;
+            client
+                .query_opt(
+                    "SELECT id, organization_id, email, role, invited_by_user_id, status, token,
+                            created_at, expires_at, responded_at
+                     FROM organization_invitations
+                     WHERE token = $1",
+                    &[&token],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         match row {
             Some(r) => {
@@ -237,38 +249,42 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
         org_id: Uuid,
         status: Option<ServicesInvitationStatus>,
     ) -> Result<Vec<ServicesInvitation>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let db_status = status.map(|s| self.domain_to_db_status(s));
 
-        let rows = if let Some(status) = status {
-            let db_status = self.domain_to_db_status(status);
-            client
-                .query(
-                    "SELECT id, organization_id, email, role, invited_by_user_id, status, token, 
-                            created_at, expires_at, responded_at
-                     FROM organization_invitations
-                     WHERE organization_id = $1 AND status = $2
-                     ORDER BY created_at DESC",
-                    &[&org_id, &db_status.to_string()],
-                )
+        let rows = retry_db!("list_organization_invitations_by_org", {
+            let client = self
+                .pool
+                .get()
                 .await
-                .context("Failed to list invitations")?
-        } else {
-            client
-                .query(
-                    "SELECT id, organization_id, email, role, invited_by_user_id, status, token, 
-                            created_at, expires_at, responded_at
-                     FROM organization_invitations
-                     WHERE organization_id = $1
-                     ORDER BY created_at DESC",
-                    &[&org_id],
-                )
-                .await
-                .context("Failed to list invitations")?
-        };
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            if let Some(ref db_status) = db_status {
+                client
+                    .query(
+                        "SELECT id, organization_id, email, role, invited_by_user_id, status, token,
+                                created_at, expires_at, responded_at
+                         FROM organization_invitations
+                         WHERE organization_id = $1 AND status = $2
+                         ORDER BY created_at DESC",
+                        &[&org_id, &db_status.to_string()],
+                    )
+                    .await
+                    .map_err(map_db_error)
+            } else {
+                client
+                    .query(
+                        "SELECT id, organization_id, email, role, invited_by_user_id, status, token,
+                                created_at, expires_at, responded_at
+                         FROM organization_invitations
+                         WHERE organization_id = $1
+                         ORDER BY created_at DESC",
+                        &[&org_id],
+                    )
+                    .await
+                    .map_err(map_db_error)
+            }
+        })?;
 
         let mut invitations = Vec::new();
         for r in rows {
@@ -295,38 +311,42 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
         email: &str,
         status: Option<ServicesInvitationStatus>,
     ) -> Result<Vec<ServicesInvitation>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let db_status = status.map(|s| self.domain_to_db_status(s));
 
-        let rows = if let Some(status) = status {
-            let db_status = self.domain_to_db_status(status);
-            client
-                .query(
-                    "SELECT id, organization_id, email, role, invited_by_user_id, status, token, 
-                            created_at, expires_at, responded_at
-                     FROM organization_invitations
-                     WHERE email = $1 AND status = $2
-                     ORDER BY created_at DESC",
-                    &[&email, &db_status.to_string()],
-                )
+        let rows = retry_db!("list_organization_invitations_by_email", {
+            let client = self
+                .pool
+                .get()
                 .await
-                .context("Failed to list invitations")?
-        } else {
-            client
-                .query(
-                    "SELECT id, organization_id, email, role, invited_by_user_id, status, token, 
-                            created_at, expires_at, responded_at
-                     FROM organization_invitations
-                     WHERE email = $1
-                     ORDER BY created_at DESC",
-                    &[&email],
-                )
-                .await
-                .context("Failed to list invitations")?
-        };
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            if let Some(ref db_status) = db_status {
+                client
+                    .query(
+                        "SELECT id, organization_id, email, role, invited_by_user_id, status, token,
+                                created_at, expires_at, responded_at
+                         FROM organization_invitations
+                         WHERE email = $1 AND status = $2
+                         ORDER BY created_at DESC",
+                        &[&email, &db_status.to_string()],
+                    )
+                    .await
+                    .map_err(map_db_error)
+            } else {
+                client
+                    .query(
+                        "SELECT id, organization_id, email, role, invited_by_user_id, status, token,
+                                created_at, expires_at, responded_at
+                         FROM organization_invitations
+                         WHERE email = $1
+                         ORDER BY created_at DESC",
+                        &[&email],
+                    )
+                    .await
+                    .map_err(map_db_error)
+            }
+        })?;
 
         let mut invitations = Vec::new();
         for r in rows {
@@ -353,25 +373,28 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
         id: Uuid,
         status: ServicesInvitationStatus,
     ) -> Result<ServicesInvitation> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
         let db_status = self.domain_to_db_status(status);
 
-        let row = client
-            .query_one(
-                "UPDATE organization_invitations 
-                 SET status = $1, responded_at = NOW()
-                 WHERE id = $2
-                 RETURNING id, organization_id, email, role, invited_by_user_id, status, token, 
-                           created_at, expires_at, responded_at",
-                &[&db_status.to_string(), &id],
-            )
-            .await
-            .context("Failed to update invitation status")?;
+        let row = retry_db!("update_organization_invitation_status", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_one(
+                    "UPDATE organization_invitations
+                     SET status = $1, responded_at = NOW()
+                     WHERE id = $2
+                     RETURNING id, organization_id, email, role, invited_by_user_id, status, token,
+                               created_at, expires_at, responded_at",
+                    &[&db_status.to_string(), &id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         let db_inv = OrganizationInvitation {
             id: row.get("id"),
@@ -390,36 +413,42 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
     }
 
     async fn delete(&self, id: Uuid) -> Result<bool> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let rows_affected = retry_db!("delete_organization_invitation", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let rows_affected = client
-            .execute("DELETE FROM organization_invitations WHERE id = $1", &[&id])
-            .await
-            .context("Failed to delete invitation")?;
+            client
+                .execute("DELETE FROM organization_invitations WHERE id = $1", &[&id])
+                .await
+                .map_err(map_db_error)
+        })?;
 
         Ok(rows_affected > 0)
     }
 
     async fn mark_expired(&self) -> Result<usize> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let rows_affected = retry_db!("mark_expired_organization_invitations", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let rows_affected = client
-            .execute(
-                "UPDATE organization_invitations 
-                 SET status = 'expired'
-                 WHERE status = 'pending' AND expires_at < NOW()",
-                &[],
-            )
-            .await
-            .context("Failed to mark expired invitations")?;
+            client
+                .execute(
+                    "UPDATE organization_invitations
+                     SET status = 'expired'
+                     WHERE status = 'pending' AND expires_at < NOW()",
+                    &[],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         Ok(rows_affected as usize)
     }

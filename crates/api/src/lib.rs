@@ -86,6 +86,22 @@ pub async fn init_database(db_config: &config::DatabaseConfig) -> Arc<Database> 
         .expect("Failed to run database migrations");
     tracing::info!("Database migrations completed.");
 
+    // Start periodic pool status logging
+    let pool = database.pool().clone();
+    tokio::spawn(async move {
+        use std::time::Duration;
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            tracing::info!(
+                pool = "database",
+                size = pool.status().size,
+                available = pool.status().available,
+                waiting = pool.status().waiting,
+                "Pool status"
+            );
+        }
+    });
+
     database
 }
 
@@ -208,6 +224,24 @@ pub async fn init_domain_services(
     config: &ApiConfig,
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
 ) -> DomainServices {
+    let inference_provider_pool = init_inference_providers(config).await;
+    init_domain_services_with_pool(
+        database,
+        config,
+        organization_service,
+        inference_provider_pool,
+    )
+    .await
+}
+
+/// Initialize domain services with a provided inference provider pool
+/// This allows tests to inject mock providers without changing core implementations
+pub async fn init_domain_services_with_pool(
+    database: Arc<Database>,
+    config: &ApiConfig,
+    organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
+    inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+) -> DomainServices {
     // Create shared repositories
     let conversation_repo = Arc::new(database::PgConversationRepository::new(
         database.pool().clone(),
@@ -232,9 +266,6 @@ pub async fn init_domain_services(
         response_repo.clone(),
         response_items_repo.clone(),
     ));
-
-    // Create inference provider pool
-    let inference_provider_pool = init_inference_providers(config).await;
 
     // Create attestation service
     let attestation_service = Arc::new(services::attestation::AttestationService::new(
@@ -401,6 +432,52 @@ pub async fn init_inference_providers(
     pool
 }
 
+/// Initialize inference provider pool with mock providers for testing
+/// This function uses the existing MockProvider from inference_providers::mock
+/// and registers it for common test models without changing any implementations
+pub async fn init_inference_providers_with_mocks(
+    _config: &ApiConfig,
+) -> Arc<services::inference_provider_pool::InferenceProviderPool> {
+    use inference_providers::MockProvider;
+    use std::sync::Arc;
+
+    // Create pool with dummy discovery URL (won't be used since we're registering providers directly)
+    let pool = Arc::new(
+        services::inference_provider_pool::InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30 * 60,
+        ),
+    );
+
+    // Create a MockProvider that accepts all models (using new_accept_all)
+    let mock_provider = Arc::new(MockProvider::new_accept_all())
+        as Arc<dyn inference_providers::InferenceProvider + Send + Sync>;
+
+    // Register providers for models commonly used in tests
+    let test_models = vec![
+        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        "zai-org/GLM-4.6".to_string(),
+        "nearai/gpt-oss-120b".to_string(),
+        "dphn/Dolphin-Mistral-24B-Venice-Edition".to_string(),
+    ];
+
+    let providers: Vec<(
+        String,
+        Arc<dyn inference_providers::InferenceProvider + Send + Sync>,
+    )> = test_models
+        .into_iter()
+        .map(|model_id| (model_id, mock_provider.clone()))
+        .collect();
+
+    pool.register_providers(providers).await;
+
+    tracing::info!("Initialized inference provider pool with MockProvider for testing");
+
+    pool
+}
+
 /// Build the complete application router with config
 pub fn build_app_with_config(
     database: Arc<Database>,
@@ -420,6 +497,7 @@ pub fn build_app_with_config(
         usage_service: domain_services.usage_service.clone(),
         user_service: domain_services.user_service.clone(),
         files_service: domain_services.files_service.clone(),
+        inference_provider_pool: domain_services.inference_provider_pool.clone(),
         config: config.clone(),
     };
 

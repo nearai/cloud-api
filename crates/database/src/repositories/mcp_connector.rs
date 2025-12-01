@@ -3,8 +3,11 @@ use crate::models::{
     McpConnectorUsage, UpdateMcpConnectorRequest,
 };
 use crate::pool::DbPool;
+use crate::repositories::utils::map_db_error;
+use crate::retry_db;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
+use services::common::RepositoryError;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
@@ -24,14 +27,7 @@ impl McpConnectorRepository {
         creator_user_id: Uuid,
         request: CreateMcpConnectorRequest,
     ) -> Result<McpConnector> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
         let id = Uuid::new_v4();
-        let now = Utc::now();
 
         // Convert bearer token to auth_config if present
         let auth_config = request.bearer_token.as_ref().map(|token| {
@@ -41,35 +37,45 @@ impl McpConnectorRepository {
             .unwrap()
         });
 
-        let row = client
-            .query_one(
-                r#"
-            INSERT INTO mcp_connectors (
-                id, organization_id, name, description,
-                mcp_server_url, auth_type, auth_config,
-                is_active, created_by, created_at, updated_at,
-                connection_status, capabilities, metadata
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, $9, $10, 'pending', $11, $12)
-            RETURNING *
-            "#,
-                &[
-                    &id,
-                    &organization_id,
-                    &request.name,
-                    &request.description,
-                    &request.mcp_server_url,
-                    &request.auth_type.to_string(),
-                    &auth_config,
-                    &creator_user_id,
-                    &now,
-                    &now,
-                    &None::<serde_json::Value>,
-                    &None::<serde_json::Value>,
-                ],
-            )
-            .await
-            .context("Failed to create MCP connector")?;
+        let row = retry_db!("create_mcp_connector", {
+            let now = Utc::now();
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_one(
+                    r#"
+                INSERT INTO mcp_connectors (
+                    id, organization_id, name, description,
+                    mcp_server_url, auth_type, auth_config,
+                    is_active, created_by, created_at, updated_at,
+                    connection_status, capabilities, metadata
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, $9, $10, 'pending', $11, $12)
+                RETURNING *
+                "#,
+                    &[
+                        &id,
+                        &organization_id,
+                        &request.name,
+                        &request.description,
+                        &request.mcp_server_url,
+                        &request.auth_type.to_string(),
+                        &auth_config,
+                        &creator_user_id,
+                        &now,
+                        &now,
+                        &None::<serde_json::Value>,
+                        &None::<serde_json::Value>,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         debug!(
             "Created MCP connector: {} for organization: {}",
@@ -80,16 +86,19 @@ impl McpConnectorRepository {
 
     /// Get an MCP connector by ID
     pub async fn get_by_id(&self, id: Uuid) -> Result<Option<McpConnector>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("get_mcp_connector_by_id", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_opt("SELECT * FROM mcp_connectors WHERE id = $1", &[&id])
-            .await
-            .context("Failed to query MCP connector")?;
+            client
+                .query_opt("SELECT * FROM mcp_connectors WHERE id = $1", &[&id])
+                .await
+                .map_err(map_db_error)
+        })?;
 
         match row {
             Some(row) => Ok(Some(self.row_to_connector(row)?)),
@@ -99,23 +108,26 @@ impl McpConnectorRepository {
 
     /// Get all MCP connectors for an organization
     pub async fn list_by_organization(&self, organization_id: Uuid) -> Result<Vec<McpConnector>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let rows = retry_db!("list_mcp_connectors_by_organization", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let rows = client
-            .query(
-                r#"
-            SELECT * FROM mcp_connectors 
-            WHERE organization_id = $1 
-            ORDER BY created_at DESC
-            "#,
-                &[&organization_id],
-            )
-            .await
-            .context("Failed to query MCP connectors")?;
+            client
+                .query(
+                    r#"
+                SELECT * FROM mcp_connectors
+                WHERE organization_id = $1
+                ORDER BY created_at DESC
+                "#,
+                    &[&organization_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         rows.into_iter()
             .map(|row| self.row_to_connector(row))
@@ -127,23 +139,26 @@ impl McpConnectorRepository {
         &self,
         organization_id: Uuid,
     ) -> Result<Vec<McpConnector>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let rows = retry_db!("list_active_mcp_connectors_by_organization", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let rows = client
-            .query(
-                r#"
-            SELECT * FROM mcp_connectors 
-            WHERE organization_id = $1 AND is_active = true
-            ORDER BY created_at DESC
-            "#,
-                &[&organization_id],
-            )
-            .await
-            .context("Failed to query active MCP connectors")?;
+            client
+                .query(
+                    r#"
+                SELECT * FROM mcp_connectors
+                WHERE organization_id = $1 AND is_active = true
+                ORDER BY created_at DESC
+                "#,
+                    &[&organization_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         rows.into_iter()
             .map(|row| self.row_to_connector(row))
@@ -156,12 +171,6 @@ impl McpConnectorRepository {
         id: Uuid,
         request: UpdateMcpConnectorRequest,
     ) -> Result<McpConnector> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
         let now = Utc::now();
 
         // Build dynamic update query
@@ -215,10 +224,19 @@ impl McpConnectorRepository {
         query.push_str(&format!(" WHERE id = ${param_idx} RETURNING *"));
         params.push(&id);
 
-        let row = client
-            .query_one(&query, &params)
-            .await
-            .context("Failed to update MCP connector")?;
+        let row = retry_db!("update_mcp_connector", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_one(&query, &params)
+                .await
+                .map_err(map_db_error)
+        })?;
 
         debug!("Updated MCP connector: {}", id);
         self.row_to_connector(row)
@@ -226,16 +244,19 @@ impl McpConnectorRepository {
 
     /// Delete an MCP connector
     pub async fn delete(&self, id: Uuid) -> Result<()> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let result = retry_db!("delete_mcp_connector", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let result = client
-            .execute("DELETE FROM mcp_connectors WHERE id = $1", &[&id])
-            .await
-            .context("Failed to delete MCP connector")?;
+            client
+                .execute("DELETE FROM mcp_connectors WHERE id = $1", &[&id])
+                .await
+                .map_err(map_db_error)
+        })?;
 
         if result == 0 {
             bail!("MCP connector not found");
@@ -264,63 +285,66 @@ impl McpConnectorRepository {
             capabilities.is_some()
         );
 
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
-        debug!("Got database connection for connector {} status update", id);
-
-        let now = Utc::now();
         let status_str = match status {
             McpConnectionStatus::Pending => "pending".to_string(),
             McpConnectionStatus::Connected => "connected".to_string(),
             McpConnectionStatus::Failed => "failed".to_string(),
         };
 
-        debug!("Executing UPDATE query for connector {}: status={}, error_message={:?}, capabilities={:?}, now={}, id={}",
-               id, status_str, error_message, capabilities.as_ref().map(|_| "<present>"), now, id);
-
         // Use separate variables to avoid type ambiguity
         let update_last_connected = status == McpConnectionStatus::Connected;
 
-        let rows_affected = if update_last_connected {
-            client
-                .execute(
-                    r#"
-                UPDATE mcp_connectors 
-                SET connection_status = $1,
-                    error_message = $2,
-                    capabilities = $3,
-                    last_connected_at = $4,
-                    updated_at = $4
-                WHERE id = $5
-                "#,
-                    &[&status_str, &error_message, &capabilities, &now, &id],
-                )
+        let rows_affected = retry_db!("update_mcp_connector_connection_status", {
+            let now = Utc::now();
+
+            debug!("Executing UPDATE query for connector {}: status={}, error_message={:?}, capabilities={:?}, now={}, id={}",
+                   id, status_str, error_message, capabilities.as_ref().map(|_| "<present>"), now, id);
+
+            let client = self
+                .pool
+                .get()
                 .await
-        } else {
-            client
-                .execute(
-                    r#"
-                UPDATE mcp_connectors 
-                SET connection_status = $1,
-                    error_message = $2,
-                    capabilities = $3,
-                    updated_at = $4
-                WHERE id = $5
-                "#,
-                    &[&status_str, &error_message, &capabilities, &now, &id],
-                )
-                .await
-        }
-        .map_err(|e| {
-            error!("Database UPDATE failed for connector {}", id);
-            debug!("SQL Error details: {:#}", e);
-            e
-        })
-        .context("Failed to update connection status")?;
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            debug!("Got database connection for connector {} status update", id);
+
+            if update_last_connected {
+                client
+                    .execute(
+                        r#"
+                    UPDATE mcp_connectors
+                    SET connection_status = $1,
+                        error_message = $2,
+                        capabilities = $3,
+                        last_connected_at = $4,
+                        updated_at = $4
+                    WHERE id = $5
+                    "#,
+                        &[&status_str, &error_message, &capabilities, &now, &id],
+                    )
+                    .await
+            } else {
+                client
+                    .execute(
+                        r#"
+                    UPDATE mcp_connectors
+                    SET connection_status = $1,
+                        error_message = $2,
+                        capabilities = $3,
+                        updated_at = $4
+                    WHERE id = $5
+                    "#,
+                        &[&status_str, &error_message, &capabilities, &now, &id],
+                    )
+                    .await
+            }
+            .map_err(|e| {
+                error!("Database UPDATE failed for connector {}", id);
+                debug!("SQL Error details: {:#}", e);
+                map_db_error(e)
+            })
+        })?;
 
         debug!(
             "Updated connection status for MCP connector {}: {} (rows affected: {})",
@@ -350,41 +374,44 @@ impl McpConnectorRepository {
         error_message: Option<String>,
         duration_ms: Option<i32>,
     ) -> Result<()> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
         let id = Uuid::new_v4();
-        let now = Utc::now();
 
-        client
-            .execute(
-                r#"
-            INSERT INTO mcp_connector_usage (
-                id, connector_id, user_id, method,
-                request_payload, response_payload,
-                status_code, error_message, duration_ms,
-                created_at
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            "#,
-                &[
-                    &id,
-                    &connector_id,
-                    &user_id,
-                    &method,
-                    &request_payload,
-                    &response_payload,
-                    &status_code,
-                    &error_message,
-                    &duration_ms,
-                    &now,
-                ],
-            )
-            .await
-            .context("Failed to log MCP connector usage")?;
+        retry_db!("log_mcp_connector_usage", {
+            let now = Utc::now();
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .execute(
+                    r#"
+                INSERT INTO mcp_connector_usage (
+                    id, connector_id, user_id, method,
+                    request_payload, response_payload,
+                    status_code, error_message, duration_ms,
+                    created_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                "#,
+                    &[
+                        &id,
+                        &connector_id,
+                        &user_id,
+                        &method,
+                        &request_payload,
+                        &response_payload,
+                        &status_code,
+                        &error_message,
+                        &duration_ms,
+                        &now,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         Ok(())
     }
@@ -395,24 +422,27 @@ impl McpConnectorRepository {
         connector_id: Uuid,
         limit: i64,
     ) -> Result<Vec<McpConnectorUsage>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let rows = retry_db!("get_mcp_connector_usage_logs", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let rows = client
-            .query(
-                r#"
-            SELECT * FROM mcp_connector_usage
-            WHERE connector_id = $1
-            ORDER BY created_at DESC
-            LIMIT $2
-            "#,
-                &[&connector_id, &limit],
-            )
-            .await
-            .context("Failed to query usage logs")?;
+            client
+                .query(
+                    r#"
+                SELECT * FROM mcp_connector_usage
+                WHERE connector_id = $1
+                ORDER BY created_at DESC
+                LIMIT $2
+                "#,
+                    &[&connector_id, &limit],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         rows.into_iter().map(|row| self.row_to_usage(row)).collect()
     }

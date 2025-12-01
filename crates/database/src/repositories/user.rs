@@ -1,8 +1,10 @@
-use crate::models::User;
 use crate::pool::DbPool;
+use crate::repositories::utils::map_db_error;
+use crate::{models::User, retry_db};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
+use services::common::RepositoryError;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -25,18 +27,20 @@ impl UserRepository {
         auth_provider: String,
         provider_user_id: String,
     ) -> Result<User> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
         let id = Uuid::new_v4();
-        let now = Utc::now();
 
-        let row = client
-            .query_one(
-                r#"
+        let row = retry_db!("create_new_user", {
+            let now = Utc::now();
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_one(
+                    r#"
             INSERT INTO users (
                 id, email, username, display_name, avatar_url,
                 created_at, updated_at, is_active,
@@ -52,20 +56,21 @@ impl UserRepository {
                 provider_user_id = EXCLUDED.provider_user_id
             RETURNING *
             "#,
-                &[
-                    &id,
-                    &email,
-                    &username,
-                    &display_name,
-                    &avatar_url,
-                    &now,
-                    &now,
-                    &auth_provider,
-                    &provider_user_id,
-                ],
-            )
-            .await
-            .context("Failed to create user")?;
+                    &[
+                        &id,
+                        &email,
+                        &username,
+                        &display_name,
+                        &avatar_url,
+                        &now,
+                        &now,
+                        &auth_provider,
+                        &provider_user_id,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         debug!("Created/updated user: {} ({})", email, id);
         self.row_to_user(row)
@@ -73,19 +78,22 @@ impl UserRepository {
 
     /// Get a user by ID
     pub async fn get_by_id(&self, id: Uuid) -> Result<Option<User>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("get_user_by_id", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_opt(
-                "SELECT * FROM users WHERE id = $1 AND is_active = true",
-                &[&id],
-            )
-            .await
-            .context("Failed to query user")?;
+            client
+                .query_opt(
+                    "SELECT * FROM users WHERE id = $1 AND is_active = true",
+                    &[&id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         match row {
             Some(row) => Ok(Some(self.row_to_user(row)?)),
@@ -95,19 +103,22 @@ impl UserRepository {
 
     /// Get a user by email
     pub async fn get_by_email(&self, email: &str) -> Result<Option<User>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("get_user_by_email", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_opt(
-                "SELECT * FROM users WHERE email = $1 AND is_active = true",
-                &[&email],
-            )
-            .await
-            .context("Failed to query user by email")?;
+            client
+                .query_opt(
+                    "SELECT * FROM users WHERE email = $1 AND is_active = true",
+                    &[&email],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         match row {
             Some(row) => Ok(Some(self.row_to_user(row)?)),
@@ -121,16 +132,19 @@ impl UserRepository {
         auth_provider: &str,
         provider_user_id: &str,
     ) -> Result<Option<User>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("get_user_by_oauth_details", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client.query_opt(
+            client.query_opt(
             "SELECT * FROM users WHERE auth_provider = $1 AND provider_user_id = $2 AND is_active = true",
             &[&auth_provider, &provider_user_id],
-        ).await.context("Failed to query user by provider")?;
+        ).await.map_err(map_db_error)
+        })?;
 
         match row {
             Some(row) => Ok(Some(self.row_to_user(row)?)),
@@ -140,19 +154,22 @@ impl UserRepository {
 
     /// Update user's last login time
     pub async fn update_last_login(&self, id: Uuid) -> Result<()> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        retry_db!("update_user_last_login_time", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        client
-            .execute(
-                "UPDATE users SET last_login_at = NOW() WHERE id = $1",
-                &[&id],
-            )
-            .await
-            .context("Failed to update last login")?;
+            client
+                .execute(
+                    "UPDATE users SET last_login_at = NOW() WHERE id = $1",
+                    &[&id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         Ok(())
     }
@@ -164,15 +181,17 @@ impl UserRepository {
         display_name: Option<String>,
         avatar_url: Option<String>,
     ) -> Result<User> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("update_user_profile", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_one(
-                r#"
+            client
+                .query_one(
+                    r#"
             UPDATE users
             SET display_name = COALESCE($2, display_name),
                 avatar_url = COALESCE($3, avatar_url),
@@ -180,10 +199,11 @@ impl UserRepository {
             WHERE id = $1 AND is_active = true
             RETURNING *
             "#,
-                &[&id, &display_name, &avatar_url],
-            )
-            .await
-            .context("Failed to update user profile")?;
+                    &[&id, &display_name, &avatar_url],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         debug!("Updated profile for user: {}", id);
         self.row_to_user(row)
@@ -191,36 +211,42 @@ impl UserRepository {
 
     /// Get the number of active users
     pub async fn get_active_user_count(&self) -> Result<i64> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let row = retry_db!("get_number_of_active_users", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let row = client
-            .query_one(
-                r#"
+            client
+                .query_one(
+                    r#"
                 SELECT COUNT(*) as count FROM users WHERE is_active = true
                 "#,
-                &[],
-            )
-            .await
-            .context("Failed to query users")?;
+                    &[],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
         Ok(row.get::<_, i64>("count"))
     }
 
     /// List all users (with pagination)
     pub async fn list(&self, limit: i64, offset: i64) -> Result<Vec<User>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let rows = retry_db!("list_all_users_with_pagination", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let rows = client.query(
+            client.query(
             "SELECT * FROM users WHERE is_active = true ORDER BY created_at DESC LIMIT $1 OFFSET $2",
             &[&limit, &offset],
-        ).await.context("Failed to list users")?;
+        ).await.map_err(map_db_error)
+        })?;
 
         rows.into_iter().map(|row| self.row_to_user(row)).collect()
     }
@@ -233,15 +259,17 @@ impl UserRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<(User, Option<services::admin::UserOrganizationInfo>)>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let rows = retry_db!("list_all_users_with_organizations_with_pagination", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let rows = client
-            .query(
-                r#"
+            client
+                .query(
+                    r#"
             SELECT DISTINCT ON (u.id)
                 u.*,
                 o.id as organization_id,
@@ -264,10 +292,11 @@ impl UserRepository {
             LIMIT $1
             OFFSET $2
             "#,
-                &[&limit, &offset],
-            )
-            .await
-            .context("Failed to list users with organizations")?;
+                    &[&limit, &offset],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         rows.into_iter()
             .map(|row| {
@@ -291,52 +320,61 @@ impl UserRepository {
 
     /// Search users by username or email
     pub async fn search(&self, query: &str, limit: i64) -> Result<Vec<User>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
-
         let pattern = format!("%{query}%");
-        let rows = client.query(
+        let rows = retry_db!("search_users_by_username_or_email", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client.query(
             "SELECT * FROM users WHERE is_active = true AND (username ILIKE $1 OR email ILIKE $1) LIMIT $2",
             &[&pattern, &limit],
-        ).await.context("Failed to search users")?;
+        ).await.map_err(map_db_error)
+        })?;
 
         rows.into_iter().map(|row| self.row_to_user(row)).collect()
     }
 
     /// Deactivate a user (soft delete)
     pub async fn deactivate(&self, id: Uuid) -> Result<bool> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        let rows_affected = retry_db!("deactivate_user_soft_delete", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        let rows_affected = client
-            .execute("UPDATE users SET is_active = false WHERE id = $1", &[&id])
-            .await
-            .context("Failed to deactivate user")?;
+            client
+                .execute("UPDATE users SET is_active = false WHERE id = $1", &[&id])
+                .await
+                .map_err(map_db_error)
+        })?;
 
         Ok(rows_affected > 0)
     }
 
     /// Update user's tokens_revoked_at timestamp
     pub async fn update_tokens_revoked_at(&self, id: Uuid) -> Result<()> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection")?;
+        retry_db!("update_user_token_revoked_at_timestamp", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
 
-        client
-            .execute(
-                "UPDATE users SET tokens_revoked_at = NOW() WHERE id = $1",
-                &[&id],
-            )
-            .await
-            .context("Failed to update tokens_revoked_at")?;
+            client
+                .execute(
+                    "UPDATE users SET tokens_revoked_at = NOW() WHERE id = $1",
+                    &[&id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
 
         Ok(())
     }

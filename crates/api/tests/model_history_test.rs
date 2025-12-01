@@ -331,12 +331,10 @@ async fn test_user_tracking_in_history() {
     let (_, user_id, user_email, reason, _) = &history[0];
 
     // Verify user tracking
-    assert!(user_id.is_some(), "User ID should be recorded");
-    assert_eq!(
-        user_id.unwrap().to_string(),
-        MOCK_USER_ID,
-        "User ID should be admin user"
-    );
+    let user_id = user_id
+        .as_ref()
+        .expect("User ID should be recorded in history entry");
+    assert_eq!(user_id.to_string(), MOCK_USER_ID, "User ID should be admin user");
     assert_eq!(
         user_email.as_ref().unwrap(),
         "admin@test.com",

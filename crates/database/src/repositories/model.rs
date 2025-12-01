@@ -204,18 +204,23 @@ impl ModelRepository {
             .await
             .context("Failed to get database connection")?;
 
-        // Start explicit transaction to ensure atomicity (Issue #3)
+        // Start explicit transaction to ensure atomicity
         let tx = client
             .transaction()
             .await
             .context("Failed to start transaction")?;
+
+        // Serialize concurrent writes to models while allowing reads
+        tx.execute("LOCK TABLE models IN SHARE ROW EXCLUSIVE MODE", &[])
+            .await
+            .context("Failed to acquire models table lock")?;
 
         // For updates, we can do partial updates with COALESCE
         // For inserts, we need all required fields
         // Check if model exists first to determine which code path to take
         let existing = self.get_by_internal_name(model_name).await?;
 
-        // Capture single timestamp for all operations (Issue #2 - prevent temporal gaps)
+        // Capture single timestamp for all operations
         let now = chrono::Utc::now();
 
         let row = if existing.is_some() {
@@ -267,7 +272,7 @@ impl ModelRepository {
 
             updated_row
         } else {
-            // Model doesn't exist - do INSERT with ON CONFLICT to handle race conditions
+            // Model doesn't exist - do a simple INSERT (writes serialized by table lock)
             let display_name = update_request
                 .model_display_name
                 .as_ref()
@@ -284,9 +289,19 @@ impl ModelRepository {
                 .context_length
                 .context("context_length is required for new models")?;
 
-            // Use INSERT ... ON CONFLICT to handle race conditions where another
-            // transaction inserts the same model between our check and insert
-            // Use COALESCE to preserve existing values during conflict (Issue #5 - race condition)
+            let input_cost = update_request
+                .input_cost_per_token
+                .context("input_cost_per_token is required for new models")?;
+            let output_cost = update_request
+                .output_cost_per_token
+                .context("output_cost_per_token is required for new models")?;
+            let verifiable = update_request
+                .verifiable
+                .context("verifiable flag is required for new models")?;
+            let is_active = update_request
+                .is_active
+                .context("is_active flag is required for new models")?;
+
             let inserted_row = tx
                 .query_one(
                     r#"
@@ -296,31 +311,20 @@ impl ModelRepository {
                         model_display_name, model_description, model_icon,
                         context_length, verifiable, is_active
                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                    ON CONFLICT (model_name) DO UPDATE SET
-                        input_cost_per_token = COALESCE(EXCLUDED.input_cost_per_token, models.input_cost_per_token),
-                        output_cost_per_token = COALESCE(EXCLUDED.output_cost_per_token, models.output_cost_per_token),
-                        model_display_name = COALESCE(EXCLUDED.model_display_name, models.model_display_name),
-                        model_description = COALESCE(EXCLUDED.model_description, models.model_description),
-                        model_icon = COALESCE(EXCLUDED.model_icon, models.model_icon),
-                        context_length = COALESCE(EXCLUDED.context_length, models.context_length),
-                        verifiable = COALESCE(EXCLUDED.verifiable, models.verifiable),
-                        is_active = COALESCE(EXCLUDED.is_active, models.is_active),
-                        updated_at = $10
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token,
                               context_length, verifiable, is_active, created_at, updated_at
                     "#,
                     &[
                         &model_name,
-                        &update_request.input_cost_per_token.unwrap_or(0),
-                        &update_request.output_cost_per_token.unwrap_or(0),
+                        &input_cost,
+                        &output_cost,
                         &display_name,
                         &description,
                         &update_request.model_icon,
                         &context_length,
-                        &update_request.verifiable.unwrap_or(true),
-                        &update_request.is_active.unwrap_or(true),
-                        &now,
+                        &verifiable,
+                        &is_active,
                     ],
                 )
                 .await
@@ -534,13 +538,13 @@ impl ModelRepository {
             .await
             .context("Failed to get database connection")?;
 
-        // Start transaction to ensure atomicity (Issue #3)
+        // Start transaction to ensure atomicity
         let tx = client
             .transaction()
             .await
             .context("Failed to start transaction")?;
 
-        // Capture single timestamp for all operations (Issue #2)
+        // Capture single timestamp for all operations
         let now = chrono::Utc::now();
 
         let result = tx
@@ -561,7 +565,8 @@ impl ModelRepository {
         if let Some(row) = result {
             // Record history: capture the soft delete in history
             let model_id: uuid::Uuid = row.get("id");
-            let reason = change_reason.or_else(|| Some(DEFAULT_SOFT_DELETE_REASON.to_string()));
+            let reason =
+                Some(change_reason.unwrap_or_else(|| DEFAULT_SOFT_DELETE_REASON.to_string()));
             let audit = AuditInfo {
                 user_id: changed_by_user_id,
                 user_email: changed_by_user_email,
@@ -582,7 +587,7 @@ impl ModelRepository {
 
     /// Helper method to record a model history entry
     /// Closes the previous history record and creates a new one
-    /// Works within a transaction context with a provided timestamp (Issue #2 - prevent temporal gaps)
+    /// Works within a transaction context with a provided timestamp
     async fn record_model_history(
         &self,
         tx: &tokio_postgres::Transaction<'_>,

@@ -6,3 +6,6 @@ ALTER TABLE chat_signatures DROP CONSTRAINT IF EXISTS chat_signatures_chat_id_ke
 
 -- Add composite unique constraint on (chat_id, signing_algo)
 ALTER TABLE chat_signatures ADD UNIQUE (chat_id, signing_algo);
+
+-- Add explicit composite index for query performance optimization
+CREATE INDEX IF NOT EXISTS idx_chat_signatures_chat_id_signing_algo ON chat_signatures(chat_id, signing_algo);

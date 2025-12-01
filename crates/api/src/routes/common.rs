@@ -216,4 +216,33 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid UUID"));
     }
+
+    #[test]
+    fn test_validate_limit_offset() {
+        // Valid cases
+        assert!(validate_limit_offset(10, 0).is_ok());
+        assert!(validate_limit_offset(1000, 100).is_ok());
+
+        // Invalid limit <= 0
+        let err = validate_limit_offset(0, 0).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0.error.message, "Limit must be positive");
+        assert_eq!(err.1 .0.error.r#type, "invalid_parameter");
+
+        let err = validate_limit_offset(-1, 0).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0.error.message, "Limit must be positive");
+
+        // Invalid limit > 1000
+        let err = validate_limit_offset(1001, 0).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0.error.message, "Limit cannot exceed 1000");
+        assert_eq!(err.1 .0.error.r#type, "invalid_parameter");
+
+        // Invalid offset < 0
+        let err = validate_limit_offset(10, -1).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0.error.message, "Offset must be non-negative");
+        assert_eq!(err.1 .0.error.r#type, "invalid_parameter");
+    }
 }

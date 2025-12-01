@@ -825,15 +825,7 @@ pub async fn list_conversation_items(
     );
 
     // Validate limit parameter
-    if params.limit <= 0 || params.limit > 1000 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                "Limit must be between 1 and 1000".to_string(),
-                "invalid_request_error".to_string(),
-            )),
-        ));
-    }
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
         Ok(id) => id,

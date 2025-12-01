@@ -7,16 +7,14 @@ use axum::{
 };
 use chrono::Utc;
 use config::ApiConfig;
+use database::repositories::OAuthStateRepository;
 use serde::{Deserialize, Serialize};
 use services::auth::{AuthServiceTrait, OAuthManager};
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
-/// Temporary storage for OAuth state and PKCE verifiers
-/// In production, use Redis or similar
-pub type StateStore = Arc<RwLock<HashMap<String, OAuthState>>>;
+/// OAuth state storage backed by PostgreSQL for multi-instance support
+pub type StateStore = Arc<OAuthStateRepository>;
 
 pub type AuthState = (
     Arc<OAuthManager>,
@@ -24,12 +22,6 @@ pub type AuthState = (
     Arc<dyn AuthServiceTrait>,
     Arc<ApiConfig>,
 );
-
-#[derive(Clone)]
-pub struct OAuthState {
-    provider: String,
-    pkce_verifier: Option<String>, // Store verifier as string
-}
 
 #[derive(Deserialize)]
 pub struct OAuthCallback {
@@ -63,15 +55,14 @@ pub async fn github_login(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Store state for verification
-    let mut store = state_store.write().await;
-    store.insert(
-        state.clone(),
-        OAuthState {
-            provider: "github".to_string(),
-            pkce_verifier: None,
-        },
-    );
+    // Store state in database for multi-instance support
+    state_store
+        .create(state.clone(), "github".to_string(), None)
+        .await
+        .map_err(|e| {
+            error!("Failed to store OAuth state: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     debug!("Redirecting to GitHub with state: {}", state);
     Ok(Redirect::to(&auth_url))
@@ -88,15 +79,14 @@ pub async fn google_login(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Store state and PKCE verifier for verification
-    let mut store = state_store.write().await;
-    store.insert(
-        state.clone(),
-        OAuthState {
-            provider: "google".to_string(),
-            pkce_verifier: Some(pkce_verifier),
-        },
-    );
+    // Store state and PKCE verifier in database for multi-instance support
+    state_store
+        .create(state.clone(), "google".to_string(), Some(pkce_verifier))
+        .await
+        .map_err(|e| {
+            error!("Failed to store OAuth state: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     debug!("Redirecting to Google with state: {}", state);
     Ok(Redirect::to(&auth_url))
@@ -134,16 +124,11 @@ pub async fn oauth_callback(
         }
     };
 
-    // Retrieve and verify state
-    let oauth_state = {
-        let mut store = state_store.write().await;
-        store.remove(&params.state)
-    };
-
-    let oauth_state = match oauth_state {
-        Some(state) => state,
-        None => {
-            error!("Invalid or expired OAuth state");
+    // Retrieve and delete state from database (atomic operation prevents replay attacks)
+    let oauth_state_row = match state_store.get_and_delete(&params.state).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            error!("Invalid or expired OAuth state: {}", params.state);
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -153,19 +138,30 @@ pub async fn oauth_callback(
             )
                 .into_response();
         }
+        Err(e) => {
+            error!("Database error retrieving OAuth state: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "internal_server_error",
+                    "error_description": "Failed to verify OAuth state"
+                })),
+            )
+                .into_response();
+        }
     };
 
-    info!("Processing {} OAuth callback", oauth_state.provider);
+    info!("Processing {} OAuth callback", oauth_state_row.provider);
 
     // Handle provider-specific callback to get OAuth user info
-    let oauth_result = match oauth_state.provider.as_str() {
+    let oauth_result = match oauth_state_row.provider.as_str() {
         "github" => {
             oauth
                 .handle_github_callback(params.code, params.state)
                 .await
         }
         "google" => {
-            let verifier = match oauth_state.pkce_verifier {
+            let verifier = match oauth_state_row.pkce_verifier {
                 Some(v) => v,
                 None => {
                     error!("Missing PKCE verifier for Google OAuth");
@@ -184,7 +180,7 @@ pub async fn oauth_callback(
                 .await
         }
         _ => {
-            error!("Unknown provider: {}", oauth_state.provider);
+            error!("Unknown provider: {}", oauth_state_row.provider);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
@@ -250,7 +246,7 @@ pub async fn oauth_callback(
                 user: AuthResponse {
                     message: "Authenticated".to_string(),
                     email: user.email.clone(),
-                    provider: oauth_state.provider,
+                    provider: oauth_state_row.provider,
                 },
             };
 

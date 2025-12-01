@@ -47,11 +47,14 @@ A Rust-based cloud API for AI model inference, conversation management, and orga
 ### Run Tests
 
 ```bash
-# Run unit tests
-cargo test --lib --bins
+# Run unit tests only
+make test-unit
 
-# Run integration/e2e tests (requires database)
-cargo test --test e2e_test
+# Run integration/e2e tests only (requires database)
+make test-integration
+
+# Run both unit and integration tests
+make test
 ```
 
 ### Test Database Setup
@@ -69,7 +72,7 @@ docker run --name test-postgres \
   -d postgres:latest
 
 # Run tests with default values (or override with env vars)
-cargo test --test e2e_test
+make test-integration
 
 # Or with custom database settings
 DATABASE_HOST=localhost \
@@ -77,7 +80,7 @@ DATABASE_PORT=5432 \
 DATABASE_NAME=platform_api \
 DATABASE_USERNAME=postgres \
 DATABASE_PASSWORD=postgres \
-cargo test --test e2e_test
+make test-integration
 ```
 
 #### Option 2: Using existing PostgreSQL
@@ -97,7 +100,7 @@ Copy `env.example` to `.env` and configure your test database:
 ```bash
 cp env.example .env
 # Edit .env with your database credentials
-cargo test --test e2e_test
+make test-integration
 ```
 
 ### vLLM Integration Tests

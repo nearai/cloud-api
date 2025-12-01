@@ -89,6 +89,7 @@ pub async fn list_models(
                 model_display_name: model.model_display_name.clone(),
                 model_description: model.model_description.clone(),
                 model_icon: model.model_icon.clone(),
+                owned_by: model.owned_by.clone(),
                 aliases: model.aliases.clone(),
             },
         })
@@ -173,6 +174,7 @@ pub async fn get_model_by_name(
             model_display_name: model.model_display_name,
             model_description: model.model_description,
             model_icon: model.model_icon,
+            owned_by: model.owned_by,
             aliases: model.aliases,
         },
     };

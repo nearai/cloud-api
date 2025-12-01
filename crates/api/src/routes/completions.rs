@@ -376,7 +376,7 @@ pub async fn models(
                 id: model.model_name,
                 object: "model".to_string(),
                 created: 0,
-                owned_by: "system".to_string(),
+                owned_by: model.owned_by,
             })
             .collect(),
     };

@@ -45,10 +45,10 @@ impl ModelRepository {
         let rows = client
             .query(
                 r#"
-                SELECT 
+                SELECT
                     m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
                     m.input_cost_per_token, m.output_cost_per_token,
-                    m.context_length, m.verifiable, m.is_active, m.created_at, m.updated_at,
+                    m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
                     COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                 FROM models m
                 LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -81,10 +81,10 @@ impl ModelRepository {
         let rows = client
             .query(
                 r#"
-                SELECT 
+                SELECT
                     id, model_name, model_display_name, model_description, model_icon,
                     input_cost_per_token, output_cost_per_token,
-                    context_length, verifiable, is_active, created_at, updated_at
+                    context_length, verifiable, is_active, owned_by, created_at, updated_at
                 FROM models
                 WHERE model_name = $1
                 "#,
@@ -111,10 +111,10 @@ impl ModelRepository {
         let rows = client
             .query(
                 r#"
-                SELECT 
+                SELECT
                     id, model_name, model_display_name, model_description, model_icon,
                     input_cost_per_token, output_cost_per_token,
-                    context_length, verifiable, is_active, created_at, updated_at
+                    context_length, verifiable, is_active, owned_by, created_at, updated_at
                 FROM models
                 WHERE id = $1
                 "#,
@@ -142,7 +142,7 @@ impl ModelRepository {
         let rows = client
             .query(
                 r#"
-                SELECT 
+                SELECT
                     m.id,
                     m.model_name,
                     m.model_display_name,
@@ -153,6 +153,7 @@ impl ModelRepository {
                     m.context_length,
                     m.verifiable,
                     m.is_active,
+                    m.owned_by,
                     m.created_at,
                     m.updated_at,
                     COALESCE(
@@ -212,11 +213,12 @@ impl ModelRepository {
                         context_length = COALESCE($7, context_length),
                         verifiable = COALESCE($8, verifiable),
                         is_active = COALESCE($9, is_active),
+                        owned_by = COALESCE($10, owned_by),
                         updated_at = NOW()
                     WHERE model_name = $1
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token,
-                              context_length, verifiable, is_active, created_at, updated_at
+                              context_length, verifiable, is_active, owned_by, created_at, updated_at
                     "#,
                     &[
                         &model_name,
@@ -228,6 +230,7 @@ impl ModelRepository {
                         &update_request.context_length,
                         &update_request.verifiable,
                         &update_request.is_active,
+                        &update_request.owned_by,
                     ],
                 )
                 .await
@@ -250,6 +253,8 @@ impl ModelRepository {
                 .context_length
                 .context("context_length is required for new models")?;
 
+            let owned_by = update_request.owned_by.as_ref().cloned();
+
             // Use INSERT ... ON CONFLICT to handle race conditions where another
             // transaction inserts the same model between our check and insert
             client
@@ -259,8 +264,8 @@ impl ModelRepository {
                         model_name,
                         input_cost_per_token, output_cost_per_token,
                         model_display_name, model_description, model_icon,
-                        context_length, verifiable, is_active
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        context_length, verifiable, is_active, owned_by
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, 'nearai'))
                     ON CONFLICT (model_name) DO UPDATE SET
                         input_cost_per_token = EXCLUDED.input_cost_per_token,
                         output_cost_per_token = EXCLUDED.output_cost_per_token,
@@ -270,10 +275,11 @@ impl ModelRepository {
                         context_length = EXCLUDED.context_length,
                         verifiable = EXCLUDED.verifiable,
                         is_active = EXCLUDED.is_active,
+                        owned_by = CASE WHEN $10 IS NULL THEN models.owned_by ELSE EXCLUDED.owned_by END,
                         updated_at = NOW()
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token,
-                              context_length, verifiable, is_active, created_at, updated_at
+                              context_length, verifiable, is_active, owned_by, created_at, updated_at
                     "#,
                     &[
                         &model_name,
@@ -285,6 +291,7 @@ impl ModelRepository {
                         &context_length,
                         &update_request.verifiable.unwrap_or(true),
                         &update_request.is_active.unwrap_or(true),
+                        &owned_by,
                     ],
                 )
                 .await
@@ -308,11 +315,11 @@ impl ModelRepository {
                 INSERT INTO models (
                     model_name, model_display_name, model_description, model_icon,
                     input_cost_per_token, output_cost_per_token,
-                    context_length, verifiable, is_active
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    context_length, verifiable, is_active, owned_by
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 RETURNING id, model_name, model_display_name, model_description, model_icon,
                           input_cost_per_token, output_cost_per_token,
-                          context_length, verifiable, is_active, created_at, updated_at
+                          context_length, verifiable, is_active, owned_by, created_at, updated_at
                 "#,
                 &[
                     &model.model_name,
@@ -324,6 +331,7 @@ impl ModelRepository {
                     &model.context_length,
                     &model.verifiable,
                     &model.is_active,
+                    &model.owned_by,
                 ],
             )
             .await
@@ -530,7 +538,7 @@ impl ModelRepository {
         let row = client
             .query_opt(
                 r#"
-                SELECT 
+                SELECT
                     m.id,
                     m.model_name,
                     m.model_display_name,
@@ -541,6 +549,7 @@ impl ModelRepository {
                     m.context_length,
                     m.verifiable,
                     m.is_active,
+                    m.owned_by,
                     m.created_at,
                     m.updated_at,
                     COALESCE(
@@ -587,6 +596,7 @@ impl ModelRepository {
             context_length: row.get("context_length"),
             verifiable: row.get("verifiable"),
             is_active: row.get("is_active"),
+            owned_by: row.get("owned_by"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
             aliases: row.try_get("aliases").unwrap_or_default(),
@@ -638,6 +648,7 @@ impl services::models::ModelsRepository for ModelRepository {
                 context_length: m.context_length,
                 verifiable: m.verifiable,
                 aliases: m.aliases,
+                owned_by: m.owned_by,
             })
             .collect())
     }
@@ -658,6 +669,7 @@ impl services::models::ModelsRepository for ModelRepository {
             context_length: m.context_length,
             verifiable: m.verifiable,
             aliases: m.aliases,
+            owned_by: m.owned_by,
         }))
     }
 
@@ -677,6 +689,7 @@ impl services::models::ModelsRepository for ModelRepository {
             context_length: m.context_length,
             verifiable: m.verifiable,
             aliases: m.aliases,
+            owned_by: m.owned_by,
         }))
     }
 

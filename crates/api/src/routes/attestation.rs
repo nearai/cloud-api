@@ -5,6 +5,7 @@ use axum::{
     response::Json as ResponseJson,
 };
 use serde::{Deserialize, Serialize};
+use services::attestation::AttestationError;
 use utoipa::{IntoParams, ToSchema};
 
 /// Query parameters for signature endpoint
@@ -56,16 +57,21 @@ impl From<services::attestation::ChatSignature> for SignatureResponse {
 )]
 pub async fn get_signature(
     Path(chat_id): Path<String>,
-    Query(_params): Query<SignatureQuery>,
+    Query(params): Query<SignatureQuery>,
     State(app_state): State<AppState>,
 ) -> Result<ResponseJson<SignatureResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let signing_algo = params.signing_algo;
     let signature = app_state
         .attestation_service
-        .get_chat_signature(chat_id.as_str())
+        .get_chat_signature(chat_id.as_str(), signing_algo)
         .await
         .map_err(|e| {
+            let status_code = match e {
+                AttestationError::SignatureNotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                status_code,
                 ResponseJson(ErrorResponse {
                     error: e.to_string(),
                 }),

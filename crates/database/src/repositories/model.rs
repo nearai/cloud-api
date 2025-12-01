@@ -391,7 +391,7 @@ impl ModelRepository {
                             input_cost_per_token, output_cost_per_token,
                             model_display_name, model_description, model_icon,
                             context_length, verifiable, is_active, owned_by
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, 'nearai'))
                         ON CONFLICT (model_name) DO UPDATE SET
                             input_cost_per_token = EXCLUDED.input_cost_per_token,
                             output_cost_per_token = EXCLUDED.output_cost_per_token,
@@ -401,7 +401,7 @@ impl ModelRepository {
                             context_length = EXCLUDED.context_length,
                             verifiable = EXCLUDED.verifiable,
                             is_active = EXCLUDED.is_active,
-                            owned_by = COALESCE(EXCLUDED.owned_by, models.owned_by),
+                            owned_by = CASE WHEN $10 IS NULL THEN models.owned_by ELSE EXCLUDED.owned_by END,
                             updated_at = NOW()
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token,

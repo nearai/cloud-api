@@ -364,6 +364,56 @@ async fn test_admin_model_custom_owned_by() {
 }
 
 #[tokio::test]
+async fn test_admin_model_default_owned_by() {
+    let server = setup_test_server().await;
+
+    // Create a unique model name to ensure we test INSERT path, not UPDATE path
+    let unique_model_name = format!("test-model-{}", uuid::Uuid::new_v4());
+
+    // Create model WITHOUT specifying ownedBy - should default to "nearai"
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        unique_model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 1000000,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 2000000,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Test Default Owned By",
+            "modelDescription": "Testing default owned_by value",
+            "contextLength": 128000,
+            "verifiable": true
+            // NOTE: No ownedBy field - should default to "nearai"
+        }))
+        .unwrap(),
+    );
+
+    let created_models = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    assert_eq!(created_models.len(), 1);
+    assert_eq!(
+        created_models[0].metadata.owned_by, "nearai",
+        "Model created without ownedBy should default to 'nearai'"
+    );
+
+    // Verify the default persists in retrieval
+    let encoded_name =
+        url::form_urlencoded::byte_serialize(unique_model_name.as_bytes()).collect::<String>();
+    let response = server
+        .get(format!("/v1/model/{encoded_name}").as_str())
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let retrieved_model = response.json::<api::models::ModelWithPricing>();
+    assert_eq!(
+        retrieved_model.metadata.owned_by, "nearai",
+        "Retrieved model should have default owned_by value"
+    );
+}
+
+#[tokio::test]
 async fn test_admin_update_organization_limits() {
     let server = setup_test_server().await;
 

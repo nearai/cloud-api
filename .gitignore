@@ -8,3 +8,4 @@ config/examples/production.yaml
 .GIT_REV
 oci.tar
 .idea
+.claude

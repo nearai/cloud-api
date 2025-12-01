@@ -1,11 +1,7 @@
 use async_trait::async_trait;
 use services::attestation::{ports::AttestationRepository, AttestationError, ChatSignature};
 
-use crate::repositories::utils::map_db_error;
-use crate::retry_db;
 use crate::DbPool;
-use anyhow::Context;
-use services::common::RepositoryError;
 
 pub struct PgAttestationRepository {
     pool: DbPool,
@@ -48,53 +44,43 @@ impl AttestationRepository for PgAttestationRepository {
         chat_id: &str,
         signature: ChatSignature,
     ) -> Result<(), AttestationError> {
-        retry_db!("add_chat_signature", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .execute(
-                    "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo) VALUES ($1, $2, $3, $4, $5)",
-                    &[&chat_id, &signature.text, &signature.signature, &signature.signing_address, &signature.signing_algo],
-                )
-                .await
-                .map_err(map_db_error)
-        })
-        .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
+        client
+            .execute(
+                "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (chat_id) DO UPDATE SET text = EXCLUDED.text, signature = EXCLUDED.signature, signing_address = EXCLUDED.signing_address, signing_algo = EXCLUDED.signing_algo, updated_at = NOW()",
+                &[&chat_id, &signature.text, &signature.signature, &signature.signing_address, &signature.signing_algo],
+            )
+            .await
+            .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
 
         Ok(())
     }
 
     async fn get_chat_signature(&self, chat_id: &str) -> Result<ChatSignature, AttestationError> {
-        let row = retry_db!("get_chat_signature", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query_one(
-                    "SELECT * FROM chat_signatures WHERE chat_id = $1",
-                    &[&chat_id],
-                )
-                .await
-                .map_err(map_db_error)
-        })
-        .map_err(|e| {
-            // query_one returns RowNotFound when no rows are found
-            if e.to_string()
-                .contains("query returned an unexpected number of rows")
-            {
-                return AttestationError::SignatureNotFound(chat_id.to_string());
-            }
-            AttestationError::RepositoryError(e.to_string())
-        })?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
+        let row = client
+            .query_one(
+                "SELECT * FROM chat_signatures WHERE chat_id = $1",
+                &[&chat_id],
+            )
+            .await
+            .map_err(|e| {
+                // query_one returns RowNotFound when no rows are found
+                if e.to_string()
+                    .contains("query returned an unexpected number of rows")
+                {
+                    return AttestationError::SignatureNotFound(chat_id.to_string());
+                }
+                AttestationError::RepositoryError(e.to_string())
+            })?;
         self.row_to_chat_signature(row)
     }
 }

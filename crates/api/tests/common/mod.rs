@@ -329,7 +329,20 @@ pub async fn setup_qwen_model(server: &axum_test::TestServer) -> String {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(server, batch, get_session_id()).await;
+    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    // Verify that the model was updated with the correct pricing
+    assert_eq!(updated.len(), 1, "Should have updated 1 model");
+    assert_eq!(
+        updated[0].input_cost_per_token.amount, 1000000,
+        "Input cost per token should be 1000000"
+    );
+    assert_eq!(
+        updated[0].output_cost_per_token.amount, 2000000,
+        "Output cost per token should be 2000000"
+    );
+    // Delay to ensure database writes are fully committed and visible on other connections
+    // This is necessary because tests share the same database but may use different connection pool instances
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string()
 }
 

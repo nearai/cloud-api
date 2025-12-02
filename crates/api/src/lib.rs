@@ -412,22 +412,9 @@ pub async fn init_inference_providers(
         tracing::info!("Models will be discovered on first request");
     }
 
-    // Start periodic refresh task
-    let pool_clone = pool.clone();
+    // Start periodic refresh task with handle management
     let refresh_interval = config.model_discovery.refresh_interval as u64;
-
-    tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(tokio::time::Duration::from_secs(refresh_interval));
-        loop {
-            interval.tick().await;
-            tracing::debug!("Running periodic model discovery refresh");
-            // Re-run model discovery
-            if pool_clone.initialize().await.is_err() {
-                tracing::error!("Failed to refresh model discovery");
-            }
-        }
-    });
+    pool.clone().start_refresh_task(refresh_interval).await;
 
     pool
 }

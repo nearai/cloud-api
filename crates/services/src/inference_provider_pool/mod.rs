@@ -6,7 +6,8 @@ use inference_providers::{
 use regex::Regex;
 use serde::Deserialize;
 use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use tracing::{debug, info};
 
 type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
 
@@ -38,6 +39,8 @@ pub struct InferenceProviderPool {
     chat_id_mapping: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
     /// Map of chat_id -> (request_hash, response_hash) for MockProvider signature generation
     signature_hashes: Arc<RwLock<HashMap<String, (String, String)>>>,
+    /// Background task handle for periodic model discovery refresh
+    refresh_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl InferenceProviderPool {
@@ -57,6 +60,7 @@ impl InferenceProviderPool {
             load_balancer_index: Arc::new(RwLock::new(HashMap::new())),
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
             signature_hashes: Arc::new(RwLock::new(HashMap::new())),
+            refresh_task_handle: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -625,6 +629,94 @@ impl InferenceProviderPool {
         );
 
         Ok(response)
+    }
+
+    /// Start the periodic model discovery refresh task and store the handle
+    pub async fn start_refresh_task(self: Arc<Self>, refresh_interval_secs: u64) {
+        let handle = tokio::spawn({
+            let pool = self.clone();
+            async move {
+                let mut interval =
+                    tokio::time::interval(tokio::time::Duration::from_secs(refresh_interval_secs));
+                loop {
+                    interval.tick().await;
+                    debug!("Running periodic model discovery refresh");
+                    // Re-run model discovery
+                    if pool.initialize().await.is_err() {
+                        info!("Failed to refresh model discovery, will retry on next interval");
+                    }
+                }
+            }
+        });
+
+        let mut task_handle = self.refresh_task_handle.lock().await;
+        *task_handle = Some(handle);
+        info!(
+            "Model discovery refresh task started with interval: {} seconds",
+            refresh_interval_secs
+        );
+    }
+
+    /// Shutdown the inference provider pool and cleanup all resources
+    ///
+    /// This method handles:
+    /// 1. Cancelling the periodic model discovery refresh task
+    /// 2. Clearing all cached model mappings and provider references
+    /// 3. Clearing chat session to provider mappings
+    /// 4. Clearing signature hash tracking
+    ///
+    /// This ensures all resources are released and no dangling references exist.
+    pub async fn shutdown(&self) {
+        info!("Initiating inference provider pool shutdown");
+
+        // Step 1: Cancel the refresh task
+        debug!("Step 1: Cancelling model discovery refresh task");
+        let mut task_handle = self.refresh_task_handle.lock().await;
+        if let Some(handle) = task_handle.take() {
+            debug!("Cancelling model discovery refresh task");
+            handle.abort();
+            info!("Model discovery refresh task cancelled successfully");
+        } else {
+            debug!("No active refresh task to cancel");
+        }
+        drop(task_handle); // Explicitly drop the lock
+
+        // Step 2: Clear model mappings and provider references
+        debug!("Step 2: Clearing model mappings");
+        let mut model_mapping = self.model_mapping.write().await;
+        let model_count = model_mapping.len();
+        model_mapping.clear();
+        debug!("Cleared {} model mappings", model_count);
+        drop(model_mapping);
+
+        // Step 3: Clear load balancer indices
+        debug!("Step 3: Clearing load balancer indices");
+        let mut lb_index = self.load_balancer_index.write().await;
+        let index_count = lb_index.len();
+        lb_index.clear();
+        debug!("Cleared {} load balancer indices", index_count);
+        drop(lb_index);
+
+        // Step 4: Clear chat_id to provider mappings
+        debug!("Step 4: Clearing chat session mappings");
+        let mut chat_mapping = self.chat_id_mapping.write().await;
+        let chat_count = chat_mapping.len();
+        chat_mapping.clear();
+        debug!("Cleared {} chat session mappings", chat_count);
+        drop(chat_mapping);
+
+        // Step 5: Clear signature hashes
+        debug!("Step 5: Clearing signature hash tracking");
+        let mut sig_hashes = self.signature_hashes.write().await;
+        let sig_count = sig_hashes.len();
+        sig_hashes.clear();
+        debug!("Cleared {} signature hash entries", sig_count);
+        drop(sig_hashes);
+
+        info!(
+            "Inference provider pool shutdown completed. Cleaned up: {} models, {} load balancer indices, {} chat mappings, {} signatures",
+            model_count, index_count, chat_count, sig_count
+        );
     }
 }
 

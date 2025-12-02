@@ -1,6 +1,7 @@
 use api::{build_app_with_config, init_auth_services, init_database, init_domain_services};
 use config::{ApiConfig, LoggingConfig};
 use database::{Database, ShutdownCoordinator, ShutdownStage};
+use services::inference_provider_pool::InferenceProviderPool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,12 +28,18 @@ async fn main() {
     let app = build_app_with_config(
         database.clone(),
         auth_components,
-        domain_services,
+        domain_services.clone(),
         config.clone(),
     );
 
     // Start server with graceful shutdown handling
-    start_server(app, config, database).await;
+    start_server(
+        app,
+        config,
+        database,
+        domain_services.inference_provider_pool,
+    )
+    .await;
 }
 
 /// Load and validate configuration
@@ -47,7 +54,12 @@ fn load_configuration() -> ApiConfig {
 }
 
 /// Start the HTTP server with graceful shutdown on SIGTERM/SIGINT
-async fn start_server(app: axum::Router, config: Arc<ApiConfig>, database: Arc<Database>) {
+async fn start_server(
+    app: axum::Router,
+    config: Arc<ApiConfig>,
+    database: Arc<Database>,
+    inference_provider_pool: Arc<InferenceProviderPool>,
+) {
     let bind_address = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&bind_address)
         .await
@@ -68,11 +80,11 @@ async fn start_server(app: axum::Router, config: Arc<ApiConfig>, database: Arc<D
     match server.await {
         Ok(_) => {
             tracing::info!("Server shutdown successfully, initiating coordinated cleanup");
-            perform_coordinated_shutdown(database).await;
+            perform_coordinated_shutdown(database, inference_provider_pool).await;
         }
         Err(e) => {
             tracing::error!("Server error: {}", e);
-            perform_coordinated_shutdown(database).await;
+            perform_coordinated_shutdown(database, inference_provider_pool).await;
             std::process::exit(1);
         }
     }
@@ -84,7 +96,10 @@ async fn start_server(app: axum::Router, config: Arc<ApiConfig>, database: Arc<D
 /// 1. Stop accepting requests (already done by HTTP server)
 /// 2. Cancel background tasks (model discovery, cluster monitoring)
 /// 3. Close connections (drain and close pools)
-async fn perform_coordinated_shutdown(database: Arc<Database>) {
+async fn perform_coordinated_shutdown(
+    database: Arc<Database>,
+    inference_provider_pool: Arc<InferenceProviderPool>,
+) {
     let mut coordinator = ShutdownCoordinator::new(Duration::from_secs(30));
     coordinator.start();
 
@@ -100,7 +115,7 @@ async fn perform_coordinated_shutdown(database: Arc<Database>) {
             },
             || async {
                 tracing::info!("Step 1.1: Cancelling model discovery refresh task");
-                // InferenceProviderPool::shutdown() would be called here
+                inference_provider_pool.shutdown().await;
                 tracing::debug!("Model discovery refresh task cancelled");
 
                 tracing::info!("Step 1.2: Cancelling database cluster monitoring task");
@@ -149,17 +164,6 @@ async fn perform_coordinated_shutdown(database: Arc<Database>) {
     tracing::info!("=== SHUTDOWN COMPLETE ===");
 }
 
-/// Listen for SIGTERM and SIGINT signals for graceful shutdown
-///
-/// This implements PHASE 0 of graceful shutdown:
-/// - Stop accepting new HTTP requests
-/// - Wait for in-flight requests to complete (with 30-second timeout)
-/// - After timeout expires, proceed to Phase 1 (cancel background tasks)
-///
-/// Timeline:
-/// - Signal received: Server stops accepting new connections
-/// - ~30 seconds: Axum drains existing connections gracefully
-/// - After Phase 0: Perform Phase 1 & 2 cleanup (handled by perform_coordinated_shutdown)
 async fn shutdown_signal() {
     use tokio::signal;
 
@@ -178,23 +182,16 @@ async fn shutdown_signal() {
         _ = sigterm => {
             tracing::info!("SIGTERM signal received");
             tracing::info!("=== SHUTDOWN PHASE 0: STOP ACCEPTING REQUESTS ===");
-            tracing::info!("Server will stop accepting new requests");
-            tracing::info!("Waiting up to 30 seconds for in-flight requests to complete");
+            tracing::info!("Server will stop accepting new requests immediately");
+            tracing::info!("Draining in-flight requests...");
         }
         _ = sigint => {
             tracing::info!("SIGINT signal received");
             tracing::info!("=== SHUTDOWN PHASE 0: STOP ACCEPTING REQUESTS ===");
-            tracing::info!("Server will stop accepting new requests");
-            tracing::info!("Waiting up to 30 seconds for in-flight requests to complete");
+            tracing::info!("Server will stop accepting new requests immediately");
+            tracing::info!("Draining in-flight requests...");
         }
     }
-
-    // Phase 0: Allow requests to drain for up to 30 seconds
-    // Axum's graceful shutdown will stop accepting new connections
-    // and wait for all active connections to close
-    tokio::time::sleep(Duration::from_secs(30)).await;
-    tracing::info!("=== SHUTDOWN PHASE 0 COMPLETE ===");
-    tracing::info!("Request drain timeout reached. Proceeding to Phase 1.");
 }
 
 /// Initialize tracing/logging based on configuration

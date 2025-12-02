@@ -2,27 +2,6 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Shutdown coordinator for orchestrating graceful application shutdown
-///
-/// This coordinator manages the shutdown sequence with timeout protection,
-/// ensuring all services are cleanly terminated in the correct order:
-///
-/// 1. **Stop Accepting Requests** (Handled by HTTP server)
-///    - Server stops accepting new connections
-///    - Existing requests drain (30s window)
-///    - No new operations initiated
-///
-/// 2. **Cancel Background Tasks** (Managed by coordinator)
-///    - Model discovery refresh task
-///    - Database cluster monitoring task
-///    - Other periodic background operations
-///    - ~5-10 seconds allocated
-///
-/// 3. **Close Connections** (Managed by coordinator)
-///    - Wait for active connections to return to pool
-///    - Close all database connections
-///    - Release provider pool resources
-///    - ~10-15 seconds allocated
-///
 pub struct ShutdownCoordinator {
     /// Total shutdown timeout (e.g., 30 seconds)
     total_timeout: Duration,

@@ -91,11 +91,6 @@ async fn start_server(
 }
 
 /// Perform coordinated shutdown with timeout protection
-///
-/// Ensures proper cleanup order:
-/// 1. Stop accepting requests (already done by HTTP server)
-/// 2. Cancel background tasks (model discovery, cluster monitoring)
-/// 3. Close connections (drain and close pools)
 async fn perform_coordinated_shutdown(
     database: Arc<Database>,
     inference_provider_pool: Arc<InferenceProviderPool>,
@@ -116,14 +111,6 @@ async fn perform_coordinated_shutdown(
             || async {
                 tracing::info!("Step 1.1: Cancelling model discovery refresh task");
                 inference_provider_pool.shutdown().await;
-                tracing::debug!("Model discovery refresh task cancelled");
-
-                tracing::info!("Step 1.2: Cancelling database cluster monitoring task");
-                // Database cluster manager tasks already cancelled in shutdown()
-                tracing::debug!("Database cluster monitoring task cancelled");
-
-                tracing::info!("Step 1.3: Cancelling other background tasks");
-                // Any other periodic tasks cancelled here
                 tracing::debug!("All background tasks cancelled");
             },
         )

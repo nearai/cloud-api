@@ -155,12 +155,6 @@ impl Database {
     }
 
     /// Shutdown the database service and coordinate cleanup
-    ///
-    /// This method handles:
-    /// 1. Cancelling background cluster discovery and failover tasks
-    /// 2. Waiting for active connections to return to the pool
-    /// 3. Closing the connection pool
-    ///
     /// The process waits up to 15 seconds for connections to gracefully close
     /// before proceeding with shutdown.
     pub async fn shutdown(&self) {
@@ -193,9 +187,6 @@ impl Database {
     }
 
     /// Wait for active connections to return to the pool
-    ///
-    /// Gives active database connections time to return to the pool.
-    /// Waits with a timeout of 15 seconds to avoid indefinite waits.
     async fn wait_for_connections(&self) {
         const DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -208,10 +199,6 @@ impl Database {
     }
 
     /// Close the connection pool
-    ///
-    /// The deadpool connection pool is closed when dropped. Since we hold the pool
-    /// as part of the Database struct, it will be dropped when the Database is dropped.
-    /// This method provides a placeholder for additional cleanup if needed in the future.
     async fn close_pool(&self) {
         debug!("Closing connection pool resources");
         info!("Connection pool shutdown initiated");

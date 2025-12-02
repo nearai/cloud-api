@@ -658,14 +658,6 @@ impl InferenceProviderPool {
     }
 
     /// Shutdown the inference provider pool and cleanup all resources
-    ///
-    /// This method handles:
-    /// 1. Cancelling the periodic model discovery refresh task
-    /// 2. Clearing all cached model mappings and provider references
-    /// 3. Clearing chat session to provider mappings
-    /// 4. Clearing signature hash tracking
-    ///
-    /// This ensures all resources are released and no dangling references exist.
     pub async fn shutdown(&self) {
         info!("Initiating inference provider pool shutdown");
 

@@ -812,11 +812,39 @@ async fn test_complete_file_lifecycle() {
 
 #[tokio::test]
 async fn test_file_in_response_api() {
-    let server = setup_test_server().await;
+    let (server, _pool, mock) = setup_test_server_with_pool().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
+    // Configure mock provider with exact prompt matchers
+    // Timestamps will be normalized automatically to [TIME] for matching
+    use common::mock_prompts;
+
+    // First request - with file content
+    let first_prompt = mock_prompts::build_prompt(
+        "Tell me more about yourself.\n\nFile: test_doc.txt\nContent:\nMichael Jordan is widely regarded as one of the greatest basketball players of all time. He won six NBA championships and was known for his scoring and competitiveness."
+    );
+    mock.when(inference_providers::mock::RequestMatcher::ExactPrompt(first_prompt))
+    .respond_with(inference_providers::mock::ResponseTemplate::new(
+        "Michael Jordan is indeed a legendary basketball player! He's widely regarded as one of the greatest players of all time, having won six NBA championships with the Chicago Bulls."
+    ))
+    .await;
+
+    // Second request - conversation history includes first message with file + new question
+    let second_prompt = mock_prompts::build_prompt(
+        "Tell me more about yourself.\nFile: test_doc.txt\nContent:\nMichael Jordan is widely regarded as one of the greatest basketball players of all time. He won six NBA championships and was known for his scoring and competitiveness. Michael Jordan is indeed a legendary basketball player! He's widely regarded as one of the greatest players of all time, having won six NBA championships with the Chicago Bulls. What does the file say?"
+    );
+    let expected_response = "The file contains information about Michael Jordan, discussing his greatness as a basketball player and his six NBA championships.";
+
+    mock.when(inference_providers::mock::RequestMatcher::ExactPrompt(
+        second_prompt,
+    ))
+    .respond_with(inference_providers::mock::ResponseTemplate::new(
+        expected_response,
+    ))
+    .await;
+
     // 1. Upload a text file
-    let file_content = b"This is a test document.\nIt contains important information about testing.\nLine 3 has more details.";
+    let file_content = b"Michael Jordan is widely regarded as one of the greatest basketball players of all time. He won six NBA championships and was known for his scoring and competitiveness.";
     let upload_response = upload_file(
         &server,
         &api_key,
@@ -870,7 +898,7 @@ async fn test_file_in_response_api() {
                 "role": "user",
                 "content": [{
                     "type": "input_text",
-                    "text": "Please summarize the content of the file."
+                    "text": "Tell me more about yourself."
                 }, {
                     "type": "input_file",
                     "file_id": file.id
@@ -883,8 +911,6 @@ async fn test_file_in_response_api() {
 
     assert_eq!(response.status_code(), 200);
     let response_obj: api::models::ResponseObject = response.json();
-    println!("Response status: {:?}", response_obj.status);
-    println!("Response output: {:?}", response_obj.output);
 
     // 5. Verify the response completed successfully
     assert_eq!(response_obj.status, api::models::ResponseStatus::Completed);
@@ -924,9 +950,6 @@ async fn test_file_in_response_api() {
                 "content": [{
                     "type": "input_text",
                     "text": "What does the file say?"
-                }, {
-                    "type": "input_file",
-                    "file_id": file.id
                 }]
             }],
             "max_output_tokens": 50,
@@ -980,6 +1003,23 @@ async fn test_file_in_response_api() {
         "Expected final response in stream"
     );
     let final_resp = final_response.unwrap();
+    // Extract text from the response output
+    let mut final_text = String::new();
+    for item in &final_resp.output {
+        if let api::models::ResponseOutputItem::Message { content, .. } = item {
+            for part in content {
+                if let api::models::ResponseOutputContent::OutputText { text, .. } = part {
+                    final_text.push_str(text);
+                }
+            }
+        }
+    }
+    let final_text = final_text.trim();
+    // Verify we got the expected response from the mock
+    assert_eq!(
+        expected_response, final_text,
+        "final response does not match expected mock response"
+    );
     assert_eq!(final_resp.status, api::models::ResponseStatus::Completed);
 }
 

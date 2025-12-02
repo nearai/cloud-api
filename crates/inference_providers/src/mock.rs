@@ -15,7 +15,7 @@ use bytes::Bytes;
 use futures_util::stream;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 /// Hash pair for signature generation
 #[derive(Clone, Debug)]
@@ -24,12 +24,192 @@ struct SignatureHashes {
     response_hash: String,
 }
 
+/// Request matcher for conditional responses
+#[derive(Clone)]
+pub enum RequestMatcher {
+    /// Match any request
+    Any,
+    /// Match requests with exact prompt text (checks all text content in messages)
+    /// Timestamps are automatically normalized to [TIME] for matching across test runs
+    ExactPrompt(String),
+}
+
+impl RequestMatcher {
+    /// Check if this matcher matches the given parameters
+    pub fn matches(&self, params: &ChatCompletionParams) -> bool {
+        match self {
+            Self::Any => true,
+            Self::ExactPrompt(prompt) => {
+                // Extract all text from messages and check if it equals the prompt
+                let all_text = Self::extract_text_from_messages(&params.messages);
+                // Normalize timestamps in both to allow matching regardless of when request was made
+                let normalized_text = Self::normalize_timestamps(&all_text);
+                let normalized_prompt = Self::normalize_timestamps(prompt);
+                normalized_text == normalized_prompt
+            }
+        }
+    }
+
+    /// Extract all text content from messages
+    fn extract_text_from_messages(messages: &[crate::ChatMessage]) -> String {
+        messages
+            .iter()
+            .filter_map(|msg| msg.content.as_deref())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Normalize timestamps in text by replacing ISO 8601 datetime patterns with [TIME]
+    /// This allows exact matching of prompts regardless of when they were sent
+    pub fn normalize_timestamps(text: &str) -> String {
+        use regex::Regex;
+        // Match ISO 8601 format: 2025-12-02T21:59:30.374311+00:00
+        // Also match the human-readable part: (Tuesday, December 02, 2025 at 21:59:30 UTC)
+        let iso_regex =
+            Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+\+\d{2}:\d{2}").unwrap();
+        let human_regex =
+            Regex::new(r"\([A-Za-z]+, [A-Za-z]+ \d{2}, \d{4} at \d{2}:\d{2}:\d{2} UTC\)").unwrap();
+
+        let text = iso_regex.replace_all(text, "[TIME]").to_string();
+        let text = human_regex.replace_all(&text, "[TIME]").to_string();
+        text
+    }
+}
+
+/// Template for generating responses
+#[derive(Clone)]
+pub struct ResponseTemplate {
+    content: String,
+}
+
+impl ResponseTemplate {
+    /// Create a new response template with the given content
+    pub fn new(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+        }
+    }
+
+    /// Generate a ChatCompletionResponse from this template
+    fn generate_response(&self, id: String, created: i64, model: String) -> ChatCompletionResponse {
+        ChatCompletionResponse {
+            id,
+            object: "chat.completion".to_string(),
+            created,
+            model,
+            choices: vec![ChatCompletionResponseChoice {
+                index: 0,
+                message: ChatResponseMessage {
+                    role: MessageRole::Assistant,
+                    content: Some(self.content.clone()),
+                    refusal: None,
+                    annotations: None,
+                    audio: None,
+                    function_call: None,
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                logprobs: None,
+                finish_reason: Some("stop".to_string()),
+                token_ids: None,
+            }],
+            service_tier: None,
+            system_fingerprint: None,
+            usage: TokenUsage::new(6, 8),
+            prompt_logprobs: None,
+            prompt_token_ids: None,
+            kv_transfer_params: None,
+        }
+    }
+
+    /// Generate streaming chunks from this template
+    fn generate_chunks(&self, id: String, created: i64, model: String) -> Vec<ChatCompletionChunk> {
+        let mut chunks = Vec::new();
+
+        // Stream the content character by character
+        let chars: Vec<char> = self.content.chars().collect();
+        for (i, ch) in chars.iter().enumerate() {
+            chunks.push(ChatCompletionChunk {
+                id: id.clone(),
+                object: "chat.completion.chunk".to_string(),
+                created,
+                model: model.clone(),
+                system_fingerprint: None,
+                choices: vec![ChatChoice {
+                    index: 0,
+                    delta: Some(ChatDelta {
+                        role: None,
+                        content: Some(ch.to_string()),
+                        name: None,
+                        tool_call_id: None,
+                        tool_calls: None,
+                    }),
+                    logprobs: None,
+                    finish_reason: if i == chars.len() - 1 {
+                        Some(FinishReason::Stop)
+                    } else {
+                        None
+                    },
+                    token_ids: None,
+                }],
+                usage: None,
+                prompt_token_ids: None,
+            });
+        }
+
+        // Final chunk with usage
+        chunks.push(ChatCompletionChunk {
+            id,
+            object: "chat.completion.chunk".to_string(),
+            created,
+            model,
+            system_fingerprint: None,
+            choices: vec![],
+            usage: Some(TokenUsage::new(6, 8)),
+            prompt_token_ids: None,
+        });
+
+        chunks
+    }
+}
+
+/// Configuration for a single expectation
+struct MockExpectation {
+    matcher: RequestMatcher,
+    response: ResponseTemplate,
+}
+
+/// Configuration for the mock provider
+struct MockConfig {
+    expectations: Vec<MockExpectation>,
+    default_response: ResponseTemplate,
+}
+
+/// Builder for configuring a single expectation
+pub struct MockExpectationBuilder {
+    config: Arc<Mutex<MockConfig>>,
+    matcher: RequestMatcher,
+}
+
+impl MockExpectationBuilder {
+    /// Set the response for this expectation
+    pub async fn respond_with(self, response: ResponseTemplate) {
+        let mut config = self.config.lock().await;
+        config.expectations.push(MockExpectation {
+            matcher: self.matcher,
+            response,
+        });
+    }
+}
+
 /// Mock provider that implements InferenceProvider for testing
 pub struct MockProvider {
     /// List of available mock models
     models: Vec<ModelInfo>,
     /// Map of chat_id to (request_hash, response_hash) for signature generation
     signature_hashes: Arc<RwLock<std::collections::HashMap<String, SignatureHashes>>>,
+    /// Configuration for conditional responses (thread-safe)
+    config: Arc<Mutex<MockConfig>>,
 }
 
 impl MockProvider {
@@ -44,6 +224,10 @@ impl MockProvider {
         Self {
             models,
             signature_hashes: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            config: Arc::new(Mutex::new(MockConfig {
+                expectations: Vec::new(),
+                default_response: ResponseTemplate::new("1. 2. 3."),
+            })),
         }
     }
 
@@ -54,6 +238,10 @@ impl MockProvider {
         Self {
             models: vec![],
             signature_hashes: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            config: Arc::new(Mutex::new(MockConfig {
+                expectations: Vec::new(),
+                default_response: ResponseTemplate::new("1. 2. 3."),
+            })),
         }
     }
 
@@ -62,6 +250,10 @@ impl MockProvider {
         Self {
             models,
             signature_hashes: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            config: Arc::new(Mutex::new(MockConfig {
+                expectations: Vec::new(),
+                default_response: ResponseTemplate::new("1. 2. 3."),
+            })),
         }
     }
 
@@ -81,6 +273,20 @@ impl MockProvider {
                 response_hash,
             },
         );
+    }
+
+    /// Add a conditional response for a specific matcher
+    pub fn when(&self, matcher: RequestMatcher) -> MockExpectationBuilder {
+        MockExpectationBuilder {
+            config: self.config.clone(),
+            matcher,
+        }
+    }
+
+    /// Set the default response for requests that don't match any expectation
+    pub async fn set_default_response(&self, response: ResponseTemplate) {
+        let mut config = self.config.lock().await;
+        config.default_response = response;
     }
 
     /// Generate a completion ID
@@ -349,8 +555,27 @@ impl crate::InferenceProvider for MockProvider {
             )));
         }
 
+        // Check for matching expectation
+        let response_template = {
+            let config = self.config.lock().await;
+            config
+                .expectations
+                .iter()
+                .find(|exp| exp.matcher.matches(&params))
+                .map(|exp| exp.response.clone())
+                .unwrap_or_else(|| config.default_response.clone())
+        };
+
+        // Generate chunks from the matched response or default
         let has_tools = params.tools.is_some();
-        let chunks = self.generate_chat_chunks(&params, has_tools);
+        let chunks = if has_tools && params.tools.is_some() {
+            self.generate_chat_chunks(&params, true)
+        } else {
+            let id = self.generate_chat_id();
+            let created = self.current_timestamp();
+            let model = params.model.clone();
+            response_template.generate_chunks(id, created, model)
+        };
 
         // Convert chunks to SSE stream
         let stream = stream::iter(chunks.into_iter().map(move |chunk| {
@@ -382,34 +607,18 @@ impl crate::InferenceProvider for MockProvider {
         let created = self.current_timestamp();
         let model = params.model.clone();
 
-        let response = ChatCompletionResponse {
-            id: id.clone(),
-            object: "chat.completion".to_string(),
-            created,
-            model: model.clone(),
-            choices: vec![ChatCompletionResponseChoice {
-                index: 0,
-                message: ChatResponseMessage {
-                    role: MessageRole::Assistant,
-                    content: Some("1. 2. 3.".to_string()),
-                    refusal: None,
-                    annotations: None,
-                    audio: None,
-                    function_call: None,
-                    tool_calls: None,
-                    reasoning_content: None,
-                },
-                logprobs: None,
-                finish_reason: Some("stop".to_string()),
-                token_ids: None,
-            }],
-            service_tier: None,
-            system_fingerprint: None,
-            usage: TokenUsage::new(6, 8),
-            prompt_logprobs: None,
-            prompt_token_ids: None,
-            kv_transfer_params: None,
+        // Find matching expectation in config
+        let response_template = {
+            let config = self.config.lock().await;
+            config
+                .expectations
+                .iter()
+                .find(|exp| exp.matcher.matches(&params))
+                .map(|exp| exp.response.clone())
+                .unwrap_or_else(|| config.default_response.clone())
         };
+
+        let response = response_template.generate_response(id, created, model);
 
         let raw_bytes = serde_json::to_vec(&response)
             .map_err(|e| CompletionError::CompletionError(format!("Failed to serialize: {e}")))?;

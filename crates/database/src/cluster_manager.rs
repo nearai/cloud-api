@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
@@ -41,6 +41,7 @@ pub struct ClusterManager {
     read_preference: ReadPreference,
     max_replica_lag_ms: Option<i64>,
     round_robin_counter: AtomicUsize,
+    background_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 #[derive(Clone)]
@@ -69,6 +70,7 @@ impl ClusterManager {
             read_preference,
             max_replica_lag_ms,
             round_robin_counter: AtomicUsize::new(0),
+            background_task_handle: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -307,37 +309,42 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Start background tasks for cluster management
-    pub fn start_background_tasks(self: Arc<Self>) {
-        let manager = self.clone();
-        tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(30));
-            let mut last_leader: Option<String> = None;
+    /// Start background tasks for cluster management and store handle for lifecycle management
+    pub async fn start_background_tasks(self: Arc<Self>) {
+        let handle = tokio::spawn({
+            let manager = self.clone();
+            async move {
+                let mut interval = time::interval(Duration::from_secs(30));
+                let mut last_leader: Option<String> = None;
 
-            loop {
-                interval.tick().await;
+                loop {
+                    interval.tick().await;
 
-                // Check for leader changes
-                if let Some(leader) = manager.discovery.get_leader().await {
-                    let current_leader = Some(leader.host.clone());
-                    if last_leader != current_leader {
-                        if last_leader.is_some() {
-                            // Leader changed
-                            info!("Leader change detected");
-                            if manager.handle_leader_change().await.is_err() {
-                                error!("Failed to handle leader change");
+                    // Check for leader changes
+                    if let Some(leader) = manager.discovery.get_leader().await {
+                        let current_leader = Some(leader.host.clone());
+                        if last_leader != current_leader {
+                            if last_leader.is_some() {
+                                // Leader changed
+                                info!("Leader change detected");
+                                if manager.handle_leader_change().await.is_err() {
+                                    error!("Failed to handle leader change");
+                                }
                             }
+                            last_leader = current_leader;
                         }
-                        last_leader = current_leader;
                     }
-                }
 
-                // Update read pools periodically
-                if manager.update_read_pools().await.is_err() {
-                    error!("Failed to update read pools");
+                    // Update read pools periodically
+                    if manager.update_read_pools().await.is_err() {
+                        error!("Failed to update read pools");
+                    }
                 }
             }
         });
+
+        let mut task_handle = self.background_task_handle.lock().await;
+        *task_handle = Some(handle);
     }
 
     /// Get statistics about the cluster
@@ -363,6 +370,23 @@ impl ClusterManager {
             .as_ref()
             .ok_or_else(|| anyhow!("Write pool not initialized"))
             .cloned()
+    }
+
+    /// Shutdown the cluster manager and cancel background tasks
+    pub async fn shutdown(&self) {
+        info!("Shutting down cluster manager");
+
+        let mut task_handle = self.background_task_handle.lock().await;
+        if let Some(handle) = task_handle.take() {
+            debug!("Cancelling background monitoring task");
+            handle.abort();
+            info!("Background monitoring task cancelled successfully");
+        } else {
+            debug!("No active background task to cancel");
+        }
+
+        // Shutdown the discovery service as well
+        self.discovery.shutdown().await;
     }
 }
 

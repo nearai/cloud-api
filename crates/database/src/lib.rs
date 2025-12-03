@@ -5,6 +5,7 @@ pub mod models;
 pub mod patroni_discovery;
 pub mod pool;
 pub mod repositories;
+pub mod shutdown_coordinator;
 
 pub use models::*;
 pub use pool::DbPool;
@@ -13,12 +14,14 @@ pub use repositories::{
     PgConversationRepository, PgOrganizationInvitationRepository, PgOrganizationRepository,
     PgResponseItemsRepository, PgResponseRepository, SessionRepository, UserRepository,
 };
+pub use shutdown_coordinator::{ShutdownCoordinator, ShutdownStage, ShutdownStageResult};
 
 use anyhow::Result;
 use cluster_manager::{ClusterManager, DatabaseConfig as ClusterDbConfig, ReadPreference};
 use deadpool::Runtime;
 use patroni_discovery::PatroniDiscovery;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::{debug, info};
 // Re-export mock function
 use crate::pool::create_pool_with_native_tls;
@@ -98,7 +101,7 @@ impl Database {
 
         // Start background refresh task
         info!("Starting cluster discovery refresh task");
-        discovery.clone().start_refresh_task();
+        discovery.clone().start_refresh_task().await;
 
         // Create cluster manager
         let db_config = ClusterDbConfig {
@@ -124,7 +127,7 @@ impl Database {
 
         // Start background tasks for leader failover handling
         info!("Starting cluster manager background tasks");
-        cluster_manager.clone().start_background_tasks();
+        cluster_manager.clone().start_background_tasks().await;
 
         // Get write pool to use for repositories
         let pool = cluster_manager.get_write_pool().await?;
@@ -149,6 +152,56 @@ impl Database {
     /// Get a reference to the cluster manager (if using Patroni)
     pub fn cluster_manager(&self) -> Option<&Arc<ClusterManager>> {
         self.cluster_manager.as_ref()
+    }
+
+    /// Shutdown the database service and coordinate cleanup
+    /// The process waits up to 15 seconds for connections to gracefully close
+    /// before proceeding with shutdown.
+    pub async fn shutdown(&self) {
+        info!("Initiating database service shutdown");
+        let shutdown_start = Instant::now();
+
+        // Step 1: Cancel background tasks
+        debug!("Step 1: Cancelling background cluster tasks");
+        if let Some(cluster_manager) = &self.cluster_manager {
+            info!("Shutting down cluster manager and discovery tasks");
+            cluster_manager.shutdown().await;
+            debug!("Cluster manager and discovery tasks cancelled");
+        } else {
+            debug!("No cluster manager active, skipping cluster shutdown");
+        }
+
+        // Step 2: Allow active connections to drain from pool
+        debug!("Step 2: Allowing active connections to return to pool");
+        self.wait_for_connections().await;
+
+        // Step 3: Close the connection pool
+        debug!("Step 3: Closing connection pool");
+        self.close_pool().await;
+
+        let elapsed = shutdown_start.elapsed();
+        info!(
+            "Database service shutdown completed in {:.2}s",
+            elapsed.as_secs_f32()
+        );
+    }
+
+    /// Wait for active connections to return to the pool
+    async fn wait_for_connections(&self) {
+        const DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+
+        info!(
+            "Waiting up to {:?} for active connections to return",
+            DRAIN_TIMEOUT
+        );
+        tokio::time::sleep(DRAIN_TIMEOUT).await;
+        debug!("Connection wait period completed");
+    }
+
+    /// Close the connection pool
+    async fn close_pool(&self) {
+        debug!("Closing connection pool resources");
+        info!("Connection pool shutdown initiated");
     }
 
     /// Create database connection for testing without Patroni

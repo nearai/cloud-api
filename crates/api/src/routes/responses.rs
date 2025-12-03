@@ -472,6 +472,27 @@ pub async fn create_response(
                     "Created response {} for key {}",
                     response.id, api_key.api_key.created_by_user_id.0
                 );
+
+                // Store signature for non-streaming response
+                let response_id = response.id.clone();
+                let response_json = serde_json::to_string(&response).unwrap_or_default();
+                let response_hash = {
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    hasher.update(response_json.as_bytes());
+                    format!("{:x}", hasher.finalize())
+                };
+
+                if let Err(e) = attestation_service
+                    .store_response_signature(&response_id, body_hash.hash.clone(), response_hash)
+                    .await
+                {
+                    tracing::error!(
+                        "Failed to store response signature for non-streaming: {}",
+                        e
+                    );
+                }
+
                 (StatusCode::OK, ResponseJson(response)).into_response()
             }
             Err(error) => {

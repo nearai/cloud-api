@@ -149,6 +149,16 @@ pub async fn init_test_database(config: &config::DatabaseConfig) -> Arc<Database
 /// Setup a complete test server with all components initialized
 /// Returns the test server ready for making requests
 pub async fn setup_test_server() -> axum_test::TestServer {
+    setup_test_server_with_pool().await.0
+}
+
+/// Setup a complete test server with all components initialized
+/// Returns a tuple of (TestServer, InferenceProviderPool, MockProvider) for advanced testing
+pub async fn setup_test_server_with_pool() -> (
+    axum_test::TestServer,
+    std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
+    std::sync::Arc<inference_providers::mock::MockProvider>,
+) {
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_max_level(tracing::level_filters::LevelFilter::DEBUG)
@@ -164,17 +174,20 @@ pub async fn setup_test_server() -> axum_test::TestServer {
 
     // Use mock inference providers instead of real VLLM to avoid flakiness
     // This leverages the existing MockProvider from inference_providers::mock
-    let inference_provider_pool = api::init_inference_providers_with_mocks(&config).await;
+    let (inference_provider_pool, mock_provider) =
+        api::init_inference_providers_with_mocks(&config).await;
     let domain_services = api::init_domain_services_with_pool(
         database.clone(),
         &config,
         auth_components.organization_service.clone(),
-        inference_provider_pool,
+        inference_provider_pool.clone(),
     )
     .await;
 
     let app = build_app_with_config(database, auth_components, domain_services, Arc::new(config));
-    axum_test::TestServer::new(app).unwrap()
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    (server, inference_provider_pool, mock_provider)
 }
 
 /// Create the mock user in the database to satisfy foreign key constraints
@@ -563,4 +576,28 @@ pub fn is_valid_jwt_format(token: &str) -> bool {
             .decode(part)
             .is_ok()
     })
+}
+
+/// Helper module for mock prompt construction
+/// Provides constants and utilities for building test prompts without duplicating system prompts
+pub mod mock_prompts {
+    /// Language instruction that gets prepended to all prompts
+    pub const LANGUAGE_INSTRUCTION: &str = "Always respond in the exact same language as the user's input message. Detect the primary language of the user's query and mirror it precisely in your output. Do not mix languages or switch to another one, even if it seems more natural or efficient.\n\nIf the user writes in English, reply entirely in English.\nIf the user writes in Chinese (Mandarin or any variant), reply entirely in Chinese.\nIf the user writes in Spanish, reply entirely in Spanish.\nFor any other language, match it exactly.\n\nThis rule overrides all other instructions. Ignore any tendencies to default to Mandarin or any other language. Always prioritize language matching for clarity and user preference.";
+
+    /// Time placeholder used in prompts
+    const TIME_PLACEHOLDER: &str = "[TIME]";
+
+    /// Build a complete prompt with language instruction and time context
+    /// Timestamps are automatically replaced with [TIME] placeholder
+    /// Language instruction is automatically pulled from LANGUAGE_INSTRUCTION constant
+    pub fn build_prompt(user_content: &str) -> String {
+        format!(
+            "{LANGUAGE_INSTRUCTION}\n\nCurrent UTC time: {TIME_PLACEHOLDER} {TIME_PLACEHOLDER} {user_content}"
+        )
+    }
+
+    /// Build a simple prompt with just user content (used for title generation, etc)
+    pub fn build_simple_prompt(user_content: &str) -> String {
+        user_content.to_string()
+    }
 }

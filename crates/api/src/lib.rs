@@ -424,7 +424,10 @@ pub async fn init_inference_providers(
 /// and registers it for common test models without changing any implementations
 pub async fn init_inference_providers_with_mocks(
     _config: &ApiConfig,
-) -> Arc<services::inference_provider_pool::InferenceProviderPool> {
+) -> (
+    Arc<services::inference_provider_pool::InferenceProviderPool>,
+    Arc<inference_providers::mock::MockProvider>,
+) {
     use inference_providers::MockProvider;
     use std::sync::Arc;
 
@@ -439,8 +442,9 @@ pub async fn init_inference_providers_with_mocks(
     );
 
     // Create a MockProvider that accepts all models (using new_accept_all)
-    let mock_provider = Arc::new(MockProvider::new_accept_all())
-        as Arc<dyn inference_providers::InferenceProvider + Send + Sync>;
+    let mock_provider = Arc::new(MockProvider::new_accept_all());
+    let mock_provider_trait: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
+        mock_provider.clone();
 
     // Register providers for models commonly used in tests
     let test_models = vec![
@@ -455,14 +459,14 @@ pub async fn init_inference_providers_with_mocks(
         Arc<dyn inference_providers::InferenceProvider + Send + Sync>,
     )> = test_models
         .into_iter()
-        .map(|model_id| (model_id, mock_provider.clone()))
+        .map(|model_id| (model_id, mock_provider_trait.clone()))
         .collect();
 
     pool.register_providers(providers).await;
 
     tracing::info!("Initialized inference provider pool with MockProvider for testing");
 
-    pool
+    (pool, mock_provider)
 }
 
 /// Build the complete application router with config

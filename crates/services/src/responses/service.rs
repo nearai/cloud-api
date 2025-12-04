@@ -298,8 +298,30 @@ impl ResponseServiceImpl {
         while let Some(event) = completion_stream.next().await {
             match event {
                 Ok(sse_event) => {
-                    // Parse the SSE event for content and tool calls
-                    if let Some(delta_text) = Self::extract_text_delta(&sse_event) {
+                    // Parse the SSE event for content, reasoning, and tool calls
+                    let (delta_text_opt, delta_reasoning_opt) = Self::extract_deltas(&sse_event);
+
+                    if delta_text_opt.is_some() || delta_reasoning_opt.is_some() {
+                        let delta_text = delta_text_opt.unwrap_or_default();
+
+                        // Handle explicit reasoning from provider
+                        if let Some(reasoning) = delta_reasoning_opt {
+                            if !reasoning.is_empty() {
+                                if !reasoning_item_emitted {
+                                    emitter.emit_reasoning_started(ctx, &reasoning_item_id).await?;
+                                    reasoning_item_emitted = true;
+                                }
+                                emitter
+                                    .emit_reasoning_delta(
+                                        ctx,
+                                        reasoning_item_id.clone(),
+                                        reasoning.clone(),
+                                    )
+                                    .await?;
+                                reasoning_buffer.push_str(&reasoning);
+                            }
+                        }
+
                         // Process reasoning tags and extract clean text (no reasoning tags)
                         let (text_without_reasoning, reasoning_delta, tag_transition) =
                             Self::process_reasoning_tags(
@@ -307,6 +329,32 @@ impl ResponseServiceImpl {
                                 &mut reasoning_buffer,
                                 &mut inside_reasoning,
                             );
+
+                        // Handle transition from explicit reasoning to content
+                        // If we have content, and we were reasoning (but not inside a tag block), close reasoning
+                        if !text_without_reasoning.is_empty()
+                            && reasoning_item_emitted
+                            && !inside_reasoning
+                        {
+                            // Close explicit reasoning item
+                            emitter
+                                .emit_reasoning_completed(
+                                    ctx,
+                                    &reasoning_item_id,
+                                    &reasoning_buffer,
+                                    response_items_repository,
+                                )
+                                .await?;
+
+                            let reasoning_token_count =
+                                crate::responses::service_helpers::ResponseStreamContext::estimate_tokens(
+                                    &reasoning_buffer,
+                                );
+                            ctx.add_reasoning_tokens(reasoning_token_count);
+                            ctx.next_output_index();
+                            reasoning_buffer.clear();
+                            reasoning_item_emitted = false;
+                        }
 
                         // Feed text (without reasoning tags) to citation tracker for real-time processing
                         // Returns clean text with citation tags also removed, plus any completed citations
@@ -1703,8 +1751,10 @@ impl ResponseServiceImpl {
         })
     }
 
-    /// Extract text delta from SSE event (placeholder)
-    fn extract_text_delta(event: &inference_providers::SSEEvent) -> Option<String> {
+    /// Extract text and reasoning deltas from SSE event
+    fn extract_deltas(
+        event: &inference_providers::SSEEvent,
+    ) -> (Option<String>, Option<String>) {
         use inference_providers::StreamChunk;
 
         match &event.chunk {
@@ -1712,14 +1762,21 @@ impl ResponseServiceImpl {
                 // Extract delta content from choices
                 for choice in &chat_chunk.choices {
                     if let Some(delta) = &choice.delta {
-                        if let Some(content) = &delta.content {
-                            return Some(content.clone());
+                        let content = delta.content.clone();
+                        // Check for reasoning_content or reasoning (some providers use one or the other)
+                        let reasoning = delta
+                            .reasoning_content
+                            .clone()
+                            .or_else(|| delta.reasoning.clone());
+
+                        if content.is_some() || reasoning.is_some() {
+                            return (content, reasoning);
                         }
                     }
                 }
-                None
+                (None, None)
             }
-            _ => None,
+            _ => (None, None),
         }
     }
 

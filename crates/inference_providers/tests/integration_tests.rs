@@ -6,6 +6,7 @@
 
 use futures_util::StreamExt;
 use inference_providers::{
+    mock::{RequestMatcher, ResponseTemplate},
     ChatCompletionParams, ChatMessage, CompletionParams, FunctionDefinition, InferenceProvider,
     MessageRole, MockProvider, StreamChunk, ToolChoice, ToolDefinition,
 };
@@ -572,4 +573,88 @@ async fn test_chat_completion_streaming_with_tool_calls() {
         Ok(Err(e)) => panic!("Tool call chat completion failed: {e}"),
         Err(_) => panic!("Tool call chat completion timed out after {test_timeout_secs} seconds"),
     }
+}
+
+#[tokio::test]
+async fn test_reasoning_content() {
+    // Only test with MockProvider as VLLM models might not support/return reasoning
+    if std::env::var("USE_REAL_VLLM").is_ok() {
+        println!("Skipping reasoning content test for real VLLM");
+        return;
+    }
+
+    let provider = MockProvider::new();
+
+    // Setup expectation with reasoning
+    provider
+        .when(RequestMatcher::ExactPrompt("Why is the sky blue?".to_string()))
+        .respond_with(
+            ResponseTemplate::new("The sky is blue due to Rayleigh scattering.")
+                .with_reasoning("I should explain Rayleigh scattering simply."),
+        )
+        .await;
+
+    let params = ChatCompletionParams {
+        model: "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        messages: vec![ChatMessage {
+            role: MessageRole::User,
+            content: Some("Why is the sky blue?".to_string()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }],
+        max_completion_tokens: Some(100),
+        temperature: Some(0.7),
+        stream: Some(true),
+        max_tokens: None,
+        top_p: None,
+        n: None,
+        stop: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        logit_bias: None,
+        logprobs: None,
+        top_logprobs: None,
+        user: None,
+        response_format: None,
+        seed: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        metadata: None,
+        store: None,
+        stream_options: None,
+        extra: std::collections::HashMap::new(),
+    };
+
+    let stream = provider
+        .chat_completion_stream(params, "test_hash".to_string())
+        .await
+        .expect("Failed to create stream");
+
+    let mut reasoning_received = String::new();
+    let mut content_received = String::new();
+    let mut stream = stream;
+
+    while let Some(chunk_result) = stream.next().await {
+        let event = chunk_result.expect("Stream error");
+        match event.chunk {
+            StreamChunk::Chat(chunk) => {
+                if let Some(choice) = chunk.choices.first() {
+                    if let Some(delta) = &choice.delta {
+                        if let Some(reasoning) = &delta.reasoning_content {
+                            reasoning_received.push_str(reasoning);
+                        }
+                        if let Some(content) = &delta.content {
+                            content_received.push_str(content);
+                        }
+                    }
+                }
+            }
+            _ => panic!("Unexpected chunk type"),
+        }
+    }
+
+    assert_eq!(reasoning_received, "I should explain Rayleigh scattering simply.");
+    assert_eq!(content_received, "The sky is blue due to Rayleigh scattering.");
 }

@@ -308,7 +308,9 @@ impl ResponseServiceImpl {
                         if let Some(reasoning) = delta_reasoning_opt {
                             if !reasoning.is_empty() {
                                 if !reasoning_item_emitted {
-                                    emitter.emit_reasoning_started(ctx, &reasoning_item_id).await?;
+                                    emitter
+                                        .emit_reasoning_started(ctx, &reasoning_item_id)
+                                        .await?;
                                     reasoning_item_emitted = true;
                                 }
                                 emitter
@@ -1752,9 +1754,7 @@ impl ResponseServiceImpl {
     }
 
     /// Extract text and reasoning deltas from SSE event
-    fn extract_deltas(
-        event: &inference_providers::SSEEvent,
-    ) -> (Option<String>, Option<String>) {
+    fn extract_deltas(event: &inference_providers::SSEEvent) -> (Option<String>, Option<String>) {
         use inference_providers::StreamChunk;
 
         match &event.chunk {

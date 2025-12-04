@@ -587,7 +587,9 @@ async fn test_reasoning_content() {
 
     // Setup expectation with reasoning
     provider
-        .when(RequestMatcher::ExactPrompt("Why is the sky blue?".to_string()))
+        .when(RequestMatcher::ExactPrompt(
+            "Why is the sky blue?".to_string(),
+        ))
         .respond_with(
             ResponseTemplate::new("The sky is blue due to Rayleigh scattering.")
                 .with_reasoning("I should explain Rayleigh scattering simply."),
@@ -655,6 +657,12 @@ async fn test_reasoning_content() {
         }
     }
 
-    assert_eq!(reasoning_received, "I should explain Rayleigh scattering simply.");
-    assert_eq!(content_received, "The sky is blue due to Rayleigh scattering.");
+    assert_eq!(
+        reasoning_received,
+        "I should explain Rayleigh scattering simply."
+    );
+    assert_eq!(
+        content_received,
+        "The sky is blue due to Rayleigh scattering."
+    );
 }

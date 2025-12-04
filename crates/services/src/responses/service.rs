@@ -179,6 +179,71 @@ impl ResponseServiceImpl {
             .map_err(|e| errors::ResponseError::InvalidParams(format!("Invalid file ID: {e}")))
     }
 
+    /// Process a single input file and return its formatted content
+    /// Returns the file content formatted as "File: {filename}\nContent:\n{content}"
+    /// For non-UTF8 files, returns a placeholder message
+    async fn process_input_file(
+        file_id: &str,
+        workspace_id: uuid::Uuid,
+        file_service: &Arc<dyn FileServiceTrait>,
+    ) -> Result<String, errors::ResponseError> {
+        // Parse file ID and fetch content from S3
+        let file_uuid = Self::parse_file_id(file_id)?;
+        match file_service.get_file_content(file_uuid, workspace_id).await {
+            Ok((file, file_content)) => {
+                // Convert file content to string (we currently support only text)
+                match String::from_utf8(file_content) {
+                    Ok(text_content) => {
+                        // Format file content with filename as context
+                        Ok(format!(
+                            "File: {}\nContent:\n{}",
+                            file.filename, text_content
+                        ))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to convert file {} to UTF-8 text: {}", file_id, e);
+                        Ok(format!(
+                            "[File: {} - Content cannot be displayed as text]",
+                            file.filename
+                        ))
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to fetch file content for {}: {}", file_id, e);
+                Err(errors::ResponseError::InternalError(format!(
+                    "Failed to fetch file content: {e}"
+                )))
+            }
+        }
+    }
+
+    /// Extract content from a vector of content parts, handling text and files
+    /// Returns a string with all parts joined by "\n\n"
+    async fn extract_content_parts(
+        parts: &[models::ResponseContentPart],
+        workspace_id: uuid::Uuid,
+        file_service: &Arc<dyn FileServiceTrait>,
+    ) -> Result<String, errors::ResponseError> {
+        let mut content_parts = Vec::new();
+        for part in parts {
+            match part {
+                models::ResponseContentPart::InputText { text } => {
+                    content_parts.push(text.clone());
+                }
+                models::ResponseContentPart::InputFile { file_id, .. } => {
+                    let file_content =
+                        Self::process_input_file(file_id, workspace_id, file_service).await?;
+                    content_parts.push(file_content);
+                }
+                _ => {
+                    // Skip other content types for now (images, etc.)
+                }
+            }
+        }
+        Ok(content_parts.join("\n\n"))
+    }
+
     /// Extract response ID UUID from response object
     fn extract_response_uuid(
         response: &models::ResponseObject,
@@ -1337,18 +1402,53 @@ impl ResponseServiceImpl {
             let messages_before = messages.len();
             for item in conversation_items {
                 if let models::ResponseOutputItem::Message { role, content, .. } = item {
-                    // Extract text from content parts
-                    let text = content
-                        .iter()
-                        .filter_map(|part| match part {
-                            models::ResponseContentItem::InputText { text } => Some(text.clone()),
-                            models::ResponseContentItem::OutputText { text, .. } => {
-                                Some(text.clone())
+                    // Extract text from content parts (handles InputText, OutputText, and InputFile)
+                    let mut text_parts = Vec::new();
+
+                    type ContentFuture = std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<Output = Result<String, errors::ResponseError>>
+                                + Send,
+                        >,
+                    >;
+                    let mut results: Vec<ContentFuture> = Vec::new();
+
+                    for part in &content {
+                        match part {
+                            models::ResponseContentItem::InputText { text } => {
+                                results.push(Box::pin(futures::future::ready(Ok(text.clone()))));
                             }
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                            models::ResponseContentItem::OutputText { text, .. } => {
+                                results.push(Box::pin(futures::future::ready(Ok(text.clone()))));
+                            }
+                            models::ResponseContentItem::InputFile { file_id, .. } => {
+                                // Process input file and add to context
+                                let file_id = file_id.clone();
+                                let workspace_id = workspace_id.0;
+                                let file_service = file_service.clone();
+                                results.push(Box::pin(async move {
+                                    Self::process_input_file(&file_id, workspace_id, &file_service)
+                                        .await
+                                }));
+                            }
+                            _ => {
+                                // Skip other content types for now (images, etc.)
+                            }
+                        }
+                    }
+
+                    for result in futures::future::join_all(results).await {
+                        match result {
+                            Ok(text) => {
+                                text_parts.push(text);
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to process content part: {}", e);
+                            }
+                        }
+                    }
+
+                    let text = text_parts.join("\n");
 
                     if !text.is_empty() {
                         messages.push(CompletionMessage {
@@ -1389,66 +1489,8 @@ impl ResponseServiceImpl {
                             models::ResponseContent::Text(text) => text.clone(),
                             models::ResponseContent::Parts(parts) => {
                                 // Extract text from parts and fetch file content if needed
-                                let mut content_parts = Vec::new();
-                                for part in parts {
-                                    match part {
-                                        models::ResponseContentPart::InputText { text } => {
-                                            content_parts.push(text.clone());
-                                        }
-                                        models::ResponseContentPart::InputFile {
-                                            file_id, ..
-                                        } => {
-                                            // Parse file ID and fetch content from S3
-                                            let file_uuid = Self::parse_file_id(file_id)?;
-                                            match file_service
-                                                .get_file_content(file_uuid, workspace_id.0)
-                                                .await
-                                            {
-                                                Ok((file, file_content)) => {
-                                                    // Convert file content to string (we currently support only text)
-                                                    match String::from_utf8(file_content) {
-                                                        Ok(text_content) => {
-                                                            // Prepend file content with filename as context
-                                                            content_parts.push(format!(
-                                                                "File: {}\nContent:\n{}",
-                                                                file.filename, text_content
-                                                            ));
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::warn!(
-                                                                "Failed to convert file {} to UTF-8 text: {}",
-                                                                file_id,
-                                                                e
-                                                            );
-                                                            content_parts.push(format!(
-                                                                "[File: {} - Content cannot be displayed as text]",
-                                                                file.filename
-                                                            ));
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    tracing::error!(
-                                                        "Failed to fetch file content for {}: {}",
-                                                        file_id,
-                                                        e
-                                                    );
-                                                    return Err(
-                                                        errors::ResponseError::InternalError(
-                                                            format!(
-                                                                "Failed to fetch file content: {e}"
-                                                            ),
-                                                        ),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        _ => {
-                                            // Skip other content types for now
-                                        }
-                                    }
-                                }
-                                content_parts.join("\n\n")
+                                Self::extract_content_parts(parts, workspace_id.0, file_service)
+                                    .await?
                             }
                         };
 

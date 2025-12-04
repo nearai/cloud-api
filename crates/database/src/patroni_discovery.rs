@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
@@ -39,6 +39,7 @@ pub struct PatroniDiscovery {
     postgres_app_id: String,
     cluster_state: Arc<RwLock<Option<ClusterState>>>,
     refresh_interval: Duration,
+    refresh_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl PatroniDiscovery {
@@ -51,6 +52,7 @@ impl PatroniDiscovery {
             postgres_app_id,
             cluster_state: Arc::new(RwLock::new(None)),
             refresh_interval: Duration::from_secs(refresh_interval_secs),
+            refresh_task_handle: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -183,25 +185,31 @@ impl PatroniDiscovery {
         replicas
     }
 
-    /// Start background refresh task
-    pub fn start_refresh_task(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut interval = time::interval(self.refresh_interval);
-            interval.tick().await; // Skip first immediate tick
+    /// Start background refresh task and store handle for lifecycle management
+    pub async fn start_refresh_task(self: Arc<Self>) {
+        let handle = tokio::spawn({
+            let discovery = self.clone();
+            async move {
+                let mut interval = time::interval(discovery.refresh_interval);
+                interval.tick().await; // Skip first immediate tick
 
-            loop {
-                interval.tick().await;
+                loop {
+                    interval.tick().await;
 
-                match self.update_cluster_state().await {
-                    Ok(_) => {
-                        debug!("Cluster state refreshed successfully");
-                    }
-                    Err(e) => {
-                        error!("Failed to refresh cluster state: {:?}", e);
+                    match discovery.update_cluster_state().await {
+                        Ok(_) => {
+                            debug!("Cluster state refreshed successfully");
+                        }
+                        Err(e) => {
+                            error!("Failed to refresh cluster state: {:?}", e);
+                        }
                     }
                 }
             }
-        })
+        });
+
+        let mut task_handle = self.refresh_task_handle.lock().await;
+        *task_handle = Some(handle);
     }
 
     /// Get cluster state age in seconds
@@ -247,6 +255,20 @@ impl PatroniDiscovery {
             }
         }
         None
+    }
+
+    /// Shutdown the cluster discovery and cancel the refresh task
+    pub async fn shutdown(&self) {
+        info!("Shutting down cluster discovery service");
+
+        let mut task_handle = self.refresh_task_handle.lock().await;
+        if let Some(handle) = task_handle.take() {
+            debug!("Cancelling cluster refresh task");
+            handle.abort();
+            info!("Cluster refresh task cancelled successfully");
+        } else {
+            debug!("No active refresh task to cancel");
+        }
     }
 }
 

@@ -3398,6 +3398,7 @@ dependencies = [
  "dstack-sdk-types",
  "futures-core",
  "futures-util",
+ "regex",
  "reqwest 0.12.24",
  "serde",
  "serde_json",

@@ -75,16 +75,13 @@ jobs:
         DEV: "true"
 
     - name: Run integration tests
-      run: |
-        for test in crates/api/tests/e2e_*.rs; do
-          name=$(basename "$test" .rs)
-          cargo test --test "$name" -p api
-        done
+      run: cargo test -p api --tests
       env:
         POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
         DATABASE_HOST: localhost
         DATABASE_PORT: 5432
         DATABASE_NAME: platform_api
+        DATABASE_TEST_NAME: platform_api_test
         DATABASE_USERNAME: postgres
         DATABASE_PASSWORD: postgres
         DATABASE_MAX_CONNECTIONS: 5

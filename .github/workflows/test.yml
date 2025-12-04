@@ -81,6 +81,7 @@ jobs:
         DATABASE_HOST: localhost
         DATABASE_PORT: 5432
         DATABASE_NAME: platform_api
+        DATABASE_TEST_NAME: platform_api_test
         DATABASE_USERNAME: postgres
         DATABASE_PASSWORD: postgres
         DATABASE_MAX_CONNECTIONS: 5

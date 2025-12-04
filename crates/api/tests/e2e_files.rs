@@ -812,7 +812,7 @@ async fn test_complete_file_lifecycle() {
 
 #[tokio::test]
 async fn test_file_in_response_api() {
-    let (server, _pool, mock) = setup_test_server_with_pool().await;
+    let (server, _pool, mock, _database) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 

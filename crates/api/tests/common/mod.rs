@@ -167,11 +167,12 @@ pub async fn setup_test_server() -> axum_test::TestServer {
 }
 
 /// Setup a complete test server with all components initialized
-/// Returns a tuple of (TestServer, InferenceProviderPool, MockProvider) for advanced testing
+/// Returns a tuple of (TestServer, InferenceProviderPool, MockProvider, Database) for advanced testing
 pub async fn setup_test_server_with_pool() -> (
     axum_test::TestServer,
     std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
     std::sync::Arc<inference_providers::mock::MockProvider>,
+    Arc<Database>,
 ) {
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
@@ -198,10 +199,15 @@ pub async fn setup_test_server_with_pool() -> (
     )
     .await;
 
-    let app = build_app_with_config(database, auth_components, domain_services, Arc::new(config));
+    let app = build_app_with_config(
+        database.clone(),
+        auth_components,
+        domain_services,
+        Arc::new(config),
+    );
     let server = axum_test::TestServer::new(app).unwrap();
 
-    (server, inference_provider_pool, mock_provider)
+    (server, inference_provider_pool, mock_provider, database)
 }
 
 /// Create the mock user in the database to satisfy foreign key constraints

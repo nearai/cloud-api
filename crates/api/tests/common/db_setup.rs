@@ -4,7 +4,7 @@ use tracing::{error, info, warn};
 
 /// Get test database name from environment or default
 pub fn get_test_db_name() -> String {
-    env::var("TEST_DATABASE_NAME").unwrap_or_else(|_| "platform_api_test".to_string())
+    env::var("DATABASE_TEST_NAME").unwrap_or_else(|_| "platform_api_test".to_string())
 }
 
 /// Get admin database name - try 'postgres' first, fallback to 'template1' if not available

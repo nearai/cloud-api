@@ -18,6 +18,39 @@ services:
       timeout: 3s
       retries: 5
 
+  datadog-agent:
+    image: gcr.io/datadoghq/agent:7
+    container_name: datadog-agent
+    ports:
+      - "8125:8125/udp"  # DogStatsD
+      - "8126:8126"      # APM
+      - "4317:4317"      # OTLP gRPC
+      - "4318:4318"      # OTLP HTTP
+    environment:
+      - DD_API_KEY=${DD_API_KEY}
+      - DD_SITE=${DD_SITE}
+      - DD_LOGS_ENABLED=true
+      - DD_LOGS_CONFIG_CONTAINER_COLLECT_ALL=true
+      - DD_CONTAINER_EXCLUDE="name:datadog-agent"
+      # Enable OTLP ingestion
+      - DD_OTLP_CONFIG_RECEIVER_PROTOCOLS_GRPC_ENDPOINT=0.0.0.0:4317
+      - DD_OTLP_CONFIG_RECEIVER_PROTOCOLS_HTTP_ENDPOINT=0.0.0.0:4318
+      # Additional settings
+      - DD_DOGSTATSD_NON_LOCAL_TRAFFIC=true
+      - DD_APM_ENABLED=true
+      - DD_APM_NON_LOCAL_TRAFFIC=true
+      - DD_PROCESS_AGENT_ENABLED=true
+      - DD_TAGS=env:${ENVIRONMENT:-local} service:cloud-api
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /proc/:/host/proc/:ro
+      - /sys/fs/cgroup/:/host/sys/fs/cgroup:ro
+    healthcheck:
+      test: ["CMD", "agent", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
   api:
     build: .
     ports:
@@ -26,10 +59,17 @@ services:
       CONFIG_FILE: config/docker.yaml
       RUST_LOG: debug
       RUST_BACKTRACE: "1"
+      # OTLP configuration to send metrics to Datadog agent
+      TELEMETRY_OTLP_ENDPOINT: http://datadog-agent:4317
+      TELEMETRY_OTLP_PROTOCOL: grpc
+      # Environment tag for metrics
+      ENVIRONMENT: ${ENVIRONMENT:-local}
     volumes:
       - ./config:/app/config:ro
     depends_on:
       postgres:
+        condition: service_healthy
+      datadog-agent:
         condition: service_healthy
 
 volumes:

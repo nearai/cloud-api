@@ -1,5 +1,9 @@
 pub mod ports;
 
+use crate::metrics::{
+    consts::{get_environment, METRIC_COST_USD, TAG_ENVIRONMENT, TAG_MODEL},
+    MetricsServiceTrait,
+};
 pub use ports::*;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -9,6 +13,7 @@ pub struct UsageServiceImpl {
     model_repository: Arc<dyn ModelRepository>,
     limits_repository: Arc<dyn OrganizationLimitsRepository>,
     workspace_service: Arc<dyn crate::workspace::WorkspaceServiceTrait>,
+    metrics_service: Arc<dyn MetricsServiceTrait>,
 }
 
 impl UsageServiceImpl {
@@ -17,12 +22,14 @@ impl UsageServiceImpl {
         model_repository: Arc<dyn ModelRepository>,
         limits_repository: Arc<dyn OrganizationLimitsRepository>,
         workspace_service: Arc<dyn crate::workspace::WorkspaceServiceTrait>,
+        metrics_service: Arc<dyn MetricsServiceTrait>,
     ) -> Self {
         Self {
             usage_repository,
             model_repository,
             limits_repository,
             workspace_service,
+            metrics_service,
         }
     }
 }
@@ -81,13 +88,15 @@ impl UsageServiceTrait for UsageServiceImpl {
             api_key_id: request.api_key_id,
             response_id: request.response_id,
             model_id: request.model_id,
-            model_name: model.model_name,
+            model_name: model.model_name.clone(),
             input_tokens: request.input_tokens,
             output_tokens: request.output_tokens,
             input_cost,
             output_cost,
             total_cost,
             request_type: request.request_type,
+            ttft_ms: request.ttft_ms,
+            avg_itl_ms: request.avg_itl_ms,
         };
 
         // Record in database
@@ -96,6 +105,18 @@ impl UsageServiceTrait for UsageServiceImpl {
             .record_usage(db_request)
             .await
             .map_err(|e| UsageError::InternalError(format!("Failed to record usage: {e}")))?;
+
+        // Record cost metric (low-cardinality: model + environment only)
+        if total_cost > 0 {
+            let environment = get_environment();
+            let tags = [
+                format!("{}:{}", TAG_MODEL, model.model_name),
+                format!("{TAG_ENVIRONMENT}:{environment}"),
+            ];
+            let tags_str: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
+            self.metrics_service
+                .record_count(METRIC_COST_USD, total_cost, &tags_str);
+        }
 
         Ok(())
     }

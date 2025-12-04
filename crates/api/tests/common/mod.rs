@@ -77,6 +77,11 @@ pub fn test_config() -> ApiConfig {
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string()
             }),
         },
+        otlp: config::OtlpConfig {
+            endpoint: std::env::var("TELEMETRY_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://localhost:4317".to_string()),
+            protocol: std::env::var("TELEMETRY_OTLP_PROTOCOL").unwrap_or("grpc".to_string()),
+        },
     }
 }
 
@@ -176,11 +181,13 @@ pub async fn setup_test_server_with_pool() -> (
     // This leverages the existing MockProvider from inference_providers::mock
     let (inference_provider_pool, mock_provider) =
         api::init_inference_providers_with_mocks(&config).await;
+    let metrics_service = Arc::new(services::metrics::MockMetricsService);
     let domain_services = api::init_domain_services_with_pool(
         database.clone(),
         &config,
         auth_components.organization_service.clone(),
         inference_provider_pool.clone(),
+        metrics_service,
     )
     .await;
 

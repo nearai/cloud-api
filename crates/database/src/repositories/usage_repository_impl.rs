@@ -23,6 +23,8 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             output_cost: request.output_cost,
             total_cost: request.total_cost,
             request_type: request.request_type,
+            ttft_ms: request.ttft_ms,
+            avg_itl_ms: request.avg_itl_ms,
         };
 
         let log = self.record_usage(db_request).await?;
@@ -43,6 +45,8 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             total_cost: log.total_cost,
             request_type: log.request_type,
             created_at: log.created_at,
+            ttft_ms: log.ttft_ms,
+            avg_itl_ms: log.avg_itl_ms,
         })
     }
 
@@ -92,6 +96,8 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 total_cost: log.total_cost,
                 request_type: log.request_type,
                 created_at: log.created_at,
+                ttft_ms: log.ttft_ms,
+                avg_itl_ms: log.avg_itl_ms,
             })
             .collect();
 
@@ -128,6 +134,8 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 total_cost: log.total_cost,
                 request_type: log.request_type,
                 created_at: log.created_at,
+                ttft_ms: log.ttft_ms,
+                avg_itl_ms: log.avg_itl_ms,
             })
             .collect();
 

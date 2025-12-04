@@ -54,3 +54,4 @@ dotenvy = "0.15.7"
 k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 sha3 = "0.10"
 hmac = "0.12"
+tokio-postgres = "0.7"

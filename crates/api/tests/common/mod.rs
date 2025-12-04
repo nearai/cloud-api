@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+mod db_setup;
+
 use api::{build_app_with_config, init_auth_services, models::BatchUpdateModelApiRequest};
 use base64::Engine;
 use chrono::Utc;
@@ -18,6 +20,9 @@ use sha3::Keccak256;
 
 // Global once cell to ensure migrations only run once across all tests
 static MIGRATIONS_INITIALIZED: OnceCell<()> = OnceCell::const_new();
+
+// Global once cell to ensure database reset happens only once per test run
+static RESET_DONE: OnceCell<()> = OnceCell::const_new();
 
 // Constants for mock test data
 pub const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
@@ -86,7 +91,7 @@ fn db_config_for_tests() -> config::DatabaseConfig {
         primary_app_id: "postgres-test".to_string(),
         port: 5432,
         host: None,
-        database: "platform_api".to_string(),
+        database: db_setup::get_test_db_name(),
         username: std::env::var("DATABASE_USERNAME").unwrap_or("postgres".to_string()),
         password: std::env::var("DATABASE_PASSWORD").unwrap_or("postgres".to_string()),
         max_connections: 2,
@@ -125,6 +130,15 @@ pub async fn get_access_token_from_refresh_token(
 
 /// Initialize database with migrations running only once
 pub async fn init_test_database(config: &config::DatabaseConfig) -> Arc<Database> {
+    // Reset database once per test run
+    RESET_DONE
+        .get_or_init(|| async {
+            db_setup::reset_test_database(config)
+                .await
+                .expect("Failed to reset test database");
+        })
+        .await;
+
     let database = Arc::new(
         Database::from_config(config)
             .await

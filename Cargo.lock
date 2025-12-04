@@ -504,6 +504,7 @@ dependencies = [
  "sha3",
  "thiserror 2.0.17",
  "tokio",
+ "tokio-postgres",
  "tokio-stream",
  "tokio-test",
  "tower",

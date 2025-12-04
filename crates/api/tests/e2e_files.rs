@@ -813,6 +813,7 @@ async fn test_complete_file_lifecycle() {
 #[tokio::test]
 async fn test_file_in_response_api() {
     let (server, _pool, mock) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Configure mock provider with exact prompt matchers
@@ -1026,6 +1027,7 @@ async fn test_file_in_response_api() {
 #[tokio::test]
 async fn test_file_not_found_in_response_api() {
     let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Get available models
@@ -1083,6 +1085,7 @@ async fn test_file_not_found_in_response_api() {
 #[tokio::test]
 async fn test_multiple_files_in_response_api() {
     let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // 1. Upload multiple text files

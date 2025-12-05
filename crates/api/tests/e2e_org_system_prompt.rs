@@ -147,6 +147,7 @@ async fn test_system_prompt_integration_with_responses() {
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
     setup_glm_model(&server).await;
+    setup_qwen_model(&server).await;
 
     // Set system prompt
     server

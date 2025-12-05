@@ -145,4 +145,10 @@ pub trait InferenceProvider {
         nonce: Option<String>,
         signing_address: Option<String>,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError>;
+
+    /// Count tokens for text using the provider's tokenizer
+    ///
+    /// This method returns the number of tokens for the given text using the model's tokenizer.
+    /// This is primarily implemented by vLLM via its /tokenize endpoint.
+    async fn count_tokens(&self, text: &str, model: &str) -> Result<i32, String>;
 }

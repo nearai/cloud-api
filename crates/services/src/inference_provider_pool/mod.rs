@@ -631,6 +631,46 @@ impl InferenceProviderPool {
         Ok(response)
     }
 
+    /// Count tokens for text using the provider's tokenizer via vLLM
+    ///
+    /// This method calls the provider's count_tokens method to get an accurate token count
+    /// for the given text using the model's tokenizer.
+    /// Falls back to rough estimation (chars / 4) if the tokenize API fails.
+    pub async fn count_tokens_for_model(
+        &self,
+        text: &str,
+        model_name: &str,
+    ) -> Result<i32, String> {
+        // Get providers for this model to see if we have any available
+        let model_mapping = self.model_mapping.read().await;
+        let providers = model_mapping.get(model_name);
+
+        if let Some(provider_list) = providers {
+            if let Some(provider) = provider_list.first() {
+                match provider.count_tokens(text, model_name).await {
+                    Ok(count) => {
+                        return Ok(count);
+                    }
+                    Err(e) => {
+                        // Fall back to estimation if count_tokens fails
+                        tracing::warn!(
+                            "Failed to get token count from provider: {}, using estimation",
+                            e
+                        );
+                        return Ok((text.len() / 4).max(1) as i32);
+                    }
+                }
+            }
+        }
+
+        // No providers found, use estimation
+        tracing::warn!(
+            "No providers found for model: {}, using token estimation",
+            model_name
+        );
+        Ok((text.len() / 4).max(1) as i32)
+    }
+
     /// Start the periodic model discovery refresh task and store the handle
     pub async fn start_refresh_task(self: Arc<Self>, refresh_interval_secs: u64) {
         let handle = tokio::spawn({

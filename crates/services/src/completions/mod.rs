@@ -13,6 +13,16 @@ use futures_util::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+/// Context for stream interception and usage tracking
+struct StreamContext {
+    organization_id: Uuid,
+    workspace_id: Uuid,
+    api_key_id: Uuid,
+    model_id: Uuid,
+    model_name: String,
+    request_type: String,
+}
+
 struct InterceptStream<S>
 where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
@@ -20,11 +30,9 @@ where
     inner: S,
     attestation_service: Arc<dyn AttestationServiceTrait>,
     usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
-    organization_id: Uuid,
-    workspace_id: Uuid,
-    api_key_id: Uuid,
-    model_id: Uuid,
-    request_type: String,
+    inference_provider_pool: Arc<InferenceProviderPool>,
+    context: StreamContext,
+    accumulated_text: String,
 }
 
 impl<S> Stream for InterceptStream<S>
@@ -37,6 +45,33 @@ where
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(ref event))) => {
                 if let StreamChunk::Chat(ref chat_chunk) = event.chunk {
+                    // Accumulate ALL output content from deltas in choices
+                    // This includes: text, tool calls, reasoning, etc.
+                    for choice in &chat_chunk.choices {
+                        if let Some(ref delta) = choice.delta {
+                            // Accumulate regular text content
+                            if let Some(ref delta_content) = delta.content {
+                                self.accumulated_text.push_str(delta_content);
+                            }
+
+                            // Accumulate tool calls (names and arguments)
+                            if let Some(ref tool_calls) = delta.tool_calls {
+                                for tool_call in tool_calls {
+                                    if let Some(function) = &tool_call.function {
+                                        // Include tool function name
+                                        if let Some(name) = &function.name {
+                                            self.accumulated_text.push_str(name);
+                                        }
+                                        // Include tool arguments
+                                        if let Some(args) = &function.arguments {
+                                            self.accumulated_text.push_str(args);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     if let Some(usage) = &chat_chunk.usage {
                         // Store attestation signature when completion finishes
                         let attestation_service = self.attestation_service.clone();
@@ -49,51 +84,117 @@ where
                             {
                                 tracing::error!("Failed to store chat signature");
                             } else {
-                                tracing::debug!("Stored signature for chat_id: {}", chat_id);
+                                tracing::debug!("Stored signature");
                             }
                         });
 
-                        // Record usage
-                        let usage_service = self.usage_service.clone();
-                        let organization_id = self.organization_id;
-                        let workspace_id = self.workspace_id;
-                        let api_key_id = self.api_key_id;
-                        let model_id = self.model_id;
-                        let request_type = self.request_type.clone();
-                        let input_tokens = usage.prompt_tokens;
-                        let output_tokens = usage.completion_tokens;
-
-                        tokio::spawn(async move {
-                            if usage_service
-                                .record_usage(RecordUsageServiceRequest {
-                                    organization_id,
-                                    workspace_id,
-                                    api_key_id,
-                                    response_id: None,
-                                    model_id,
-                                    input_tokens,
-                                    output_tokens,
-                                    request_type,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                tracing::error!("Failed to record usage in completion service");
-                            } else {
-                                tracing::debug!(
-                                    "Recorded usage for org {}: {} input, {} output tokens (api_key: {})",
-                                    organization_id,
-                                    input_tokens,
-                                    output_tokens,
-                                    api_key_id
-                                );
-                            }
-                        });
+                        // This is the final chunk with usage info - use vLLM's counts
+                        self.record_usage_with_counts(usage.prompt_tokens, usage.completion_tokens);
+                        // Clear accumulated text since we've recorded the final usage
+                        self.accumulated_text.clear();
                     }
                 }
                 Poll::Ready(Some(Ok(event.clone())))
             }
             other => other,
+        }
+    }
+}
+
+impl<S> InterceptStream<S>
+where
+    S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
+{
+    /// Record usage with the given token counts
+    /// Called when vLLM sends the final chunk with usage information
+    fn record_usage_with_counts(&self, input_tokens: i32, output_tokens: i32) {
+        // Spawn task to record usage (non-blocking)
+        let usage_service = self.usage_service.clone();
+        let context = StreamContext {
+            organization_id: self.context.organization_id,
+            workspace_id: self.context.workspace_id,
+            api_key_id: self.context.api_key_id,
+            model_id: self.context.model_id,
+            model_name: self.context.model_name.clone(),
+            request_type: self.context.request_type.clone(),
+        };
+
+        tokio::spawn(async move {
+            if usage_service
+                .record_usage(RecordUsageServiceRequest {
+                    organization_id: context.organization_id,
+                    workspace_id: context.workspace_id,
+                    api_key_id: context.api_key_id,
+                    response_id: None,
+                    model_id: context.model_id,
+                    input_tokens,
+                    output_tokens,
+                    request_type: context.request_type,
+                })
+                .await
+                .is_err()
+            {
+                tracing::error!("Failed to record usage in completion service");
+            }
+        });
+    }
+}
+
+impl<S> Drop for InterceptStream<S>
+where
+    S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
+{
+    fn drop(&mut self) {
+        // If we have accumulated text, it means we disconnected before receiving final chunk
+        // Count tokens for accumulated output and record usage as fallback
+        if !self.accumulated_text.is_empty() {
+            // Client disconnected before final chunk - count accumulated text
+            let accumulated_text = self.accumulated_text.clone();
+            let inference_provider_pool = self.inference_provider_pool.clone();
+            let usage_service = self.usage_service.clone();
+            let context = StreamContext {
+                organization_id: self.context.organization_id,
+                workspace_id: self.context.workspace_id,
+                api_key_id: self.context.api_key_id,
+                model_id: self.context.model_id,
+                model_name: self.context.model_name.clone(),
+                request_type: self.context.request_type.clone(),
+            };
+
+            tokio::spawn(async move {
+                // Count tokens for accumulated text
+                let output_tokens = match inference_provider_pool
+                    .count_tokens_for_model(&accumulated_text, &context.model_name)
+                    .await
+                {
+                    Ok(count) => count,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to count tokens on disconnect: {}, using estimation",
+                            e
+                        );
+                        (accumulated_text.len() / 4).max(1) as i32
+                    }
+                };
+
+                // Record the accumulated usage (0 input tokens since we only track output on disconnect)
+                if usage_service
+                    .record_usage(RecordUsageServiceRequest {
+                        organization_id: context.organization_id,
+                        workspace_id: context.workspace_id,
+                        api_key_id: context.api_key_id,
+                        response_id: None,
+                        model_id: context.model_id,
+                        input_tokens: 0,
+                        output_tokens,
+                        request_type: context.request_type,
+                    })
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("Failed to record accumulated usage on disconnect");
+                }
+            });
         }
     }
 }
@@ -142,21 +243,15 @@ impl CompletionServiceImpl {
     async fn handle_stream_with_context(
         &self,
         llm_stream: StreamingResult,
-        organization_id: Uuid,
-        workspace_id: Uuid,
-        api_key_id: Uuid,
-        model_id: Uuid,
-        request_type: &str,
+        context: StreamContext,
     ) -> StreamingResult {
         let intercepted_stream = InterceptStream {
             inner: llm_stream,
             attestation_service: self.attestation_service.clone(),
             usage_service: self.usage_service.clone(),
-            organization_id,
-            workspace_id,
-            api_key_id,
-            model_id,
-            request_type: request_type.to_string(),
+            inference_provider_pool: self.inference_provider_pool.clone(),
+            context,
+            accumulated_text: String::new(),
         };
         Box::pin(intercepted_stream)
     }
@@ -267,16 +362,16 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // Create the completion event stream with usage tracking
         // Use model UUID for usage tracking
-        let event_stream = self
-            .handle_stream_with_context(
-                llm_stream,
-                organization_id,
-                workspace_id,
-                api_key_id,
-                model.id,
-                request_type,
-            )
-            .await;
+        let context = StreamContext {
+            organization_id,
+            workspace_id,
+            api_key_id,
+            model_id: model.id,
+            model_name: canonical_name.clone(),
+            request_type: request_type.to_string(),
+        };
+
+        let event_stream = self.handle_stream_with_context(llm_stream, context).await;
 
         Ok(event_stream)
     }
@@ -377,7 +472,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             {
                 tracing::error!("Failed to store chat signature");
             } else {
-                tracing::debug!("Stored signature for chat_id: {}", chat_id);
+                tracing::debug!("Stored signature");
             }
         });
 
@@ -408,14 +503,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 .is_err()
             {
                 tracing::error!("Failed to record usage in completion service");
-            } else {
-                tracing::debug!(
-                    "Recorded usage for org {}: {} input, {} output tokens (api_key: {})",
-                    organization_id,
-                    input_tokens,
-                    output_tokens,
-                    api_key_id
-                );
             }
         });
 

@@ -709,6 +709,11 @@ impl crate::InferenceProvider for MockProvider {
         );
         Ok(report)
     }
+
+    async fn count_tokens(&self, text: &str, _model: &str) -> Result<i32, String> {
+        // Mock implementation: return rough estimation (chars / 4)
+        Ok((text.len() / 4) as i32)
+    }
 }
 
 impl MockProvider {

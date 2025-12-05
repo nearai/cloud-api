@@ -1,7 +1,7 @@
 use crate::{models::StreamOptions, sse_parser::SSEParser, *};
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Configuration for vLLM provider
 #[derive(Debug, Clone)]
@@ -19,6 +19,23 @@ impl VLlmConfig {
             timeout_seconds: timeout_seconds.unwrap_or(30),
         }
     }
+}
+
+/// Request for tokenizing text via vLLM's tokenize endpoint
+#[derive(Debug, Serialize)]
+struct TokenizeCompletionRequest {
+    model: String,
+    prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    add_special_tokens: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    return_token_strs: Option<bool>,
+}
+
+/// Response from vLLM's tokenize endpoint
+#[derive(Debug, Deserialize)]
+struct TokenizeResponse {
+    count: i32,
 }
 
 /// vLLM provider implementation
@@ -316,5 +333,43 @@ impl InferenceProvider for VLlmProvider {
         // Use the SSE parser to handle the stream properly
         let sse_stream = SSEParser::new(response.bytes_stream(), false);
         Ok(Box::pin(sse_stream))
+    }
+
+    /// Count tokens for text using vLLM's tokenize endpoint
+    ///
+    /// This method calls vLLM's /tokenize endpoint to get an accurate token count
+    /// for the given text using the model's tokenizer.
+    async fn count_tokens(&self, text: &str, model: &str) -> Result<i32, String> {
+        let url = format!("{}/v1/tokenize", self.config.base_url);
+
+        let request_body = TokenizeCompletionRequest {
+            model: model.to_string(),
+            prompt: text.to_string(),
+            add_special_tokens: None,
+            return_token_strs: None,
+        };
+
+        let response = self
+            .client
+            .post(&url)
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to call tokenize API: {e}"))?;
+
+        if !response.status().is_success() {
+            return Err(format!(
+                "Tokenize API returned status: {}",
+                response.status()
+            ));
+        }
+
+        let tokenize_response: TokenizeResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse tokenize response: {e}"))?;
+
+        // Return the count field from vLLM
+        Ok(tokenize_response.count)
     }
 }

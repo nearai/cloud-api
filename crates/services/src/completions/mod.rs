@@ -30,7 +30,7 @@ where
     model_id: Uuid,
     #[allow(dead_code)] // Kept for potential debugging/logging use
     model_name: String,
-    request_type: String,
+    inference_type: String,
     start_time: Instant,
     first_token_received: bool,
     first_token_time: Option<Instant>,
@@ -106,10 +106,15 @@ where
                         let workspace_id = self.workspace_id;
                         let api_key_id = self.api_key_id;
                         let model_id = self.model_id;
-                        let request_type = self.request_type.clone();
+                        let inference_type = self.inference_type.clone();
                         let input_tokens = usage.prompt_tokens;
                         let output_tokens = usage.completion_tokens;
                         let ttft_ms = self.ttft_ms;
+                        // Strip prefix for usage log storage (UUID-only)
+                        let inference_id_for_usage = chat_chunk.id
+                            .strip_prefix("chatcmpl-")
+                            .unwrap_or(&chat_chunk.id)
+                            .to_string();
 
                         tokio::spawn(async move {
                             if usage_service
@@ -117,13 +122,13 @@ where
                                     organization_id,
                                     workspace_id,
                                     api_key_id,
-                                    response_id: None,
                                     model_id,
                                     input_tokens,
                                     output_tokens,
-                                    request_type,
+                                    inference_type,
                                     ttft_ms,
                                     avg_itl_ms,
+                                    inference_id: Some(inference_id_for_usage.clone()),
                                 })
                                 .await
                                 .is_err()
@@ -131,12 +136,13 @@ where
                                 tracing::error!("Failed to record usage in completion service");
                             } else {
                                 tracing::debug!(
-                                    "Recorded usage for org {}: {} input, {} output tokens (api_key: {}, ttft: {:?}ms)",
+                                    "Recorded usage for org {}: {} input, {} output tokens (api_key: {}, ttft: {:?}ms, inference_id: {})",
                                     organization_id,
                                     input_tokens,
                                     output_tokens,
                                     api_key_id,
-                                    ttft_ms
+                                    ttft_ms,
+                                    inference_id_for_usage
                                 );
                             }
                         });
@@ -290,7 +296,7 @@ impl CompletionServiceImpl {
         api_key_id: Uuid,
         model_id: Uuid,
         model_name: String,
-        request_type: &str,
+        inference_type: &str,
         request_start_time: Instant,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
@@ -311,7 +317,7 @@ impl CompletionServiceImpl {
             api_key_id,
             model_id,
             model_name,
-            request_type: request_type.to_string(),
+            inference_type: inference_type.to_string(),
             start_time: request_start_time,
             first_token_received: false,
             first_token_time: None,
@@ -444,8 +450,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             }
         };
 
-        // Determine request type
-        let request_type = if is_streaming {
+        // Determine inference type
+        let inference_type = if is_streaming {
             "chat_completion_stream"
         } else {
             "chat_completion"
@@ -461,7 +467,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 api_key_id,
                 model.id,
                 model.model_name.clone(),
-                request_type,
+                inference_type,
                 request_start_time,
             )
             .await;
@@ -635,6 +641,11 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let model_id = model.id;
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
         let output_tokens = response_with_bytes.response.usage.completion_tokens;
+        // Strip prefix for usage log storage (UUID-only)
+        let inference_id_for_usage = response_with_bytes.response.id
+            .strip_prefix("chatcmpl-")
+            .unwrap_or(&response_with_bytes.response.id)
+            .to_string();
 
         tokio::spawn(async move {
             if usage_service
@@ -642,13 +653,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     organization_id,
                     workspace_id,
                     api_key_id,
-                    response_id: None,
                     model_id,
                     input_tokens,
                     output_tokens,
-                    request_type: "chat_completion".to_string(),
+                    inference_type: "chat_completion".to_string(),
                     ttft_ms: None,    // N/A for non-streaming
                     avg_itl_ms: None, // N/A for non-streaming
+                    inference_id: Some(inference_id_for_usage.clone()),
                 })
                 .await
                 .is_err()
@@ -656,11 +667,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 tracing::error!("Failed to record usage in completion service");
             } else {
                 tracing::debug!(
-                    "Recorded usage for org {}: {} input, {} output tokens (api_key: {})",
+                    "Recorded usage for org {}: {} input, {} output tokens (api_key: {}, inference_id: {})",
                     organization_id,
                     input_tokens,
                     output_tokens,
-                    api_key_id
+                    api_key_id,
+                    inference_id_for_usage
                 );
             }
         });
@@ -740,7 +752,7 @@ mod tests {
             api_key_id,
             model_id,
             model_name: "test-model".to_string(),
-            request_type: "chat_completion_stream".to_string(),
+            inference_type: "chat_completion_stream".to_string(),
             start_time: Instant::now(),
             first_token_received: false,
             first_token_time: None,
@@ -875,7 +887,7 @@ mod tests {
             api_key_id,
             model_id,
             model_name: "test-model".to_string(),
-            request_type: "chat_completion_stream".to_string(),
+            inference_type: "chat_completion_stream".to_string(),
             start_time,
             first_token_received: false,
             first_token_time: None,
@@ -974,7 +986,7 @@ mod tests {
             api_key_id,
             model_id,
             model_name: "test-model".to_string(),
-            request_type: "chat_completion_stream".to_string(),
+            inference_type: "chat_completion_stream".to_string(),
             start_time: Instant::now(),
             first_token_received: false,
             first_token_time: None,

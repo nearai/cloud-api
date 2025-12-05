@@ -43,7 +43,7 @@ pub struct UsageHistoryEntryResponse {
     pub total_tokens: i32,
     pub total_cost: i64,            // In nano-dollars (scale 9)
     pub total_cost_display: String, // Human readable, e.g., "$0.00123"
-    pub request_type: String,
+    pub inference_type: String,
     pub created_at: String,
 }
 
@@ -333,7 +333,7 @@ pub async fn get_organization_usage_history(
             total_tokens: entry.total_tokens,
             total_cost: entry.total_cost,
             total_cost_display: format_amount(entry.total_cost),
-            request_type: entry.request_type,
+            inference_type: entry.inference_type,
             created_at: entry.created_at.to_rfc3339(),
         })
         .collect();
@@ -458,7 +458,7 @@ pub async fn get_api_key_usage_history(
             total_tokens: entry.total_tokens,
             total_cost: entry.total_cost,
             total_cost_display: format_amount(entry.total_cost),
-            request_type: entry.request_type,
+            inference_type: entry.inference_type,
             created_at: entry.created_at.to_rfc3339(),
         })
         .collect();

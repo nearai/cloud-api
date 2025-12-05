@@ -86,7 +86,6 @@ impl UsageServiceTrait for UsageServiceImpl {
             organization_id: request.organization_id,
             workspace_id: request.workspace_id,
             api_key_id: request.api_key_id,
-            response_id: request.response_id,
             model_id: request.model_id,
             model_name: model.model_name.clone(),
             input_tokens: request.input_tokens,
@@ -94,9 +93,10 @@ impl UsageServiceTrait for UsageServiceImpl {
             input_cost,
             output_cost,
             total_cost,
-            request_type: request.request_type,
+            inference_type: request.inference_type,
             ttft_ms: request.ttft_ms,
             avg_itl_ms: request.avg_itl_ms,
+            inference_id: request.inference_id,
         };
 
         // Record in database

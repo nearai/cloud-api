@@ -108,6 +108,7 @@ pub struct ResponseRouteState {
         (status = 200, description = "Response created", body = ResponseObject),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 402, description = "Insufficient credits", body = ErrorResponse),
         (status = 500, description = "Server error", body = ErrorResponse)
     ),
     security(

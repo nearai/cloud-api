@@ -949,13 +949,8 @@ async fn test_responses_api_usage_limit_enforcement() {
         error_response
             .error
             .message
-            .contains("insufficient_credits")
-            || error_response
-                .error
-                .message
-                .contains("Credit limit exceeded")
-            || error_response.error.message.contains("No credits"),
-        "Error response should indicate insufficient credits, got: {}",
+            .contains("Credit limit exceeded."),
+        "Error response should indicate no credits, got: {}",
         error_response.error.message
     );
 }
@@ -1011,9 +1006,10 @@ async fn test_responses_api_no_credits() {
 
     let error_response = response.json::<api::models::ErrorResponse>();
     assert!(
-        error_response.error.message.contains("no_credits")
-            || error_response.error.message.contains("No credits")
-            || error_response.error.message.contains("no_limit_configured"),
+        error_response
+            .error
+            .message
+            .contains("No spending limit configured"),
         "Error response should indicate no credits, got: {}",
         error_response.error.message
     );
@@ -1070,8 +1066,10 @@ async fn test_responses_api_zero_credits() {
 
     let error_response = response.json::<api::models::ErrorResponse>();
     assert!(
-        error_response.error.message.contains("no_credits")
-            || error_response.error.message.contains("No credits"),
+        error_response
+            .error
+            .message
+            .contains("Credit limit exceeded."),
         "Error response should indicate no credits, got: {}",
         error_response.error.message
     );
@@ -1215,13 +1213,8 @@ async fn test_responses_api_streaming_usage_limit() {
         error_response
             .error
             .message
-            .contains("insufficient_credits")
-            || error_response
-                .error
-                .message
-                .contains("Credit limit exceeded")
-            || error_response.error.message.contains("No credits"),
-        "Error response should indicate insufficient credits, got: {}",
+            .contains("Credit limit exceeded."),
+        "Error response should indicate no credits, got: {}",
         error_response.error.message
     );
 }

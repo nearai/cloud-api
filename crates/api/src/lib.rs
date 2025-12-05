@@ -449,13 +449,14 @@ pub fn build_app_with_config(
     let completion_routes = build_completion_routes(
         app_state.clone(),
         &auth_components.auth_state_middleware,
-        usage_state,
+        usage_state.clone(),
     );
 
     let response_routes = build_response_routes(
         domain_services.response_service,
         domain_services.attestation_service.clone(),
         &auth_components.auth_state_middleware,
+        usage_state,
     );
 
     let conversation_routes = build_conversation_routes(
@@ -617,14 +618,27 @@ pub fn build_response_routes(
     response_service: Arc<services::ResponseService>,
     attestation_service: Arc<dyn services::attestation::ports::AttestationServiceTrait>,
     auth_state_middleware: &AuthState,
+    usage_state: middleware::UsageState,
 ) -> Router {
     let route_state = responses::ResponseRouteState {
         response_service: response_service.clone(),
-        attestation_service,
+        attestation_service: attestation_service.clone(),
     };
 
-    Router::new()
+    let inference_routes = Router::new()
         .route("/responses", post(responses::create_response))
+        .with_state(route_state.clone())
+        .layer(from_fn_with_state(
+            usage_state,
+            middleware::usage_check_middleware,
+        ))
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::auth_middleware_with_workspace_context,
+        ))
+        .layer(from_fn(middleware::body_hash_middleware));
+
+    let other_routes = Router::new()
         .route("/responses/{response_id}", get(responses::get_response))
         .route(
             "/responses/{response_id}",
@@ -642,8 +656,9 @@ pub fn build_response_routes(
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
-        ))
-        .layer(from_fn(middleware::body_hash_middleware))
+        ));
+
+    Router::new().merge(inference_routes).merge(other_routes)
 }
 
 /// Build conversation routes with auth

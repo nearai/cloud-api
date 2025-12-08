@@ -69,8 +69,8 @@ impl OrganizationUsageRepository {
                         id, organization_id, workspace_id, api_key_id,
                         model_id, model_name, input_tokens, output_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
-                        inference_type, created_at, ttft_ms, avg_itl_ms, inference_id
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                        request_type, inference_type, created_at, ttft_ms, avg_itl_ms, inference_id
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
                     RETURNING *
                     "#,
                     &[
@@ -86,6 +86,7 @@ impl OrganizationUsageRepository {
                         &request.input_cost,
                         &request.output_cost,
                         &request.total_cost,
+                        &request.inference_type,
                         &request.inference_type,
                         &now,
                         &request.ttft_ms,

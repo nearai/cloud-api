@@ -539,7 +539,7 @@ pub struct OrganizationUsageLog {
     /// Average inter-token latency in milliseconds
     pub avg_itl_ms: Option<f64>,
     /// Inference UUID (without prefix). For chat completions, this is the UUID portion without "chatcmpl-"
-    pub inference_id: Option<String>,
+    pub inference_id: Option<Uuid>,
 }
 
 /// Organization balance summary - cached aggregate spending
@@ -574,7 +574,7 @@ pub struct RecordUsageRequest {
     /// Average inter-token latency in milliseconds
     pub avg_itl_ms: Option<f64>,
     /// Inference UUID (without prefix). For chat completions, this is the UUID portion without "chatcmpl-"
-    pub inference_id: Option<String>,
+    pub inference_id: Option<Uuid>,
 }
 
 // ============================================

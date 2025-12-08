@@ -15,6 +15,12 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+/// Hash inference ID to UUID deterministically using MD5 hash (v5)
+/// Takes the full ID including prefix (e.g., "chatcmpl-abc123") and returns a stable UUID
+fn hash_inference_id_to_uuid(full_id: &str) -> Uuid {
+    Uuid::new_v5(&Uuid::NAMESPACE_DNS, full_id.as_bytes())
+}
+
 struct InterceptStream<S>
 where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
@@ -110,11 +116,8 @@ where
                         let input_tokens = usage.prompt_tokens;
                         let output_tokens = usage.completion_tokens;
                         let ttft_ms = self.ttft_ms;
-                        // Strip prefix for usage log storage (UUID-only)
-                        let inference_id_for_usage = chat_chunk.id
-                            .strip_prefix("chatcmpl-")
-                            .unwrap_or(&chat_chunk.id)
-                            .to_string();
+                        // Hash the full chat ID to UUID for storage
+                        let inference_id_uuid = Some(hash_inference_id_to_uuid(&chat_chunk.id));
 
                         tokio::spawn(async move {
                             if usage_service
@@ -128,22 +131,12 @@ where
                                     inference_type,
                                     ttft_ms,
                                     avg_itl_ms,
-                                    inference_id: Some(inference_id_for_usage.clone()),
+                                    inference_id: inference_id_uuid,
                                 })
                                 .await
                                 .is_err()
                             {
                                 tracing::error!("Failed to record usage in completion service");
-                            } else {
-                                tracing::debug!(
-                                    "Recorded usage for org {}: {} input, {} output tokens (api_key: {}, ttft: {:?}ms, inference_id: {})",
-                                    organization_id,
-                                    input_tokens,
-                                    output_tokens,
-                                    api_key_id,
-                                    ttft_ms,
-                                    inference_id_for_usage
-                                );
                             }
                         });
 
@@ -641,11 +634,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let model_id = model.id;
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
         let output_tokens = response_with_bytes.response.usage.completion_tokens;
-        // Strip prefix for usage log storage (UUID-only)
-        let inference_id_for_usage = response_with_bytes.response.id
-            .strip_prefix("chatcmpl-")
-            .unwrap_or(&response_with_bytes.response.id)
-            .to_string();
+        // Hash the full chat ID to UUID for storage
+        let inference_id_uuid = Some(hash_inference_id_to_uuid(&response_with_bytes.response.id));
 
         tokio::spawn(async move {
             if usage_service
@@ -659,21 +649,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     inference_type: "chat_completion".to_string(),
                     ttft_ms: None,    // N/A for non-streaming
                     avg_itl_ms: None, // N/A for non-streaming
-                    inference_id: Some(inference_id_for_usage.clone()),
+                    inference_id: inference_id_uuid,
                 })
                 .await
                 .is_err()
             {
                 tracing::error!("Failed to record usage in completion service");
-            } else {
-                tracing::debug!(
-                    "Recorded usage for org {}: {} input, {} output tokens (api_key: {}, inference_id: {})",
-                    organization_id,
-                    input_tokens,
-                    output_tokens,
-                    api_key_id,
-                    inference_id_for_usage
-                );
             }
         });
 

@@ -210,7 +210,8 @@ pub async fn create_response(
                         }
 
                         // Format as SSE: "event: {type}\ndata: {json}\n\n"
-                        let json = serde_json::to_string(&event).unwrap_or_default();
+                        let json = serde_json::to_string(&event)
+                            .expect("event serialization failed");
                         let sse_bytes = format!("event: {}\ndata: {}\n\n", event.event_type, json);
                         let bytes = Bytes::from(sse_bytes);
 
@@ -473,6 +474,23 @@ pub async fn create_response(
                     "Created response {} for key {}",
                     response.id, api_key.api_key.created_by_user_id.0
                 );
+
+                // Store signature for non-streaming response
+                let response_id = response.id.clone();
+                let response_json =
+                    serde_json::to_string(&response).expect("response serialization failed");
+                let response_hash = compute_sha256(response_json.as_bytes());
+
+                if let Err(e) = attestation_service
+                    .store_response_signature(&response_id, body_hash.hash.clone(), response_hash)
+                    .await
+                {
+                    tracing::error!(
+                        "Failed to store response signature for non-streaming: {}",
+                        e
+                    );
+                }
+
                 (StatusCode::OK, ResponseJson(response)).into_response()
             }
             Err(error) => {

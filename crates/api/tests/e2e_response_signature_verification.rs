@@ -281,3 +281,165 @@ async fn test_streaming_response_signature_verification() {
     println!("✅ Signing algorithm: {signing_algo}");
     println!("✅ ECDSA signature cryptographically verified");
 }
+
+// ============================================
+// Non-Streaming Response Signature Tests
+// ============================================
+
+#[tokio::test]
+async fn test_non_streaming_response_signature_verification() {
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let model_name = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+
+    let conversation_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "name": "Test Conversation",
+            "description": "Test non-streaming signatures"
+        }))
+        .await;
+
+    assert_eq!(conversation_response.status_code(), 201);
+    let conversation = conversation_response.json::<api::models::ConversationObject>();
+
+    let request_body = serde_json::json!({
+        "conversation": { "id": conversation.id },
+        "input": "Respond with two words.",
+        "stream": false,
+        "model": model_name,
+        "nonce": 42
+    });
+
+    let request_json = serde_json::to_string(&request_body).unwrap();
+    let expected_request_hash = compute_sha256(&request_json);
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&request_body)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "POST /v1/responses should succeed"
+    );
+
+    let response_text = response.text();
+    let response_json: serde_json::Value =
+        serde_json::from_str(&response_text).expect("Response must be valid JSON");
+    let response_id = response_json
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("Response must have id field")
+        .to_string();
+
+    let expected_response_hash = compute_sha256(&response_text);
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+    // Test ECDSA signature
+    let ecdsa_response = server
+        .get(format!("/v1/signature/{response_id}?model={model_name}&signing_algo=ecdsa").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+
+    assert_eq!(
+        ecdsa_response.status_code(),
+        200,
+        "Signature should be stored for non-streaming response"
+    );
+
+    let ecdsa_json = ecdsa_response.json::<serde_json::Value>();
+    let signature_text = ecdsa_json
+        .get("text")
+        .and_then(|v| v.as_str())
+        .expect("Signature response must have text field");
+
+    let hash_parts: Vec<&str> = signature_text.split(':').collect();
+    assert_eq!(
+        hash_parts.len(),
+        2,
+        "Signature text should be request_hash:response_hash"
+    );
+
+    assert_eq!(
+        hash_parts[0], expected_request_hash,
+        "Request hash must match computed value"
+    );
+    assert_eq!(
+        hash_parts[1], expected_response_hash,
+        "Response hash must match computed value"
+    );
+
+    let signature = ecdsa_json
+        .get("signature")
+        .and_then(|v| v.as_str())
+        .expect("Must have signature field");
+    assert!(!signature.is_empty(), "Signature cannot be empty");
+    assert!(signature.starts_with("0x"), "Signature must be hex-encoded");
+
+    let signing_address = ecdsa_json
+        .get("signing_address")
+        .and_then(|v| v.as_str())
+        .expect("Must have signing_address field");
+    assert!(
+        !signing_address.is_empty(),
+        "Signing address cannot be empty"
+    );
+
+    let signing_algo = ecdsa_json
+        .get("signing_algo")
+        .and_then(|v| v.as_str())
+        .expect("Must have signing_algo field");
+    assert_eq!(signing_algo, "ecdsa", "Should use ECDSA algorithm");
+
+    let is_valid = common::verify_ecdsa_signature(signature_text, signature, signing_address);
+    assert!(is_valid, "ECDSA signature must be cryptographically valid");
+
+    // Test ED25519 signature uses same format
+    let ed25519_response = server
+        .get(
+            format!("/v1/signature/{response_id}?model={model_name}&signing_algo=ed25519").as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+
+    assert_eq!(
+        ed25519_response.status_code(),
+        200,
+        "ED25519 signature should be available"
+    );
+
+    let ed25519_json = ed25519_response.json::<serde_json::Value>();
+    let ed25519_text = ed25519_json
+        .get("text")
+        .and_then(|v| v.as_str())
+        .expect("Must have ED25519 signature text");
+
+    assert_eq!(
+        signature_text, ed25519_text,
+        "Both algorithms must produce same signature text format"
+    );
+
+    // Verify the ED25519 signature cryptographically
+    let ed25519_signature = ed25519_json
+        .get("signature")
+        .and_then(|v| v.as_str())
+        .expect("Should have ED25519 signature field");
+
+    let ed25519_signing_address = ed25519_json
+        .get("signing_address")
+        .and_then(|v| v.as_str())
+        .expect("Should have ED25519 signing_address field");
+
+    let is_valid =
+        common::verify_ed25519_signature(ed25519_text, ed25519_signature, ed25519_signing_address);
+    assert!(
+        is_valid,
+        "ED25519 signature must be cryptographically valid"
+    );
+}

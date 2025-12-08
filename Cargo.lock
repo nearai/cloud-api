@@ -489,6 +489,7 @@ dependencies = [
  "config",
  "database",
  "dotenvy",
+ "ed25519-dalek",
  "futures",
  "headers",
  "hex",

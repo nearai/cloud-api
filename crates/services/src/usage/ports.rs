@@ -129,11 +129,16 @@ pub struct RecordUsageServiceRequest {
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
     pub api_key_id: Uuid,
-    pub response_id: Option<Uuid>,
     pub model_id: Uuid,
     pub input_tokens: i32,
     pub output_tokens: i32,
-    pub request_type: String, // 'chat_completion', 'text_completion', 'response'
+    pub inference_type: String, // 'chat_completion', 'chat_completion_stream', 'image_generation', etc.
+    /// Time to first token in milliseconds
+    pub ttft_ms: Option<i32>,
+    /// Average inter-token latency in milliseconds
+    pub avg_itl_ms: Option<f64>,
+    /// Inference UUID
+    pub inference_id: Option<Uuid>,
 }
 
 /// Request to record usage (database layer)
@@ -143,7 +148,6 @@ pub struct RecordUsageDbRequest {
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
     pub api_key_id: Uuid,
-    pub response_id: Option<Uuid>,
     pub model_id: Uuid,
     pub model_name: String, // Denormalized canonical model name
     pub input_tokens: i32,
@@ -151,7 +155,13 @@ pub struct RecordUsageDbRequest {
     pub input_cost: i64,
     pub output_cost: i64,
     pub total_cost: i64,
-    pub request_type: String,
+    pub inference_type: String,
+    /// Time to first token in milliseconds
+    pub ttft_ms: Option<i32>,
+    /// Average inter-token latency in milliseconds
+    pub avg_itl_ms: Option<f64>,
+    /// Inference UUID
+    pub inference_id: Option<Uuid>,
 }
 
 /// Model pricing information
@@ -210,7 +220,6 @@ pub struct UsageLogEntry {
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
     pub api_key_id: Uuid,
-    pub response_id: Option<Uuid>,
     pub model_id: Uuid,
     pub model: String, // Canonical model name from models table
     pub input_tokens: i32,
@@ -219,8 +228,14 @@ pub struct UsageLogEntry {
     pub input_cost: i64,
     pub output_cost: i64,
     pub total_cost: i64,
-    pub request_type: String,
+    pub inference_type: String,
     pub created_at: DateTime<Utc>,
+    /// Time to first token in milliseconds
+    pub ttft_ms: Option<i32>,
+    /// Average inter-token latency in milliseconds
+    pub avg_itl_ms: Option<f64>,
+    /// Inference UUID
+    pub inference_id: Option<Uuid>,
 }
 
 // ============================================

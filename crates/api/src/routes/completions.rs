@@ -158,6 +158,7 @@ pub async fn chat_completions(
     let request_hash = body_hash.hash.clone();
 
     // Convert HTTP request to service parameters
+    // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
     let service_request = convert_chat_request_to_service(
         &request,
         api_key.api_key.created_by_user_id.0,
@@ -418,6 +419,7 @@ pub async fn completions(
     }
 
     // Convert HTTP request to service parameters
+    // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
     let service_request = convert_text_request_to_service(
         &request,
         api_key.api_key.created_by_user_id.0,

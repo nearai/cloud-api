@@ -14,7 +14,6 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             organization_id: request.organization_id,
             workspace_id: request.workspace_id,
             api_key_id: request.api_key_id,
-            response_id: request.response_id,
             model_id: request.model_id,
             model_name: request.model_name,
             input_tokens: request.input_tokens,
@@ -22,7 +21,10 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             input_cost: request.input_cost,
             output_cost: request.output_cost,
             total_cost: request.total_cost,
-            request_type: request.request_type,
+            inference_type: request.inference_type,
+            ttft_ms: request.ttft_ms,
+            avg_itl_ms: request.avg_itl_ms,
+            inference_id: request.inference_id,
         };
 
         let log = self.record_usage(db_request).await?;
@@ -32,7 +34,6 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             organization_id: log.organization_id,
             workspace_id: log.workspace_id,
             api_key_id: log.api_key_id,
-            response_id: log.response_id,
             model_id: log.model_id,
             model: log.model,
             input_tokens: log.input_tokens,
@@ -41,8 +42,11 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             input_cost: log.input_cost,
             output_cost: log.output_cost,
             total_cost: log.total_cost,
-            request_type: log.request_type,
+            inference_type: log.inference_type,
             created_at: log.created_at,
+            ttft_ms: log.ttft_ms,
+            avg_itl_ms: log.avg_itl_ms,
+            inference_id: log.inference_id,
         })
     }
 
@@ -81,7 +85,6 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 organization_id: log.organization_id,
                 workspace_id: log.workspace_id,
                 api_key_id: log.api_key_id,
-                response_id: log.response_id,
                 model_id: log.model_id,
                 model: log.model,
                 input_tokens: log.input_tokens,
@@ -90,8 +93,11 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 input_cost: log.input_cost,
                 output_cost: log.output_cost,
                 total_cost: log.total_cost,
-                request_type: log.request_type,
+                inference_type: log.inference_type,
                 created_at: log.created_at,
+                ttft_ms: log.ttft_ms,
+                avg_itl_ms: log.avg_itl_ms,
+                inference_id: log.inference_id,
             })
             .collect();
 
@@ -117,7 +123,6 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 organization_id: log.organization_id,
                 workspace_id: log.workspace_id,
                 api_key_id: log.api_key_id,
-                response_id: log.response_id,
                 model_id: log.model_id,
                 model: log.model,
                 input_tokens: log.input_tokens,
@@ -126,8 +131,11 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 input_cost: log.input_cost,
                 output_cost: log.output_cost,
                 total_cost: log.total_cost,
-                request_type: log.request_type,
+                inference_type: log.inference_type,
                 created_at: log.created_at,
+                ttft_ms: log.ttft_ms,
+                avg_itl_ms: log.avg_itl_ms,
+                inference_id: log.inference_id,
             })
             .collect();
 

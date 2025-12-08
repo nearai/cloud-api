@@ -1,5 +1,6 @@
 pub mod admin_access_token;
 pub mod admin_composite;
+pub mod analytics;
 pub mod api_key;
 pub mod attestation;
 pub mod conversation;
@@ -25,6 +26,7 @@ pub mod workspace;
 
 pub use admin_access_token::AdminAccessTokenRepository;
 pub use admin_composite::AdminCompositeRepository;
+pub use analytics::PgAnalyticsRepository;
 pub use api_key::ApiKeyRepository;
 pub use attestation::PgAttestationRepository;
 pub use conversation::PgConversationRepository;

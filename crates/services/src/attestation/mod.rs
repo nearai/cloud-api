@@ -20,6 +20,7 @@ use crate::{
         ports::AttestationRepository,
     },
     inference_provider_pool::InferenceProviderPool,
+    metrics::{consts::*, MetricsServiceTrait},
     models::ModelsRepository,
 };
 
@@ -33,6 +34,7 @@ pub struct AttestationService {
     pub repository: Arc<dyn AttestationRepository + Send + Sync>,
     pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub models_repository: Arc<dyn ModelsRepository>,
+    pub metrics_service: Arc<dyn MetricsServiceTrait>,
     pub vpc_info: Option<VpcInfo>,
     pub vpc_shared_secret: Option<String>,
     ed25519_signing_key: Arc<SigningKey>,
@@ -46,6 +48,7 @@ impl AttestationService {
         repository: Arc<dyn AttestationRepository + Send + Sync>,
         inference_provider_pool: Arc<InferenceProviderPool>,
         models_repository: Arc<dyn ModelsRepository>,
+        metrics_service: Arc<dyn MetricsServiceTrait>,
     ) -> Self {
         // Load VPC info once during initialization
         let vpc_info = load_vpc_info();
@@ -89,6 +92,7 @@ impl AttestationService {
             repository,
             inference_provider_pool,
             models_repository,
+            metrics_service,
             vpc_info,
             vpc_shared_secret,
             ed25519_signing_key,
@@ -209,6 +213,8 @@ impl ports::AttestationServiceTrait for AttestationService {
         &self,
         chat_id: &str,
     ) -> Result<(), AttestationError> {
+        let start_time = std::time::Instant::now();
+
         // Get the provider for this chat
         let provider = self
             .inference_provider_pool
@@ -217,6 +223,9 @@ impl ports::AttestationServiceTrait for AttestationService {
             .ok_or_else(|| {
                 AttestationError::ProviderError(format!("No provider found for chat_id: {chat_id}"))
             })?;
+
+        let environment = get_environment();
+        let env_tag = format!("{TAG_ENVIRONMENT}:{environment}");
 
         // For MockProvider: Check if hashes are registered in the pool first
         // This allows the route handler to register hashes before InterceptStream stores the signature
@@ -254,9 +263,30 @@ impl ports::AttestationServiceTrait for AttestationService {
                             "Failed to store chat signature in repository for algorithm: {}",
                             algo
                         );
+                        let duration = start_time.elapsed();
+                        self.metrics_service.record_count(
+                            METRIC_VERIFICATION_FAILURE,
+                            1,
+                            &[&format!("{TAG_REASON}:{REASON_REPOSITORY_ERROR}"), &env_tag],
+                        );
+                        self.metrics_service.record_latency(
+                            METRIC_VERIFICATION_DURATION,
+                            duration,
+                            &[&env_tag],
+                        );
                         AttestationError::RepositoryError(e.to_string())
                     })?;
             }
+
+            // Record successful verification
+            let duration = start_time.elapsed();
+            self.metrics_service
+                .record_count(METRIC_VERIFICATION_SUCCESS, 1, &[&env_tag]);
+            self.metrics_service.record_latency(
+                METRIC_VERIFICATION_DURATION,
+                duration,
+                &[&env_tag],
+            );
 
             return Ok(());
         }
@@ -271,6 +301,17 @@ impl ports::AttestationServiceTrait for AttestationService {
                     tracing::error!(
                         "Failed to get chat signature from provider for algorithm: {}",
                         algo
+                    );
+                    let duration = start_time.elapsed();
+                    self.metrics_service.record_count(
+                        METRIC_VERIFICATION_FAILURE,
+                        1,
+                        &[&format!("{TAG_REASON}:{REASON_INFERENCE_ERROR}"), &env_tag],
+                    );
+                    self.metrics_service.record_latency(
+                        METRIC_VERIFICATION_DURATION,
+                        duration,
+                        &[&env_tag],
                     );
                     AttestationError::ProviderError(e.to_string())
                 })?;
@@ -291,9 +332,27 @@ impl ports::AttestationServiceTrait for AttestationService {
                         "Failed to store chat signature in repository for algorithm: {}",
                         algo
                     );
+                    let duration = start_time.elapsed();
+                    self.metrics_service.record_count(
+                        METRIC_VERIFICATION_FAILURE,
+                        1,
+                        &[&format!("{TAG_REASON}:{REASON_REPOSITORY_ERROR}"), &env_tag],
+                    );
+                    self.metrics_service.record_latency(
+                        METRIC_VERIFICATION_DURATION,
+                        duration,
+                        &[&env_tag],
+                    );
                     AttestationError::RepositoryError(e.to_string())
                 })?;
         }
+
+        // Record successful verification
+        let duration = start_time.elapsed();
+        self.metrics_service
+            .record_count(METRIC_VERIFICATION_SUCCESS, 1, &[&env_tag]);
+        self.metrics_service
+            .record_latency(METRIC_VERIFICATION_DURATION, duration, &[&env_tag]);
 
         Ok(())
     }
@@ -304,6 +363,10 @@ impl ports::AttestationServiceTrait for AttestationService {
         request_hash: String,
         response_hash: String,
     ) -> Result<(), AttestationError> {
+        let start_time = std::time::Instant::now();
+        let environment = get_environment();
+        let env_tag = format!("{TAG_ENVIRONMENT}:{environment}");
+
         // Create signature text in format "request_hash:response_hash"
         let signature_text = format!("{request_hash}:{response_hash}");
 
@@ -389,6 +452,13 @@ impl ports::AttestationServiceTrait for AttestationService {
                 algo
             );
         }
+
+        // Record successful verification
+        let duration = start_time.elapsed();
+        self.metrics_service
+            .record_count(METRIC_VERIFICATION_SUCCESS, 1, &[&env_tag]);
+        self.metrics_service
+            .record_latency(METRIC_VERIFICATION_DURATION, duration, &[&env_tag]);
 
         Ok(())
     }

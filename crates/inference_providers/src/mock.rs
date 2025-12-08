@@ -80,6 +80,7 @@ impl RequestMatcher {
 #[derive(Clone)]
 pub struct ResponseTemplate {
     content: String,
+    reasoning_content: Option<String>,
 }
 
 impl ResponseTemplate {
@@ -87,7 +88,14 @@ impl ResponseTemplate {
     pub fn new(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            reasoning_content: None,
         }
+    }
+
+    /// Set reasoning content for this template
+    pub fn with_reasoning(mut self, reasoning: impl Into<String>) -> Self {
+        self.reasoning_content = Some(reasoning.into());
+        self
     }
 
     /// Generate a ChatCompletionResponse from this template
@@ -107,7 +115,8 @@ impl ResponseTemplate {
                     audio: None,
                     function_call: None,
                     tool_calls: None,
-                    reasoning_content: None,
+                    reasoning_content: self.reasoning_content.clone(),
+                    reasoning: self.reasoning_content.clone(),
                 },
                 logprobs: None,
                 finish_reason: Some("stop".to_string()),
@@ -126,6 +135,37 @@ impl ResponseTemplate {
     fn generate_chunks(&self, id: String, created: i64, model: String) -> Vec<ChatCompletionChunk> {
         let mut chunks = Vec::new();
 
+        // Stream reasoning content if present
+        if let Some(reasoning) = &self.reasoning_content {
+            let chars: Vec<char> = reasoning.chars().collect();
+            for ch in chars.iter() {
+                chunks.push(ChatCompletionChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk".to_string(),
+                    created,
+                    model: model.clone(),
+                    system_fingerprint: None,
+                    choices: vec![ChatChoice {
+                        index: 0,
+                        delta: Some(ChatDelta {
+                            role: None,
+                            content: None,
+                            name: None,
+                            tool_call_id: None,
+                            tool_calls: None,
+                            reasoning_content: Some(ch.to_string()),
+                            reasoning: Some(ch.to_string()),
+                        }),
+                        logprobs: None,
+                        finish_reason: None,
+                        token_ids: None,
+                    }],
+                    usage: None,
+                    prompt_token_ids: None,
+                });
+            }
+        }
+
         // Stream the content character by character
         let chars: Vec<char> = self.content.chars().collect();
         for (i, ch) in chars.iter().enumerate() {
@@ -143,6 +183,8 @@ impl ResponseTemplate {
                         name: None,
                         tool_call_id: None,
                         tool_calls: None,
+                        reasoning_content: None,
+                        reasoning: None,
                     }),
                     logprobs: None,
                     finish_reason: if i == chars.len() - 1 {
@@ -372,6 +414,8 @@ impl MockProvider {
                                 arguments: None,
                             }),
                         }]),
+                        reasoning_content: None,
+                        reasoning: None,
                     }),
                     logprobs: None,
                     finish_reason: None,
@@ -405,6 +449,8 @@ impl MockProvider {
                                     arguments: Some(char.to_string()),
                                 }),
                             }]),
+                            reasoning_content: None,
+                            reasoning: None,
                         }),
                         logprobs: None,
                         finish_reason: None,
@@ -447,6 +493,8 @@ impl MockProvider {
                             name: None,
                             tool_call_id: None,
                             tool_calls: None,
+                            reasoning_content: None,
+                            reasoning: None,
                         }),
                         logprobs: None,
                         finish_reason: if i == content_parts.len() - 1 {

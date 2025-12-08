@@ -712,6 +712,7 @@ pub fn build_response_routes(
         attestation_service: attestation_service.clone(),
     };
 
+    // Create response route with usage check
     let inference_routes = Router::new()
         .route("/responses", post(responses::create_response))
         .with_state(route_state.clone())
@@ -725,6 +726,7 @@ pub fn build_response_routes(
         ))
         .layer(from_fn(middleware::body_hash_middleware));
 
+    // Response management routes
     let other_routes = Router::new()
         .route("/responses/{response_id}", get(responses::get_response))
         .route(

@@ -173,8 +173,7 @@ async fn create_response_stream(
 #[tokio::test]
 async fn test_responses_api() {
     let server = setup_test_server().await;
-    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
-    let api_key = get_api_key_for_org(&server, org.id).await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
 
     let response = server
         .get("/v1/models")
@@ -249,8 +248,7 @@ async fn test_responses_api() {
 #[tokio::test]
 async fn test_streaming_responses_api() {
     let server = setup_test_server().await;
-    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
-    let api_key = get_api_key_for_org(&server, org.id).await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Get available models
     let response = server

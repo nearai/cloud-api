@@ -313,12 +313,14 @@ pub async fn get_api_key_for_org(server: &axum_test::TestServer, org_id: String)
     api_key_resp.key.unwrap()
 }
 
-/// Create an organization and API key
+/// Create an organization with spending limit and API key
 /// Returns the API key string and the API key response
+/// Sets a default spending limit of $10.00 USD (10000000000 nano-dollars)
 pub async fn create_org_and_api_key(
     server: &axum_test::TestServer,
 ) -> (String, api::models::ApiKeyResponse) {
-    let org = create_org(server).await;
+    // Create organization with spending limit ($10.00 USD by default)
+    let org = setup_org_with_credits(server, 10000000000i64).await;
     let workspaces = list_workspaces(server, org.id.clone()).await;
     let workspace = workspaces.first().unwrap();
     let api_key_resp =

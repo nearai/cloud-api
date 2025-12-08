@@ -814,7 +814,8 @@ async fn test_complete_file_lifecycle() {
 #[tokio::test]
 async fn test_file_in_response_api() {
     let (server, _pool, mock) = setup_test_server_with_pool().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Configure mock provider with exact prompt matchers
     // Timestamps will be normalized automatically to [TIME] for matching
@@ -1027,7 +1028,8 @@ async fn test_file_in_response_api() {
 #[tokio::test]
 async fn test_file_not_found_in_response_api() {
     let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Get available models
     let models_response = server
@@ -1084,7 +1086,8 @@ async fn test_file_not_found_in_response_api() {
 #[tokio::test]
 async fn test_multiple_files_in_response_api() {
     let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
 
     // 1. Upload multiple text files
     let file1_content = b"File 1: Product specifications\nPrice: $100\nColor: Red";

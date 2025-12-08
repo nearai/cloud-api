@@ -33,6 +33,7 @@ where
     inference_provider_pool: Arc<InferenceProviderPool>,
     context: StreamContext,
     accumulated_text: String,
+    input_text: String, // NEW: formatted input for tokenization on disconnect
 }
 
 impl<S> Stream for InterceptStream<S>
@@ -150,6 +151,7 @@ where
         if !self.accumulated_text.is_empty() {
             // Client disconnected before final chunk - count accumulated text
             let accumulated_text = self.accumulated_text.clone();
+            let input_text = self.input_text.clone(); // Also clone input for tokenization
             let inference_provider_pool = self.inference_provider_pool.clone();
             let usage_service = self.usage_service.clone();
             let context = StreamContext {
@@ -162,7 +164,7 @@ where
             };
 
             tokio::spawn(async move {
-                // Count tokens for accumulated text
+                // Count OUTPUT tokens
                 let output_tokens = match inference_provider_pool
                     .count_tokens_for_model(&accumulated_text, &context.model_name)
                     .await
@@ -170,14 +172,29 @@ where
                     Ok(count) => count,
                     Err(e) => {
                         tracing::warn!(
-                            "Failed to count tokens on disconnect: {}, using estimation",
+                            "Failed to count output tokens on disconnect: {}, not charging customer",
                             e
                         );
-                        (accumulated_text.len() / 4).max(1) as i32
+                        0 // Don't charge if tokenization fails
                     }
                 };
 
-                // Record the accumulated usage (0 input tokens since we only track output on disconnect)
+                // NEW: Count INPUT tokens
+                let input_tokens = match inference_provider_pool
+                    .count_tokens_for_model(&input_text, &context.model_name)
+                    .await
+                {
+                    Ok(count) => count,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to count input tokens on disconnect: {}, not charging customer",
+                            e
+                        );
+                        0 // Don't charge if tokenization fails
+                    }
+                };
+
+                // Record the accumulated usage with both input and output token counts
                 if usage_service
                     .record_usage(RecordUsageServiceRequest {
                         organization_id: context.organization_id,
@@ -185,7 +202,7 @@ where
                         api_key_id: context.api_key_id,
                         response_id: None,
                         model_id: context.model_id,
-                        input_tokens: 0,
+                        input_tokens, // NEW: use tokenized count (not 0)
                         output_tokens,
                         request_type: context.request_type,
                     })
@@ -244,6 +261,7 @@ impl CompletionServiceImpl {
         &self,
         llm_stream: StreamingResult,
         context: StreamContext,
+        input_text: String,
     ) -> StreamingResult {
         let intercepted_stream = InterceptStream {
             inner: llm_stream,
@@ -252,6 +270,7 @@ impl CompletionServiceImpl {
             inference_provider_pool: self.inference_provider_pool.clone(),
             context,
             accumulated_text: String::new(),
+            input_text,
         };
         Box::pin(intercepted_stream)
     }
@@ -272,6 +291,15 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let is_streaming = request.stream.unwrap_or(false);
 
         let chat_messages = Self::prepare_chat_messages(&request.messages);
+
+        // Capture input text for potential tokenization on disconnect
+        // Just concatenate the message contents directly
+        let input_text = request
+            .messages
+            .iter()
+            .map(|msg| msg.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
 
         let mut chat_params = inference_providers::ChatCompletionParams {
             model: request.model.clone(),
@@ -371,7 +399,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             request_type: request_type.to_string(),
         };
 
-        let event_stream = self.handle_stream_with_context(llm_stream, context).await;
+        let event_stream = self
+            .handle_stream_with_context(llm_stream, context, input_text)
+            .await;
 
         Ok(event_stream)
     }

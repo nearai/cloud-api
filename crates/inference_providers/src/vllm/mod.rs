@@ -341,6 +341,7 @@ impl InferenceProvider for VLlmProvider {
     /// for the given text using the model's tokenizer.
     async fn count_tokens(&self, text: &str, model: &str) -> Result<i32, String> {
         let url = format!("{}/v1/tokenize", self.config.base_url);
+        let headers = self.build_headers()?;
 
         let request_body = TokenizeCompletionRequest {
             model: model.to_string(),
@@ -352,6 +353,7 @@ impl InferenceProvider for VLlmProvider {
         let response = self
             .client
             .post(&url)
+            .headers(headers)
             .json(&request_body)
             .send()
             .await
@@ -369,6 +371,10 @@ impl InferenceProvider for VLlmProvider {
             .await
             .map_err(|e| format!("Failed to parse tokenize response: {e}"))?;
 
+        tracing::debug!(
+            "Successfully tokenized text, token count: {}",
+            tokenize_response.count
+        );
         // Return the count field from vLLM
         Ok(tokenize_response.count)
     }

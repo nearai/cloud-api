@@ -424,4 +424,21 @@ async fn test_non_streaming_response_signature_verification() {
         signature_text, ed25519_text,
         "Both algorithms must produce same signature text format"
     );
+
+    // Verify the ED25519 signature cryptographically
+    let ed25519_signature = ed25519_json
+        .get("signature")
+        .and_then(|v| v.as_str())
+        .expect("Should have ED25519 signature field");
+
+    let ed25519_signing_address = ed25519_json
+        .get("signing_address")
+        .and_then(|v| v.as_str())
+        .expect("Should have ED25519 signing_address field");
+
+    let is_valid = common::verify_ed25519_signature(ed25519_text, ed25519_signature, ed25519_signing_address);
+    assert!(
+        is_valid,
+        "ED25519 signature must be cryptographically valid"
+    );
 }

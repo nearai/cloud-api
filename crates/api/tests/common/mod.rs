@@ -15,6 +15,8 @@ use tokio::sync::OnceCell;
 use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey};
 #[cfg(test)]
 use sha3::Keccak256;
+#[cfg(test)]
+use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
 
 // Global once cell to ensure migrations only run once across all tests
 static MIGRATIONS_INITIALIZED: OnceCell<()> = OnceCell::const_new();
@@ -532,6 +534,93 @@ pub fn verify_ecdsa_signature(
     }
 
     addresses_match
+}
+
+/// Verify an ED25519 signature cryptographically
+///
+/// # Arguments
+///
+/// * `signature_text` - The message that was signed (format: "request_hash:response_hash")
+/// * `signature_hex` - The hex-encoded signature (64 bytes)
+/// * `public_key_hex` - The public key in hex format (32 bytes)
+///
+/// # Returns
+/// `true` if the signature is valid and was signed by the public key, `false` otherwise
+#[cfg(test)]
+pub fn verify_ed25519_signature(
+    signature_text: &str,
+    signature_hex: &str,
+    public_key_hex: &str,
+) -> bool {
+    // Remove 0x prefix if present
+    let sig_clean = signature_hex.strip_prefix("0x").unwrap_or(signature_hex);
+    let pub_key_clean = public_key_hex
+        .strip_prefix("0x")
+        .unwrap_or(public_key_hex);
+
+    // Decode signature (should be 64 bytes = 128 hex chars)
+    let signature_bytes = match hex::decode(sig_clean) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            eprintln!("Failed to decode signature hex");
+            return false;
+        }
+    };
+
+    if signature_bytes.len() != 64 {
+        eprintln!(
+            "Invalid ED25519 signature length: expected 64 bytes, got {} bytes",
+            signature_bytes.len()
+        );
+        return false;
+    }
+
+    // Parse the signature
+    let signature = match Ed25519Signature::try_from(signature_bytes.as_slice()) {
+        Ok(sig) => sig,
+        Err(e) => {
+            eprintln!("Failed to parse ED25519 signature: {e}");
+            return false;
+        }
+    };
+
+    // Decode public key (should be 32 bytes = 64 hex chars)
+    let public_key_bytes = match hex::decode(pub_key_clean) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            eprintln!("Failed to decode public key hex");
+            return false;
+        }
+    };
+
+    if public_key_bytes.len() != 32 {
+        eprintln!(
+            "Invalid ED25519 public key length: expected 32 bytes, got {} bytes",
+            public_key_bytes.len()
+        );
+        return false;
+    }
+
+    // Parse the public key
+    let public_key = match Ed25519VerifyingKey::try_from(public_key_bytes.as_slice()) {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("Failed to parse ED25519 public key: {e}");
+            return false;
+        }
+    };
+
+    // Verify the signature
+    match public_key.verify_strict(signature_text.as_bytes(), &signature) {
+        Ok(_) => {
+            eprintln!("✅ ED25519 signature is cryptographically valid!");
+            true
+        }
+        Err(e) => {
+            eprintln!("ED25519 signature verification failed: {e}");
+            false
+        }
+    }
 }
 
 pub fn decode_access_token_claims(token: &str) -> AccessTokenClaims {

@@ -7,7 +7,7 @@
 ALTER TABLE organization_usage_log
     ADD COLUMN IF NOT EXISTS inference_type VARCHAR(50);
 
--- Add inference_id column (stores UUID-only, no prefix)
+-- Add inference_id column
 ALTER TABLE organization_usage_log
     ADD COLUMN IF NOT EXISTS inference_id UUID;
 
@@ -18,7 +18,7 @@ CREATE INDEX IF NOT EXISTS idx_org_usage_inference_id
 
 -- Update comments for documentation
 COMMENT ON COLUMN organization_usage_log.inference_id IS
-    'Inference UUID (without prefix) for correlation with provider systems and client headers. For chat completions, prepend "chatcmpl-" to get full ID.';
+    'Inference UUID for inference level usage tracking.';
 
 COMMENT ON COLUMN organization_usage_log.inference_type IS
     'Type of inference request: chat_completion, chat_completion_stream, image_generation, embeddings, etc.';

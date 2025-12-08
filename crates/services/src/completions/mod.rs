@@ -5,6 +5,7 @@ use crate::inference_provider_pool::InferenceProviderPool;
 use crate::models::ModelsRepository;
 use crate::usage::{RecordUsageServiceRequest, UsageServiceTrait};
 use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, StreamingResult};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -15,10 +16,24 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-/// Hash inference ID to UUID deterministically using MD5 hash (v5)
+/// Hash inference ID to UUID deterministically using SHA2-256
 /// Takes the full ID including prefix (e.g., "chatcmpl-abc123") and returns a stable UUID
 fn hash_inference_id_to_uuid(full_id: &str) -> Uuid {
-    Uuid::new_v5(&Uuid::NAMESPACE_DNS, full_id.as_bytes())
+    // Hash the input using SHA2-256
+    let mut hasher = Sha256::new();
+    hasher.update(full_id.as_bytes());
+    let hash = hasher.finalize();
+
+    // Take first 16 bytes of the hash and convert to UUID
+    // Using UUID v4 format (random UUID) but with deterministic bytes from the hash
+    let mut uuid_bytes = [0u8; 16];
+    uuid_bytes.copy_from_slice(&hash[..16]);
+
+    // Set version to 4 (random UUID) and variant bits
+    uuid_bytes[6] = (uuid_bytes[6] & 0x0f) | 0x40; // Version 4
+    uuid_bytes[8] = (uuid_bytes[8] & 0x3f) | 0x80; // Variant bits
+
+    Uuid::from_bytes(uuid_bytes)
 }
 
 struct InterceptStream<S>
@@ -137,6 +152,15 @@ where
                                 .is_err()
                             {
                                 tracing::error!("Failed to record usage in completion service");
+                            } else {
+                                tracing::debug!(
+                                    "Recorded usage for org {}: {} input, {} output tokens (api_key: {}, ttft: {:?}ms)",
+                                    organization_id,
+                                    input_tokens,
+                                    output_tokens,
+                                    api_key_id,
+                                    ttft_ms
+                                );
                             }
                         });
 
@@ -655,6 +679,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 .is_err()
             {
                 tracing::error!("Failed to record usage in completion service");
+            } else {
+                tracing::debug!(
+                    "Recorded usage for org {}: {} input, {} output tokens (api_key: {})",
+                    organization_id,
+                    input_tokens,
+                    output_tokens,
+                    api_key_id
+                );
             }
         });
 

@@ -137,7 +137,7 @@ pub struct RecordUsageServiceRequest {
     pub ttft_ms: Option<i32>,
     /// Average inter-token latency in milliseconds
     pub avg_itl_ms: Option<f64>,
-    /// Inference UUID (without prefix). For chat completions, this is the UUID portion without "chatcmpl-"
+    /// Inference UUID
     pub inference_id: Option<Uuid>,
 }
 
@@ -160,7 +160,7 @@ pub struct RecordUsageDbRequest {
     pub ttft_ms: Option<i32>,
     /// Average inter-token latency in milliseconds
     pub avg_itl_ms: Option<f64>,
-    /// Inference UUID (without prefix). For chat completions, this is the UUID portion without "chatcmpl-"
+    /// Inference UUID
     pub inference_id: Option<Uuid>,
 }
 
@@ -234,7 +234,7 @@ pub struct UsageLogEntry {
     pub ttft_ms: Option<i32>,
     /// Average inter-token latency in milliseconds
     pub avg_itl_ms: Option<f64>,
-    /// Inference UUID (without prefix). For chat completions, this is the UUID portion without "chatcmpl-"
+    /// Inference UUID
     pub inference_id: Option<Uuid>,
 }
 

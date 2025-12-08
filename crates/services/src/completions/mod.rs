@@ -15,6 +15,12 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+/// Hash inference ID to UUID deterministically using MD5 (v5)
+/// Takes the full ID including prefix (e.g., "chatcmpl-abc123") and returns a stable UUID
+fn hash_inference_id_to_uuid(full_id: &str) -> Uuid {
+    Uuid::new_v5(&Uuid::NAMESPACE_DNS, full_id.as_bytes())
+}
+
 struct InterceptStream<S>
 where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
@@ -30,7 +36,7 @@ where
     model_id: Uuid,
     #[allow(dead_code)] // Kept for potential debugging/logging use
     model_name: String,
-    request_type: String,
+    inference_type: String,
     start_time: Instant,
     first_token_received: bool,
     first_token_time: Option<Instant>,
@@ -106,10 +112,12 @@ where
                         let workspace_id = self.workspace_id;
                         let api_key_id = self.api_key_id;
                         let model_id = self.model_id;
-                        let request_type = self.request_type.clone();
+                        let inference_type = self.inference_type.clone();
                         let input_tokens = usage.prompt_tokens;
                         let output_tokens = usage.completion_tokens;
                         let ttft_ms = self.ttft_ms;
+                        // Hash the full chat ID to UUID for storage
+                        let inference_id_uuid = Some(hash_inference_id_to_uuid(&chat_chunk.id));
 
                         tokio::spawn(async move {
                             if usage_service
@@ -117,13 +125,13 @@ where
                                     organization_id,
                                     workspace_id,
                                     api_key_id,
-                                    response_id: None,
                                     model_id,
                                     input_tokens,
                                     output_tokens,
-                                    request_type,
+                                    inference_type,
                                     ttft_ms,
                                     avg_itl_ms,
+                                    inference_id: inference_id_uuid,
                                 })
                                 .await
                                 .is_err()
@@ -290,7 +298,7 @@ impl CompletionServiceImpl {
         api_key_id: Uuid,
         model_id: Uuid,
         model_name: String,
-        request_type: &str,
+        inference_type: &str,
         request_start_time: Instant,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
@@ -311,7 +319,7 @@ impl CompletionServiceImpl {
             api_key_id,
             model_id,
             model_name,
-            request_type: request_type.to_string(),
+            inference_type: inference_type.to_string(),
             start_time: request_start_time,
             first_token_received: false,
             first_token_time: None,
@@ -444,8 +452,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             }
         };
 
-        // Determine request type
-        let request_type = if is_streaming {
+        // Determine inference type
+        let inference_type = if is_streaming {
             "chat_completion_stream"
         } else {
             "chat_completion"
@@ -461,7 +469,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 api_key_id,
                 model.id,
                 model.model_name.clone(),
-                request_type,
+                inference_type,
                 request_start_time,
             )
             .await;
@@ -635,6 +643,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let model_id = model.id;
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
         let output_tokens = response_with_bytes.response.usage.completion_tokens;
+        // Hash the full chat ID to UUID for storage
+        let inference_id_uuid = Some(hash_inference_id_to_uuid(&response_with_bytes.response.id));
 
         tokio::spawn(async move {
             if usage_service
@@ -642,13 +652,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     organization_id,
                     workspace_id,
                     api_key_id,
-                    response_id: None,
                     model_id,
                     input_tokens,
                     output_tokens,
-                    request_type: "chat_completion".to_string(),
+                    inference_type: "chat_completion".to_string(),
                     ttft_ms: None,    // N/A for non-streaming
                     avg_itl_ms: None, // N/A for non-streaming
+                    inference_id: inference_id_uuid,
                 })
                 .await
                 .is_err()
@@ -740,7 +750,7 @@ mod tests {
             api_key_id,
             model_id,
             model_name: "test-model".to_string(),
-            request_type: "chat_completion_stream".to_string(),
+            inference_type: "chat_completion_stream".to_string(),
             start_time: Instant::now(),
             first_token_received: false,
             first_token_time: None,
@@ -875,7 +885,7 @@ mod tests {
             api_key_id,
             model_id,
             model_name: "test-model".to_string(),
-            request_type: "chat_completion_stream".to_string(),
+            inference_type: "chat_completion_stream".to_string(),
             start_time,
             first_token_received: false,
             first_token_time: None,
@@ -974,7 +984,7 @@ mod tests {
             api_key_id,
             model_id,
             model_name: "test-model".to_string(),
-            request_type: "chat_completion_stream".to_string(),
+            inference_type: "chat_completion_stream".to_string(),
             start_time: Instant::now(),
             first_token_received: false,
             first_token_time: None,

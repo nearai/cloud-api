@@ -524,7 +524,6 @@ pub struct OrganizationUsageLog {
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
     pub api_key_id: Uuid,
-    pub response_id: Option<Uuid>,
     pub model_id: Uuid,
     pub model: String, // Canonical model name from models table
     pub input_tokens: i32,
@@ -533,12 +532,14 @@ pub struct OrganizationUsageLog {
     pub input_cost: i64,
     pub output_cost: i64,
     pub total_cost: i64,
-    pub request_type: String,
+    pub inference_type: String,
     pub created_at: DateTime<Utc>,
     /// Time to first token in milliseconds
     pub ttft_ms: Option<i32>,
     /// Average inter-token latency in milliseconds
     pub avg_itl_ms: Option<f64>,
+    /// Inference UUID
+    pub inference_id: Option<Uuid>,
 }
 
 /// Organization balance summary - cached aggregate spending
@@ -560,7 +561,6 @@ pub struct RecordUsageRequest {
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
     pub api_key_id: Uuid,
-    pub response_id: Option<Uuid>,
     pub model_id: Uuid,
     pub model_name: String, // Denormalized for performance
     pub input_tokens: i32,
@@ -568,11 +568,13 @@ pub struct RecordUsageRequest {
     pub input_cost: i64,
     pub output_cost: i64,
     pub total_cost: i64,
-    pub request_type: String,
+    pub inference_type: String,
     /// Time to first token in milliseconds
     pub ttft_ms: Option<i32>,
     /// Average inter-token latency in milliseconds
     pub avg_itl_ms: Option<f64>,
+    /// Inference UUID
+    pub inference_id: Option<Uuid>,
 }
 
 // ============================================

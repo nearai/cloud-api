@@ -12,11 +12,11 @@ use std::sync::Arc;
 use tokio::sync::OnceCell;
 
 #[cfg(test)]
+use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
+#[cfg(test)]
 use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey};
 #[cfg(test)]
 use sha3::Keccak256;
-#[cfg(test)]
-use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
 
 // Global once cell to ensure migrations only run once across all tests
 static MIGRATIONS_INITIALIZED: OnceCell<()> = OnceCell::const_new();
@@ -554,9 +554,7 @@ pub fn verify_ed25519_signature(
 ) -> bool {
     // Remove 0x prefix if present
     let sig_clean = signature_hex.strip_prefix("0x").unwrap_or(signature_hex);
-    let pub_key_clean = public_key_hex
-        .strip_prefix("0x")
-        .unwrap_or(public_key_hex);
+    let pub_key_clean = public_key_hex.strip_prefix("0x").unwrap_or(public_key_hex);
 
     // Decode signature (should be 64 bytes = 128 hex chars)
     let signature_bytes = match hex::decode(sig_clean) {

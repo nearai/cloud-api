@@ -436,7 +436,8 @@ async fn test_non_streaming_response_signature_verification() {
         .and_then(|v| v.as_str())
         .expect("Should have ED25519 signing_address field");
 
-    let is_valid = common::verify_ed25519_signature(ed25519_text, ed25519_signature, ed25519_signing_address);
+    let is_valid =
+        common::verify_ed25519_signature(ed25519_text, ed25519_signature, ed25519_signing_address);
     assert!(
         is_valid,
         "ED25519 signature must be cryptographically valid"

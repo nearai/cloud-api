@@ -35,17 +35,13 @@ pub fn test_config() -> ApiConfig {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(0), // Use port 0 to get a random available port
         },
-        model_discovery: config::ModelDiscoveryConfig {
-            discovery_server_url: std::env::var("MODEL_DISCOVERY_SERVER_URL")
-                .unwrap_or_else(|_| "http://localhost:8080/models".to_string()),
-            api_key: std::env::var("MODEL_DISCOVERY_API_KEY")
+        inference_router: config::InferenceRouterConfig {
+            router_url: std::env::var("INFERENCE_ROUTER_URL")
+                .unwrap_or_else(|_| "http://localhost:8080".to_string()),
+            api_key: std::env::var("INFERENCE_ROUTER_API_KEY")
                 .ok()
                 .or(Some("test_api_key".to_string())),
-            refresh_interval: std::env::var("MODEL_DISCOVERY_REFRESH_INTERVAL")
-                .ok()
-                .and_then(|i| i.parse().ok())
-                .unwrap_or(3600), // 1 hour - large value to avoid refresh during tests
-            timeout: std::env::var("MODEL_DISCOVERY_TIMEOUT")
+            timeout: std::env::var("INFERENCE_ROUTER_TIMEOUT")
                 .ok()
                 .and_then(|t| t.parse().ok())
                 .unwrap_or(5),

@@ -141,20 +141,20 @@ async fn perform_coordinated_shutdown(
     let mut coordinator = ShutdownCoordinator::new(Duration::from_secs(30));
     coordinator.start();
 
-    tracing::info!("=== SHUTDOWN PHASE: CANCEL BACKGROUND TASKS ===");
-    tracing::info!("Cancelling all periodic background tasks");
+    tracing::info!("=== SHUTDOWN PHASE: CLEANUP RESOURCES ===");
+    tracing::info!("Cleaning up inference provider pool resources");
 
-    // Stage 1: Cancel background tasks (should be quick, 5-10 seconds)
+    // Stage 1: Clean up inference provider pool (should be quick, < 5 seconds)
     let (status, remaining) = coordinator
         .execute_stage(
             ShutdownStage {
-                name: "Cancel Background Tasks",
-                timeout: Duration::from_secs(10),
+                name: "Cleanup Inference Resources",
+                timeout: Duration::from_secs(5),
             },
             || async {
-                tracing::info!("Step 1.1: Cancelling model discovery refresh task");
+                tracing::info!("Step 1.1: Clearing inference provider pool mappings");
                 inference_provider_pool.shutdown().await;
-                tracing::debug!("All background tasks cancelled");
+                tracing::debug!("Inference provider pool cleanup complete");
             },
         )
         .await;

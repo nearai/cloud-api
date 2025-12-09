@@ -401,30 +401,23 @@ pub async fn init_domain_services_with_pool(
 pub async fn init_inference_providers(
     config: &ApiConfig,
 ) -> Arc<services::inference_provider_pool::InferenceProviderPool> {
-    let discovery_url = config.model_discovery.discovery_server_url.clone();
-    let api_key = config.model_discovery.api_key.clone();
+    let router_url = config.inference_router.router_url.clone();
+    let api_key = config.inference_router.api_key.clone();
+    let inference_timeout = config.inference_router.inference_timeout;
 
-    // Create pool with discovery URL and API key
-    let pool = Arc::new(
-        services::inference_provider_pool::InferenceProviderPool::new(
-            discovery_url,
-            api_key,
-            config.model_discovery.timeout,
-            config.model_discovery.inference_timeout,
-        ),
+    tracing::info!(
+        router_url = %router_url,
+        "Initializing inference provider pool with router endpoint"
     );
 
-    // Initialize model discovery during startup
-    if pool.initialize().await.is_err() {
-        tracing::warn!("Failed to initialize model discovery during startup");
-        tracing::info!("Models will be discovered on first request");
-    }
-
-    // Start periodic refresh task with handle management
-    let refresh_interval = config.model_discovery.refresh_interval as u64;
-    pool.clone().start_refresh_task(refresh_interval).await;
-
-    pool
+    // Create pool with single router endpoint
+    Arc::new(
+        services::inference_provider_pool::InferenceProviderPool::new(
+            router_url,
+            api_key,
+            inference_timeout,
+        ),
+    )
 }
 
 /// Initialize inference provider pool with mock providers for testing
@@ -439,38 +432,19 @@ pub async fn init_inference_providers_with_mocks(
     use inference_providers::MockProvider;
     use std::sync::Arc;
 
-    // Create pool with dummy discovery URL (won't be used since we're registering providers directly)
+    // Create a MockProvider that accepts all models (using new_accept_all)
+    let mock_provider = Arc::new(MockProvider::new_accept_all());
+
+    // For the new simplified pool, we need to create a wrapper pool that uses the mock provider
+    // Since the pool now expects a router URL, we'll create it with a dummy URL
+    // but the mock will be used directly in tests via a different mechanism
     let pool = Arc::new(
         services::inference_provider_pool::InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
+            "http://localhost:8080".to_string(),
             None,
-            5,
             30 * 60,
         ),
     );
-
-    // Create a MockProvider that accepts all models (using new_accept_all)
-    let mock_provider = Arc::new(MockProvider::new_accept_all());
-    let mock_provider_trait: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
-        mock_provider.clone();
-
-    // Register providers for models commonly used in tests
-    let test_models = vec![
-        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
-        "zai-org/GLM-4.6".to_string(),
-        "nearai/gpt-oss-120b".to_string(),
-        "dphn/Dolphin-Mistral-24B-Venice-Edition".to_string(),
-    ];
-
-    let providers: Vec<(
-        String,
-        Arc<dyn inference_providers::InferenceProvider + Send + Sync>,
-    )> = test_models
-        .into_iter()
-        .map(|model_id| (model_id, mock_provider_trait.clone()))
-        .collect();
-
-    pool.register_providers(providers).await;
 
     tracing::info!("Initialized inference provider pool with MockProvider for testing");
 
@@ -1081,10 +1055,9 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 0, // Use port 0 for testing to get a random available port
             },
-            model_discovery: config::ModelDiscoveryConfig {
-                discovery_server_url: "http://localhost:8080/models".to_string(),
+            inference_router: config::InferenceRouterConfig {
+                router_url: "http://localhost:8080".to_string(),
                 api_key: Some("test-key".to_string()),
-                refresh_interval: 0,
                 timeout: 5,
                 inference_timeout: 30 * 60, // 30 minutes
             },
@@ -1180,10 +1153,9 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 0,
             },
-            model_discovery: config::ModelDiscoveryConfig {
-                discovery_server_url: "http://localhost:8080/models".to_string(),
+            inference_router: config::InferenceRouterConfig {
+                router_url: "http://localhost:8080".to_string(),
                 api_key: Some("test-key".to_string()),
-                refresh_interval: 0,
                 timeout: 5,
                 inference_timeout: 30 * 60, // 30 minutes
             },

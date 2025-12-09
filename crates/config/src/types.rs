@@ -3,7 +3,7 @@ use std::{collections::HashMap, env};
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
     pub server: ServerConfig,
-    pub model_discovery: ModelDiscoveryConfig,
+    pub inference_router: InferenceRouterConfig,
     pub logging: LoggingConfig,
     pub dstack_client: DstackClientConfig,
     pub auth: AuthConfig,
@@ -17,7 +17,7 @@ impl ApiConfig {
     pub fn from_env() -> Result<Self, String> {
         Ok(Self {
             server: ServerConfig::from_env()?,
-            model_discovery: ModelDiscoveryConfig::from_env()?,
+            inference_router: InferenceRouterConfig::from_env()?,
             logging: LoggingConfig::from_env()?,
             dstack_client: DstackClientConfig::from_env()?,
             auth: AuthConfig::from_env()?,
@@ -115,26 +115,21 @@ impl ServerConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct ModelDiscoveryConfig {
-    pub discovery_server_url: String,
+pub struct InferenceRouterConfig {
+    pub router_url: String,
     pub api_key: Option<String>,
-    pub refresh_interval: i64,  // seconds
-    pub timeout: i64,           // seconds (for discovery requests)
+    pub timeout: i64,           // seconds (for router requests)
     pub inference_timeout: i64, // seconds (for model inference requests)
 }
 
-impl ModelDiscoveryConfig {
+impl InferenceRouterConfig {
     /// Load from environment variables
     pub fn from_env() -> Result<Self, String> {
         Ok(Self {
-            discovery_server_url: env::var("MODEL_DISCOVERY_SERVER_URL")
-                .map_err(|_| "MODEL_DISCOVERY_SERVER_URL not set")?,
-            api_key: env::var("MODEL_DISCOVERY_API_KEY").ok(),
-            refresh_interval: env::var("MODEL_DISCOVERY_REFRESH_INTERVAL")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(300), // 5 minutes
-            timeout: env::var("MODEL_DISCOVERY_TIMEOUT")
+            router_url: env::var("INFERENCE_ROUTER_URL")
+                .map_err(|_| "INFERENCE_ROUTER_URL not set")?,
+            api_key: env::var("INFERENCE_ROUTER_API_KEY").ok(),
+            timeout: env::var("INFERENCE_ROUTER_TIMEOUT")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30), // 30 seconds
@@ -146,17 +141,13 @@ impl ModelDiscoveryConfig {
     }
 }
 
-impl Default for ModelDiscoveryConfig {
+impl Default for InferenceRouterConfig {
     fn default() -> Self {
         Self {
-            discovery_server_url: env::var("MODEL_DISCOVERY_SERVER_URL")
-                .expect("MODEL_DISCOVERY_SERVER_URL environment variable is required"),
-            api_key: env::var("MODEL_DISCOVERY_API_KEY").ok(),
-            refresh_interval: env::var("MODEL_DISCOVERY_REFRESH_INTERVAL")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(300), // 5 minutes
-            timeout: env::var("MODEL_DISCOVERY_TIMEOUT")
+            router_url: env::var("INFERENCE_ROUTER_URL")
+                .expect("INFERENCE_ROUTER_URL environment variable is required"),
+            api_key: env::var("INFERENCE_ROUTER_API_KEY").ok(),
+            timeout: env::var("INFERENCE_ROUTER_TIMEOUT")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30), // 30 seconds
@@ -232,7 +223,7 @@ impl DstackClientConfig {
 // Domain-specific configuration types that will be used by domain layer
 #[derive(Debug, Clone)]
 pub struct DomainConfig {
-    pub model_discovery: ModelDiscoveryConfig,
+    pub inference_router: InferenceRouterConfig,
     pub dstack_client: DstackClientConfig,
     pub auth: AuthConfig,
 }
@@ -366,7 +357,7 @@ impl From<GoogleOAuthConfig> for OAuthProviderConfig {
 impl From<ApiConfig> for DomainConfig {
     fn from(api_config: ApiConfig) -> Self {
         Self {
-            model_discovery: api_config.model_discovery,
+            inference_router: api_config.inference_router,
             dstack_client: api_config.dstack_client,
             auth: api_config.auth,
         }

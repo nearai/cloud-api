@@ -34,29 +34,6 @@ impl InferenceProviderPool {
         }
     }
 
-    /// Register a provider for testing (useful for testing with mock providers)
-    pub async fn register_provider(
-        &self,
-        _model_id: String,
-        _provider: Arc<InferenceProviderTrait>,
-    ) {
-        // For testing, we replace the router provider with the mock
-        // This is a simplified approach - in tests we'll use the mock directly
-        // Note: We can't actually replace router_provider since it's Arc, but tests
-        // should call register_providers which creates a pool differently
-        tracing::debug!("register_provider called - this is mainly for backwards compatibility");
-    }
-
-    /// Register multiple providers for testing
-    /// In the new simplified design, this creates a new pool with a mock provider
-    pub async fn register_providers(&self, providers: Vec<(String, Arc<InferenceProviderTrait>)>) {
-        tracing::debug!(
-            "register_providers called with {} providers - mainly for backwards compatibility",
-            providers.len()
-        );
-        // In tests, we should create pools directly with mock providers instead of using this
-    }
-
     /// Store a mapping of chat_id to provider for attestation lookups
     async fn store_chat_id_mapping(
         &self,

@@ -1830,14 +1830,14 @@ impl ResponseServiceImpl {
                         // Look ahead to see if '/' is followed by '>' or space+'>'
                         let mut peek_iter = chars.clone();
                         peek_iter.next(); // skip '/'
-                        // Skip whitespace after '/'
+                                          // Skip whitespace after '/'
                         while let Some(&peek_ch) = peek_iter.peek() {
                             if peek_ch == '>' {
                                 // This is a self-closing tag
                                 is_self_closing = true;
                                 full_tag.push('/');
                                 chars.next(); // consume '/'
-                                // Don't set found_non_tag_char yet - we want to check if it's a reasoning tag
+                                              // Don't set found_non_tag_char yet - we want to check if it's a reasoning tag
                                 break;
                             } else if peek_ch.is_whitespace() {
                                 peek_iter.next();
@@ -2730,7 +2730,8 @@ mod tests {
         let mut inside_reasoning = false;
 
         // Test self-closing tags with attributes
-        let input = r#"<img src="image.jpg" alt="Test" /><br class="clear" /><meta charset="UTF-8" />"#;
+        let input =
+            r#"<img src="image.jpg" alt="Test" /><br class="clear" /><meta charset="UTF-8" />"#;
         let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
             input,
             &mut reasoning_buffer,

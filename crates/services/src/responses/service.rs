@@ -1885,6 +1885,18 @@ impl ResponseServiceImpl {
                             *inside_reasoning = true;
                             tag_transition = TagTransition::OpeningTag(tag_name.clone());
                             tracing::debug!("Detected opening reasoning tag: <{}>", tag_name);
+                        } else if is_closing && !*inside_reasoning {
+                            // Closing tag encountered but not inside reasoning (malformed or extra closing tag)
+                            tracing::debug!(
+                                "Ignoring closing reasoning tag </{}> - not currently inside reasoning block",
+                                tag_name
+                            );
+                        } else if !is_closing && *inside_reasoning {
+                            // Opening tag encountered while already inside reasoning (nested or malformed)
+                            tracing::debug!(
+                                "Ignoring opening reasoning tag <{}> - already inside reasoning block",
+                                tag_name
+                            );
                         }
                         // Don't include the tag itself in any output
                         continue;
@@ -2850,6 +2862,67 @@ mod tests {
         assert_eq!(reasoning, None);
         assert!(!inside_reasoning);
         assert!(reasoning_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_malformed_extra_closing() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test extra closing tag when not inside reasoning (malformed)
+        let input = "</think>Text";
+        let (clean, reasoning, transition) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        // Extra closing tag should be ignored, text should remain
+        assert_eq!(clean, "Text");
+        assert_eq!(reasoning, None);
+        assert!(!inside_reasoning);
+        assert_eq!(transition, TagTransition::None);
+        assert!(reasoning_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_malformed_nested_opening() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test nested opening tag (malformed - opening while already inside reasoning)
+        let input = "<think>First<think>Second</think></think>";
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        // Nested opening tag should be ignored, but content should be in reasoning
+        assert_eq!(clean, "");
+        assert!(reasoning.is_some());
+        assert_eq!(reasoning_buffer, "FirstSecond");
+        assert!(!inside_reasoning);
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_malformed_double_closing() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test double closing tag
+        let input = "<think>Content</think></think>";
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        // First closing tag should work, second should be ignored
+        assert_eq!(clean, "");
+        assert!(reasoning.is_some());
+        assert_eq!(reasoning_buffer, "Content");
+        assert!(!inside_reasoning);
     }
 
     #[test]

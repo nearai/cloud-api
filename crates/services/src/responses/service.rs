@@ -2347,11 +2347,7 @@ DO NOT USE THESE FORMATS:
                 ))
             })?;
 
-        tracing::info!(
-            "Generated title for conversation {}: {}",
-            conversation_id,
-            title
-        );
+        tracing::info!("Generated title for conversation {}", conversation_id);
 
         // Emit conversation.title.updated event
         use futures::SinkExt;

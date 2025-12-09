@@ -84,6 +84,7 @@ pub fn test_config() -> ApiConfig {
                 .unwrap_or_else(|_| "http://localhost:4317".to_string()),
             protocol: std::env::var("TELEMETRY_OTLP_PROTOCOL").unwrap_or("grpc".to_string()),
         },
+        cors: config::CorsConfig::default(),
     }
 }
 

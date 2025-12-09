@@ -132,7 +132,7 @@ impl OrganizationUsageRepository {
             Ok::<tokio_postgres::Row, RepositoryError>(row)
         })?;
 
-        Ok(self.row_to_usage_log(&row))
+        self.row_to_usage_log(&row)
     }
 
     /// Get current balance for an organization
@@ -213,7 +213,7 @@ impl OrganizationUsageRepository {
                         id, organization_id, workspace_id, api_key_id,
                         model_id, model_name, input_tokens, output_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
-                        inference_type, created_at, ttft_ms, avg_itl_ms, inference_id
+                        inference_type, request_type, created_at, ttft_ms, avg_itl_ms, inference_id
                     FROM organization_usage_log
                     WHERE organization_id = $1
                     ORDER BY created_at DESC
@@ -225,7 +225,7 @@ impl OrganizationUsageRepository {
                 .map_err(map_db_error)
         })?;
 
-        Ok(rows.iter().map(|row| self.row_to_usage_log(row)).collect())
+        rows.iter().map(|row| self.row_to_usage_log(row)).collect()
     }
 
     /// Count total usage history records for an API key
@@ -279,7 +279,7 @@ impl OrganizationUsageRepository {
                         id, organization_id, workspace_id, api_key_id,
                         model_id, model_name, input_tokens, output_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
-                        inference_type, created_at, ttft_ms, avg_itl_ms, inference_id
+                        inference_type, request_type, created_at, ttft_ms, avg_itl_ms, inference_id
                     FROM organization_usage_log
                     WHERE api_key_id = $1
                     ORDER BY created_at DESC
@@ -291,7 +291,7 @@ impl OrganizationUsageRepository {
                 .map_err(map_db_error)
         })?;
 
-        Ok(rows.iter().map(|row| self.row_to_usage_log(row)).collect())
+        rows.iter().map(|row| self.row_to_usage_log(row)).collect()
     }
 
     /// Get usage statistics for a time period
@@ -334,8 +334,18 @@ impl OrganizationUsageRepository {
         })
     }
 
-    fn row_to_usage_log(&self, row: &Row) -> OrganizationUsageLog {
-        OrganizationUsageLog {
+    fn row_to_usage_log(&self, row: &Row) -> Result<OrganizationUsageLog> {
+        // Try to get inference_type, fallback to request_type, error if neither exists
+        let inference_type = row
+            .try_get("inference_type")
+            .or_else(|_| row.try_get("request_type"))
+            .map_err(|_| {
+                RepositoryError::RequiredFieldMissing(
+                    "Neither inference_type nor request_type column found".to_string(),
+                )
+            })?;
+
+        Ok(OrganizationUsageLog {
             id: row.get("id"),
             organization_id: row.get("organization_id"),
             workspace_id: row.get("workspace_id"),
@@ -348,12 +358,12 @@ impl OrganizationUsageRepository {
             input_cost: row.get("input_cost"),
             output_cost: row.get("output_cost"),
             total_cost: row.get("total_cost"),
-            inference_type: row.get("inference_type"),
+            inference_type,
             created_at: row.get("created_at"),
             ttft_ms: row.get("ttft_ms"),
             avg_itl_ms: row.get("avg_itl_ms"),
             inference_id: row.get("inference_id"),
-        }
+        })
     }
 
     fn row_to_balance(&self, row: &Row) -> OrganizationBalance {

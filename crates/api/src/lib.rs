@@ -899,8 +899,8 @@ pub fn build_admin_routes(
     use crate::routes::admin::{
         batch_upsert_models, create_admin_access_token, delete_admin_access_token, delete_model,
         get_model_history, get_organization_limits_history, get_organization_metrics,
-        get_organization_timeseries, get_platform_metrics, list_admin_access_tokens, list_users,
-        update_organization_limits, AdminAppState,
+        get_organization_timeseries, get_platform_metrics, list_admin_access_tokens,
+        list_models as admin_list_models, list_users, update_organization_limits, AdminAppState,
     };
     use database::repositories::{
         AdminAccessTokenRepository, AdminCompositeRepository, PgAnalyticsRepository,
@@ -934,7 +934,10 @@ pub fn build_admin_routes(
     };
 
     Router::new()
-        .route("/admin/models", axum::routing::patch(batch_upsert_models))
+        .route(
+            "/admin/models",
+            axum::routing::get(admin_list_models).patch(batch_upsert_models),
+        )
         .route(
             "/admin/models/{model_name}",
             axum::routing::delete(delete_model),

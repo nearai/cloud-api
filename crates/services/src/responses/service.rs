@@ -1798,58 +1798,67 @@ impl ResponseServiceImpl {
 
         while let Some(ch) = chars.next() {
             if ch == '<' {
-                // Check if this is an opening or closing tag
+                // Start collecting the entire tag to handle complex tags like <!DOCTYPE>
+                let mut full_tag = String::from("<");
                 let mut tag_candidate = String::new();
-                let is_closing = chars.peek() == Some(&'/');
+                let mut is_closing = false;
+                let mut found_non_tag_char = false;
 
-                if is_closing {
+                // Check if this is a closing tag
+                if chars.peek() == Some(&'/') {
+                    is_closing = true;
+                    full_tag.push('/');
                     chars.next(); // consume '/'
                 }
 
-                // Collect tag name
+                // Collect tag content until '>'
                 while let Some(&next_ch) = chars.peek() {
                     if next_ch == '>' {
+                        full_tag.push('>');
                         chars.next(); // consume '>'
                         break;
-                    } else if next_ch.is_alphanumeric() || next_ch == '_' || next_ch == '-' {
+                    } else if !found_non_tag_char && (next_ch.is_alphanumeric() || next_ch == '_' || next_ch == '-') {
+                        // Still collecting tag name for reasoning tag detection
                         tag_candidate.push(next_ch);
+                        full_tag.push(next_ch);
                         chars.next();
                     } else {
-                        break;
+                        // Hit a non-tag-name character (like '!' in <!DOCTYPE, space, etc.)
+                        // This is not a simple reasoning tag, collect the entire tag content
+                        found_non_tag_char = true;
+                        full_tag.push(next_ch);
+                        chars.next();
                     }
                 }
 
-                let tag_name = tag_candidate.to_lowercase();
+                // Only check for reasoning tags if we didn't find any non-tag-name characters
+                if !found_non_tag_char {
+                    let tag_name = tag_candidate.to_lowercase();
 
-                // Check if this is a known reasoning tag
-                if REASONING_TAGS.contains(&tag_name.as_str()) {
-                    if is_closing && *inside_reasoning {
-                        // Closing reasoning tag
-                        *inside_reasoning = false;
-                        tag_transition = TagTransition::ClosingTag(tag_name.clone());
-                        tracing::debug!("Detected closing reasoning tag: </{}>", tag_name);
-                    } else if !is_closing && !*inside_reasoning {
-                        // Opening reasoning tag
-                        *inside_reasoning = true;
-                        tag_transition = TagTransition::OpeningTag(tag_name.clone());
-                        tracing::debug!("Detected opening reasoning tag: <{}>", tag_name);
+                    // Check if this is a known reasoning tag
+                    if REASONING_TAGS.contains(&tag_name.as_str()) {
+                        if is_closing && *inside_reasoning {
+                            // Closing reasoning tag
+                            *inside_reasoning = false;
+                            tag_transition = TagTransition::ClosingTag(tag_name.clone());
+                            tracing::debug!("Detected closing reasoning tag: </{}>", tag_name);
+                        } else if !is_closing && !*inside_reasoning {
+                            // Opening reasoning tag
+                            *inside_reasoning = true;
+                            tag_transition = TagTransition::OpeningTag(tag_name.clone());
+                            tracing::debug!("Detected opening reasoning tag: <{}>", tag_name);
+                        }
+                        // Don't include the tag itself in any output
+                        continue;
                     }
-                    // Don't include the tag itself in any output
-                    continue;
                 }
 
-                // Not a reasoning tag, reconstruct the tag text
-                let reconstructed = if is_closing {
-                    format!("</{tag_candidate}>")
-                } else {
-                    format!("<{tag_candidate}>")
-                };
-
+                // Not a reasoning tag, output the full tag as-is
                 if *inside_reasoning {
-                    reasoning_delta.push_str(&reconstructed);
-                    reasoning_buffer.push_str(&reconstructed);
+                    reasoning_delta.push_str(&full_tag);
+                    reasoning_buffer.push_str(&full_tag);
                 } else {
-                    clean_text.push_str(&reconstructed);
+                    clean_text.push_str(&full_tag);
                 }
             } else {
                 // Regular character
@@ -2584,6 +2593,44 @@ mod tests {
 
         assert_eq!(clean, " world");
         assert_eq!(transition, TagTransition::ClosingTag("think".to_string()));
+        assert!(!inside_reasoning);
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_html_doctype() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test that HTML DOCTYPE and other HTML tags are preserved correctly
+        let input = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <title>Test</title>\n</head>\n<body>\n    <h1>Hello</h1>\n</body>\n</html>";
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        // All HTML tags should be preserved in clean text
+        assert_eq!(clean, input);
+        assert_eq!(reasoning, None);
+        assert!(!inside_reasoning);
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_html_with_attributes() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test HTML tags with attributes
+        let input = "<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <title>SVG Drawing Example</title>\n</head>";
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        // All HTML tags should be preserved
+        assert_eq!(clean, input);
+        assert_eq!(reasoning, None);
         assert!(!inside_reasoning);
     }
 

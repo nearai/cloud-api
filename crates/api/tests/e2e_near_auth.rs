@@ -251,6 +251,33 @@ async fn test_near_login_missing_fields() {
     println!("✅ Correctly rejected request with missing fields");
 }
 
+/// Test that zero-timestamp nonce is rejected (security fix)
+#[tokio::test]
+async fn test_near_login_zero_timestamp_nonce() {
+    let server = setup_test_server().await;
+    let account_id = "hacker.near";
+
+    // Create request with zero-timestamp nonce (all zeros in first 8 bytes)
+    let mut request_body = create_near_auth_request_json(account_id, 0);
+    // Replace nonce with all-zero bytes
+    request_body["payload"]["nonce"] = serde_json::json!(vec![0u8; 32]);
+
+    let response = server
+        .post("/v1/auth/near")
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&request_body)
+        .await;
+
+    // Zero-timestamp nonce should be rejected with UNAUTHORIZED (401)
+    assert_eq!(
+        response.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "Zero-timestamp nonce should return 401"
+    );
+
+    println!("✅ Correctly rejected zero-timestamp nonce");
+}
+
 // ============================================
 // Note: Signature Verification Limitation
 // ============================================

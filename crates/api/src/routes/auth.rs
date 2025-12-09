@@ -516,6 +516,8 @@ pub async fn near_login(
             let (status, error_type) = if error_msg.contains("Invalid signature")
                 || error_msg.contains("replay attack")
                 || error_msg.contains("expired")
+                || error_msg.contains("Invalid nonce")
+                || error_msg.contains("Invalid signature timestamp")
             {
                 (StatusCode::UNAUTHORIZED, "invalid_signature")
             } else if error_msg.contains("Invalid recipient")

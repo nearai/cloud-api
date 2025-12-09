@@ -109,26 +109,33 @@ impl NearAuthService {
                 timestamp_bytes[7],
             ]);
 
-            if nonce_timestamp_ms > 0 {
-                let nonce_time = DateTime::from_timestamp_millis(nonce_timestamp_ms as i64);
-                if let Some(nonce_time) = nonce_time {
-                    let age = Utc::now().signed_duration_since(nonce_time);
-                    if age > Duration::milliseconds(MAX_NONCE_AGE_MS as i64) {
-                        tracing::warn!(
-                            "NEAR signature expired for account {}: age={:?}ms, max_age={}ms",
-                            account_id,
-                            age.num_milliseconds(),
-                            MAX_NONCE_AGE_MS
-                        );
-                        return Err(anyhow::anyhow!("Signature expired"));
-                    }
-                    if age < Duration::zero() {
-                        tracing::warn!(
-                            "NEAR signature has future timestamp for account {}",
-                            account_id
-                        );
-                        return Err(anyhow::anyhow!("Invalid signature timestamp"));
-                    }
+            // Reject zero-timestamp nonces - a valid nonce must have a current timestamp
+            if nonce_timestamp_ms == 0 {
+                tracing::warn!(
+                    "NEAR signature rejected: nonce has zero timestamp for account {}",
+                    account_id
+                );
+                return Err(anyhow::anyhow!("Invalid nonce: zero timestamp"));
+            }
+
+            let nonce_time = DateTime::from_timestamp_millis(nonce_timestamp_ms as i64);
+            if let Some(nonce_time) = nonce_time {
+                let age = Utc::now().signed_duration_since(nonce_time);
+                if age > Duration::milliseconds(MAX_NONCE_AGE_MS as i64) {
+                    tracing::warn!(
+                        "NEAR signature expired for account {}: age={:?}ms, max_age={}ms",
+                        account_id,
+                        age.num_milliseconds(),
+                        MAX_NONCE_AGE_MS
+                    );
+                    return Err(anyhow::anyhow!("Signature expired"));
+                }
+                if age < Duration::zero() {
+                    tracing::warn!(
+                        "NEAR signature has future timestamp for account {}",
+                        account_id
+                    );
+                    return Err(anyhow::anyhow!("Invalid signature timestamp"));
                 }
             }
         }

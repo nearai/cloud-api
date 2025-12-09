@@ -2154,7 +2154,6 @@ DO NOT USE THESE FORMATS:
         completion_service: Arc<dyn CompletionServiceTrait>,
         tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
     ) -> Option<tokio::task::JoinHandle<Result<(), errors::ResponseError>>> {
-        let model = request.model.clone();
         // Only proceed if we have a conversation_id
         let conv_id = conversation_id?;
 
@@ -2202,7 +2201,6 @@ DO NOT USE THESE FORMATS:
                 conv_id,
                 user_id,
                 user_message,
-                model,
                 api_key_id,
                 organization_id,
                 workspace_id,
@@ -2222,7 +2220,6 @@ DO NOT USE THESE FORMATS:
         conversation_id: ConversationId,
         user_id: crate::UserId,
         user_message: String,
-        model: String,
         api_key_id: String,
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
@@ -2269,14 +2266,16 @@ DO NOT USE THESE FORMATS:
         );
 
         // Generate title using completion service (names not included - tracked via database)
+        let title_model = std::env::var("TITLE_GENERATION_MODEL")
+            .unwrap_or_else(|_| "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string());
         let completion_request = crate::completions::ports::CompletionRequest {
-            model, // Use the same model as the user's request
+            model: title_model,
             messages: vec![crate::completions::ports::CompletionMessage {
                 role: "user".to_string(),
                 content: title_prompt,
             }],
-            max_tokens: Some(20), // Short response for title
-            temperature: Some(0.7),
+            max_tokens: Some(150),
+            temperature: Some(1.0),
             top_p: None,
             stop: None,
             stream: Some(false),
@@ -2287,7 +2286,10 @@ DO NOT USE THESE FORMATS:
             metadata: None,
             body_hash: String::new(),
             n: None,
-            extra: std::collections::HashMap::new(),
+            extra: std::collections::HashMap::from([(
+                "chat_template_kwargs".to_string(),
+                serde_json::json!({ "enable_thinking": false }),
+            )]),
         };
 
         // Call completion service to generate title
@@ -2304,8 +2306,13 @@ DO NOT USE THESE FORMATS:
             .choices
             .first()
             .and_then(|choice| choice.message.content.as_ref())
-            .map(|content| content.trim().to_string())
-            .unwrap_or_else(|| "Conversation".to_string());
+            .map(|content| content.trim().to_string());
+        let raw_title = if raw_title.is_none() {
+            tracing::warn!("LLM response doesn't contain title, using default");
+            "Conversation".to_string()
+        } else {
+            raw_title.unwrap().to_string()
+        };
 
         // Strip reasoning tags from title
         let mut reasoning_buffer = String::new();

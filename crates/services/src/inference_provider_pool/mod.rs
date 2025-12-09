@@ -637,25 +637,28 @@ impl InferenceProviderPool {
     /// for the given text using the model's tokenizer.
     /// Falls back to 0 tokens (don't charge) if the tokenize API fails or no providers are found.
     pub async fn count_tokens_for_model(&self, text: &str, model_name: &str) -> i32 {
-        // Get providers for this model to see if we have any available
-        let model_mapping = self.model_mapping.read().await;
-        let providers = model_mapping.get(model_name);
+        // Clone the provider while holding the lock, then release lock before async call
+        // to avoid blocking the model discovery refresh task
+        let provider = {
+            let model_mapping = self.model_mapping.read().await;
+            model_mapping
+                .get(model_name)
+                .and_then(|providers| providers.first().cloned())
+        };
 
-        if let Some(provider_list) = providers {
-            if let Some(provider) = provider_list.first() {
-                match provider.count_tokens(text, model_name).await {
-                    Ok(count) => {
-                        return count;
-                    }
-                    Err(e) => {
-                        // Fall back to 0 tokens if count_tokens fails - don't charge customers
-                        // if our infrastructure fails
-                        tracing::warn!(
-                            "Failed to get token count from provider: {}, returning 0 (not charging customer)",
-                            e
-                        );
-                        return 0;
-                    }
+        if let Some(provider) = provider {
+            match provider.count_tokens(text, model_name).await {
+                Ok(count) => {
+                    return count;
+                }
+                Err(e) => {
+                    // Fall back to 0 tokens if count_tokens fails - don't charge customers
+                    // if our infrastructure fails
+                    tracing::warn!(
+                        "Failed to get token count from provider: {}, returning 0 (not charging customer)",
+                        e
+                    );
+                    return 0;
                 }
             }
         }

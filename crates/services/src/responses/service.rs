@@ -2307,11 +2307,11 @@ DO NOT USE THESE FORMATS:
             .first()
             .and_then(|choice| choice.message.content.as_ref())
             .map(|content| content.trim().to_string());
-        let raw_title = if raw_title.is_none() {
+        let raw_title = if let Some(title) = raw_title {
+            title
+        } else {
             tracing::warn!("LLM response doesn't contain title, using default");
             "Conversation".to_string()
-        } else {
-            raw_title.unwrap().to_string()
         };
 
         // Strip reasoning tags from title

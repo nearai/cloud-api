@@ -1803,6 +1803,7 @@ impl ResponseServiceImpl {
                 let mut tag_candidate = String::new();
                 let mut is_closing = false;
                 let mut found_non_tag_char = false;
+                let mut is_self_closing = false;
 
                 // Check if this is a closing tag
                 if chars.peek() == Some(&'/') {
@@ -1824,6 +1825,34 @@ impl ResponseServiceImpl {
                         tag_candidate.push(next_ch);
                         full_tag.push(next_ch);
                         chars.next();
+                    } else if next_ch == '/' {
+                        // Check if this is a self-closing tag (like <br/> or <think/>)
+                        // Look ahead to see if '/' is followed by '>' or space+'>'
+                        let mut peek_iter = chars.clone();
+                        peek_iter.next(); // skip '/'
+                        // Skip whitespace after '/'
+                        while let Some(&peek_ch) = peek_iter.peek() {
+                            if peek_ch == '>' {
+                                // This is a self-closing tag
+                                is_self_closing = true;
+                                full_tag.push('/');
+                                chars.next(); // consume '/'
+                                // Don't set found_non_tag_char yet - we want to check if it's a reasoning tag
+                                break;
+                            } else if peek_ch.is_whitespace() {
+                                peek_iter.next();
+                            } else {
+                                // Not a self-closing tag, just a regular non-tag-char
+                                found_non_tag_char = true;
+                                full_tag.push('/');
+                                chars.next();
+                                break;
+                            }
+                        }
+                        if is_self_closing {
+                            // Continue to collect '>' in the next iteration
+                            continue;
+                        }
                     } else {
                         // Hit a non-tag-name character (like '!' in <!DOCTYPE, space, etc.)
                         // This is not a simple reasoning tag, collect the entire tag content
@@ -1833,13 +1862,20 @@ impl ResponseServiceImpl {
                     }
                 }
 
-                // Only check for reasoning tags if we didn't find any non-tag-name characters
-                if !found_non_tag_char {
+                // Check for reasoning tags: either simple tags or self-closing reasoning tags
+                if !found_non_tag_char || is_self_closing {
                     let tag_name = tag_candidate.to_lowercase();
 
                     // Check if this is a known reasoning tag
                     if REASONING_TAGS.contains(&tag_name.as_str()) {
-                        if is_closing && *inside_reasoning {
+                        if is_self_closing {
+                            // Self-closing reasoning tag: treat as no-op (empty reasoning block)
+                            // Don't change inside_reasoning state, just ignore the tag
+                            tag_transition = TagTransition::None;
+                            tracing::debug!("Detected self-closing reasoning tag: <{}/>", tag_name);
+                            // Don't include the tag itself in any output
+                            continue;
+                        } else if is_closing && *inside_reasoning {
                             // Closing reasoning tag
                             *inside_reasoning = false;
                             tag_transition = TagTransition::ClosingTag(tag_name.clone());
@@ -2615,6 +2651,7 @@ mod tests {
         assert_eq!(clean, input);
         assert_eq!(reasoning, None);
         assert!(!inside_reasoning);
+        assert!(reasoning_buffer.is_empty());
     }
 
     #[test]
@@ -2747,6 +2784,69 @@ mod tests {
         );
 
         assert_eq!(clean, input);
+        assert_eq!(reasoning, None);
+        assert!(!inside_reasoning);
+        assert!(reasoning_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_self_closing_reasoning_tag() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test self-closing reasoning tag <think/> - should be treated as reasoning tag, not output
+        let input = "<think/>";
+        let (clean, reasoning, transition) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        // Self-closing reasoning tag should be ignored (not in output)
+        assert_eq!(clean, "");
+        assert_eq!(reasoning, None);
+        // Self-closing tag should not change reasoning state (no-op)
+        assert!(!inside_reasoning);
+        assert!(reasoning_buffer.is_empty());
+        assert_eq!(transition, TagTransition::None);
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_self_closing_reasoning_tag_with_space() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test self-closing reasoning tag with space <think /> - should be treated as reasoning tag
+        let input = "<think />";
+        let (clean, reasoning, transition) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        // Self-closing reasoning tag should be ignored (not in output)
+        assert_eq!(clean, "");
+        assert_eq!(reasoning, None);
+        assert!(!inside_reasoning);
+        assert!(reasoning_buffer.is_empty());
+        assert_eq!(transition, TagTransition::None);
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_self_closing_reasoning_tag_mixed() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test mix of self-closing reasoning tag and regular HTML
+        let input = "Text <think/> more text <br/>";
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        // Self-closing reasoning tag should be removed, but HTML tags should remain
+        assert_eq!(clean, "Text  more text <br/>");
         assert_eq!(reasoning, None);
         assert!(!inside_reasoning);
         assert!(reasoning_buffer.is_empty());

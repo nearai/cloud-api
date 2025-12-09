@@ -963,17 +963,10 @@ pub struct MetricsQueryParams {
     pub end: Option<String>,
 }
 
-/// Get organization metrics for enterprise dashboards (Admin only)
+/// Get organization metrics (Admin only)
 ///
-/// Returns comprehensive usage metrics for an organization including:
-/// - Summary totals (requests, tokens, cost)
-/// - Breakdown by workspace
-/// - Breakdown by API key
-/// - Breakdown by model
-///
-/// This endpoint uses database queries instead of metrics services to provide
-/// high-cardinality data (per-org, per-workspace, per-key) without the cost
-/// of storing all combinations in Datadog/OTLP.
+/// Returns usage metrics for an organization including summary totals,
+/// and breakdowns by workspace, API key, and model.
 #[utoipa::path(
     get,
     path = "/v1/admin/organizations/{org_id}/metrics",
@@ -1051,6 +1044,193 @@ pub async fn get_organization_metrics(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(
                         format!("Failed to retrieve metrics: {e}"),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+
+    Ok(ResponseJson(metrics))
+}
+
+/// Get platform-wide metrics for admin dashboards (Admin only)
+///
+/// Returns aggregated metrics across all organizations including:
+/// - Total users and organizations
+/// - Total requests and revenue
+/// - Top models by usage
+/// - Top organizations by spend
+#[utoipa::path(
+    get,
+    path = "/v1/admin/platform/metrics",
+    tag = "Admin",
+    params(
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now.")
+    ),
+    responses(
+        (status = 200, description = "Platform metrics retrieved successfully"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_platform_metrics(
+    State(app_state): State<AdminAppState>,
+    Query(params): Query<MetricsQueryParams>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<ResponseJson<services::admin::PlatformMetrics>, (StatusCode, ResponseJson<ErrorResponse>)>
+{
+    debug!(
+        "Get platform metrics request, start: {:?}, end: {:?}",
+        params.start, params.end
+    );
+
+    // Parse time range with defaults
+    let end = params
+        .end
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now);
+
+    let start = params
+        .start
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|| end - Duration::days(30));
+
+    // Get platform metrics from analytics service
+    let metrics = app_state
+        .analytics_service
+        .get_platform_metrics(start, end)
+        .await
+        .map_err(|e| {
+            error!("Failed to get platform metrics, error: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to retrieve platform metrics: {e}"),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    Ok(ResponseJson(metrics))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct TimeSeriesQueryParams {
+    /// Start of time range (ISO 8601 format). Defaults to 30 days ago.
+    pub start: Option<String>,
+    /// End of time range (ISO 8601 format). Defaults to now.
+    pub end: Option<String>,
+    /// Granularity: "hour", "day" (default), or "week"
+    #[serde(default = "default_granularity")]
+    pub granularity: String,
+}
+
+fn default_granularity() -> String {
+    "day".to_string()
+}
+
+/// Get time series metrics for an organization (Admin only)
+///
+/// Returns daily/weekly/hourly aggregations for charting:
+/// requests, tokens, and cost per time period.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations/{org_id}/metrics/timeseries",
+    tag = "Admin",
+    params(
+        ("org_id" = String, Path, description = "Organization ID to get metrics for"),
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
+        ("granularity" = Option<String>, Query, description = "Time granularity: hour, day (default), or week")
+    ),
+    responses(
+        (status = 200, description = "Time series metrics retrieved successfully"),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_organization_timeseries(
+    State(app_state): State<AdminAppState>,
+    Path(org_id): Path<String>,
+    Query(params): Query<TimeSeriesQueryParams>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<
+    ResponseJson<services::admin::TimeSeriesMetrics>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    debug!(
+        "Get organization timeseries request for org_id: {}, start: {:?}, end: {:?}, granularity: {}",
+        org_id, params.start, params.end, params.granularity
+    );
+
+    // Parse organization ID
+    let organization_id = uuid::Uuid::parse_str(&org_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Invalid organization ID format".to_string(),
+                "invalid_id".to_string(),
+            )),
+        )
+    })?;
+
+    // Validate granularity
+    let granularity = match params.granularity.as_str() {
+        "hour" | "day" | "week" => params.granularity.as_str(),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "Invalid granularity. Must be 'hour', 'day', or 'week'".to_string(),
+                    "invalid_granularity".to_string(),
+                )),
+            ))
+        }
+    };
+
+    // Parse time range with defaults
+    let end = params
+        .end
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now);
+
+    let start = params
+        .start
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|| end - Duration::days(30));
+
+    // Get timeseries from analytics service
+    let metrics = app_state
+        .analytics_service
+        .get_organization_timeseries(organization_id, start, end, granularity)
+        .await
+        .map_err(|e| {
+            error!("Failed to get organization timeseries, error: {:?}", e);
+            match e {
+                services::admin::AdminError::OrganizationNotFound(msg) => (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        msg,
+                        "organization_not_found".to_string(),
+                    )),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        format!("Failed to retrieve timeseries metrics: {e}"),
                         "internal_server_error".to_string(),
                     )),
                 ),

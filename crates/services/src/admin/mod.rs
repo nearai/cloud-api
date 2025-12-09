@@ -3,7 +3,8 @@ pub mod ports;
 
 pub use analytics::{
     AnalyticsRepository, AnalyticsService, ApiKeyMetrics, MetricsSummary, ModelMetrics,
-    OrganizationMetrics, WorkspaceMetrics,
+    OrganizationMetrics, PlatformMetrics, TimeSeriesMetrics, TimeSeriesPoint, TopModelMetrics,
+    TopOrganizationMetrics, WorkspaceMetrics,
 };
 pub use ports::*;
 use std::sync::Arc;

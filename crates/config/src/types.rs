@@ -587,7 +587,7 @@ impl Default for CorsConfig {
                 let safe_suffix = if suffix.starts_with('.') || suffix.starts_with('-') {
                     suffix.to_string()
                 } else {
-                    format!(".{}", suffix)
+                    format!(".{suffix}")
                 };
                 wildcard_suffixes.push(safe_suffix);
             } else {

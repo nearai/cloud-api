@@ -2634,6 +2634,7 @@ mod tests {
         assert_eq!(clean, input);
         assert_eq!(reasoning, None);
         assert!(!inside_reasoning);
+        assert!(reasoning_buffer.is_empty());
     }
 
     #[test]

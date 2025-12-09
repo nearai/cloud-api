@@ -37,19 +37,25 @@ pub struct ClusterState {
 pub struct PatroniDiscovery {
     client: Client,
     postgres_app_id: String,
+    gateway_subdomain: String,
     cluster_state: Arc<RwLock<Option<ClusterState>>>,
     refresh_interval: Duration,
     refresh_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl PatroniDiscovery {
-    pub fn new(postgres_app_id: String, refresh_interval_secs: u64) -> Self {
+    pub fn new(
+        postgres_app_id: String,
+        gateway_subdomain: String,
+        refresh_interval_secs: u64,
+    ) -> Self {
         Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
                 .expect("Failed to create HTTP client"),
             postgres_app_id,
+            gateway_subdomain,
             cluster_state: Arc::new(RwLock::new(None)),
             refresh_interval: Duration::from_secs(refresh_interval_secs),
             refresh_task_handle: Arc::new(Mutex::new(None)),
@@ -63,14 +69,19 @@ impl PatroniDiscovery {
             self.postgres_app_id
         );
 
-        let url = "http://dstack-service/cluster";
-        let response = self
-            .client
+        let url = format!(
+            "https://{}-8008.{}/cluster",
+            self.postgres_app_id, self.gateway_subdomain
+        );
+        // Allow self-signed certificates
+        let client = Client::builder()
+            .tls_info(true)
+            .danger_accept_invalid_certs(true)
+            .tls_built_in_root_certs(false)
+            .build()
+            .expect("Failed to create HTTP client");
+        let response = client
             .get(url)
-            .header("x-dstack-target-app", &self.postgres_app_id)
-            .header("x-dstack-target-port", "8008")
-            .header("x-dstack-target-use-tls", "false")
-            .header("Host", "vpc-server")
             .send()
             .await
             .map_err(|e| anyhow!("Failed to connect to Patroni API: {e}"))?;

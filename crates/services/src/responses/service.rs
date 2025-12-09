@@ -1817,7 +1817,9 @@ impl ResponseServiceImpl {
                         full_tag.push('>');
                         chars.next(); // consume '>'
                         break;
-                    } else if !found_non_tag_char && (next_ch.is_alphanumeric() || next_ch == '_' || next_ch == '-') {
+                    } else if !found_non_tag_char
+                        && (next_ch.is_alphanumeric() || next_ch == '_' || next_ch == '-')
+                    {
                         // Still collecting tag name for reasoning tag detection
                         tag_candidate.push(next_ch);
                         full_tag.push(next_ch);

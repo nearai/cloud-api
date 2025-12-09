@@ -2299,13 +2299,25 @@ DO NOT USE THESE FORMATS:
             })?;
 
         // Extract title from completion result
-        let generated_title = completion_result
+        let raw_title = completion_result
             .response
             .choices
             .first()
             .and_then(|choice| choice.message.content.as_ref())
             .map(|content| content.trim().to_string())
             .unwrap_or_else(|| "Conversation".to_string());
+
+        // Strip reasoning tags from title
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+        let (generated_title, _, _) =
+            Self::process_reasoning_tags(&raw_title, &mut reasoning_buffer, &mut inside_reasoning);
+        let generated_title = generated_title.trim();
+        let generated_title = if generated_title.is_empty() {
+            "Conversation".to_string()
+        } else {
+            generated_title.to_string()
+        };
 
         // Truncate to max 60 characters
         let title = if generated_title.len() > 60 {

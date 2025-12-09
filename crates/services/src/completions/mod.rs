@@ -87,6 +87,14 @@ where
                 }
 
                 if let StreamChunk::Chat(ref chat_chunk) = event.chunk {
+                    // Accumulate all output content from deltas in choices
+                    // This includes: text, tool calls, reasoning, etc.
+                    for choice in &chat_chunk.choices {
+                        if let Some(ref delta) = choice.delta {
+                            delta.accumulate_into(&mut self.accumulated_text);
+                        }
+                    }
+
                     if let Some(usage) = &chat_chunk.usage {
                         // Store attestation signature when completion finishes
                         let attestation_service = self.attestation_service.clone();
@@ -201,6 +209,10 @@ where
                                 &tags,
                             );
                         });
+
+                        // Clear accumulated text to prevent Drop handler from double-billing
+                        // on normal completion (Drop always runs, even on success)
+                        self.accumulated_text.clear();
                     }
                 }
                 Poll::Ready(Some(Ok(event.clone())))
@@ -215,6 +227,12 @@ where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
 {
     fn drop(&mut self) {
+        tracing::debug!(
+            "InterceptStream::drop called. accumulated_text_len={}, input_text_len={}",
+            self.accumulated_text.len(),
+            self.input_text.len()
+        );
+
         // If we have accumulated text, it means we disconnected before receiving final chunk
         // Count tokens for accumulated output and record usage as fallback
         if !self.accumulated_text.is_empty() {
@@ -260,6 +278,8 @@ where
                     tracing::warn!("Failed to record accumulated usage on disconnect");
                 }
             });
+        } else {
+            tracing::debug!("InterceptStream dropped with no accumulated text");
         }
     }
 }

@@ -33,6 +33,69 @@ pub struct ChatDelta {
     pub reasoning: Option<String>,
 }
 
+impl ChatDelta {
+    /// Accumulate all content from this delta into a text buffer for token counting.
+    ///
+    /// This method is used when tracking partial output during streaming, particularly
+    /// for calculating usage when clients disconnect early.
+    ///
+    /// **IMPORTANT:** When adding new content fields to ChatDelta, you MUST update
+    /// this method to include them, otherwise token counting on disconnect will be
+    /// incomplete. The unit tests (`test_accumulate_into_includes_all_content_fields`)
+    /// will fail if new content fields are added but not handled here.
+    ///
+    /// # Arguments
+    /// * `buffer` - String to append content into
+    ///
+    /// # Fields Accumulated:
+    /// - `content` - Main text content
+    /// - `tool_calls` - Function names and arguments
+    /// - `reasoning_content` - Chain-of-thought reasoning (primary)
+    /// - `reasoning` - Chain-of-thought reasoning (fallback)
+    /// - `name` - Function/tool name
+    ///
+    /// # Fields NOT Accumulated (metadata only):
+    /// - `role` - Message role (assistant/user/etc)
+    /// - `tool_call_id` - ID reference only
+    pub fn accumulate_into(&self, buffer: &mut String) {
+        // Main text content
+        if let Some(ref content) = self.content {
+            buffer.push_str(content);
+        }
+
+        // Tool calls (function names and arguments)
+        if let Some(ref tool_calls) = self.tool_calls {
+            for tool_call in tool_calls {
+                if let Some(function) = &tool_call.function {
+                    // Function name
+                    if let Some(name) = &function.name {
+                        buffer.push_str(name);
+                    }
+                    // Function arguments
+                    if let Some(args) = &function.arguments {
+                        buffer.push_str(args);
+                    }
+                }
+            }
+        }
+
+        // Reasoning content (both variants)
+        if let Some(ref reasoning) = self.reasoning_content {
+            buffer.push_str(reasoning);
+        }
+        if let Some(ref reasoning) = self.reasoning {
+            buffer.push_str(reasoning);
+        }
+
+        // Function/tool name
+        if let Some(ref name) = self.name {
+            buffer.push_str(name);
+        }
+
+        // Note: role and tool_call_id are metadata and don't contribute to token count
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
@@ -808,5 +871,104 @@ mod tests {
         assert_eq!(choice.index, 0);
         assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
         assert!(choice.message.content.is_some());
+    }
+
+    #[test]
+    fn test_accumulate_into_includes_all_content_fields() {
+        let mut buffer = String::new();
+
+        let delta = ChatDelta {
+            role: Some(MessageRole::Assistant), // metadata - should not accumulate
+            content: Some("Hello ".to_string()),
+            name: Some("my_function".to_string()),
+            tool_call_id: Some("call_123".to_string()), // metadata - should not accumulate
+            tool_calls: Some(vec![ToolCallDelta {
+                index: Some(0),
+                id: Some("call_456".to_string()),
+                type_: Some("function".to_string()),
+                function: Some(FunctionCallDelta {
+                    name: Some("search".to_string()),
+                    arguments: Some("{\"query\":\"test\"}".to_string()),
+                }),
+            }]),
+            reasoning_content: Some("Let me think...".to_string()),
+            reasoning: Some("Actually...".to_string()),
+        };
+
+        delta.accumulate_into(&mut buffer);
+
+        // Verify all content fields are included
+        assert!(buffer.contains("Hello "), "content field missing");
+        assert!(buffer.contains("my_function"), "name field missing");
+        assert!(
+            buffer.contains("search"),
+            "tool_calls.function.name missing"
+        );
+        assert!(
+            buffer.contains("{\"query\":\"test\"}"),
+            "tool_calls.function.arguments missing"
+        );
+        assert!(
+            buffer.contains("Let me think..."),
+            "reasoning_content field missing"
+        );
+        assert!(buffer.contains("Actually..."), "reasoning field missing");
+
+        // Verify metadata fields are NOT included
+        assert!(
+            !buffer.contains("call_123"),
+            "tool_call_id should not be accumulated"
+        );
+    }
+
+    #[test]
+    fn test_accumulate_into_handles_empty_fields() {
+        let mut buffer = String::new();
+
+        let delta = ChatDelta {
+            role: None,
+            content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+        };
+
+        delta.accumulate_into(&mut buffer);
+
+        // Should not panic and buffer should remain empty
+        assert_eq!(buffer, "");
+    }
+
+    #[test]
+    fn test_accumulate_into_multiple_deltas() {
+        let mut buffer = String::new();
+
+        // Simulate streaming chunks
+        let delta1 = ChatDelta {
+            role: None,
+            content: Some("The answer ".to_string()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+        };
+
+        let delta2 = ChatDelta {
+            role: None,
+            content: Some("is 42".to_string()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+        };
+
+        delta1.accumulate_into(&mut buffer);
+        delta2.accumulate_into(&mut buffer);
+
+        assert_eq!(buffer, "The answer is 42");
     }
 }

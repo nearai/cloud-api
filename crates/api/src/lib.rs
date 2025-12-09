@@ -1156,6 +1156,7 @@ mod tests {
             },
             database: config::DatabaseConfig {
                 primary_app_id: "postgres-patroni-1".to_string(),
+                gateway_subdomain: "cvm1.near.ai".to_string(),
                 host: None,
                 port: 5432,
                 database: "test_db".to_string(),
@@ -1211,6 +1212,7 @@ mod tests {
         // Create custom database config for testing
         let db_config = config::DatabaseConfig {
             primary_app_id: "postgres-patroni-1".to_string(),
+            gateway_subdomain: "cvm1.near.ai".to_string(),
             port: 5432,
             host: None,
             database: "test_db".to_string(),
@@ -1256,6 +1258,7 @@ mod tests {
             },
             database: config::DatabaseConfig {
                 primary_app_id: "postgres-patroni-1".to_string(),
+                gateway_subdomain: "cvm1.near.ai".to_string(),
                 host: None,
                 port: 5432,
                 database: "test_db".to_string(),

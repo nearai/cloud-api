@@ -2638,6 +2638,121 @@ mod tests {
     }
 
     #[test]
+    fn test_process_reasoning_tags_self_closing_tags() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test self-closing tags without space: <br/>, <hr/>, <img/>
+        let input = "Line 1<br/>Line 2<hr/>Line 3<img/>";
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        assert_eq!(clean, input);
+        assert_eq!(reasoning, None);
+        assert!(!inside_reasoning);
+        assert!(reasoning_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_self_closing_tags_with_space() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test self-closing tags with space: <br />, <hr />, <img />
+        let input = "Line 1<br />Line 2<hr />Line 3<img />";
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        assert_eq!(clean, input);
+        assert_eq!(reasoning, None);
+        assert!(!inside_reasoning);
+        assert!(reasoning_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_self_closing_tags_with_attributes() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test self-closing tags with attributes
+        let input = r#"<img src="image.jpg" alt="Test" /><br class="clear" /><meta charset="UTF-8" />"#;
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        assert_eq!(clean, input);
+        assert_eq!(reasoning, None);
+        assert!(!inside_reasoning);
+        assert!(reasoning_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_self_closing_in_reasoning_block() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test self-closing tags inside reasoning block should be preserved in reasoning
+        let input = "<think>Think about <br/> this</think>";
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        // Self-closing tag should be in reasoning buffer, not in clean text
+        assert_eq!(clean, "");
+        assert!(reasoning.is_some());
+        assert_eq!(reasoning_buffer, "Think about <br/> this");
+        assert!(!inside_reasoning);
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_mixed_self_closing_and_normal_tags() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test mix of self-closing and normal HTML tags
+        let input = r#"<div><p>Paragraph 1</p><br/><p>Paragraph 2</p><hr/></div>"#;
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        assert_eq!(clean, input);
+        assert_eq!(reasoning, None);
+        assert!(!inside_reasoning);
+        assert!(reasoning_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_self_closing_xml_tags() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test XML-style self-closing tags
+        let input = "<root><child attr=\"value\"/><another/></root>";
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        assert_eq!(clean, input);
+        assert_eq!(reasoning, None);
+        assert!(!inside_reasoning);
+        assert!(reasoning_buffer.is_empty());
+    }
+
+    #[test]
     fn test_multiple_web_search_registry_accumulation() {
         use crate::responses::models::SourceRegistry;
         use crate::responses::tools::WebSearchResult;

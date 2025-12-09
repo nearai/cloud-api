@@ -3104,28 +3104,31 @@ async fn test_conversation_title_strips_thinking_tags() {
         }
     }
 
-    if let Some(title) = &title_from_event {
-        assert!(
-            !title.contains("<think>"),
-            "Title should not contain <think> tags, got: {title}"
-        );
-        assert!(
-            !title.contains("</think>"),
-            "Title should not contain </think> tags, got: {title}"
-        );
-        println!("✅ Title successfully stripped thinking tags: {title}");
-    } else {
-        let conv_response = server
-            .get(format!("/v1/conversations/{}", conversation.id).as_str())
-            .add_header("Authorization", format!("Bearer {api_key}"))
-            .await;
-        assert_eq!(conv_response.status_code(), 200);
-        let updated_conv = conv_response.json::<api::models::ConversationObject>();
-
-        if let Some(title) = updated_conv.metadata.get("title").and_then(|v| v.as_str()) {
-            assert!(!title.contains("<think>"));
-            assert!(!title.contains("</think>"));
-            println!("✅ Title in metadata successfully stripped thinking tags: {title}");
+    let title = match title_from_event {
+        Some(t) => t,
+        None => {
+            let conv_response = server
+                .get(format!("/v1/conversations/{}", conversation.id).as_str())
+                .add_header("Authorization", format!("Bearer {api_key}"))
+                .await;
+            assert_eq!(conv_response.status_code(), 200);
+            let updated_conv = conv_response.json::<api::models::ConversationObject>();
+            updated_conv
+                .metadata
+                .get("title")
+                .and_then(|v| v.as_str())
+                .expect("Expected title in event or metadata")
+                .to_string()
         }
-    }
+    };
+
+    assert!(
+        !title.contains("<think>"),
+        "Title should not contain <think> tags, got: {title}"
+    );
+    assert!(
+        !title.contains("</think>"),
+        "Title should not contain </think> tags, got: {title}"
+    );
+    println!("✅ Title stripped thinking tags: {title}");
 }

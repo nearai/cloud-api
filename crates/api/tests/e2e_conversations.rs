@@ -3030,3 +3030,102 @@ async fn test_batch_get_conversations() {
 
     println!("✅ Batch conversation retrieval test passed!");
 }
+
+#[tokio::test]
+async fn test_conversation_title_strips_thinking_tags() {
+    use inference_providers::mock::ResponseTemplate;
+
+    let (server, _pool, mock_provider) = setup_test_server_with_pool().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    mock_provider
+        .set_default_response(ResponseTemplate::new(
+            "<think>Let me analyze this message to generate a title...</think>Test Conversation Title",
+        ))
+        .await;
+
+    let response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "name": "test-conv-title-strip",
+            "description": "Testing title generation with thinking model"
+        }))
+        .await;
+    assert_eq!(response.status_code(), 201);
+    let conversation = response.json::<api::models::ConversationObject>();
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "conversation": {
+                "id": conversation.id,
+            },
+            "input": "Hello, this is a test message for title generation",
+            "temperature": 0.7,
+            "max_output_tokens": 50,
+            "stream": true,
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507"
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    let response_text = response.text();
+    let mut title_from_event: Option<String> = None;
+
+    for line_chunk in response_text.split("\n\n") {
+        if line_chunk.trim().is_empty() {
+            continue;
+        }
+
+        let mut event_type = "";
+        let mut event_data = "";
+
+        for line in line_chunk.lines() {
+            if let Some(event_name) = line.strip_prefix("event: ") {
+                event_type = event_name;
+            } else if let Some(data) = line.strip_prefix("data: ") {
+                event_data = data;
+            }
+        }
+
+        if event_type == "conversation.title.updated" && !event_data.is_empty() {
+            if let Ok(event_json) = serde_json::from_str::<serde_json::Value>(event_data) {
+                if let Some(title) = event_json
+                    .get("conversation_title")
+                    .and_then(|v| v.as_str())
+                {
+                    title_from_event = Some(title.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(title) = &title_from_event {
+        assert!(
+            !title.contains("<think>"),
+            "Title should not contain <think> tags, got: {title}"
+        );
+        assert!(
+            !title.contains("</think>"),
+            "Title should not contain </think> tags, got: {title}"
+        );
+        println!("✅ Title successfully stripped thinking tags: {title}");
+    } else {
+        let conv_response = server
+            .get(format!("/v1/conversations/{}", conversation.id).as_str())
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .await;
+        assert_eq!(conv_response.status_code(), 200);
+        let updated_conv = conv_response.json::<api::models::ConversationObject>();
+
+        if let Some(title) = updated_conv.metadata.get("title").and_then(|v| v.as_str()) {
+            assert!(!title.contains("<think>"));
+            assert!(!title.contains("</think>"));
+            println!("✅ Title in metadata successfully stripped thinking tags: {title}");
+        }
+    }
+}

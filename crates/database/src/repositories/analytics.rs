@@ -344,7 +344,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         let query = format!(
             r#"
             SELECT 
-                DATE_TRUNC('{}', created_at)::text as date,
+                DATE_TRUNC('{date_trunc}', created_at)::text as date,
                 COUNT(*)::bigint as requests,
                 COALESCE(SUM(input_tokens), 0)::bigint as input_tokens,
                 COALESCE(SUM(output_tokens), 0)::bigint as output_tokens,
@@ -353,10 +353,9 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             WHERE organization_id = $1
               AND created_at >= $2
               AND created_at < $3
-            GROUP BY DATE_TRUNC('{}', created_at)
+            GROUP BY DATE_TRUNC('{date_trunc}', created_at)
             ORDER BY date ASC
-            "#,
-            date_trunc, date_trunc
+            "#
         );
 
         let rows = client

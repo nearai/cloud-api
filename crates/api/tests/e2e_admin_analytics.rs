@@ -117,8 +117,7 @@ async fn test_admin_get_organization_metrics_with_usage() {
         assert_eq!(
             response.status_code(),
             200,
-            "Completion request {} should succeed",
-            i
+            "Completion request {i} should succeed"
         );
     }
 

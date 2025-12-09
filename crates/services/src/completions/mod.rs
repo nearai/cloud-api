@@ -52,8 +52,8 @@ where
     // Pre-allocated low-cardinality metric tags (for Datadog/OTLP)
     metric_tags: Vec<String>,
     // Token counting fields for early disconnect fallback
-    accumulated_text: String,  // For output token counting on disconnect
-    input_text: String,        // For input token counting on disconnect
+    accumulated_text: String, // For output token counting on disconnect
+    input_text: String,       // For input token counting on disconnect
 }
 
 impl<S> Stream for InterceptStream<S>
@@ -231,35 +231,14 @@ where
             let inference_type = self.inference_type.clone();
 
             tokio::spawn(async move {
-                // Count OUTPUT tokens
-                let output_tokens = match inference_provider_pool
+                // Count tokens for both input and output (fallback to 0 if tokenization fails)
+                let output_tokens = inference_provider_pool
                     .count_tokens_for_model(&accumulated_text, &model_name)
-                    .await
-                {
-                    Ok(count) => count,
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to count output tokens on disconnect: {}, not charging customer",
-                            e
-                        );
-                        0 // Don't charge if tokenization fails
-                    }
-                };
+                    .await;
 
-                // Count INPUT tokens
-                let input_tokens = match inference_provider_pool
+                let input_tokens = inference_provider_pool
                     .count_tokens_for_model(&input_text, &model_name)
-                    .await
-                {
-                    Ok(count) => count,
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to count input tokens on disconnect: {}, not charging customer",
-                            e
-                        );
-                        0 // Don't charge if tokenization fails
-                    }
-                };
+                    .await;
 
                 // Record the accumulated usage with both input and output token counts
                 if usage_service
@@ -268,12 +247,12 @@ where
                         workspace_id,
                         api_key_id,
                         model_id,
-                        input_tokens,  // Use tokenized count (not 0)
+                        input_tokens,
                         output_tokens,
                         inference_type,
-                        ttft_ms: None,  // Not available on disconnect
-                        avg_itl_ms: None,  // Not available on disconnect
-                        inference_id: None,  // Not available on disconnect
+                        ttft_ms: None,      // Not available on disconnect
+                        avg_itl_ms: None,   // Not available on disconnect
+                        inference_id: None, // Not available on disconnect
                     })
                     .await
                     .is_err()
@@ -379,7 +358,7 @@ impl CompletionServiceImpl {
         model_name: String,
         inference_type: &str,
         request_start_time: Instant,
-        input_text: String,  // Added for token tracking on disconnect
+        input_text: String, // Added for token tracking on disconnect
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
         let metric_tags = Self::create_metric_tags(&model_name);

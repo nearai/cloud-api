@@ -635,12 +635,8 @@ impl InferenceProviderPool {
     ///
     /// This method calls the provider's count_tokens method to get an accurate token count
     /// for the given text using the model's tokenizer.
-    /// Falls back to rough estimation (chars / 4) if the tokenize API fails.
-    pub async fn count_tokens_for_model(
-        &self,
-        text: &str,
-        model_name: &str,
-    ) -> Result<i32, String> {
+    /// Falls back to 0 tokens (don't charge) if the tokenize API fails or no providers are found.
+    pub async fn count_tokens_for_model(&self, text: &str, model_name: &str) -> i32 {
         // Get providers for this model to see if we have any available
         let model_mapping = self.model_mapping.read().await;
         let providers = model_mapping.get(model_name);
@@ -649,26 +645,27 @@ impl InferenceProviderPool {
             if let Some(provider) = provider_list.first() {
                 match provider.count_tokens(text, model_name).await {
                     Ok(count) => {
-                        return Ok(count);
+                        return count;
                     }
                     Err(e) => {
-                        // Fall back to estimation if count_tokens fails
+                        // Fall back to 0 tokens if count_tokens fails - don't charge customers
+                        // if our infrastructure fails
                         tracing::warn!(
-                            "Failed to get token count from provider: {}, using estimation",
+                            "Failed to get token count from provider: {}, returning 0 (not charging customer)",
                             e
                         );
-                        return Ok((text.len() / 4).max(1) as i32);
+                        return 0;
                     }
                 }
             }
         }
 
-        // No providers found, use estimation
+        // No providers found, return 0 (don't charge if we can't count tokens)
         tracing::warn!(
-            "No providers found for model: {}, using token estimation",
+            "No providers found for model: {}, returning 0 (not charging customer)",
             model_name
         );
-        Ok((text.len() / 4).max(1) as i32)
+        0
     }
 
     /// Start the periodic model discovery refresh task and store the handle

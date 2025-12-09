@@ -463,6 +463,7 @@ mod tests {
             encoding_key: "mock_encoding_key".to_string(),
             github: None,
             google: None,
+            near: NearConfig::default(),
             admin_domains: vec!["near.ai".to_string(), "near.org".to_string()],
         };
 
@@ -485,6 +486,7 @@ mod tests {
             encoding_key: "mock_encoding_key".to_string(),
             github: None,
             google: None,
+            near: NearConfig::default(),
             admin_domains: vec![],
         };
 

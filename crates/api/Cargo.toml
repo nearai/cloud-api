@@ -45,6 +45,7 @@ aws-config = { version = "1.5", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.70"
 # NEAR wallet authentication
 near-api = { git = "https://github.com/near/near-api-rs", rev = "f07473256aa7a70e094432618bac174e60d533df" }
+base64 = "0.22"
 # Ordered collections
 indexmap = "2"
 
@@ -60,3 +61,4 @@ k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 sha3 = "0.10"
 hmac = "0.12"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand = "0.8"

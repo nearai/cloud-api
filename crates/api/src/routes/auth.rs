@@ -47,12 +47,116 @@ pub struct AuthResponse {
 }
 
 // NEAR authentication types
+use base64::prelude::*;
 use near_api::signer::NEP413Payload;
 
-#[derive(Deserialize)]
+/// Request body for NEAR authentication (NEP-413)
+#[derive(Debug, Deserialize)]
 pub struct NearAuthRequest {
-    pub signed_message: services::auth::near::SignedMessage,
-    pub payload: NEP413Payload,
+    /// The signed message from the wallet
+    pub signed_message: NearSignedMessageJson,
+    /// The payload that was signed
+    pub payload: NearPayloadJson,
+}
+
+/// Signed message from wallet (NEP-413 SignedMessage)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NearSignedMessageJson {
+    /// NEAR account ID (e.g., "alice.near")
+    pub account_id: String,
+    /// Public key used to sign (e.g., "ed25519:...")
+    pub public_key: String,
+    /// Base64-encoded signature
+    pub signature: String,
+    /// Optional state for browser wallets
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+}
+
+/// Payload that was signed (NEP-413 Payload)
+#[derive(Debug)]
+pub struct NearPayloadJson {
+    /// The message that was signed
+    pub message: String,
+    /// The nonce (as array of 32 bytes)
+    pub nonce: Vec<u8>,
+    /// The recipient (your app identifier)
+    pub recipient: String,
+    /// Optional callback URL
+    pub callback_url: Option<String>,
+}
+
+impl TryFrom<NearSignedMessageJson> for services::auth::near::SignedMessage {
+    type Error = anyhow::Error;
+
+    fn try_from(msg: NearSignedMessageJson) -> Result<Self, Self::Error> {
+        use near_api::types::Signature;
+
+        let public_key: near_api::PublicKey = msg.public_key.parse()?;
+
+        // Parse base64 signature and create Signature based on key type
+        let sig_bytes = BASE64_STANDARD.decode(&msg.signature)?;
+        let signature = Signature::from_parts(public_key.key_type(), &sig_bytes)?;
+
+        Ok(services::auth::near::SignedMessage {
+            account_id: msg.account_id.parse()?,
+            public_key,
+            signature,
+            state: msg.state,
+        })
+    }
+}
+
+impl TryFrom<NearPayloadJson> for NEP413Payload {
+    type Error = anyhow::Error;
+
+    fn try_from(payload: NearPayloadJson) -> Result<Self, Self::Error> {
+        let nonce: [u8; 32] = payload
+            .nonce
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Nonce must be exactly 32 bytes"))?;
+
+        Ok(NEP413Payload {
+            message: payload.message,
+            nonce,
+            recipient: payload.recipient,
+            callback_url: payload.callback_url,
+        })
+    }
+}
+
+// Custom deserializer for NearPayloadJson to validate nonce length
+impl<'de> serde::Deserialize<'de> for NearPayloadJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct NearPayloadJsonRaw {
+            message: String,
+            nonce: Vec<u8>,
+            recipient: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            callback_url: Option<String>,
+        }
+
+        let raw = NearPayloadJsonRaw::deserialize(deserializer)?;
+
+        // Validate nonce length during deserialization
+        if raw.nonce.len() != 32 {
+            return Err(serde::de::Error::custom("Nonce must be exactly 32 bytes"));
+        }
+
+        Ok(NearPayloadJson {
+            message: raw.message,
+            nonce: raw.nonce,
+            recipient: raw.recipient,
+            callback_url: raw.callback_url,
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -319,10 +423,42 @@ pub async fn near_login(
     headers: HeaderMap,
     Json(auth_request): Json<NearAuthRequest>,
 ) -> Response {
+    let account_id_str = auth_request.signed_message.account_id.clone();
     debug!(
         "NEAR authentication attempt for account: {}",
-        auth_request.signed_message.account_id
+        account_id_str
     );
+
+    // Convert JSON types to internal types
+    let signed_message = match auth_request.signed_message.try_into() {
+        Ok(msg) => msg,
+        Err(e) => {
+            error!("Failed to parse signed message: {}", e);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "bad_request",
+                    "error_description": "Invalid signed message format"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let payload = match auth_request.payload.try_into() {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Failed to parse payload: {}", e);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "bad_request",
+                    "error_description": "Invalid payload format"
+                })),
+            )
+                .into_response();
+        }
+    };
 
     // Extract user agent
     let user_agent_header = match headers.get("User-Agent").and_then(|h| h.to_str().ok()) {
@@ -343,8 +479,8 @@ pub async fn near_login(
     // Verify and authenticate
     let result = near_auth_service
         .verify_and_authenticate(
-            auth_request.signed_message.clone(),
-            auth_request.payload,
+            signed_message,
+            payload,
             None, // ip_address
             user_agent_header.to_string(),
             config.auth.encoding_key.clone(),
@@ -353,8 +489,7 @@ pub async fn near_login(
 
     match result {
         Ok((access_token, refresh_session, refresh_token, is_new_user)) => {
-            let account_id = auth_request.signed_message.account_id.to_string();
-            debug!("NEAR authentication successful: {}", account_id);
+            debug!("NEAR authentication successful: {}", account_id_str);
 
             let response = NearAuthResponse {
                 access_token,
@@ -367,7 +502,7 @@ pub async fn near_login(
                         "Authenticated"
                     }
                     .to_string(),
-                    email: format!("{account_id}@near"),
+                    email: format!("{account_id_str}@near"),
                     provider: "near".to_string(),
                 },
                 is_new_user,

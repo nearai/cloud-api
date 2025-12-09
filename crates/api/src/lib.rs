@@ -1127,6 +1127,7 @@ mod tests {
                 encoding_key: "mock_encoding_key".to_string(),
                 github: None,
                 google: None,
+                near: config::NearConfig::default(),
                 admin_domains: vec![],
             },
             database: config::DatabaseConfig {
@@ -1226,6 +1227,7 @@ mod tests {
                 encoding_key: "mock_encoding_key".to_string(),
                 github: None,
                 google: None,
+                near: config::NearConfig::default(),
                 admin_domains: vec![],
             },
             database: config::DatabaseConfig {

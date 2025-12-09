@@ -225,6 +225,18 @@ pub trait SessionRepository: Send + Sync {
     async fn cleanup_expired(&self) -> anyhow::Result<usize>;
 }
 
+/// Repository for NEAR nonce management (replay protection)
+#[async_trait]
+pub trait NearNonceRepository: Send + Sync {
+    /// Check if a nonce has been used and mark it as used.
+    /// Returns true if the nonce was successfully consumed (first use).
+    /// Returns false if the nonce was already used (replay attack).
+    async fn consume_nonce(&self, nonce_hex: &str) -> anyhow::Result<bool>;
+
+    /// Clean up expired nonces (older than 10 minutes)
+    async fn cleanup_expired_nonces(&self) -> anyhow::Result<u64>;
+}
+
 // Service interfaces
 #[async_trait]
 pub trait AuthServiceTrait: Send + Sync {

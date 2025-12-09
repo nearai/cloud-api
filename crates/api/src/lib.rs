@@ -44,6 +44,7 @@ use std::sync::Arc;
 use utoipa::OpenApi;
 
 /// Service initialization components
+#[derive(Clone)]
 pub struct AuthComponents {
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub oauth_manager: Arc<OAuthManager>,
@@ -51,6 +52,7 @@ pub struct AuthComponents {
     pub auth_state_middleware: AuthState,
     pub organization_service:
         Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
+    pub near_auth_service: Arc<services::auth::NearAuthService>,
 }
 
 #[derive(Clone)]
@@ -182,12 +184,25 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
         config.auth.encoding_key.clone(),
     );
 
+    // Create NEAR nonce repository
+    let nonce_repository = Arc::new(database::PostgresNearNonceRepository::new(
+        database.pool().clone(),
+    )) as Arc<dyn services::auth::NearNonceRepository>;
+
+    // Create NEAR auth service (injecting AuthService for reuse)
+    let near_auth_service = Arc::new(services::auth::NearAuthService::new(
+        auth_service.clone(),
+        nonce_repository,
+        config.auth.near.clone(),
+    ));
+
     AuthComponents {
         auth_service,
         oauth_manager: oauth_manager_arc,
         state_store,
         auth_state_middleware,
         organization_service,
+        near_auth_service,
     }
 }
 
@@ -516,9 +531,7 @@ pub fn build_app_with_config(
 
     // Build individual route groups
     let auth_routes = build_auth_routes(
-        auth_components.oauth_manager.clone(),
-        auth_components.state_store,
-        auth_components.auth_service.clone(),
+        Arc::new(auth_components.clone()),
         &auth_components.auth_state_middleware,
         config.clone(),
     );
@@ -639,13 +652,25 @@ pub fn build_invitation_routes(app_state: AppState, auth_state_middleware: &Auth
 
 /// Build authentication routes
 pub fn build_auth_routes(
-    oauth_manager: Arc<OAuthManager>,
-    state_store: StateStore,
-    auth_service: Arc<dyn AuthServiceTrait>,
-    auth_state_middleware: &AuthState,
+    auth_components: Arc<AuthComponents>,
+    auth_state_middleware: &middleware::AuthState,
     config: Arc<ApiConfig>,
 ) -> Router {
-    let auth_state = (oauth_manager, state_store, auth_service, config);
+    use routes::auth::{AuthState, NearAuthState};
+
+    let auth_state: AuthState = (
+        auth_components.oauth_manager.clone(),
+        auth_components.state_store.clone(),
+        auth_components.auth_service.clone(),
+        config.clone(),
+    );
+
+    let near_auth_state: NearAuthState = (auth_components.near_auth_service.clone(), config);
+
+    // Create a sub-router for the NEAR route with its own state
+    let near_router = Router::new()
+        .route("/near", post(routes::auth::near_login))
+        .with_state(near_auth_state);
 
     Router::new()
         .route("/login", get(login_page))
@@ -660,6 +685,7 @@ pub fn build_auth_routes(
             )),
         )
         .route("/logout", post(logout))
+        .merge(near_router)
         .with_state(auth_state)
 }
 

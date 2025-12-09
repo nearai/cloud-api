@@ -1,6 +1,8 @@
+pub mod near;
 pub mod oauth;
 pub mod ports;
 
+pub use near::NearAuthService;
 pub use oauth::OAuthManager;
 pub use ports::*;
 use tracing::debug;

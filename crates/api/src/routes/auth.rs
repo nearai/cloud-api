@@ -1,7 +1,7 @@
 use crate::middleware::AuthenticatedUser;
 use axum::{
     extract::{Query, Request, State},
-    http::{header::SET_COOKIE, StatusCode},
+    http::{header::SET_COOKIE, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     Extension, Json,
 };
@@ -23,6 +23,8 @@ pub type AuthState = (
     Arc<ApiConfig>,
 );
 
+pub type NearAuthState = (Arc<services::auth::NearAuthService>, Arc<ApiConfig>);
+
 #[derive(Deserialize)]
 pub struct OAuthCallback {
     code: String,
@@ -42,6 +44,24 @@ pub struct AuthResponse {
     message: String,
     email: String,
     provider: String,
+}
+
+// NEAR authentication types
+use near_api::signer::NEP413Payload;
+
+#[derive(Deserialize)]
+pub struct NearAuthRequest {
+    pub signed_message: services::auth::near::SignedMessage,
+    pub payload: NEP413Payload,
+}
+
+#[derive(Serialize)]
+pub struct NearAuthResponse {
+    access_token: String,
+    refresh_token: String,
+    refresh_token_expiration: chrono::DateTime<Utc>,
+    user: AuthResponse,
+    is_new_user: bool,
 }
 
 /// Initiate GitHub OAuth flow - redirects to GitHub
@@ -291,6 +311,96 @@ pub async fn logout(Extension(user): Extension<AuthenticatedUser>) -> Response {
         })),
     )
         .into_response()
+}
+
+/// NEAR wallet login endpoint
+pub async fn near_login(
+    State((near_auth_service, config)): State<NearAuthState>,
+    headers: HeaderMap,
+    Json(auth_request): Json<NearAuthRequest>,
+) -> Response {
+    debug!(
+        "NEAR authentication attempt for account: {}",
+        auth_request.signed_message.account_id
+    );
+
+    // Extract user agent
+    let user_agent_header = match headers.get("User-Agent").and_then(|h| h.to_str().ok()) {
+        Some(ua) => ua,
+        None => {
+            error!("Missing User-Agent header");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "bad_request",
+                    "error_description": "Missing User-Agent header"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Verify and authenticate
+    let result = near_auth_service
+        .verify_and_authenticate(
+            auth_request.signed_message.clone(),
+            auth_request.payload,
+            None, // ip_address
+            user_agent_header.to_string(),
+            config.auth.encoding_key.clone(),
+        )
+        .await;
+
+    match result {
+        Ok((access_token, refresh_session, refresh_token, is_new_user)) => {
+            let account_id = auth_request.signed_message.account_id.to_string();
+            debug!("NEAR authentication successful: {}", account_id);
+
+            let response = NearAuthResponse {
+                access_token,
+                refresh_token,
+                refresh_token_expiration: refresh_session.expires_at,
+                user: AuthResponse {
+                    message: if is_new_user {
+                        "Account created"
+                    } else {
+                        "Authenticated"
+                    }
+                    .to_string(),
+                    email: format!("{account_id}@near"),
+                    provider: "near".to_string(),
+                },
+                is_new_user,
+            };
+
+            Json(response).into_response()
+        }
+        Err(e) => {
+            error!("NEAR authentication failed: {}", e);
+            let error_msg = e.to_string();
+            let (status, error_type) = if error_msg.contains("Invalid signature")
+                || error_msg.contains("replay attack")
+                || error_msg.contains("expired")
+            {
+                (StatusCode::UNAUTHORIZED, "invalid_signature")
+            } else if error_msg.contains("Invalid recipient")
+                || error_msg.contains("Invalid message")
+            {
+                (StatusCode::BAD_REQUEST, "invalid_request")
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+            };
+
+            (
+                status,
+                Json(serde_json::json!({
+                    "error": error_type,
+                    "error_description": error_msg
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Login page with OAuth provider options

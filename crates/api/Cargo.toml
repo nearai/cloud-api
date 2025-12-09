@@ -43,6 +43,8 @@ http-body-util = "0.1"
 # AWS S3 for file storage
 aws-config = { version = "1.5", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.70"
+# NEAR wallet authentication
+near-api = { git = "https://github.com/near/near-api-rs", rev = "f07473256aa7a70e094432618bac174e60d533df" }
 # Ordered collections
 indexmap = "2"
 

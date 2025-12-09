@@ -35,8 +35,8 @@ impl NearAuthService {
         nonce_repository: Arc<dyn NearNonceRepository>,
         config: NearConfig,
     ) -> Self {
-        let network_config =
-            NetworkConfig::from_rpc_url("near", Url::parse(&config.rpc_url).unwrap());
+        let rpc_url = Url::parse(&config.rpc_url).expect("Invalid NEAR RPC URL");
+        let network_config = NetworkConfig::from_rpc_url("near", rpc_url);
         Self {
             auth_service,
             nonce_repository,
@@ -80,7 +80,7 @@ impl NearAuthService {
         ip_address: Option<String>,
         user_agent: String,
         encoding_key: String,
-    ) -> anyhow::Result<(String, Session, String, bool)> {
+    ) -> anyhow::Result<(String, Session, String)> {
         let account_id = signed_message.account_id.to_string();
 
         tracing::info!("NEAR authentication attempt for account: {}", account_id);
@@ -195,11 +195,6 @@ impl NearAuthService {
 
         tracing::info!("NEAR authentication successful - account_id={}", account_id);
 
-        Ok((
-            access_token,
-            session,
-            refresh_token,
-            user.created_at == user.updated_at,
-        ))
+        Ok((access_token, session, refresh_token))
     }
 }

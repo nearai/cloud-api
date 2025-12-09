@@ -165,7 +165,6 @@ pub struct NearAuthResponse {
     refresh_token: String,
     refresh_token_expiration: chrono::DateTime<Utc>,
     user: AuthResponse,
-    is_new_user: bool,
 }
 
 /// Initiate GitHub OAuth flow - redirects to GitHub
@@ -488,7 +487,7 @@ pub async fn near_login(
         .await;
 
     match result {
-        Ok((access_token, refresh_session, refresh_token, is_new_user)) => {
+        Ok((access_token, refresh_session, refresh_token)) => {
             debug!("NEAR authentication successful: {}", account_id_str);
 
             let response = NearAuthResponse {
@@ -496,16 +495,10 @@ pub async fn near_login(
                 refresh_token,
                 refresh_token_expiration: refresh_session.expires_at,
                 user: AuthResponse {
-                    message: if is_new_user {
-                        "Account created"
-                    } else {
-                        "Authenticated"
-                    }
-                    .to_string(),
+                    message: "Authenticated".to_string(),
                     email: format!("{account_id_str}@near"),
                     provider: "near".to_string(),
                 },
-                is_new_user,
             };
 
             Json(response).into_response()

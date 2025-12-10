@@ -1058,7 +1058,6 @@ mod tests {
             inference_router: config::InferenceRouterConfig {
                 router_url: "http://localhost:8080".to_string(),
                 api_key: Some("test-key".to_string()),
-                timeout: 5,
                 inference_timeout: 30 * 60, // 30 minutes
             },
             logging: config::LoggingConfig {
@@ -1156,7 +1155,6 @@ mod tests {
             inference_router: config::InferenceRouterConfig {
                 router_url: "http://localhost:8080".to_string(),
                 api_key: Some("test-key".to_string()),
-                timeout: 5,
                 inference_timeout: 30 * 60, // 30 minutes
             },
             logging: config::LoggingConfig {

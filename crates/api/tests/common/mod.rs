@@ -41,10 +41,6 @@ pub fn test_config() -> ApiConfig {
             api_key: std::env::var("INFERENCE_ROUTER_API_KEY")
                 .ok()
                 .or(Some("test_api_key".to_string())),
-            timeout: std::env::var("INFERENCE_ROUTER_TIMEOUT")
-                .ok()
-                .and_then(|t| t.parse().ok())
-                .unwrap_or(5),
             inference_timeout: std::env::var("MODEL_INFERENCE_TIMEOUT")
                 .ok()
                 .and_then(|t| t.parse().ok())

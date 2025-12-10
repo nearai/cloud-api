@@ -78,27 +78,19 @@ impl InferenceProviderPool {
         signing_algo: Option<String>,
         nonce: Option<String>,
         signing_address: Option<String>,
-    ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError> {
+    ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
         // Forward directly to router
-        match self
-            .router_provider
+        self.router_provider
             .get_attestation_report(model.clone(), signing_algo, nonce, signing_address)
             .await
-        {
-            Ok(mut attestation) => {
-                // Remove 'all_attestations' field if present for backwards compatibility
-                attestation.remove("all_attestations");
-                Ok(vec![attestation])
-            }
-            Err(e) => {
+            .map_err(|e| {
                 tracing::debug!(
                     model = %model,
                     error = %e,
                     "Router returned error for attestation request"
                 );
-                Err(AttestationError::ProviderNotFound(model))
-            }
-        }
+                AttestationError::ProviderNotFound(model)
+            })
     }
 
     pub async fn models(&self) -> Result<ModelsResponse, ListModelsError> {

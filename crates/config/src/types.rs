@@ -118,7 +118,6 @@ impl ServerConfig {
 pub struct InferenceRouterConfig {
     pub router_url: String,
     pub api_key: Option<String>,
-    pub timeout: i64,           // seconds (for router requests)
     pub inference_timeout: i64, // seconds (for model inference requests)
 }
 
@@ -129,10 +128,6 @@ impl InferenceRouterConfig {
             router_url: env::var("INFERENCE_ROUTER_URL")
                 .map_err(|_| "INFERENCE_ROUTER_URL not set")?,
             api_key: env::var("INFERENCE_ROUTER_API_KEY").ok(),
-            timeout: env::var("INFERENCE_ROUTER_TIMEOUT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(30), // 30 seconds
             inference_timeout: env::var("MODEL_INFERENCE_TIMEOUT")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -147,10 +142,6 @@ impl Default for InferenceRouterConfig {
             router_url: env::var("INFERENCE_ROUTER_URL")
                 .expect("INFERENCE_ROUTER_URL environment variable is required"),
             api_key: env::var("INFERENCE_ROUTER_API_KEY").ok(),
-            timeout: env::var("INFERENCE_ROUTER_TIMEOUT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(30), // 30 seconds
             inference_timeout: env::var("MODEL_INFERENCE_TIMEOUT")
                 .ok()
                 .and_then(|s| s.parse().ok())

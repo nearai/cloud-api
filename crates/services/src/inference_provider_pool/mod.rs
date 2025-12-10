@@ -34,6 +34,15 @@ impl InferenceProviderPool {
         }
     }
 
+    /// Create a new pool with a custom provider (useful for testing with mock providers)
+    pub fn new_with_provider(provider: Arc<InferenceProviderTrait>) -> Self {
+        Self {
+            router_provider: provider,
+            chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
+            signature_hashes: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
     /// Store a mapping of chat_id to provider for attestation lookups
     async fn store_chat_id_mapping(
         &self,

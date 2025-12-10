@@ -422,7 +422,7 @@ pub async fn init_inference_providers(
 
 /// Initialize inference provider pool with mock providers for testing
 /// This function uses the existing MockProvider from inference_providers::mock
-/// and registers it for common test models without changing any implementations
+/// and creates a pool that uses the mock provider directly
 pub async fn init_inference_providers_with_mocks(
     _config: &ApiConfig,
 ) -> (
@@ -435,14 +435,14 @@ pub async fn init_inference_providers_with_mocks(
     // Create a MockProvider that accepts all models (using new_accept_all)
     let mock_provider = Arc::new(MockProvider::new_accept_all());
 
-    // For the new simplified pool, we need to create a wrapper pool that uses the mock provider
-    // Since the pool now expects a router URL, we'll create it with a dummy URL
-    // but the mock will be used directly in tests via a different mechanism
+    // Cast to the trait type for the pool
+    let mock_provider_trait: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
+        mock_provider.clone();
+
+    // Create pool with the mock provider
     let pool = Arc::new(
-        services::inference_provider_pool::InferenceProviderPool::new(
-            "http://localhost:8080".to_string(),
-            None,
-            30 * 60,
+        services::inference_provider_pool::InferenceProviderPool::new_with_provider(
+            mock_provider_trait,
         ),
     );
 

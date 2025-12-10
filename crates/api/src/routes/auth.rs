@@ -9,6 +9,7 @@ use chrono::Utc;
 use config::ApiConfig;
 use database::repositories::OAuthStateRepository;
 use serde::{Deserialize, Serialize};
+use services::auth::near::NearAuthError;
 use services::auth::{AuthServiceTrait, OAuthManager};
 use std::sync::Arc;
 use tracing::{debug, error, info};
@@ -506,19 +507,12 @@ pub async fn near_login(
         Err(e) => {
             error!("NEAR authentication failed: {}", e);
             let error_msg = e.to_string();
-            let (status, error_type) = if error_msg.contains("Invalid signature")
-                || error_msg.contains("replay attack")
-                || error_msg.contains("expired")
-                || error_msg.contains("Invalid nonce")
-                || error_msg.contains("Invalid signature timestamp")
-            {
-                (StatusCode::UNAUTHORIZED, "invalid_signature")
-            } else if error_msg.contains("Invalid recipient")
-                || error_msg.contains("Invalid message")
-            {
-                (StatusCode::BAD_REQUEST, "invalid_request")
-            } else {
+
+            // Map errors: InternalError -> 500, everything else -> 401 Unauthorized
+            let (status, error_type) = if let Some(NearAuthError::InternalError(_)) = e.downcast_ref::<NearAuthError>() {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+            } else {
+                (StatusCode::UNAUTHORIZED, "invalid_auth")
             };
 
             (

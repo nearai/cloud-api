@@ -1,6 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use config::NearConfig;
 use near_api::{signer::NEP413Payload, types::Signature, AccountId, NetworkConfig, PublicKey};
+use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use url::Url;
 
@@ -8,6 +9,38 @@ use super::ports::{AuthServiceTrait, NearNonceRepository, OAuthUserInfo, Session
 
 const MAX_NONCE_AGE_MS: u64 = 5 * 60 * 1000; // 5 minutes
 const EXPECTED_MESSAGE: &str = "Sign in to NEAR AI Cloud API";
+
+/// Custom error type for NEAR authentication
+#[derive(Debug)]
+pub enum NearAuthError {
+    InvalidSignature,
+    ReplayAttack,
+    ExpiredNonce,
+    InvalidTimestamp,
+    InvalidNonce(String),
+    InvalidRecipient(String),
+    InvalidMessage(String),
+    SignatureVerificationFailed(String),
+    InternalError(String),
+}
+
+impl Display for NearAuthError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSignature => write!(f, "Invalid signature"),
+            Self::ReplayAttack => write!(f, "Nonce already used (replay attack detected)"),
+            Self::ExpiredNonce => write!(f, "Signature expired"),
+            Self::InvalidTimestamp => write!(f, "Invalid signature timestamp"),
+            Self::InvalidNonce(msg) => write!(f, "Invalid nonce: {}", msg),
+            Self::InvalidRecipient(msg) => write!(f, "Invalid recipient: {}", msg),
+            Self::InvalidMessage(msg) => write!(f, "Invalid message: {}", msg),
+            Self::SignatureVerificationFailed(msg) => write!(f, "Signature verification failed: {}", msg),
+            Self::InternalError(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl std::error::Error for NearAuthError {}
 
 /// Signed message data received from the wallet (NEP-413 output)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -43,18 +76,18 @@ pub struct NearAuthService {
 pub(crate) fn validate_nonce_timestamp_ms(
     now: DateTime<Utc>,
     nonce_timestamp_ms: u64,
-) -> anyhow::Result<()> {
+) -> Result<(), NearAuthError> {
     let nonce_time = DateTime::from_timestamp_millis(nonce_timestamp_ms as i64)
-        .ok_or_else(|| anyhow::anyhow!("Invalid nonce: timestamp out of valid range"))?;
+        .ok_or(NearAuthError::InvalidNonce("timestamp out of valid range".to_string()))?;
 
     let age = now.signed_duration_since(nonce_time);
 
     if age > Duration::milliseconds(MAX_NONCE_AGE_MS as i64) {
-        return Err(anyhow::anyhow!("Signature expired"));
+        return Err(NearAuthError::ExpiredNonce);
     }
 
     if age < Duration::zero() {
-        return Err(anyhow::anyhow!("Invalid signature timestamp"));
+        return Err(NearAuthError::InvalidTimestamp);
     }
 
     Ok(())
@@ -82,25 +115,25 @@ impl NearAuthService {
         }
     }
 
-    fn validate_recipient(&self, recipient: &str) -> anyhow::Result<()> {
+    fn validate_recipient(&self, recipient: &str) -> Result<(), NearAuthError> {
         if recipient == self.config.expected_recipient {
             Ok(())
         } else {
-            Err(anyhow::anyhow!(
-                "Invalid recipient: expected {}, got {}",
+            Err(NearAuthError::InvalidRecipient(format!(
+                "expected {}, got {}",
                 self.config.expected_recipient,
                 recipient
-            ))
+            )))
         }
     }
 
-    fn validate_message(message: &str) -> anyhow::Result<()> {
+    fn validate_message(message: &str) -> Result<(), NearAuthError> {
         if message == EXPECTED_MESSAGE {
             Ok(())
         } else {
-            Err(anyhow::anyhow!(
-                "Invalid message: expected '{EXPECTED_MESSAGE}', got '{message}'"
-            ))
+            Err(NearAuthError::InvalidMessage(format!(
+                "expected '{EXPECTED_MESSAGE}', got '{message}'"
+            )))
         }
     }
 
@@ -117,10 +150,10 @@ impl NearAuthService {
         tracing::info!("NEAR authentication attempt for account: {}", account_id);
 
         // 1. Validate recipient
-        self.validate_recipient(&payload.recipient)?;
+        self.validate_recipient(&payload.recipient).map_err(|e| anyhow::anyhow!(e))?;
 
         // 2. Validate message
-        Self::validate_message(&payload.message)?;
+        Self::validate_message(&payload.message).map_err(|e| anyhow::anyhow!(e))?;
 
         // 3. Cleanup expired nonces
         self.cleanup_nonces().await;
@@ -146,7 +179,7 @@ impl NearAuthService {
                     "NEAR signature rejected: nonce has zero timestamp for account {}",
                     account_id
                 );
-                return Err(anyhow::anyhow!("Invalid nonce: zero timestamp"));
+                return Err(anyhow::anyhow!(NearAuthError::InvalidNonce("zero timestamp".to_string())));
             }
 
             // Validate timestamp is within acceptable range
@@ -156,7 +189,7 @@ impl NearAuthService {
                     account_id,
                     e
                 );
-                e
+                anyhow::anyhow!(e)
             })?;
         }
 
@@ -169,10 +202,10 @@ impl NearAuthService {
                 &self.network_config,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Signature verification failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!(NearAuthError::SignatureVerificationFailed(e.to_string())))?;
 
         if !is_valid {
-            return Err(anyhow::anyhow!("Invalid signature"));
+            return Err(anyhow::anyhow!(NearAuthError::InvalidSignature));
         }
 
         // 6. Consume nonce AFTER signature verification (replay protection)
@@ -181,9 +214,7 @@ impl NearAuthService {
         let nonce_consumed = self.nonce_repository.consume_nonce(&nonce_hex).await?;
         if !nonce_consumed {
             tracing::warn!("NEAR signature replay detected for account {}", account_id);
-            return Err(anyhow::anyhow!(
-                "Nonce already used (replay attack detected)"
-            ));
+            return Err(anyhow::anyhow!(NearAuthError::ReplayAttack));
         }
 
         // 7. Find or create user via AuthService
@@ -340,15 +371,20 @@ mod tests {
 
     #[test]
     fn test_nonce_timestamp_with_small_value() {
+        // Test that a future timestamp is correctly rejected
+        // now = 1_000_000 ms (16.67 minutes after Unix epoch)
+        // short_timestamp_ms = 0xFFFF_FFFF (4294967295 ms = 49.7 days after epoch)
+        // This timestamp is ~49.5 days in the future
         let now = Utc.timestamp_millis_opt(1_000_000).unwrap();
         let short_timestamp_ms = 0xFFFF_FFFFu64;
 
         let result = validate_nonce_timestamp_ms(now, short_timestamp_ms);
 
-        // Should validate the timestamp
+        assert!(result.is_err(), "Future timestamp should be rejected");
+        let err_msg = format!("{}", result.unwrap_err());
         assert!(
-            result.is_ok() || result.is_err(),
-            "Should validate timestamp"
+            err_msg.contains("Invalid signature timestamp"),
+            "Error should mention invalid timestamp, got: {err_msg}"
         );
     }
 }

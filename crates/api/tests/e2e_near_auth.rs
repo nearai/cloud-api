@@ -7,10 +7,10 @@ use common::*;
 // Happy Path Tests
 // ============================================
 
-/// Test successful NEAR login for a new user
-/// Verifies: new user creation, tokens returned, user data in response
+/// Test that NEAR login correctly rejects requests with invalid signatures
+/// Verifies: unsigned/invalid signature requests return 401 UNAUTHORIZED
 #[tokio::test]
-async fn test_near_login_success_new_user() {
+async fn test_near_login_rejects_invalid_signature() {
     let server = setup_test_server().await;
     let account_id = "alice.near";
 
@@ -130,11 +130,11 @@ async fn test_near_login_invalid_message() {
         .json(&request_body)
         .await;
 
-    // Invalid message returns BAD_REQUEST (400)
+    // Invalid message returns UNAUTHORIZED (401)
     assert_eq!(
         response.status_code(),
-        StatusCode::BAD_REQUEST,
-        "Invalid message should return 400"
+        StatusCode::UNAUTHORIZED,
+        "Invalid message should return 401"
     );
 
     println!("✅ Correctly rejected invalid message");
@@ -156,11 +156,11 @@ async fn test_near_login_invalid_recipient() {
         .json(&request_body)
         .await;
 
-    // Invalid recipient returns BAD_REQUEST (400)
+    // Invalid recipient returns UNAUTHORIZED (401)
     assert_eq!(
         response.status_code(),
-        StatusCode::BAD_REQUEST,
-        "Invalid recipient should return 400"
+        StatusCode::UNAUTHORIZED,
+        "Invalid recipient should return 401"
     );
 
     println!("✅ Correctly rejected invalid recipient");

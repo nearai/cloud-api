@@ -10,8 +10,9 @@ use axum::{
     response::{IntoResponse, Json as ResponseJson, Response},
 };
 use futures::stream::StreamExt;
-use services::completions::ports::{
-    CompletionMessage, CompletionRequest as ServiceCompletionRequest,
+use services::completions::{
+    hash_inference_id_to_uuid,
+    ports::{CompletionMessage, CompletionRequest as ServiceCompletionRequest},
 };
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -24,11 +25,17 @@ const HEADER_INFERENCE_ID: &str = "Inference-Id";
 
 // Helper function to extract inference ID from first SSE chunk
 fn extract_inference_id_from_sse(raw_bytes: &[u8]) -> Option<Uuid> {
-    let chunk_str = String::from_utf8(raw_bytes.to_vec()).ok()?;
+    let chunk_str = match String::from_utf8(raw_bytes.to_vec()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "Invalid UTF-8 in SSE chunk, cannot extract inference ID");
+            return None;
+        }
+    };
     let data = chunk_str.strip_prefix("data: ")?;
     let obj = serde_json::from_str::<serde_json::Value>(data.trim()).ok()?;
     let id = obj.get("id")?.as_str()?;
-    Some(Uuid::new_v5(&Uuid::NAMESPACE_DNS, id.as_bytes()))
+    Some(hash_inference_id_to_uuid(id))
 }
 
 // Helper function to extract text from MessageContent
@@ -377,11 +384,9 @@ pub async fn chat_completions(
             .await
         {
             Ok(response_with_bytes) => {
-                // Extract inference ID from response ID
-                let inference_id = Some(Uuid::new_v5(
-                    &Uuid::NAMESPACE_DNS,
-                    response_with_bytes.response.id.as_bytes(),
-                ));
+                // Extract inference ID from response ID (reuse same hashing as usage tracking)
+                let inference_id =
+                    Some(hash_inference_id_to_uuid(&response_with_bytes.response.id));
 
                 // Return the exact bytes from the provider for hash verification
                 // This ensures clients can hash the response and compare with attestation endpoints

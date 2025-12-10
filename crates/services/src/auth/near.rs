@@ -99,7 +99,8 @@ impl NearAuthService {
         nonce_repository: Arc<dyn NearNonceRepository>,
         config: NearConfig,
     ) -> Self {
-        let rpc_url = Url::parse(&config.rpc_url).expect("Invalid NEAR RPC URL");
+        let rpc_url = Url::parse(&config.rpc_url)
+            .unwrap_or_else(|_| panic!("Invalid NEAR RPC URL in configuration: '{}'", config.rpc_url));
         let network_config = NetworkConfig::from_rpc_url("near", rpc_url);
         Self {
             auth_service,
@@ -160,38 +161,29 @@ impl NearAuthService {
 
         // 4. Extract timestamp from nonce (first 8 bytes are timestamp)
         // Nonce format: [8 bytes timestamp (big-endian)] + [24 bytes random]
-        if payload.nonce.len() >= 8 {
-            let timestamp_bytes = &payload.nonce[0..8];
-            let nonce_timestamp_ms = u64::from_be_bytes([
-                timestamp_bytes[0],
-                timestamp_bytes[1],
-                timestamp_bytes[2],
-                timestamp_bytes[3],
-                timestamp_bytes[4],
-                timestamp_bytes[5],
-                timestamp_bytes[6],
-                timestamp_bytes[7],
-            ]);
+        // Nonce is guaranteed to be 32 bytes (validated during deserialization)
+        let nonce_timestamp_ms = u64::from_be_bytes(
+            payload.nonce[0..8].try_into().unwrap()
+        );
 
-            // Reject zero-timestamp nonces - a valid nonce must have a current timestamp
-            if nonce_timestamp_ms == 0 {
-                tracing::warn!(
-                    "NEAR signature rejected: nonce has zero timestamp for account {}",
-                    account_id
-                );
-                return Err(anyhow::anyhow!(NearAuthError::InvalidNonce("zero timestamp".to_string())));
-            }
-
-            // Validate timestamp is within acceptable range
-            validate_nonce_timestamp_ms(Utc::now(), nonce_timestamp_ms).map_err(|e| {
-                tracing::warn!(
-                    "NEAR signature rejected: invalid timestamp for account {}: {}",
-                    account_id,
-                    e
-                );
-                anyhow::anyhow!(e)
-            })?;
+        // Reject zero-timestamp nonces - a valid nonce must have a current timestamp
+        if nonce_timestamp_ms == 0 {
+            tracing::warn!(
+                "NEAR signature rejected: nonce has zero timestamp for account {}",
+                account_id
+            );
+            return Err(anyhow::anyhow!(NearAuthError::InvalidNonce("zero timestamp".to_string())));
         }
+
+        // Validate timestamp is within acceptable range
+        validate_nonce_timestamp_ms(Utc::now(), nonce_timestamp_ms).map_err(|e| {
+            tracing::warn!(
+                "NEAR signature rejected: invalid timestamp for account {}: {}",
+                account_id,
+                e
+            );
+            anyhow::anyhow!(e)
+        })?;
 
         // 5. Verify signature AND public key ownership via near-api
         let is_valid = payload

@@ -1830,10 +1830,12 @@ impl ResponseServiceImpl {
                         // Look ahead to see if '/' is followed by '>' or space+'>'
                         let mut peek_iter = chars.clone();
                         peek_iter.next(); // skip '/'
-                                          // Skip whitespace after '/'
+                        let mut found_gt = false;
+                        // Skip whitespace after '/'
                         while let Some(&peek_ch) = peek_iter.peek() {
                             if peek_ch == '>' {
                                 // This is a self-closing tag
+                                found_gt = true;
                                 is_self_closing = true;
                                 full_tag.push('/');
                                 chars.next(); // consume '/'
@@ -1843,13 +1845,16 @@ impl ResponseServiceImpl {
                                 peek_iter.next();
                             } else {
                                 // Not a self-closing tag, just a regular non-tag-char
-                                found_non_tag_char = true;
-                                full_tag.push('/');
-                                chars.next();
                                 break;
                             }
                         }
-                        if is_self_closing {
+                        if !found_gt {
+                            // No '>' found after '/' (incomplete tag in streaming input)
+                            // Treat '/' as a regular non-tag-char to avoid infinite loop
+                            found_non_tag_char = true;
+                            full_tag.push('/');
+                            chars.next(); // consume '/' to prevent infinite loop
+                        } else if is_self_closing {
                             // Continue to collect '>' in the next iteration
                             continue;
                         }
@@ -2924,6 +2929,67 @@ mod tests {
         assert!(reasoning.is_some());
         assert_eq!(reasoning_buffer, "Content");
         assert!(!inside_reasoning);
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_incomplete_self_closing() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test incomplete self-closing tag (like <br/ in streaming input)
+        // This should not cause an infinite loop
+        let input = "<br/";
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        // Incomplete tag should be treated as regular text to avoid infinite loop
+        assert_eq!(clean, "<br/");
+        assert_eq!(reasoning, None);
+        assert!(!inside_reasoning);
+        assert!(reasoning_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_incomplete_self_closing_with_text() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test incomplete self-closing tag followed by text
+        let input = "<br/Text";
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        // Incomplete tag should be treated as regular text
+        assert_eq!(clean, "<br/Text");
+        assert_eq!(reasoning, None);
+        assert!(!inside_reasoning);
+        assert!(reasoning_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_incomplete_self_closing_reasoning() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test incomplete self-closing reasoning tag (like <think/ in streaming input)
+        let input = "<think/";
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        // Incomplete tag should be treated as regular text to avoid infinite loop
+        assert_eq!(clean, "<think/");
+        assert_eq!(reasoning, None);
+        assert!(!inside_reasoning);
+        assert!(reasoning_buffer.is_empty());
     }
 
     #[test]

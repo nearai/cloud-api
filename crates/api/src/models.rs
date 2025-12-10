@@ -1416,6 +1416,33 @@ pub struct ModelListResponse {
     pub total: i64,
 }
 
+/// Response for admin model list endpoint
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AdminModelListResponse {
+    pub models: Vec<AdminModelWithPricing>,
+    pub limit: i64,
+    pub offset: i64,
+    pub total: i64,
+}
+
+/// Model with pricing information for admin listing
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AdminModelWithPricing {
+    #[serde(rename = "modelId")]
+    pub model_id: String,
+    #[serde(rename = "inputCostPerToken")]
+    pub input_cost_per_token: DecimalPrice,
+    #[serde(rename = "outputCostPerToken")]
+    pub output_cost_per_token: DecimalPrice,
+    pub metadata: ModelMetadata,
+    #[serde(rename = "isActive")]
+    pub is_active: bool,
+    #[serde(rename = "createdAt")]
+    pub created_at: DateTime<Utc>,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Model with pricing information
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelWithPricing {

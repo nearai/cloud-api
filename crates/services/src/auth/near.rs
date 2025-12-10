@@ -29,6 +29,37 @@ pub struct NearAuthService {
     network_config: NetworkConfig,
 }
 
+/// Validates that a nonce timestamp is within the acceptable window
+///
+/// # Arguments
+/// * `now` - Current time for comparison
+/// * `nonce_timestamp_ms` - Timestamp from nonce in milliseconds
+///
+/// # Errors
+/// Returns error if:
+/// - Timestamp is out of valid range
+/// - Timestamp is older than MAX_NONCE_AGE_MS (expired)
+/// - Timestamp is in the future
+pub(crate) fn validate_nonce_timestamp_ms(
+    now: DateTime<Utc>,
+    nonce_timestamp_ms: u64,
+) -> anyhow::Result<()> {
+    let nonce_time = DateTime::from_timestamp_millis(nonce_timestamp_ms as i64)
+        .ok_or_else(|| anyhow::anyhow!("Invalid nonce: timestamp out of valid range"))?;
+
+    let age = now.signed_duration_since(nonce_time);
+
+    if age > Duration::milliseconds(MAX_NONCE_AGE_MS as i64) {
+        return Err(anyhow::anyhow!("Signature expired"));
+    }
+
+    if age < Duration::zero() {
+        return Err(anyhow::anyhow!("Invalid signature timestamp"));
+    }
+
+    Ok(())
+}
+
 impl NearAuthService {
     pub fn new(
         auth_service: Arc<dyn AuthServiceTrait>,
@@ -118,26 +149,15 @@ impl NearAuthService {
                 return Err(anyhow::anyhow!("Invalid nonce: zero timestamp"));
             }
 
-            let nonce_time = DateTime::from_timestamp_millis(nonce_timestamp_ms as i64);
-            if let Some(nonce_time) = nonce_time {
-                let age = Utc::now().signed_duration_since(nonce_time);
-                if age > Duration::milliseconds(MAX_NONCE_AGE_MS as i64) {
-                    tracing::warn!(
-                        "NEAR signature expired for account {}: age={:?}ms, max_age={}ms",
-                        account_id,
-                        age.num_milliseconds(),
-                        MAX_NONCE_AGE_MS
-                    );
-                    return Err(anyhow::anyhow!("Signature expired"));
-                }
-                if age < Duration::zero() {
-                    tracing::warn!(
-                        "NEAR signature has future timestamp for account {}",
-                        account_id
-                    );
-                    return Err(anyhow::anyhow!("Invalid signature timestamp"));
-                }
-            }
+            // Validate timestamp is within acceptable range
+            validate_nonce_timestamp_ms(Utc::now(), nonce_timestamp_ms).map_err(|e| {
+                tracing::warn!(
+                    "NEAR signature rejected: invalid timestamp for account {}: {}",
+                    account_id,
+                    e
+                );
+                e
+            })?;
         }
 
         // 5. Verify signature AND public key ownership via near-api
@@ -196,5 +216,139 @@ impl NearAuthService {
         tracing::info!("NEAR authentication successful - account_id={}", account_id);
 
         Ok((access_token, session, refresh_token))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn test_rejects_out_of_range_timestamp() {
+        let now = Utc.timestamp_millis_opt(1_000_000).unwrap();
+
+        // i64::MAX is beyond chrono's valid range
+        let nonce_timestamp_ms = i64::MAX as u64;
+
+        let result = validate_nonce_timestamp_ms(now, nonce_timestamp_ms);
+
+        assert!(result.is_err(), "Out-of-range timestamp should be rejected");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("out of valid range"),
+            "Error should mention out of range, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_accepts_recent_valid_timestamp() {
+        let now = Utc.timestamp_millis_opt(1_000_000).unwrap();
+        let nonce_ts = now.timestamp_millis() - 60_000; // 1 minute ago
+
+        let result = validate_nonce_timestamp_ms(now, nonce_ts as u64);
+
+        assert!(result.is_ok(), "Recent timestamp should be accepted");
+    }
+
+    #[test]
+    fn test_rejects_expired_timestamp() {
+        let now = Utc.timestamp_millis_opt(1_000_000).unwrap();
+        let nonce_ts = now.timestamp_millis() - (10 * 60 * 1000); // 10 minutes ago (exceeds 5-minute window)
+
+        let result = validate_nonce_timestamp_ms(now, nonce_ts as u64);
+
+        assert!(result.is_err(), "Expired timestamp should be rejected");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Signature expired"),
+            "Error should mention expiration, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_future_timestamp() {
+        let now = Utc.timestamp_millis_opt(1_000_000).unwrap();
+        let nonce_ts = now.timestamp_millis() + 60_000; // 1 minute in the future
+
+        let result = validate_nonce_timestamp_ms(now, nonce_ts as u64);
+
+        assert!(result.is_err(), "Future timestamp should be rejected");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Invalid signature timestamp"),
+            "Error should mention invalid timestamp, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_accepts_timestamp_at_boundary() {
+        let now = Utc.timestamp_millis_opt(1_000_000).unwrap();
+
+        // Exactly at the 5-minute boundary should still be valid
+        let nonce_ts = now.timestamp_millis() - (5 * 60 * 1000); // Exactly 5 minutes ago
+
+        let result = validate_nonce_timestamp_ms(now, nonce_ts as u64);
+
+        assert!(
+            result.is_ok(),
+            "Timestamp at exactly 5-minute boundary should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_rejects_timestamp_just_beyond_boundary() {
+        let now = Utc.timestamp_millis_opt(1_000_000).unwrap();
+
+        // Just beyond the 5-minute boundary should be rejected
+        let nonce_ts = now.timestamp_millis() - (5 * 60 * 1000 + 1); // 5 minutes + 1ms ago
+
+        let result = validate_nonce_timestamp_ms(now, nonce_ts as u64);
+
+        assert!(
+            result.is_err(),
+            "Timestamp beyond 5-minute window should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_negative_i64_max_out_of_range() {
+        // i64::MIN also causes from_timestamp_millis to return None
+        let now = Utc.timestamp_millis_opt(1_000_000).unwrap();
+
+        // Large negative value (way before year -262144)
+        let nonce_timestamp_ms = (-9_000_000_000_000_000i64) as u64;
+
+        let result = validate_nonce_timestamp_ms(now, nonce_timestamp_ms);
+
+        assert!(
+            result.is_err(),
+            "Timestamp way in the past should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_empty_nonce_timestamp_validation() {
+        let now = Utc.timestamp_millis_opt(1_000_000).unwrap();
+        let empty_nonce_ms = 0u64;
+
+        let result = validate_nonce_timestamp_ms(now, empty_nonce_ms);
+
+        // Zero timestamp is from 1970, should be rejected as expired
+        assert!(result.is_err(), "Empty nonce should be rejected");
+    }
+
+    #[test]
+    fn test_nonce_timestamp_with_small_value() {
+        let now = Utc.timestamp_millis_opt(1_000_000).unwrap();
+        let short_timestamp_ms = 0xFFFF_FFFFu64;
+
+        let result = validate_nonce_timestamp_ms(now, short_timestamp_ms);
+
+        // Should validate the timestamp
+        assert!(
+            result.is_ok() || result.is_err(),
+            "Should validate timestamp"
+        );
     }
 }

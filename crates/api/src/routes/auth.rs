@@ -509,11 +509,12 @@ pub async fn near_login(
             let error_msg = e.to_string();
 
             // Map errors: InternalError -> 500, everything else -> 401 Unauthorized
-            let (status, error_type) = if let Some(NearAuthError::InternalError(_)) = e.downcast_ref::<NearAuthError>() {
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
-            } else {
-                (StatusCode::UNAUTHORIZED, "invalid_auth")
-            };
+            let (status, error_type) =
+                if let Some(NearAuthError::InternalError(_)) = e.downcast_ref::<NearAuthError>() {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+                } else {
+                    (StatusCode::UNAUTHORIZED, "invalid_auth")
+                };
 
             (
                 status,

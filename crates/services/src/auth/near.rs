@@ -31,11 +31,13 @@ impl Display for NearAuthError {
             Self::ReplayAttack => write!(f, "Nonce already used (replay attack detected)"),
             Self::ExpiredNonce => write!(f, "Signature expired"),
             Self::InvalidTimestamp => write!(f, "Invalid signature timestamp"),
-            Self::InvalidNonce(msg) => write!(f, "Invalid nonce: {}", msg),
-            Self::InvalidRecipient(msg) => write!(f, "Invalid recipient: {}", msg),
-            Self::InvalidMessage(msg) => write!(f, "Invalid message: {}", msg),
-            Self::SignatureVerificationFailed(msg) => write!(f, "Signature verification failed: {}", msg),
-            Self::InternalError(msg) => write!(f, "{}", msg),
+            Self::InvalidNonce(msg) => write!(f, "Invalid nonce: {msg}"),
+            Self::InvalidRecipient(msg) => write!(f, "Invalid recipient: {msg}"),
+            Self::InvalidMessage(msg) => write!(f, "Invalid message: {msg}"),
+            Self::SignatureVerificationFailed(msg) => {
+                write!(f, "Signature verification failed: {msg}")
+            }
+            Self::InternalError(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -77,8 +79,9 @@ pub(crate) fn validate_nonce_timestamp_ms(
     now: DateTime<Utc>,
     nonce_timestamp_ms: u64,
 ) -> Result<(), NearAuthError> {
-    let nonce_time = DateTime::from_timestamp_millis(nonce_timestamp_ms as i64)
-        .ok_or(NearAuthError::InvalidNonce("timestamp out of valid range".to_string()))?;
+    let nonce_time = DateTime::from_timestamp_millis(nonce_timestamp_ms as i64).ok_or(
+        NearAuthError::InvalidNonce("timestamp out of valid range".to_string()),
+    )?;
 
     let age = now.signed_duration_since(nonce_time);
 
@@ -99,8 +102,12 @@ impl NearAuthService {
         nonce_repository: Arc<dyn NearNonceRepository>,
         config: NearConfig,
     ) -> Self {
-        let rpc_url = Url::parse(&config.rpc_url)
-            .unwrap_or_else(|_| panic!("Invalid NEAR RPC URL in configuration: '{}'", config.rpc_url));
+        let rpc_url = Url::parse(&config.rpc_url).unwrap_or_else(|_| {
+            panic!(
+                "Invalid NEAR RPC URL in configuration: '{}'",
+                config.rpc_url
+            )
+        });
         let network_config = NetworkConfig::from_rpc_url("near", rpc_url);
         Self {
             auth_service,
@@ -122,8 +129,7 @@ impl NearAuthService {
         } else {
             Err(NearAuthError::InvalidRecipient(format!(
                 "expected {}, got {}",
-                self.config.expected_recipient,
-                recipient
+                self.config.expected_recipient, recipient
             )))
         }
     }
@@ -151,7 +157,8 @@ impl NearAuthService {
         tracing::info!("NEAR authentication attempt for account: {}", account_id);
 
         // 1. Validate recipient
-        self.validate_recipient(&payload.recipient).map_err(|e| anyhow::anyhow!(e))?;
+        self.validate_recipient(&payload.recipient)
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         // 2. Validate message
         Self::validate_message(&payload.message).map_err(|e| anyhow::anyhow!(e))?;
@@ -162,9 +169,7 @@ impl NearAuthService {
         // 4. Extract timestamp from nonce (first 8 bytes are timestamp)
         // Nonce format: [8 bytes timestamp (big-endian)] + [24 bytes random]
         // Nonce is guaranteed to be 32 bytes (validated during deserialization)
-        let nonce_timestamp_ms = u64::from_be_bytes(
-            payload.nonce[0..8].try_into().unwrap()
-        );
+        let nonce_timestamp_ms = u64::from_be_bytes(payload.nonce[0..8].try_into().unwrap());
 
         // Reject zero-timestamp nonces - a valid nonce must have a current timestamp
         if nonce_timestamp_ms == 0 {
@@ -172,7 +177,9 @@ impl NearAuthService {
                 "NEAR signature rejected: nonce has zero timestamp for account {}",
                 account_id
             );
-            return Err(anyhow::anyhow!(NearAuthError::InvalidNonce("zero timestamp".to_string())));
+            return Err(anyhow::anyhow!(NearAuthError::InvalidNonce(
+                "zero timestamp".to_string()
+            )));
         }
 
         // Validate timestamp is within acceptable range
@@ -194,7 +201,9 @@ impl NearAuthService {
                 &self.network_config,
             )
             .await
-            .map_err(|e| anyhow::anyhow!(NearAuthError::SignatureVerificationFailed(e.to_string())))?;
+            .map_err(|e| {
+                anyhow::anyhow!(NearAuthError::SignatureVerificationFailed(e.to_string()))
+            })?;
 
         if !is_valid {
             return Err(anyhow::anyhow!(NearAuthError::InvalidSignature));

@@ -717,7 +717,7 @@ fn generate_test_signature() -> String {
 /// Create a valid NEP-413 nonce with timestamp
 ///
 /// # Arguments
-/// * `timestamp_offset_ms` - Milliseconds offset from now (positive = past, negative = future)
+/// * `timestamp_offset_ms` - Milliseconds offset from now (0 = now, positive = future, negative = past)
 ///
 /// Returns a 32-byte nonce: [8 bytes timestamp (big-endian)] + [24 bytes random]
 pub fn create_near_test_nonce(timestamp_offset_ms: i64) -> Vec<u8> {

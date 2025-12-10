@@ -10,6 +10,7 @@ use database::{Database, OAuthStateRepository};
 async fn create_test_pool() -> database::pool::DbPool {
     let config = config::DatabaseConfig {
         primary_app_id: "postgres-test".to_string(),
+        gateway_subdomain: "cvm1.near.ai".to_string(),
         port: 5432,
         host: None,
         database: "platform_api".to_string(),

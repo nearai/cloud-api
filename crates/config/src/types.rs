@@ -34,6 +34,7 @@ impl ApiConfig {
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
     pub primary_app_id: String,
+    pub gateway_subdomain: String,
     pub host: Option<String>,
     pub port: u16,
     pub database: String,
@@ -71,6 +72,8 @@ impl DatabaseConfig {
         Ok(Self {
             primary_app_id: env::var("POSTGRES_PRIMARY_APP_ID")
                 .map_err(|_| "POSTGRES_PRIMARY_APP_ID not set".to_string())?,
+            gateway_subdomain: env::var("GATEWAY_SUBDOMAIN")
+                .map_err(|_| "GATEWAY_SUBDOMAIN not set".to_string())?,
             host: env::var("DATABASE_HOST").ok(),
             port: env::var("DATABASE_PORT")
                 .unwrap_or_else(|_| "5432".to_string())

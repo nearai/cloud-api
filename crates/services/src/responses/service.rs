@@ -1867,45 +1867,46 @@ impl ResponseServiceImpl {
                     }
                 }
 
-                // Check for reasoning tags: either simple tags or self-closing reasoning tags
-                if !found_non_tag_char || is_self_closing {
-                    let tag_name = tag_candidate.to_lowercase();
-
-                    // Check if this is a known reasoning tag
-                    if REASONING_TAGS.contains(&tag_name.as_str()) {
-                        if is_self_closing {
-                            // Self-closing reasoning tag: treat as no-op (empty reasoning block)
-                            // Don't change inside_reasoning state, just ignore the tag
-                            tag_transition = TagTransition::None;
-                            tracing::debug!("Detected self-closing reasoning tag: <{}/>", tag_name);
-                            // Don't include the tag itself in any output
-                            continue;
-                        } else if is_closing && *inside_reasoning {
-                            // Closing reasoning tag
-                            *inside_reasoning = false;
-                            tag_transition = TagTransition::ClosingTag(tag_name.clone());
-                            tracing::debug!("Detected closing reasoning tag: </{}>", tag_name);
-                        } else if !is_closing && !*inside_reasoning {
-                            // Opening reasoning tag
-                            *inside_reasoning = true;
-                            tag_transition = TagTransition::OpeningTag(tag_name.clone());
-                            tracing::debug!("Detected opening reasoning tag: <{}>", tag_name);
-                        } else if is_closing && !*inside_reasoning {
-                            // Closing tag encountered but not inside reasoning (malformed or extra closing tag)
-                            tracing::debug!(
-                                "Ignoring closing reasoning tag </{}> - not currently inside reasoning block",
-                                tag_name
-                            );
-                        } else if !is_closing && *inside_reasoning {
-                            // Opening tag encountered while already inside reasoning (nested or malformed)
-                            tracing::debug!(
-                                "Ignoring opening reasoning tag <{}> - already inside reasoning block",
-                                tag_name
-                            );
-                        }
+                // Check for reasoning tags: check tag name even if it has attributes
+                // This ensures symmetric handling of opening and closing tags
+                // Only check if tag is complete (ended with '>') or is self-closing
+                let tag_name = tag_candidate.to_lowercase();
+                if !tag_name.is_empty() 
+                    && REASONING_TAGS.contains(&tag_name.as_str())
+                    && (full_tag.ends_with('>') || is_self_closing)
+                {
+                    if is_self_closing {
+                        // Self-closing reasoning tag: treat as no-op (empty reasoning block)
+                        // Don't change inside_reasoning state, just ignore the tag
+                        tag_transition = TagTransition::None;
+                        tracing::debug!("Detected self-closing reasoning tag: <{}/>", tag_name);
                         // Don't include the tag itself in any output
                         continue;
+                    } else if is_closing && *inside_reasoning {
+                        // Closing reasoning tag
+                        *inside_reasoning = false;
+                        tag_transition = TagTransition::ClosingTag(tag_name.clone());
+                        tracing::debug!("Detected closing reasoning tag: </{}>", tag_name);
+                    } else if !is_closing && !*inside_reasoning {
+                        // Opening reasoning tag (even with attributes)
+                        *inside_reasoning = true;
+                        tag_transition = TagTransition::OpeningTag(tag_name.clone());
+                        tracing::debug!("Detected opening reasoning tag: <{}>", tag_name);
+                    } else if is_closing && !*inside_reasoning {
+                        // Closing tag encountered but not inside reasoning (malformed or extra closing tag)
+                        tracing::debug!(
+                            "Ignoring closing reasoning tag </{}> - not currently inside reasoning block",
+                            tag_name
+                        );
+                    } else if !is_closing && *inside_reasoning {
+                        // Opening tag encountered while already inside reasoning (nested or malformed)
+                        tracing::debug!(
+                            "Ignoring opening reasoning tag <{}> - already inside reasoning block",
+                            tag_name
+                        );
                     }
+                    // Don't include the tag itself in any output
+                    continue;
                 }
 
                 // Not a reasoning tag, output the full tag as-is
@@ -2990,6 +2991,68 @@ mod tests {
         assert_eq!(reasoning, None);
         assert!(!inside_reasoning);
         assert!(reasoning_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_with_attributes() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test reasoning tag with attributes - should be recognized and stripped
+        let input = r#"<think attr="val">content</think>"#;
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        // Both opening and closing tags should be stripped, content should be in reasoning
+        assert_eq!(clean, "");
+        assert!(reasoning.is_some());
+        assert_eq!(reasoning_buffer, "content");
+        assert!(!inside_reasoning);
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_with_attributes_symmetric() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test that opening tag with attributes and closing tag are both handled
+        let input = r#"<think id="1" class="test">reasoning content</think> normal text"#;
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        // Tags should be stripped, content should be in reasoning, normal text should remain
+        assert_eq!(clean, " normal text");
+        assert!(reasoning.is_some());
+        assert_eq!(reasoning_buffer, "reasoning content");
+        assert!(!inside_reasoning);
+    }
+
+    #[test]
+    fn test_process_reasoning_tags_with_attributes_no_unclosed_tag() {
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+
+        // Test that we don't leave unclosed tags in output
+        let input = r#"<think attr="val">content</think>"#;
+        let (clean, reasoning, _) = ResponseServiceImpl::process_reasoning_tags(
+            input,
+            &mut reasoning_buffer,
+            &mut inside_reasoning,
+        );
+
+        // Should not contain any unclosed tags
+        assert!(!clean.contains("<think"));
+        assert!(!clean.contains("attr"));
+        assert_eq!(clean, "");
+        assert!(reasoning.is_some());
+        assert_eq!(reasoning_buffer, "content");
+        assert!(!inside_reasoning);
     }
 
     #[test]

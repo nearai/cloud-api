@@ -5,6 +5,7 @@ use crate::{
         ports::AttestationServiceTrait,
         AttestationError,
     },
+    models::ports::{ModelWithPricing, ModelsError},
     usage::{
         CostBreakdown, OrganizationBalanceInfo, OrganizationLimit, RecordUsageServiceRequest,
         UsageCheckResult, UsageError, UsageLogEntry, UsageServiceTrait,
@@ -138,6 +139,12 @@ pub struct CapturingUsageService {
     requests: std::sync::Mutex<Vec<RecordUsageServiceRequest>>,
 }
 
+impl Default for CapturingUsageService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CapturingUsageService {
     pub fn new() -> Self {
         Self {
@@ -215,5 +222,61 @@ impl UsageServiceTrait for CapturingUsageService {
         _offset: Option<i64>,
     ) -> Result<(Vec<UsageLogEntry>, i64), UsageError> {
         Ok((vec![], 0))
+    }
+}
+
+/// Create a mock models service with standard test models
+/// Returns a mockall-generated mock pre-configured with models matching the mock inference provider pool
+pub fn create_mock_models_service() -> crate::models::ports::MockModelsServiceTrait {
+    let mut mock = crate::models::ports::MockModelsServiceTrait::new();
+
+    // Standard test models matching mock inference provider pool
+    let standard_models = vec![
+        create_test_model("Qwen/Qwen3-30B-A3B-Instruct-2507"),
+        create_test_model("Qwen/Qwen2.5-72B-Instruct"),
+        create_test_model("zai-org/GLM-4.6"),
+        create_test_model("nearai/gpt-oss-120b"),
+        create_test_model("dphn/Dolphin-Mistral-24B-Venice-Edition"),
+        create_test_model("meta-llama/Llama-3.1-70B-Instruct"),
+        create_test_model("meta-llama/Llama-3.1-8B-Instruct"),
+    ];
+
+    // Clone for use in closures
+    let models_for_pricing = standard_models.clone();
+    let models_for_resolve = standard_models.clone();
+
+    // Set up get_models_with_pricing to return standard models
+    mock.expect_get_models_with_pricing()
+        .returning(move |_limit, _offset| {
+            let models = models_for_pricing.clone();
+            let total = models.len() as i64;
+            Ok((models, total))
+        });
+
+    // Set up resolve_and_get_model to find by name
+    mock.expect_resolve_and_get_model()
+        .returning(move |identifier| {
+            models_for_resolve
+                .iter()
+                .find(|m| m.model_name == identifier)
+                .cloned()
+                .ok_or(ModelsError::NotFound(identifier.to_string()))
+        });
+
+    mock
+}
+
+fn create_test_model(name: &str) -> ModelWithPricing {
+    ModelWithPricing {
+        id: Uuid::new_v4(),
+        model_name: name.to_string(),
+        model_display_name: format!("{name} (Test)"),
+        model_description: "Test model".to_string(),
+        input_cost_per_token: 1000000,  // $0.0001 per token
+        output_cost_per_token: 2000000, // $0.0002 per token
+        context_length: 128000,
+        verifiable: true,
+        aliases: vec![],
+        model_icon: None,
     }
 }

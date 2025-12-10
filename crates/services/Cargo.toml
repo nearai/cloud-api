@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 description.workspace = true
 
+[features]
+# Feature flag for test support - enables mock generation and test utilities
+test-support = ["dep:mockall"]
+
 [dependencies]
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
@@ -52,6 +56,8 @@ aes-gcm = "0.10"
 # HMAC for VPC signature verification
 hmac = "0.12"
 sha2 = "0.10"
+# Optional: mockall for test mocking (only when test-support feature is enabled)
+mockall = { version = "0.13", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

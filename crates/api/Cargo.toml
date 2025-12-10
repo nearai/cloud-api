@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 description.workspace = true
 
+[features]
+# Feature flag for test support - enables test-only initialization functions
+test-support = ["services/test-support"]
+
 [dependencies]
 axum = { version = "0.8", features = ["macros", "multipart"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
@@ -58,3 +62,5 @@ k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 sha3 = "0.10"
 hmac = "0.12"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+# Enable test-support feature for integration tests
+api = { path = ".", features = ["test-support"] }

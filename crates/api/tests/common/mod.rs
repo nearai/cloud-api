@@ -186,12 +186,17 @@ pub async fn setup_test_server_with_pool() -> (
     let (inference_provider_pool, mock_provider) =
         api::init_inference_providers_with_mocks(&config).await;
     let metrics_service = Arc::new(services::metrics::MockMetricsService);
-    let domain_services = api::init_domain_services_with_pool(
+
+    // Use mockall-generated mock models service with standard test models
+    let mock_models_service = Arc::new(services::test_utils::create_mock_models_service());
+
+    let domain_services = api::init_domain_services_with_pool_and_models(
         database.clone(),
         &config,
         auth_components.organization_service.clone(),
         inference_provider_pool.clone(),
         metrics_service,
+        mock_models_service,
     )
     .await;
 

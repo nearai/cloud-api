@@ -77,6 +77,7 @@ pub trait ModelsRepository: Send + Sync {
     async fn get_configured_model_names(&self) -> Result<Vec<String>, anyhow::Error>;
 }
 
+#[cfg_attr(any(test, feature = "test-support"), mockall::automock)]
 #[async_trait]
 pub trait ModelsServiceTrait: Send + Sync {
     /// Get basic model info (from inference providers)

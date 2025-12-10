@@ -21,5 +21,6 @@ pub use completions::CompletionServiceImpl;
 pub use conversations::service::ConversationServiceImpl as ConversationService;
 pub use responses::service::ResponseServiceImpl as ResponseService;
 
-#[cfg(test)]
-mod test_utils;
+// Export test utilities for integration tests when test-support feature is enabled
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_utils;

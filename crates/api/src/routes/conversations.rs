@@ -60,9 +60,12 @@ pub async fn create_conversation(
 ) -> Result<(StatusCode, ResponseJson<ConversationObject>), (StatusCode, ResponseJson<ErrorResponse>)>
 {
     debug!("Create conversation request from key: {:?}", api_key);
+    // Log the conversation metadata for debugging
+    tracing::info!("Creating conversation with metadata: {:?}", request.metadata);
 
     // Validate the request
     if let Err(error) = request.validate() {
+        tracing::error!("Validation failed for conversation creation: {}", error);
         return Err((
             StatusCode::BAD_REQUEST,
             ResponseJson(ErrorResponse::new(
@@ -74,6 +77,7 @@ pub async fn create_conversation(
 
     // Parse API key ID from string to UUID
     let api_key_uuid = uuid::Uuid::parse_str(&api_key.id.0).map_err(|e| {
+        tracing::error!("Failed to parse API key ID: api_key_id={}, workspace_id={}", api_key.id.0, api_key.workspace_id.0);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             ResponseJson(ErrorResponse::new(
@@ -91,17 +95,22 @@ pub async fn create_conversation(
 
     match service.create_conversation(domain_request.clone()).await {
         Ok(domain_conversation) => {
-            let http_conversation = convert_domain_conversation_to_http(domain_conversation);
+            let http_conversation = convert_domain_conversation_to_http(domain_conversation.clone());
             debug!(
                 "Created conversation {} for workspace {}",
                 http_conversation.id, api_key.workspace_id.0
             );
+            // Log successful creation with full details
+            tracing::info!("Conversation created successfully: metadata={:?}", domain_conversation.metadata);
             Ok((StatusCode::CREATED, ResponseJson(http_conversation)))
         }
-        Err(error) => Err((
-            map_conversation_error_to_status(&error),
-            ResponseJson(error.into()),
-        )),
+        Err(error) => {
+            tracing::error!("Failed to create conversation: error={}, metadata={:?}", error, domain_request.metadata);
+            Err((
+                map_conversation_error_to_status(&error),
+                ResponseJson(error.into()),
+            ))
+        }
     }
 }
 
@@ -329,6 +338,7 @@ pub async fn update_conversation(
         "Update conversation {} for workspace {}",
         conversation_id, api_key.workspace_id.0
     );
+    tracing::info!("Updating conversation {} with new metadata: {:?}", conversation_id, request.metadata);
 
     let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
         Ok(id) => id,
@@ -358,17 +368,23 @@ pub async fn update_conversation(
             );
             Ok(ResponseJson(http_conversation))
         }
-        Ok(None) => Err((
-            StatusCode::NOT_FOUND,
-            ResponseJson(ErrorResponse::new(
-                "Conversation not found".to_string(),
-                "not_found_error".to_string(),
-            )),
-        )),
-        Err(error) => Err((
-            map_conversation_error_to_status(&error),
-            ResponseJson(error.into()),
-        )),
+        Ok(None) => {
+            tracing::warn!("Conversation not found for update: conversation_id={}, workspace_id={}", conversation_id, api_key.workspace_id.0);
+            Err((
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    "Conversation not found".to_string(),
+                    "not_found_error".to_string(),
+                )),
+            ))
+        }
+        Err(error) => {
+            tracing::error!("Failed to update conversation: conversation_id={}, workspace_id={}, error={}", conversation_id, api_key.workspace_id.0, error);
+            Err((
+                map_conversation_error_to_status(&error),
+                ResponseJson(error.into()),
+            ))
+        }
     }
 }
 
@@ -919,6 +935,7 @@ pub async fn create_conversation_items(
         "Create items in conversation {} for workspace {}",
         conversation_id, api_key.workspace_id.0
     );
+    tracing::info!("Backfilling conversation items: {:?}", request.items);
 
     // Validate items count (max 20 items per request)
     if request.items.is_empty() {
@@ -969,6 +986,7 @@ pub async fn create_conversation_items(
         .map(convert_input_item_to_response_item)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| {
+            tracing::error!("Failed to convert conversation items: error={}, items={:?}", e, request.items);
             (
                 StatusCode::BAD_REQUEST,
                 ResponseJson(ErrorResponse::new(
@@ -1006,10 +1024,13 @@ pub async fn create_conversation_items(
                 has_more: false,
             }))
         }
-        Err(error) => Err((
-            map_conversation_error_to_status(&error),
-            ResponseJson(error.into()),
-        )),
+        Err(error) => {
+            tracing::error!("Failed to create conversation items: conversation_id={}, workspace_id={}, item_count={}", parsed_conversation_id, api_key.workspace_id.0, response_items.len());
+            Err((
+                map_conversation_error_to_status(&error),
+                ResponseJson(error.into()),
+            ))
+        }
     }
 }
 

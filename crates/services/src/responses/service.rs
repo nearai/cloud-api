@@ -2310,7 +2310,10 @@ DO NOT USE THESE FORMATS:
         let raw_title = if let Some(title) = raw_title {
             title
         } else {
-            tracing::warn!("LLM response doesn't contain title, using default");
+            tracing::warn!(
+                conversation_id = %conversation_id,
+                "LLM response doesn't contain title for conversation, using default"
+            );
             "Conversation".to_string()
         };
 
@@ -2348,11 +2351,11 @@ DO NOT USE THESE FORMATS:
             })?;
 
         tracing::info!(
-            "Generated title for conversation {}: {}",
-            conversation_id,
-            title
+            conversation_id = %conversation_id,
+            title_length = title.len(),
+            truncated = title.len() > 60,
+            "Generated conversation title"
         );
-
         // Emit conversation.title.updated event
         use futures::SinkExt;
         let event = models::ResponseStreamEvent {

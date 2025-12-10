@@ -1871,7 +1871,7 @@ impl ResponseServiceImpl {
                 // This ensures symmetric handling of opening and closing tags
                 // Only check if tag is complete (ended with '>') or is self-closing
                 let tag_name = tag_candidate.to_lowercase();
-                if !tag_name.is_empty() 
+                if !tag_name.is_empty()
                     && REASONING_TAGS.contains(&tag_name.as_str())
                     && (full_tag.ends_with('>') || is_self_closing)
                 {

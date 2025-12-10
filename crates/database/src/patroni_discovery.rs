@@ -52,8 +52,6 @@ impl PatroniDiscovery {
         Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(10))
-                .danger_accept_invalid_certs(true)
-                .tls_built_in_root_certs(false)
                 .build()
                 .expect("Failed to create HTTP client"),
             postgres_app_id,

@@ -1791,6 +1791,18 @@ impl ResponseServiceImpl {
     ) -> (String, Option<String>, TagTransition) {
         const REASONING_TAGS: &[&str] = &["think", "reasoning", "thought", "reflect", "analysis"];
 
+        // Fast path: if we're not currently inside a reasoning block and this delta
+        // contains no potential tags at all, we can safely treat the entire chunk
+        // as clean text without walking it character-by-character.
+        //
+        // We MUST still run the full logic when:
+        // - inside_reasoning == true (the text should be routed to reasoning_buffer)
+        // - the chunk contains '<' (may start or close reasoning tags, or HTML tags we
+        //   want to preserve exactly, like <!DOCTYPE> or <br/>)
+        if !*inside_reasoning && !delta_text.contains('<') {
+            return (delta_text.to_string(), None, TagTransition::None);
+        }
+
         let mut clean_text = String::new();
         let mut reasoning_delta = String::new();
         let mut tag_transition = TagTransition::None;

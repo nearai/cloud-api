@@ -1172,7 +1172,21 @@ pub struct PublicUserResponse {
     pub created_at: DateTime<Utc>,
 }
 
-/// Organization details with spend limit (for admin user listing)
+/// Organization usage information (for admin user listing)
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OrganizationUsage {
+    /// Total amount spent in nano-dollars (scale 9)
+    pub total_spent: i64,
+    /// Human readable total spent, e.g., "$12.50"
+    pub total_spent_display: String,
+    /// Total number of API requests
+    pub total_requests: i64,
+    /// Total number of tokens used
+    pub total_tokens: i64,
+}
+
+/// Organization details with spend limit and usage (for admin user listing)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AdminUserOrganizationDetails {
     pub id: String,
@@ -1180,6 +1194,8 @@ pub struct AdminUserOrganizationDetails {
     pub description: Option<String>,
     #[serde(rename = "spendLimit", skip_serializing_if = "Option::is_none")]
     pub spend_limit: Option<SpendLimit>,
+    #[serde(rename = "currentUsage", skip_serializing_if = "Option::is_none")]
+    pub current_usage: Option<OrganizationUsage>,
 }
 
 /// Admin user response model (for owners/admins)

@@ -2546,6 +2546,21 @@ async fn test_admin_list_users_with_organizations() {
     assert_eq!(spend_limit.scale, 9, "Scale should be 9 (nano-dollars)");
     assert_eq!(spend_limit.currency, "USD", "Currency should be USD");
 
+    // Verify current_usage is present (new org, no API calls yet)
+    if let Some(usage) = &org.current_usage {
+        assert_eq!(usage.total_spent, 0, "New org should have zero total_spent");
+        assert_eq!(
+            usage.total_spent_display, "$0.00",
+            "Display should show $0.00"
+        );
+        assert_eq!(
+            usage.total_requests, 0,
+            "New org should have zero total_requests"
+        );
+        assert_eq!(usage.total_tokens, 0, "New org should have zero total_tokens");
+        println!("   - Current usage: {:?}", usage);
+    }
+
     println!("✅ Admin list users with organizations works correctly");
     println!("   - User has earliest organization: {}", org.name);
     println!(
@@ -2591,10 +2606,117 @@ async fn test_admin_list_users_with_organizations_no_spend_limit() {
             );
             assert_eq!(org_detail.id, org.id);
             assert!(!org_detail.name.is_empty());
+
+            // Verify current_usage is present with zero values (new org, no API calls)
+            if let Some(usage) = &org_detail.current_usage {
+                assert_eq!(usage.total_spent, 0, "New org should have zero total_spent");
+                assert_eq!(
+                    usage.total_spent_display, "$0.00",
+                    "Display should show $0.00"
+                );
+                assert_eq!(
+                    usage.total_requests, 0,
+                    "New org should have zero total_requests"
+                );
+                assert_eq!(
+                    usage.total_tokens, 0,
+                    "New org should have zero total_tokens"
+                );
+                println!("   - Current usage: {:?}", usage);
+            }
         }
     }
 
     println!("✅ Admin list users correctly handles organizations without spend limits");
+}
+
+#[tokio::test]
+async fn test_admin_list_users_with_organization_usage() {
+    let server = setup_test_server().await;
+
+    // Get access token from refresh token
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+
+    // Create an organization with credits
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    // Make a chat completion request to generate usage
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "messages": [{"role": "user", "content": "Say hello"}],
+            "stream": false,
+            "max_tokens": 20
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200, "Chat completion should succeed");
+
+    // Wait for async usage recording to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // List users with organizations and verify usage is tracked
+    let response = server
+        .get("/v1/admin/users?limit=50&offset=0&include_organizations=true")
+        .add_header("Authorization", format!("Bearer {access_token}"))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    let users_response = response.json::<api::models::ListUsersResponse>();
+
+    // Find the mock user
+    let mock_user = users_response
+        .users
+        .iter()
+        .find(|u| u.email == "admin@test.com")
+        .expect("Should find mock user");
+
+    // Find our organization
+    if let Some(organizations) = &mock_user.organizations {
+        if let Some(org_detail) = organizations.iter().find(|o| o.id == org.id) {
+            // Verify spend_limit is set
+            assert!(
+                org_detail.spend_limit.is_some(),
+                "Organization should have a spend limit"
+            );
+
+            // Verify current_usage reflects the API call
+            let usage = org_detail
+                .current_usage
+                .as_ref()
+                .expect("Organization should have current_usage");
+
+            assert!(
+                usage.total_spent > 0,
+                "Should have non-zero total_spent after API call"
+            );
+            assert!(
+                usage.total_requests >= 1,
+                "Should have at least 1 request after API call"
+            );
+            assert!(
+                usage.total_tokens > 0,
+                "Should have non-zero total_tokens after API call"
+            );
+            assert!(
+                !usage.total_spent_display.is_empty(),
+                "Should have formatted total_spent_display"
+            );
+
+            println!("✅ Admin list users shows organization usage correctly");
+            println!("   - Total spent: {} ({})", usage.total_spent, usage.total_spent_display);
+            println!("   - Total requests: {}", usage.total_requests);
+            println!("   - Total tokens: {}", usage.total_tokens);
+        } else {
+            panic!("Should find our organization in user's organizations");
+        }
+    } else {
+        panic!("User should have organizations");
+    }
 }
 
 #[tokio::test]

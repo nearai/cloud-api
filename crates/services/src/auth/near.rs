@@ -8,7 +8,7 @@ use url::Url;
 use super::ports::{AuthServiceTrait, NearNonceRepository, OAuthUserInfo, Session};
 
 const MAX_NONCE_AGE_MS: u64 = 5 * 60 * 1000; // 5 minutes
-const EXPECTED_MESSAGE: &str = "Sign in to NEAR AI Cloud API";
+const EXPECTED_MESSAGE: &str = "Sign in to NEAR AI Cloud";
 
 /// Custom error type for NEAR authentication
 #[derive(Debug)]

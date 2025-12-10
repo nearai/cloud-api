@@ -38,7 +38,7 @@ rmcp = { version = "0.6", features = [
 ] }
 hex = "0.4"
 # NEAR wallet authentication (NEP-413)
-near-api = { git = "https://github.com/near/near-api-rs", rev = "f07473256aa7a70e094432618bac174e60d533df" }
+near-api = "0.8.0"
 dstack-sdk = "0.1.2"
 dstack-sdk-types = "0.1.2"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }

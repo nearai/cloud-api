@@ -3882,8 +3882,9 @@ dependencies = [
 
 [[package]]
 name = "near-api"
-version = "0.7.8"
-source = "git+https://github.com/near/near-api-rs?rev=f07473256aa7a70e094432618bac174e60d533df#f07473256aa7a70e094432618bac174e60d533df"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4db0fc73b5d3312219b251b9b777da274867c48e9793f6916f5c17d3914384a7"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3907,8 +3908,9 @@ dependencies = [
 
 [[package]]
 name = "near-api-types"
-version = "0.7.8"
-source = "git+https://github.com/near/near-api-rs?rev=f07473256aa7a70e094432618bac174e60d533df#f07473256aa7a70e094432618bac174e60d533df"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82ad7dfc45b9bd7755d7a036d406aada171eb5d95428cbc324dc916018ec3ffb"
 dependencies = [
  "base64 0.22.1",
  "borsh",
@@ -4127,7 +4129,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.21.7",
+ "base64 0.22.1",
  "chrono",
  "getrandom 0.2.16",
  "http 1.3.1",

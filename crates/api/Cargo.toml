@@ -44,7 +44,7 @@ http-body-util = "0.1"
 aws-config = { version = "1.5", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.70"
 # NEAR wallet authentication
-near-api = { git = "https://github.com/near/near-api-rs", rev = "f07473256aa7a70e094432618bac174e60d533df" }
+near-api = "0.8.0"
 base64 = "0.22"
 # Ordered collections
 indexmap = "2"

@@ -484,7 +484,6 @@ name = "api"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "api",
  "aws-config",
  "aws-sdk-s3",
  "axum 0.8.6",

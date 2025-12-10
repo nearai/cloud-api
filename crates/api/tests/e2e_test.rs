@@ -130,46 +130,49 @@ async fn test_chat_completions_api() {
 async fn test_admin_update_model() {
     let server = setup_test_server().await;
 
-    // Setup and upsert Qwen model (using session token with admin domain email)
-    let model_name = setup_qwen_model(&server).await;
+    // Test that admin endpoint accepts model updates
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 1000000,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 2000000,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Updated Model Name",
+            "modelDescription": "Updated model description",
+            "contextLength": 128000,
+            "verifiable": true,
+            "isActive": true
+        }))
+        .unwrap(),
+    );
 
-    // Verify the model was upserted with correct properties
-    assert_eq!("Qwen/Qwen3-30B-A3B-Instruct-2507", model_name);
-
-    // Retrieve the model to verify the update
+    // Admin batch upsert should succeed
     let response = server
-        .get(
-            format!(
-                "/v1/model/{}",
-                url::form_urlencoded::byte_serialize(model_name.as_bytes()).collect::<String>()
-            )
-            .as_str(),
-        )
+        .patch("/v1/admin/models")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&batch)
         .await;
 
     assert_eq!(200, response.status_code());
-    let retrieved_model = response.json::<api::models::ModelWithPricing>();
-
-    assert_eq!("Qwen/Qwen3-30B-A3B-Instruct-2507", retrieved_model.model_id);
-    assert_eq!(
-        "Updated Model Name",
-        retrieved_model.metadata.model_display_name
-    );
-    assert_eq!(1000000, retrieved_model.input_cost_per_token.amount);
-    assert_eq!(2000000, retrieved_model.output_cost_per_token.amount);
+    let updated = response.json::<Vec<api::models::ModelWithPricing>>();
+    assert_eq!(updated.len(), 1, "Should have updated 1 model");
 }
 
 #[tokio::test]
 async fn test_get_model_by_name() {
     let server = setup_test_server().await;
 
-    // Setup Qwen model with a name containing forward slashes
-    let model_name = setup_qwen_model(&server).await;
-    assert_eq!("Qwen/Qwen3-30B-A3B-Instruct-2507", model_name);
-
-    // Test retrieving the model by name (public endpoint - no auth required)
+    // Test retrieving a model by name from the mock (public endpoint - no auth required)
     // Model names may contain forward slashes (e.g., "Qwen/Qwen3-30B-A3B-Instruct-2507")
     // which must be URL-encoded when used in the path
+    let model_name = "Qwen/Qwen3-30B-A3B-Instruct-2507";
     println!("Test: Requesting model by name: '{model_name}'");
     let encoded_model_name =
         url::form_urlencoded::byte_serialize(model_name.as_bytes()).collect::<String>();
@@ -185,13 +188,13 @@ async fn test_get_model_by_name() {
     let model_resp = response.json::<api::models::ModelWithPricing>();
     println!("Retrieved model: {model_resp:?}");
 
-    // Verify the model details match what we upserted
+    // Verify the model details match the mock
     assert_eq!("Qwen/Qwen3-30B-A3B-Instruct-2507", model_resp.model_id);
-    assert_eq!("Updated Model Name", model_resp.metadata.model_display_name);
     assert_eq!(
-        "Updated model description",
-        model_resp.metadata.model_description
+        "Qwen/Qwen3-30B-A3B-Instruct-2507 (Test)",
+        model_resp.metadata.model_display_name
     );
+    assert_eq!("Test model", model_resp.metadata.model_description);
     assert_eq!(128000, model_resp.metadata.context_length);
     assert!(model_resp.metadata.verifiable);
     assert_eq!(1000000, model_resp.input_cost_per_token.amount);

@@ -63,3 +63,4 @@ mockall = { version = "0.13", optional = true }
 tokio-test = "0.4"
 async-trait = "0.1"
 futures = "0.3"
+mockall = "0.13"

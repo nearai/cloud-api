@@ -63,4 +63,4 @@ sha3 = "0.10"
 hmac = "0.12"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 # Enable test-support feature for integration tests
-api = { path = ".", features = ["test-support"] }
+services = { path = "../services", features = ["test-support"] }

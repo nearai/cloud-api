@@ -1789,18 +1789,52 @@ impl ResponseServiceImpl {
         reasoning_buffer: &mut String,
         inside_reasoning: &mut bool,
     ) -> (String, Option<String>, TagTransition) {
+        // Base reasoning tag names (used when matching parsed tag names)
         const REASONING_TAGS: &[&str] = &["think", "reasoning", "thought", "reflect", "analysis"];
 
-        // Fast path: if we're not currently inside a reasoning block and this delta
-        // contains no potential tags at all, we can safely treat the entire chunk
-        // as clean text without walking it character-by-character.
+        // String prefixes (with '<' / '</') used for cheap substring checks in the fast path.
+        // This avoids allocating strings with `format!` on every call.
+        const REASONING_TAG_PREFIXES: &[&str] = &[
+            "<think",
+            "</think",
+            "<reasoning",
+            "</reasoning",
+            "<thought",
+            "</thought",
+            "<reflect",
+            "</reflect",
+            "<analysis",
+            "</analysis",
+        ];
+
+        // Fast paths for common cases when we're not currently inside a reasoning block.
         //
         // We MUST still run the full logic when:
         // - inside_reasoning == true (the text should be routed to reasoning_buffer)
-        // - the chunk contains '<' (may start or close reasoning tags, or HTML tags we
-        //   want to preserve exactly, like <!DOCTYPE> or <br/>)
-        if !*inside_reasoning && !delta_text.contains('<') {
-            return (delta_text.to_string(), None, TagTransition::None);
+        // - the chunk contains '<' that might start or close reasoning tags, or HTML
+        //   tags we want to preserve exactly, like <!DOCTYPE> or <br/>.
+        if !*inside_reasoning {
+            // 1) No '<' at all: impossible to contain reasoning tags or HTML markup
+            // we need to specially handle. Treat entire chunk as clean text.
+            if !delta_text.contains('<') {
+                return (delta_text.to_string(), None, TagTransition::None);
+            }
+
+            // 2) Contains '<' but clearly no reasoning tag prefixes. We still want to
+            // preserve HTML tags exactly, but we don't need to walk character-by-character
+            // to strip reasoning, because there is none.
+            //
+            // This is a conservative check: we only skip detailed parsing if we see
+            // no known reasoning tag prefixes at all (case-insensitive). This does not
+            // try to handle cross-chunk partial tags – those are already treated as
+            // literal text by design.
+            let lower = delta_text.to_ascii_lowercase();
+            let has_reasoning_prefix = REASONING_TAG_PREFIXES
+                .iter()
+                .any(|prefix| lower.contains(prefix));
+            if !has_reasoning_prefix {
+                return (delta_text.to_string(), None, TagTransition::None);
+            }
         }
 
         let mut clean_text = String::new();

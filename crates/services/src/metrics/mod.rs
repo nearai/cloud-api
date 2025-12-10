@@ -56,9 +56,15 @@ impl MetricsServiceTrait for OtlpMetricsService {
         let histogram = histograms.entry(name.to_string()).or_insert_with(|| {
             let description = match name {
                 consts::METRIC_LATENCY_TTFT => {
-                    "Time from request arrival to first token generation"
+                    "Backend TTFT: Time from provider request to first token"
                 }
-                consts::METRIC_LATENCY_TOTAL => "Total request processing time",
+                consts::METRIC_LATENCY_TTFT_TOTAL => {
+                    "E2E TTFT: Time from service request to first token (includes queue time)"
+                }
+                consts::METRIC_LATENCY_QUEUE_TIME => {
+                    "Queue/Wait time: Internal overhead before provider call"
+                }
+                consts::METRIC_LATENCY_TOTAL => "Total E2E request processing time",
                 consts::METRIC_LATENCY_DECODING_TIME => {
                     "Time from first token to last token (decoding phase)"
                 }

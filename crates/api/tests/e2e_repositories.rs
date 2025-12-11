@@ -3,7 +3,6 @@
 mod common;
 
 use chrono::{Duration, Utc};
-use common::*;
 use database::{Database, OAuthStateRepository};
 
 // Helper to get database pool for repository testing

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+echo "[pre-commit] Running cargo fmt --all"
+cargo fmt --all
+
+echo "[pre-commit] Running cargo clippy --fix (all targets, all features)"
+cargo clippy --fix --allow-dirty --allow-staged --all-targets --all-features
+
+# Ensure any formatting / clippy fixes are included in the commit.
+git add -u

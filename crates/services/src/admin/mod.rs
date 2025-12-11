@@ -1,5 +1,11 @@
+pub mod analytics;
 pub mod ports;
 
+pub use analytics::{
+    AnalyticsRepository, AnalyticsService, ApiKeyMetrics, MetricsSummary, ModelMetrics,
+    OrganizationMetrics, PlatformMetrics, TimeSeriesMetrics, TimeSeriesPoint, TopModelMetrics,
+    TopOrganizationMetrics, WorkspaceMetrics,
+};
 pub use ports::*;
 use std::sync::Arc;
 
@@ -184,6 +190,21 @@ impl AdminService for AdminServiceImpl {
             .map_err(|e| AdminError::InternalError(e.to_string()))?;
 
         Ok((users_with_orgs, total))
+    }
+
+    async fn list_models(
+        &self,
+        include_inactive: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<AdminModelInfo>, i64), AdminError> {
+        let (models, total) = self
+            .repository
+            .list_models(include_inactive, limit, offset)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+
+        Ok((models, total))
     }
 }
 

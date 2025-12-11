@@ -24,7 +24,10 @@ inference_providers = { path = "../inference_providers" }
 # Authentication dependencies
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
-uuid = { version = "1.5", features = ["v4"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }
+opentelemetry = { version = "0.21", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.21", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.14", features = ["metrics"] }
 url = "2.5"
 chrono = { version = "0.4", features = ["serde"] }
 # For TypedHeader support
@@ -55,3 +58,4 @@ k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 sha3 = "0.10"
 hmac = "0.12"
 tokio-postgres = "0.7"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }

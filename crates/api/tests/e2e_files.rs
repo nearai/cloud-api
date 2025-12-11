@@ -2,6 +2,7 @@
 mod common;
 
 use common::*;
+use services::id_prefixes::PREFIX_FILE;
 
 /// Helper function to upload a file
 async fn upload_file(
@@ -74,7 +75,7 @@ async fn test_upload_file_success() {
 
     assert_eq!(response.status_code(), 201);
     let file: api::models::FileUploadResponse = response.json();
-    assert!(file.id.starts_with("file-"));
+    assert!(file.id.starts_with(PREFIX_FILE));
     assert_eq!(file.object, "file");
     assert_eq!(file.bytes, content.len() as i64);
     assert_eq!(file.filename, "test.txt");
@@ -736,15 +737,15 @@ async fn test_file_id_formats() {
     assert_eq!(upload_response.status_code(), 201);
     let uploaded_file: api::models::FileUploadResponse = upload_response.json();
 
-    // Test with "file-" prefix
+    // Test with file prefix
     let response = server
         .get(&format!("/v1/files/{}", uploaded_file.id))
         .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
     assert_eq!(response.status_code(), 200);
 
-    // Test without "file-" prefix (strip prefix from ID)
-    let id_without_prefix = uploaded_file.id.strip_prefix("file-").unwrap();
+    // Test without file prefix (strip prefix from ID)
+    let id_without_prefix = uploaded_file.id.strip_prefix(PREFIX_FILE).unwrap();
     let response = server
         .get(&format!("/v1/files/{id_without_prefix}"))
         .add_header("Authorization", format!("Bearer {api_key}"))
@@ -814,7 +815,8 @@ async fn test_complete_file_lifecycle() {
 async fn test_file_in_response_api() {
     let (server, _pool, mock, _database) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Configure mock provider with exact prompt matchers
     // Timestamps will be normalized automatically to [TIME] for matching
@@ -1028,7 +1030,8 @@ async fn test_file_in_response_api() {
 async fn test_file_not_found_in_response_api() {
     let server = setup_test_server().await;
     setup_qwen_model(&server).await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Get available models
     let models_response = server
@@ -1086,7 +1089,8 @@ async fn test_file_not_found_in_response_api() {
 async fn test_multiple_files_in_response_api() {
     let server = setup_test_server().await;
     setup_qwen_model(&server).await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
 
     // 1. Upload multiple text files
     let file1_content = b"File 1: Product specifications\nPrice: $100\nColor: Red";

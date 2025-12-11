@@ -174,7 +174,8 @@ async fn create_response_stream(
 async fn test_responses_api() {
     let server = setup_test_server().await;
     setup_qwen_model(&server).await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
 
     let response = server
         .get("/v1/models")
@@ -250,7 +251,8 @@ async fn test_responses_api() {
 async fn test_streaming_responses_api() {
     let server = setup_test_server().await;
     setup_qwen_model(&server).await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Get available models
     let response = server
@@ -300,6 +302,357 @@ async fn test_streaming_responses_api() {
             false
         }
     }));
+}
+
+// ============================================
+// Usage Limit Enforcement Tests
+// ============================================
+
+#[tokio::test]
+async fn test_responses_api_usage_limit_enforcement() {
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 1).await; // 1 nano-dollar (minimal)
+    println!("Created organization: {org:?}");
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let model_name = setup_qwen_model(&server).await;
+
+    // Create a conversation for the response
+    let conversation_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "name": "Test Conversation",
+            "description": "A test conversation"
+        }))
+        .await;
+
+    assert_eq!(
+        conversation_response.status_code(),
+        201,
+        "Failed to create conversation"
+    );
+    let conversation = conversation_response.json::<api::models::ConversationObject>();
+
+    // First request should succeed (no usage yet)
+    let response1 = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "conversation": {
+                "id": conversation.id,
+            },
+            "input": "Hi",
+            "model": model_name,
+            "stream": false,
+            "max_output_tokens": 10
+        }))
+        .await;
+
+    println!("First request status: {}", response1.status_code());
+    // This might succeed or fail depending on timing
+
+    // Wait for usage to be recorded
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Second request should fail with payment required
+    let response2 = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "conversation": {
+                "id": conversation.id,
+            },
+            "input": "Hi again",
+            "model": model_name,
+            "stream": false,
+            "max_output_tokens": 10
+        }))
+        .await;
+
+    println!("Second request status: {}", response2.status_code());
+    println!("Second request body: {}", response2.text());
+
+    // Should get 402 Payment Required after exceeding limit
+    assert!(
+        response2.status_code() == 402,
+        "Expected 402 Payment Required, got: {}",
+        response2.status_code()
+    );
+
+    // Since we got 402, verify the error message
+    let error_response = response2.json::<api::models::ErrorResponse>();
+    assert!(
+        error_response
+            .error
+            .message
+            .contains("Credit limit exceeded."),
+        "Error response should indicate no credits, got: {}",
+        error_response.error.message
+    );
+}
+
+#[tokio::test]
+async fn test_responses_api_no_credits() {
+    let server = setup_test_server().await;
+    // Create org without credits (no limit set)
+    let org = create_org(&server).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let model_name = setup_qwen_model(&server).await;
+
+    // Create a conversation for the response
+    let conversation_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "name": "Test Conversation",
+            "description": "A test conversation"
+        }))
+        .await;
+
+    assert_eq!(
+        conversation_response.status_code(),
+        201,
+        "Failed to create conversation"
+    );
+    let conversation = conversation_response.json::<api::models::ConversationObject>();
+
+    // Request should fail with payment required (no credits)
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "conversation": {
+                "id": conversation.id,
+            },
+            "input": "Hi",
+            "model": model_name,
+            "stream": false,
+            "max_output_tokens": 10
+        }))
+        .await;
+
+    println!("Response status: {}", response.status_code());
+    println!("Response body: {}", response.text());
+
+    assert_eq!(
+        response.status_code(),
+        402,
+        "Expected 402 Payment Required when no credits are available"
+    );
+
+    let error_response = response.json::<api::models::ErrorResponse>();
+    assert!(
+        error_response
+            .error
+            .message
+            .contains("No spending limit configured"),
+        "Error response should indicate no credits, got: {}",
+        error_response.error.message
+    );
+}
+
+#[tokio::test]
+async fn test_responses_api_zero_credits() {
+    let server = setup_test_server().await;
+    // Create org with zero credits
+    let org = setup_org_with_credits(&server, 0).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let model_name = setup_qwen_model(&server).await;
+
+    // Create a conversation for the response
+    let conversation_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "name": "Test Conversation",
+            "description": "A test conversation"
+        }))
+        .await;
+
+    assert_eq!(
+        conversation_response.status_code(),
+        201,
+        "Failed to create conversation"
+    );
+    let conversation = conversation_response.json::<api::models::ConversationObject>();
+
+    // Request should fail with payment required (zero credits)
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "conversation": {
+                "id": conversation.id,
+            },
+            "input": "Hi",
+            "model": model_name,
+            "stream": false,
+            "max_output_tokens": 10
+        }))
+        .await;
+
+    println!("Response status: {}", response.status_code());
+    println!("Response body: {}", response.text());
+
+    assert_eq!(
+        response.status_code(),
+        402,
+        "Expected 402 Payment Required when credits are zero"
+    );
+
+    let error_response = response.json::<api::models::ErrorResponse>();
+    assert!(
+        error_response
+            .error
+            .message
+            .contains("Credit limit exceeded."),
+        "Error response should indicate no credits, got: {}",
+        error_response.error.message
+    );
+}
+
+#[tokio::test]
+async fn test_responses_api_sufficient_credits() {
+    let server = setup_test_server().await;
+    // Create org with sufficient credits
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let model_name = setup_qwen_model(&server).await;
+
+    // Create a conversation for the response
+    let conversation_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "name": "Test Conversation",
+            "description": "A test conversation"
+        }))
+        .await;
+
+    assert_eq!(
+        conversation_response.status_code(),
+        201,
+        "Failed to create conversation"
+    );
+    let conversation = conversation_response.json::<api::models::ConversationObject>();
+
+    // Request should succeed with sufficient credits
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "conversation": {
+                "id": conversation.id,
+            },
+            "input": "Say hello in exactly 5 words.",
+            "model": model_name,
+            "stream": false,
+            "max_output_tokens": 50
+        }))
+        .await;
+
+    println!("Response status: {}", response.status_code());
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Expected 200 OK when sufficient credits are available"
+    );
+
+    let response_obj = response.json::<api::models::ResponseObject>();
+    assert_eq!(
+        response_obj.status,
+        api::models::ResponseStatus::Completed,
+        "Response should complete successfully"
+    );
+}
+
+#[tokio::test]
+async fn test_responses_api_streaming_usage_limit() {
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 1).await; // 1 nano-dollar (minimal)
+    println!("Created organization: {org:?}");
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let model_name = setup_qwen_model(&server).await;
+
+    // Create a conversation for the response
+    let conversation_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "name": "Test Conversation",
+            "description": "A test conversation"
+        }))
+        .await;
+
+    assert_eq!(
+        conversation_response.status_code(),
+        201,
+        "Failed to create conversation"
+    );
+    let conversation = conversation_response.json::<api::models::ConversationObject>();
+
+    // First streaming request should succeed (no usage yet)
+    let response1 = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "conversation": {
+                "id": conversation.id,
+            },
+            "input": "Hi",
+            "model": model_name,
+            "stream": true,
+            "max_output_tokens": 10
+        }))
+        .await;
+
+    println!(
+        "First streaming request status: {}",
+        response1.status_code()
+    );
+    // This might succeed or fail depending on timing
+
+    // Wait for usage to be recorded
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Second streaming request should fail with payment required
+    let response2 = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "conversation": {
+                "id": conversation.id,
+            },
+            "input": "Hi again",
+            "model": model_name,
+            "stream": true,
+            "max_output_tokens": 10
+        }))
+        .await;
+
+    println!(
+        "Second streaming request status: {}",
+        response2.status_code()
+    );
+    println!("Second streaming request body: {}", response2.text());
+
+    // Should get 402 Payment Required after exceeding limit
+    assert!(
+        response2.status_code() == 402,
+        "Expected 402 Payment Required, got: {}",
+        response2.status_code()
+    );
+
+    // If we got 402, verify the error message
+    let error_response = response2.json::<api::models::ErrorResponse>();
+    assert!(
+        error_response
+            .error
+            .message
+            .contains("Credit limit exceeded."),
+        "Error response should indicate no credits, got: {}",
+        error_response.error.message
+    );
 }
 
 // ============================================
@@ -2682,4 +3035,106 @@ async fn test_batch_get_conversations() {
     }
 
     println!("✅ Batch conversation retrieval test passed!");
+}
+
+#[tokio::test]
+async fn test_conversation_title_strips_thinking_tags() {
+    use inference_providers::mock::ResponseTemplate;
+
+    let (server, _pool, mock_provider) = setup_test_server_with_pool().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    mock_provider
+        .set_default_response(ResponseTemplate::new(
+            "<think>Let me analyze this message to generate a title...</think>Test Conversation Title",
+        ))
+        .await;
+
+    let response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "name": "test-conv-title-strip",
+            "description": "Testing title generation with thinking model"
+        }))
+        .await;
+    assert_eq!(response.status_code(), 201);
+    let conversation = response.json::<api::models::ConversationObject>();
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "conversation": {
+                "id": conversation.id,
+            },
+            "input": "Hello, this is a test message for title generation",
+            "temperature": 0.7,
+            "max_output_tokens": 50,
+            "stream": true,
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507"
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    let response_text = response.text();
+    let mut title_from_event: Option<String> = None;
+
+    for line_chunk in response_text.split("\n\n") {
+        if line_chunk.trim().is_empty() {
+            continue;
+        }
+
+        let mut event_type = "";
+        let mut event_data = "";
+
+        for line in line_chunk.lines() {
+            if let Some(event_name) = line.strip_prefix("event: ") {
+                event_type = event_name;
+            } else if let Some(data) = line.strip_prefix("data: ") {
+                event_data = data;
+            }
+        }
+
+        if event_type == "conversation.title.updated" && !event_data.is_empty() {
+            if let Ok(event_json) = serde_json::from_str::<serde_json::Value>(event_data) {
+                if let Some(title) = event_json
+                    .get("conversation_title")
+                    .and_then(|v| v.as_str())
+                {
+                    title_from_event = Some(title.to_string());
+                }
+            }
+        }
+    }
+
+    let title = match title_from_event {
+        Some(t) => t,
+        None => {
+            let conv_response = server
+                .get(format!("/v1/conversations/{}", conversation.id).as_str())
+                .add_header("Authorization", format!("Bearer {api_key}"))
+                .await;
+            assert_eq!(conv_response.status_code(), 200);
+            let updated_conv = conv_response.json::<api::models::ConversationObject>();
+            updated_conv
+                .metadata
+                .get("title")
+                .and_then(|v| v.as_str())
+                .expect("Expected title in event or metadata")
+                .to_string()
+        }
+    };
+
+    assert!(
+        !title.contains("<think>"),
+        "Title should not contain <think> tags, got: {title}"
+    );
+    assert!(
+        !title.contains("</think>"),
+        "Title should not contain </think> tags, got: {title}"
+    );
+    println!("✅ Title stripped thinking tags: {title}");
 }

@@ -66,11 +66,11 @@ impl OrganizationUsageRepository {
                 .query_one(
                     r#"
                     INSERT INTO organization_usage_log (
-                        id, organization_id, workspace_id, api_key_id, response_id,
+                        id, organization_id, workspace_id, api_key_id,
                         model_id, model_name, input_tokens, output_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
-                        request_type, created_at
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                        request_type, inference_type, created_at, ttft_ms, avg_itl_ms, inference_id
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
                     RETURNING *
                     "#,
                     &[
@@ -78,7 +78,6 @@ impl OrganizationUsageRepository {
                         &request.organization_id,
                         &request.workspace_id,
                         &request.api_key_id,
-                        &request.response_id,
                         &request.model_id,
                         &request.model_name,
                         &request.input_tokens,
@@ -87,8 +86,12 @@ impl OrganizationUsageRepository {
                         &request.input_cost,
                         &request.output_cost,
                         &request.total_cost,
-                        &request.request_type,
+                        &request.inference_type,
+                        &request.inference_type,
                         &now,
+                        &request.ttft_ms,
+                        &request.avg_itl_ms,
+                        &request.inference_id,
                     ],
                 )
                 .await
@@ -129,7 +132,7 @@ impl OrganizationUsageRepository {
             Ok::<tokio_postgres::Row, RepositoryError>(row)
         })?;
 
-        Ok(self.row_to_usage_log(&row))
+        self.row_to_usage_log(&row)
     }
 
     /// Get current balance for an organization
@@ -207,10 +210,10 @@ impl OrganizationUsageRepository {
                 .query(
                     r#"
                     SELECT
-                        id, organization_id, workspace_id, api_key_id, response_id,
+                        id, organization_id, workspace_id, api_key_id,
                         model_id, model_name, input_tokens, output_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
-                        request_type, created_at
+                        inference_type, request_type, created_at, ttft_ms, avg_itl_ms, inference_id
                     FROM organization_usage_log
                     WHERE organization_id = $1
                     ORDER BY created_at DESC
@@ -222,7 +225,7 @@ impl OrganizationUsageRepository {
                 .map_err(map_db_error)
         })?;
 
-        Ok(rows.iter().map(|row| self.row_to_usage_log(row)).collect())
+        rows.iter().map(|row| self.row_to_usage_log(row)).collect()
     }
 
     /// Count total usage history records for an API key
@@ -273,10 +276,10 @@ impl OrganizationUsageRepository {
                 .query(
                     r#"
                     SELECT
-                        id, organization_id, workspace_id, api_key_id, response_id,
+                        id, organization_id, workspace_id, api_key_id,
                         model_id, model_name, input_tokens, output_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
-                        request_type, created_at
+                        inference_type, request_type, created_at, ttft_ms, avg_itl_ms, inference_id
                     FROM organization_usage_log
                     WHERE api_key_id = $1
                     ORDER BY created_at DESC
@@ -288,7 +291,7 @@ impl OrganizationUsageRepository {
                 .map_err(map_db_error)
         })?;
 
-        Ok(rows.iter().map(|row| self.row_to_usage_log(row)).collect())
+        rows.iter().map(|row| self.row_to_usage_log(row)).collect()
     }
 
     /// Get usage statistics for a time period
@@ -331,13 +334,22 @@ impl OrganizationUsageRepository {
         })
     }
 
-    fn row_to_usage_log(&self, row: &Row) -> OrganizationUsageLog {
-        OrganizationUsageLog {
+    fn row_to_usage_log(&self, row: &Row) -> Result<OrganizationUsageLog> {
+        // Try to get inference_type, fallback to request_type, error if neither exists
+        let inference_type = row
+            .try_get("inference_type")
+            .or_else(|_| row.try_get("request_type"))
+            .map_err(|_| {
+                RepositoryError::RequiredFieldMissing(
+                    "Neither inference_type nor request_type column found".to_string(),
+                )
+            })?;
+
+        Ok(OrganizationUsageLog {
             id: row.get("id"),
             organization_id: row.get("organization_id"),
             workspace_id: row.get("workspace_id"),
             api_key_id: row.get("api_key_id"),
-            response_id: row.get("response_id"),
             model_id: row.get("model_id"),
             model: row.get("model_name"),
             input_tokens: row.get("input_tokens"),
@@ -346,9 +358,12 @@ impl OrganizationUsageRepository {
             input_cost: row.get("input_cost"),
             output_cost: row.get("output_cost"),
             total_cost: row.get("total_cost"),
-            request_type: row.get("request_type"),
+            inference_type,
             created_at: row.get("created_at"),
-        }
+            ttft_ms: row.get("ttft_ms"),
+            avg_itl_ms: row.get("avg_itl_ms"),
+            inference_id: row.get("inference_id"),
+        })
     }
 
     fn row_to_balance(&self, row: &Row) -> OrganizationBalance {

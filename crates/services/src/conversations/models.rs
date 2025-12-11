@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{conversations::errors, workspace::WorkspaceId};
+use crate::{conversations::errors, id_prefixes::PREFIX_CONV, workspace::WorkspaceId};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ConversationId(pub Uuid);
@@ -11,7 +11,7 @@ impl std::str::FromStr for ConversationId {
     type Err = errors::ConversationError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let value = value.strip_prefix("conv_").unwrap_or(value);
+        let value = value.strip_prefix(PREFIX_CONV).unwrap_or(value);
         Uuid::parse_str(value).map(ConversationId).map_err(|e| {
             errors::ConversationError::InvalidParams(format!(
                 "Invalid conversation ID: {value}, error: {e}"
@@ -28,7 +28,7 @@ impl From<Uuid> for ConversationId {
 
 impl std::fmt::Display for ConversationId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "conv_{}", self.0.simple())
+        write!(f, "{}{}", PREFIX_CONV, self.0.simple())
     }
 }
 

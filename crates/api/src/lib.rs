@@ -21,6 +21,7 @@ use crate::{
         responses,
     },
 };
+use axum::http::HeaderValue;
 use axum::{
     extract::DefaultBodyLimit,
     middleware::{from_fn, from_fn_with_state},
@@ -41,6 +42,7 @@ use services::{
     models::ModelsServiceTrait,
 };
 use std::sync::Arc;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use utoipa::OpenApi;
 
 /// Service initialization components
@@ -68,6 +70,7 @@ pub struct DomainServices {
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
+    pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 }
 
 /// Initialize database connection and run migrations
@@ -223,6 +226,7 @@ pub async fn init_domain_services(
     database: Arc<Database>,
     config: &ApiConfig,
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
+    metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
     let inference_provider_pool = init_inference_providers(config).await;
     init_domain_services_with_pool(
@@ -230,6 +234,7 @@ pub async fn init_domain_services(
         config,
         organization_service,
         inference_provider_pool,
+        metrics_service,
     )
     .await
 }
@@ -241,6 +246,7 @@ pub async fn init_domain_services_with_pool(
     config: &ApiConfig,
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+    metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
     // Create shared repositories
     let conversation_repo = Arc::new(database::PgConversationRepository::new(
@@ -272,6 +278,7 @@ pub async fn init_domain_services_with_pool(
         attestation_repo,
         inference_provider_pool.clone(),
         models_repo.clone(),
+        metrics_service.clone(),
     ));
 
     // Create models service
@@ -313,6 +320,7 @@ pub async fn init_domain_services_with_pool(
         models_repo.clone() as Arc<dyn services::usage::ModelRepository>,
         limits_repository_for_usage as Arc<dyn services::usage::OrganizationLimitsRepository>,
         workspace_service.clone(),
+        metrics_service.clone(),
     )) as Arc<dyn services::usage::UsageServiceTrait + Send + Sync>;
 
     // Create completion service with usage tracking (needs usage_service)
@@ -320,6 +328,7 @@ pub async fn init_domain_services_with_pool(
         inference_provider_pool.clone(),
         attestation_service.clone(),
         usage_service.clone(),
+        metrics_service.clone(),
         models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
     ));
 
@@ -386,6 +395,7 @@ pub async fn init_domain_services_with_pool(
         usage_service,
         user_service,
         files_service,
+        metrics_service,
     }
 }
 
@@ -469,6 +479,35 @@ pub async fn init_inference_providers_with_mocks(
     (pool, mock_provider)
 }
 
+fn is_origin_allowed(origin_str: &str, cors_config: &config::CorsConfig) -> bool {
+    if cors_config.exact_matches.iter().any(|o| o == origin_str) {
+        return true;
+    }
+
+    if let Some(remainder) = origin_str.strip_prefix("http://localhost") {
+        if remainder.is_empty() || remainder.starts_with(':') {
+            return true;
+        }
+    }
+
+    if let Some(remainder) = origin_str.strip_prefix("http://127.0.0.1") {
+        if remainder.is_empty() || remainder.starts_with(':') {
+            return true;
+        }
+    }
+
+    if origin_str.starts_with("https://")
+        && cors_config
+            .wildcard_suffixes
+            .iter()
+            .any(|suffix| origin_str.ends_with(suffix))
+    {
+        return true;
+    }
+
+    false
+}
+
 /// Build the complete application router with config
 pub fn build_app_with_config(
     database: Arc<Database>,
@@ -518,13 +557,14 @@ pub fn build_app_with_config(
     let completion_routes = build_completion_routes(
         app_state.clone(),
         &auth_components.auth_state_middleware,
-        usage_state,
+        usage_state.clone(),
     );
 
     let response_routes = build_response_routes(
         domain_services.response_service,
         domain_services.attestation_service.clone(),
         &auth_components.auth_state_middleware,
+        usage_state,
     );
 
     let conversation_routes = build_conversation_routes(
@@ -565,6 +605,27 @@ pub fn build_app_with_config(
     // Build health check route (public, no auth required)
     let health_routes = Router::new().route("/health", get(health_check));
 
+    // Create metrics state for HTTP metrics middleware
+    let metrics_state = middleware::MetricsState {
+        metrics_service: domain_services.metrics_service.clone(),
+    };
+
+    // Create CORS layer
+    let cors_config = config.cors.clone();
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(
+            move |origin: &HeaderValue, _request_parts: &axum::http::request::Parts| {
+                let origin_str = match origin.to_str() {
+                    Ok(s) => s,
+                    Err(_) => return false,
+                };
+                is_origin_allowed(origin_str, &cors_config)
+            },
+        ))
+        .allow_methods(Any)
+        .allow_headers(Any)
+        .expose_headers(Any);
+
     Router::new()
         .nest(
             "/v1",
@@ -584,6 +645,12 @@ pub fn build_app_with_config(
                 .merge(health_routes),
         )
         .merge(openapi_routes)
+        .layer(cors)
+        // Add HTTP metrics middleware to track all requests
+        .layer(from_fn_with_state(
+            metrics_state,
+            middleware::http_metrics_middleware,
+        ))
 }
 
 /// Build VPC authentication routes
@@ -686,14 +753,29 @@ pub fn build_response_routes(
     response_service: Arc<services::ResponseService>,
     attestation_service: Arc<dyn services::attestation::ports::AttestationServiceTrait>,
     auth_state_middleware: &AuthState,
+    usage_state: middleware::UsageState,
 ) -> Router {
     let route_state = responses::ResponseRouteState {
         response_service: response_service.clone(),
-        attestation_service,
+        attestation_service: attestation_service.clone(),
     };
 
-    Router::new()
+    // Create response route with usage check
+    let inference_routes = Router::new()
         .route("/responses", post(responses::create_response))
+        .with_state(route_state.clone())
+        .layer(from_fn_with_state(
+            usage_state,
+            middleware::usage_check_middleware,
+        ))
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::auth_middleware_with_workspace_context,
+        ))
+        .layer(from_fn(middleware::body_hash_middleware));
+
+    // Response management routes
+    let other_routes = Router::new()
         .route("/responses/{response_id}", get(responses::get_response))
         .route(
             "/responses/{response_id}",
@@ -711,8 +793,9 @@ pub fn build_response_routes(
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
-        ))
-        .layer(from_fn(middleware::body_hash_middleware))
+        ));
+
+    Router::new().merge(inference_routes).merge(other_routes)
 }
 
 /// Build conversation routes with auth
@@ -863,11 +946,14 @@ pub fn build_admin_routes(
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
         batch_upsert_models, create_admin_access_token, delete_admin_access_token, delete_model,
-        get_model_history, get_organization_limits_history, list_admin_access_tokens, list_users,
-        update_organization_limits, AdminAppState,
+        get_model_history, get_organization_limits_history, get_organization_metrics,
+        get_organization_timeseries, get_platform_metrics, list_admin_access_tokens,
+        list_models as admin_list_models, list_users, update_organization_limits, AdminAppState,
     };
-    use database::repositories::{AdminAccessTokenRepository, AdminCompositeRepository};
-    use services::admin::AdminServiceImpl;
+    use database::repositories::{
+        AdminAccessTokenRepository, AdminCompositeRepository, PgAnalyticsRepository,
+    };
+    use services::admin::{AdminServiceImpl, AnalyticsService};
 
     // Create composite admin repository (handles models, organization limits, and users)
     let admin_repository = Arc::new(AdminCompositeRepository::new(database.pool().clone()));
@@ -876,6 +962,12 @@ pub fn build_admin_routes(
     let admin_access_token_repository =
         Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
 
+    // Create analytics repository and service
+    let analytics_repository = Arc::new(PgAnalyticsRepository::new(database.pool().clone()));
+    let analytics_service = Arc::new(AnalyticsService::new(
+        analytics_repository as Arc<dyn services::admin::AnalyticsRepository>,
+    ));
+
     // Create admin service with composite repository
     let admin_service = Arc::new(AdminServiceImpl::new(
         admin_repository as Arc<dyn services::admin::AdminRepository>,
@@ -883,13 +975,17 @@ pub fn build_admin_routes(
 
     let admin_app_state = AdminAppState {
         admin_service,
+        analytics_service,
         auth_service: auth_state_middleware.auth_service.clone(),
         config,
         admin_access_token_repository,
     };
 
     Router::new()
-        .route("/admin/models", axum::routing::patch(batch_upsert_models))
+        .route(
+            "/admin/models",
+            axum::routing::get(admin_list_models).patch(batch_upsert_models),
+        )
         .route(
             "/admin/models/{model_name}",
             axum::routing::delete(delete_model),
@@ -905,6 +1001,18 @@ pub fn build_admin_routes(
         .route(
             "/admin/organizations/{organization_id}/limits/history",
             axum::routing::get(get_organization_limits_history),
+        )
+        .route(
+            "/admin/organizations/{org_id}/metrics",
+            axum::routing::get(get_organization_metrics),
+        )
+        .route(
+            "/admin/organizations/{org_id}/metrics/timeseries",
+            axum::routing::get(get_organization_timeseries),
+        )
+        .route(
+            "/admin/platform/metrics",
+            axum::routing::get(get_platform_metrics),
         )
         .route("/admin/users", axum::routing::get(list_users))
         .route(
@@ -1048,6 +1156,7 @@ mod tests {
             },
             database: config::DatabaseConfig {
                 primary_app_id: "postgres-patroni-1".to_string(),
+                gateway_subdomain: "cvm1.near.ai".to_string(),
                 host: None,
                 port: 5432,
                 database: "test_db".to_string(),
@@ -1066,15 +1175,23 @@ mod tests {
                 encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_string(), // Mock 256-bit hex key
             },
+            otlp: config::OtlpConfig {
+                endpoint: "http://localhost:4317".to_string(),
+                protocol: "grpc".to_string(),
+            },
+            cors: config::CorsConfig::default(),
         };
 
         // Initialize services
         let database = init_database(&config.database).await;
         let auth_components = init_auth_services(database.clone(), &config);
+        let metrics_service = Arc::new(services::metrics::MockMetricsService)
+            as Arc<dyn services::metrics::MetricsServiceTrait>;
         let domain_services = init_domain_services(
             database.clone(),
             &config,
             auth_components.organization_service.clone(),
+            metrics_service,
         )
         .await;
 
@@ -1095,6 +1212,7 @@ mod tests {
         // Create custom database config for testing
         let db_config = config::DatabaseConfig {
             primary_app_id: "postgres-patroni-1".to_string(),
+            gateway_subdomain: "cvm1.near.ai".to_string(),
             port: 5432,
             host: None,
             database: "test_db".to_string(),
@@ -1140,6 +1258,7 @@ mod tests {
             },
             database: config::DatabaseConfig {
                 primary_app_id: "postgres-patroni-1".to_string(),
+                gateway_subdomain: "cvm1.near.ai".to_string(),
                 host: None,
                 port: 5432,
                 database: "test_db".to_string(),
@@ -1158,13 +1277,21 @@ mod tests {
                 encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_string(), // Mock 256-bit hex key
             },
+            otlp: config::OtlpConfig {
+                endpoint: "http://localhost:4317".to_string(),
+                protocol: "grpc".to_string(),
+            },
+            cors: config::CorsConfig::default(),
         };
 
         let auth_components = init_auth_services(database.clone(), &config);
+        let metrics_service = Arc::new(services::metrics::MockMetricsService)
+            as Arc<dyn services::metrics::MetricsServiceTrait>;
         let domain_services = init_domain_services(
             database.clone(),
             &config,
             auth_components.organization_service.clone(),
+            metrics_service,
         )
         .await;
 
@@ -1172,5 +1299,94 @@ mod tests {
             build_app_with_config(database, auth_components, domain_services, Arc::new(config));
 
         // Test the app...
+    }
+
+    fn test_cors_config() -> config::CorsConfig {
+        config::CorsConfig {
+            exact_matches: vec![
+                "https://example.com".to_string(),
+                "http://test.com".to_string(),
+            ],
+            wildcard_suffixes: vec![".near.ai".to_string(), "-example.com".to_string()],
+        }
+    }
+
+    #[test]
+    fn test_cors_exact_match_allowed() {
+        let config = test_cors_config();
+        assert!(is_origin_allowed("https://example.com", &config));
+        assert!(is_origin_allowed("http://test.com", &config));
+    }
+
+    #[test]
+    fn test_cors_exact_match_denied() {
+        let config = test_cors_config();
+        assert!(!is_origin_allowed("https://evil.com", &config));
+        assert!(!is_origin_allowed("http://example.com", &config));
+    }
+
+    #[test]
+    fn test_cors_localhost_allowed() {
+        let config = test_cors_config();
+        assert!(is_origin_allowed("http://localhost:3000", &config));
+        assert!(is_origin_allowed("http://localhost:8080", &config));
+        assert!(is_origin_allowed("http://localhost", &config));
+    }
+
+    #[test]
+    fn test_cors_localhost_subdomain_denied() {
+        let config = test_cors_config();
+        assert!(!is_origin_allowed("http://localhost.evil.com", &config));
+        assert!(!is_origin_allowed(
+            "http://localhost.evil.com:3000",
+            &config
+        ));
+    }
+
+    #[test]
+    fn test_cors_127_0_0_1_allowed() {
+        let config = test_cors_config();
+        assert!(is_origin_allowed("http://127.0.0.1:3000", &config));
+        assert!(is_origin_allowed("http://127.0.0.1:8080", &config));
+        assert!(is_origin_allowed("http://127.0.0.1", &config));
+    }
+
+    #[test]
+    fn test_cors_127_0_0_1_subdomain_denied() {
+        let config = test_cors_config();
+        assert!(!is_origin_allowed("http://127.0.0.1.evil.com", &config));
+    }
+
+    #[test]
+    fn test_cors_https_wildcard_allowed() {
+        let config = test_cors_config();
+        assert!(is_origin_allowed("https://app.near.ai", &config));
+        assert!(is_origin_allowed("https://chat.near.ai", &config));
+        assert!(is_origin_allowed("https://preview-example.com", &config));
+    }
+
+    #[test]
+    fn test_cors_https_wildcard_denied() {
+        let config = test_cors_config();
+        assert!(!is_origin_allowed("http://app.near.ai", &config));
+        assert!(!is_origin_allowed("https://fakenear.ai", &config));
+        assert!(!is_origin_allowed("https://near.ai.evil.com", &config));
+    }
+
+    #[test]
+    fn test_cors_wildcard_suffix_protection() {
+        let config = config::CorsConfig {
+            exact_matches: vec![],
+            wildcard_suffixes: vec![".near.ai".to_string()],
+        };
+        assert!(is_origin_allowed("https://app.near.ai", &config));
+        assert!(!is_origin_allowed("https://fakenear.ai", &config));
+    }
+
+    #[test]
+    fn test_cors_wildcard_with_hyphen_allowed() {
+        let config = test_cors_config();
+        assert!(is_origin_allowed("https://preview-example.com", &config));
+        assert!(is_origin_allowed("https://staging-example.com", &config));
     }
 }

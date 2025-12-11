@@ -170,9 +170,11 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
 }
 
 impl ResponseServiceImpl {
-    /// Parse file ID from string (handles "file-" prefix)
+    /// Parse file ID from string (handles prefix)
     fn parse_file_id(file_id: &str) -> Result<Uuid, errors::ResponseError> {
-        let id_str = file_id.strip_prefix("file-").unwrap_or(file_id);
+        let id_str = file_id
+            .strip_prefix(crate::id_prefixes::PREFIX_FILE)
+            .unwrap_or(file_id);
         Uuid::parse_str(id_str)
             .map_err(|e| errors::ResponseError::InvalidParams(format!("Invalid file ID: {e}")))
     }
@@ -246,11 +248,15 @@ impl ResponseServiceImpl {
     fn extract_response_uuid(
         response: &models::ResponseObject,
     ) -> Result<models::ResponseId, errors::ResponseError> {
-        let response_uuid =
-            uuid::Uuid::parse_str(response.id.strip_prefix("resp_").unwrap_or(&response.id))
-                .map_err(|e| {
-                    errors::ResponseError::InternalError(format!("Invalid response ID format: {e}"))
-                })?;
+        let response_uuid = uuid::Uuid::parse_str(
+            response
+                .id
+                .strip_prefix(crate::id_prefixes::PREFIX_RESP)
+                .unwrap_or(&response.id),
+        )
+        .map_err(|e| {
+            errors::ResponseError::InternalError(format!("Invalid response ID format: {e}"))
+        })?;
 
         Ok(models::ResponseId(response_uuid))
     }
@@ -292,8 +298,32 @@ impl ResponseServiceImpl {
         while let Some(event) = completion_stream.next().await {
             match event {
                 Ok(sse_event) => {
-                    // Parse the SSE event for content and tool calls
-                    if let Some(delta_text) = Self::extract_text_delta(&sse_event) {
+                    // Parse the SSE event for content, reasoning, and tool calls
+                    let (delta_text_opt, delta_reasoning_opt) = Self::extract_deltas(&sse_event);
+
+                    if delta_text_opt.is_some() || delta_reasoning_opt.is_some() {
+                        let delta_text = delta_text_opt.unwrap_or_default();
+
+                        // Handle explicit reasoning from provider
+                        if let Some(reasoning) = delta_reasoning_opt {
+                            if !reasoning.is_empty() {
+                                if !reasoning_item_emitted {
+                                    emitter
+                                        .emit_reasoning_started(ctx, &reasoning_item_id)
+                                        .await?;
+                                    reasoning_item_emitted = true;
+                                }
+                                emitter
+                                    .emit_reasoning_delta(
+                                        ctx,
+                                        reasoning_item_id.clone(),
+                                        reasoning.clone(),
+                                    )
+                                    .await?;
+                                reasoning_buffer.push_str(&reasoning);
+                            }
+                        }
+
                         // Process reasoning tags and extract clean text (no reasoning tags)
                         let (text_without_reasoning, reasoning_delta, tag_transition) =
                             Self::process_reasoning_tags(
@@ -301,6 +331,32 @@ impl ResponseServiceImpl {
                                 &mut reasoning_buffer,
                                 &mut inside_reasoning,
                             );
+
+                        // Handle transition from explicit reasoning to content
+                        // If we have content, and we were reasoning (but not inside a tag block), close reasoning
+                        if !text_without_reasoning.is_empty()
+                            && reasoning_item_emitted
+                            && !inside_reasoning
+                        {
+                            // Close explicit reasoning item
+                            emitter
+                                .emit_reasoning_completed(
+                                    ctx,
+                                    &reasoning_item_id,
+                                    &reasoning_buffer,
+                                    response_items_repository,
+                                )
+                                .await?;
+
+                            let reasoning_token_count =
+                                crate::responses::service_helpers::ResponseStreamContext::estimate_tokens(
+                                    &reasoning_buffer,
+                                );
+                            ctx.add_reasoning_tokens(reasoning_token_count);
+                            ctx.next_output_index();
+                            reasoning_buffer.clear();
+                            reasoning_item_emitted = false;
+                        }
 
                         // Feed text (without reasoning tags) to citation tracker for real-time processing
                         // Returns clean text with citation tags also removed, plus any completed citations
@@ -694,7 +750,9 @@ impl ResponseServiceImpl {
         // Extract conversation_id from the created response (may have been inherited from previous_response_id)
         let conversation_id = initial_response.conversation.as_ref().and_then(|conv_ref| {
             let id = &conv_ref.id;
-            let uuid_str = id.strip_prefix("conv_").unwrap_or(id);
+            let uuid_str = id
+                .strip_prefix(crate::id_prefixes::PREFIX_CONV)
+                .unwrap_or(id);
             Uuid::parse_str(uuid_str).ok().map(ConversationId)
         });
 
@@ -885,7 +943,7 @@ impl ResponseServiceImpl {
                 extra.insert("tool_choice".to_string(), serde_json::to_value(tc).unwrap());
             }
 
-            // Create completion request
+            // Create completion request (names not included - tracked via database analytics)
             let completion_request = CompletionRequest {
                 model: process_context.request.model.clone(),
                 messages: messages.clone(),
@@ -1695,8 +1753,8 @@ impl ResponseServiceImpl {
         })
     }
 
-    /// Extract text delta from SSE event (placeholder)
-    fn extract_text_delta(event: &inference_providers::SSEEvent) -> Option<String> {
+    /// Extract text and reasoning deltas from SSE event
+    fn extract_deltas(event: &inference_providers::SSEEvent) -> (Option<String>, Option<String>) {
         use inference_providers::StreamChunk;
 
         match &event.chunk {
@@ -1704,14 +1762,21 @@ impl ResponseServiceImpl {
                 // Extract delta content from choices
                 for choice in &chat_chunk.choices {
                     if let Some(delta) = &choice.delta {
-                        if let Some(content) = &delta.content {
-                            return Some(content.clone());
+                        let content = delta.content.clone();
+                        // Check for reasoning_content or reasoning (some providers use one or the other)
+                        let reasoning = delta
+                            .reasoning_content
+                            .clone()
+                            .or_else(|| delta.reasoning.clone());
+
+                        if content.is_some() || reasoning.is_some() {
+                            return (content, reasoning);
                         }
                     }
                 }
-                None
+                (None, None)
             }
-            _ => None,
+            _ => (None, None),
         }
     }
 
@@ -2009,7 +2074,9 @@ DO NOT USE THESE FORMATS:
                     let conversation_id = match &context.request.conversation {
                         Some(models::ConversationReference::Id(id)) => {
                             // Parse conversation ID
-                            let uuid_str = id.strip_prefix("conv_").unwrap_or(id);
+                            let uuid_str = id
+                                .strip_prefix(crate::id_prefixes::PREFIX_CONV)
+                                .unwrap_or(id);
                             uuid::Uuid::parse_str(uuid_str).map_err(|e| {
                                 errors::ResponseError::InvalidParams(format!(
                                     "Invalid conversation ID: {e}"
@@ -2017,7 +2084,9 @@ DO NOT USE THESE FORMATS:
                             })?
                         }
                         Some(models::ConversationReference::Object { id, .. }) => {
-                            let uuid_str = id.strip_prefix("conv_").unwrap_or(id);
+                            let uuid_str = id
+                                .strip_prefix(crate::id_prefixes::PREFIX_CONV)
+                                .unwrap_or(id);
                             uuid::Uuid::parse_str(uuid_str).map_err(|e| {
                                 errors::ResponseError::InvalidParams(format!(
                                     "Invalid conversation ID: {e}"
@@ -2085,7 +2154,6 @@ DO NOT USE THESE FORMATS:
         completion_service: Arc<dyn CompletionServiceTrait>,
         tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
     ) -> Option<tokio::task::JoinHandle<Result<(), errors::ResponseError>>> {
-        let model = request.model.clone();
         // Only proceed if we have a conversation_id
         let conv_id = conversation_id?;
 
@@ -2133,7 +2201,6 @@ DO NOT USE THESE FORMATS:
                 conv_id,
                 user_id,
                 user_message,
-                model,
                 api_key_id,
                 organization_id,
                 workspace_id,
@@ -2153,7 +2220,6 @@ DO NOT USE THESE FORMATS:
         conversation_id: ConversationId,
         user_id: crate::UserId,
         user_message: String,
-        model: String,
         api_key_id: String,
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
@@ -2199,15 +2265,17 @@ DO NOT USE THESE FORMATS:
             Only respond with the title, nothing else.\n\nMessage: {truncated_message}"
         );
 
-        // Generate title using completion service
+        // Generate title using completion service (names not included - tracked via database)
+        let title_model = std::env::var("TITLE_GENERATION_MODEL")
+            .unwrap_or_else(|_| "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string());
         let completion_request = crate::completions::ports::CompletionRequest {
-            model, // Use the same model as the user's request
+            model: title_model,
             messages: vec![crate::completions::ports::CompletionMessage {
                 role: "user".to_string(),
                 content: title_prompt,
             }],
-            max_tokens: Some(20), // Short response for title
-            temperature: Some(0.7),
+            max_tokens: Some(150),
+            temperature: Some(1.0),
             top_p: None,
             stop: None,
             stream: Some(false),
@@ -2218,7 +2286,10 @@ DO NOT USE THESE FORMATS:
             metadata: None,
             body_hash: String::new(),
             n: None,
-            extra: std::collections::HashMap::new(),
+            extra: std::collections::HashMap::from([(
+                "chat_template_kwargs".to_string(),
+                serde_json::json!({ "enable_thinking": false }),
+            )]),
         };
 
         // Call completion service to generate title
@@ -2230,13 +2301,33 @@ DO NOT USE THESE FORMATS:
             })?;
 
         // Extract title from completion result
-        let generated_title = completion_result
+        let raw_title = completion_result
             .response
             .choices
             .first()
             .and_then(|choice| choice.message.content.as_ref())
-            .map(|content| content.trim().to_string())
-            .unwrap_or_else(|| "Conversation".to_string());
+            .map(|content| content.trim().to_string());
+        let raw_title = if let Some(title) = raw_title {
+            title
+        } else {
+            tracing::warn!(
+                conversation_id = %conversation_id,
+                "LLM response doesn't contain title for conversation, using default"
+            );
+            "Conversation".to_string()
+        };
+
+        // Strip reasoning tags from title
+        let mut reasoning_buffer = String::new();
+        let mut inside_reasoning = false;
+        let (generated_title, _, _) =
+            Self::process_reasoning_tags(&raw_title, &mut reasoning_buffer, &mut inside_reasoning);
+        let generated_title = generated_title.trim();
+        let generated_title = if generated_title.is_empty() {
+            "Conversation".to_string()
+        } else {
+            generated_title.to_string()
+        };
 
         // Truncate to max 60 characters
         let title = if generated_title.len() > 60 {
@@ -2260,11 +2351,11 @@ DO NOT USE THESE FORMATS:
             })?;
 
         tracing::info!(
-            "Generated title for conversation {}: {}",
-            conversation_id,
-            title
+            conversation_id = %conversation_id,
+            title_length = title.len(),
+            truncated = title.len() > 60,
+            "Generated conversation title"
         );
-
         // Emit conversation.title.updated event
         use futures::SinkExt;
         let event = models::ResponseStreamEvent {

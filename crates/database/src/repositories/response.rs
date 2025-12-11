@@ -36,11 +36,15 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         let mut conversation_uuid = if let Some(conv_ref) = &request.conversation {
             match conv_ref {
                 ConversationReference::Id(id) => {
-                    let uuid_str = id.strip_prefix("conv_").unwrap_or(id);
+                    let uuid_str = id
+                        .strip_prefix(services::id_prefixes::PREFIX_CONV)
+                        .unwrap_or(id);
                     Some(Uuid::parse_str(uuid_str).context("Invalid conversation ID")?)
                 }
                 ConversationReference::Object { id, .. } => {
-                    let uuid_str = id.strip_prefix("conv_").unwrap_or(id);
+                    let uuid_str = id
+                        .strip_prefix(services::id_prefixes::PREFIX_CONV)
+                        .unwrap_or(id);
                     Some(Uuid::parse_str(uuid_str).context("Invalid conversation ID")?)
                 }
             }
@@ -51,7 +55,9 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         // Extract previous_response_id if present (this is the parent response)
         // If not provided but conversation is provided, find the latest response in the conversation
         let previous_response_uuid = if let Some(prev_id) = &request.previous_response_id {
-            let uuid_str = prev_id.strip_prefix("resp_").unwrap_or(prev_id);
+            let uuid_str = prev_id
+                .strip_prefix(services::id_prefixes::PREFIX_RESP)
+                .unwrap_or(prev_id);
             let prev_uuid = Uuid::parse_str(uuid_str).context("Invalid previous response ID")?;
 
             // If conversation_uuid is not explicitly set, inherit it from the previous response
@@ -104,7 +110,10 @@ impl ResponseRepositoryTrait for PgResponseRepository {
 
             if let Some(latest) = latest_response {
                 // Extract UUID from the latest response ID (format: "resp_{uuid}")
-                let latest_uuid_str = latest.id.strip_prefix("resp_").unwrap_or(&latest.id);
+                let latest_uuid_str = latest
+                    .id
+                    .strip_prefix(services::id_prefixes::PREFIX_RESP)
+                    .unwrap_or(&latest.id);
                 Some(Uuid::parse_str(latest_uuid_str).context("Invalid latest response ID")?)
             } else {
                 None

@@ -50,6 +50,9 @@ pub struct ChatCompletionRequest {
     pub stop: Option<Vec<String>>,
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
+    /// Response format specification (json_object or json_schema)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<services::responses::models::ResponseTextFormat>,
 
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -1903,6 +1906,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            response_format: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -1937,6 +1941,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            response_format: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -1971,6 +1976,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            response_format: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -2002,6 +2008,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            response_format: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -2031,6 +2038,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            response_format: None,
             extra: std::collections::HashMap::new(),
         };
 

@@ -75,11 +75,7 @@ jobs:
         DEV: "true"
 
     - name: Run integration tests
-      run: |
-        for test in crates/api/tests/e2e_*.rs; do
-          name=$(basename "$test" .rs)
-          cargo test --test "$name" -p api
-        done
+      run: cargo test -p api --tests
       env:
         POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
         DATABASE_HOST: localhost
@@ -94,6 +90,7 @@ jobs:
         AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
         AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
         BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
+        TEST_DATABASE_NAME: platform_api_test
         RUST_LOG: debug
         DEV: "true"
 

@@ -173,6 +173,7 @@ async fn create_response_stream(
 #[tokio::test]
 async fn test_responses_api() {
     let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -249,6 +250,7 @@ async fn test_responses_api() {
 #[tokio::test]
 async fn test_streaming_responses_api() {
     let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -1121,6 +1123,7 @@ async fn test_create_conversation_items_different_roles() {
 #[tokio::test]
 async fn test_conversation_items_pagination() {
     let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
     let models = list_models(&server, api_key.clone()).await;
@@ -1412,6 +1415,7 @@ async fn test_response_previous_next_relationships() {
 #[tokio::test]
 async fn test_response_previous_next_relationships_streaming() {
     let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -1943,6 +1947,7 @@ async fn test_clone_conversation() {
 #[tokio::test]
 async fn test_clone_conversation_with_responses_and_items() {
     let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -2698,6 +2703,7 @@ async fn test_conversation_items_include_model() {
 #[tokio::test]
 async fn test_conversation_items_model_with_streaming() {
     let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -3035,7 +3041,7 @@ async fn test_batch_get_conversations() {
 async fn test_conversation_title_strips_thinking_tags() {
     use inference_providers::mock::ResponseTemplate;
 
-    let (server, _pool, mock_provider) = setup_test_server_with_pool().await;
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 

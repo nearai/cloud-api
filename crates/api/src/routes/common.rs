@@ -92,6 +92,23 @@ pub fn parse_legacy_file_reference(text: &str) -> Result<Option<String>, String>
     Ok(Some(file_id.to_string()))
 }
 
+/// Helper function to format amount (fixed scale 9 = nano-dollars, USD)
+pub fn format_amount(amount: i64) -> String {
+    const SCALE: i64 = 9;
+    let divisor = 10_i64.pow(SCALE as u32);
+    let whole = amount / divisor;
+    let frac = amount % divisor;
+
+    if frac == 0 {
+        format!("${whole}.00")
+    } else {
+        // Remove trailing zeros from fractional part
+        let frac_str = format!("{:0>9}", frac.abs());
+        let trimmed = frac_str.trim_end_matches('0');
+        format!("${whole}.{trimmed}")
+    }
+}
+
 /// Map OrganizationError to HTTP response
 pub fn map_organization_error(
     error: OrganizationError,
@@ -244,5 +261,17 @@ mod tests {
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(err.1 .0.error.message, "Offset must be non-negative");
         assert_eq!(err.1 .0.error.r#type, "invalid_parameter");
+    }
+
+    #[test]
+    fn test_format_amount() {
+        // Test with scale 9 (nano-dollars, USD)
+        assert_eq!(format_amount(1000000000), "$1.00");
+        assert_eq!(format_amount(1500000000), "$1.5");
+        assert_eq!(format_amount(1230000000), "$1.23");
+        assert_eq!(format_amount(100000), "$0.0001");
+        assert_eq!(format_amount(100), "$0.0000001");
+        assert_eq!(format_amount(1), "$0.000000001");
+        assert_eq!(format_amount(0), "$0.00");
     }
 }

@@ -252,7 +252,7 @@ impl UserRepository {
     }
 
     /// List all users with organizations (with pagination)
-    /// Returns the earliest organization created by each user (owner role) with spend limit
+    /// Returns the earliest organization created by each user (owner role) with spend limit and usage
     /// Returns a tuple of (User, Option<UserOrganizationInfo>)
     pub async fn list_with_organizations(
         &self,
@@ -275,7 +275,10 @@ impl UserRepository {
                 o.id as organization_id,
                 o.name as organization_name,
                 o.description as organization_description,
-                olh.spend_limit as organization_spend_limit
+                olh.spend_limit as organization_spend_limit,
+                ob.total_spent as organization_total_spent,
+                ob.total_requests as organization_total_requests,
+                ob.total_tokens as organization_total_tokens
             FROM users u
             LEFT JOIN organization_members om ON u.id = om.user_id AND om.role = 'owner'
             LEFT JOIN organizations o ON om.organization_id = o.id AND o.is_active = true
@@ -287,6 +290,7 @@ impl UserRepository {
                 ORDER BY effective_from DESC
                 LIMIT 1
             ) olh ON true
+            LEFT JOIN organization_balance ob ON o.id = ob.organization_id
             WHERE u.is_active = true
             ORDER BY u.id, o.created_at ASC NULLS LAST
             LIMIT $1
@@ -305,12 +309,18 @@ impl UserRepository {
                 let org_name: Option<String> = row.get("organization_name");
                 let org_description: Option<String> = row.get("organization_description");
                 let spend_limit: Option<i64> = row.get("organization_spend_limit");
+                let total_spent: Option<i64> = row.get("organization_total_spent");
+                let total_requests: Option<i64> = row.get("organization_total_requests");
+                let total_tokens: Option<i64> = row.get("organization_total_tokens");
 
                 let org_data = org_id.map(|id| services::admin::UserOrganizationInfo {
                     id,
                     name: org_name.unwrap_or_default(),
                     description: org_description,
                     spend_limit,
+                    total_spent,
+                    total_requests,
+                    total_tokens,
                 });
 
                 Ok((user, org_data))

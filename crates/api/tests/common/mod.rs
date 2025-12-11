@@ -251,7 +251,6 @@ pub async fn create_org(server: &axum_test::TestServer) -> api::models::Organiza
     let request = api::models::CreateOrganizationRequest {
         name: uuid::Uuid::new_v4().to_string(),
         description: Some("A test organization".to_string()),
-        display_name: Some("Test Organization".to_string()),
     };
     let response = server
         .post("/v1/organizations")

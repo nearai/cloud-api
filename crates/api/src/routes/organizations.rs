@@ -480,7 +480,7 @@ pub async fn update_organization(
         .update_organization(
             organization_id,
             user_id,
-            request.display_name,
+            request.name,
             request.description,
             request.rate_limit,
             request.settings,

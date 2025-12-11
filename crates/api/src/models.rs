@@ -997,14 +997,13 @@ pub struct CreateApiKeyRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateOrganizationRequest {
     pub name: String,
-    pub display_name: Option<String>,
     pub description: Option<String>,
 }
 
 /// Request to update an organization
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateOrganizationRequest {
-    pub display_name: Option<String>,
+    pub name: Option<String>,
     pub description: Option<String>,
     pub rate_limit: Option<i32>,
     pub settings: Option<serde_json::Value>,

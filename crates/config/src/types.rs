@@ -429,7 +429,6 @@ mod tests {
     use serial_test::serial;
 
     #[test]
-    #[serial]
     fn test_is_admin_email() {
         let config = AuthConfig {
             mock: false,
@@ -452,7 +451,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_is_admin_email_empty_config() {
         let config = AuthConfig {
             mock: false,

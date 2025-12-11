@@ -101,8 +101,7 @@ pub async fn api_key_rate_limit_middleware(
             StatusCode::TOO_MANY_REQUESTS,
             axum::Json(ErrorResponse::new(
                 format!(
-                    "API rate limit exceeded ({}/{} requests/min). Try again in {} seconds.",
-                    count, limit, RATE_LIMIT_WINDOW_SECS
+                    "API rate limit exceeded ({count}/{limit} requests/min). Try again in {RATE_LIMIT_WINDOW_SECS} seconds."
                 ),
                 "rate_limit_exceeded".to_string(),
             )),
@@ -128,7 +127,7 @@ mod tests {
         // First 5 requests should be allowed
         for i in 1..=5 {
             let (allowed, count, limit) = state.check_limit(api_key_id).await;
-            assert!(allowed, "Request {} should be allowed", i);
+            assert!(allowed, "Request {i} should be allowed");
             assert_eq!(count, i as u32);
             assert_eq!(limit, 5);
         }

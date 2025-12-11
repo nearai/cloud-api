@@ -23,7 +23,7 @@ const API_KEY_CACHE_MAX_CAPACITY: u64 = 10_000;
 const API_KEY_CACHE_TTL_SECS: u64 = 30;
 const BLOOM_FILTER_ITEMS: usize = 10_000_000;
 const BLOOM_FILTER_FP_RATE: f64 = 0.001;
-const BLOOM_FILTER_SYNC_INTERVAL_SECS: u64 = 30;
+const BLOOM_FILTER_SYNC_INTERVAL_SECS: u64 = 10;
 
 #[async_trait]
 impl AuthServiceTrait for AuthService {

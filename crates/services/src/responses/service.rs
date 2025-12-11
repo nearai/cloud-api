@@ -910,6 +910,23 @@ impl ResponseServiceImpl {
         Ok(())
     }
 
+    /// Convert ResponseTextFormat to inference provider ResponseFormat
+    fn convert_text_format_to_response_format(
+        text_config: &Option<models::ResponseTextConfig>,
+    ) -> Option<inference_providers::models::ResponseFormat> {
+        text_config.as_ref().and_then(|config| match &config.format {
+            models::ResponseTextFormat::Text => None,
+            models::ResponseTextFormat::JsonObject => {
+                Some(inference_providers::models::ResponseFormat::JsonObject)
+            }
+            models::ResponseTextFormat::JsonSchema { json_schema } => {
+                Some(crate::common::convert_json_schema_to_response_format(
+                    json_schema,
+                ))
+            }
+        })
+    }
+
     /// Run the agent loop - repeatedly call completion API and execute tool calls
     #[allow(clippy::too_many_arguments)]
     async fn run_agent_loop(
@@ -933,6 +950,10 @@ impl ResponseServiceImpl {
             }
 
             tracing::debug!("Agent loop iteration {}", iteration);
+
+            // Convert text format to response_format
+            let response_format =
+                Self::convert_text_format_to_response_format(&process_context.request.text);
 
             // Prepare extra params with tools
             let mut extra = std::collections::HashMap::new();
@@ -958,6 +979,7 @@ impl ResponseServiceImpl {
                 workspace_id: process_context.workspace_id,
                 metadata: process_context.request.metadata.clone(),
                 body_hash: process_context.body_hash.to_string(),
+                response_format,
                 n: None,
                 extra,
             };
@@ -2398,6 +2420,7 @@ DO NOT USE THESE FORMATS:
             workspace_id,
             metadata: None,
             body_hash: String::new(),
+            response_format: None, // Title generation doesn't need structured output
             n: None,
             extra: std::collections::HashMap::from([(
                 "chat_template_kwargs".to_string(),
@@ -3212,5 +3235,68 @@ mod tests {
         );
         // Verify that searching for index 3 gets fourth result
         assert_eq!(final_registry.web_sources[3].url, "https://example.com/4");
+    }
+
+    #[test]
+    fn test_convert_text_format_json_object() {
+        let config = Some(models::ResponseTextConfig {
+            format: models::ResponseTextFormat::JsonObject,
+            verbosity: None,
+        });
+
+        let result = ResponseServiceImpl::convert_text_format_to_response_format(&config);
+        assert!(matches!(
+            result,
+            Some(inference_providers::models::ResponseFormat::JsonObject)
+        ));
+    }
+
+    #[test]
+    fn test_convert_text_format_json_schema() {
+        let schema = serde_json::json!({
+            "name": "test_schema",
+            "schema": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}}
+            },
+            "strict": true
+        });
+
+        let config = Some(models::ResponseTextConfig {
+            format: models::ResponseTextFormat::JsonSchema {
+                json_schema: schema,
+            },
+            verbosity: None,
+        });
+
+        let result = ResponseServiceImpl::convert_text_format_to_response_format(&config);
+        assert!(matches!(
+            result,
+            Some(inference_providers::models::ResponseFormat::JsonSchema { .. })
+        ));
+
+        if let Some(inference_providers::models::ResponseFormat::JsonSchema { json_schema }) =
+            result
+        {
+            assert_eq!(json_schema.name, "test_schema");
+            assert_eq!(json_schema.strict, Some(true));
+        }
+    }
+
+    #[test]
+    fn test_convert_text_format_text_returns_none() {
+        let config = Some(models::ResponseTextConfig {
+            format: models::ResponseTextFormat::Text,
+            verbosity: None,
+        });
+
+        let result = ResponseServiceImpl::convert_text_format_to_response_format(&config);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_convert_text_format_none_returns_none() {
+        let result = ResponseServiceImpl::convert_text_format_to_response_format(&None);
+        assert!(result.is_none());
     }
 }

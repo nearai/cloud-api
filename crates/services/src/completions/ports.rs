@@ -59,6 +59,7 @@ pub struct CompletionRequest {
     pub workspace_id: Uuid,
     pub metadata: Option<serde_json::Value>,
     pub body_hash: String,
+    pub response_format: Option<inference_providers::models::ResponseFormat>,
 
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }

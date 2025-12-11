@@ -57,6 +57,23 @@ fn extract_text_from_content(content: &Option<MessageContent>) -> String {
     }
 }
 
+// Convert ResponseTextFormat to inference provider ResponseFormat
+fn convert_api_response_format(
+    text_format: &Option<services::responses::models::ResponseTextFormat>,
+) -> Option<inference_providers::models::ResponseFormat> {
+    text_format.as_ref().and_then(|format| match format {
+        services::responses::models::ResponseTextFormat::Text => None,
+        services::responses::models::ResponseTextFormat::JsonObject => {
+            Some(inference_providers::models::ResponseFormat::JsonObject)
+        }
+        services::responses::models::ResponseTextFormat::JsonSchema { json_schema } => {
+            Some(services::common::convert_json_schema_to_response_format(
+                json_schema,
+            ))
+        }
+    })
+}
+
 // Convert HTTP ChatCompletionRequest to service CompletionRequest
 fn convert_chat_request_to_service(
     request: &ChatCompletionRequest,
@@ -88,6 +105,7 @@ fn convert_chat_request_to_service(
         workspace_id,
         metadata: None,
         body_hash: body_hash.hash.clone(),
+        response_format: convert_api_response_format(&request.response_format),
         extra: request.extra.clone(),
     }
 }
@@ -119,6 +137,7 @@ fn convert_text_request_to_service(
         workspace_id,
         metadata: None,
         body_hash: body_hash.hash.clone(),
+        response_format: None, // Legacy endpoint doesn't support response_format
         extra: request.extra.clone(),
     }
 }

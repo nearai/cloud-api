@@ -618,6 +618,7 @@ mod tests {
             stop: Some(vec!["\\n".to_string()]),
             presence_penalty: None,
             frequency_penalty: None,
+            response_format: None,
 
             extra: HashMap::new(),
         };

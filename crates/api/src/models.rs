@@ -995,6 +995,7 @@ pub struct CreateApiKeyRequest {
 
 /// Request to create a new organization
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateOrganizationRequest {
     pub name: String,
     pub description: Option<String>,
@@ -1002,6 +1003,7 @@ pub struct CreateOrganizationRequest {
 
 /// Request to update an organization
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateOrganizationRequest {
     pub name: Option<String>,
     pub description: Option<String>,

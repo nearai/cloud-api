@@ -1,6 +1,8 @@
 // Latency metrics
 pub const METRIC_LATENCY_TTFT: &str = "cloud_api.latency.time_to_first_token";
+pub const METRIC_LATENCY_TTFT_TOTAL: &str = "cloud_api.latency.time_to_first_token_total";
 pub const METRIC_LATENCY_TOTAL: &str = "cloud_api.latency.total";
+pub const METRIC_LATENCY_QUEUE_TIME: &str = "cloud_api.latency.queue_time";
 pub const METRIC_LATENCY_DECODING_TIME: &str = "cloud_api.latency.decoding_time";
 pub const METRIC_TOKENS_PER_SECOND: &str = "cloud_api.tokens_per_second";
 
@@ -32,6 +34,7 @@ pub const TAG_STATUS_CODE: &str = "status_code";
 pub const TAG_ENDPOINT: &str = "endpoint";
 pub const TAG_METHOD: &str = "method";
 pub const TAG_REASON: &str = "reason";
+pub const TAG_INPUT_BUCKET: &str = "input_bucket";
 
 // Error types for TAG_ERROR_TYPE
 pub const ERROR_TYPE_INVALID_MODEL: &str = "invalid_model";

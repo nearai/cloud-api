@@ -10,3 +10,4 @@ config/examples/production.yaml
 oci.tar
 .idea
 .claude
+.DS_Store

@@ -6,7 +6,7 @@ use crate::repositories::{
 use anyhow::Result;
 use async_trait::async_trait;
 use services::admin::{
-    AdminRepository, ModelHistoryEntry, ModelPricing, OrganizationLimits,
+    AdminModelInfo, AdminRepository, ModelHistoryEntry, ModelPricing, OrganizationLimits,
     OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate, UpdateModelAdminRequest, UserInfo,
     UserOrganizationInfo,
 };
@@ -237,5 +237,43 @@ impl AdminRepository for AdminCompositeRepository {
 
     async fn get_active_user_count(&self) -> Result<i64> {
         self.user_repo.get_active_user_count().await
+    }
+
+    async fn list_models(
+        &self,
+        include_inactive: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<AdminModelInfo>, i64)> {
+        let total = self
+            .model_repo
+            .get_all_models_count(include_inactive)
+            .await?;
+
+        let models = self
+            .model_repo
+            .get_all_models(include_inactive, limit, offset)
+            .await?;
+
+        let admin_models = models
+            .into_iter()
+            .map(|m| AdminModelInfo {
+                id: m.id,
+                model_name: m.model_name,
+                model_display_name: m.model_display_name,
+                model_description: m.model_description,
+                model_icon: m.model_icon,
+                input_cost_per_token: m.input_cost_per_token,
+                output_cost_per_token: m.output_cost_per_token,
+                context_length: m.context_length,
+                verifiable: m.verifiable,
+                is_active: m.is_active,
+                aliases: m.aliases,
+                created_at: m.created_at,
+                updated_at: m.updated_at,
+            })
+            .collect();
+
+        Ok((admin_models, total))
     }
 }

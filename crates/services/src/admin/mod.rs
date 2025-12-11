@@ -191,6 +191,21 @@ impl AdminService for AdminServiceImpl {
 
         Ok((users_with_orgs, total))
     }
+
+    async fn list_models(
+        &self,
+        include_inactive: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<AdminModelInfo>, i64), AdminError> {
+        let (models, total) = self
+            .repository
+            .list_models(include_inactive, limit, offset)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+
+        Ok((models, total))
+    }
 }
 
 impl AdminServiceImpl {

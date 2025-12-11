@@ -10,6 +10,7 @@ pub struct ApiConfig {
     pub database: DatabaseConfig,
     pub s3: S3Config,
     pub otlp: OtlpConfig,
+    pub cors: CorsConfig,
 }
 
 impl ApiConfig {
@@ -24,6 +25,7 @@ impl ApiConfig {
             database: DatabaseConfig::from_env()?,
             s3: S3Config::from_env()?,
             otlp: OtlpConfig::from_env()?,
+            cors: CorsConfig::default(),
         })
     }
 }
@@ -32,6 +34,7 @@ impl ApiConfig {
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
     pub primary_app_id: String,
+    pub gateway_subdomain: String,
     pub host: Option<String>,
     pub port: u16,
     pub database: String,
@@ -69,6 +72,8 @@ impl DatabaseConfig {
         Ok(Self {
             primary_app_id: env::var("POSTGRES_PRIMARY_APP_ID")
                 .map_err(|_| "POSTGRES_PRIMARY_APP_ID not set".to_string())?,
+            gateway_subdomain: env::var("GATEWAY_SUBDOMAIN")
+                .map_err(|_| "GATEWAY_SUBDOMAIN not set".to_string())?,
             host: env::var("DATABASE_HOST").ok(),
             port: env::var("DATABASE_PORT")
                 .unwrap_or_else(|_| "5432".to_string())
@@ -421,6 +426,7 @@ impl S3Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_is_admin_email() {
@@ -457,6 +463,93 @@ mod tests {
         // Should return false when no admin domains configured
         assert!(!config.is_admin_email("admin@near.ai"));
     }
+
+    #[test]
+    #[serial]
+    fn test_cors_config_parsing_exact_matches() {
+        std::env::set_var(
+            "CORS_ALLOWED_ORIGINS",
+            "https://example.com,http://test.com",
+        );
+        let config = CorsConfig::default();
+        assert!(config
+            .exact_matches
+            .contains(&"https://example.com".to_string()));
+        assert!(config
+            .exact_matches
+            .contains(&"http://test.com".to_string()));
+        assert!(config.wildcard_suffixes.is_empty());
+        std::env::remove_var("CORS_ALLOWED_ORIGINS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_cors_config_parsing_wildcard_with_dot() {
+        std::env::set_var("CORS_ALLOWED_ORIGINS", "*.near.ai");
+        let config = CorsConfig::default();
+        assert_eq!(config.wildcard_suffixes, vec![".near.ai"]);
+        assert!(config.exact_matches.is_empty());
+        std::env::remove_var("CORS_ALLOWED_ORIGINS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_cors_config_parsing_wildcard_without_dot() {
+        std::env::set_var("CORS_ALLOWED_ORIGINS", "*near.ai");
+        let config = CorsConfig::default();
+        assert_eq!(config.wildcard_suffixes, vec![".near.ai"]);
+        std::env::remove_var("CORS_ALLOWED_ORIGINS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_cors_config_parsing_wildcard_with_hyphen() {
+        std::env::set_var("CORS_ALLOWED_ORIGINS", "*-example.com");
+        let config = CorsConfig::default();
+        assert_eq!(config.wildcard_suffixes, vec!["-example.com"]);
+        std::env::remove_var("CORS_ALLOWED_ORIGINS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_cors_config_parsing_mixed() {
+        std::env::set_var(
+            "CORS_ALLOWED_ORIGINS",
+            "https://example.com,*.near.ai,http://test.com",
+        );
+        let config = CorsConfig::default();
+        assert_eq!(config.exact_matches.len(), 2);
+        assert!(config
+            .exact_matches
+            .contains(&"https://example.com".to_string()));
+        assert!(config
+            .exact_matches
+            .contains(&"http://test.com".to_string()));
+        assert_eq!(config.wildcard_suffixes, vec![".near.ai"]);
+        std::env::remove_var("CORS_ALLOWED_ORIGINS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_cors_config_parsing_whitespace() {
+        std::env::set_var("CORS_ALLOWED_ORIGINS", " https://example.com , *.near.ai ");
+        let config = CorsConfig::default();
+        assert!(config
+            .exact_matches
+            .contains(&"https://example.com".to_string()));
+        assert_eq!(config.wildcard_suffixes, vec![".near.ai"]);
+        std::env::remove_var("CORS_ALLOWED_ORIGINS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_cors_config_parsing_empty_entries() {
+        std::env::set_var("CORS_ALLOWED_ORIGINS", "https://example.com,,*.near.ai,");
+        let config = CorsConfig::default();
+        assert_eq!(config.exact_matches.len(), 1);
+        assert_eq!(config.wildcard_suffixes.len(), 1);
+        std::env::remove_var("CORS_ALLOWED_ORIGINS");
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -477,6 +570,45 @@ impl Default for OtlpConfig {
             endpoint: env::var("TELEMETRY_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://localhost:4317".to_string()),
             protocol: env::var("TELEMETRY_OTLP_PROTOCOL").unwrap_or_else(|_| "grpc".to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CorsConfig {
+    pub exact_matches: Vec<String>,
+    pub wildcard_suffixes: Vec<String>,
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        let raw_origins = env::var("CORS_ALLOWED_ORIGINS")
+            .unwrap_or_else(|_| "http://localhost:3000,https://near.ai,*.near.ai".to_string());
+
+        let mut exact_matches = Vec::new();
+        let mut wildcard_suffixes = Vec::new();
+
+        for origin in raw_origins.split(',') {
+            let s = origin.trim();
+            if s.is_empty() {
+                continue;
+            }
+
+            if let Some(suffix) = s.strip_prefix('*') {
+                let safe_suffix = if suffix.starts_with('.') || suffix.starts_with('-') {
+                    suffix.to_string()
+                } else {
+                    format!(".{suffix}")
+                };
+                wildcard_suffixes.push(safe_suffix);
+            } else {
+                exact_matches.push(s.to_string());
+            }
+        }
+
+        Self {
+            exact_matches,
+            wildcard_suffixes,
         }
     }
 }

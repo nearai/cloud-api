@@ -2637,6 +2637,9 @@ async fn test_admin_list_users_with_organizations_no_spend_limit() {
 async fn test_admin_list_users_with_organization_usage() {
     let server = setup_test_server().await;
 
+    // Setup the model with pricing
+    setup_qwen_model(&server).await;
+
     // Get access token from refresh token
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 

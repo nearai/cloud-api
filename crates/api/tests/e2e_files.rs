@@ -813,7 +813,8 @@ async fn test_complete_file_lifecycle() {
 
 #[tokio::test]
 async fn test_file_in_response_api() {
-    let (server, _pool, mock) = setup_test_server_with_pool().await;
+    let (server, _pool, mock, _database) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -1028,6 +1029,7 @@ async fn test_file_in_response_api() {
 #[tokio::test]
 async fn test_file_not_found_in_response_api() {
     let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -1086,6 +1088,7 @@ async fn test_file_not_found_in_response_api() {
 #[tokio::test]
 async fn test_multiple_files_in_response_api() {
     let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 

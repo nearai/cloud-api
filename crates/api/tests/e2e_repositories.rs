@@ -3,27 +3,13 @@
 mod common;
 
 use chrono::{Duration, Utc};
-use common::*;
-use database::{Database, OAuthStateRepository};
+use database::OAuthStateRepository;
 
-// Helper to create database pool for repository testing
-async fn create_test_pool() -> database::pool::DbPool {
-    let config = config::DatabaseConfig {
-        primary_app_id: "postgres-test".to_string(),
-        gateway_subdomain: "cvm1.near.ai".to_string(),
-        port: 5432,
-        host: None,
-        database: "platform_api".to_string(),
-        username: std::env::var("DATABASE_USERNAME").unwrap_or("postgres".to_string()),
-        password: std::env::var("DATABASE_PASSWORD").unwrap_or("postgres".to_string()),
-        max_connections: 2,
-        tls_enabled: false,
-        tls_ca_cert_path: None,
-        refresh_interval: 30,
-        mock: false,
-    };
-
-    Database::from_config(&config).await.unwrap().pool().clone()
+// Helper to get database pool for repository testing
+async fn get_test_pool() -> database::pool::DbPool {
+    let (_server, _inference_provider_pool, _mock_provider, database) =
+        common::setup_test_server_with_pool().await;
+    database.pool().clone()
 }
 
 // ============================================
@@ -32,9 +18,7 @@ async fn create_test_pool() -> database::pool::DbPool {
 
 #[tokio::test]
 async fn test_create_and_get_oauth_state() {
-    let _ = setup_test_server().await; // Initialize DB once via OnceCell
-
-    let pool = create_test_pool().await;
+    let pool = get_test_pool().await;
     let repo = OAuthStateRepository::new(pool.clone());
 
     let state = format!("test-state-{}", uuid::Uuid::new_v4());
@@ -63,9 +47,7 @@ async fn test_create_and_get_oauth_state() {
 
 #[tokio::test]
 async fn test_expired_state_not_returned() {
-    let _ = setup_test_server().await; // Initialize DB once via OnceCell
-
-    let pool = create_test_pool().await;
+    let pool = get_test_pool().await;
     let repo = OAuthStateRepository::new(pool.clone());
 
     let state = format!("test-state-{}", uuid::Uuid::new_v4());
@@ -91,9 +73,7 @@ async fn test_expired_state_not_returned() {
 
 #[tokio::test]
 async fn test_google_with_pkce_verifier() {
-    let _ = setup_test_server().await; // Initialize DB once via OnceCell
-
-    let pool = create_test_pool().await;
+    let pool = get_test_pool().await;
     let repo = OAuthStateRepository::new(pool.clone());
 
     let state = format!("test-state-{}", uuid::Uuid::new_v4());
@@ -114,9 +94,7 @@ async fn test_google_with_pkce_verifier() {
 
 #[tokio::test]
 async fn test_state_replay_protection() {
-    let _ = setup_test_server().await; // Initialize DB once via OnceCell
-
-    let pool = create_test_pool().await;
+    let pool = get_test_pool().await;
     let repo = OAuthStateRepository::new(pool.clone());
 
     let state = format!("test-state-{}", uuid::Uuid::new_v4());

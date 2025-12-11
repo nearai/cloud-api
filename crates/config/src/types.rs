@@ -426,8 +426,10 @@ impl S3Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_is_admin_email() {
         let config = AuthConfig {
             mock: false,
@@ -450,6 +452,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_is_admin_email_empty_config() {
         let config = AuthConfig {
             mock: false,
@@ -464,6 +467,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_cors_config_parsing_exact_matches() {
         std::env::set_var(
             "CORS_ALLOWED_ORIGINS",
@@ -481,6 +485,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_cors_config_parsing_wildcard_with_dot() {
         std::env::set_var("CORS_ALLOWED_ORIGINS", "*.near.ai");
         let config = CorsConfig::default();
@@ -490,6 +495,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_cors_config_parsing_wildcard_without_dot() {
         std::env::set_var("CORS_ALLOWED_ORIGINS", "*near.ai");
         let config = CorsConfig::default();
@@ -498,6 +504,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_cors_config_parsing_wildcard_with_hyphen() {
         std::env::set_var("CORS_ALLOWED_ORIGINS", "*-example.com");
         let config = CorsConfig::default();
@@ -506,6 +513,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_cors_config_parsing_mixed() {
         std::env::set_var(
             "CORS_ALLOWED_ORIGINS",
@@ -524,6 +532,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_cors_config_parsing_whitespace() {
         std::env::set_var("CORS_ALLOWED_ORIGINS", " https://example.com , *.near.ai ");
         let config = CorsConfig::default();
@@ -535,6 +544,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_cors_config_parsing_empty_entries() {
         std::env::set_var("CORS_ALLOWED_ORIGINS", "https://example.com,,*.near.ai,");
         let config = CorsConfig::default();

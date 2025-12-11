@@ -2942,7 +2942,7 @@ mod tests {
             &mut inside_reasoning,
         );
 
-        // Hole text should remain
+        // The whole text should remain
         assert_eq!(clean, input);
         assert_eq!(reasoning, None);
         assert!(!inside_reasoning);

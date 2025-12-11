@@ -2557,8 +2557,11 @@ async fn test_admin_list_users_with_organizations() {
             usage.total_requests, 0,
             "New org should have zero total_requests"
         );
-        assert_eq!(usage.total_tokens, 0, "New org should have zero total_tokens");
-        println!("   - Current usage: {:?}", usage);
+        assert_eq!(
+            usage.total_tokens, 0,
+            "New org should have zero total_tokens"
+        );
+        println!("   - Current usage: {usage:?}");
     }
 
     println!("✅ Admin list users with organizations works correctly");
@@ -2622,7 +2625,7 @@ async fn test_admin_list_users_with_organizations_no_spend_limit() {
                     usage.total_tokens, 0,
                     "New org should have zero total_tokens"
                 );
-                println!("   - Current usage: {:?}", usage);
+                println!("   - Current usage: {usage:?}");
             }
         }
     }
@@ -2653,7 +2656,11 @@ async fn test_admin_list_users_with_organization_usage() {
         }))
         .await;
 
-    assert_eq!(response.status_code(), 200, "Chat completion should succeed");
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Chat completion should succeed"
+    );
 
     // Wait for async usage recording to complete
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -2708,7 +2715,10 @@ async fn test_admin_list_users_with_organization_usage() {
             );
 
             println!("✅ Admin list users shows organization usage correctly");
-            println!("   - Total spent: {} ({})", usage.total_spent, usage.total_spent_display);
+            println!(
+                "   - Total spent: {} ({})",
+                usage.total_spent, usage.total_spent_display
+            );
             println!("   - Total requests: {}", usage.total_requests);
             println!("   - Total tokens: {}", usage.total_tokens);
         } else {

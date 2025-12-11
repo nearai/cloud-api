@@ -1,4 +1,8 @@
-use crate::{middleware::AuthenticatedUser, models::ErrorResponse, routes::api::AppState};
+use crate::{
+    middleware::AuthenticatedUser,
+    models::ErrorResponse,
+    routes::{api::AppState, common::format_amount},
+};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -469,37 +473,4 @@ pub async fn get_api_key_usage_history(
         limit: query.limit,
         offset: query.offset,
     }))
-}
-
-/// Helper function to format amount (fixed scale 9 = nano-dollars, USD)
-fn format_amount(amount: i64) -> String {
-    const SCALE: i64 = 9;
-    let divisor = 10_i64.pow(SCALE as u32);
-    let whole = amount / divisor;
-    let fraction = amount % divisor;
-
-    if fraction == 0 {
-        format!("${whole}.00")
-    } else {
-        // Remove trailing zeros from fraction
-        let fraction_str = format!("{fraction:09}");
-        let trimmed = fraction_str.trim_end_matches('0');
-        format!("${whole}.{trimmed}")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_format_amount() {
-        // Test with scale 9 (nano-dollars, USD)
-        assert_eq!(format_amount(1000000000), "$1.00");
-        assert_eq!(format_amount(1500000000), "$1.5");
-        assert_eq!(format_amount(1230000000), "$1.23");
-        assert_eq!(format_amount(100000), "$0.0001");
-        assert_eq!(format_amount(1), "$0.000000001");
-        assert_eq!(format_amount(0), "$0.00");
-    }
 }

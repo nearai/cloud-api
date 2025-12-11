@@ -9,7 +9,7 @@ use common::*;
 
 #[tokio::test]
 async fn test_duplicate_organization_name_returns_409() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     let org_name = format!("test-org-{}", uuid::Uuid::new_v4());
 
@@ -60,7 +60,7 @@ async fn test_duplicate_organization_name_returns_409() {
 
 #[tokio::test]
 async fn test_duplicate_organization_name_case_sensitive() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     let org_name = format!("TestOrg-{}", uuid::Uuid::new_v4());
 
@@ -112,7 +112,7 @@ async fn test_duplicate_organization_name_case_sensitive() {
 
 #[tokio::test]
 async fn test_duplicate_workspace_name_returns_409() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = create_org(&server).await;
 
     let workspace_name = format!("test-workspace-{}", uuid::Uuid::new_v4());
@@ -165,7 +165,7 @@ async fn test_duplicate_workspace_name_returns_409() {
 
 #[tokio::test]
 async fn test_same_workspace_name_different_organizations_allowed() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Create two different organizations
     let org1 = create_org(&server).await;
@@ -227,7 +227,7 @@ async fn test_same_workspace_name_different_organizations_allowed() {
 
 #[tokio::test]
 async fn test_duplicate_workspace_default_workspace() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = create_org(&server).await;
 
     // When an organization is created, a "default" workspace is automatically created
@@ -260,7 +260,7 @@ async fn test_duplicate_workspace_default_workspace() {
 
 #[tokio::test]
 async fn test_duplicate_api_key_name_on_create_returns_409() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = create_org(&server).await;
 
     // Get the default workspace
@@ -329,7 +329,7 @@ async fn test_duplicate_api_key_name_on_create_returns_409() {
 
 #[tokio::test]
 async fn test_duplicate_api_key_name_on_update_returns_409() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = create_org(&server).await;
 
     // Get the default workspace
@@ -410,7 +410,7 @@ async fn test_duplicate_api_key_name_on_update_returns_409() {
 
 #[tokio::test]
 async fn test_api_key_update_with_same_name_succeeds() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = create_org(&server).await;
 
     // Get the default workspace
@@ -474,7 +474,7 @@ async fn test_api_key_update_with_same_name_succeeds() {
 
 #[tokio::test]
 async fn test_same_api_key_name_different_workspaces_allowed() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = create_org(&server).await;
 
     // Get the default workspace
@@ -557,7 +557,7 @@ async fn test_same_api_key_name_different_workspaces_allowed() {
 
 #[tokio::test]
 async fn test_duplicate_errors_no_information_leakage() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Create organization
     let org_name = format!("secret-org-{}", uuid::Uuid::new_v4());
@@ -606,7 +606,7 @@ async fn test_duplicate_errors_no_information_leakage() {
 
 #[tokio::test]
 async fn test_workspace_duplicate_check_respects_permissions() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = create_org(&server).await;
 
     let workspace_name = format!("test-workspace-{}", uuid::Uuid::new_v4());

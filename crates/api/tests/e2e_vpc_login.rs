@@ -59,7 +59,7 @@ async fn test_vpc_login_success() {
     // The guard must be kept alive for the test duration to ensure cleanup happens after the test
     let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
 
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     let timestamp = chrono::Utc::now().timestamp();
     let signature = generate_vpc_signature(timestamp, "test_vpc_secret_123");
@@ -106,7 +106,7 @@ async fn test_vpc_login_success() {
 async fn test_vpc_login_expired_timestamp() {
     let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
 
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Use timestamp from 5 minutes ago (beyond 30 second window)
     let timestamp = chrono::Utc::now().timestamp() - 300;
@@ -133,7 +133,7 @@ async fn test_vpc_login_expired_timestamp() {
 async fn test_vpc_login_future_timestamp() {
     let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
 
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Use timestamp 5 minutes in the future (beyond 30 second window)
     let timestamp = chrono::Utc::now().timestamp() + 300;
@@ -160,7 +160,7 @@ async fn test_vpc_login_future_timestamp() {
 async fn test_vpc_login_invalid_signature() {
     let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
 
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     let timestamp = chrono::Utc::now().timestamp();
     // Use wrong secret to generate signature
@@ -187,7 +187,7 @@ async fn test_vpc_login_invalid_signature() {
 async fn test_vpc_login_invalid_hex_signature() {
     let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
 
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     let timestamp = chrono::Utc::now().timestamp();
 
@@ -212,7 +212,7 @@ async fn test_vpc_login_invalid_hex_signature() {
 async fn test_vpc_login_creates_user_and_resources() {
     let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
 
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     let client_id = format!("vpc-client-{}", uuid::Uuid::new_v4());
     let timestamp = chrono::Utc::now().timestamp();
@@ -260,7 +260,7 @@ async fn test_vpc_login_creates_user_and_resources() {
 async fn test_vpc_login_api_key_works() {
     let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
 
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     let timestamp = chrono::Utc::now().timestamp();
     let signature = generate_vpc_signature(timestamp, "test_vpc_secret_123");
@@ -297,7 +297,7 @@ async fn test_vpc_login_api_key_works() {
 async fn test_vpc_login_access_token_works() {
     let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
 
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     let timestamp = chrono::Utc::now().timestamp();
     let signature = generate_vpc_signature(timestamp, "test_vpc_secret_123");
@@ -339,7 +339,7 @@ async fn test_vpc_login_access_token_works() {
 async fn test_vpc_login_missing_fields() {
     let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
 
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Missing signature
     let request = serde_json::json!({

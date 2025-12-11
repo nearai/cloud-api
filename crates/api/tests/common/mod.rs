@@ -24,6 +24,47 @@ static MIGRATIONS_INITIALIZED: OnceCell<()> = OnceCell::const_new();
 // Constants for mock test data
 pub const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
 
+/// Configuration for test server - controls which services are mocked
+#[derive(Default, Clone)]
+pub struct TestServerConfig {
+    pub mock_models: bool,
+    pub mock_admin: bool,
+}
+
+impl TestServerConfig {
+    /// All services mocked (default for fast tests)
+    pub fn all_mocked() -> Self {
+        Self {
+            mock_models: true,
+            mock_admin: true,
+        }
+    }
+
+    /// Real admin service for testing database CRUD operations
+    pub fn real_admin() -> Self {
+        Self {
+            mock_models: true,
+            mock_admin: false, // Use real AdminService + database
+        }
+    }
+
+    /// Real models service for testing model operations
+    pub fn real_models() -> Self {
+        Self {
+            mock_models: false,
+            mock_admin: true,
+        }
+    }
+
+    /// Everything real (full integration test)
+    pub fn all_real() -> Self {
+        Self {
+            mock_models: false,
+            mock_admin: false,
+        }
+    }
+}
+
 /// Helper function to create a test configuration
 pub fn test_config() -> ApiConfig {
     let _ = dotenvy::dotenv();
@@ -155,171 +196,23 @@ pub async fn init_test_database(config: &config::DatabaseConfig) -> Arc<Database
     database
 }
 
-/// Initialize domain services with mocked models service for testing
-async fn init_domain_services_with_mock_models(
-    database: Arc<Database>,
-    config: &ApiConfig,
-    organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
-    inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
-    metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
-    models_service: Arc<dyn services::models::ModelsServiceTrait>,
-) -> api::DomainServices {
-    // Create shared repositories
-    let conversation_repo = Arc::new(database::PgConversationRepository::new(
-        database.pool().clone(),
-    ));
-    let response_repo = Arc::new(database::PgResponseRepository::new(database.pool().clone()));
-    let response_items_repo = Arc::new(database::PgResponseItemsRepository::new(
-        database.pool().clone(),
-    ))
-        as Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>;
-    let user_repo = Arc::new(database::UserRepository::new(database.pool().clone()))
-        as Arc<dyn services::auth::UserRepository>;
-    let attestation_repo = Arc::new(database::PgAttestationRepository::new(
-        database.pool().clone(),
-    ));
-    let models_repo = Arc::new(database::repositories::ModelRepository::new(
-        database.pool().clone(),
-    ));
-
-    // Create conversation service
-    let conversation_service = Arc::new(services::ConversationService::new(
-        conversation_repo.clone(),
-        response_repo.clone(),
-        response_items_repo.clone(),
-    ));
-
-    // Create attestation service
-    let attestation_service = Arc::new(services::attestation::AttestationService::new(
-        attestation_repo,
-        inference_provider_pool.clone(),
-        models_repo.clone(),
-        metrics_service.clone(),
-    ));
-
-    // Use injected models_service instead of creating a new one
-
-    // Prepare repositories for usage service (will be created after workspace service)
-    let usage_repository = Arc::new(database::repositories::OrganizationUsageRepository::new(
-        database.pool().clone(),
-    ));
-    let limits_repository_for_usage = Arc::new(
-        database::repositories::OrganizationLimitsRepository::new(database.pool().clone()),
-    );
-
-    // Create MCP client manager
-    let mcp_manager = Arc::new(services::mcp::McpClientManager::new());
-
-    // Create workspace service with API key management (needs organization_service)
-    let workspace_repository = Arc::new(database::repositories::WorkspaceRepository::new(
-        database.pool().clone(),
-    )) as Arc<dyn services::workspace::WorkspaceRepository>;
-
-    let api_key_repository = Arc::new(database::repositories::ApiKeyRepository::new(
-        database.pool().clone(),
-    )) as Arc<dyn services::workspace::ApiKeyRepository>;
-
-    let workspace_service = Arc::new(services::workspace::WorkspaceServiceImpl::new(
-        workspace_repository,
-        api_key_repository,
-        organization_service.clone(),
-    ))
-        as Arc<dyn services::workspace::WorkspaceServiceTrait + Send + Sync>;
-
-    // Now create usage service with workspace_service
-    let usage_service = Arc::new(services::usage::UsageServiceImpl::new(
-        usage_repository as Arc<dyn services::usage::UsageRepository>,
-        models_repo.clone() as Arc<dyn services::usage::ModelRepository>,
-        limits_repository_for_usage as Arc<dyn services::usage::OrganizationLimitsRepository>,
-        workspace_service.clone(),
-        metrics_service.clone(),
-    )) as Arc<dyn services::usage::UsageServiceTrait + Send + Sync>;
-
-    // Create completion service with usage tracking (needs usage_service)
-    let completion_service = Arc::new(services::CompletionServiceImpl::new(
-        inference_provider_pool.clone(),
-        attestation_service.clone(),
-        usage_service.clone(),
-        metrics_service.clone(),
-        models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
-    ));
-
-    let web_search_provider =
-        Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
-
-    // Create session repository for user service
-    let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
-        as Arc<dyn services::auth::SessionRepository>;
-
-    // Create user service
-    let user_service = Arc::new(services::user::UserService::new(user_repo, session_repo))
-        as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
-
-    // Create S3 storage and file service (must be created before response service)
-    let s3_storage: Arc<dyn services::files::storage::StorageTrait> = if config.s3.mock {
-        tracing::info!("Using mock S3 storage for file uploads");
-        Arc::new(services::files::storage::MockStorage::new(
-            config.s3.encryption_key.clone(),
-        ))
-    } else {
-        tracing::info!("Using real S3 storage for file uploads");
-        let s3_config = aws_config::load_from_env().await;
-        let s3_client = aws_sdk_s3::Client::new(&s3_config);
-
-        Arc::new(services::files::storage::S3Storage::new(
-            s3_client,
-            config.s3.bucket.clone(),
-            config.s3.encryption_key.clone(),
-        ))
-    };
-
-    let file_repository = Arc::new(database::repositories::FileRepository::new(
-        database.pool().clone(),
-    )) as Arc<dyn services::files::FileRepositoryTrait>;
-
-    let files_service = Arc::new(services::files::FileServiceImpl::new(
-        file_repository,
-        s3_storage,
-    )) as Arc<dyn services::files::FileServiceTrait + Send + Sync>;
-
-    let response_service = Arc::new(services::ResponseService::new(
-        response_repo,
-        response_items_repo.clone(),
-        inference_provider_pool.clone(),
-        conversation_service.clone(),
-        completion_service.clone(),
-        Some(web_search_provider), // web_search_provider
-        None,                      // file_search_provider
-        files_service.clone(),     // file_service
-        organization_service.clone(),
-    ));
-
-    api::DomainServices {
-        conversation_service,
-        response_service,
-        completion_service,
-        models_service, // Use injected mock
-        mcp_manager,
-        inference_provider_pool,
-        attestation_service,
-        organization_service,
-        workspace_service,
-        usage_service,
-        user_service,
-        files_service,
-        metrics_service,
-    }
-}
-
 /// Setup a complete test server with all components initialized
 /// Returns the test server ready for making requests
-pub async fn setup_test_server() -> axum_test::TestServer {
-    setup_test_server_with_pool().await.0
+///
+/// # Arguments
+/// * `config` - Optional test configuration. If None, uses all_mocked() by default
+pub async fn setup_test_server(config: Option<TestServerConfig>) -> axum_test::TestServer {
+    setup_test_server_with_pool(config).await.0
 }
 
 /// Setup a complete test server with all components initialized
 /// Returns a tuple of (TestServer, InferenceProviderPool, MockProvider) for advanced testing
-pub async fn setup_test_server_with_pool() -> (
+///
+/// # Arguments
+/// * `server_config` - Optional test configuration. If None, uses all_mocked() by default
+pub async fn setup_test_server_with_pool(
+    server_config: Option<TestServerConfig>,
+) -> (
     axum_test::TestServer,
     std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
     std::sync::Arc<inference_providers::mock::MockProvider>,
@@ -328,6 +221,9 @@ pub async fn setup_test_server_with_pool() -> (
         .with_test_writer()
         .with_max_level(tracing::level_filters::LevelFilter::DEBUG)
         .try_init();
+
+    // Use provided config or default to all_mocked
+    let server_config = server_config.unwrap_or_else(TestServerConfig::all_mocked);
 
     let config = test_config();
     let database = init_test_database(&config.database).await;
@@ -343,19 +239,26 @@ pub async fn setup_test_server_with_pool() -> (
         api::init_inference_providers_with_mocks(&config).await;
     let metrics_service = Arc::new(services::metrics::MockMetricsService);
 
-    // Use mockall-generated mock models service with standard test models
-    let mock_models_service = Arc::new(services::test_utils::create_mock_models_service());
+    // Conditional models service based on config
+    let models_service = if server_config.mock_models {
+        Some(Arc::new(services::test_utils::create_mock_models_service())
+            as Arc<dyn services::models::ModelsServiceTrait>)
+    } else {
+        None // Use real models service with database
+    };
 
-    let domain_services = init_domain_services_with_mock_models(
+    // Call existing function with optional mock
+    let domain_services = api::init_domain_services_with_pool(
         database.clone(),
         &config,
         auth_components.organization_service.clone(),
         inference_provider_pool.clone(),
         metrics_service,
-        mock_models_service,
+        models_service,
     )
     .await;
 
+    // Use build_app_with_config which creates real admin service with database
     let app = build_app_with_config(database, auth_components, domain_services, Arc::new(config));
     let server = axum_test::TestServer::new(app).unwrap();
 

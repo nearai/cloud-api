@@ -235,18 +235,20 @@ pub async fn init_domain_services(
         organization_service,
         inference_provider_pool,
         metrics_service,
+        None, // Use real models service (not mocked)
     )
     .await
 }
 
 /// Initialize domain services with a provided inference provider pool
-/// This allows tests to inject mock providers without changing core implementations
+/// This allows tests to inject mock providers and models service without changing core implementations
 pub async fn init_domain_services_with_pool(
     database: Arc<Database>,
     config: &ApiConfig,
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
+    models_service: Option<Arc<dyn services::models::ModelsServiceTrait>>,
 ) -> DomainServices {
     // Create shared repositories
     let conversation_repo = Arc::new(database::PgConversationRepository::new(
@@ -281,11 +283,16 @@ pub async fn init_domain_services_with_pool(
         metrics_service.clone(),
     ));
 
-    // Create models service
-    let models_service = Arc::new(services::models::ModelsServiceImpl::new(
-        inference_provider_pool.clone(),
-        models_repo.clone(),
-    ));
+    // Create or use injected models service
+    let models_service = if let Some(service) = models_service {
+        service // Use injected mock (for tests)
+    } else {
+        // Create real models service (for production)
+        Arc::new(services::models::ModelsServiceImpl::new(
+            inference_provider_pool.clone(),
+            models_repo.clone(),
+        )) as Arc<dyn services::models::ModelsServiceTrait>
+    };
 
     // Prepare repositories for usage service (will be created after workspace service)
     let usage_repository = Arc::new(database::repositories::OrganizationUsageRepository::new(
@@ -589,6 +596,7 @@ pub fn build_app_with_config(
         database.clone(),
         &auth_components.auth_state_middleware,
         config.clone(),
+        None, // Use real admin service (not mocked)
     );
 
     let invitation_routes =
@@ -942,6 +950,7 @@ pub fn build_admin_routes(
     database: Arc<Database>,
     auth_state_middleware: &AuthState,
     config: Arc<ApiConfig>,
+    admin_service: Option<Arc<dyn services::admin::AdminService + Send + Sync>>,
 ) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
@@ -968,10 +977,15 @@ pub fn build_admin_routes(
         analytics_repository as Arc<dyn services::admin::AnalyticsRepository>,
     ));
 
-    // Create admin service with composite repository
-    let admin_service = Arc::new(AdminServiceImpl::new(
-        admin_repository as Arc<dyn services::admin::AdminRepository>,
-    )) as Arc<dyn services::admin::AdminService + Send + Sync>;
+    // Use injected admin service or create real one
+    let admin_service = if let Some(service) = admin_service {
+        service // Use injected mock for tests
+    } else {
+        // Create real admin service for production
+        Arc::new(AdminServiceImpl::new(
+            admin_repository as Arc<dyn services::admin::AdminRepository>,
+        )) as Arc<dyn services::admin::AdminService + Send + Sync>
+    };
 
     let admin_app_state = AdminAppState {
         admin_service,

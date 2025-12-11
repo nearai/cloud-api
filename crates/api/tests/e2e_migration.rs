@@ -14,7 +14,7 @@ use uuid::Uuid;
 /// requiring fallback to the deprecated request_type column
 #[tokio::test]
 async fn test_usage_api_with_old_v0029_records() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = create_org(&server).await;
 
     // Get workspace and create API key

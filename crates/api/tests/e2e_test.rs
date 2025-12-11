@@ -8,7 +8,7 @@ use inference_providers::{models::ChatCompletionChunk, StreamChunk};
 
 #[tokio::test]
 async fn test_models_api() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let (api_key, _) = create_org_and_api_key(&server).await;
     let response = list_models(&server, api_key).await;
 
@@ -17,7 +17,7 @@ async fn test_models_api() {
 
 #[tokio::test]
 async fn test_chat_completions_api() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -128,7 +128,7 @@ async fn test_chat_completions_api() {
 
 #[tokio::test]
 async fn test_admin_update_model() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Test that admin endpoint accepts model updates
     let mut batch = BatchUpdateModelApiRequest::new();
@@ -163,11 +163,24 @@ async fn test_admin_update_model() {
     assert_eq!(200, response.status_code());
     let updated = response.json::<Vec<api::models::ModelWithPricing>>();
     assert_eq!(updated.len(), 1, "Should have updated 1 model");
+
+    // Verify the response contains the updated values (Pierre's assertions restored)
+    let model = &updated[0];
+    assert_eq!("Qwen/Qwen3-30B-A3B-Instruct-2507", model.model_id);
+    assert_eq!("Updated Model Name", model.metadata.model_display_name);
+    assert_eq!(
+        "Updated model description",
+        model.metadata.model_description
+    );
+    assert_eq!(1000000, model.input_cost_per_token.amount);
+    assert_eq!(2000000, model.output_cost_per_token.amount);
+    assert_eq!(128000, model.metadata.context_length);
+    assert!(model.metadata.verifiable);
 }
 
 #[tokio::test]
 async fn test_get_model_by_name() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Test retrieving a model by name from the mock (public endpoint - no auth required)
     // Model names may contain forward slashes (e.g., "Qwen/Qwen3-30B-A3B-Instruct-2507")
@@ -255,7 +268,7 @@ async fn test_get_model_by_name() {
 
 #[tokio::test]
 async fn test_admin_update_organization_limits() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Create an organization
     let org = create_org(&server).await;
@@ -302,7 +315,7 @@ async fn test_admin_update_organization_limits() {
 
 #[tokio::test]
 async fn test_admin_update_organization_limits_invalid_org() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Try to update limits for non-existent organization
     let fake_org_id = uuid::Uuid::new_v4().to_string();
@@ -333,7 +346,7 @@ async fn test_admin_update_organization_limits_invalid_org() {
 
 #[tokio::test]
 async fn test_admin_update_organization_limits_multiple_times() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Create an organization
     let org = create_org(&server).await;
@@ -393,7 +406,7 @@ async fn test_admin_update_organization_limits_multiple_times() {
 
 #[tokio::test]
 async fn test_admin_update_organization_limits_usd_only() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Create an organization
     let org = create_org(&server).await;
@@ -424,7 +437,7 @@ async fn test_admin_update_organization_limits_usd_only() {
 
 #[tokio::test]
 async fn test_admin_get_organization_limits_history() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Create an organization
     let org = create_org(&server).await;
@@ -577,7 +590,7 @@ async fn test_admin_get_organization_limits_history() {
 
 #[tokio::test]
 async fn test_admin_get_organization_limits_history_with_pagination() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Create an organization
     let org = create_org(&server).await;
@@ -689,7 +702,7 @@ async fn test_admin_get_organization_limits_history_with_pagination() {
 
 #[tokio::test]
 async fn test_no_credits_denies_request() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Create organization WITHOUT setting any credits
     let (api_key, _api_key_response) = create_org_and_api_key(&server).await;
@@ -732,7 +745,7 @@ async fn test_no_credits_denies_request() {
 
 #[tokio::test]
 async fn test_unconfigured_model_rejected() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -793,7 +806,7 @@ async fn test_unconfigured_model_rejected() {
 
 #[tokio::test]
 async fn test_usage_tracking_on_completion() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = setup_org_with_credits(&server, 1000000000i64).await; // $1.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -830,7 +843,7 @@ async fn test_usage_tracking_on_completion() {
 
 #[tokio::test]
 async fn test_usage_limit_enforcement() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = setup_org_with_credits(&server, 1).await; // 1 nano-dollar (minimal)
     println!("Created organization: {org:?}");
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -878,7 +891,7 @@ async fn test_usage_limit_enforcement() {
 
 #[tokio::test]
 async fn test_get_organization_balance() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = setup_org_with_credits(&server, 5000000000i64).await; // $5.00 USD
 
     // Get balance - should now show limit even with no usage
@@ -937,7 +950,7 @@ async fn test_get_organization_balance() {
 
 #[tokio::test]
 async fn test_get_organization_usage_history() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = create_org(&server).await;
 
     // Get usage history (should be empty initially)
@@ -958,7 +971,7 @@ async fn test_get_organization_usage_history() {
 
 #[tokio::test]
 async fn test_completion_cost_calculation() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = setup_org_with_credits(&server, 1000000000000i64).await; // $1000.00 USD
     println!("Created organization: {}", org.id);
 
@@ -1164,7 +1177,7 @@ async fn test_completion_cost_calculation() {
 
 #[tokio::test]
 async fn test_organization_balance_with_limit_and_usage() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
 
     // Get balance before any usage
@@ -1252,7 +1265,7 @@ async fn test_organization_balance_with_limit_and_usage() {
 
 #[tokio::test]
 async fn test_high_context_length_completion() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = setup_org_with_credits(&server, 100000000000i64).await; // $100.00 USD
     println!("Created organization: {}", org.id);
 
@@ -1366,7 +1379,7 @@ async fn test_high_context_length_completion() {
 
 #[tokio::test]
 async fn test_high_context_streaming() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = setup_org_with_credits(&server, 100000000000i64).await; // $100.00 USD
 
     // Upsert Qwen3-30B model with high context length capability (260k)
@@ -1486,7 +1499,7 @@ async fn test_high_context_streaming() {
 
 #[tokio::test]
 async fn test_model_aliases() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     println!("Created organization: {}", org.id);
 
@@ -1687,7 +1700,7 @@ async fn test_model_aliases() {
 
 #[tokio::test]
 async fn test_model_alias_consistency() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
 
     // Set up model with multiple aliases
@@ -1813,7 +1826,7 @@ async fn test_model_alias_consistency() {
 
 #[tokio::test]
 async fn test_admin_access_token_create_long_term() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     let expires_in_hours = 4320; // 180 days
     let name = "Production Billing Service Token";
@@ -1864,7 +1877,7 @@ async fn test_admin_access_token_create_long_term() {
 
 #[tokio::test]
 async fn test_admin_access_token_create_invalid_expiration() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Test with invalid expiration time (negative)
     let request = serde_json::json!({
@@ -1893,7 +1906,7 @@ async fn test_admin_access_token_create_invalid_expiration() {
 
 #[tokio::test]
 async fn test_admin_access_token_create_zero_expiration() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Test with zero expiration time
     let request = serde_json::json!({
@@ -1922,7 +1935,7 @@ async fn test_admin_access_token_create_zero_expiration() {
 
 #[tokio::test]
 async fn test_admin_access_token_create_unauthorized() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Test without authorization header
     let request = serde_json::json!({
@@ -1939,7 +1952,7 @@ async fn test_admin_access_token_create_unauthorized() {
 #[tokio::test]
 #[ignore] // the implementation of MockAuthService accepts any string as valid token, so this test won't pass
 async fn test_admin_access_token_create_invalid_token() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Test with invalid session token
     let request = serde_json::json!({
@@ -1959,7 +1972,7 @@ async fn test_admin_access_token_create_invalid_token() {
 
 #[tokio::test]
 async fn test_admin_access_token_use_created_token() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // First, create an admin access token
     let create_request = serde_json::json!({
@@ -2007,7 +2020,7 @@ async fn test_admin_access_token_use_created_token() {
 
 #[tokio::test]
 async fn test_admin_access_token_user_agent_match() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     let create_request = serde_json::json!({
         "expires_in_hours": 24,
@@ -2050,7 +2063,7 @@ async fn test_admin_access_token_user_agent_match() {
 
 #[tokio::test]
 async fn test_admin_access_token_user_agent_mismatch() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     let create_request = serde_json::json!({
         "expires_in_hours": 24,
@@ -2095,7 +2108,7 @@ async fn test_admin_access_token_user_agent_mismatch() {
 
 #[tokio::test]
 async fn test_admin_access_token_create_and_list() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Get access token from refresh token
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
@@ -2151,7 +2164,7 @@ async fn test_admin_access_token_create_and_list() {
 
 #[tokio::test]
 async fn test_admin_access_token_list_pagination() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Get access token from refresh token
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
@@ -2207,7 +2220,7 @@ async fn test_admin_access_token_list_pagination() {
 
 #[tokio::test]
 async fn test_admin_access_token_create_and_delete() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Get access token from refresh token
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
@@ -2256,7 +2269,7 @@ async fn test_admin_access_token_create_and_delete() {
 
 #[tokio::test]
 async fn test_admin_access_token_delete_not_found() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Get access token from refresh token
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
@@ -2287,7 +2300,7 @@ async fn test_admin_access_token_delete_not_found() {
 
 #[tokio::test]
 async fn test_admin_access_token_delete_invalid_id() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Get access token from refresh token
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
@@ -2318,7 +2331,7 @@ async fn test_admin_access_token_delete_invalid_id() {
 
 #[tokio::test]
 async fn test_admin_access_token_unauthorized() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Test create without authentication
     let create_request = serde_json::json!({
@@ -2354,7 +2367,7 @@ async fn test_admin_access_token_unauthorized() {
 
 #[tokio::test]
 async fn test_admin_access_token_cannot_manage_tokens() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Get access token from refresh token
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
@@ -2418,7 +2431,7 @@ async fn test_admin_access_token_cannot_manage_tokens() {
 
 #[tokio::test]
 async fn test_admin_list_users_without_organizations() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Get access token from refresh token
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
@@ -2438,7 +2451,7 @@ async fn test_admin_list_users_without_organizations() {
 
 #[tokio::test]
 async fn test_admin_list_users_with_orgs() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Get access token from refresh token
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
@@ -2483,7 +2496,7 @@ async fn test_admin_list_users_with_orgs() {
 #[tokio::test]
 #[ignore = "skip the test as the user has created orgs in other tests"]
 async fn test_admin_list_users_with_organizations() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Get access token from refresh token
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
@@ -2559,7 +2572,7 @@ async fn test_admin_list_users_with_organizations() {
 
 #[tokio::test]
 async fn test_admin_list_users_with_organizations_no_spend_limit() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Get access token from refresh token
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
@@ -2602,7 +2615,7 @@ async fn test_admin_list_users_with_organizations_no_spend_limit() {
 
 #[tokio::test]
 async fn test_admin_list_users_pagination() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Get access token from refresh token
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
@@ -2658,7 +2671,7 @@ async fn test_admin_list_users_pagination() {
 
 #[tokio::test]
 async fn test_admin_list_users_pagination_with_organizations() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Get access token from refresh token
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
@@ -2696,7 +2709,7 @@ async fn test_admin_list_users_pagination_with_organizations() {
 
 #[tokio::test]
 async fn test_admin_list_users_unauthorized() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Try to list users without authentication
     let response = server.get("/v1/admin/users").await;
@@ -2709,7 +2722,7 @@ async fn test_admin_list_users_unauthorized() {
 #[tokio::test]
 #[ignore = "skip the test as the user has created orgs in other tests"]
 async fn test_admin_list_users_earliest_organization_only() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Get access token from refresh token
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
@@ -2773,7 +2786,7 @@ async fn test_admin_list_users_earliest_organization_only() {
 
 #[tokio::test]
 async fn test_admin_list_users_default_parameters() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
 
     // Get access token from refresh token
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;

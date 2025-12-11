@@ -426,6 +426,7 @@ impl S3Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_is_admin_email() {
@@ -463,7 +464,10 @@ mod tests {
         assert!(!config.is_admin_email("admin@near.ai"));
     }
 
+    // CORS config tests - marked #[serial] because they modify environment variables
+
     #[test]
+    #[serial]
     fn test_cors_config_parsing_exact_matches() {
         std::env::set_var(
             "CORS_ALLOWED_ORIGINS",
@@ -481,6 +485,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_cors_config_parsing_wildcard_with_dot() {
         std::env::set_var("CORS_ALLOWED_ORIGINS", "*.near.ai");
         let config = CorsConfig::default();
@@ -490,6 +495,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_cors_config_parsing_wildcard_without_dot() {
         std::env::set_var("CORS_ALLOWED_ORIGINS", "*near.ai");
         let config = CorsConfig::default();
@@ -498,6 +504,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_cors_config_parsing_wildcard_with_hyphen() {
         std::env::set_var("CORS_ALLOWED_ORIGINS", "*-example.com");
         let config = CorsConfig::default();
@@ -506,6 +513,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_cors_config_parsing_mixed() {
         std::env::set_var(
             "CORS_ALLOWED_ORIGINS",
@@ -524,6 +532,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_cors_config_parsing_whitespace() {
         std::env::set_var("CORS_ALLOWED_ORIGINS", " https://example.com , *.near.ai ");
         let config = CorsConfig::default();
@@ -535,6 +544,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_cors_config_parsing_empty_entries() {
         std::env::set_var("CORS_ALLOWED_ORIGINS", "https://example.com,,*.near.ai,");
         let config = CorsConfig::default();
@@ -572,11 +582,9 @@ pub struct CorsConfig {
     pub wildcard_suffixes: Vec<String>,
 }
 
-impl Default for CorsConfig {
-    fn default() -> Self {
-        let raw_origins = env::var("CORS_ALLOWED_ORIGINS")
-            .unwrap_or_else(|_| "http://localhost:3000,https://near.ai,*.near.ai".to_string());
-
+impl CorsConfig {
+    /// Parse CORS configuration from a comma-separated string of allowed origins
+    pub fn from_origins(raw_origins: &str) -> Self {
         let mut exact_matches = Vec::new();
         let mut wildcard_suffixes = Vec::new();
 
@@ -602,5 +610,13 @@ impl Default for CorsConfig {
             exact_matches,
             wildcard_suffixes,
         }
+    }
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        let raw_origins = env::var("CORS_ALLOWED_ORIGINS")
+            .unwrap_or_else(|_| "http://localhost:3000,https://near.ai,*.near.ai".to_string());
+        Self::from_origins(&raw_origins)
     }
 }

@@ -122,7 +122,7 @@ fn verify_citation_validity(annotation: &serde_json::Value, text: &str, citation
 #[tokio::test]
 #[ignore]
 async fn test_non_streaming_web_search_with_citations() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
     let model = setup_glm_model(&server).await;
@@ -272,7 +272,7 @@ async fn test_non_streaming_web_search_with_citations() {
 
 #[tokio::test]
 async fn test_streaming_web_search_with_citations() {
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
     let model = setup_glm_model(&server).await;
@@ -574,7 +574,7 @@ async fn capture_streaming_citations_to_file() {
     use std::fs::File;
     use std::io::Write;
 
-    let server = setup_test_server().await;
+    let server = setup_test_server(None).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
     let model = setup_glm_model(&server).await;

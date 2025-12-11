@@ -6,10 +6,6 @@ authors.workspace = true
 license.workspace = true
 description.workspace = true
 
-[features]
-# Feature flag for test support - enables test-only initialization functions
-test-support = ["services/test-support"]
-
 [dependencies]
 axum = { version = "0.8", features = ["macros", "multipart"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }

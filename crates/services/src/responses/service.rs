@@ -1792,20 +1792,11 @@ impl ResponseServiceImpl {
         // Base reasoning tag names (used when matching parsed tag names)
         const REASONING_TAGS: &[&str] = &["think", "reasoning", "thought", "reflect", "analysis"];
 
-        // String prefixes (with '<' / '</') used for cheap substring checks in the fast path.
-        // This avoids allocating strings with `format!` on every call.
-        const REASONING_TAG_PREFIXES: &[&str] = &[
-            "<think",
-            "</think",
-            "<reasoning",
-            "</reasoning",
-            "<thought",
-            "</thought",
-            "<reflect",
-            "</reflect",
-            "<analysis",
-            "</analysis",
-        ];
+        // String prefixes (with '<' and '</') used for cheap substring checks in the fast path.
+        // This avoids allocating strings with `format!` on every call and keeps the list
+        // in sync with REASONING_TAGS.
+        const REASONING_TAG_PREFIXES: &[&str] =
+            &["<think", "<reasoning", "<thought", "<reflect", "<analysis"];
 
         // Fast paths for common cases when we're not currently inside a reasoning block.
         //
@@ -1906,7 +1897,18 @@ impl ResponseServiceImpl {
                         }
                     } else {
                         // Hit a non-tag-name character (like '!' in <!DOCTYPE, space, etc.)
-                        // This is not a simple reasoning tag, collect the entire tag content
+                        // This is not a simple reasoning tag, collect the entire tag content.
+                        //
+                        // However, if we've already seen non-tag-name characters for this tag
+                        // and now see another '<', this likely indicates the start of a new tag
+                        // (e.g. in sequences like "<think>1 < 2</think>"). In that case we
+                        // should stop parsing the current tag and let the outer loop handle
+                        // the next '<' as a new tag, instead of greedily consuming
+                        // "</think>" into this tag.
+                        if found_non_tag_char && next_ch == '<' {
+                            break;
+                        }
+
                         found_non_tag_char = true;
                         full_tag.push(next_ch);
                         chars.next();
@@ -2940,8 +2942,8 @@ mod tests {
             &mut inside_reasoning,
         );
 
-        // Extra closing tag should be ignored, text should remain
-        assert_eq!(clean, "Text");
+        // Hole text should remain
+        assert_eq!(clean, input);
         assert_eq!(reasoning, None);
         assert!(!inside_reasoning);
         assert_eq!(transition, TagTransition::None);

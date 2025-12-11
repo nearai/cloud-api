@@ -10,6 +10,7 @@ use tracing::{debug, warn};
 
 use super::auth::AuthenticatedApiKey;
 use crate::models::ErrorResponse;
+use crate::routes::common::format_amount;
 
 /// State for usage middleware
 #[derive(Clone)]
@@ -167,37 +168,5 @@ pub async fn usage_check_middleware(
                 )),
             ))
         }
-    }
-}
-
-/// Helper function to format amount (fixed scale 9 = nano-dollars, USD)
-fn format_amount(amount: i64) -> String {
-    const SCALE: i64 = 9;
-    let divisor = 10_i64.pow(SCALE as u32);
-    let whole = amount / divisor;
-    let fraction = amount % divisor;
-
-    if fraction == 0 {
-        format!("${whole}.00")
-    } else {
-        // Format with leading zeros, then trim trailing zeros
-        let fraction_str = format!("{fraction:09}");
-        let trimmed = fraction_str.trim_end_matches('0');
-        format!("${whole}.{trimmed}")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_format_amount() {
-        // Test with scale 9 (nano-dollars)
-        assert_eq!(format_amount(1000000000), "$1.00");
-        assert_eq!(format_amount(1500000000), "$1.5");
-        assert_eq!(format_amount(100), "$0.0000001");
-        assert_eq!(format_amount(1), "$0.000000001");
-        assert_eq!(format_amount(0), "$0.00");
     }
 }

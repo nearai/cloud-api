@@ -4,9 +4,10 @@ use crate::models::{
     AdminUserOrganizationDetails, AdminUserResponse, BatchUpdateModelApiRequest,
     CreateAdminAccessTokenRequest, DecimalPrice, DeleteAdminAccessTokenRequest, ErrorResponse,
     ListUsersResponse, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
-    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, SpendLimit, UpdateOrganizationLimitsRequest,
-    UpdateOrganizationLimitsResponse,
+    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, SpendLimit,
+    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
 };
+use crate::routes::common::format_amount;
 use axum::{
     extract::{Json, Path, Query, State},
     http::HeaderMap,
@@ -686,6 +687,13 @@ pub async fn list_users(
             .into_iter()
             .map(|(u, org_data)| {
                 let organizations = org_data.map(|org_info| {
+                    let current_usage = org_info.total_spent.map(|total_spent| OrganizationUsage {
+                        total_spent,
+                        total_spent_display: format_amount(total_spent),
+                        total_requests: org_info.total_requests.unwrap_or(0),
+                        total_tokens: org_info.total_tokens.unwrap_or(0),
+                    });
+
                     vec![AdminUserOrganizationDetails {
                         id: org_info.id.to_string(),
                         name: org_info.name,
@@ -695,6 +703,7 @@ pub async fn list_users(
                             scale: 9,
                             currency: "USD".to_string(),
                         }),
+                        current_usage,
                     }]
                 });
 

@@ -45,6 +45,7 @@ aws-config = { version = "1.5", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.70"
 # Ordered collections
 indexmap = "2"
+moka = { version = "0.12.11", features = ["future"] }
 
 [dev-dependencies]
 axum-test = "18"

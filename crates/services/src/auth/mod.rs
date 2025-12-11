@@ -3,15 +3,27 @@ pub mod ports;
 
 pub use oauth::OAuthManager;
 pub use ports::*;
-use tracing::debug;
+use tracing::{debug, error, info, warn};
 
+use crate::common::{hash_api_key, is_valid_api_key_format};
 use crate::organization::OrganizationRepository;
 use crate::workspace::{ApiKey, ApiKeyRepository, WorkspaceId, WorkspaceRepository};
 use async_trait::async_trait;
+use bloomfilter::Bloom;
 use chrono::Utc;
+use moka::future::Cache;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
 
-pub const MAX_USER_AGENT_LEN: usize = 4096; // 4KB
+pub const MAX_USER_AGENT_LEN: usize = 4096;
+
+const API_KEY_CACHE_MAX_CAPACITY: u64 = 10_000;
+const API_KEY_CACHE_TTL_SECS: u64 = 30;
+const BLOOM_FILTER_ITEMS: usize = 10_000_000;
+const BLOOM_FILTER_FP_RATE: f64 = 0.001;
+const BLOOM_FILTER_SYNC_INTERVAL_SECS: u64 = 30;
 
 #[async_trait]
 impl AuthServiceTrait for AuthService {
@@ -341,12 +353,35 @@ impl AuthServiceTrait for AuthService {
     }
 
     async fn validate_api_key(&self, api_key: String) -> Result<ApiKey, AuthError> {
-        debug!("Validating API key: {}", api_key);
-        self.api_key_repository
+        if !is_valid_api_key_format(&api_key) {
+            return Err(AuthError::Unauthorized);
+        }
+
+        let key_hash = hash_api_key(&api_key);
+
+        if let Some(cached_key) = self.api_key_cache.get(&key_hash).await {
+            return Ok(cached_key);
+        }
+
+        if self.bloom_filter_ready.load(Ordering::Acquire) {
+            let bloom = self.api_key_bloom_filter.read().await;
+            if !bloom.check(&key_hash) {
+                return Err(AuthError::Unauthorized);
+            }
+        }
+
+        let validated_key = self
+            .api_key_repository
             .validate(api_key)
             .await
             .map_err(|e| AuthError::InternalError(format!("Failed to validate API key: {e}")))?
-            .ok_or(AuthError::Unauthorized)
+            .ok_or(AuthError::Unauthorized)?;
+
+        self.api_key_cache
+            .insert(key_hash, validated_key.clone())
+            .await;
+
+        Ok(validated_key)
     }
 
     async fn can_manage_workspace_api_keys(
@@ -384,6 +419,22 @@ impl AuthService {
         workspace_repository: Arc<dyn WorkspaceRepository>,
         organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
     ) -> Self {
+        let api_key_cache: ApiKeyCache = Cache::builder()
+            .max_capacity(API_KEY_CACHE_MAX_CAPACITY)
+            .time_to_live(Duration::from_secs(API_KEY_CACHE_TTL_SECS))
+            .build();
+
+        let bloom = Bloom::new_for_fp_rate(BLOOM_FILTER_ITEMS, BLOOM_FILTER_FP_RATE)
+            .expect("bloom filter creation failed");
+        let api_key_bloom_filter: ApiKeyBloomFilter = Arc::new(RwLock::new(bloom));
+        let bloom_filter_ready: BloomFilterReady = Arc::new(AtomicBool::new(false));
+
+        Self::spawn_bloom_filter_sync(
+            api_key_repository.clone(),
+            api_key_bloom_filter.clone(),
+            bloom_filter_ready.clone(),
+        );
+
         Self {
             user_repository,
             session_repository,
@@ -391,7 +442,59 @@ impl AuthService {
             organization_repository,
             workspace_repository,
             organization_service,
+            api_key_cache,
+            api_key_bloom_filter,
+            bloom_filter_ready,
         }
+    }
+
+    fn spawn_bloom_filter_sync(
+        api_key_repository: Arc<dyn ApiKeyRepository>,
+        bloom_filter: ApiKeyBloomFilter,
+        ready_flag: BloomFilterReady,
+    ) {
+        tokio::spawn(async move {
+            match api_key_repository.get_all_active_key_hashes().await {
+                Ok(hashes) => {
+                    let count = hashes.len();
+                    let mut bloom = bloom_filter.write().await;
+                    for hash in hashes {
+                        bloom.set(&hash);
+                    }
+                    drop(bloom);
+                    ready_flag.store(true, Ordering::Release);
+                    info!("Initialized bloom filter with {} keys", count);
+                }
+                Err(e) => {
+                    error!("Failed to initialize bloom filter: {}", e);
+                }
+            }
+
+            let mut last_sync = Utc::now();
+            loop {
+                tokio::time::sleep(Duration::from_secs(BLOOM_FILTER_SYNC_INTERVAL_SECS)).await;
+                let query_time = Utc::now();
+
+                match api_key_repository
+                    .get_active_key_hashes_created_after(last_sync)
+                    .await
+                {
+                    Ok(new_hashes) => {
+                        if !new_hashes.is_empty() {
+                            let mut bloom = bloom_filter.write().await;
+                            for hash in &new_hashes {
+                                bloom.set(hash);
+                            }
+                            debug!("Added {} keys to bloom filter", new_hashes.len());
+                        }
+                        last_sync = query_time;
+                    }
+                    Err(e) => {
+                        warn!("Failed to sync bloom filter: {}", e);
+                    }
+                }
+            }
+        });
     }
 
     /// Clean up expired sessions

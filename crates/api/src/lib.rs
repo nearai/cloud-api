@@ -545,6 +545,8 @@ pub fn build_app_with_config(
         api_key_repository,
     };
 
+    let rate_limit_state = middleware::RateLimitState::default();
+
     // Build individual route groups
     let auth_routes = build_auth_routes(
         auth_components.oauth_manager.clone(),
@@ -558,6 +560,7 @@ pub fn build_app_with_config(
         app_state.clone(),
         &auth_components.auth_state_middleware,
         usage_state.clone(),
+        rate_limit_state.clone(),
     );
 
     let response_routes = build_response_routes(
@@ -565,6 +568,7 @@ pub fn build_app_with_config(
         domain_services.attestation_service.clone(),
         &auth_components.auth_state_middleware,
         usage_state,
+        rate_limit_state.clone(),
     );
 
     let conversation_routes = build_conversation_routes(
@@ -716,35 +720,37 @@ pub fn build_completion_routes(
     app_state: AppState,
     auth_state_middleware: &AuthState,
     usage_state: middleware::UsageState,
+    rate_limit_state: middleware::RateLimitState,
 ) -> Router {
-    // Routes that require credits (actual inference)
     let inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
-        // .route("/completions", post(completions))
         .with_state(app_state.clone())
-        // First check usage limits for inference endpoints
         .layer(from_fn_with_state(
             usage_state,
             middleware::usage_check_middleware,
         ))
-        // Then authenticate with workspace context (provides organization)
+        .layer(from_fn_with_state(
+            rate_limit_state.clone(),
+            middleware::api_key_rate_limit_middleware,
+        ))
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
         .layer(from_fn(middleware::body_hash_middleware));
 
-    // Routes that don't require credits (metadata)
     let metadata_routes = Router::new()
         .route("/models", get(models))
         .with_state(app_state)
-        // Only require API key, no usage check
+        .layer(from_fn_with_state(
+            rate_limit_state,
+            middleware::api_key_rate_limit_middleware,
+        ))
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware_with_api_key,
         ));
 
-    // Merge routes
     Router::new().merge(inference_routes).merge(metadata_routes)
 }
 
@@ -754,13 +760,13 @@ pub fn build_response_routes(
     attestation_service: Arc<dyn services::attestation::ports::AttestationServiceTrait>,
     auth_state_middleware: &AuthState,
     usage_state: middleware::UsageState,
+    rate_limit_state: middleware::RateLimitState,
 ) -> Router {
     let route_state = responses::ResponseRouteState {
         response_service: response_service.clone(),
         attestation_service: attestation_service.clone(),
     };
 
-    // Create response route with usage check
     let inference_routes = Router::new()
         .route("/responses", post(responses::create_response))
         .with_state(route_state.clone())
@@ -769,12 +775,15 @@ pub fn build_response_routes(
             middleware::usage_check_middleware,
         ))
         .layer(from_fn_with_state(
+            rate_limit_state.clone(),
+            middleware::api_key_rate_limit_middleware,
+        ))
+        .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
         .layer(from_fn(middleware::body_hash_middleware));
 
-    // Response management routes
     let other_routes = Router::new()
         .route("/responses/{response_id}", get(responses::get_response))
         .route(
@@ -790,6 +799,10 @@ pub fn build_response_routes(
             get(responses::list_input_items),
         )
         .with_state(route_state)
+        .layer(from_fn_with_state(
+            rate_limit_state,
+            middleware::api_key_rate_limit_middleware,
+        ))
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,

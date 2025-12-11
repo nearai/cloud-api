@@ -217,6 +217,15 @@ pub trait ApiKeyRepository: Send + Sync {
 
     /// Revoke (soft delete) an API key
     async fn revoke(&self, id: ApiKeyId) -> Result<bool, RepositoryError>;
+
+    /// Get all active key hashes (for Bloom Filter initialization)
+    async fn get_all_active_key_hashes(&self) -> Result<Vec<String>, RepositoryError>;
+
+    /// Get key hashes created after a timestamp (for incremental Bloom Filter updates)
+    async fn get_active_key_hashes_created_after(
+        &self,
+        timestamp: DateTime<Utc>,
+    ) -> Result<Vec<String>, RepositoryError>;
 }
 
 // Service trait

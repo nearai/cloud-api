@@ -1,11 +1,19 @@
 use async_trait::async_trait;
+use bloomfilter::Bloom;
 use chrono::{DateTime, Utc};
+use moka::future::Cache;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::organization::OrganizationRepository;
 use crate::workspace::{ApiKey, ApiKeyRepository, WorkspaceId, WorkspaceRepository};
+
+pub type ApiKeyCache = Cache<String, ApiKey>;
+pub type ApiKeyBloomFilter = Arc<RwLock<Bloom<String>>>;
+pub type BloomFilterReady = Arc<AtomicBool>;
 
 // Domain ID types
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -315,6 +323,9 @@ pub struct AuthService {
     pub organization_repository: Arc<dyn OrganizationRepository>,
     pub workspace_repository: Arc<dyn WorkspaceRepository>,
     pub organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
+    pub api_key_cache: ApiKeyCache,
+    pub api_key_bloom_filter: ApiKeyBloomFilter,
+    pub bloom_filter_ready: BloomFilterReady,
 }
 
 pub struct UserService {

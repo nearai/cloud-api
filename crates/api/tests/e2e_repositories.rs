@@ -3,33 +3,13 @@
 mod common;
 
 use chrono::{Duration, Utc};
-use database::{Database, OAuthStateRepository};
+use database::OAuthStateRepository;
 
 // Helper to get database pool for repository testing
 async fn get_test_pool() -> database::pool::DbPool {
     let (_server, _inference_provider_pool, _mock_provider, database) =
         common::setup_test_server_with_pool().await;
     database.pool().clone()
-}
-
-// Helper to create database pool for repository testing
-async fn create_test_pool() -> database::pool::DbPool {
-    let config = config::DatabaseConfig {
-        primary_app_id: "postgres-test".to_string(),
-        gateway_subdomain: "cvm1.near.ai".to_string(),
-        port: 5432,
-        host: None,
-        database: "platform_api".to_string(),
-        username: std::env::var("DATABASE_USERNAME").unwrap_or("postgres".to_string()),
-        password: std::env::var("DATABASE_PASSWORD").unwrap_or("postgres".to_string()),
-        max_connections: 2,
-        tls_enabled: false,
-        tls_ca_cert_path: None,
-        refresh_interval: 30,
-        mock: false,
-    };
-
-    Database::from_config(&config).await.unwrap().pool().clone()
 }
 
 // ============================================

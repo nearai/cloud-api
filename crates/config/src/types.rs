@@ -352,11 +352,12 @@ pub struct NearConfig {
 }
 
 const NEAR_DEFAULT_RECIPIENT: &str = "cloud.near.ai";
+const NEAR_DEFAULT_RPC_URL: &str = "https://free.rpc.fastnear.com";
 
 impl Default for NearConfig {
     fn default() -> Self {
         Self {
-            rpc_url: "https://free.rpc.fastnear.com".to_string(),
+            rpc_url: NEAR_DEFAULT_RPC_URL.to_string(),
             expected_recipient: NEAR_DEFAULT_RECIPIENT.to_string(),
         }
     }
@@ -365,9 +366,9 @@ impl Default for NearConfig {
 impl NearConfig {
     pub fn from_env() -> Self {
         Self {
-            rpc_url: env::var("NEAR_RPC_URL")
-                .unwrap_or_else(|_| "https://free.rpc.fastnear.com".to_string()),
-            expected_recipient: NEAR_DEFAULT_RECIPIENT.to_string(),
+            rpc_url: env::var("NEAR_RPC_URL").unwrap_or_else(|_| NEAR_DEFAULT_RPC_URL.to_string()),
+            expected_recipient: env::var("NEAR_EXPECTED_RECIPIENT")
+                .unwrap_or_else(|_| NEAR_DEFAULT_RECIPIENT.to_string()),
         }
     }
 }

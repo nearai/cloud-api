@@ -519,7 +519,7 @@ pub async fn near_login(
                 status,
                 Json(serde_json::json!({
                     "error": error_type,
-                    "error_description": e.to_string()
+                    "error_description": "NEAR authentication failed"
 
                 })),
             )

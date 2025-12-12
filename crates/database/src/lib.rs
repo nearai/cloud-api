@@ -1,4 +1,5 @@
 pub mod cluster_manager;
+pub mod constants;
 pub mod migrations;
 pub mod mock;
 pub mod models;
@@ -7,6 +8,7 @@ pub mod pool;
 pub mod repositories;
 pub mod shutdown_coordinator;
 
+pub use constants::*;
 pub use models::*;
 pub use pool::DbPool;
 pub use repositories::{

@@ -351,9 +351,13 @@ impl MockAuthService {
     }
 
     fn create_mock_user_with_id(id: UserId) -> User {
+        Self::create_mock_user_with_id_and_email(id, "admin@test.com".to_string())
+    }
+
+    fn create_mock_user_with_id_and_email(id: UserId, email: String) -> User {
         User {
             id,
-            email: "admin@test.com".to_string(),
+            email,
             username: "testuser".to_string(),
             display_name: Some("Test User".to_string()),
             avatar_url: Some("https://example.com/avatar.jpg".to_string()),
@@ -365,6 +369,17 @@ impl MockAuthService {
             updated_at: chrono::Utc::now(),
             tokens_revoked_at: None,
         }
+    }
+
+    /// Extract user ID from a token in format "rt_{uuid}"
+    /// Falls back to MOCK_USER_ID if parsing fails
+    fn extract_user_id_from_token(token: &str) -> UserId {
+        if let Some(uuid_str) = token.strip_prefix("rt_") {
+            if let Ok(uuid) = uuid::Uuid::parse_str(uuid_str) {
+                return UserId(uuid);
+            }
+        }
+        UserId(uuid::Uuid::parse_str(MOCK_USER_ID).expect("Invalid mock user ID"))
     }
 
     fn create_mock_session(&self, user_id: UserId) -> (String, Session, String) {
@@ -491,14 +506,17 @@ impl AuthServiceTrait for MockAuthService {
         access_token: String,
         encoding_key: String,
     ) -> Result<User, AuthError> {
-        match self.validate_session_access_token(access_token, encoding_key) {
+        // First try to decode as JWT
+        match self.validate_session_access_token(access_token.clone(), encoding_key) {
             Ok(Some(claims)) => {
                 let user = Self::create_mock_user_with_id(claims.sub);
                 tracing::debug!("MockAuthService returning mock user: {}", user.email);
                 Ok(user)
             }
             Ok(None) => {
-                let user = Self::create_mock_user();
+                // JWT decoding failed - try to extract user ID from rt_ token format
+                let user_id = Self::extract_user_id_from_token(&access_token);
+                let user = Self::create_mock_user_with_id(user_id);
                 tracing::debug!("MockAuthService returning mock user: {}", user.email);
                 Ok(user)
             }
@@ -511,9 +529,10 @@ impl AuthServiceTrait for MockAuthService {
         session_token: SessionToken,
         user_agent: &str,
     ) -> Result<Option<Session>, AuthError> {
-        // Accept the known test session token or any token that starts with "rt_"
+        // Accept any token that starts with "rt_"
         if session_token.0.starts_with("rt_") && user_agent == MOCK_USER_AGENT {
-            let mock_user = Self::create_mock_user();
+            let user_id = Self::extract_user_id_from_token(&session_token.0);
+            let mock_user = Self::create_mock_user_with_id(user_id);
             let (_access_token, refresh_session, _refresh_token) =
                 self.create_mock_session(mock_user.id);
             Ok(Some(refresh_session))
@@ -532,9 +551,10 @@ impl AuthServiceTrait for MockAuthService {
             session_token,
             user_agent
         );
-        // Accept the known test session token or any token that starts with "rt_"
+        // Accept any token that starts with "rt_"
         if session_token.0.starts_with("rt_") && user_agent == MOCK_USER_AGENT {
-            let user = Self::create_mock_user();
+            let user_id = Self::extract_user_id_from_token(&session_token.0);
+            let user = Self::create_mock_user_with_id(user_id);
             let (_, session, _) = self.create_mock_session(user.id.clone());
             tracing::debug!("MockAuthService returning mock user: {}", user.email);
             Ok((session, user))

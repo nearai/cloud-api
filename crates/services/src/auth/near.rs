@@ -1,7 +1,6 @@
 use chrono::{DateTime, Duration, Utc};
 use config::NearConfig;
 use near_api::{signer::NEP413Payload, types::Signature, AccountId, NetworkConfig, PublicKey};
-use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use url::Url;
 
@@ -9,40 +8,31 @@ use super::ports::{AuthServiceTrait, NearNonceRepository, OAuthUserInfo, Session
 
 const MAX_NONCE_AGE_MS: u64 = 5 * 60 * 1000; // 5 minutes
 const EXPECTED_MESSAGE: &str = "Sign in to NEAR AI Cloud";
+const ACCESS_TOKEN_LIFETIME_HOURS: i64 = 1;
+const REFRESH_TOKEN_LIFETIME_HOURS: i64 = 7 * 24; // 7 days
 
 /// Custom error type for NEAR authentication
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum NearAuthError {
+    #[error("Invalid signature")]
     InvalidSignature,
+    #[error("Nonce already used (replay attack detected)")]
     ReplayAttack,
+    #[error("Signature expired")]
     ExpiredNonce,
+    #[error("Invalid signature timestamp")]
     InvalidTimestamp,
+    #[error("Invalid nonce: {0}")]
     InvalidNonce(String),
+    #[error("Invalid recipient: {0}")]
     InvalidRecipient(String),
+    #[error("Invalid message: {0}")]
     InvalidMessage(String),
+    #[error("Signature verification failed: {0}")]
     SignatureVerificationFailed(String),
+    #[error("{0}")]
     InternalError(String),
 }
-
-impl Display for NearAuthError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidSignature => write!(f, "Invalid signature"),
-            Self::ReplayAttack => write!(f, "Nonce already used (replay attack detected)"),
-            Self::ExpiredNonce => write!(f, "Signature expired"),
-            Self::InvalidTimestamp => write!(f, "Invalid signature timestamp"),
-            Self::InvalidNonce(msg) => write!(f, "Invalid nonce: {msg}"),
-            Self::InvalidRecipient(msg) => write!(f, "Invalid recipient: {msg}"),
-            Self::InvalidMessage(msg) => write!(f, "Invalid message: {msg}"),
-            Self::SignatureVerificationFailed(msg) => {
-                write!(f, "Signature verification failed: {msg}")
-            }
-            Self::InternalError(msg) => write!(f, "{msg}"),
-        }
-    }
-}
-
-impl std::error::Error for NearAuthError {}
 
 /// Signed message data received from the wallet (NEP-413 output)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -249,8 +239,8 @@ impl NearAuthService {
                 ip_address,
                 user_agent,
                 encoding_key,
-                1,
-                7 * 24,
+                ACCESS_TOKEN_LIFETIME_HOURS,
+                REFRESH_TOKEN_LIFETIME_HOURS,
             )
             .await
             .map_err(|e| anyhow::anyhow!(NearAuthError::InternalError(e.to_string())))?;

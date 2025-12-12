@@ -37,7 +37,7 @@ jobs:
           prompt: |
             <pr_context>
             REPO: ${{ github.repository }}
-            PR NUMBER: ${{ github.event.pull_request.number }}
+            PR NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
             LANGUAGE: Rust
             </pr_context>
 

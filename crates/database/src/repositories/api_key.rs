@@ -5,9 +5,8 @@ use crate::retry_db;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use services::common::RepositoryError;
+use services::common::{extract_api_key_prefix, generate_api_key, hash_api_key, RepositoryError};
 use services::workspace::ports::CreateApiKeyRequest;
-use sha2::{Digest, Sha256};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -20,34 +19,15 @@ impl ApiKeyRepository {
         Self { pool }
     }
 
-    /// Generate a new API key
-    pub fn generate_api_key() -> String {
-        format!("sk-{}", Uuid::new_v4().to_string().replace("-", ""))
-    }
-
-    /// Hash an API key for storage
-    fn hash_api_key(key: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(key.as_bytes());
-        format!("{:x}", hasher.finalize())
-    }
-
-    /// Extract key prefix from a generated key for display purposes
-    fn extract_key_prefix(key: &str) -> String {
-        // Take first 10 characters (e.g., "sk-abc1234" from "sk-abc1234567890...")
-        let prefix_len = 10.min(key.len());
-        key[..prefix_len].to_string()
-    }
-
     /// Create a new API key
     pub async fn create(
         &self,
         request: CreateApiKeyRequest,
     ) -> Result<(String, ApiKey), RepositoryError> {
         let id = Uuid::new_v4();
-        let key = Self::generate_api_key();
-        let key_hash = Self::hash_api_key(&key);
-        let key_prefix = Self::extract_key_prefix(&key);
+        let key = generate_api_key();
+        let key_hash = hash_api_key(&key);
+        let key_prefix = extract_api_key_prefix(&key);
 
         let _row = retry_db!("create_api_key", {
             let now = Utc::now();
@@ -140,7 +120,7 @@ impl ApiKeyRepository {
     /// Validate an API key globally and return it if valid
     /// API keys are globally unique across all workspaces
     pub async fn validate(&self, key: &str) -> Result<Option<ApiKey>, RepositoryError> {
-        let key_hash = Self::hash_api_key(key);
+        let key_hash = hash_api_key(key);
 
         let row = retry_db!("validate_api_key", {
             let client = self
@@ -546,6 +526,64 @@ impl ApiKeyRepository {
             usage: row.get("usage"),
         })
     }
+
+    /// Get all active key hashes for Bloom Filter initialization
+    pub async fn get_all_active_key_hashes(&self) -> Result<Vec<String>, RepositoryError> {
+        let rows = retry_db!("get_all_active_key_hashes", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query(
+                    r#"
+                    SELECT key_hash FROM api_keys
+                    WHERE is_active = true
+                      AND deleted_at IS NULL
+                      AND (expires_at IS NULL OR expires_at > NOW())
+                    "#,
+                    &[],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(rows.into_iter().map(|row| row.get("key_hash")).collect())
+    }
+
+    /// Get key hashes created after a timestamp for incremental Bloom Filter updates
+    pub async fn get_active_key_hashes_created_after(
+        &self,
+        timestamp: DateTime<Utc>,
+    ) -> Result<Vec<String>, RepositoryError> {
+        let rows = retry_db!("get_active_key_hashes_created_after", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query(
+                    r#"
+                    SELECT key_hash FROM api_keys
+                    WHERE created_at > $1
+                      AND is_active = true
+                      AND deleted_at IS NULL
+                      AND (expires_at IS NULL OR expires_at > NOW())
+                    "#,
+                    &[&timestamp],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(rows.into_iter().map(|row| row.get("key_hash")).collect())
+    }
 }
 
 // Implement the workspace service layer trait
@@ -662,6 +700,17 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
             .context("Invalid UUID format")
             .map_err(RepositoryError::DataConversionError)?;
         self.revoke(uuid).await
+    }
+
+    async fn get_all_active_key_hashes(&self) -> Result<Vec<String>, RepositoryError> {
+        self.get_all_active_key_hashes().await
+    }
+
+    async fn get_active_key_hashes_created_after(
+        &self,
+        timestamp: DateTime<Utc>,
+    ) -> Result<Vec<String>, RepositoryError> {
+        self.get_active_key_hashes_created_after(timestamp).await
     }
 }
 

@@ -54,6 +54,8 @@ aes-gcm = "0.10"
 # HMAC for VPC signature verification
 hmac = "0.12"
 sha2 = "0.10"
+moka = { version = "0.12.11", features = ["future"] }
+bloomfilter = "3.0.1"
 
 [dev-dependencies]
 tokio-test = "0.4"

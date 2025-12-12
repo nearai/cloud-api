@@ -4,6 +4,7 @@ mod common;
 use common::*;
 
 use api::models::BatchUpdateModelApiRequest;
+use database::DEFAULT_MODEL_OWNED_BY;
 use inference_providers::{models::ChatCompletionChunk, StreamChunk};
 
 #[tokio::test]
@@ -13,6 +14,14 @@ async fn test_models_api() {
     let response = list_models(&server, api_key).await;
 
     assert!(!response.data.is_empty());
+
+    // Verify that all models have owned_by field populated
+    for model in &response.data {
+        assert!(
+            !model.owned_by.is_empty(),
+            "owned_by field should not be empty"
+        );
+    }
 }
 
 #[tokio::test]
@@ -157,6 +166,8 @@ async fn test_admin_update_model() {
     );
     assert_eq!(1000000, retrieved_model.input_cost_per_token.amount);
     assert_eq!(2000000, retrieved_model.output_cost_per_token.amount);
+    // Verify that owned_by defaults to DEFAULT_MODEL_OWNED_BY when not explicitly provided
+    assert_eq!(retrieved_model.metadata.owned_by, DEFAULT_MODEL_OWNED_BY);
 }
 
 #[tokio::test]
@@ -200,6 +211,8 @@ async fn test_get_model_by_name() {
     assert_eq!(2000000, model_resp.output_cost_per_token.amount);
     assert_eq!(9, model_resp.output_cost_per_token.scale);
     assert_eq!("USD", model_resp.output_cost_per_token.currency);
+    // Verify that owned_by defaults to DEFAULT_MODEL_OWNED_BY when not explicitly provided
+    assert_eq!(model_resp.metadata.owned_by, DEFAULT_MODEL_OWNED_BY);
 
     // Test retrieving the same model again by canonical name to verify consistency
     let response_by_name_again = server
@@ -248,6 +261,157 @@ async fn test_get_model_by_name() {
     } else {
         println!("Warning: 404 response had empty body");
     }
+}
+
+#[tokio::test]
+async fn test_admin_model_custom_owned_by() {
+    let server = setup_test_server().await;
+
+    // Test 1: Create model with custom owned_by value
+    let mut batch1 = BatchUpdateModelApiRequest::new();
+    batch1.insert(
+        "custom-model-1".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 1000000,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 2000000,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Custom Model",
+            "modelDescription": "Test custom owned_by",
+            "contextLength": 128000,
+            "verifiable": true,
+            "ownedBy": "openai"
+        }))
+        .unwrap(),
+    );
+
+    let created_models = admin_batch_upsert_models(&server, batch1, get_session_id()).await;
+    assert_eq!(created_models.len(), 1);
+    let created_model = &created_models[0];
+    assert_eq!(
+        created_model.metadata.owned_by, "openai",
+        "Created model should have custom owned_by"
+    );
+
+    // Test 2: Retrieve model and verify custom owned_by persisted
+    let model_name = created_model.model_id.clone();
+    let encoded_name =
+        url::form_urlencoded::byte_serialize(model_name.as_bytes()).collect::<String>();
+    let response = server
+        .get(format!("/v1/model/{encoded_name}").as_str())
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let retrieved_model = response.json::<api::models::ModelWithPricing>();
+    assert_eq!(
+        retrieved_model.metadata.owned_by, "openai",
+        "Retrieved model should have custom owned_by"
+    );
+
+    // Test 3: Update model WITHOUT specifying ownedBy (should preserve)
+    let mut batch2 = BatchUpdateModelApiRequest::new();
+    batch2.insert(
+        "custom-model-1".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 5000000,
+                "currency": "USD"
+            }
+        }))
+        .unwrap(),
+    );
+
+    let updated_models = admin_batch_upsert_models(&server, batch2, get_session_id()).await;
+    assert_eq!(updated_models.len(), 1);
+    assert_eq!(
+        updated_models[0].metadata.owned_by, "openai",
+        "Updated model should preserve owned_by when not explicitly set"
+    );
+
+    // Test 4: Override owned_by during update
+    let mut batch3 = BatchUpdateModelApiRequest::new();
+    batch3.insert(
+        "custom-model-1".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 5000000,
+                "currency": "USD"
+            },
+            "ownedBy": "anthropic"
+        }))
+        .unwrap(),
+    );
+
+    let overridden_models = admin_batch_upsert_models(&server, batch3, get_session_id()).await;
+    assert_eq!(overridden_models.len(), 1);
+    assert_eq!(
+        overridden_models[0].metadata.owned_by, "anthropic",
+        "Updated model should have new owned_by when explicitly provided"
+    );
+
+    // Test 5: Verify the override persisted in retrieval
+    let response = server
+        .get(format!("/v1/model/{encoded_name}").as_str())
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let final_model = response.json::<api::models::ModelWithPricing>();
+    assert_eq!(
+        final_model.metadata.owned_by, "anthropic",
+        "Final retrieval should confirm override"
+    );
+}
+
+#[tokio::test]
+async fn test_admin_model_default_owned_by() {
+    let server = setup_test_server().await;
+
+    // Create a unique model name to ensure we test INSERT path, not UPDATE path
+    let unique_model_name = format!("test-model-{}", uuid::Uuid::new_v4());
+
+    // Create model WITHOUT specifying ownedBy - should default to DEFAULT_MODEL_OWNED_BY
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        unique_model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 1000000,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 2000000,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Test Default Owned By",
+            "modelDescription": "Testing default owned_by value",
+            "contextLength": 128000,
+            "verifiable": true
+            // NOTE: No ownedBy field - should default to DEFAULT_MODEL_OWNED_BY
+        }))
+        .unwrap(),
+    );
+
+    let created_models = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    assert_eq!(created_models.len(), 1);
+    assert_eq!(
+        created_models[0].metadata.owned_by, DEFAULT_MODEL_OWNED_BY,
+        "Model created without ownedBy should default to DEFAULT_MODEL_OWNED_BY"
+    );
+
+    // Verify the default persists in retrieval
+    let encoded_name =
+        url::form_urlencoded::byte_serialize(unique_model_name.as_bytes()).collect::<String>();
+    let response = server
+        .get(format!("/v1/model/{encoded_name}").as_str())
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let retrieved_model = response.json::<api::models::ModelWithPricing>();
+    assert_eq!(
+        retrieved_model.metadata.owned_by, DEFAULT_MODEL_OWNED_BY,
+        "Retrieved model should have default owned_by value"
+    );
 }
 
 #[tokio::test]
@@ -2635,52 +2799,21 @@ async fn test_admin_list_users_with_organizations_no_spend_limit() {
 
 #[tokio::test]
 async fn test_admin_list_users_with_organization_usage() {
-    let server = setup_test_server().await;
-
-    // Setup the model with pricing
+    let (server, database) = setup_test_server_with_database().await;
     setup_qwen_model(&server).await;
 
-    // Get access token from refresh token
-    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+    // Create a unique test user for this test to avoid conflicts with other parallel tests
+    let (unique_session, test_user_email) = setup_unique_test_session(&database).await;
 
-    // Create a unique organization for this test with a recognizable name
-    let org_name = format!("test-usage-{}", uuid::Uuid::new_v4());
-    let request = serde_json::json!({
-        "name": org_name.clone(),
-        "description": "Test organization for usage tracking"
-    });
-
-    let response = server
-        .post("/v1/organizations")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", "test-client")
-        .json(&request)
-        .await;
-
-    assert_eq!(response.status_code(), 200, "Failed to create organization");
-    let org = response.json::<api::models::OrganizationResponse>();
-
-    // Set up spending limit for the organization
-    let update_request = serde_json::json!({
-        "spendLimit": {
-            "amount": 10000000000i64,
-            "currency": "USD"
-        },
-        "changedBy": "admin@test.com",
-        "changeReason": "Test credits"
-    });
-
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", "test-client")
-        .json(&update_request)
-        .await;
-
-    assert_eq!(response.status_code(), 200, "Failed to set spending limit");
-
-    // Get API key for the organization
-    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    // Create an organization with credits using the unique session
+    let org = setup_org_with_credits_and_session_and_email(
+        &server,
+        10000000000i64,
+        &unique_session,
+        &test_user_email,
+    )
+    .await; // $10.00 USD
+    let api_key = get_api_key_for_org_with_session(&server, org.id.clone(), &unique_session).await;
 
     // Make a chat completion request to generate usage
     let response = server
@@ -2706,19 +2839,19 @@ async fn test_admin_list_users_with_organization_usage() {
     // List users with organizations and verify usage is tracked
     let response = server
         .get("/v1/admin/users?limit=50&offset=0&include_organizations=true")
-        .add_header("Authorization", format!("Bearer {access_token}"))
+        .add_header("Authorization", format!("Bearer {}", &unique_session))
         .await;
 
     assert_eq!(response.status_code(), 200);
 
     let users_response = response.json::<api::models::ListUsersResponse>();
 
-    // Find the mock user
+    // Find the test user we created
     let mock_user = users_response
         .users
         .iter()
-        .find(|u| u.email == "admin@test.com")
-        .expect("Should find mock user");
+        .find(|u| u.email == test_user_email)
+        .expect("Should find the test user we created");
 
     // Verify user has at least one organization returned (admin list returns earliest org only)
     let organizations = mock_user

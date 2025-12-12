@@ -48,6 +48,7 @@ near-api = "0.8.0"
 base64 = "0.22"
 # Ordered collections
 indexmap = "2"
+moka = { version = "0.12.11", features = ["future"] }
 
 [dev-dependencies]
 axum-test = "18"

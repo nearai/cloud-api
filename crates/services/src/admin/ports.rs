@@ -103,13 +103,16 @@ pub struct UserInfo {
     pub is_active: bool,
 }
 
-/// Organization information for user listing (earliest organization with spend limit)
+/// Organization information for user listing (earliest organization with spend limit and usage)
 #[derive(Debug, Clone)]
 pub struct UserOrganizationInfo {
     pub id: uuid::Uuid,
     pub name: String,
     pub description: Option<String>,
     pub spend_limit: Option<i64>, // Amount in nano-dollars (scale 9)
+    pub total_spent: Option<i64>, // Amount in nano-dollars (scale 9)
+    pub total_requests: Option<i64>,
+    pub total_tokens: Option<i64>,
 }
 
 /// Model information for admin listing (includes is_active status)

@@ -268,8 +268,8 @@ mod tests {
         assert!(result.is_err(), "Out-of-range timestamp should be rejected");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
-            err_msg.contains("out of valid range"),
-            "Error should mention out of range, got: {err_msg}"
+            err_msg.contains("Invalid nonce"),
+            "Error should be Invalid nonce, got: {err_msg}"
         );
     }
 

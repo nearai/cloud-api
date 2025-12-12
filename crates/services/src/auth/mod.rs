@@ -24,6 +24,7 @@ const API_KEY_CACHE_TTL_SECS: u64 = 30;
 const BLOOM_FILTER_ITEMS: usize = 10_000_000;
 const BLOOM_FILTER_FP_RATE: f64 = 0.001;
 const BLOOM_FILTER_SYNC_INTERVAL_SECS: u64 = 10;
+const BLOOM_FILTER_FULL_REBUILD_INTERVAL_SECS: u64 = 60 * 60;
 
 #[async_trait]
 impl AuthServiceTrait for AuthService {
@@ -453,28 +454,67 @@ impl AuthService {
         bloom_filter: ApiKeyBloomFilter,
         ready_flag: BloomFilterReady,
     ) {
+        /// Fetch all active key hashes, clear the bloom filter, and repopulate it.
+        async fn rebuild_bloom(
+            repo: &dyn ApiKeyRepository,
+            bloom_filter: &ApiKeyBloomFilter,
+            ready_flag: &BloomFilterReady,
+        ) -> Result<usize, String> {
+            let hashes = repo
+                .get_all_active_key_hashes()
+                .await
+                .map_err(|e| e.to_string())?;
+            let count = hashes.len();
+
+            let mut bloom = bloom_filter.write().await;
+            bloom.clear();
+            for hash in hashes {
+                bloom.set(&hash);
+            }
+            drop(bloom);
+
+            ready_flag.store(true, Ordering::Release);
+            Ok(count)
+        }
+
         tokio::spawn(async move {
-            match api_key_repository.get_all_active_key_hashes().await {
-                Ok(hashes) => {
-                    let count = hashes.len();
-                    let mut bloom = bloom_filter.write().await;
-                    for hash in hashes {
-                        bloom.set(&hash);
-                    }
-                    drop(bloom);
-                    ready_flag.store(true, Ordering::Release);
+            let mut last_sync = Utc::now();
+            let mut last_full_rebuild = Utc::now()
+                - chrono::Duration::seconds(BLOOM_FILTER_FULL_REBUILD_INTERVAL_SECS as i64);
+
+            // Initial full build
+            match rebuild_bloom(&*api_key_repository, &bloom_filter, &ready_flag).await {
+                Ok(count) => {
+                    // Keep last_sync at the pre-fetch timestamp to ensure keys created
+                    // during the fetch are picked up by the next incremental sync
+                    last_full_rebuild = Utc::now();
                     info!("Initialized bloom filter with {} keys", count);
                 }
                 Err(e) => {
-                    error!("Failed to initialize bloom filter: {}", e);
+                    error!("Failed to initialize bloom filter; continuing without bloom optimization: {e}");
                 }
             }
 
-            let mut last_sync = Utc::now();
             loop {
                 tokio::time::sleep(Duration::from_secs(BLOOM_FILTER_SYNC_INTERVAL_SECS)).await;
-                let query_time = Utc::now();
+                let now = Utc::now();
 
+                // Periodic full rebuild to remove revoked keys.
+                if (now - last_full_rebuild).num_seconds()
+                    >= BLOOM_FILTER_FULL_REBUILD_INTERVAL_SECS as i64
+                {
+                    match rebuild_bloom(&*api_key_repository, &bloom_filter, &ready_flag).await {
+                        Ok(count) => {
+                            last_full_rebuild = now;
+                            last_sync = now;
+                            info!("Rebuilt bloom filter with {} keys", count);
+                        }
+                        Err(e) => warn!("Failed to rebuild bloom filter: {e}"),
+                    }
+                    continue;
+                }
+
+                // Incremental sync (adds only)
                 match api_key_repository
                     .get_active_key_hashes_created_after(last_sync)
                     .await
@@ -487,11 +527,9 @@ impl AuthService {
                             }
                             debug!("Added {} keys to bloom filter", new_hashes.len());
                         }
-                        last_sync = query_time;
+                        last_sync = now;
                     }
-                    Err(e) => {
-                        warn!("Failed to sync bloom filter: {}", e);
-                    }
+                    Err(e) => warn!("Failed to sync bloom filter: {e}"),
                 }
             }
         });

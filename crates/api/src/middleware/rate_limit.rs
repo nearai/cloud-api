@@ -19,6 +19,7 @@ use crate::models::ErrorResponse;
 
 const DEFAULT_API_KEY_RATE_LIMIT: u32 = 1000; // requests per minute
 const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+const RATE_LIMIT_CACHE_MAX_CAPACITY: u64 = 50_000;
 
 #[derive(Debug)]
 struct Counter(AtomicU32);
@@ -30,12 +31,6 @@ impl Counter {
 
     fn increment(&self) -> u32 {
         self.0.fetch_add(1, Ordering::Relaxed) + 1
-    }
-}
-
-impl Clone for Counter {
-    fn clone(&self) -> Self {
-        Self(AtomicU32::new(self.0.load(Ordering::Relaxed)))
     }
 }
 
@@ -57,7 +52,7 @@ impl RateLimitState {
 
         let key_limits: Cache<String, Arc<Counter>> = Cache::builder()
             .time_to_live(window)
-            .max_capacity(50_000)
+            .max_capacity(RATE_LIMIT_CACHE_MAX_CAPACITY)
             .build();
 
         Self {

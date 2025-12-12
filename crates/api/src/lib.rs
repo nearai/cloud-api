@@ -743,7 +743,7 @@ pub fn build_completion_routes(
         .route("/models", get(models))
         .with_state(app_state)
         .layer(from_fn_with_state(
-            rate_limit_state,
+            rate_limit_state.clone(),
             middleware::api_key_rate_limit_middleware,
         ))
         .layer(from_fn_with_state(
@@ -800,7 +800,7 @@ pub fn build_response_routes(
         )
         .with_state(route_state)
         .layer(from_fn_with_state(
-            rate_limit_state,
+            rate_limit_state.clone(),
             middleware::api_key_rate_limit_middleware,
         ))
         .layer(from_fn_with_state(

@@ -547,11 +547,21 @@ pub async fn models(
         object: "list".to_string(),
         data: models
             .into_iter()
-            .map(|model| ModelInfo {
-                id: model.model_name,
-                object: "model".to_string(),
-                created: 0,
-                owned_by: model.owned_by,
+            .map(|model| {
+                // Convert nano-dollars per token (scale 9) to dollars per million tokens
+                // Formula: nano_dollars_per_token * 1_000_000 / 1_000_000_000 = dollars_per_million
+                let pricing = ModelPricing {
+                    input: (model.input_cost_per_token as f64) * 1_000_000.0 / 1_000_000_000.0,
+                    output: (model.output_cost_per_token as f64) * 1_000_000.0 / 1_000_000_000.0,
+                };
+                ModelInfo {
+                    id: model.model_name,
+                    object: "model".to_string(),
+                    created: 0,
+                    owned_by: "nearai".to_string(),
+                    pricing: Some(pricing),
+                    context_length: Some(model.context_length),
+                }
             })
             .collect(),
     };

@@ -376,6 +376,47 @@ impl OrganizationUsageRepository {
             updated_at: row.get("updated_at"),
         }
     }
+
+    /// Get costs by inference IDs (for HuggingFace billing integration)
+    /// Returns costs for each inference_id that was found
+    pub async fn get_costs_by_inference_ids(
+        &self,
+        inference_ids: Vec<Uuid>,
+    ) -> Result<Vec<(Uuid, i64)>> {
+        if inference_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let rows = retry_db!("get_costs_by_inference_ids", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query(
+                    r#"
+                    SELECT inference_id, total_cost
+                    FROM organization_usage_log
+                    WHERE inference_id = ANY($1)
+                    "#,
+                    &[&inference_ids],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let inference_id: Option<Uuid> = row.get("inference_id");
+                let total_cost: i64 = row.get("total_cost");
+                inference_id.map(|id| (id, total_cost))
+            })
+            .collect())
+    }
 }
 
 #[derive(Debug, Clone)]

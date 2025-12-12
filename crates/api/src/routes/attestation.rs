@@ -158,6 +158,8 @@ pub struct AttestationResponse {
     pub gateway_attestation: DstackCpuQuote,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub model_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub router_attestation: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl From<services::attestation::models::AttestationReport> for AttestationResponse {
@@ -165,6 +167,7 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
         Self {
             gateway_attestation: report.gateway_attestation.into(),
             model_attestations: report.model_attestations,
+            router_attestation: report.router_attestation,
         }
     }
 }

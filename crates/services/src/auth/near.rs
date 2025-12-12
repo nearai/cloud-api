@@ -212,7 +212,15 @@ impl NearAuthService {
         // 6. Consume nonce AFTER signature verification (replay protection)
         // This prevents attackers from burning legitimate nonces with invalid signatures
         let nonce_hex = hex::encode(payload.nonce);
-        let nonce_consumed = self.nonce_repository.consume_nonce(&nonce_hex).await?;
+        let nonce_consumed = self
+            .nonce_repository
+            .consume_nonce(&nonce_hex)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(NearAuthError::InternalError(format!(
+                    "Failed to consume nonce: {e}"
+                )))
+            })?;
         if !nonce_consumed {
             tracing::warn!("NEAR signature replay detected for account {}", account_id);
             return Err(anyhow::anyhow!(NearAuthError::ReplayAttack));
@@ -230,7 +238,8 @@ impl NearAuthService {
         let user = self
             .auth_service
             .get_or_create_oauth_user(oauth_info)
-            .await?;
+            .await
+            .map_err(|e| anyhow::anyhow!(NearAuthError::InternalError(e.to_string())))?;
 
         // 8. Create session via AuthService (dual-token system)
         let (access_token, session, refresh_token) = self
@@ -243,7 +252,8 @@ impl NearAuthService {
                 1,
                 7 * 24,
             )
-            .await?;
+            .await
+            .map_err(|e| anyhow::anyhow!(NearAuthError::InternalError(e.to_string())))?;
 
         tracing::info!("NEAR authentication successful - account_id={}", account_id);
 

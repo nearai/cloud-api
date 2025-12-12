@@ -742,7 +742,7 @@ pub fn create_near_test_payload(timestamp_offset_ms: i64) -> NEP413Payload {
     let nonce = create_near_test_nonce(timestamp_offset_ms);
 
     NEP413Payload {
-        message: "Sign in to NEAR AI Cloud API".to_string(),
+        message: "Sign in to NEAR AI Cloud".to_string(),
         nonce: nonce.try_into().expect("Nonce should be 32 bytes"),
         recipient: "cloud.near.ai".to_string(),
         callback_url: None,

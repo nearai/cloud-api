@@ -36,17 +36,20 @@ async fn test_billing_costs_happy_path() {
         .expect("Missing Inference-Id header")
         .to_str()
         .unwrap();
-    let inference_uuid = uuid::Uuid::parse_str(inference_id).unwrap();
+    let real_inference_uuid = uuid::Uuid::parse_str(inference_id).unwrap();
+
+    // Create a fake inference ID that doesn't exist
+    let fake_inference_uuid = uuid::Uuid::new_v4();
 
     // Wait for async usage recording to complete
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-    // Query billing costs
+    // Query billing costs for both real and fake IDs
     let billing_response = server
         .post("/v1/billing/costs")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "requestIds": [inference_uuid]
+            "requestIds": [real_inference_uuid, fake_inference_uuid]
         }))
         .await;
 
@@ -54,12 +57,32 @@ async fn test_billing_costs_happy_path() {
 
     let body: serde_json::Value = billing_response.json();
     let requests = body["requests"].as_array().unwrap();
-    assert_eq!(requests.len(), 1, "Should return 1 cost entry");
+    assert_eq!(
+        requests.len(),
+        2,
+        "Should return 2 cost entries (1 real + 1 missing)"
+    );
 
-    let cost_entry = &requests[0];
-    assert_eq!(cost_entry["requestId"], inference_uuid.to_string());
+    // Find the real and fake entries
+    let real_entry = requests
+        .iter()
+        .find(|r| r["requestId"] == real_inference_uuid.to_string())
+        .expect("Real inference ID should be in response");
+    let fake_entry = requests
+        .iter()
+        .find(|r| r["requestId"] == fake_inference_uuid.to_string())
+        .expect("Fake inference ID should be in response");
+
+    // Verify real ID has positive cost
     assert!(
-        cost_entry["costNanoUsd"].as_i64().unwrap() > 0,
-        "Cost should be positive"
+        real_entry["costNanoUsd"].as_i64().unwrap() > 0,
+        "Real inference ID should have positive cost"
+    );
+
+    // Verify fake ID has zero cost
+    assert_eq!(
+        fake_entry["costNanoUsd"].as_i64().unwrap(),
+        0,
+        "Missing inference ID should have zero cost"
     );
 }

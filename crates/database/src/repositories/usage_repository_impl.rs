@@ -150,14 +150,6 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
         &self,
         inference_ids: Vec<Uuid>,
     ) -> anyhow::Result<Vec<InferenceCost>> {
-        let results = self.get_costs_by_inference_ids(inference_ids).await?;
-
-        Ok(results
-            .into_iter()
-            .map(|(inference_id, cost_nano_usd)| InferenceCost {
-                inference_id,
-                cost_nano_usd,
-            })
-            .collect())
+        self.get_costs_by_inference_ids(inference_ids).await
     }
 }

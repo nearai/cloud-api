@@ -549,16 +549,16 @@ pub async fn models(
             .into_iter()
             .map(|model| {
                 // Convert nano-dollars per token (scale 9) to dollars per million tokens
-                // Formula: nano_dollars_per_token * 1_000_000 / 1_000_000_000 = dollars_per_million
+                // Formula: nano_dollars_per_token * 0.001 = dollars_per_million
                 let pricing = ModelPricing {
-                    input: (model.input_cost_per_token as f64) * 1_000_000.0 / 1_000_000_000.0,
-                    output: (model.output_cost_per_token as f64) * 1_000_000.0 / 1_000_000_000.0,
+                    input: (model.input_cost_per_token as f64) * 0.001,
+                    output: (model.output_cost_per_token as f64) * 0.001,
                 };
                 ModelInfo {
-                    id: model.model_name,
+                    id: model.model_name.clone(),
                     object: "model".to_string(),
-                    created: 0,
-                    owned_by: "nearai".to_string(),
+                    created: 0, // No timestamp available in ModelWithPricing
+                    owned_by: model.owned_by,
                     pricing: Some(pricing),
                     context_length: Some(model.context_length),
                 }

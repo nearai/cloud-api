@@ -5,6 +5,7 @@ use crate::retry_db;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use services::common::RepositoryError;
+use std::collections::HashMap;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
@@ -378,11 +379,12 @@ impl OrganizationUsageRepository {
     }
 
     /// Get costs by inference IDs (for HuggingFace billing integration)
-    /// Returns costs for each inference_id that was found
+    /// Returns costs for all requested inference_ids
+    /// Missing inference_ids will have cost = 0
     pub async fn get_costs_by_inference_ids(
         &self,
         inference_ids: Vec<Uuid>,
-    ) -> Result<Vec<(Uuid, i64)>> {
+    ) -> Result<Vec<services::usage::InferenceCost>> {
         if inference_ids.is_empty() {
             return Ok(vec![]);
         }
@@ -408,12 +410,25 @@ impl OrganizationUsageRepository {
                 .map_err(map_db_error)
         })?;
 
-        Ok(rows
+        // Build map of found costs
+        let mut found_costs: HashMap<Uuid, i64> = rows
             .iter()
             .filter_map(|row| {
                 let inference_id: Option<Uuid> = row.get("inference_id");
                 let total_cost: i64 = row.get("total_cost");
                 inference_id.map(|id| (id, total_cost))
+            })
+            .collect();
+
+        // Return all requested IDs, with 0 for missing ones
+        Ok(inference_ids
+            .into_iter()
+            .map(|id| {
+                let cost_nano_usd = found_costs.remove(&id).unwrap_or(0);
+                services::usage::InferenceCost {
+                    inference_id: id,
+                    cost_nano_usd,
+                }
             })
             .collect())
     }

@@ -304,11 +304,24 @@ impl UsageServiceTrait for UsageServiceImpl {
         &self,
         inference_ids: Vec<Uuid>,
     ) -> Result<Vec<InferenceCost>, UsageError> {
-        self.usage_repository
+        let results = self
+            .usage_repository
             .get_costs_by_inference_ids(inference_ids)
             .await
             .map_err(|e| {
                 UsageError::InternalError(format!("Failed to get costs by inference IDs: {e}"))
-            })
+            })?;
+
+        // Log inference IDs that were not found (cost = 0)
+        for inference_cost in &results {
+            if inference_cost.cost_nano_usd == 0 {
+                tracing::error!(
+                    "Inference ID not found in usage log: inference_id={}",
+                    inference_cost.inference_id
+                );
+            }
+        }
+
+        Ok(results)
     }
 }

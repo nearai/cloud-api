@@ -1,5 +1,9 @@
 use crate::models::ErrorResponse;
-use axum::{extract::State, http::StatusCode, response::Json as ResponseJson};
+use axum::{
+    extract::{Json, State},
+    http::StatusCode,
+    response::Json as ResponseJson,
+};
 use serde::{Deserialize, Serialize};
 use services::usage::UsageServiceTrait;
 use std::sync::Arc;
@@ -43,7 +47,7 @@ pub struct BillingRouteState {
 /// Returns the cost in nano-USD for each request ID provided.
 /// This endpoint is designed for HuggingFace billing integration.
 ///
-/// Request IDs that are not found are not included in the response.
+/// Request IDs that are not found will be returned with costNanoUsd: 0
 #[utoipa::path(
     post,
     path = "/v1/billing/costs",
@@ -61,7 +65,7 @@ pub struct BillingRouteState {
 )]
 pub async fn get_billing_costs(
     State(state): State<BillingRouteState>,
-    ResponseJson(request): ResponseJson<BillingCostsRequest>,
+    Json(request): Json<BillingCostsRequest>,
 ) -> Result<ResponseJson<BillingCostsResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     tracing::debug!(
         "Billing costs request for {} inference IDs",

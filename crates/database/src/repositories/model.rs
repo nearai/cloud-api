@@ -78,6 +78,105 @@ impl ModelRepository {
         Ok(models)
     }
 
+    /// Get count of all models (optionally including inactive)
+    pub async fn get_all_models_count(&self, include_inactive: bool) -> Result<i64> {
+        let row = retry_db!("get_all_models_count", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            if include_inactive {
+                client
+                    .query_one(
+                        r#"
+                        SELECT COUNT(*) as count FROM models
+                        "#,
+                        &[],
+                    )
+                    .await
+                    .map_err(map_db_error)
+            } else {
+                client
+                    .query_one(
+                        r#"
+                        SELECT COUNT(*) as count FROM models WHERE is_active = true
+                        "#,
+                        &[],
+                    )
+                    .await
+                    .map_err(map_db_error)
+            }
+        })?;
+        Ok(row.get::<_, i64>("count"))
+    }
+
+    /// Get all models with pricing information (optionally including inactive)
+    pub async fn get_all_models(
+        &self,
+        include_inactive: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Model>> {
+        let rows = retry_db!("get_all_models", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            if include_inactive {
+                client
+                    .query(
+                        r#"
+                        SELECT
+                            m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
+                            m.input_cost_per_token, m.output_cost_per_token,
+                            m.context_length, m.verifiable, m.is_active, m.created_at, m.updated_at,
+                            COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
+                        FROM models m
+                        LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
+                        GROUP BY m.id
+                        ORDER BY m.model_name ASC
+                        LIMIT $1 OFFSET $2
+                        "#,
+                        &[&limit, &offset],
+                    )
+                    .await
+                    .map_err(map_db_error)
+            } else {
+                client
+                    .query(
+                        r#"
+                        SELECT
+                            m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
+                            m.input_cost_per_token, m.output_cost_per_token,
+                            m.context_length, m.verifiable, m.is_active, m.created_at, m.updated_at,
+                            COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
+                        FROM models m
+                        LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
+                        WHERE m.is_active = true
+                        GROUP BY m.id
+                        ORDER BY m.model_name ASC
+                        LIMIT $1 OFFSET $2
+                        "#,
+                        &[&limit, &offset],
+                    )
+                    .await
+                    .map_err(map_db_error)
+            }
+        })?;
+
+        let models = rows
+            .into_iter()
+            .map(|row| self.row_to_model(&row))
+            .collect();
+        Ok(models)
+    }
+
     /// Get model by internal model name (for upsert logic - includes inactive models)
     /// Searches model_name only
     pub async fn get_by_internal_name(&self, model_name: &str) -> Result<Option<Model>> {

@@ -17,7 +17,6 @@ async fn test_duplicate_organization_name_returns_409() {
     let request = api::models::CreateOrganizationRequest {
         name: org_name.clone(),
         description: Some("First organization".to_string()),
-        display_name: Some("First Org".to_string()),
     };
 
     let response = server
@@ -39,7 +38,6 @@ async fn test_duplicate_organization_name_returns_409() {
     let duplicate_request = api::models::CreateOrganizationRequest {
         name: org_name.clone(),
         description: Some("Duplicate organization".to_string()),
-        display_name: Some("Duplicate Org".to_string()),
     };
 
     let duplicate_response = server
@@ -68,7 +66,6 @@ async fn test_duplicate_organization_name_case_sensitive() {
     let request = api::models::CreateOrganizationRequest {
         name: org_name.clone(),
         description: Some("First organization".to_string()),
-        display_name: Some("First Org".to_string()),
     };
 
     let response = server
@@ -84,7 +81,6 @@ async fn test_duplicate_organization_name_case_sensitive() {
     let different_case_request = api::models::CreateOrganizationRequest {
         name: org_name.to_lowercase(),
         description: Some("Different case organization".to_string()),
-        display_name: Some("Different Case Org".to_string()),
     };
 
     let case_response = server
@@ -564,7 +560,6 @@ async fn test_duplicate_errors_no_information_leakage() {
     let request = api::models::CreateOrganizationRequest {
         name: org_name.clone(),
         description: Some("Secret organization".to_string()),
-        display_name: Some("Secret Org".to_string()),
     };
 
     server

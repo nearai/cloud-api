@@ -1,0 +1,98 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]  # When PR is ready for review (not draft)
+  issue_comment:
+    types: [created]  # Listen for @claude mentions in PR comments
+
+jobs:
+  claude-review:
+    # Run if: (PR opened/ready AND not draft) OR @claude review in PR comment
+    if: |
+      (github.event_name == 'pull_request' && !github.event.pull_request.draft) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       (contains(github.event.comment.body, '@claude review') ||
+        contains(github.event.comment.body, '@claude code review')))
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            <pr_context>
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            LANGUAGE: Rust
+            </pr_context>
+
+            <review_instructions>
+            Analyze this pull request focusing on CRITICAL issues only. Keep feedback concise and actionable.
+
+            PRIORITY CHECKS (report only if found):
+            1. Logic & Functionality
+               - Logic flaws or incorrect implementations
+               - Missing edge cases (empty inputs, boundary conditions, None/Some variants)
+               - Unhandled error paths or panics in production code
+               - Backward compatibility issues with existing APIs/data formats
+
+            2. Production Safety (multi-cluster deployment context)
+               - Breaking changes that could fail during rolling updates
+               - State migration issues between old/new versions
+               - Race conditions or data consistency problems
+               - Resource leaks (memory, file handles, connections)
+
+            3. Database & Data Handling
+               - SQL injection risks or unsafe query construction
+               - N+1 query problems (queries in loops)
+               - Missing indexes causing slow queries (check query patterns)
+               - Missing or improper transaction boundaries
+               - Database migrations: ensure backward compatibility, no data loss
+
+            4. Performance & Efficiency
+               - Blocking operations in async functions (sync I/O, CPU-intensive work)
+               - Excessive memory allocations or large data structures
+               - Sequential operations that should be parallel (use tokio::join!/select!)
+               - Missing timeouts on external calls (HTTP, database, vLLM)
+               - Connection pool exhaustion risks
+
+            5. Rust-Specific Concerns
+               - Unnecessary .clone() calls (suggest borrows/references instead)
+               - Unsafe code without safety comments explaining invariants
+               - Incorrect ownership patterns or lifetime issues
+               - Improper error handling (unwrap/expect in library code)
+               - Concurrency issues (Arc/Mutex misuse, data races)
+
+            6. Code Quality
+               - Poor modularity (functions >100 lines, god objects)
+               - Unclear naming or missing documentation for public APIs
+               - Violated Single Responsibility Principle
+               - Security vulnerabilities (injection, hardcoded secrets)
+
+            REVIEW STYLE:
+            - List only CRITICAL issues that need fixing before merge
+            - Use bullet points, be direct and specific
+            - Provide code examples for suggested fixes when helpful
+            - If no critical issues: approve with brief summary
+            - Sign off with: ✅ (approved) or ⚠️ (issues found)
+
+            Consult the repository's CLAUDE.md file (if present) for project-specific conventions.
+            Use `gh pr comment` to post your review.
+            </review_instructions>
+          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
+

@@ -21,6 +21,7 @@ use crate::{
         responses,
     },
 };
+use axum::http::HeaderValue;
 use axum::{
     extract::DefaultBodyLimit,
     middleware::{from_fn, from_fn_with_state},
@@ -41,6 +42,7 @@ use services::{
     models::ModelsServiceTrait,
 };
 use std::sync::Arc;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use utoipa::OpenApi;
 
 /// Service initialization components
@@ -492,6 +494,35 @@ pub async fn init_inference_providers_with_mocks(
     (pool, mock_provider)
 }
 
+fn is_origin_allowed(origin_str: &str, cors_config: &config::CorsConfig) -> bool {
+    if cors_config.exact_matches.iter().any(|o| o == origin_str) {
+        return true;
+    }
+
+    if let Some(remainder) = origin_str.strip_prefix("http://localhost") {
+        if remainder.is_empty() || remainder.starts_with(':') {
+            return true;
+        }
+    }
+
+    if let Some(remainder) = origin_str.strip_prefix("http://127.0.0.1") {
+        if remainder.is_empty() || remainder.starts_with(':') {
+            return true;
+        }
+    }
+
+    if origin_str.starts_with("https://")
+        && cors_config
+            .wildcard_suffixes
+            .iter()
+            .any(|suffix| origin_str.ends_with(suffix))
+    {
+        return true;
+    }
+
+    false
+}
+
 /// Build the complete application router with config
 pub fn build_app_with_config(
     database: Arc<Database>,
@@ -592,6 +623,22 @@ pub fn build_app_with_config(
         metrics_service: domain_services.metrics_service.clone(),
     };
 
+    // Create CORS layer
+    let cors_config = config.cors.clone();
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(
+            move |origin: &HeaderValue, _request_parts: &axum::http::request::Parts| {
+                let origin_str = match origin.to_str() {
+                    Ok(s) => s,
+                    Err(_) => return false,
+                };
+                is_origin_allowed(origin_str, &cors_config)
+            },
+        ))
+        .allow_methods(Any)
+        .allow_headers(Any)
+        .expose_headers(Any);
+
     Router::new()
         .nest(
             "/v1",
@@ -611,6 +658,7 @@ pub fn build_app_with_config(
                 .merge(health_routes),
         )
         .merge(openapi_routes)
+        .layer(cors)
         // Add HTTP metrics middleware to track all requests
         .layer(from_fn_with_state(
             metrics_state,
@@ -925,8 +973,8 @@ pub fn build_admin_routes(
     use crate::routes::admin::{
         batch_upsert_models, create_admin_access_token, delete_admin_access_token, delete_model,
         get_model_history, get_organization_limits_history, get_organization_metrics,
-        get_organization_timeseries, get_platform_metrics, list_admin_access_tokens, list_users,
-        update_organization_limits, AdminAppState,
+        get_organization_timeseries, get_platform_metrics, list_admin_access_tokens,
+        list_models as admin_list_models, list_users, update_organization_limits, AdminAppState,
     };
     use database::repositories::{
         AdminAccessTokenRepository, AdminCompositeRepository, PgAnalyticsRepository,
@@ -960,7 +1008,10 @@ pub fn build_admin_routes(
     };
 
     Router::new()
-        .route("/admin/models", axum::routing::patch(batch_upsert_models))
+        .route(
+            "/admin/models",
+            axum::routing::get(admin_list_models).patch(batch_upsert_models),
+        )
         .route(
             "/admin/models/{model_name}",
             axum::routing::delete(delete_model),
@@ -1132,6 +1183,7 @@ mod tests {
             },
             database: config::DatabaseConfig {
                 primary_app_id: "postgres-patroni-1".to_string(),
+                gateway_subdomain: "cvm1.near.ai".to_string(),
                 host: None,
                 port: 5432,
                 database: "test_db".to_string(),
@@ -1154,6 +1206,7 @@ mod tests {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),
             },
+            cors: config::CorsConfig::default(),
         };
 
         // Initialize services
@@ -1186,6 +1239,7 @@ mod tests {
         // Create custom database config for testing
         let db_config = config::DatabaseConfig {
             primary_app_id: "postgres-patroni-1".to_string(),
+            gateway_subdomain: "cvm1.near.ai".to_string(),
             port: 5432,
             host: None,
             database: "test_db".to_string(),
@@ -1232,6 +1286,7 @@ mod tests {
             },
             database: config::DatabaseConfig {
                 primary_app_id: "postgres-patroni-1".to_string(),
+                gateway_subdomain: "cvm1.near.ai".to_string(),
                 host: None,
                 port: 5432,
                 database: "test_db".to_string(),
@@ -1254,6 +1309,7 @@ mod tests {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),
             },
+            cors: config::CorsConfig::default(),
         };
 
         let auth_components = init_auth_services(database.clone(), &config);
@@ -1271,5 +1327,94 @@ mod tests {
             build_app_with_config(database, auth_components, domain_services, Arc::new(config));
 
         // Test the app...
+    }
+
+    fn test_cors_config() -> config::CorsConfig {
+        config::CorsConfig {
+            exact_matches: vec![
+                "https://example.com".to_string(),
+                "http://test.com".to_string(),
+            ],
+            wildcard_suffixes: vec![".near.ai".to_string(), "-example.com".to_string()],
+        }
+    }
+
+    #[test]
+    fn test_cors_exact_match_allowed() {
+        let config = test_cors_config();
+        assert!(is_origin_allowed("https://example.com", &config));
+        assert!(is_origin_allowed("http://test.com", &config));
+    }
+
+    #[test]
+    fn test_cors_exact_match_denied() {
+        let config = test_cors_config();
+        assert!(!is_origin_allowed("https://evil.com", &config));
+        assert!(!is_origin_allowed("http://example.com", &config));
+    }
+
+    #[test]
+    fn test_cors_localhost_allowed() {
+        let config = test_cors_config();
+        assert!(is_origin_allowed("http://localhost:3000", &config));
+        assert!(is_origin_allowed("http://localhost:8080", &config));
+        assert!(is_origin_allowed("http://localhost", &config));
+    }
+
+    #[test]
+    fn test_cors_localhost_subdomain_denied() {
+        let config = test_cors_config();
+        assert!(!is_origin_allowed("http://localhost.evil.com", &config));
+        assert!(!is_origin_allowed(
+            "http://localhost.evil.com:3000",
+            &config
+        ));
+    }
+
+    #[test]
+    fn test_cors_127_0_0_1_allowed() {
+        let config = test_cors_config();
+        assert!(is_origin_allowed("http://127.0.0.1:3000", &config));
+        assert!(is_origin_allowed("http://127.0.0.1:8080", &config));
+        assert!(is_origin_allowed("http://127.0.0.1", &config));
+    }
+
+    #[test]
+    fn test_cors_127_0_0_1_subdomain_denied() {
+        let config = test_cors_config();
+        assert!(!is_origin_allowed("http://127.0.0.1.evil.com", &config));
+    }
+
+    #[test]
+    fn test_cors_https_wildcard_allowed() {
+        let config = test_cors_config();
+        assert!(is_origin_allowed("https://app.near.ai", &config));
+        assert!(is_origin_allowed("https://chat.near.ai", &config));
+        assert!(is_origin_allowed("https://preview-example.com", &config));
+    }
+
+    #[test]
+    fn test_cors_https_wildcard_denied() {
+        let config = test_cors_config();
+        assert!(!is_origin_allowed("http://app.near.ai", &config));
+        assert!(!is_origin_allowed("https://fakenear.ai", &config));
+        assert!(!is_origin_allowed("https://near.ai.evil.com", &config));
+    }
+
+    #[test]
+    fn test_cors_wildcard_suffix_protection() {
+        let config = config::CorsConfig {
+            exact_matches: vec![],
+            wildcard_suffixes: vec![".near.ai".to_string()],
+        };
+        assert!(is_origin_allowed("https://app.near.ai", &config));
+        assert!(!is_origin_allowed("https://fakenear.ai", &config));
+    }
+
+    #[test]
+    fn test_cors_wildcard_with_hyphen_allowed() {
+        let config = test_cors_config();
+        assert!(is_origin_allowed("https://preview-example.com", &config));
+        assert!(is_origin_allowed("https://staging-example.com", &config));
     }
 }

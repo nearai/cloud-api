@@ -1,12 +1,13 @@
 use crate::middleware::AdminUser;
 use crate::models::{
-    AdminAccessTokenResponse, AdminUserOrganizationDetails, AdminUserResponse,
-    BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, DecimalPrice,
-    DeleteAdminAccessTokenRequest, ErrorResponse, ListUsersResponse, ModelHistoryEntry,
-    ModelHistoryResponse, ModelMetadata, ModelWithPricing, OrgLimitsHistoryEntry,
-    OrgLimitsHistoryResponse, SpendLimit, UpdateOrganizationLimitsRequest,
-    UpdateOrganizationLimitsResponse,
+    AdminAccessTokenResponse, AdminModelListResponse, AdminModelWithPricing,
+    AdminUserOrganizationDetails, AdminUserResponse, BatchUpdateModelApiRequest,
+    CreateAdminAccessTokenRequest, DecimalPrice, DeleteAdminAccessTokenRequest, ErrorResponse,
+    ListUsersResponse, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
+    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, SpendLimit,
+    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
 };
+use crate::routes::common::format_amount;
 use axum::{
     extract::{Json, Path, Query, State},
     http::HeaderMap,
@@ -148,6 +149,93 @@ pub async fn batch_upsert_models(
         .collect();
 
     Ok(ResponseJson(api_models))
+}
+
+/// List all models (Admin only)
+///
+/// Returns a paginated list of all models in the system. By default, only active models are returned.
+/// Use `include_inactive=true` to also include disabled models.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/models",
+    tag = "Admin",
+    params(
+        ("limit" = Option<i64>, Query, description = "Maximum number of models to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Number of models to skip (default: 0)"),
+        ("include_inactive" = Option<bool>, Query, description = "Whether to include inactive (disabled) models (default: false)")
+    ),
+    responses(
+        (status = 200, description = "Models retrieved successfully", body = AdminModelListResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_models(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    axum::extract::Query(params): axum::extract::Query<ListModelsQueryParams>,
+) -> Result<ResponseJson<AdminModelListResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+
+    debug!(
+        "List models request with limit={}, offset={}, include_inactive={}",
+        params.limit, params.offset, params.include_inactive
+    );
+
+    let (models, total) = app_state
+        .admin_service
+        .list_models(params.include_inactive, params.limit, params.offset)
+        .await
+        .map_err(|e| {
+            error!("Failed to list models");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to retrieve models: {e}"),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    let api_models: Vec<AdminModelWithPricing> = models
+        .into_iter()
+        .map(|model| AdminModelWithPricing {
+            model_id: model.model_name,
+            input_cost_per_token: DecimalPrice {
+                amount: model.input_cost_per_token,
+                scale: 9,
+                currency: "USD".to_string(),
+            },
+            output_cost_per_token: DecimalPrice {
+                amount: model.output_cost_per_token,
+                scale: 9,
+                currency: "USD".to_string(),
+            },
+            metadata: ModelMetadata {
+                verifiable: model.verifiable,
+                context_length: model.context_length,
+                model_display_name: model.model_display_name,
+                model_description: model.model_description,
+                model_icon: model.model_icon,
+                aliases: model.aliases,
+            },
+            is_active: model.is_active,
+            created_at: model.created_at,
+            updated_at: model.updated_at,
+        })
+        .collect();
+
+    let response = AdminModelListResponse {
+        models: api_models,
+        total,
+        limit: params.limit,
+        offset: params.offset,
+    };
+
+    Ok(ResponseJson(response))
 }
 
 /// Get complete history for a model (Admin only)
@@ -599,6 +687,13 @@ pub async fn list_users(
             .into_iter()
             .map(|(u, org_data)| {
                 let organizations = org_data.map(|org_info| {
+                    let current_usage = org_info.total_spent.map(|total_spent| OrganizationUsage {
+                        total_spent,
+                        total_spent_display: format_amount(total_spent),
+                        total_requests: org_info.total_requests.unwrap_or(0),
+                        total_tokens: org_info.total_tokens.unwrap_or(0),
+                    });
+
                     vec![AdminUserOrganizationDetails {
                         id: org_info.id.to_string(),
                         name: org_info.name,
@@ -608,6 +703,7 @@ pub async fn list_users(
                             scale: 9,
                             currency: "USD".to_string(),
                         }),
+                        current_usage,
                     }]
                 });
 
@@ -937,6 +1033,16 @@ pub struct ListUsersQueryParams {
     pub offset: i64,
     #[serde(default)]
     pub include_organizations: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ListModelsQueryParams {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    #[serde(default)]
+    pub include_inactive: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]

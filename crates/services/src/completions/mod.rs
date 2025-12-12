@@ -17,8 +17,22 @@ use std::time::Instant;
 
 /// Hash inference ID to UUID deterministically using MD5 (v5)
 /// Takes the full ID including prefix (e.g., "chatcmpl-abc123") and returns a stable UUID
-fn hash_inference_id_to_uuid(full_id: &str) -> Uuid {
+pub fn hash_inference_id_to_uuid(full_id: &str) -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_DNS, full_id.as_bytes())
+}
+
+/// Get input bucket tag based on token count for metrics breakdown
+/// Buckets: 0-1k, 1-4k, 4-16k, 16-32k, 32-64k, 64-128k, 128k+
+fn get_input_bucket(token_count: i32) -> &'static str {
+    match token_count {
+        0..=1000 => "0-1k",
+        1001..=4000 => "1-4k",
+        4001..=16000 => "4-16k",
+        16001..=32000 => "16-32k",
+        32001..=64000 => "32-64k",
+        64001..=128000 => "64-128k",
+        _ => "128k+",
+    }
 }
 
 struct InterceptStream<S>
@@ -37,7 +51,8 @@ where
     #[allow(dead_code)] // Kept for potential debugging/logging use
     model_name: String,
     inference_type: String,
-    start_time: Instant,
+    service_start_time: Instant,
+    provider_start_time: Instant,
     first_token_received: bool,
     first_token_time: Option<Instant>,
     /// Time to first token in milliseconds (captured for DB storage)
@@ -66,14 +81,21 @@ where
                 if !self.first_token_received {
                     self.first_token_received = true;
                     self.first_token_time = Some(now);
-                    let duration = self.start_time.elapsed();
-                    // Capture TTFT in milliseconds for DB storage
-                    self.ttft_ms = Some(duration.as_millis() as i32);
+                    let backend_ttft = now.duration_since(self.provider_start_time);
+                    let e2e_ttft = now.duration_since(self.service_start_time);
+                    self.ttft_ms = Some(e2e_ttft.as_millis() as i32);
                     self.last_token_time = Some(now);
-                    // Reuse pre-allocated tags
                     let tags_str: Vec<&str> = self.metric_tags.iter().map(|s| s.as_str()).collect();
-                    self.metrics_service
-                        .record_latency(METRIC_LATENCY_TTFT, duration, &tags_str);
+                    self.metrics_service.record_latency(
+                        METRIC_LATENCY_TTFT,
+                        backend_ttft,
+                        &tags_str,
+                    );
+                    self.metrics_service.record_latency(
+                        METRIC_LATENCY_TTFT_TOTAL,
+                        e2e_ttft,
+                        &tags_str,
+                    );
                 } else if let Some(last_time) = self.last_token_time {
                     // Calculate inter-token latency
                     let itl = now.duration_since(last_time);
@@ -151,21 +173,23 @@ where
 
                         // Record metrics
                         let metrics_service = self.metrics_service.clone();
-                        let duration = self.start_time.elapsed();
-                        let total_tokens = usage.total_tokens;
+                        let e2e_duration = self.service_start_time.elapsed();
                         let input_tokens = usage.prompt_tokens;
                         let output_tokens = usage.completion_tokens;
                         let first_token_time = self.first_token_time;
-                        // Reuse pre-allocated tags
-                        let tags_owned = self.metric_tags.clone();
+                        let input_bucket = get_input_bucket(input_tokens);
+                        let mut tags_owned = self.metric_tags.clone();
+                        tags_owned.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
 
                         tokio::spawn(async move {
                             let tags: Vec<&str> = tags_owned.iter().map(|s| s.as_str()).collect();
 
-                            // Total latency
-                            metrics_service.record_latency(METRIC_LATENCY_TOTAL, duration, &tags);
+                            metrics_service.record_latency(
+                                METRIC_LATENCY_TOTAL,
+                                e2e_duration,
+                                &tags,
+                            );
 
-                            // Decoding time (first token to last token)
                             if let Some(first_token_instant) = first_token_time {
                                 let decoding_duration = first_token_instant.elapsed();
                                 metrics_service.record_latency(
@@ -173,16 +197,16 @@ where
                                     decoding_duration,
                                     &tags,
                                 );
-                            }
 
-                            // Tokens per second
-                            if duration.as_secs_f64() > 0.0 {
-                                let tps = total_tokens as f64 / duration.as_secs_f64();
-                                metrics_service.record_histogram(
-                                    METRIC_TOKENS_PER_SECOND,
-                                    tps,
-                                    &tags,
-                                );
+                                let decode_secs = decoding_duration.as_secs_f64();
+                                if decode_secs > 0.0 {
+                                    let tps = output_tokens as f64 / decode_secs;
+                                    metrics_service.record_histogram(
+                                        METRIC_TOKENS_PER_SECOND,
+                                        tps,
+                                        &tags,
+                                    );
+                                }
                             }
 
                             // Token counts
@@ -299,15 +323,19 @@ impl CompletionServiceImpl {
         model_id: Uuid,
         model_name: String,
         inference_type: &str,
-        request_start_time: Instant,
+        service_start_time: Instant,
+        provider_start_time: Instant,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
         let metric_tags = Self::create_metric_tags(&model_name);
 
-        // Record request count metric
         let tags_str: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
         self.metrics_service
             .record_count(METRIC_REQUEST_COUNT, 1, &tags_str);
+
+        let queue_time = provider_start_time.duration_since(service_start_time);
+        self.metrics_service
+            .record_latency(METRIC_LATENCY_QUEUE_TIME, queue_time, &tags_str);
 
         let intercepted_stream = InterceptStream {
             inner: llm_stream,
@@ -320,7 +348,8 @@ impl CompletionServiceImpl {
             model_id,
             model_name,
             inference_type: inference_type.to_string(),
-            start_time: request_start_time,
+            service_start_time,
+            provider_start_time,
             first_token_received: false,
             first_token_time: None,
             ttft_ms: None,
@@ -339,6 +368,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         &self,
         request: ports::CompletionRequest,
     ) -> Result<StreamingResult, ports::CompletionError> {
+        let service_start_time = Instant::now();
+
         // Extract context for usage tracking
         let organization_id = request.organization_id;
         let workspace_id = request.workspace_id;
@@ -419,8 +450,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             chat_params.model = canonical_name.clone();
         }
 
-        // Capture start time BEFORE making the request to provider (for accurate TTFT)
-        let request_start_time = Instant::now();
+        let provider_start_time = Instant::now();
 
         // Get the LLM stream
         let llm_stream = match self
@@ -470,7 +500,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 model.id,
                 model.model_name.clone(),
                 inference_type,
-                request_start_time,
+                service_start_time,
+                provider_start_time,
             )
             .await;
 
@@ -481,7 +512,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         &self,
         request: ports::CompletionRequest,
     ) -> Result<inference_providers::ChatCompletionResponseWithBytes, ports::CompletionError> {
-        let start_time = Instant::now();
+        let service_start_time = Instant::now();
         let chat_messages = Self::prepare_chat_messages(&request.messages);
 
         let mut chat_params = inference_providers::ChatCompletionParams {
@@ -558,6 +589,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             chat_params.model = canonical_name.clone();
         }
 
+        let provider_start_time = Instant::now();
         let response_with_bytes = match self
             .inference_provider_pool
             .chat_completion(chat_params, request.body_hash.clone())
@@ -587,8 +619,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             }
         };
 
-        // For non-streaming, total latency = time until full response received
-        let total_latency = start_time.elapsed();
+        let e2e_latency = service_start_time.elapsed();
+        let backend_latency = provider_start_time.elapsed();
+        let queue_time = provider_start_time.duration_since(service_start_time);
 
         // Store attestation signature
         let attestation_service = self.attestation_service.clone();
@@ -607,30 +640,27 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // Record metrics with low-cardinality tags only
         let metrics_service = self.metrics_service.clone();
-        let total_tokens = response_with_bytes.response.usage.total_tokens;
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
         let output_tokens = response_with_bytes.response.usage.completion_tokens;
         let model_name = model.model_name.clone();
 
         tokio::spawn(async move {
-            // Create low-cardinality tags (model + environment only)
-            let tags = CompletionServiceImpl::create_metric_tags(&model_name);
+            let mut tags = CompletionServiceImpl::create_metric_tags(&model_name);
+            let input_bucket = get_input_bucket(input_tokens);
+            tags.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
             let tags_str: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
 
-            // Request count
             metrics_service.record_count(METRIC_REQUEST_COUNT, 1, &tags_str);
+            metrics_service.record_latency(METRIC_LATENCY_QUEUE_TIME, queue_time, &tags_str);
+            metrics_service.record_latency(METRIC_LATENCY_TTFT, backend_latency, &tags_str);
+            metrics_service.record_latency(METRIC_LATENCY_TTFT_TOTAL, e2e_latency, &tags_str);
+            metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_latency, &tags_str);
 
-            // For non-streaming, TTFT = total latency (all tokens arrive together)
-            metrics_service.record_latency(METRIC_LATENCY_TTFT, total_latency, &tags_str);
-            metrics_service.record_latency(METRIC_LATENCY_TOTAL, total_latency, &tags_str);
-
-            // Tokens per second
-            if total_latency.as_secs_f64() > 0.0 {
-                let tps = total_tokens as f64 / total_latency.as_secs_f64();
+            if backend_latency.as_secs_f64() > 0.0 {
+                let tps = output_tokens as f64 / backend_latency.as_secs_f64();
                 metrics_service.record_histogram(METRIC_TOKENS_PER_SECOND, tps, &tags_str);
             }
 
-            // Token counts
             metrics_service.record_count(METRIC_TOKENS_INPUT, input_tokens as i64, &tags_str);
             metrics_service.record_count(METRIC_TOKENS_OUTPUT, output_tokens as i64, &tags_str);
         });
@@ -740,6 +770,7 @@ mod tests {
 
         let metric_tags = CompletionServiceImpl::create_metric_tags("test-model");
 
+        let now = Instant::now();
         let intercept_stream = InterceptStream {
             inner: stream,
             attestation_service,
@@ -751,7 +782,8 @@ mod tests {
             model_id,
             model_name: "test-model".to_string(),
             inference_type: "chat_completion_stream".to_string(),
-            start_time: Instant::now(),
+            service_start_time: now,
+            provider_start_time: now,
             first_token_received: false,
             first_token_time: None,
             ttft_ms: None,
@@ -771,12 +803,13 @@ mod tests {
         let metrics = metrics_service.get_metrics();
 
         // Should have:
-        // 1. latency.time_to_first_token (from first chunk)
-        // 2. latency.total (from usage chunk)
-        // 3. tokens_per_second (from usage chunk)
+        // 1. latency.time_to_first_token (Backend TTFT from first chunk)
+        // 2. latency.time_to_first_token_total (E2E TTFT from first chunk)
+        // 3. latency.total (from usage chunk)
+        // 4. tokens_per_second (from usage chunk)
         assert!(
-            metrics.len() >= 3,
-            "Expected at least 3 metrics, got {}",
+            metrics.len() >= 4,
+            "Expected at least 4 metrics, got {}",
             metrics.len()
         );
 
@@ -873,7 +906,8 @@ mod tests {
         let metric_tags = CompletionServiceImpl::create_metric_tags("test-model");
 
         // Use a start time from "before" to simulate real TTFT
-        let start_time = Instant::now() - Duration::from_millis(50);
+        let service_start_time = Instant::now() - Duration::from_millis(50);
+        let provider_start_time = Instant::now() - Duration::from_millis(25);
 
         let intercept_stream = InterceptStream {
             inner: stream,
@@ -886,7 +920,8 @@ mod tests {
             model_id,
             model_name: "test-model".to_string(),
             inference_type: "chat_completion_stream".to_string(),
-            start_time,
+            service_start_time,
+            provider_start_time,
             first_token_received: false,
             first_token_time: None,
             ttft_ms: None,
@@ -974,6 +1009,7 @@ mod tests {
         let stream = stream::iter(vec![Ok(usage_chunk)]);
         let metric_tags = CompletionServiceImpl::create_metric_tags("test-model");
 
+        let now = Instant::now();
         let intercept_stream = InterceptStream {
             inner: stream,
             attestation_service,
@@ -985,7 +1021,8 @@ mod tests {
             model_id,
             model_name: "test-model".to_string(),
             inference_type: "chat_completion_stream".to_string(),
-            start_time: Instant::now(),
+            service_start_time: now,
+            provider_start_time: now,
             first_token_received: false,
             first_token_time: None,
             ttft_ms: None,

@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.88.0-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS builder
+FROM rust:1.92.0-bookworm@sha256:9676d0547a259997add8f5924eb6b959c589ed39055338e23b99aba7958d6d31 AS builder
 
 # Install pinned apt dependencies
 RUN --mount=type=bind,source=pinned-packages-builder.txt,target=/tmp/pinned-packages-builder.txt,ro \

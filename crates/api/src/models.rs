@@ -995,16 +995,17 @@ pub struct CreateApiKeyRequest {
 
 /// Request to create a new organization
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateOrganizationRequest {
     pub name: String,
-    pub display_name: Option<String>,
     pub description: Option<String>,
 }
 
 /// Request to update an organization
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateOrganizationRequest {
-    pub display_name: Option<String>,
+    pub name: Option<String>,
     pub description: Option<String>,
     pub rate_limit: Option<i32>,
     pub settings: Option<serde_json::Value>,
@@ -1172,7 +1173,21 @@ pub struct PublicUserResponse {
     pub created_at: DateTime<Utc>,
 }
 
-/// Organization details with spend limit (for admin user listing)
+/// Organization usage information (for admin user listing)
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OrganizationUsage {
+    /// Total amount spent in nano-dollars (scale 9)
+    pub total_spent: i64,
+    /// Human readable total spent, e.g., "$12.50"
+    pub total_spent_display: String,
+    /// Total number of API requests
+    pub total_requests: i64,
+    /// Total number of tokens used
+    pub total_tokens: i64,
+}
+
+/// Organization details with spend limit and usage (for admin user listing)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AdminUserOrganizationDetails {
     pub id: String,
@@ -1180,6 +1195,8 @@ pub struct AdminUserOrganizationDetails {
     pub description: Option<String>,
     #[serde(rename = "spendLimit", skip_serializing_if = "Option::is_none")]
     pub spend_limit: Option<SpendLimit>,
+    #[serde(rename = "currentUsage", skip_serializing_if = "Option::is_none")]
+    pub current_usage: Option<OrganizationUsage>,
 }
 
 /// Admin user response model (for owners/admins)
@@ -1414,6 +1431,33 @@ pub struct ModelListResponse {
     pub limit: i64,
     pub offset: i64,
     pub total: i64,
+}
+
+/// Response for admin model list endpoint
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AdminModelListResponse {
+    pub models: Vec<AdminModelWithPricing>,
+    pub limit: i64,
+    pub offset: i64,
+    pub total: i64,
+}
+
+/// Model with pricing information for admin listing
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AdminModelWithPricing {
+    #[serde(rename = "modelId")]
+    pub model_id: String,
+    #[serde(rename = "inputCostPerToken")]
+    pub input_cost_per_token: DecimalPrice,
+    #[serde(rename = "outputCostPerToken")]
+    pub output_cost_per_token: DecimalPrice,
+    pub metadata: ModelMetadata,
+    #[serde(rename = "isActive")]
+    pub is_active: bool,
+    #[serde(rename = "createdAt")]
+    pub created_at: DateTime<Utc>,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Model with pricing information

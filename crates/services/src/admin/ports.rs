@@ -103,13 +103,35 @@ pub struct UserInfo {
     pub is_active: bool,
 }
 
-/// Organization information for user listing (earliest organization with spend limit)
+/// Organization information for user listing (earliest organization with spend limit and usage)
 #[derive(Debug, Clone)]
 pub struct UserOrganizationInfo {
     pub id: uuid::Uuid,
     pub name: String,
     pub description: Option<String>,
     pub spend_limit: Option<i64>, // Amount in nano-dollars (scale 9)
+    pub total_spent: Option<i64>, // Amount in nano-dollars (scale 9)
+    pub total_requests: Option<i64>,
+    pub total_tokens: Option<i64>,
+}
+
+/// Model information for admin listing (includes is_active status)
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency
+#[derive(Debug, Clone)]
+pub struct AdminModelInfo {
+    pub id: uuid::Uuid,
+    pub model_name: String,
+    pub model_display_name: String,
+    pub model_description: String,
+    pub model_icon: Option<String>,
+    pub input_cost_per_token: i64,
+    pub output_cost_per_token: i64,
+    pub context_length: i32,
+    pub verifiable: bool,
+    pub is_active: bool,
+    pub aliases: Vec<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -188,6 +210,15 @@ pub trait AdminRepository: Send + Sync {
 
     /// Get the count of active users (admin only)
     async fn get_active_user_count(&self) -> Result<i64, anyhow::Error>;
+
+    /// List all models with pagination (admin only)
+    /// If include_inactive is true, includes disabled models
+    async fn list_models(
+        &self,
+        include_inactive: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<AdminModelInfo>, i64), anyhow::Error>;
 }
 
 /// Admin service trait for managing platform configuration
@@ -235,4 +266,13 @@ pub trait AdminService: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64), AdminError>;
+
+    /// List all models with pagination (admin only)
+    /// If include_inactive is true, includes disabled models
+    async fn list_models(
+        &self,
+        include_inactive: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<AdminModelInfo>, i64), AdminError>;
 }

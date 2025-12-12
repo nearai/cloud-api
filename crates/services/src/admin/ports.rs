@@ -13,6 +13,7 @@ pub struct UpdateModelAdminRequest {
     pub verifiable: Option<bool>,
     pub is_active: Option<bool>,
     pub aliases: Option<Vec<String>>,
+    pub owned_by: Option<String>,
 }
 
 /// Batch update request format - Map of model name to update data
@@ -34,6 +35,7 @@ pub struct ModelPricing {
     pub verifiable: bool,
     pub is_active: bool,
     pub aliases: Vec<String>,
+    pub owned_by: String,
 }
 
 /// Model history entry - includes pricing, context length, and other model attributes
@@ -103,13 +105,16 @@ pub struct UserInfo {
     pub is_active: bool,
 }
 
-/// Organization information for user listing (earliest organization with spend limit)
+/// Organization information for user listing (earliest organization with spend limit and usage)
 #[derive(Debug, Clone)]
 pub struct UserOrganizationInfo {
     pub id: uuid::Uuid,
     pub name: String,
     pub description: Option<String>,
     pub spend_limit: Option<i64>, // Amount in nano-dollars (scale 9)
+    pub total_spent: Option<i64>, // Amount in nano-dollars (scale 9)
+    pub total_requests: Option<i64>,
+    pub total_tokens: Option<i64>,
 }
 
 /// Model information for admin listing (includes is_active status)
@@ -126,6 +131,7 @@ pub struct AdminModelInfo {
     pub context_length: i32,
     pub verifiable: bool,
     pub is_active: bool,
+    pub owned_by: String,
     pub aliases: Vec<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,

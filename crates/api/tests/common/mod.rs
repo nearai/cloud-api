@@ -73,6 +73,7 @@ pub fn test_config() -> ApiConfig {
             encoding_key: "mock_encoding_key".to_string(),
             github: None,
             google: None,
+            near: config::NearConfig::default(),
             admin_domains: vec!["test.com".to_string()],
         },
         database: db_config_for_tests(),
@@ -111,8 +112,9 @@ fn db_config_for_tests() -> config::DatabaseConfig {
     }
 }
 
+/// Get the default mock session ID for tests
 pub fn get_session_id() -> String {
-    "rt_402af343-70ba-4a8a-b926-012f71e86769".to_string()
+    format!("rt_{MOCK_USER_ID}")
 }
 
 /// Get an access token from a refresh token (session token)
@@ -139,20 +141,21 @@ pub async fn get_access_token_from_refresh_token(
 
 /// Initialize database with migrations running only once
 pub async fn init_test_database(config: &config::DatabaseConfig) -> Arc<Database> {
-    // Reset database once per test run
-    RESET_DONE
-        .get_or_init(|| async {
-            db_setup::reset_test_database(config)
-                .await
-                .expect("Failed to reset test database");
-        })
-        .await;
-
     let database = Arc::new(
         Database::from_config(config)
             .await
             .expect("Failed to connect to database"),
     );
+
+    // Reset database once per test run (before migrations)
+    RESET_DONE
+        .get_or_init(|| async {
+            // Run full database reset
+            db_setup::reset_test_database(config)
+                .await
+                .expect("Failed to reset test database");
+        })
+        .await;
 
     // Only run migrations for real database, not mock
     if !config.mock {
@@ -172,7 +175,15 @@ pub async fn init_test_database(config: &config::DatabaseConfig) -> Arc<Database
 /// Setup a complete test server with all components initialized
 /// Returns the test server ready for making requests
 pub async fn setup_test_server() -> axum_test::TestServer {
-    setup_test_server_with_pool().await.0
+    let (server, _) = setup_test_server_with_database().await;
+    server
+}
+
+/// Setup a complete test server and return it along with the database
+/// Useful for tests that need to create test users in the database
+pub async fn setup_test_server_with_database() -> (axum_test::TestServer, Arc<Database>) {
+    let (server, _pool, _mock, db) = setup_test_server_with_pool().await;
+    (server, db)
 }
 
 /// Setup a complete test server with all components initialized
@@ -221,6 +232,35 @@ pub async fn setup_test_server_with_pool() -> (
     (server, inference_provider_pool, mock_provider, database)
 }
 
+/// Create a unique test user in the database and return (session_id, email)
+pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, String) {
+    let user_id = uuid::Uuid::new_v4();
+    let user_id_str = user_id.to_string();
+    // Session ID format: rt_{uuid} (with dashes so it can be parsed by MockAuthService)
+    let session_id = format!("rt_{user_id_str}");
+    let email = format!("test-{user_id_str}@test.com");
+
+    // Create user in database
+    let pool = database.pool();
+    let client = pool.get().await.expect("Failed to get database connection");
+    let _ = client.execute(
+        "INSERT INTO users (id, email, username, display_name, avatar_url, auth_provider, provider_user_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+         ON CONFLICT (id) DO NOTHING",
+        &[
+            &user_id,
+            &email,
+            &format!("testuser-{user_id_str}"),
+            &Some("Test User".to_string()),
+            &Some("https://example.com/avatar.jpg".to_string()),
+            &"mock",
+            &"mock_user",
+        ],
+    ).await;
+
+    (session_id, email)
+}
+
 /// Create the mock user in the database to satisfy foreign key constraints
 pub async fn assert_mock_user_in_db(database: &Arc<Database>) {
     // For real database, create the mock user
@@ -229,13 +269,13 @@ pub async fn assert_mock_user_in_db(database: &Arc<Database>) {
 
     // Insert mock user if it doesn't exist with admin domain email
     let _ = client.execute(
-        "INSERT INTO users (id, email, username, display_name, avatar_url, auth_provider, provider_user_id, created_at, updated_at) 
+        "INSERT INTO users (id, email, username, display_name, avatar_url, auth_provider, provider_user_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
          ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email",
         &[
             &uuid::Uuid::parse_str(MOCK_USER_ID).unwrap(),
             &"admin@test.com", // Using test.com domain for admin access
-            &"testuser", 
+            &"testuser",
             &Some("Test User".to_string()),
             &Some("https://example.com/avatar.jpg".to_string()),
             &"mock",
@@ -248,14 +288,21 @@ pub async fn assert_mock_user_in_db(database: &Arc<Database>) {
 
 /// Create an organization
 pub async fn create_org(server: &axum_test::TestServer) -> api::models::OrganizationResponse {
+    create_org_with_session(server, &get_session_id()).await
+}
+
+/// Create an organization with a specific session ID
+pub async fn create_org_with_session(
+    server: &axum_test::TestServer,
+    session_id: &str,
+) -> api::models::OrganizationResponse {
     let request = api::models::CreateOrganizationRequest {
         name: uuid::Uuid::new_v4().to_string(),
         description: Some("A test organization".to_string()),
-        display_name: Some("Test Organization".to_string()),
     };
     let response = server
         .post("/v1/organizations")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {session_id}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!(request))
         .await;
@@ -269,20 +316,44 @@ pub async fn setup_org_with_credits(
     server: &axum_test::TestServer,
     amount_nano_dollars: i64,
 ) -> api::models::OrganizationResponse {
-    let org = create_org(server).await;
+    setup_org_with_credits_and_session(server, amount_nano_dollars, &get_session_id()).await
+}
+
+/// Create an organization and set spending limit with a specific session ID
+pub async fn setup_org_with_credits_and_session(
+    server: &axum_test::TestServer,
+    amount_nano_dollars: i64,
+    session_id: &str,
+) -> api::models::OrganizationResponse {
+    setup_org_with_credits_and_session_and_email(
+        server,
+        amount_nano_dollars,
+        session_id,
+        "admin@test.com",
+    )
+    .await
+}
+
+pub async fn setup_org_with_credits_and_session_and_email(
+    server: &axum_test::TestServer,
+    amount_nano_dollars: i64,
+    session_id: &str,
+    email: &str,
+) -> api::models::OrganizationResponse {
+    let org = create_org_with_session(server, session_id).await;
 
     let update_request = serde_json::json!({
         "spendLimit": {
             "amount": amount_nano_dollars,
             "currency": "USD"
         },
-        "changedBy": "admin@test.com",
+        "changedBy": email,
         "changeReason": "Test credits"
     });
 
     let response = server
         .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {session_id}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&update_request)
         .await;
@@ -296,9 +367,18 @@ pub async fn list_workspaces(
     server: &axum_test::TestServer,
     org_id: String,
 ) -> Vec<api::routes::workspaces::WorkspaceResponse> {
+    list_workspaces_with_session(server, org_id, &get_session_id()).await
+}
+
+/// List workspaces for an organization with a specific session
+pub async fn list_workspaces_with_session(
+    server: &axum_test::TestServer,
+    org_id: String,
+    session_id: &str,
+) -> Vec<api::routes::workspaces::WorkspaceResponse> {
     let response = server
         .get(format!("/v1/organizations/{org_id}/workspaces").as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {session_id}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
     assert_eq!(response.status_code(), 200);
@@ -312,6 +392,16 @@ pub async fn create_api_key_in_workspace(
     workspace_id: String,
     name: String,
 ) -> api::models::ApiKeyResponse {
+    create_api_key_in_workspace_with_session(server, workspace_id, name, &get_session_id()).await
+}
+
+/// Create an API key in a workspace with a specific session
+pub async fn create_api_key_in_workspace_with_session(
+    server: &axum_test::TestServer,
+    workspace_id: String,
+    name: String,
+    session_id: &str,
+) -> api::models::ApiKeyResponse {
     let request = api::models::CreateApiKeyRequest {
         name,
         expires_at: Some(Utc::now() + chrono::Duration::days(90)),
@@ -319,7 +409,7 @@ pub async fn create_api_key_in_workspace(
     };
     let response = server
         .post(format!("/v1/workspaces/{workspace_id}/api-keys").as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("Authorization", format!("Bearer {session_id}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!(request))
         .await;
@@ -330,10 +420,25 @@ pub async fn create_api_key_in_workspace(
 /// Get an API key for an organization (using its default workspace)
 /// Returns the API key string
 pub async fn get_api_key_for_org(server: &axum_test::TestServer, org_id: String) -> String {
-    let workspaces = list_workspaces(server, org_id).await;
+    get_api_key_for_org_with_session(server, org_id, &get_session_id()).await
+}
+
+/// Get an API key for an organization with a specific session (using its default workspace)
+/// Returns the API key string
+pub async fn get_api_key_for_org_with_session(
+    server: &axum_test::TestServer,
+    org_id: String,
+    session_id: &str,
+) -> String {
+    let workspaces = list_workspaces_with_session(server, org_id, session_id).await;
     let workspace = workspaces.first().unwrap();
-    let api_key_resp =
-        create_api_key_in_workspace(server, workspace.id.clone(), "Test API Key".to_string()).await;
+    let api_key_resp = create_api_key_in_workspace_with_session(
+        server,
+        workspace.id.clone(),
+        "Test API Key".to_string(),
+        session_id,
+    )
+    .await;
     api_key_resp.key.unwrap()
 }
 
@@ -716,4 +821,100 @@ pub mod mock_prompts {
     pub fn build_simple_prompt(user_content: &str) -> String {
         user_content.to_string()
     }
+}
+
+// ============================================
+// NEAR Wallet Authentication Test Helpers
+// ============================================
+
+use near_api::signer::NEP413Payload;
+use rand::Rng;
+
+pub const NEAR_TEST_ACCOUNT: &str = "testuser.near";
+pub const NEAR_TEST_PUBLIC_KEY: &str = "ed25519:7FmyF5aYxwHKVvpBJxWrRi58EXQhG5KUkCb3Jv8TzWqM";
+
+/// Generate a valid base64-encoded ed25519 signature (64 zero bytes for testing)
+fn generate_test_signature() -> String {
+    use base64::prelude::*;
+    let sig_bytes = vec![0u8; 64];
+    BASE64_STANDARD.encode(&sig_bytes)
+}
+
+/// Create a valid NEP-413 nonce with timestamp
+///
+/// # Arguments
+/// * `timestamp_offset_ms` - Milliseconds offset from now (0 = now, positive = future, negative = past)
+///
+/// Returns a 32-byte nonce: [8 bytes timestamp (big-endian)] + [24 bytes random]
+pub fn create_near_test_nonce(timestamp_offset_ms: i64) -> Vec<u8> {
+    let now_ms = Utc::now().timestamp_millis();
+    let nonce_timestamp_ms = (now_ms + timestamp_offset_ms) as u64;
+    let mut nonce = Vec::with_capacity(32);
+
+    // First 8 bytes: timestamp (big-endian)
+    nonce.extend_from_slice(&nonce_timestamp_ms.to_be_bytes());
+
+    // Remaining 24 bytes: random data
+    let mut rng = rand::thread_rng();
+    let mut random_bytes = [0u8; 24];
+    rng.fill(&mut random_bytes);
+    nonce.extend_from_slice(&random_bytes);
+
+    nonce
+}
+
+/// Create a NEP-413 payload for testing
+pub fn create_near_test_payload(timestamp_offset_ms: i64) -> NEP413Payload {
+    let nonce = create_near_test_nonce(timestamp_offset_ms);
+
+    NEP413Payload {
+        message: "Sign in to NEAR AI Cloud".to_string(),
+        nonce: nonce.try_into().expect("Nonce should be 32 bytes"),
+        recipient: "cloud.near.ai".to_string(),
+        callback_url: None,
+    }
+}
+
+/// Create NEAR authentication request JSON for the endpoint
+pub fn create_near_auth_request_json(
+    account_id: &str,
+    timestamp_offset_ms: i64,
+) -> serde_json::Value {
+    let payload = create_near_test_payload(timestamp_offset_ms);
+
+    serde_json::json!({
+        "signed_message": {
+            "accountId": account_id,
+            "publicKey": NEAR_TEST_PUBLIC_KEY,
+            "signature": generate_test_signature(),
+        },
+        "payload": {
+            "message": payload.message,
+            "nonce": payload.nonce.to_vec(),
+            "recipient": payload.recipient,
+            "callbackUrl": serde_json::Value::Null,
+        }
+    })
+}
+
+/// Test NEAR login endpoint
+///
+/// # Arguments
+/// * `server` - Test server instance
+/// * `account_id` - NEAR account ID to use
+/// * `timestamp_offset_ms` - Nonce timestamp offset (0 = now, positive = future, negative = past)
+///
+/// Returns the HTTP response
+pub async fn test_near_login(
+    server: &axum_test::TestServer,
+    account_id: &str,
+    timestamp_offset_ms: i64,
+) -> axum_test::TestResponse {
+    let request_body = create_near_auth_request_json(account_id, timestamp_offset_ms);
+
+    server
+        .post("/v1/auth/near")
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&request_body)
+        .await
 }

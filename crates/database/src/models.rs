@@ -7,7 +7,6 @@ use uuid::Uuid;
 pub struct Organization {
     pub id: Uuid,
     pub name: String,
-    pub display_name: String,
     pub description: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -174,7 +173,6 @@ pub struct AdminAccessToken {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateOrganizationRequest {
     pub name: String,
-    pub display_name: String,
     pub description: Option<String>,
 }
 
@@ -191,7 +189,7 @@ pub struct UpdateOrganizationMemberRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateOrganizationRequest {
-    pub display_name: Option<String>,
+    pub name: Option<String>,
     pub description: Option<String>,
     pub rate_limit: Option<i32>,
     pub settings: Option<serde_json::Value>,
@@ -417,6 +415,7 @@ pub struct Model {
 
     // Tracking fields
     pub is_active: bool,
+    pub owned_by: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -434,6 +433,7 @@ pub struct UpdateModelPricingRequest {
     pub verifiable: Option<bool>,
     pub is_active: Option<bool>,
     pub aliases: Option<Vec<String>>,
+    pub owned_by: Option<String>,
 }
 
 /// Model pricing history - stores historical pricing data for models

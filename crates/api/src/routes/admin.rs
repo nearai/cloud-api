@@ -4,9 +4,10 @@ use crate::models::{
     AdminUserOrganizationDetails, AdminUserResponse, BatchUpdateModelApiRequest,
     CreateAdminAccessTokenRequest, DecimalPrice, DeleteAdminAccessTokenRequest, ErrorResponse,
     ListUsersResponse, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
-    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, SpendLimit, UpdateOrganizationLimitsRequest,
-    UpdateOrganizationLimitsResponse,
+    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, SpendLimit,
+    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
 };
+use crate::routes::common::format_amount;
 use axum::{
     extract::{Json, Path, Query, State},
     http::HeaderMap,
@@ -71,6 +72,8 @@ pub async fn batch_upsert_models(
     }
 
     // Convert API request to service request
+    // Note: Default owned_by value is applied in the repository layer during INSERT,
+    // not here, so we can distinguish between CREATE (apply default) and UPDATE (preserve old)
     let models = batch_request
         .iter()
         .map(|(model_name, request)| {
@@ -86,6 +89,7 @@ pub async fn batch_upsert_models(
                     verifiable: request.verifiable,
                     is_active: request.is_active,
                     aliases: request.aliases.clone(),
+                    owned_by: request.owned_by.clone(),
                 },
             )
         })
@@ -142,6 +146,7 @@ pub async fn batch_upsert_models(
                 model_display_name: updated_model.model_display_name,
                 model_description: updated_model.model_description,
                 model_icon: updated_model.model_icon,
+                owned_by: updated_model.owned_by,
                 aliases: updated_model.aliases,
             },
         })
@@ -220,6 +225,7 @@ pub async fn list_models(
                 model_description: model.model_description,
                 model_icon: model.model_icon,
                 aliases: model.aliases,
+                owned_by: model.owned_by,
             },
             is_active: model.is_active,
             created_at: model.created_at,
@@ -686,6 +692,13 @@ pub async fn list_users(
             .into_iter()
             .map(|(u, org_data)| {
                 let organizations = org_data.map(|org_info| {
+                    let current_usage = org_info.total_spent.map(|total_spent| OrganizationUsage {
+                        total_spent,
+                        total_spent_display: format_amount(total_spent),
+                        total_requests: org_info.total_requests.unwrap_or(0),
+                        total_tokens: org_info.total_tokens.unwrap_or(0),
+                    });
+
                     vec![AdminUserOrganizationDetails {
                         id: org_info.id.to_string(),
                         name: org_info.name,
@@ -695,6 +708,7 @@ pub async fn list_users(
                             scale: 9,
                             currency: "USD".to_string(),
                         }),
+                        current_usage,
                     }]
                 });
 

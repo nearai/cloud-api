@@ -46,6 +46,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use utoipa::OpenApi;
 
 /// Service initialization components
+#[derive(Clone)]
 pub struct AuthComponents {
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub oauth_manager: Arc<OAuthManager>,
@@ -53,6 +54,7 @@ pub struct AuthComponents {
     pub auth_state_middleware: AuthState,
     pub organization_service:
         Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
+    pub near_auth_service: Arc<services::auth::NearAuthService>,
 }
 
 #[derive(Clone)]
@@ -184,12 +186,25 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
         config.auth.encoding_key.clone(),
     );
 
+    // Create NEAR nonce repository
+    let nonce_repository = Arc::new(database::PostgresNearNonceRepository::new(
+        database.pool().clone(),
+    )) as Arc<dyn services::auth::NearNonceRepository>;
+
+    // Create NEAR auth service (injecting AuthService for reuse)
+    let near_auth_service = Arc::new(services::auth::NearAuthService::new(
+        auth_service.clone(),
+        nonce_repository,
+        config.auth.near.clone(),
+    ));
+
     AuthComponents {
         auth_service,
         oauth_manager: oauth_manager_arc,
         state_store,
         auth_state_middleware,
         organization_service,
+        near_auth_service,
     }
 }
 
@@ -545,11 +560,11 @@ pub fn build_app_with_config(
         api_key_repository,
     };
 
+    let rate_limit_state = middleware::RateLimitState::default();
+
     // Build individual route groups
     let auth_routes = build_auth_routes(
-        auth_components.oauth_manager.clone(),
-        auth_components.state_store,
-        auth_components.auth_service.clone(),
+        Arc::new(auth_components.clone()),
         &auth_components.auth_state_middleware,
         config.clone(),
     );
@@ -558,6 +573,7 @@ pub fn build_app_with_config(
         app_state.clone(),
         &auth_components.auth_state_middleware,
         usage_state.clone(),
+        rate_limit_state.clone(),
     );
 
     let response_routes = build_response_routes(
@@ -565,6 +581,7 @@ pub fn build_app_with_config(
         domain_services.attestation_service.clone(),
         &auth_components.auth_state_middleware,
         usage_state,
+        rate_limit_state.clone(),
     );
 
     let conversation_routes = build_conversation_routes(
@@ -687,13 +704,25 @@ pub fn build_invitation_routes(app_state: AppState, auth_state_middleware: &Auth
 
 /// Build authentication routes
 pub fn build_auth_routes(
-    oauth_manager: Arc<OAuthManager>,
-    state_store: StateStore,
-    auth_service: Arc<dyn AuthServiceTrait>,
-    auth_state_middleware: &AuthState,
+    auth_components: Arc<AuthComponents>,
+    auth_state_middleware: &middleware::AuthState,
     config: Arc<ApiConfig>,
 ) -> Router {
-    let auth_state = (oauth_manager, state_store, auth_service, config);
+    use routes::auth::{AuthState, NearAuthState};
+
+    let auth_state: AuthState = (
+        auth_components.oauth_manager.clone(),
+        auth_components.state_store.clone(),
+        auth_components.auth_service.clone(),
+        config.clone(),
+    );
+
+    let near_auth_state: NearAuthState = (auth_components.near_auth_service.clone(), config);
+
+    // Create a sub-router for the NEAR route with its own state
+    let near_router = Router::new()
+        .route("/near", post(routes::auth::near_login))
+        .with_state(near_auth_state);
 
     Router::new()
         .route("/login", get(login_page))
@@ -708,6 +737,7 @@ pub fn build_auth_routes(
             )),
         )
         .route("/logout", post(logout))
+        .merge(near_router)
         .with_state(auth_state)
 }
 
@@ -716,35 +746,37 @@ pub fn build_completion_routes(
     app_state: AppState,
     auth_state_middleware: &AuthState,
     usage_state: middleware::UsageState,
+    rate_limit_state: middleware::RateLimitState,
 ) -> Router {
-    // Routes that require credits (actual inference)
     let inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
-        // .route("/completions", post(completions))
         .with_state(app_state.clone())
-        // First check usage limits for inference endpoints
         .layer(from_fn_with_state(
             usage_state,
             middleware::usage_check_middleware,
         ))
-        // Then authenticate with workspace context (provides organization)
+        .layer(from_fn_with_state(
+            rate_limit_state.clone(),
+            middleware::api_key_rate_limit_middleware,
+        ))
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
         .layer(from_fn(middleware::body_hash_middleware));
 
-    // Routes that don't require credits (metadata)
     let metadata_routes = Router::new()
         .route("/models", get(models))
         .with_state(app_state)
-        // Only require API key, no usage check
+        .layer(from_fn_with_state(
+            rate_limit_state.clone(),
+            middleware::api_key_rate_limit_middleware,
+        ))
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware_with_api_key,
         ));
 
-    // Merge routes
     Router::new().merge(inference_routes).merge(metadata_routes)
 }
 
@@ -754,13 +786,13 @@ pub fn build_response_routes(
     attestation_service: Arc<dyn services::attestation::ports::AttestationServiceTrait>,
     auth_state_middleware: &AuthState,
     usage_state: middleware::UsageState,
+    rate_limit_state: middleware::RateLimitState,
 ) -> Router {
     let route_state = responses::ResponseRouteState {
         response_service: response_service.clone(),
         attestation_service: attestation_service.clone(),
     };
 
-    // Create response route with usage check
     let inference_routes = Router::new()
         .route("/responses", post(responses::create_response))
         .with_state(route_state.clone())
@@ -769,12 +801,15 @@ pub fn build_response_routes(
             middleware::usage_check_middleware,
         ))
         .layer(from_fn_with_state(
+            rate_limit_state.clone(),
+            middleware::api_key_rate_limit_middleware,
+        ))
+        .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
         .layer(from_fn(middleware::body_hash_middleware));
 
-    // Response management routes
     let other_routes = Router::new()
         .route("/responses/{response_id}", get(responses::get_response))
         .route(
@@ -790,6 +825,10 @@ pub fn build_response_routes(
             get(responses::list_input_items),
         )
         .with_state(route_state)
+        .layer(from_fn_with_state(
+            rate_limit_state.clone(),
+            middleware::api_key_rate_limit_middleware,
+        ))
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
@@ -1152,6 +1191,7 @@ mod tests {
                 encoding_key: "mock_encoding_key".to_string(),
                 github: None,
                 google: None,
+                near: config::NearConfig::default(),
                 admin_domains: vec![],
             },
             database: config::DatabaseConfig {
@@ -1254,6 +1294,7 @@ mod tests {
                 encoding_key: "mock_encoding_key".to_string(),
                 github: None,
                 google: None,
+                near: config::NearConfig::default(),
                 admin_domains: vec![],
             },
             database: config::DatabaseConfig {

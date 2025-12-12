@@ -1,4 +1,5 @@
 pub mod cluster_manager;
+pub mod constants;
 pub mod migrations;
 pub mod mock;
 pub mod models;
@@ -7,12 +8,14 @@ pub mod pool;
 pub mod repositories;
 pub mod shutdown_coordinator;
 
+pub use constants::*;
 pub use models::*;
 pub use pool::DbPool;
 pub use repositories::{
     ApiKeyRepository, McpConnectorRepository, OAuthStateRepository, PgAttestationRepository,
     PgConversationRepository, PgOrganizationInvitationRepository, PgOrganizationRepository,
-    PgResponseItemsRepository, PgResponseRepository, SessionRepository, UserRepository,
+    PgResponseItemsRepository, PgResponseRepository, PostgresNearNonceRepository,
+    SessionRepository, UserRepository,
 };
 pub use shutdown_coordinator::{ShutdownCoordinator, ShutdownStage, ShutdownStageResult};
 

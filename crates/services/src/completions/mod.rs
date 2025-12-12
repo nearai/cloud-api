@@ -17,7 +17,7 @@ use std::time::Instant;
 
 /// Hash inference ID to UUID deterministically using MD5 (v5)
 /// Takes the full ID including prefix (e.g., "chatcmpl-abc123") and returns a stable UUID
-fn hash_inference_id_to_uuid(full_id: &str) -> Uuid {
+pub fn hash_inference_id_to_uuid(full_id: &str) -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_DNS, full_id.as_bytes())
 }
 

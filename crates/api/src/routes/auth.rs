@@ -507,23 +507,20 @@ pub async fn near_login(
         Err(e) => {
             error!("NEAR authentication failed: {}", e);
 
-            // Check if InternalError and sanitize message to hide DB/service details
-            let (status, error_type, error_msg) =
+            // Map errors: InternalError -> 500, everything else -> 401 Unauthorized
+            let (status, error_type) =
                 if let Some(NearAuthError::InternalError(_)) = e.downcast_ref::<NearAuthError>() {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "internal_error",
-                        "Internal server error".to_string(),
-                    )
+                    (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
                 } else {
-                    (StatusCode::UNAUTHORIZED, "invalid_auth", e.to_string())
+                    (StatusCode::UNAUTHORIZED, "invalid_auth")
                 };
 
             (
                 status,
                 Json(serde_json::json!({
                     "error": error_type,
-                    "error_description": error_msg
+                    "error_description": e.to_string()
+
                 })),
             )
                 .into_response()

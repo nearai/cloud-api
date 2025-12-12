@@ -797,7 +797,7 @@ pub fn create_near_auth_request_json(
 /// # Arguments
 /// * `server` - Test server instance
 /// * `account_id` - NEAR account ID to use
-/// * `timestamp_offset_ms` - Nonce timestamp offset (0 = now, positive = past, negative = future)
+/// * `timestamp_offset_ms` - Nonce timestamp offset (0 = now, positive = future, negative = past)
 ///
 /// Returns the HTTP response
 pub async fn test_near_login(

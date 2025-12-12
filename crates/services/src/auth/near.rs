@@ -22,15 +22,15 @@ pub enum NearAuthError {
     ExpiredNonce,
     #[error("Invalid signature timestamp")]
     InvalidTimestamp,
-    #[error("Invalid nonce: {0}")]
+    #[error("Invalid nonce")]
     InvalidNonce(String),
-    #[error("Invalid recipient: {0}")]
+    #[error("Invalid recipient")]
     InvalidRecipient(String),
-    #[error("Invalid message: {0}")]
+    #[error("Invalid message")]
     InvalidMessage(String),
-    #[error("Signature verification failed: {0}")]
+    #[error("Signature verification failed")]
     SignatureVerificationFailed(String),
-    #[error("{0}")]
+    #[error("Internal server error")]
     InternalError(String),
 }
 

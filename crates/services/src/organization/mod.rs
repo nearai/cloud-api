@@ -79,11 +79,7 @@ impl OrganizationServiceImpl {
             ));
         }
 
-        let request = CreateOrganizationRequest {
-            name,
-            display_name: None,
-            description,
-        };
+        let request = CreateOrganizationRequest { name, description };
 
         self.repository
             .create(request, owner_id.0)
@@ -108,7 +104,7 @@ impl OrganizationServiceImpl {
         &self,
         id: OrganizationId,
         user_id: UserId,
-        display_name: Option<String>,
+        name: Option<String>,
         description: Option<String>,
         rate_limit: Option<i32>,
         settings: Option<serde_json::Value>,
@@ -130,17 +126,17 @@ impl OrganizationServiceImpl {
             }
         }
 
-        // Validate display_name if provided
-        if let Some(ref n) = display_name {
+        // Validate name if provided
+        if let Some(ref n) = name {
             if n.trim().is_empty() {
                 return Err(OrganizationError::InvalidParams(
-                    "Organization display name cannot be empty".to_string(),
+                    "Organization name cannot be empty".to_string(),
                 ));
             }
         }
 
         let request = UpdateOrganizationRequest {
-            display_name,
+            name,
             description,
             rate_limit,
             settings,
@@ -1029,12 +1025,12 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
         &self,
         id: OrganizationId,
         user_id: UserId,
-        display_name: Option<String>,
+        name: Option<String>,
         description: Option<String>,
         rate_limit: Option<i32>,
         settings: Option<serde_json::Value>,
     ) -> Result<Organization, OrganizationError> {
-        self.update_organization_impl(id, user_id, display_name, description, rate_limit, settings)
+        self.update_organization_impl(id, user_id, name, description, rate_limit, settings)
             .await
     }
 
@@ -1333,7 +1329,7 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
 
         // Update organization with new settings
         let request = UpdateOrganizationRequest {
-            display_name: None,
+            name: None,
             description: None,
             rate_limit: None,
             settings: Some(settings),

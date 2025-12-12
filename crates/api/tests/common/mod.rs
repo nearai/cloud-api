@@ -298,7 +298,6 @@ pub async fn create_org_with_session(
     let request = api::models::CreateOrganizationRequest {
         name: uuid::Uuid::new_v4().to_string(),
         description: Some("A test organization".to_string()),
-        display_name: Some("Test Organization".to_string()),
     };
     let response = server
         .post("/v1/organizations")

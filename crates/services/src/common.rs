@@ -1,3 +1,31 @@
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+pub const API_KEY_PREFIX: &str = "sk-";
+pub const API_KEY_LENGTH: usize = 35;
+
+pub fn generate_api_key() -> String {
+    format!(
+        "{}{}",
+        API_KEY_PREFIX,
+        Uuid::new_v4().to_string().replace("-", "")
+    )
+}
+
+pub fn hash_api_key(key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn extract_api_key_prefix(key: &str) -> String {
+    key[..10.min(key.len())].to_string()
+}
+
+pub fn is_valid_api_key_format(key: &str) -> bool {
+    key.starts_with(API_KEY_PREFIX) && key.len() == API_KEY_LENGTH
+}
+
 /// Shared error types for repository operations across all domains.
 /// These errors represent infrastructure concerns (database, connections, etc.)
 /// rather than domain-specific business logic.

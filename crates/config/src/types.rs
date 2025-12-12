@@ -249,6 +249,7 @@ pub struct AuthConfig {
     pub encoding_key: String,
     pub github: Option<GitHubOAuthConfig>,
     pub google: Option<GoogleOAuthConfig>,
+    pub near: NearConfig,
     /// Email domains that are granted platform admin access
     /// Users with emails from these domains will have admin privileges
     pub admin_domains: Vec<String>,
@@ -296,6 +297,8 @@ impl AuthConfig {
             })
             .unwrap_or_default();
 
+        let near = NearConfig::from_env();
+
         Ok(Self {
             mock: env::var("AUTH_MOCK")
                 .ok()
@@ -305,6 +308,7 @@ impl AuthConfig {
                 .expect("AUTH_ENCODING_KEY environment variable is required"),
             github,
             google,
+            near,
             admin_domains,
         })
     }
@@ -338,6 +342,35 @@ pub struct GoogleOAuthConfig {
     pub client_id: String,
     pub client_secret: String,
     pub redirect_url: String,
+}
+
+/// NEAR wallet authentication configuration
+#[derive(Debug, Clone)]
+pub struct NearConfig {
+    pub rpc_url: String,
+    pub expected_recipient: String,
+}
+
+const NEAR_DEFAULT_RECIPIENT: &str = "cloud.near.ai";
+const NEAR_DEFAULT_RPC_URL: &str = "https://free.rpc.fastnear.com";
+
+impl Default for NearConfig {
+    fn default() -> Self {
+        Self {
+            rpc_url: NEAR_DEFAULT_RPC_URL.to_string(),
+            expected_recipient: NEAR_DEFAULT_RECIPIENT.to_string(),
+        }
+    }
+}
+
+impl NearConfig {
+    pub fn from_env() -> Self {
+        Self {
+            rpc_url: env::var("NEAR_RPC_URL").unwrap_or_else(|_| NEAR_DEFAULT_RPC_URL.to_string()),
+            expected_recipient: env::var("NEAR_EXPECTED_RECIPIENT")
+                .unwrap_or_else(|_| NEAR_DEFAULT_RECIPIENT.to_string()),
+        }
+    }
 }
 
 // Generic OAuth provider config for unified handling
@@ -435,6 +468,7 @@ mod tests {
             encoding_key: "mock_encoding_key".to_string(),
             github: None,
             google: None,
+            near: NearConfig::default(),
             admin_domains: vec!["near.ai".to_string(), "near.org".to_string()],
         };
 
@@ -457,6 +491,7 @@ mod tests {
             encoding_key: "mock_encoding_key".to_string(),
             github: None,
             google: None,
+            near: NearConfig::default(),
             admin_domains: vec![],
         };
 

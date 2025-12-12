@@ -37,6 +37,8 @@ rmcp = { version = "0.6", features = [
     "transport-sse-client-reqwest",
 ] }
 hex = "0.4"
+# NEAR wallet authentication (NEP-413)
+near-api = "0.8.0"
 dstack-sdk = "0.1.2"
 dstack-sdk-types = "0.1.2"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }

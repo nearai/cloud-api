@@ -73,6 +73,7 @@ pub fn test_config() -> ApiConfig {
             encoding_key: "mock_encoding_key".to_string(),
             github: None,
             google: None,
+            near: config::NearConfig::default(),
             admin_domains: vec!["test.com".to_string()],
         },
         database: db_config_for_tests(),
@@ -820,4 +821,100 @@ pub mod mock_prompts {
     pub fn build_simple_prompt(user_content: &str) -> String {
         user_content.to_string()
     }
+}
+
+// ============================================
+// NEAR Wallet Authentication Test Helpers
+// ============================================
+
+use near_api::signer::NEP413Payload;
+use rand::Rng;
+
+pub const NEAR_TEST_ACCOUNT: &str = "testuser.near";
+pub const NEAR_TEST_PUBLIC_KEY: &str = "ed25519:7FmyF5aYxwHKVvpBJxWrRi58EXQhG5KUkCb3Jv8TzWqM";
+
+/// Generate a valid base64-encoded ed25519 signature (64 zero bytes for testing)
+fn generate_test_signature() -> String {
+    use base64::prelude::*;
+    let sig_bytes = vec![0u8; 64];
+    BASE64_STANDARD.encode(&sig_bytes)
+}
+
+/// Create a valid NEP-413 nonce with timestamp
+///
+/// # Arguments
+/// * `timestamp_offset_ms` - Milliseconds offset from now (0 = now, positive = future, negative = past)
+///
+/// Returns a 32-byte nonce: [8 bytes timestamp (big-endian)] + [24 bytes random]
+pub fn create_near_test_nonce(timestamp_offset_ms: i64) -> Vec<u8> {
+    let now_ms = Utc::now().timestamp_millis();
+    let nonce_timestamp_ms = (now_ms + timestamp_offset_ms) as u64;
+    let mut nonce = Vec::with_capacity(32);
+
+    // First 8 bytes: timestamp (big-endian)
+    nonce.extend_from_slice(&nonce_timestamp_ms.to_be_bytes());
+
+    // Remaining 24 bytes: random data
+    let mut rng = rand::thread_rng();
+    let mut random_bytes = [0u8; 24];
+    rng.fill(&mut random_bytes);
+    nonce.extend_from_slice(&random_bytes);
+
+    nonce
+}
+
+/// Create a NEP-413 payload for testing
+pub fn create_near_test_payload(timestamp_offset_ms: i64) -> NEP413Payload {
+    let nonce = create_near_test_nonce(timestamp_offset_ms);
+
+    NEP413Payload {
+        message: "Sign in to NEAR AI Cloud".to_string(),
+        nonce: nonce.try_into().expect("Nonce should be 32 bytes"),
+        recipient: "cloud.near.ai".to_string(),
+        callback_url: None,
+    }
+}
+
+/// Create NEAR authentication request JSON for the endpoint
+pub fn create_near_auth_request_json(
+    account_id: &str,
+    timestamp_offset_ms: i64,
+) -> serde_json::Value {
+    let payload = create_near_test_payload(timestamp_offset_ms);
+
+    serde_json::json!({
+        "signed_message": {
+            "accountId": account_id,
+            "publicKey": NEAR_TEST_PUBLIC_KEY,
+            "signature": generate_test_signature(),
+        },
+        "payload": {
+            "message": payload.message,
+            "nonce": payload.nonce.to_vec(),
+            "recipient": payload.recipient,
+            "callbackUrl": serde_json::Value::Null,
+        }
+    })
+}
+
+/// Test NEAR login endpoint
+///
+/// # Arguments
+/// * `server` - Test server instance
+/// * `account_id` - NEAR account ID to use
+/// * `timestamp_offset_ms` - Nonce timestamp offset (0 = now, positive = future, negative = past)
+///
+/// Returns the HTTP response
+pub async fn test_near_login(
+    server: &axum_test::TestServer,
+    account_id: &str,
+    timestamp_offset_ms: i64,
+) -> axum_test::TestResponse {
+    let request_body = create_near_auth_request_json(account_id, timestamp_offset_ms);
+
+    server
+        .post("/v1/auth/near")
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&request_body)
+        .await
 }

@@ -1,7 +1,7 @@
 use crate::middleware::AuthenticatedUser;
 use axum::{
     extract::{Query, Request, State},
-    http::{header::SET_COOKIE, StatusCode},
+    http::{header::SET_COOKIE, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     Extension, Json,
 };
@@ -9,6 +9,7 @@ use chrono::Utc;
 use config::ApiConfig;
 use database::repositories::OAuthStateRepository;
 use serde::{Deserialize, Serialize};
+use services::auth::near::NearAuthError;
 use services::auth::{AuthServiceTrait, OAuthManager};
 use std::sync::Arc;
 use tracing::{debug, error, info};
@@ -22,6 +23,8 @@ pub type AuthState = (
     Arc<dyn AuthServiceTrait>,
     Arc<ApiConfig>,
 );
+
+pub type NearAuthState = (Arc<services::auth::NearAuthService>, Arc<ApiConfig>);
 
 #[derive(Deserialize)]
 pub struct OAuthCallback {
@@ -42,6 +45,127 @@ pub struct AuthResponse {
     message: String,
     email: String,
     provider: String,
+}
+
+// NEAR authentication types
+use base64::prelude::*;
+use near_api::signer::NEP413Payload;
+
+/// Request body for NEAR authentication (NEP-413)
+#[derive(Debug, Deserialize)]
+pub struct NearAuthRequest {
+    /// The signed message from the wallet
+    pub signed_message: NearSignedMessageJson,
+    /// The payload that was signed
+    pub payload: NearPayloadJson,
+}
+
+/// Signed message from wallet (NEP-413 SignedMessage)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NearSignedMessageJson {
+    /// NEAR account ID (e.g., "alice.near")
+    pub account_id: String,
+    /// Public key used to sign (e.g., "ed25519:...")
+    pub public_key: String,
+    /// Base64-encoded signature
+    pub signature: String,
+    /// Optional state for browser wallets
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+}
+
+/// Payload that was signed (NEP-413 Payload)
+#[derive(Debug)]
+pub struct NearPayloadJson {
+    /// The message that was signed
+    pub message: String,
+    /// The nonce (as array of 32 bytes)
+    pub nonce: Vec<u8>,
+    /// The recipient (your app identifier)
+    pub recipient: String,
+    /// Optional callback URL
+    pub callback_url: Option<String>,
+}
+
+impl TryFrom<NearSignedMessageJson> for services::auth::near::SignedMessage {
+    type Error = anyhow::Error;
+
+    fn try_from(msg: NearSignedMessageJson) -> Result<Self, Self::Error> {
+        use near_api::types::Signature;
+
+        let public_key: near_api::PublicKey = msg.public_key.parse()?;
+
+        // Parse base64 signature and create Signature based on key type
+        let sig_bytes = BASE64_STANDARD.decode(&msg.signature)?;
+        let signature = Signature::from_parts(public_key.key_type(), &sig_bytes)?;
+
+        Ok(services::auth::near::SignedMessage {
+            account_id: msg.account_id.parse()?,
+            public_key,
+            signature,
+            state: msg.state,
+        })
+    }
+}
+
+impl TryFrom<NearPayloadJson> for NEP413Payload {
+    type Error = anyhow::Error;
+
+    fn try_from(payload: NearPayloadJson) -> Result<Self, Self::Error> {
+        let nonce: [u8; 32] = payload
+            .nonce
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Nonce must be exactly 32 bytes"))?;
+
+        Ok(NEP413Payload {
+            message: payload.message,
+            nonce,
+            recipient: payload.recipient,
+            callback_url: payload.callback_url,
+        })
+    }
+}
+
+// Custom deserializer for NearPayloadJson to validate nonce length
+impl<'de> serde::Deserialize<'de> for NearPayloadJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct NearPayloadJsonRaw {
+            message: String,
+            nonce: Vec<u8>,
+            recipient: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            callback_url: Option<String>,
+        }
+
+        let raw = NearPayloadJsonRaw::deserialize(deserializer)?;
+
+        // Validate nonce length during deserialization
+        if raw.nonce.len() != 32 {
+            return Err(serde::de::Error::custom("Nonce must be exactly 32 bytes"));
+        }
+
+        Ok(NearPayloadJson {
+            message: raw.message,
+            nonce: raw.nonce,
+            recipient: raw.recipient,
+            callback_url: raw.callback_url,
+        })
+    }
+}
+
+#[derive(Serialize)]
+pub struct NearAuthResponse {
+    access_token: String,
+    refresh_token: String,
+    refresh_token_expiration: chrono::DateTime<Utc>,
+    user: AuthResponse,
 }
 
 /// Initiate GitHub OAuth flow - redirects to GitHub
@@ -291,6 +415,117 @@ pub async fn logout(Extension(user): Extension<AuthenticatedUser>) -> Response {
         })),
     )
         .into_response()
+}
+
+/// NEAR wallet login endpoint
+pub async fn near_login(
+    State((near_auth_service, config)): State<NearAuthState>,
+    headers: HeaderMap,
+    Json(auth_request): Json<NearAuthRequest>,
+) -> Response {
+    let account_id_str = auth_request.signed_message.account_id.clone();
+    debug!(
+        "NEAR authentication attempt for account: {}",
+        account_id_str
+    );
+
+    // Convert JSON types to internal types
+    let signed_message = match auth_request.signed_message.try_into() {
+        Ok(msg) => msg,
+        Err(e) => {
+            error!("Failed to parse signed message: {}", e);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "bad_request",
+                    "error_description": "Invalid signed message format"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let payload = match auth_request.payload.try_into() {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Failed to parse payload: {}", e);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "bad_request",
+                    "error_description": "Invalid payload format"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Extract user agent
+    let user_agent_header = match headers.get("User-Agent").and_then(|h| h.to_str().ok()) {
+        Some(ua) => ua,
+        None => {
+            error!("Missing User-Agent header");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "bad_request",
+                    "error_description": "Missing User-Agent header"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Verify and authenticate
+    let result = near_auth_service
+        .verify_and_authenticate(
+            signed_message,
+            payload,
+            None, // ip_address
+            user_agent_header.to_string(),
+            config.auth.encoding_key.clone(),
+        )
+        .await;
+
+    match result {
+        Ok((access_token, refresh_session, refresh_token)) => {
+            debug!("NEAR authentication successful: {}", account_id_str);
+
+            let response = NearAuthResponse {
+                access_token,
+                refresh_token,
+                refresh_token_expiration: refresh_session.expires_at,
+                user: AuthResponse {
+                    message: "Authenticated".to_string(),
+                    email: format!("{account_id_str}@near"),
+                    provider: "near".to_string(),
+                },
+            };
+
+            Json(response).into_response()
+        }
+        Err(e) => {
+            error!("NEAR authentication failed: {}", e);
+
+            // Map errors: InternalError -> 500, everything else -> 401 Unauthorized
+            let (status, error_type) =
+                if let Some(NearAuthError::InternalError(_)) = e.downcast_ref::<NearAuthError>() {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+                } else {
+                    (StatusCode::UNAUTHORIZED, "invalid_auth")
+                };
+
+            (
+                status,
+                Json(serde_json::json!({
+                    "error": error_type,
+                    "error_description": "NEAR authentication failed"
+
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Login page with OAuth provider options

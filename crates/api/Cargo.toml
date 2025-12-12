@@ -43,6 +43,9 @@ http-body-util = "0.1"
 # AWS S3 for file storage
 aws-config = { version = "1.5", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.70"
+# NEAR wallet authentication
+near-api = "0.8.0"
+base64 = "0.22"
 # Ordered collections
 indexmap = "2"
 moka = { version = "0.12.11", features = ["future"] }
@@ -60,3 +63,4 @@ sha3 = "0.10"
 hmac = "0.12"
 tokio-postgres = "0.7"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand = "0.8"

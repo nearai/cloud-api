@@ -8,6 +8,7 @@ pub mod pool;
 pub mod repositories;
 pub mod shutdown_coordinator;
 
+pub use constants::*;
 pub use models::*;
 pub use pool::DbPool;
 pub use repositories::{

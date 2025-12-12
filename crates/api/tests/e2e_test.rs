@@ -4,6 +4,7 @@ mod common;
 use common::*;
 
 use api::models::BatchUpdateModelApiRequest;
+use database::DEFAULT_MODEL_OWNED_BY;
 use inference_providers::{models::ChatCompletionChunk, StreamChunk};
 
 #[tokio::test]
@@ -165,8 +166,8 @@ async fn test_admin_update_model() {
     );
     assert_eq!(1000000, retrieved_model.input_cost_per_token.amount);
     assert_eq!(2000000, retrieved_model.output_cost_per_token.amount);
-    // Verify that owned_by defaults to "nearai" when not explicitly provided
-    assert_eq!(retrieved_model.metadata.owned_by, "nearai");
+    // Verify that owned_by defaults to DEFAULT_MODEL_OWNED_BY when not explicitly provided
+    assert_eq!(retrieved_model.metadata.owned_by, DEFAULT_MODEL_OWNED_BY);
 }
 
 #[tokio::test]
@@ -210,8 +211,8 @@ async fn test_get_model_by_name() {
     assert_eq!(2000000, model_resp.output_cost_per_token.amount);
     assert_eq!(9, model_resp.output_cost_per_token.scale);
     assert_eq!("USD", model_resp.output_cost_per_token.currency);
-    // Verify that owned_by defaults to "nearai" when not explicitly provided
-    assert_eq!(model_resp.metadata.owned_by, "nearai");
+    // Verify that owned_by defaults to DEFAULT_MODEL_OWNED_BY when not explicitly provided
+    assert_eq!(model_resp.metadata.owned_by, DEFAULT_MODEL_OWNED_BY);
 
     // Test retrieving the same model again by canonical name to verify consistency
     let response_by_name_again = server
@@ -370,7 +371,7 @@ async fn test_admin_model_default_owned_by() {
     // Create a unique model name to ensure we test INSERT path, not UPDATE path
     let unique_model_name = format!("test-model-{}", uuid::Uuid::new_v4());
 
-    // Create model WITHOUT specifying ownedBy - should default to "nearai"
+    // Create model WITHOUT specifying ownedBy - should default to DEFAULT_MODEL_OWNED_BY
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
         unique_model_name.clone(),
@@ -387,7 +388,7 @@ async fn test_admin_model_default_owned_by() {
             "modelDescription": "Testing default owned_by value",
             "contextLength": 128000,
             "verifiable": true
-            // NOTE: No ownedBy field - should default to "nearai"
+            // NOTE: No ownedBy field - should default to DEFAULT_MODEL_OWNED_BY
         }))
         .unwrap(),
     );
@@ -395,8 +396,8 @@ async fn test_admin_model_default_owned_by() {
     let created_models = admin_batch_upsert_models(&server, batch, get_session_id()).await;
     assert_eq!(created_models.len(), 1);
     assert_eq!(
-        created_models[0].metadata.owned_by, "nearai",
-        "Model created without ownedBy should default to 'nearai'"
+        created_models[0].metadata.owned_by, DEFAULT_MODEL_OWNED_BY,
+        "Model created without ownedBy should default to DEFAULT_MODEL_OWNED_BY"
     );
 
     // Verify the default persists in retrieval
@@ -408,7 +409,7 @@ async fn test_admin_model_default_owned_by() {
     assert_eq!(response.status_code(), 200);
     let retrieved_model = response.json::<api::models::ModelWithPricing>();
     assert_eq!(
-        retrieved_model.metadata.owned_by, "nearai",
+        retrieved_model.metadata.owned_by, DEFAULT_MODEL_OWNED_BY,
         "Retrieved model should have default owned_by value"
     );
 }

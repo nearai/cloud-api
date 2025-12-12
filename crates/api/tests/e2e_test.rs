@@ -2635,52 +2635,21 @@ async fn test_admin_list_users_with_organizations_no_spend_limit() {
 
 #[tokio::test]
 async fn test_admin_list_users_with_organization_usage() {
-    let server = setup_test_server().await;
-
-    // Setup the model with pricing
+    let (server, database) = setup_test_server_with_database().await;
     setup_qwen_model(&server).await;
 
-    // Get access token from refresh token
-    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+    // Create a unique test user for this test to avoid conflicts with other parallel tests
+    let (unique_session, test_user_email) = setup_unique_test_session(&database).await;
 
-    // Create a unique organization for this test with a recognizable name
-    let org_name = format!("test-usage-{}", uuid::Uuid::new_v4());
-    let request = serde_json::json!({
-        "name": org_name.clone(),
-        "description": "Test organization for usage tracking"
-    });
-
-    let response = server
-        .post("/v1/organizations")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", "test-client")
-        .json(&request)
-        .await;
-
-    assert_eq!(response.status_code(), 200, "Failed to create organization");
-    let org = response.json::<api::models::OrganizationResponse>();
-
-    // Set up spending limit for the organization
-    let update_request = serde_json::json!({
-        "spendLimit": {
-            "amount": 10000000000i64,
-            "currency": "USD"
-        },
-        "changedBy": "admin@test.com",
-        "changeReason": "Test credits"
-    });
-
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", "test-client")
-        .json(&update_request)
-        .await;
-
-    assert_eq!(response.status_code(), 200, "Failed to set spending limit");
-
-    // Get API key for the organization
-    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    // Create an organization with credits using the unique session
+    let org = setup_org_with_credits_and_session_and_email(
+        &server,
+        10000000000i64,
+        &unique_session,
+        &test_user_email,
+    )
+    .await; // $10.00 USD
+    let api_key = get_api_key_for_org_with_session(&server, org.id.clone(), &unique_session).await;
 
     // Make a chat completion request to generate usage
     let response = server
@@ -2706,19 +2675,19 @@ async fn test_admin_list_users_with_organization_usage() {
     // List users with organizations and verify usage is tracked
     let response = server
         .get("/v1/admin/users?limit=50&offset=0&include_organizations=true")
-        .add_header("Authorization", format!("Bearer {access_token}"))
+        .add_header("Authorization", format!("Bearer {}", &unique_session))
         .await;
 
     assert_eq!(response.status_code(), 200);
 
     let users_response = response.json::<api::models::ListUsersResponse>();
 
-    // Find the mock user
+    // Find the test user we created
     let mock_user = users_response
         .users
         .iter()
-        .find(|u| u.email == "admin@test.com")
-        .expect("Should find mock user");
+        .find(|u| u.email == test_user_email)
+        .expect("Should find the test user we created");
 
     // Verify user has at least one organization returned (admin list returns earliest org only)
     let organizations = mock_user

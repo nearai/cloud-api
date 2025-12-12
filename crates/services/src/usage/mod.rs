@@ -302,24 +302,24 @@ impl UsageServiceTrait for UsageServiceImpl {
     /// Get costs by inference IDs (for HuggingFace billing integration)
     async fn get_costs_by_inference_ids(
         &self,
+        organization_id: Uuid,
         inference_ids: Vec<Uuid>,
     ) -> Result<Vec<InferenceCost>, UsageError> {
         let results = self
             .usage_repository
-            .get_costs_by_inference_ids(inference_ids)
+            .get_costs_by_inference_ids(organization_id, inference_ids)
             .await
             .map_err(|e| {
                 UsageError::InternalError(format!("Failed to get costs by inference IDs: {e}"))
             })?;
 
-        // Log inference IDs that were not found (cost = 0)
-        for inference_cost in &results {
-            if inference_cost.cost_nano_usd == 0 {
-                tracing::error!(
-                    "Inference ID not found in usage log: inference_id={}",
-                    inference_cost.inference_id
-                );
-            }
+        // Log count of inference IDs that were not found (cost = 0)
+        let not_found_count = results.iter().filter(|ic| ic.cost_nano_usd == 0).count();
+        if not_found_count > 0 {
+            tracing::error!(
+                "Inference IDs not found in usage log: count={}",
+                not_found_count
+            );
         }
 
         Ok(results)

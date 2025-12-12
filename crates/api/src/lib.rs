@@ -984,7 +984,7 @@ pub fn build_billing_routes(
         .with_state(billing_state)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
-            auth_middleware_with_api_key,
+            middleware::auth::auth_middleware_with_workspace_context,
         ))
 }
 

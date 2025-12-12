@@ -64,9 +64,10 @@ pub trait UsageServiceTrait: Send + Sync {
     ) -> Result<(Vec<UsageLogEntry>, i64), UsageError>;
 
     /// Get costs by inference IDs (for HuggingFace billing integration)
-    /// Returns costs for each inference_id that was found
+    /// Returns costs for each inference_id that was found and belongs to the organization
     async fn get_costs_by_inference_ids(
         &self,
+        organization_id: Uuid,
         inference_ids: Vec<Uuid>,
     ) -> Result<Vec<InferenceCost>, UsageError>;
 }
@@ -108,9 +109,10 @@ pub trait UsageRepository: Send + Sync {
     async fn get_api_key_spend(&self, api_key_id: Uuid) -> anyhow::Result<i64>;
 
     /// Get costs by inference IDs (for HuggingFace billing integration)
-    /// Returns costs for each inference_id that was found
+    /// Returns costs for each inference_id that was found and belongs to the organization
     async fn get_costs_by_inference_ids(
         &self,
+        organization_id: Uuid,
         inference_ids: Vec<Uuid>,
     ) -> anyhow::Result<Vec<InferenceCost>>;
 }

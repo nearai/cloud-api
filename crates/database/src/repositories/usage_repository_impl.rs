@@ -148,8 +148,10 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
 
     async fn get_costs_by_inference_ids(
         &self,
+        organization_id: Uuid,
         inference_ids: Vec<Uuid>,
     ) -> anyhow::Result<Vec<InferenceCost>> {
-        self.get_costs_by_inference_ids(inference_ids).await
+        self.get_costs_by_inference_ids(organization_id, inference_ids)
+            .await
     }
 }

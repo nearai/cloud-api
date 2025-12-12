@@ -1,6 +1,7 @@
+use crate::middleware::auth::AuthenticatedApiKey;
 use crate::models::ErrorResponse;
 use axum::{
-    extract::{Json, State},
+    extract::{Extension, Json, State},
     http::StatusCode,
     response::Json as ResponseJson,
 };
@@ -65,11 +66,13 @@ pub struct BillingRouteState {
 )]
 pub async fn get_billing_costs(
     State(state): State<BillingRouteState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
     Json(request): Json<BillingCostsRequest>,
 ) -> Result<ResponseJson<BillingCostsResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     tracing::debug!(
-        "Billing costs request for {} inference IDs",
-        request.request_ids.len()
+        "Billing costs request for {} inference IDs from organization: {}",
+        request.request_ids.len(),
+        api_key.organization.id
     );
 
     // Limit the number of request IDs to prevent abuse
@@ -85,7 +88,7 @@ pub async fn get_billing_costs(
 
     let costs = state
         .usage_service
-        .get_costs_by_inference_ids(request.request_ids)
+        .get_costs_by_inference_ids(api_key.organization.id.0, request.request_ids)
         .await
         .map_err(|e| {
             tracing::error!("Failed to get billing costs: {}", e);

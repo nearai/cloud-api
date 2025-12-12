@@ -379,10 +379,11 @@ impl OrganizationUsageRepository {
     }
 
     /// Get costs by inference IDs (for HuggingFace billing integration)
-    /// Returns costs for all requested inference_ids
+    /// Returns costs for all requested inference_ids that belong to the organization
     /// Missing inference_ids will have cost = 0
     pub async fn get_costs_by_inference_ids(
         &self,
+        organization_id: Uuid,
         inference_ids: Vec<Uuid>,
     ) -> Result<Vec<services::usage::InferenceCost>> {
         if inference_ids.is_empty() {
@@ -402,9 +403,9 @@ impl OrganizationUsageRepository {
                     r#"
                     SELECT inference_id, total_cost
                     FROM organization_usage_log
-                    WHERE inference_id = ANY($1)
+                    WHERE organization_id = $1 AND inference_id = ANY($2)
                     "#,
-                    &[&inference_ids],
+                    &[&organization_id, &inference_ids],
                 )
                 .await
                 .map_err(map_db_error)

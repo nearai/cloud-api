@@ -134,6 +134,7 @@ impl UsageServiceTrait for MockUsageService {
 
     async fn get_costs_by_inference_ids(
         &self,
+        _organization_id: Uuid,
         _inference_ids: Vec<Uuid>,
     ) -> Result<Vec<crate::usage::InferenceCost>, UsageError> {
         Ok(vec![])
@@ -226,6 +227,7 @@ impl UsageServiceTrait for CapturingUsageService {
 
     async fn get_costs_by_inference_ids(
         &self,
+        _organization_id: Uuid,
         _inference_ids: Vec<Uuid>,
     ) -> Result<Vec<crate::usage::InferenceCost>, UsageError> {
         Ok(vec![])

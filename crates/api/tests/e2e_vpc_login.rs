@@ -61,6 +61,9 @@ async fn test_vpc_login_success() {
 
     let server = setup_test_server().await;
 
+    // VPC login requires user to have an organization, create one for the mock user
+    create_org(&server).await;
+
     let timestamp = chrono::Utc::now().timestamp();
     let signature = generate_vpc_signature(timestamp, "test_vpc_secret_123");
 
@@ -214,6 +217,9 @@ async fn test_vpc_login_creates_user_and_resources() {
 
     let server = setup_test_server().await;
 
+    // VPC login requires user to have an organization, create one for the mock user
+    create_org(&server).await;
+
     let client_id = format!("vpc-client-{}", uuid::Uuid::new_v4());
     let timestamp = chrono::Utc::now().timestamp();
     let signature = generate_vpc_signature(timestamp, "test_vpc_secret_123");
@@ -262,6 +268,9 @@ async fn test_vpc_login_api_key_works() {
 
     let server = setup_test_server().await;
 
+    // VPC login requires user to have an organization, create one for the mock user
+    create_org(&server).await;
+
     let timestamp = chrono::Utc::now().timestamp();
     let signature = generate_vpc_signature(timestamp, "test_vpc_secret_123");
 
@@ -298,6 +307,9 @@ async fn test_vpc_login_access_token_works() {
     let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
 
     let server = setup_test_server().await;
+
+    // VPC login requires user to have an organization, create one for the mock user
+    create_org(&server).await;
 
     let timestamp = chrono::Utc::now().timestamp();
     let signature = generate_vpc_signature(timestamp, "test_vpc_secret_123");

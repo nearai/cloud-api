@@ -99,13 +99,12 @@ pub enum OrganizationError {
 #[derive(Debug, Clone)]
 pub struct CreateOrganizationRequest {
     pub name: String,
-    pub display_name: Option<String>,
     pub description: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct UpdateOrganizationRequest {
-    pub display_name: Option<String>,
+    pub name: Option<String>,
     pub description: Option<String>,
     pub rate_limit: Option<i32>,
     pub settings: Option<serde_json::Value>,

@@ -73,7 +73,6 @@ async fn test_organizations_duplicate_name_conflict_message() {
     let req = api::models::CreateOrganizationRequest {
         name: org_name.clone(),
         description: Some("desc".to_string()),
-        display_name: Some("dn".to_string()),
     };
 
     let resp1 = server

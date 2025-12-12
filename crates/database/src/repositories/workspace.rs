@@ -366,9 +366,9 @@ impl WorkspaceRepository {
             client
                 .query_opt(
                     r#"
-                SELECT 
+                SELECT
                     w.*,
-                    o.id as org_id, o.name as org_name, o.display_name as org_display_name,
+                    o.id as org_id, o.name as org_name,
                     o.description as org_description, o.created_at as org_created_at,
                     o.updated_at as org_updated_at, o.is_active as org_is_active,
                     o.rate_limit as org_rate_limit, o.settings as org_settings
@@ -400,7 +400,6 @@ impl WorkspaceRepository {
                 let organization = crate::models::Organization {
                     id: row.get("org_id"),
                     name: row.get("org_name"),
-                    display_name: row.get("org_display_name"),
                     description: row.get("org_description"),
                     created_at: row.get("org_created_at"),
                     updated_at: row.get("org_updated_at"),

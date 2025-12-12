@@ -120,20 +120,13 @@ impl PgOrganizationRepository {
                 .query_one(
                     r#"
             INSERT INTO organizations (
-                id, name, display_name, description, 
+                id, name, description,
                 created_at, updated_at, is_active
             )
-            VALUES ($1, $2, $3, $4, $5, $6, true)
+            VALUES ($1, $2, $3, $4, $5, true)
             RETURNING *
             "#,
-                    &[
-                        &id,
-                        &request.name,
-                        &request.display_name,
-                        &request.description,
-                        &now,
-                        &now,
-                    ],
+                    &[&id, &request.name, &request.description, &now, &now],
                 )
                 .await
                 .map_err(map_db_error)?;
@@ -278,7 +271,7 @@ impl PgOrganizationRepository {
                 .query_one(
                     r#"
             UPDATE organizations
-            SET display_name = COALESCE($2, display_name),
+            SET name = COALESCE($2, name),
                 description = COALESCE($3, description),
                 rate_limit = COALESCE($4, rate_limit),
                 settings = COALESCE($5, settings),
@@ -288,7 +281,7 @@ impl PgOrganizationRepository {
             "#,
                     &[
                         &id,
-                        &request.display_name,
+                        &request.name,
                         &request.description,
                         &request.rate_limit,
                         &request.settings,
@@ -508,7 +501,6 @@ impl PgOrganizationRepository {
         Ok(DbOrganization {
             id: row.try_get("id")?,
             name: row.try_get("name")?,
-            display_name: row.try_get("display_name")?,
             description: row.try_get("description")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
@@ -575,7 +567,6 @@ impl OrganizationRepository for PgOrganizationRepository {
     ) -> Result<Organization, RepositoryError> {
         let db_request = DbCreateOrganizationRequest {
             name: request.name.clone(),
-            display_name: request.display_name.unwrap_or(request.name),
             description: request.description,
         };
 
@@ -627,7 +618,7 @@ impl OrganizationRepository for PgOrganizationRepository {
         request: UpdateOrganizationRequest,
     ) -> Result<Organization, RepositoryError> {
         let db_request = DbUpdateOrganizationRequest {
-            display_name: request.display_name,
+            name: request.name,
             description: request.description,
             rate_limit: request.rate_limit,
             settings: request.settings,

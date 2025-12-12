@@ -262,7 +262,6 @@ pub fn api_create_org_req_to_services(
 ) -> services::organization::ports::CreateOrganizationRequest {
     services::organization::ports::CreateOrganizationRequest {
         name: req.name,
-        display_name: req.display_name,
         description: req.description,
     }
 }
@@ -272,7 +271,7 @@ pub fn api_update_org_req_to_services(
     req: crate::models::UpdateOrganizationRequest,
 ) -> services::organization::ports::UpdateOrganizationRequest {
     services::organization::ports::UpdateOrganizationRequest {
-        display_name: req.display_name,
+        name: req.name,
         description: req.description,
         rate_limit: req.rate_limit,
         settings: req.settings,
@@ -285,7 +284,6 @@ pub fn db_create_org_req_to_services(
 ) -> services::organization::ports::CreateOrganizationRequest {
     services::organization::ports::CreateOrganizationRequest {
         name: req.name,
-        display_name: Some(req.display_name),
         description: req.description,
     }
 }
@@ -294,7 +292,7 @@ pub fn db_update_org_req_to_services(
     req: database::UpdateOrganizationRequest,
 ) -> services::organization::ports::UpdateOrganizationRequest {
     services::organization::ports::UpdateOrganizationRequest {
-        display_name: req.display_name,
+        name: req.name,
         description: req.description,
         rate_limit: req.rate_limit,
         settings: req.settings,

@@ -292,7 +292,6 @@ async fn test_access_token_can_create_organization() {
 
     let create_request = serde_json::json!({
         "name": format!("test-org-{}", uuid::Uuid::new_v4()),
-        "display_name": "Test Organization",
         "description": "Created with access token"
     });
 

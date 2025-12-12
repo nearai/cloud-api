@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+# Capture originally staged files (NUL-separated for safety) and keep only Rust sources.
+rust_staged_paths=()
+while IFS= read -r -d '' path; do
+  if [[ "$path" == *.rs ]]; then
+    rust_staged_paths+=("$path")
+  fi
+done < <(git diff --cached --name-only -z --diff-filter=ACMR)
+
+if [[ "${#rust_staged_paths[@]}" -eq 0 ]]; then
+  echo "[pre-commit] No Rust files staged, skipping cargo fmt/clippy"
+  exit 0
+fi
+
+echo "[pre-commit] Running cargo fmt --all"
+cargo fmt --all
+
+echo "[pre-commit] Running cargo clippy --fix (all targets, all features)"
+cargo clippy --fix --allow-dirty --allow-staged --all-targets --all-features
+
+# Re-stage ONLY the Rust files that were originally staged to avoid sweeping in unrelated WIP edits.
+printf '%s\0' "${rust_staged_paths[@]}" | xargs -0 git add --

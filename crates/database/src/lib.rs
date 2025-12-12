@@ -1,4 +1,5 @@
 pub mod cluster_manager;
+pub mod constants;
 pub mod migrations;
 pub mod mock;
 pub mod models;

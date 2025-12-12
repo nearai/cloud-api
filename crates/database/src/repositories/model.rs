@@ -1,3 +1,4 @@
+use crate::constants::DEFAULT_MODEL_OWNED_BY;
 use crate::models::{Model, ModelPricingHistory, UpdateModelPricingRequest};
 use crate::pool::DbPool;
 use crate::repositories::utils::map_db_error;
@@ -391,7 +392,7 @@ impl ModelRepository {
                             input_cost_per_token, output_cost_per_token,
                             model_display_name, model_description, model_icon,
                             context_length, verifiable, is_active, owned_by
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, 'nearai'))
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, $11))
                         ON CONFLICT (model_name) DO UPDATE SET
                             input_cost_per_token = EXCLUDED.input_cost_per_token,
                             output_cost_per_token = EXCLUDED.output_cost_per_token,
@@ -418,6 +419,7 @@ impl ModelRepository {
                             &update_request.verifiable.unwrap_or(true),
                             &update_request.is_active.unwrap_or(true),
                             &owned_by,
+                            &DEFAULT_MODEL_OWNED_BY,
                         ],
                     )
                     .await

@@ -4,6 +4,7 @@ mod common;
 use common::*;
 
 use api::models::BatchUpdateModelApiRequest;
+use database::DEFAULT_MODEL_OWNED_BY;
 use inference_providers::{models::ChatCompletionChunk, StreamChunk};
 
 #[tokio::test]
@@ -13,6 +14,14 @@ async fn test_models_api() {
     let response = list_models(&server, api_key).await;
 
     assert!(!response.data.is_empty());
+
+    // Verify that all models have owned_by field populated
+    for model in &response.data {
+        assert!(
+            !model.owned_by.is_empty(),
+            "owned_by field should not be empty"
+        );
+    }
 }
 
 #[tokio::test]
@@ -157,6 +166,8 @@ async fn test_admin_update_model() {
     );
     assert_eq!(1000000, retrieved_model.input_cost_per_token.amount);
     assert_eq!(2000000, retrieved_model.output_cost_per_token.amount);
+    // Verify that owned_by defaults to DEFAULT_MODEL_OWNED_BY when not explicitly provided
+    assert_eq!(retrieved_model.metadata.owned_by, DEFAULT_MODEL_OWNED_BY);
 }
 
 #[tokio::test]
@@ -200,6 +211,8 @@ async fn test_get_model_by_name() {
     assert_eq!(2000000, model_resp.output_cost_per_token.amount);
     assert_eq!(9, model_resp.output_cost_per_token.scale);
     assert_eq!("USD", model_resp.output_cost_per_token.currency);
+    // Verify that owned_by defaults to DEFAULT_MODEL_OWNED_BY when not explicitly provided
+    assert_eq!(model_resp.metadata.owned_by, DEFAULT_MODEL_OWNED_BY);
 
     // Test retrieving the same model again by canonical name to verify consistency
     let response_by_name_again = server
@@ -248,6 +261,157 @@ async fn test_get_model_by_name() {
     } else {
         println!("Warning: 404 response had empty body");
     }
+}
+
+#[tokio::test]
+async fn test_admin_model_custom_owned_by() {
+    let server = setup_test_server().await;
+
+    // Test 1: Create model with custom owned_by value
+    let mut batch1 = BatchUpdateModelApiRequest::new();
+    batch1.insert(
+        "custom-model-1".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 1000000,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 2000000,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Custom Model",
+            "modelDescription": "Test custom owned_by",
+            "contextLength": 128000,
+            "verifiable": true,
+            "ownedBy": "openai"
+        }))
+        .unwrap(),
+    );
+
+    let created_models = admin_batch_upsert_models(&server, batch1, get_session_id()).await;
+    assert_eq!(created_models.len(), 1);
+    let created_model = &created_models[0];
+    assert_eq!(
+        created_model.metadata.owned_by, "openai",
+        "Created model should have custom owned_by"
+    );
+
+    // Test 2: Retrieve model and verify custom owned_by persisted
+    let model_name = created_model.model_id.clone();
+    let encoded_name =
+        url::form_urlencoded::byte_serialize(model_name.as_bytes()).collect::<String>();
+    let response = server
+        .get(format!("/v1/model/{encoded_name}").as_str())
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let retrieved_model = response.json::<api::models::ModelWithPricing>();
+    assert_eq!(
+        retrieved_model.metadata.owned_by, "openai",
+        "Retrieved model should have custom owned_by"
+    );
+
+    // Test 3: Update model WITHOUT specifying ownedBy (should preserve)
+    let mut batch2 = BatchUpdateModelApiRequest::new();
+    batch2.insert(
+        "custom-model-1".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 5000000,
+                "currency": "USD"
+            }
+        }))
+        .unwrap(),
+    );
+
+    let updated_models = admin_batch_upsert_models(&server, batch2, get_session_id()).await;
+    assert_eq!(updated_models.len(), 1);
+    assert_eq!(
+        updated_models[0].metadata.owned_by, "openai",
+        "Updated model should preserve owned_by when not explicitly set"
+    );
+
+    // Test 4: Override owned_by during update
+    let mut batch3 = BatchUpdateModelApiRequest::new();
+    batch3.insert(
+        "custom-model-1".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 5000000,
+                "currency": "USD"
+            },
+            "ownedBy": "anthropic"
+        }))
+        .unwrap(),
+    );
+
+    let overridden_models = admin_batch_upsert_models(&server, batch3, get_session_id()).await;
+    assert_eq!(overridden_models.len(), 1);
+    assert_eq!(
+        overridden_models[0].metadata.owned_by, "anthropic",
+        "Updated model should have new owned_by when explicitly provided"
+    );
+
+    // Test 5: Verify the override persisted in retrieval
+    let response = server
+        .get(format!("/v1/model/{encoded_name}").as_str())
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let final_model = response.json::<api::models::ModelWithPricing>();
+    assert_eq!(
+        final_model.metadata.owned_by, "anthropic",
+        "Final retrieval should confirm override"
+    );
+}
+
+#[tokio::test]
+async fn test_admin_model_default_owned_by() {
+    let server = setup_test_server().await;
+
+    // Create a unique model name to ensure we test INSERT path, not UPDATE path
+    let unique_model_name = format!("test-model-{}", uuid::Uuid::new_v4());
+
+    // Create model WITHOUT specifying ownedBy - should default to DEFAULT_MODEL_OWNED_BY
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        unique_model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 1000000,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 2000000,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Test Default Owned By",
+            "modelDescription": "Testing default owned_by value",
+            "contextLength": 128000,
+            "verifiable": true
+            // NOTE: No ownedBy field - should default to DEFAULT_MODEL_OWNED_BY
+        }))
+        .unwrap(),
+    );
+
+    let created_models = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    assert_eq!(created_models.len(), 1);
+    assert_eq!(
+        created_models[0].metadata.owned_by, DEFAULT_MODEL_OWNED_BY,
+        "Model created without ownedBy should default to DEFAULT_MODEL_OWNED_BY"
+    );
+
+    // Verify the default persists in retrieval
+    let encoded_name =
+        url::form_urlencoded::byte_serialize(unique_model_name.as_bytes()).collect::<String>();
+    let response = server
+        .get(format!("/v1/model/{encoded_name}").as_str())
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let retrieved_model = response.json::<api::models::ModelWithPricing>();
+    assert_eq!(
+        retrieved_model.metadata.owned_by, DEFAULT_MODEL_OWNED_BY,
+        "Retrieved model should have default owned_by value"
+    );
 }
 
 #[tokio::test]

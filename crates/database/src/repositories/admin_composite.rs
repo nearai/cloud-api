@@ -51,6 +51,7 @@ impl AdminRepository for AdminCompositeRepository {
             verifiable: request.verifiable,
             is_active: request.is_active,
             aliases: request.aliases.clone(),
+            owned_by: request.owned_by,
         };
 
         let model = self
@@ -75,6 +76,7 @@ impl AdminRepository for AdminCompositeRepository {
             verifiable: model.verifiable,
             is_active: model.is_active,
             aliases: model.aliases,
+            owned_by: model.owned_by,
         })
     }
 
@@ -268,6 +270,7 @@ impl AdminRepository for AdminCompositeRepository {
                 context_length: m.context_length,
                 verifiable: m.verifiable,
                 is_active: m.is_active,
+                owned_by: m.owned_by,
                 aliases: m.aliases,
                 created_at: m.created_at,
                 updated_at: m.updated_at,

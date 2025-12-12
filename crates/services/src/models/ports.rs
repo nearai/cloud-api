@@ -34,6 +34,7 @@ pub struct ModelWithPricing {
     pub context_length: i32,
     pub verifiable: bool,
     pub aliases: Vec<String>,
+    pub owned_by: String,
 }
 
 #[derive(Debug, thiserror::Error)]

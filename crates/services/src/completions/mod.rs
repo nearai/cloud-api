@@ -401,7 +401,6 @@ impl CompletionServiceImpl {
         model_id: Uuid,
         model_name: String,
         inference_type: &str,
-        request_start_time: Instant,
         input_text: String, // Added for token tracking on disconnect
         service_start_time: Instant,
         provider_start_time: Instant,
@@ -592,7 +591,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 model.id,
                 model.model_name.clone(),
                 inference_type,
-                request_start_time,
                 input_text,
                 service_start_time,
                 provider_start_time,

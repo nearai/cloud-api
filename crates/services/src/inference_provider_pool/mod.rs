@@ -7,9 +7,14 @@ use regex::Regex;
 use serde::Deserialize;
 use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, RwLock};
+use tokio::time::timeout;
 use tracing::{debug, info};
 
 type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
+
+/// Timeout for tokenize API calls (10 seconds)
+/// Tokenization should be fast, but allow for slow/overloaded servers
+const TOKENIZE_TIMEOUT_SECS: u64 = 10;
 
 /// Discovery entry returned by the discovery layer
 #[derive(Debug, Clone, Deserialize)]
@@ -647,16 +652,31 @@ impl InferenceProviderPool {
         };
 
         if let Some(provider) = provider {
-            match provider.count_tokens(text, model_name).await {
-                Ok(count) => {
+            // Wrap with timeout to prevent indefinite hangs (especially important for Drop handler)
+            match timeout(
+                Duration::from_secs(TOKENIZE_TIMEOUT_SECS),
+                provider.count_tokens(text, model_name),
+            )
+            .await
+            {
+                Ok(Ok(count)) => {
                     return count;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     // Fall back to 0 tokens if count_tokens fails - don't charge customers
                     // if our infrastructure fails
                     tracing::warn!(
                         "Failed to get token count from provider: {}, returning 0 (not charging customer)",
                         e
+                    );
+                    return 0;
+                }
+                Err(_) => {
+                    // Timeout occurred - don't charge customer if tokenization takes too long
+                    tracing::warn!(
+                        "Tokenize request timeout ({}s) for model: {}, returning 0 (not charging customer)",
+                        TOKENIZE_TIMEOUT_SECS,
+                        model_name
                     );
                     return 0;
                 }

@@ -363,8 +363,7 @@ async fn test_streaming_web_search_with_citations() {
     // Extract the final message to check citations
     let final_line = response_text
         .lines()
-        .filter(|l| l.contains("response.output_item.done"))
-        .next_back()
+        .rfind(|l| l.contains("response.output_item.done"))
         .and_then(|l| {
             l.strip_prefix("data: ")
                 .and_then(|json_str| serde_json::from_str::<serde_json::Value>(json_str).ok())

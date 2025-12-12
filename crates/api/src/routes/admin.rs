@@ -225,6 +225,7 @@ pub async fn list_models(
                 model_description: model.model_description,
                 model_icon: model.model_icon,
                 aliases: model.aliases,
+                owned_by: model.owned_by,
             },
             is_active: model.is_active,
             created_at: model.created_at,

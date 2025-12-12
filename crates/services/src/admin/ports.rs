@@ -131,6 +131,7 @@ pub struct AdminModelInfo {
     pub context_length: i32,
     pub verifiable: bool,
     pub is_active: bool,
+    pub owned_by: String,
     pub aliases: Vec<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,

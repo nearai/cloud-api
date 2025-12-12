@@ -270,6 +270,7 @@ impl AdminRepository for AdminCompositeRepository {
                 context_length: m.context_length,
                 verifiable: m.verifiable,
                 is_active: m.is_active,
+                owned_by: m.owned_by,
                 aliases: m.aliases,
                 created_at: m.created_at,
                 updated_at: m.updated_at,

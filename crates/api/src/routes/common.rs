@@ -71,7 +71,7 @@ pub fn validate_non_empty_field(value: &str, field: &str) -> Result<(), String> 
 /// Basic max-length string validation helper
 pub fn validate_max_length(value: &str, field: &str, max: usize) -> Result<(), String> {
     if value.len() > max {
-        return Err(format!("{field} is too long (max {max} characters)"));
+        return Err(format!("{field} is too long (max {max} bytes)"));
     }
     Ok(())
 }

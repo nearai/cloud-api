@@ -1,4 +1,10 @@
-use crate::routes::api::AppState;
+use crate::{
+    consts::{MAX_NAME_LENGTH, MAX_SIGNATURE_LENGTH},
+    routes::{
+        api::AppState,
+        common::{validate_max_length, validate_non_empty_field},
+    },
+};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -21,18 +27,11 @@ pub struct VpcLoginRequest {
 impl VpcLoginRequest {
     pub fn validate(&self) -> Result<(), String> {
         // Basic sanity checks to avoid extremely large inputs
-        if self.client_id.trim().is_empty() {
-            return Err("client_id cannot be empty".to_string());
-        }
-        if self.client_id.len() > 255 {
-            return Err("client_id is too long (max 255 characters)".to_string());
-        }
-        if self.signature.trim().is_empty() {
-            return Err("signature cannot be empty".to_string());
-        }
-        if self.signature.len() > 4096 {
-            return Err("signature is too long (max 4096 characters)".to_string());
-        }
+        validate_non_empty_field(&self.client_id, "client_id")?;
+        validate_max_length(&self.client_id, "client_id", MAX_NAME_LENGTH)?;
+
+        validate_non_empty_field(&self.signature, "signature")?;
+        validate_max_length(&self.signature, "signature", MAX_SIGNATURE_LENGTH)?;
         Ok(())
     }
 }

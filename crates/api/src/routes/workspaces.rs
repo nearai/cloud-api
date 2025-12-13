@@ -30,31 +30,27 @@ pub struct CreateWorkspaceRequest {
 
 impl CreateWorkspaceRequest {
     pub fn validate(&self) -> Result<(), String> {
-        crate::routes::common::validate_non_empty_field(&self.name, "name")
-            .map_err(|e| format!("workspace name: {e}"))?;
+        crate::routes::common::validate_non_empty_field(&self.name, "workspace name")?;
         crate::routes::common::validate_max_length(
             &self.name,
-            "name",
+            "workspace name",
             crate::consts::MAX_NAME_LENGTH,
-        )
-        .map_err(|e| format!("workspace name: {e}"))?;
+        )?;
 
         if let Some(display_name) = &self.display_name {
             crate::routes::common::validate_max_length(
                 display_name,
-                "display_name",
+                "workspace display_name",
                 crate::consts::MAX_NAME_LENGTH,
-            )
-            .map_err(|e| format!("workspace display_name: {e}"))?;
+            )?;
         }
 
         if let Some(description) = &self.description {
             crate::routes::common::validate_max_length(
                 description,
-                "description",
+                "workspace description",
                 crate::consts::MAX_DESCRIPTION_LENGTH,
-            )
-            .map_err(|e| format!("workspace description: {e}"))?;
+            )?;
         }
 
         Ok(())
@@ -74,28 +70,24 @@ impl UpdateWorkspaceRequest {
         if let Some(display_name) = &self.display_name {
             crate::routes::common::validate_max_length(
                 display_name,
-                "display_name",
+                "workspace display_name",
                 crate::consts::MAX_NAME_LENGTH,
-            )
-            .map_err(|e| format!("workspace display_name: {e}"))?;
+            )?;
         }
 
         if let Some(description) = &self.description {
             crate::routes::common::validate_max_length(
                 description,
-                "description",
+                "workspace description",
                 crate::consts::MAX_DESCRIPTION_LENGTH,
-            )
-            .map_err(|e| format!("workspace description: {e}"))?;
+            )?;
         }
 
         if let Some(settings) = &self.settings {
             let serialized = serde_json::to_string(settings)
-                .map_err(|_| "workspace settings: invalid JSON".to_string())?;
-            if serialized.len() > 32 * 1024 {
-                return Err(
-                    "workspace settings is too large (max 32KB when serialized)".to_string()
-                );
+                .map_err(|_| "Invalid workspace settings JSON".to_string())?;
+            if serialized.len() > crate::consts::MAX_SETTINGS_SIZE_BYTES {
+                return Err("workspace settings is too large".to_string());
             }
         }
 

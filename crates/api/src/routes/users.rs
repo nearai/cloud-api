@@ -45,16 +45,18 @@ impl UpdateUserProfileRequest {
         if let Some(display_name) = &self.display_name {
             crate::routes::common::validate_max_length(
                 display_name,
-                "display_name",
+                "user display_name",
                 crate::consts::MAX_NAME_LENGTH,
-            )
-            .map_err(|e| format!("user display_name: {e}"))?;
+            )?;
         }
 
         if let Some(avatar_url) = &self.avatar_url {
             // URLs can be long, but we still cap to a reasonable length
-            crate::routes::common::validate_max_length(avatar_url, "avatar_url", 2048)
-                .map_err(|e| format!("avatar_url: {e}"))?;
+            crate::routes::common::validate_max_length(
+                avatar_url,
+                "avatar_url",
+                crate::consts::MAX_AVATAR_URL_LENGTH,
+            )?;
         }
 
         Ok(())

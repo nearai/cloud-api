@@ -243,7 +243,8 @@ fn default_n() -> Option<i64> {
 // ============================================
 
 use crate::consts::{
-    MAX_DESCRIPTION_LENGTH, MAX_EMAIL_LENGTH, MAX_NAME_LENGTH, MAX_SYSTEM_PROMPT_LENGTH,
+    MAX_DESCRIPTION_LENGTH, MAX_EMAIL_LENGTH, MAX_INVITATIONS_PER_REQUEST, MAX_METADATA_SIZE_BYTES,
+    MAX_NAME_LENGTH, MAX_SETTINGS_SIZE_BYTES, MAX_SYSTEM_PROMPT_LENGTH,
 };
 use crate::routes::common::{validate_max_length, validate_non_empty_field};
 
@@ -1005,7 +1006,7 @@ impl CreateConversationRequest {
             let serialized =
                 serde_json::to_string(metadata).map_err(|_| "Invalid metadata".to_string())?;
             // Allow reasonably large metadata but cap to protect the database
-            if serialized.len() > 16 * 1024 {
+            if serialized.len() > MAX_METADATA_SIZE_BYTES {
                 return Err("metadata is too large (max 16KB when serialized)".to_string());
             }
         }
@@ -1092,7 +1093,7 @@ impl UpdateOrganizationRequest {
             // Cap settings size to protect DB from extremely large blobs
             let serialized =
                 serde_json::to_string(settings).map_err(|_| "Invalid settings JSON".to_string())?;
-            if serialized.len() > 32 * 1024 {
+            if serialized.len() > MAX_SETTINGS_SIZE_BYTES {
                 return Err("settings is too large (max 32KB when serialized)".to_string());
             }
         }
@@ -1170,7 +1171,7 @@ impl InviteOrganizationMemberByEmailRequest {
         }
 
         // Prevent abuse with very large batches
-        if self.invitations.len() > 100 {
+        if self.invitations.len() > MAX_INVITATIONS_PER_REQUEST {
             return Err("Maximum 100 invitations per request".to_string());
         }
 

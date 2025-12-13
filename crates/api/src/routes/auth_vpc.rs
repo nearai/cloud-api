@@ -18,6 +18,25 @@ pub struct VpcLoginRequest {
     pub client_id: String,
 }
 
+impl VpcLoginRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        // Basic sanity checks to avoid extremely large inputs
+        if self.client_id.trim().is_empty() {
+            return Err("client_id cannot be empty".to_string());
+        }
+        if self.client_id.len() > 255 {
+            return Err("client_id is too long (max 255 characters)".to_string());
+        }
+        if self.signature.trim().is_empty() {
+            return Err("signature cannot be empty".to_string());
+        }
+        if self.signature.len() > 4096 {
+            return Err("signature is too long (max 4096 characters)".to_string());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VpcLoginResponse {
     pub access_token: String,
@@ -32,6 +51,11 @@ pub async fn vpc_login(
     State(state): State<AppState>,
     Json(payload): Json<VpcLoginRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Basic payload validation to prevent obviously bad or oversized input
+    payload
+        .validate()
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
     // Verify VPC signature
     let valid = state
         .attestation_service

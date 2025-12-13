@@ -40,6 +40,27 @@ pub struct UpdateUserProfileRequest {
     pub avatar_url: Option<String>,
 }
 
+impl UpdateUserProfileRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(display_name) = &self.display_name {
+            crate::models::validate_max_length(
+                display_name,
+                "display_name",
+                crate::models::MAX_NAME_LENGTH,
+            )
+            .map_err(|e| format!("user display_name: {e}"))?;
+        }
+
+        if let Some(avatar_url) = &self.avatar_url {
+            // URLs can be long, but we still cap to a reasonable length
+            crate::models::validate_max_length(avatar_url, "avatar_url", 2048)
+                .map_err(|e| format!("avatar_url: {e}"))?;
+        }
+
+        Ok(())
+    }
+}
+
 /// Get current user
 ///
 /// Returns the profile of the currently authenticated user, including their organizations and workspaces.
@@ -181,6 +202,13 @@ pub async fn update_current_user_profile(
     Json(request): Json<UpdateUserProfileRequest>,
 ) -> Result<Json<crate::models::UserResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Updating profile for user: {}", user.0.id);
+
+    if let Err(msg) = request.validate() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
+        ));
+    }
 
     let user_id = UserId(user.0.id);
 

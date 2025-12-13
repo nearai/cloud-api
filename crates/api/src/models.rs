@@ -238,6 +238,29 @@ fn default_n() -> Option<i64> {
     Some(1)
 }
 
+// ============================================
+// Common validation helpers
+// ============================================
+
+pub const MAX_NAME_LENGTH: usize = 255;
+pub const MAX_DESCRIPTION_LENGTH: usize = 2048;
+pub const MAX_EMAIL_LENGTH: usize = 255;
+pub const MAX_SYSTEM_PROMPT_LENGTH: usize = 8192;
+
+pub fn validate_non_empty_field(value: &str, field: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{field} cannot be empty"));
+    }
+    Ok(())
+}
+
+pub fn validate_max_length(value: &str, field: &str, max: usize) -> Result<(), String> {
+    if value.len() > max {
+        return Err(format!("{field} is too long (max {max} characters)"));
+    }
+    Ok(())
+}
+
 impl ChatCompletionRequest {
     pub fn validate(&self) -> Result<(), String> {
         if self.model.is_empty() {
@@ -991,7 +1014,16 @@ impl CreateResponseRequest {
 
 impl CreateConversationRequest {
     pub fn validate(&self) -> Result<(), String> {
-        // Basic validation - can be extended if needed
+        if let Some(metadata) = &self.metadata {
+            // Prevent extremely large metadata blobs from being stored
+            let serialized =
+                serde_json::to_string(metadata).map_err(|_| "Invalid metadata".to_string())?;
+            // Allow reasonably large metadata but cap to protect the database
+            if serialized.len() > 16 * 1024 {
+                return Err("metadata is too large (max 16KB when serialized)".to_string());
+            }
+        }
+
         Ok(())
     }
 }
@@ -1003,6 +1035,19 @@ pub struct CreateApiKeyRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "spendLimit")]
     pub spend_limit: Option<DecimalPriceRequest>,
+}
+
+impl CreateApiKeyRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_non_empty_field(&self.name, "name")?;
+        validate_max_length(&self.name, "name", MAX_NAME_LENGTH)?;
+
+        if let Some(limit) = &self.spend_limit {
+            limit.validate().map_err(|e| format!("spend_limit: {e}"))?;
+        }
+
+        Ok(())
+    }
 }
 
 // ============================================
@@ -1017,6 +1062,19 @@ pub struct CreateOrganizationRequest {
     pub description: Option<String>,
 }
 
+impl CreateOrganizationRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_non_empty_field(&self.name, "name")?;
+        validate_max_length(&self.name, "name", MAX_NAME_LENGTH)?;
+
+        if let Some(desc) = &self.description {
+            validate_max_length(desc, "description", MAX_DESCRIPTION_LENGTH)?;
+        }
+
+        Ok(())
+    }
+}
+
 /// Request to update an organization
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -1025,6 +1083,36 @@ pub struct UpdateOrganizationRequest {
     pub description: Option<String>,
     pub rate_limit: Option<i32>,
     pub settings: Option<serde_json::Value>,
+}
+
+impl UpdateOrganizationRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(name) = &self.name {
+            validate_non_empty_field(name, "name")?;
+            validate_max_length(name, "name", MAX_NAME_LENGTH)?;
+        }
+
+        if let Some(desc) = &self.description {
+            validate_max_length(desc, "description", MAX_DESCRIPTION_LENGTH)?;
+        }
+
+        if let Some(rate) = self.rate_limit {
+            if rate <= 0 {
+                return Err("rate_limit must be positive".to_string());
+            }
+        }
+
+        if let Some(settings) = &self.settings {
+            // Cap settings size to protect DB from extremely large blobs
+            let serialized =
+                serde_json::to_string(settings).map_err(|_| "Invalid settings JSON".to_string())?;
+            if serialized.len() > 32 * 1024 {
+                return Err("settings is too large (max 32KB when serialized)".to_string());
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Organization response model
@@ -1072,10 +1160,42 @@ pub struct InvitationEntry {
     pub role: MemberRole,
 }
 
+impl InvitationEntry {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_non_empty_field(&self.email, "email")?;
+        validate_max_length(&self.email, "email", MAX_EMAIL_LENGTH)?;
+        if !self.email.contains('@') {
+            return Err("email must contain '@'".to_string());
+        }
+        Ok(())
+    }
+}
+
 /// Request to invite organization members by email
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct InviteOrganizationMemberByEmailRequest {
     pub invitations: Vec<InvitationEntry>,
+}
+
+impl InviteOrganizationMemberByEmailRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.invitations.is_empty() {
+            return Err("invitations cannot be empty".to_string());
+        }
+
+        // Prevent abuse with very large batches
+        if self.invitations.len() > 100 {
+            return Err("Maximum 100 invitations per request".to_string());
+        }
+
+        for (idx, inv) in self.invitations.iter().enumerate() {
+            if let Err(e) = inv.validate() {
+                return Err(format!("invitations[{idx}]: {e}"));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Request to update an organization member
@@ -1118,6 +1238,15 @@ pub struct PatchOrganizationSettingsRequest {
     #[serde(default, deserialize_with = "deserialize_nullable")]
     #[schema(value_type = Option<String>)]
     pub system_prompt: Nullable<String>,
+}
+
+impl PatchOrganizationSettingsRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(Some(prompt)) = &self.system_prompt {
+            validate_max_length(prompt, "system_prompt", MAX_SYSTEM_PROMPT_LENGTH)?;
+        }
+        Ok(())
+    }
 }
 
 /// Response containing organization settings
@@ -1378,6 +1507,15 @@ pub struct UpdateApiKeySpendLimitRequest {
     pub spend_limit: Option<DecimalPriceRequest>,
 }
 
+impl UpdateApiKeySpendLimitRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(limit) = &self.spend_limit {
+            limit.validate()?;
+        }
+        Ok(())
+    }
+}
+
 /// Request to update API key (general update for name, expires_at, and/or spend_limit)
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateApiKeyRequest {
@@ -1390,6 +1528,21 @@ pub struct UpdateApiKeyRequest {
     pub spend_limit: Option<DecimalPriceRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_active: Option<bool>,
+}
+
+impl UpdateApiKeyRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(name) = &self.name {
+            validate_non_empty_field(name, "name")?;
+            validate_max_length(name, "name", MAX_NAME_LENGTH)?;
+        }
+
+        if let Some(limit) = &self.spend_limit {
+            limit.validate()?;
+        }
+
+        Ok(())
+    }
 }
 
 // ============================================
@@ -1502,6 +1655,18 @@ pub struct DecimalPriceRequest {
     /// Amount in nano-dollars (scale 9). For example, $1.00 = 1000000000 nano-dollars.
     pub amount: i64,
     pub currency: String,
+}
+
+impl DecimalPriceRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.amount < 0 {
+            return Err("amount must be non-negative".to_string());
+        }
+        validate_non_empty_field(&self.currency, "currency")?;
+        // Currencies are typically short, e.g. \"USD\"
+        validate_max_length(&self.currency, "currency", 16)?;
+        Ok(())
+    }
 }
 
 /// Decimal price for API responses

@@ -7,9 +7,14 @@ use regex::Regex;
 use serde::Deserialize;
 use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, RwLock};
+use tokio::time::timeout;
 use tracing::{debug, info};
 
 type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
+
+/// Timeout for tokenize API calls (10 seconds)
+/// Tokenization should be fast, but allow for slow/overloaded servers
+const TOKENIZE_TIMEOUT_SECS: u64 = 10;
 
 /// Discovery entry returned by the discovery layer
 #[derive(Debug, Clone, Deserialize)]
@@ -629,6 +634,61 @@ impl InferenceProviderPool {
         );
 
         Ok(response)
+    }
+
+    /// Count tokens for text using the provider's tokenizer via vLLM
+    ///
+    /// This method calls the provider's count_tokens method to get an accurate token count
+    /// for the given text using the model's tokenizer.
+    /// Falls back to 0 tokens (don't charge) if the tokenize API fails or no providers are found.
+    pub async fn count_tokens_for_model(&self, text: &str, model_name: &str) -> i32 {
+        // Clone the provider while holding the lock, then release lock before async call
+        // to avoid blocking the model discovery refresh task
+        let provider = {
+            let model_mapping = self.model_mapping.read().await;
+            model_mapping
+                .get(model_name)
+                .and_then(|providers| providers.first().cloned())
+        };
+
+        if let Some(provider) = provider {
+            // Wrap with timeout to prevent indefinite hangs (especially important for Drop handler)
+            match timeout(
+                Duration::from_secs(TOKENIZE_TIMEOUT_SECS),
+                provider.count_tokens(text, model_name),
+            )
+            .await
+            {
+                Ok(Ok(count)) => {
+                    return count;
+                }
+                Ok(Err(e)) => {
+                    // Fall back to 0 tokens if count_tokens fails - don't charge customers
+                    // if our infrastructure fails
+                    tracing::warn!(
+                        "Failed to get token count from provider: {}, returning 0 (not charging customer)",
+                        e
+                    );
+                    return 0;
+                }
+                Err(_) => {
+                    // Timeout occurred - don't charge customer if tokenization takes too long
+                    tracing::warn!(
+                        "Tokenize request timeout ({}s) for model: {}, returning 0 (not charging customer)",
+                        TOKENIZE_TIMEOUT_SECS,
+                        model_name
+                    );
+                    return 0;
+                }
+            }
+        }
+
+        // No providers found, return 0 (don't charge if we can't count tokens)
+        tracing::warn!(
+            "No providers found for model: {}, returning 0 (not charging customer)",
+            model_name
+        );
+        0
     }
 
     /// Start the periodic model discovery refresh task and store the handle

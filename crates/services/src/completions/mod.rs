@@ -4,7 +4,8 @@ use crate::attestation::ports::AttestationServiceTrait;
 use crate::inference_provider_pool::InferenceProviderPool;
 use crate::models::ModelsRepository;
 use crate::usage::{RecordUsageServiceRequest, UsageServiceTrait};
-use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, StreamingResult};
+use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -14,12 +15,6 @@ use futures_util::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
-
-/// Hash inference ID to UUID deterministically using MD5 (v5)
-/// Takes the full ID including prefix (e.g., "chatcmpl-abc123") and returns a stable UUID
-pub fn hash_inference_id_to_uuid(full_id: &str) -> Uuid {
-    Uuid::new_v5(&Uuid::NAMESPACE_DNS, full_id.as_bytes())
-}
 
 /// Get input bucket tag based on token count for metrics breakdown
 /// Buckets: 0-1k, 1-4k, 4-16k, 16-32k, 32-64k, 64-128k, 128k+
@@ -42,6 +37,7 @@ where
     inner: S,
     attestation_service: Arc<dyn AttestationServiceTrait>,
     usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
+    inference_provider_pool: Arc<InferenceProviderPool>,
     metrics_service: Arc<dyn MetricsServiceTrait>,
     // IDs for usage tracking (database)
     organization_id: Uuid,
@@ -65,6 +61,13 @@ where
     total_itl_ms: f64,
     // Pre-allocated low-cardinality metric tags (for Datadog/OTLP)
     metric_tags: Vec<String>,
+    // Token counting fields for early disconnect fallback
+    accumulated_text: String, // For output token counting on disconnect
+    input_text: String,       // For input token counting on disconnect
+    /// Unique inference ID for usage tracking and deduplication
+    inference_id: Uuid,
+    /// Flag to prevent double usage recording (set when normal path records usage)
+    usage_recorded: Arc<AtomicBool>,
 }
 
 impl<S> Stream for InterceptStream<S>
@@ -105,6 +108,14 @@ where
                 }
 
                 if let StreamChunk::Chat(ref chat_chunk) = event.chunk {
+                    // Accumulate all output content from deltas in choices
+                    // This includes: text, tool calls, reasoning, etc.
+                    for choice in &chat_chunk.choices {
+                        if let Some(ref delta) = choice.delta {
+                            delta.accumulate_into(&mut self.accumulated_text);
+                        }
+                    }
+
                     if let Some(usage) = &chat_chunk.usage {
                         // Store attestation signature when completion finishes
                         let attestation_service = self.attestation_service.clone();
@@ -138,8 +149,12 @@ where
                         let input_tokens = usage.prompt_tokens;
                         let output_tokens = usage.completion_tokens;
                         let ttft_ms = self.ttft_ms;
-                        // Hash the full chat ID to UUID for storage
-                        let inference_id_uuid = Some(hash_inference_id_to_uuid(&chat_chunk.id));
+                        // Use pre-generated inference_id for deduplication
+                        let inference_id = self.inference_id;
+
+                        // Mark usage as recorded BEFORE spawning async task
+                        // This prevents Drop handler from attempting to record again
+                        self.usage_recorded.store(true, Ordering::SeqCst);
 
                         tokio::spawn(async move {
                             if usage_service
@@ -153,7 +168,7 @@ where
                                     inference_type,
                                     ttft_ms,
                                     avg_itl_ms,
-                                    inference_id: inference_id_uuid,
+                                    inference_id: Some(inference_id),
                                 })
                                 .await
                                 .is_err()
@@ -221,11 +236,90 @@ where
                                 &tags,
                             );
                         });
+
+                        // Clear accumulated text to prevent Drop handler from double-billing
+                        // on normal completion (Drop always runs, even on success)
+                        self.accumulated_text.clear();
                     }
                 }
                 Poll::Ready(Some(Ok(event.clone())))
             }
             other => other,
+        }
+    }
+}
+
+impl<S> Drop for InterceptStream<S>
+where
+    S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
+{
+    fn drop(&mut self) {
+        let already_recorded = self.usage_recorded.load(Ordering::SeqCst);
+        tracing::debug!(
+            "InterceptStream::drop called for workspace_id={}, has_text={}, inference_id={}, already_recorded={}",
+            self.workspace_id,
+            !self.accumulated_text.is_empty(),
+            self.inference_id,
+            already_recorded
+        );
+
+        // Only record usage if:
+        // 1. Normal path didn't already record (checked via atomic flag)
+        // 2. We have accumulated text (client disconnected before final chunk)
+        // Defense in depth: DB UNIQUE constraint on inference_id also prevents duplicates
+        if !already_recorded && !self.accumulated_text.is_empty() {
+            // Client disconnected before final chunk - count accumulated text
+            let accumulated_text = self.accumulated_text.clone();
+            let input_text = self.input_text.clone(); // Also clone input for tokenization
+            let inference_provider_pool = self.inference_provider_pool.clone();
+            let usage_service = self.usage_service.clone();
+            let organization_id = self.organization_id;
+            let workspace_id = self.workspace_id;
+            let api_key_id = self.api_key_id;
+            let model_id = self.model_id;
+            let model_name = self.model_name.clone();
+            let inference_type = self.inference_type.clone();
+            let inference_id = self.inference_id; // Same ID as normal path for deduplication
+
+            tokio::spawn(async move {
+                // Count tokens for both input and output (timeout protection in inference_provider_pool)
+                let output_tokens = inference_provider_pool
+                    .count_tokens_for_model(&accumulated_text, &model_name)
+                    .await;
+
+                let input_tokens = inference_provider_pool
+                    .count_tokens_for_model(&input_text, &model_name)
+                    .await;
+
+                // Record the accumulated usage with both input and output token counts
+                // Uses same inference_id as normal path - DB constraint prevents duplicates
+                if usage_service
+                    .record_usage(RecordUsageServiceRequest {
+                        organization_id,
+                        workspace_id,
+                        api_key_id,
+                        model_id,
+                        input_tokens,
+                        output_tokens,
+                        inference_type,
+                        ttft_ms: None,    // Not available on disconnect
+                        avg_itl_ms: None, // Not available on disconnect
+                        inference_id: Some(inference_id),
+                    })
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!("Usage already recorded for inference_id={}", inference_id);
+                }
+            });
+        } else {
+            tracing::debug!(
+                "InterceptStream dropped without recording usage: workspace_id={}, inference_id={}, already_recorded={}, has_text={}",
+                self.workspace_id,
+                self.inference_id,
+                already_recorded,
+                !self.accumulated_text.is_empty()
+            );
         }
     }
 }
@@ -316,16 +410,18 @@ impl CompletionServiceImpl {
     #[allow(clippy::too_many_arguments)]
     async fn handle_stream_with_context(
         &self,
-        llm_stream: StreamingResult,
+        llm_stream: inference_providers::StreamingResult,
         organization_id: Uuid,
         workspace_id: Uuid,
         api_key_id: Uuid,
         model_id: Uuid,
         model_name: String,
         inference_type: &str,
+        input_text: String, // Added for token tracking on disconnect
         service_start_time: Instant,
         provider_start_time: Instant,
-    ) -> StreamingResult {
+        inference_id: Uuid, // Pre-generated for usage tracking and deduplication
+    ) -> inference_providers::StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
         let metric_tags = Self::create_metric_tags(&model_name);
 
@@ -341,6 +437,7 @@ impl CompletionServiceImpl {
             inner: llm_stream,
             attestation_service: self.attestation_service.clone(),
             usage_service: self.usage_service.clone(),
+            inference_provider_pool: self.inference_provider_pool.clone(),
             metrics_service: self.metrics_service.clone(),
             organization_id,
             workspace_id,
@@ -357,6 +454,10 @@ impl CompletionServiceImpl {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
+            accumulated_text: String::new(),
+            input_text,
+            inference_id,
+            usage_recorded: Arc::new(AtomicBool::new(false)),
         };
         Box::pin(intercepted_stream)
     }
@@ -367,8 +468,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
     async fn create_chat_completion_stream(
         &self,
         request: ports::CompletionRequest,
-    ) -> Result<StreamingResult, ports::CompletionError> {
+    ) -> Result<ports::StreamingCompletionResult, ports::CompletionError> {
         let service_start_time = Instant::now();
+        // Generate unique inference_id upfront for usage tracking and deduplication
+        let inference_id = Uuid::new_v4();
 
         // Extract context for usage tracking
         let organization_id = request.organization_id;
@@ -384,6 +487,15 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let is_streaming = request.stream.unwrap_or(false);
 
         let chat_messages = Self::prepare_chat_messages(&request.messages);
+
+        // Capture input text for potential tokenization on disconnect
+        // Just concatenate the message contents directly
+        let input_text = request
+            .messages
+            .iter()
+            .map(|msg| msg.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
 
         let mut chat_params = inference_providers::ChatCompletionParams {
             model: request.model.clone(),
@@ -500,19 +612,26 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 model.id,
                 model.model_name.clone(),
                 inference_type,
+                input_text,
                 service_start_time,
                 provider_start_time,
+                inference_id,
             )
             .await;
 
-        Ok(event_stream)
+        Ok(ports::StreamingCompletionResult {
+            stream: event_stream,
+            inference_id,
+        })
     }
 
     async fn create_chat_completion(
         &self,
         request: ports::CompletionRequest,
-    ) -> Result<inference_providers::ChatCompletionResponseWithBytes, ports::CompletionError> {
+    ) -> Result<ports::ChatCompletionResult, ports::CompletionError> {
         let service_start_time = Instant::now();
+        // Generate unique inference_id upfront for usage tracking
+        let inference_id = Uuid::new_v4();
         let chat_messages = Self::prepare_chat_messages(&request.messages);
 
         let mut chat_params = inference_providers::ChatCompletionParams {
@@ -673,8 +792,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let model_id = model.id;
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
         let output_tokens = response_with_bytes.response.usage.completion_tokens;
-        // Hash the full chat ID to UUID for storage
-        let inference_id_uuid = Some(hash_inference_id_to_uuid(&response_with_bytes.response.id));
 
         tokio::spawn(async move {
             if usage_service
@@ -688,7 +805,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     inference_type: "chat_completion".to_string(),
                     ttft_ms: None,    // N/A for non-streaming
                     avg_itl_ms: None, // N/A for non-streaming
-                    inference_id: inference_id_uuid,
+                    inference_id: Some(inference_id),
                 })
                 .await
                 .is_err()
@@ -705,7 +822,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             }
         });
 
-        Ok(response_with_bytes)
+        Ok(ports::ChatCompletionResult {
+            response: response_with_bytes,
+            inference_id,
+        })
     }
 }
 
@@ -775,6 +895,12 @@ mod tests {
             inner: stream,
             attestation_service,
             usage_service,
+            inference_provider_pool: Arc::new(InferenceProviderPool::new(
+                "http://localhost".to_string(),
+                None,
+                30,
+                30,
+            )),
             metrics_service: metrics_service.clone(),
             organization_id,
             workspace_id,
@@ -791,6 +917,10 @@ mod tests {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
+            accumulated_text: String::new(),
+            input_text: String::new(),
+            inference_id: Uuid::new_v4(),
+            usage_recorded: Arc::new(AtomicBool::new(false)),
         };
 
         // Consume the stream
@@ -913,6 +1043,12 @@ mod tests {
             inner: stream,
             attestation_service,
             usage_service: usage_service.clone(),
+            inference_provider_pool: Arc::new(InferenceProviderPool::new(
+                "http://localhost".to_string(),
+                None,
+                30,
+                30,
+            )),
             metrics_service: metrics_service.clone(),
             organization_id,
             workspace_id,
@@ -929,6 +1065,10 @@ mod tests {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
+            accumulated_text: String::new(),
+            input_text: String::new(),
+            inference_id: Uuid::new_v4(),
+            usage_recorded: Arc::new(AtomicBool::new(false)),
         };
 
         // Consume the stream
@@ -1014,6 +1154,12 @@ mod tests {
             inner: stream,
             attestation_service,
             usage_service: usage_service.clone(),
+            inference_provider_pool: Arc::new(InferenceProviderPool::new(
+                "http://localhost".to_string(),
+                None,
+                30,
+                30,
+            )),
             metrics_service: metrics_service.clone(),
             organization_id,
             workspace_id,
@@ -1030,6 +1176,10 @@ mod tests {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
+            accumulated_text: String::new(),
+            input_text: String::new(),
+            inference_id: Uuid::new_v4(),
+            usage_recorded: Arc::new(AtomicBool::new(false)),
         };
 
         let _ = intercept_stream.collect::<Vec<_>>().await;

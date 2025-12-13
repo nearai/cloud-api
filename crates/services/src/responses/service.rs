@@ -963,13 +963,14 @@ impl ResponseServiceImpl {
             };
 
             // Get completion stream
-            let mut completion_stream = process_context
+            let completion_result = process_context
                 .completion_service
                 .create_chat_completion_stream(completion_request)
                 .await
                 .map_err(|e| {
                     errors::ResponseError::InternalError(format!("Completion error: {e}"))
                 })?;
+            let mut completion_stream = completion_result.stream;
 
             // Process the completion stream and extract text + tool calls
             let (current_text, tool_calls_detected) = Self::process_completion_stream(
@@ -2415,6 +2416,7 @@ DO NOT USE THESE FORMATS:
 
         // Extract title from completion result
         let raw_title = completion_result
+            .response
             .response
             .choices
             .first()

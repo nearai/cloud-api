@@ -10,9 +10,8 @@ use axum::{
     response::{IntoResponse, Json as ResponseJson, Response},
 };
 use futures::stream::StreamExt;
-use services::completions::{
-    hash_inference_id_to_uuid,
-    ports::{CompletionMessage, CompletionRequest as ServiceCompletionRequest},
+use services::completions::ports::{
+    CompletionMessage, CompletionRequest as ServiceCompletionRequest,
 };
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -22,21 +21,6 @@ use uuid::Uuid;
 
 // Custom header for exposing the inference ID as a UUID
 const HEADER_INFERENCE_ID: &str = "Inference-Id";
-
-// Helper function to extract inference ID from first SSE chunk
-fn extract_inference_id_from_sse(raw_bytes: &[u8]) -> Option<Uuid> {
-    let chunk_str = match String::from_utf8(raw_bytes.to_vec()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "Invalid UTF-8 in SSE chunk, cannot extract inference ID");
-            return None;
-        }
-    };
-    let data = chunk_str.strip_prefix("data: ")?;
-    let obj = serde_json::from_str::<serde_json::Value>(data.trim()).ok()?;
-    let id = obj.get("id")?.as_str()?;
-    Some(hash_inference_id_to_uuid(id))
-}
 
 // Helper function to extract text from MessageContent
 fn extract_text_from_content(content: &Option<MessageContent>) -> String {
@@ -198,23 +182,10 @@ pub async fn chat_completions(
             .create_chat_completion_stream(service_request)
             .await
         {
-            Ok(stream) => {
-                // Make stream peekable to extract chat_id for Inference-Id header
-                let mut peekable_stream = Box::pin(stream.peekable());
-
-                // Peek at first chunk to extract chat_id and generate Inference-Id UUID
-                let inference_id = peekable_stream
-                    .as_mut()
-                    .peek()
-                    .await
-                    .and_then(|result| result.as_ref().ok())
-                    .and_then(|event| extract_inference_id_from_sse(&event.raw_bytes));
-
-                if inference_id.is_none() {
-                    tracing::warn!(
-                        "Could not extract inference ID from first chunk for chat completion (streaming)"
-                    );
-                }
+            Ok(result) => {
+                // inference_id is now provided directly by the service
+                let inference_id = result.inference_id;
+                let stream = result.stream;
 
                 // Accumulate all SSE bytes for response hash computation
                 let accumulated_bytes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -229,7 +200,7 @@ pub async fn chat_completions(
                 let pool_clone2 = pool_clone.clone();
                 let req_hash_clone2 = req_hash_clone.clone();
                 let attestation_clone = attestation_service.clone();
-                let byte_stream = peekable_stream
+                let byte_stream = stream
                     .then(move |result| {
                         let accumulated_inner = accumulated_clone.clone();
                         let chat_id_inner = chat_id_clone.clone();
@@ -350,20 +321,13 @@ pub async fn chat_completions(
                     }));
 
                 // Return raw streaming response with SSE headers
-                let mut response_builder = Response::builder()
+                Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "text/event-stream")
                     .header(header::CACHE_CONTROL, "no-cache")
-                    .header(header::CONNECTION, "keep-alive");
-
-                // Add Inference-Id header if available
-                if let Some(uuid) = inference_id {
-                    response_builder = response_builder
-                        .header(HEADER_INFERENCE_ID, uuid.to_string())
-                        .header("Access-Control-Expose-Headers", HEADER_INFERENCE_ID);
-                }
-
-                response_builder
+                    .header(header::CONNECTION, "keep-alive")
+                    .header(HEADER_INFERENCE_ID, inference_id.to_string())
+                    .header("Access-Control-Expose-Headers", HEADER_INFERENCE_ID)
                     .body(Body::from_stream(byte_stream))
                     .unwrap()
             }
@@ -383,26 +347,18 @@ pub async fn chat_completions(
             .create_chat_completion(service_request)
             .await
         {
-            Ok(response_with_bytes) => {
-                // Extract inference ID from response ID (reuse same hashing as usage tracking)
-                let inference_id =
-                    Some(hash_inference_id_to_uuid(&response_with_bytes.response.id));
+            Ok(result) => {
+                // inference_id is now provided directly by the service
+                let inference_id = result.inference_id;
 
                 // Return the exact bytes from the provider for hash verification
                 // This ensures clients can hash the response and compare with attestation endpoints
-                let mut response_builder = Response::builder()
+                Response::builder()
                     .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "application/json");
-
-                // Add Inference-Id header if available
-                if let Some(uuid) = inference_id {
-                    response_builder = response_builder
-                        .header(HEADER_INFERENCE_ID, uuid.to_string())
-                        .header("Access-Control-Expose-Headers", HEADER_INFERENCE_ID);
-                }
-
-                response_builder
-                    .body(Body::from(response_with_bytes.raw_bytes))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(HEADER_INFERENCE_ID, inference_id.to_string())
+                    .header("Access-Control-Expose-Headers", HEADER_INFERENCE_ID)
+                    .body(Body::from(result.response.raw_bytes))
                     .unwrap()
             }
             Err(domain_error) => {
@@ -566,90 +522,4 @@ pub async fn models(
             .collect(),
     };
     Ok(ResponseJson(response))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_extract_inference_id_from_sse_valid() {
-        let sse_data = b"data: {\"id\":\"chatcmpl-123abc\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"test-model\",\"choices\":[]}";
-
-        let result = extract_inference_id_from_sse(sse_data);
-
-        assert!(result.is_some());
-        let uuid = result.unwrap();
-        // UUID should be deterministic - same input produces same UUID
-        let uuid2 = extract_inference_id_from_sse(sse_data).unwrap();
-        assert_eq!(uuid, uuid2);
-    }
-
-    #[test]
-    fn test_extract_inference_id_from_sse_deterministic() {
-        // Test that the same chat ID always produces the same UUID
-        let sse_data1 = b"data: {\"id\":\"chatcmpl-test123\",\"object\":\"chat.completion.chunk\"}";
-        let sse_data2 = b"data: {\"id\":\"chatcmpl-test123\",\"object\":\"chat.completion.chunk\",\"model\":\"different\"}";
-
-        let uuid1 = extract_inference_id_from_sse(sse_data1).unwrap();
-        let uuid2 = extract_inference_id_from_sse(sse_data2).unwrap();
-
-        // Same ID should produce same UUID even with different JSON structure
-        assert_eq!(uuid1, uuid2);
-    }
-
-    #[test]
-    fn test_extract_inference_id_from_sse_different_ids() {
-        let sse_data1 = b"data: {\"id\":\"chatcmpl-abc123\"}";
-        let sse_data2 = b"data: {\"id\":\"chatcmpl-xyz789\"}";
-
-        let uuid1 = extract_inference_id_from_sse(sse_data1).unwrap();
-        let uuid2 = extract_inference_id_from_sse(sse_data2).unwrap();
-
-        // Different IDs should produce different UUIDs
-        assert_ne!(uuid1, uuid2);
-    }
-
-    #[test]
-    fn test_extract_inference_id_from_sse_missing_data_prefix() {
-        let invalid_data = b"{\"id\":\"chatcmpl-123abc\"}";
-        let result = extract_inference_id_from_sse(invalid_data);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_inference_id_from_sse_invalid_json() {
-        let invalid_json = b"data: {invalid json}";
-        let result = extract_inference_id_from_sse(invalid_json);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_inference_id_from_sse_missing_id_field() {
-        let no_id = b"data: {\"object\":\"chat.completion.chunk\",\"model\":\"test\"}";
-        let result = extract_inference_id_from_sse(no_id);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_inference_id_from_sse_id_not_string() {
-        let id_not_string = b"data: {\"id\":12345}";
-        let result = extract_inference_id_from_sse(id_not_string);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_inference_id_from_sse_invalid_utf8() {
-        let invalid_utf8 = b"data: \xff\xfe{\"id\":\"test\"}";
-        let result = extract_inference_id_from_sse(invalid_utf8);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_inference_id_from_sse_empty_id() {
-        let empty_id = b"data: {\"id\":\"\"}";
-        let result = extract_inference_id_from_sse(empty_id);
-        // Empty string should still produce a valid UUID
-        assert!(result.is_some());
-    }
 }

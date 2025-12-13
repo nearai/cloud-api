@@ -1,4 +1,7 @@
 [build]
+# This saves a lot of disk space!!
+incremental = false
+
 # Enable reproducible builds
 [target.'cfg(target_os = "linux")']
 rustflags = [

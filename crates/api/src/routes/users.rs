@@ -43,17 +43,17 @@ pub struct UpdateUserProfileRequest {
 impl UpdateUserProfileRequest {
     pub fn validate(&self) -> Result<(), String> {
         if let Some(display_name) = &self.display_name {
-            crate::models::validate_max_length(
+            crate::routes::common::validate_max_length(
                 display_name,
                 "display_name",
-                crate::models::MAX_NAME_LENGTH,
+                crate::consts::MAX_NAME_LENGTH,
             )
             .map_err(|e| format!("user display_name: {e}"))?;
         }
 
         if let Some(avatar_url) = &self.avatar_url {
             // URLs can be long, but we still cap to a reasonable length
-            crate::models::validate_max_length(avatar_url, "avatar_url", 2048)
+            crate::routes::common::validate_max_length(avatar_url, "avatar_url", 2048)
                 .map_err(|e| format!("avatar_url: {e}"))?;
         }
 

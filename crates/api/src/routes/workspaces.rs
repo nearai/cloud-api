@@ -30,25 +30,29 @@ pub struct CreateWorkspaceRequest {
 
 impl CreateWorkspaceRequest {
     pub fn validate(&self) -> Result<(), String> {
-        crate::models::validate_non_empty_field(&self.name, "name")
+        crate::routes::common::validate_non_empty_field(&self.name, "name")
             .map_err(|e| format!("workspace name: {e}"))?;
-        crate::models::validate_max_length(&self.name, "name", crate::models::MAX_NAME_LENGTH)
-            .map_err(|e| format!("workspace name: {e}"))?;
+        crate::routes::common::validate_max_length(
+            &self.name,
+            "name",
+            crate::consts::MAX_NAME_LENGTH,
+        )
+        .map_err(|e| format!("workspace name: {e}"))?;
 
         if let Some(display_name) = &self.display_name {
-            crate::models::validate_max_length(
+            crate::routes::common::validate_max_length(
                 display_name,
                 "display_name",
-                crate::models::MAX_NAME_LENGTH,
+                crate::consts::MAX_NAME_LENGTH,
             )
             .map_err(|e| format!("workspace display_name: {e}"))?;
         }
 
         if let Some(description) = &self.description {
-            crate::models::validate_max_length(
+            crate::routes::common::validate_max_length(
                 description,
                 "description",
-                crate::models::MAX_DESCRIPTION_LENGTH,
+                crate::consts::MAX_DESCRIPTION_LENGTH,
             )
             .map_err(|e| format!("workspace description: {e}"))?;
         }
@@ -68,19 +72,19 @@ pub struct UpdateWorkspaceRequest {
 impl UpdateWorkspaceRequest {
     pub fn validate(&self) -> Result<(), String> {
         if let Some(display_name) = &self.display_name {
-            crate::models::validate_max_length(
+            crate::routes::common::validate_max_length(
                 display_name,
                 "display_name",
-                crate::models::MAX_NAME_LENGTH,
+                crate::consts::MAX_NAME_LENGTH,
             )
             .map_err(|e| format!("workspace display_name: {e}"))?;
         }
 
         if let Some(description) = &self.description {
-            crate::models::validate_max_length(
+            crate::routes::common::validate_max_length(
                 description,
                 "description",
-                crate::models::MAX_DESCRIPTION_LENGTH,
+                crate::consts::MAX_DESCRIPTION_LENGTH,
             )
             .map_err(|e| format!("workspace description: {e}"))?;
         }

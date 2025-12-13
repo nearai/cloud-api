@@ -239,27 +239,13 @@ fn default_n() -> Option<i64> {
 }
 
 // ============================================
-// Common validation helpers
+// Common validation helpers (re-exported)
 // ============================================
 
-pub const MAX_NAME_LENGTH: usize = 255;
-pub const MAX_DESCRIPTION_LENGTH: usize = 2048;
-pub const MAX_EMAIL_LENGTH: usize = 255;
-pub const MAX_SYSTEM_PROMPT_LENGTH: usize = 8192;
-
-pub fn validate_non_empty_field(value: &str, field: &str) -> Result<(), String> {
-    if value.trim().is_empty() {
-        return Err(format!("{field} cannot be empty"));
-    }
-    Ok(())
-}
-
-pub fn validate_max_length(value: &str, field: &str, max: usize) -> Result<(), String> {
-    if value.len() > max {
-        return Err(format!("{field} is too long (max {max} characters)"));
-    }
-    Ok(())
-}
+use crate::consts::{
+    MAX_DESCRIPTION_LENGTH, MAX_EMAIL_LENGTH, MAX_NAME_LENGTH, MAX_SYSTEM_PROMPT_LENGTH,
+};
+use crate::routes::common::{validate_max_length, validate_non_empty_field};
 
 impl ChatCompletionRequest {
     pub fn validate(&self) -> Result<(), String> {

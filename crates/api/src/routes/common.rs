@@ -60,6 +60,22 @@ pub fn default_limit() -> i64 {
     100
 }
 
+/// Basic non-empty string validation helper
+pub fn validate_non_empty_field(value: &str, field: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{field} cannot be empty"));
+    }
+    Ok(())
+}
+
+/// Basic max-length string validation helper
+pub fn validate_max_length(value: &str, field: &str, max: usize) -> Result<(), String> {
+    if value.len() > max {
+        return Err(format!("{field} is too long (max {max} characters)"));
+    }
+    Ok(())
+}
+
 /// Validates and parses a file ID reference from legacy text format.
 ///
 /// Legacy format: "[File: file-{uuid}]" or "[File: {uuid}]"

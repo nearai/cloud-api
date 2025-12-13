@@ -174,6 +174,14 @@ pub async fn create_organization(
         request.name, user.0.id
     );
 
+    // Validate request to protect database from invalid or oversized data
+    if let Err(msg) = request.validate() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
+        ));
+    }
+
     // Convert API request to services request
     let user_id = crate::conversions::authenticated_user_to_user_id(user);
 
@@ -415,6 +423,13 @@ pub async fn patch_organization_settings(
         organization_id.0, user.0.id
     );
 
+    if let Err(msg) = request.validate() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
+        ));
+    }
+
     let user_id = crate::conversions::authenticated_user_to_user_id(user);
 
     // Handle system_prompt based on request state
@@ -472,6 +487,13 @@ pub async fn update_organization(
         "Updating organization: {} by user: {}",
         organization_id.0, user.0.id
     );
+
+    if let Err(msg) = request.validate() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
+        ));
+    }
 
     let user_id = crate::conversions::authenticated_user_to_user_id(user);
 

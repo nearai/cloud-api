@@ -1,4 +1,10 @@
-use crate::routes::api::AppState;
+use crate::{
+    consts::{MAX_NAME_LENGTH, MAX_SIGNATURE_LENGTH},
+    routes::{
+        api::AppState,
+        common::{validate_max_length, validate_non_empty_field},
+    },
+};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -18,6 +24,18 @@ pub struct VpcLoginRequest {
     pub client_id: String,
 }
 
+impl VpcLoginRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        // Basic sanity checks to avoid extremely large inputs
+        validate_non_empty_field(&self.client_id, "client_id")?;
+        validate_max_length(&self.client_id, "client_id", MAX_NAME_LENGTH)?;
+
+        validate_non_empty_field(&self.signature, "signature")?;
+        validate_max_length(&self.signature, "signature", MAX_SIGNATURE_LENGTH)?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VpcLoginResponse {
     pub access_token: String,
@@ -32,6 +50,11 @@ pub async fn vpc_login(
     State(state): State<AppState>,
     Json(payload): Json<VpcLoginRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Basic payload validation to prevent obviously bad or oversized input
+    payload
+        .validate()
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
     // Verify VPC signature
     let valid = state
         .attestation_service

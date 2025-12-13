@@ -1,3 +1,4 @@
+pub mod consts;
 pub mod conversions;
 pub mod middleware;
 pub mod models;

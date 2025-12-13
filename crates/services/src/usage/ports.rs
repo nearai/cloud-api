@@ -62,6 +62,14 @@ pub trait UsageServiceTrait: Send + Sync {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<(Vec<UsageLogEntry>, i64), UsageError>;
+
+    /// Get costs by inference IDs (for HuggingFace billing integration)
+    /// Returns costs for each inference_id that was found and belongs to the organization
+    async fn get_costs_by_inference_ids(
+        &self,
+        organization_id: Uuid,
+        inference_ids: Vec<Uuid>,
+    ) -> Result<Vec<InferenceCost>, UsageError>;
 }
 
 // ============================================
@@ -99,6 +107,14 @@ pub trait UsageRepository: Send + Sync {
 
     /// Get total spend for a specific API key
     async fn get_api_key_spend(&self, api_key_id: Uuid) -> anyhow::Result<i64>;
+
+    /// Get costs by inference IDs (for HuggingFace billing integration)
+    /// Returns costs for each inference_id that was found and belongs to the organization
+    async fn get_costs_by_inference_ids(
+        &self,
+        organization_id: Uuid,
+        inference_ids: Vec<Uuid>,
+    ) -> anyhow::Result<Vec<InferenceCost>>;
 }
 
 #[async_trait::async_trait]
@@ -188,6 +204,14 @@ pub struct CostBreakdown {
     pub input_cost: i64,
     pub output_cost: i64,
     pub total_cost: i64,
+}
+
+/// Inference cost for billing (HuggingFace compatible)
+/// Cost is in nano-USD (10^-9 USD)
+#[derive(Debug, Clone)]
+pub struct InferenceCost {
+    pub inference_id: Uuid,
+    pub cost_nano_usd: i64,
 }
 
 /// Result of checking if organization can use credits

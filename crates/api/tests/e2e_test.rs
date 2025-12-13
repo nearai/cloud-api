@@ -10,18 +10,26 @@ use inference_providers::{models::ChatCompletionChunk, StreamChunk};
 #[tokio::test]
 async fn test_models_api() {
     let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
     let (api_key, _) = create_org_and_api_key(&server).await;
     let response = list_models(&server, api_key).await;
 
     assert!(!response.data.is_empty());
 
-    // Verify that all models have owned_by field populated
-    for model in &response.data {
-        assert!(
-            !model.owned_by.is_empty(),
-            "owned_by field should not be empty"
-        );
-    }
+    // Verify pricing and context_length are present (HuggingFace integration)
+    let model = response.data.first().unwrap();
+    assert!(model.pricing.is_some(), "Model should have pricing");
+    let pricing = model.pricing.as_ref().unwrap();
+    assert!(pricing.input > 0.0, "Input price should be positive");
+    assert!(pricing.output > 0.0, "Output price should be positive");
+    assert!(
+        model.context_length.is_some(),
+        "Model should have context_length"
+    );
+    assert!(
+        model.context_length.unwrap() > 0,
+        "Context length should be positive"
+    );
 }
 
 #[tokio::test]

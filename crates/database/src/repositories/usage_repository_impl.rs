@@ -1,6 +1,6 @@
 use crate::models::RecordUsageRequest;
 use crate::repositories::OrganizationUsageRepository;
-use services::usage::ports::{OrganizationBalanceInfo, UsageLogEntry};
+use services::usage::ports::{InferenceCost, OrganizationBalanceInfo, UsageLogEntry};
 use uuid::Uuid;
 
 /// Trait implementation adapter for UsageRepository
@@ -144,5 +144,14 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
 
     async fn get_api_key_spend(&self, api_key_id: Uuid) -> anyhow::Result<i64> {
         self.get_api_key_spend(api_key_id).await
+    }
+
+    async fn get_costs_by_inference_ids(
+        &self,
+        organization_id: Uuid,
+        inference_ids: Vec<Uuid>,
+    ) -> anyhow::Result<Vec<InferenceCost>> {
+        self.get_costs_by_inference_ids(organization_id, inference_ids)
+            .await
     }
 }

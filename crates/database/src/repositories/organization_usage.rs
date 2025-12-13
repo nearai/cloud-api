@@ -5,6 +5,7 @@ use crate::retry_db;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use services::common::RepositoryError;
+use std::collections::HashMap;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
@@ -375,6 +376,62 @@ impl OrganizationUsageRepository {
             total_tokens: row.get("total_tokens"),
             updated_at: row.get("updated_at"),
         }
+    }
+
+    /// Get costs by inference IDs (for HuggingFace billing integration)
+    /// Returns costs for all requested inference_ids that belong to the organization
+    /// Missing inference_ids will have cost = 0
+    pub async fn get_costs_by_inference_ids(
+        &self,
+        organization_id: Uuid,
+        inference_ids: Vec<Uuid>,
+    ) -> Result<Vec<services::usage::InferenceCost>> {
+        if inference_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let rows = retry_db!("get_costs_by_inference_ids", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query(
+                    r#"
+                    SELECT inference_id, total_cost
+                    FROM organization_usage_log
+                    WHERE organization_id = $1 AND inference_id = ANY($2)
+                    "#,
+                    &[&organization_id, &inference_ids],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        // Build map of found costs
+        let mut found_costs: HashMap<Uuid, i64> = rows
+            .iter()
+            .filter_map(|row| {
+                let inference_id: Option<Uuid> = row.get("inference_id");
+                let total_cost: i64 = row.get("total_cost");
+                inference_id.map(|id| (id, total_cost))
+            })
+            .collect();
+
+        // Return all requested IDs, with 0 for missing ones
+        Ok(inference_ids
+            .into_iter()
+            .map(|id| {
+                let cost_nano_usd = found_costs.remove(&id).unwrap_or(0);
+                services::usage::InferenceCost {
+                    inference_id: id,
+                    cost_nano_usd,
+                }
+            })
+            .collect())
     }
 }
 

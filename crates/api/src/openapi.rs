@@ -29,6 +29,7 @@ use utoipa::{Modify, OpenApi};
         (name = "Users", description = "User profile and token management"),
         (name = "Invitations", description = "Token-based invitation handling"),
         (name = "Usage", description = "Usage tracking and billing information"),
+        (name = "Billing", description = "Billing costs endpoint (HuggingFace integration)"),
         (name = "Health", description = "Health check endpoints"),
         (name = "Attestation", description = "Attestation and verification endpoints"),
         (name = "Admin", description = "Administrative endpoints (admin access required)"),
@@ -105,6 +106,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::usage::get_organization_balance,
         crate::routes::usage::get_organization_usage_history,
         crate::routes::usage::get_api_key_usage_history,
+        // Billing endpoints (HuggingFace integration)
+        crate::routes::billing::get_billing_costs,
         // Admin endpoints (less frequently used)
         crate::routes::admin::list_models,
         crate::routes::admin::batch_upsert_models,
@@ -131,7 +134,7 @@ use utoipa::{Modify, OpenApi};
             crate::routes::health::HealthResponse,
             // Core API models
             ChatCompletionRequest, ChatCompletionResponse, Message,
-            CompletionRequest, ModelsResponse, ModelInfo, ErrorResponse,
+            CompletionRequest, ModelsResponse, ModelInfo, ModelPricing, ErrorResponse,
             // Organization models
             CreateOrganizationRequest, OrganizationResponse,
             UpdateOrganizationRequest, CreateApiKeyRequest, ApiKeyResponse,
@@ -191,6 +194,10 @@ use utoipa::{Modify, OpenApi};
             crate::routes::usage::OrganizationBalanceResponse,
             crate::routes::usage::UsageHistoryResponse,
             crate::routes::usage::UsageHistoryEntryResponse,
+            // Billing models (HuggingFace integration)
+            crate::routes::billing::BillingCostsRequest,
+            crate::routes::billing::BillingCostsResponse,
+            crate::routes::billing::RequestCost,
             // File models
             FileUploadResponse, ExpiresAfter, FileListResponse, FileDeleteResponse,
         ),

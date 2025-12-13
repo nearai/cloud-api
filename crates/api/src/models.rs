@@ -158,12 +158,28 @@ pub struct ModelsResponse {
     pub data: Vec<ModelInfo>,
 }
 
+/// Model pricing information (HuggingFace compatible format)
+/// Price is in US dollars per million tokens
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ModelPricing {
+    /// Price per million input tokens in USD
+    pub input: f64,
+    /// Price per million output tokens in USD
+    pub output: f64,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelInfo {
     pub id: String,
     pub object: String,
     pub created: i64,
     pub owned_by: String,
+    /// Pricing information (HuggingFace compatible)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ModelPricing>,
+    /// Context length in tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]

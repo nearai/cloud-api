@@ -525,20 +525,22 @@ impl InferenceProviderPool {
                     .map(|providers| providers.iter().map(|p| p.max_model_len).collect())
                     .unwrap_or_default();
 
-                if required_tokens.is_some() && !available_contexts.is_empty() {
-                    tracing::error!(
-                        model_id = %model_id,
-                        required_tokens = ?required_tokens,
-                        available_contexts = ?available_contexts,
-                        operation = operation_name,
-                        "No provider has sufficient context length for request"
-                    );
-                    return Err(CompletionError::CompletionError(format!(
-                        "Request requires {} tokens but no provider for model '{}' has sufficient context. Available: {:?}",
-                        required_tokens.unwrap(),
-                        model_id,
-                        available_contexts
-                    )));
+                if let Some(tokens) = required_tokens {
+                    if !available_contexts.is_empty() {
+                        tracing::error!(
+                            model_id = %model_id,
+                            required_tokens = tokens,
+                            available_contexts = ?available_contexts,
+                            operation = operation_name,
+                            "No provider has sufficient context length for request"
+                        );
+                        return Err(CompletionError::CompletionError(format!(
+                            "Request requires {} tokens but no provider for model '{}' has sufficient context. Available: {:?}",
+                            tokens,
+                            model_id,
+                            available_contexts
+                        )));
+                    }
                 }
 
                 tracing::error!(

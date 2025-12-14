@@ -1,7 +1,7 @@
 use inference_providers::{
     models::{AttestationError, CompletionError, ListModelsError, ModelsResponse},
-    ChatCompletionParams, InferenceProvider, StreamingResult, StreamingResultExt, VLlmConfig,
-    VLlmProvider,
+    ChatCompletionParams, InferenceProvider, StreamingResult, StreamingResultExt,
+    TokenizeChatRequest, VLlmConfig, VLlmProvider,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -73,27 +73,49 @@ impl InferenceProviderPool {
     }
 
     /// Register a provider for a model manually (useful for testing with mock providers)
+    /// Queries the provider's models endpoint to get max_model_len for context-aware routing
     pub async fn register_provider(&self, model_id: String, provider: Arc<InferenceProviderTrait>) {
+        // Query the provider's models endpoint to get max_model_len
+        let max_model_len = match provider.models().await {
+            Ok(models_response) => models_response
+                .data
+                .iter()
+                .find(|m| m.id == model_id)
+                .and_then(|m| m.max_model_len),
+            Err(_) => None,
+        };
+
         let mut model_mapping = self.model_mapping.write().await;
         model_mapping
             .entry(model_id)
             .or_insert_with(Vec::new)
             .push(ProviderWithContext {
                 provider,
-                max_model_len: None,
+                max_model_len,
             });
     }
 
     /// Register multiple providers for multiple models (useful for testing)
+    /// Queries each provider's models endpoint to get max_model_len for context-aware routing
     pub async fn register_providers(&self, providers: Vec<(String, Arc<InferenceProviderTrait>)>) {
-        let mut model_mapping = self.model_mapping.write().await;
         for (model_id, provider) in providers {
+            // Query the provider's models endpoint to get max_model_len
+            let max_model_len = match provider.models().await {
+                Ok(models_response) => models_response
+                    .data
+                    .iter()
+                    .find(|m| m.id == model_id)
+                    .and_then(|m| m.max_model_len),
+                Err(_) => None,
+            };
+
+            let mut model_mapping = self.model_mapping.write().await;
             model_mapping
                 .entry(model_id)
                 .or_insert_with(Vec::new)
                 .push(ProviderWithContext {
                     provider,
-                    max_model_len: None,
+                    max_model_len,
                 });
         }
     }
@@ -376,10 +398,12 @@ impl InferenceProviderPool {
 
     /// Get providers for a model in priority order for fallback
     /// Returns providers sorted by max_model_len ascending (smallest context first)
-    /// Providers without max_model_len go last
+    /// Filters out providers whose max_model_len is less than required_tokens
+    /// Providers without max_model_len go last (assumed to have sufficient context)
     async fn get_providers_with_fallback(
         &self,
         model_id: &str,
+        required_tokens: Option<i64>,
     ) -> Option<Vec<Arc<InferenceProviderTrait>>> {
         let model_mapping = self.model_mapping.read().await;
         let providers = model_mapping.get(model_id)?;
@@ -388,13 +412,35 @@ impl InferenceProviderPool {
             return None;
         }
 
-        if providers.len() == 1 {
-            return Some(vec![providers[0].provider.clone()]);
+        // Filter providers that have sufficient context for the request
+        // Providers without max_model_len (None) are included (assumed sufficient)
+        let filtered_providers: Vec<_> = providers
+            .iter()
+            .filter(|p| {
+                match (p.max_model_len, required_tokens) {
+                    (Some(max_len), Some(required)) => max_len >= required,
+                    _ => true, // Include if we don't know the context length or request size
+                }
+            })
+            .collect();
+
+        if filtered_providers.is_empty() {
+            tracing::warn!(
+                model = %model_id,
+                required_tokens = ?required_tokens,
+                available_contexts = ?providers.iter().map(|p| p.max_model_len).collect::<Vec<_>>(),
+                "No providers have sufficient context length for request"
+            );
+            return None;
+        }
+
+        if filtered_providers.len() == 1 {
+            return Some(vec![filtered_providers[0].provider.clone()]);
         }
 
         // Sort providers by max_model_len ascending (smallest context first)
         // Providers without max_model_len (None) go last
-        let mut sorted_providers: Vec<_> = providers.iter().collect();
+        let mut sorted_providers = filtered_providers;
         sorted_providers.sort_by(|a, b| {
             match (a.max_model_len, b.max_model_len) {
                 (Some(a_len), Some(b_len)) => a_len.cmp(&b_len),
@@ -411,9 +457,10 @@ impl InferenceProviderPool {
 
         tracing::debug!(
             model = %model_id,
-            providers_count = providers.len(),
+            required_tokens = ?required_tokens,
+            providers_count = sorted_providers.len(),
             context_lengths = ?sorted_providers.iter().map(|p| p.max_model_len).collect::<Vec<_>>(),
-            "Prepared providers for fallback with context-aware priority (smallest first)"
+            "Prepared providers for fallback with context-aware priority (smallest sufficient first)"
         );
 
         Some(ordered_providers)
@@ -452,10 +499,12 @@ impl InferenceProviderPool {
 
     /// Generic retry helper that tries each provider in order with automatic fallback
     /// Returns both the result and the provider that succeeded (for chat_id mapping)
+    /// required_tokens: If provided, filters out providers with insufficient context length
     async fn retry_with_fallback<T, F, Fut>(
         &self,
         model_id: &str,
         operation_name: &str,
+        required_tokens: Option<i64>,
         provider_fn: F,
     ) -> Result<(T, Arc<InferenceProviderTrait>), CompletionError>
     where
@@ -465,12 +514,35 @@ impl InferenceProviderPool {
         // Ensure models are discovered first
         self.ensure_models_discovered().await?;
 
-        // Get all providers with fallback priority
-        let providers = match self.get_providers_with_fallback(model_id).await {
+        // Get all providers with fallback priority, filtered by context length
+        let providers = match self
+            .get_providers_with_fallback(model_id, required_tokens)
+            .await
+        {
             Some(p) => p,
             None => {
                 let model_mapping = self.model_mapping.read().await;
                 let available_models: Vec<_> = model_mapping.keys().collect();
+                let available_contexts: Vec<_> = model_mapping
+                    .get(model_id)
+                    .map(|providers| providers.iter().map(|p| p.max_model_len).collect())
+                    .unwrap_or_default();
+
+                if required_tokens.is_some() && !available_contexts.is_empty() {
+                    tracing::error!(
+                        model_id = %model_id,
+                        required_tokens = ?required_tokens,
+                        available_contexts = ?available_contexts,
+                        operation = operation_name,
+                        "No provider has sufficient context length for request"
+                    );
+                    return Err(CompletionError::CompletionError(format!(
+                        "Request requires {} tokens but no provider for model '{}' has sufficient context. Available: {:?}",
+                        required_tokens.unwrap(),
+                        model_id,
+                        available_contexts
+                    )));
+                }
 
                 tracing::error!(
                     model_id = %model_id,
@@ -612,6 +684,39 @@ impl InferenceProviderPool {
         self.discover_models().await
     }
 
+    /// Tokenize a request to get the token count for context-aware routing
+    /// Uses the first available provider to tokenize
+    async fn get_request_token_count(&self, params: &ChatCompletionParams) -> Option<i64> {
+        // Get any provider for this model to tokenize the request
+        let providers = self.get_providers_for_model(&params.model).await?;
+        let provider = providers.first()?;
+
+        let tokenize_request = TokenizeChatRequest {
+            model: params.model.clone(),
+            messages: params.messages.clone(),
+            add_special_tokens: Some(true),
+        };
+
+        match provider.tokenize_chat(tokenize_request).await {
+            Ok(response) => {
+                tracing::debug!(
+                    model = %params.model,
+                    token_count = response.count,
+                    "Tokenized request for context-aware routing"
+                );
+                Some(response.count)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    model = %params.model,
+                    error = %e,
+                    "Failed to tokenize request, proceeding without token count filtering"
+                );
+                None
+            }
+        }
+    }
+
     pub async fn chat_completion_stream(
         &self,
         params: ChatCompletionParams,
@@ -624,12 +729,20 @@ impl InferenceProviderPool {
             "Starting chat completion stream request"
         );
 
+        // Get the token count for context-aware routing
+        let required_tokens = self.get_request_token_count(&params).await;
+
         let (stream, provider) = self
-            .retry_with_fallback(&model_id, "chat_completion_stream", |provider| {
-                let params = params.clone();
-                let request_hash = request_hash.clone();
-                async move { provider.chat_completion_stream(params, request_hash).await }
-            })
+            .retry_with_fallback(
+                &model_id,
+                "chat_completion_stream",
+                required_tokens,
+                |provider| {
+                    let params = params.clone();
+                    let request_hash = request_hash.clone();
+                    async move { provider.chat_completion_stream(params, request_hash).await }
+                },
+            )
             .await?;
 
         // Store chat_id mapping for sticky routing by peeking at the first event
@@ -657,8 +770,11 @@ impl InferenceProviderPool {
     ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError> {
         let model_id = params.model.clone();
 
+        // Get the token count for context-aware routing
+        let required_tokens = self.get_request_token_count(&params).await;
+
         let (response, provider) = self
-            .retry_with_fallback(&model_id, "chat_completion", |provider| {
+            .retry_with_fallback(&model_id, "chat_completion", required_tokens, |provider| {
                 let params = params.clone();
                 let request_hash = request_hash.clone();
                 async move { provider.chat_completion(params, request_hash).await }
@@ -765,6 +881,182 @@ impl InferenceProviderPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use inference_providers::ModelInfo;
+
+    #[tokio::test]
+    async fn test_context_aware_routing_filters_by_token_count() {
+        // Create a pool
+        let pool = InferenceProviderPool::new("http://test:8080/models".to_string(), None, 5, 30);
+
+        // Create mock providers with different context lengths
+        let small_context_provider = Arc::new(inference_providers::MockProvider::with_models(vec![
+            ModelInfo {
+                id: "test-model".to_string(),
+                object: "model".to_string(),
+                created: 0,
+                owned_by: "test".to_string(),
+                max_model_len: Some(4096),
+            },
+        ])) as Arc<InferenceProviderTrait>;
+
+        let large_context_provider = Arc::new(inference_providers::MockProvider::with_models(vec![
+            ModelInfo {
+                id: "test-model".to_string(),
+                object: "model".to_string(),
+                created: 0,
+                owned_by: "test".to_string(),
+                max_model_len: Some(131072),
+            },
+        ])) as Arc<InferenceProviderTrait>;
+
+        // Register providers with context
+        {
+            let mut model_mapping = pool.model_mapping.write().await;
+            model_mapping.insert(
+                "test-model".to_string(),
+                vec![
+                    ProviderWithContext {
+                        provider: small_context_provider.clone(),
+                        max_model_len: Some(4096),
+                    },
+                    ProviderWithContext {
+                        provider: large_context_provider.clone(),
+                        max_model_len: Some(131072),
+                    },
+                ],
+            );
+        }
+
+        // Test 1: Small request should return both providers, sorted by size (smallest first)
+        let providers = pool
+            .get_providers_with_fallback("test-model", Some(1000))
+            .await;
+        assert!(providers.is_some());
+        let providers = providers.unwrap();
+        assert_eq!(
+            providers.len(),
+            2,
+            "Both providers should be available for small request"
+        );
+
+        // Test 2: Request larger than small context should only return large context provider
+        let providers = pool
+            .get_providers_with_fallback("test-model", Some(5000))
+            .await;
+        assert!(providers.is_some());
+        let providers = providers.unwrap();
+        assert_eq!(
+            providers.len(),
+            1,
+            "Only large context provider should be available"
+        );
+
+        // Test 3: Request larger than all contexts should return None
+        let providers = pool
+            .get_providers_with_fallback("test-model", Some(200000))
+            .await;
+        assert!(
+            providers.is_none(),
+            "No providers should be available for very large request"
+        );
+
+        // Test 4: No token count should return all providers
+        let providers = pool.get_providers_with_fallback("test-model", None).await;
+        assert!(providers.is_some());
+        let providers = providers.unwrap();
+        assert_eq!(
+            providers.len(),
+            2,
+            "All providers should be available when token count is unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_context_aware_routing_sorts_by_context_length() {
+        let pool = InferenceProviderPool::new("http://test:8080/models".to_string(), None, 5, 30);
+
+        // Create providers with different context lengths (registered out of order)
+        let medium_provider = Arc::new(inference_providers::MockProvider::with_models(vec![
+            ModelInfo {
+                id: "test-model".to_string(),
+                object: "model".to_string(),
+                created: 0,
+                owned_by: "test".to_string(),
+                max_model_len: Some(32768),
+            },
+        ])) as Arc<InferenceProviderTrait>;
+
+        let small_provider = Arc::new(inference_providers::MockProvider::with_models(vec![
+            ModelInfo {
+                id: "test-model".to_string(),
+                object: "model".to_string(),
+                created: 0,
+                owned_by: "test".to_string(),
+                max_model_len: Some(4096),
+            },
+        ])) as Arc<InferenceProviderTrait>;
+
+        let large_provider = Arc::new(inference_providers::MockProvider::with_models(vec![
+            ModelInfo {
+                id: "test-model".to_string(),
+                object: "model".to_string(),
+                created: 0,
+                owned_by: "test".to_string(),
+                max_model_len: Some(131072),
+            },
+        ])) as Arc<InferenceProviderTrait>;
+
+        // Register in random order: medium, small, large
+        {
+            let mut model_mapping = pool.model_mapping.write().await;
+            model_mapping.insert(
+                "test-model".to_string(),
+                vec![
+                    ProviderWithContext {
+                        provider: medium_provider,
+                        max_model_len: Some(32768),
+                    },
+                    ProviderWithContext {
+                        provider: small_provider,
+                        max_model_len: Some(4096),
+                    },
+                    ProviderWithContext {
+                        provider: large_provider,
+                        max_model_len: Some(131072),
+                    },
+                ],
+            );
+        }
+
+        // Get providers - should be sorted: small (4096), medium (32768), large (131072)
+        let providers = pool.get_providers_with_fallback("test-model", None).await;
+        assert!(providers.is_some());
+        let providers = providers.unwrap();
+        assert_eq!(providers.len(), 3);
+
+        // Verify sorting by checking the models endpoint of each provider
+        // The first provider should be the one with smallest context
+        let first_models = providers[0].models().await.unwrap();
+        assert_eq!(
+            first_models.data[0].max_model_len,
+            Some(4096),
+            "First provider should have smallest context"
+        );
+
+        let second_models = providers[1].models().await.unwrap();
+        assert_eq!(
+            second_models.data[0].max_model_len,
+            Some(32768),
+            "Second provider should have medium context"
+        );
+
+        let third_models = providers[2].models().await.unwrap();
+        assert_eq!(
+            third_models.data[0].max_model_len,
+            Some(131072),
+            "Third provider should have largest context"
+        );
+    }
 
     #[test]
     fn test_parse_ip_port() {

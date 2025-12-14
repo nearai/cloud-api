@@ -317,4 +317,40 @@ impl InferenceProvider for VLlmProvider {
         let sse_stream = SSEParser::new(response.bytes_stream(), false);
         Ok(Box::pin(sse_stream))
     }
+
+    /// Tokenize chat messages to get token count
+    async fn tokenize_chat(
+        &self,
+        request: TokenizeChatRequest,
+    ) -> Result<TokenizeResponse, TokenizeError> {
+        let url = format!("{}/tokenize", self.config.base_url);
+
+        let headers = self
+            .build_headers()
+            .map_err(TokenizeError::TokenizeError)?;
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| TokenizeError::TokenizeError(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(TokenizeError::TokenizeError(format!(
+                "HTTP {status}: {error_text}"
+            )));
+        }
+
+        let tokenize_response: TokenizeResponse = response
+            .json()
+            .await
+            .map_err(|e| TokenizeError::InvalidResponse(e.to_string()))?;
+
+        Ok(tokenize_response)
+    }
 }

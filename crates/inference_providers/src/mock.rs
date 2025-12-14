@@ -8,7 +8,8 @@ use crate::{
     ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseWithBytes,
     ChatDelta, ChatResponseMessage, ChatSignature, CompletionChunk, CompletionError,
     CompletionParams, FinishReason, FunctionCallDelta, ListModelsError, MessageRole, ModelInfo,
-    ModelsResponse, SSEEvent, StreamChunk, StreamingResult, TokenUsage, ToolCallDelta,
+    ModelsResponse, SSEEvent, StreamChunk, StreamingResult, TokenUsage, TokenizeChatRequest,
+    TokenizeError, TokenizeResponse, ToolCallDelta,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -757,6 +758,32 @@ impl crate::InferenceProvider for MockProvider {
             serde_json::Value::String("mock-attestation".to_string()),
         );
         Ok(report)
+    }
+
+    async fn tokenize_chat(
+        &self,
+        request: TokenizeChatRequest,
+    ) -> Result<TokenizeResponse, TokenizeError> {
+        // Simple mock tokenization: estimate ~4 characters per token
+        let total_chars: usize = request
+            .messages
+            .iter()
+            .map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0))
+            .sum();
+        let estimated_tokens = (total_chars / 4).max(1) as i64;
+
+        // Find max_model_len from models (use first model's value or default)
+        let max_model_len = self
+            .models
+            .first()
+            .and_then(|m| m.max_model_len)
+            .unwrap_or(32768);
+
+        Ok(TokenizeResponse {
+            count: estimated_tokens,
+            max_model_len,
+            tokens: (0..estimated_tokens).collect(),
+        })
     }
 }
 

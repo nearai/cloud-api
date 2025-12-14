@@ -706,6 +706,38 @@ pub struct ChatSignature {
     pub signing_algo: String,
 }
 
+/// Request to tokenize chat messages (matches vLLM API)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenizeChatRequest {
+    /// Model to use for tokenization
+    pub model: String,
+    /// Messages to tokenize
+    pub messages: Vec<ChatMessage>,
+    /// Whether to add special tokens (default: true)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub add_special_tokens: Option<bool>,
+}
+
+/// Response from tokenize endpoint (matches vLLM API)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenizeResponse {
+    /// Number of tokens in the input
+    pub count: i64,
+    /// Maximum model context length
+    pub max_model_len: i64,
+    /// Token IDs
+    pub tokens: Vec<i64>,
+}
+
+/// Tokenize errors
+#[derive(Debug, Error, Clone, Serialize, Deserialize)]
+pub enum TokenizeError {
+    #[error("Failed to tokenize: {0}")]
+    TokenizeError(String),
+    #[error("Invalid response format")]
+    InvalidResponse(String),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

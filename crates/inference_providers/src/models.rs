@@ -644,6 +644,9 @@ pub struct ModelInfo {
     pub object: String,
     /// The organization that owns the model
     pub owned_by: String,
+    /// The maximum context length supported by this model (from vLLM)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_model_len: Option<i64>,
 }
 
 /// vLLM returns OpenAI-compatible models response

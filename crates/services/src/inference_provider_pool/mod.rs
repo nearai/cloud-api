@@ -21,6 +21,14 @@ struct DiscoveryEntry {
     tags: Vec<String>,
 }
 
+/// Provider with its max context length for context-aware routing
+#[derive(Clone)]
+struct ProviderWithContext {
+    provider: Arc<InferenceProviderTrait>,
+    /// Maximum context length supported by this provider (from vLLM /v1/models)
+    max_model_len: Option<i64>,
+}
+
 #[derive(Clone)]
 pub struct InferenceProviderPool {
     /// Discovery URL for dynamic model discovery
@@ -31,8 +39,8 @@ pub struct InferenceProviderPool {
     discovery_timeout: Duration,
     /// HTTP timeout for model inference requests
     inference_timeout_secs: i64,
-    /// Map of model name -> list of providers (for load balancing)
-    model_mapping: Arc<RwLock<HashMap<String, Vec<Arc<InferenceProviderTrait>>>>>,
+    /// Map of model name -> list of providers with context info (for context-aware routing)
+    model_mapping: Arc<RwLock<HashMap<String, Vec<ProviderWithContext>>>>,
     /// Round-robin index for each model
     load_balancer_index: Arc<RwLock<HashMap<String, usize>>>,
     /// Map of chat_id -> provider for sticky routing
@@ -70,7 +78,10 @@ impl InferenceProviderPool {
         model_mapping
             .entry(model_id)
             .or_insert_with(Vec::new)
-            .push(provider);
+            .push(ProviderWithContext {
+                provider,
+                max_model_len: None,
+            });
     }
 
     /// Register multiple providers for multiple models (useful for testing)
@@ -80,7 +91,10 @@ impl InferenceProviderPool {
             model_mapping
                 .entry(model_id)
                 .or_insert_with(Vec::new)
-                .push(provider);
+                .push(ProviderWithContext {
+                    provider,
+                    max_model_len: None,
+                });
         }
     }
 
@@ -243,7 +257,38 @@ impl InferenceProviderPool {
                     .await
                 {
                     Ok(_) => {
-                        providers_for_model.push(provider);
+                        // Query the provider's /v1/models endpoint to get max_model_len
+                        let max_model_len = match provider.models().await {
+                            Ok(models_response) => {
+                                // Find the model info matching our model name
+                                models_response
+                                    .data
+                                    .iter()
+                                    .find(|m| m.id == model_name)
+                                    .and_then(|m| m.max_model_len)
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    model = %model_name,
+                                    url = %url,
+                                    error = %e,
+                                    "Failed to query models endpoint for max_model_len, using None"
+                                );
+                                None
+                            }
+                        };
+
+                        tracing::debug!(
+                            model = %model_name,
+                            url = %url,
+                            max_model_len = ?max_model_len,
+                            "Provider added with context length"
+                        );
+
+                        providers_for_model.push(ProviderWithContext {
+                            provider,
+                            max_model_len,
+                        });
                     }
                     Err(e) => {
                         tracing::debug!(
@@ -263,6 +308,7 @@ impl InferenceProviderPool {
                 object: "model".to_string(),
                 created: 0,
                 owned_by: "discovered".to_string(),
+                max_model_len: None, // Aggregated model list doesn't have a single context length
             });
         }
 
@@ -284,7 +330,9 @@ impl InferenceProviderPool {
         model_id: &str,
     ) -> Option<Vec<Arc<InferenceProviderTrait>>> {
         let model_mapping = self.model_mapping.read().await;
-        model_mapping.get(model_id).cloned()
+        model_mapping
+            .get(model_id)
+            .map(|providers| providers.iter().map(|p| p.provider.clone()).collect())
     }
 
     /// Store a mapping of chat_id to provider
@@ -327,7 +375,8 @@ impl InferenceProviderPool {
     }
 
     /// Get providers for a model in priority order for fallback
-    /// Returns providers with the round-robin selected one first, followed by others
+    /// Returns providers sorted by max_model_len ascending (smallest context first)
+    /// Providers without max_model_len go last
     async fn get_providers_with_fallback(
         &self,
         model_id: &str,
@@ -340,30 +389,31 @@ impl InferenceProviderPool {
         }
 
         if providers.len() == 1 {
-            return Some(vec![providers[0].clone()]);
+            return Some(vec![providers[0].provider.clone()]);
         }
 
-        // Get current index for round-robin
-        let mut indices = self.load_balancer_index.write().await;
-        let index = indices.entry(model_id.to_string()).or_insert(0);
-        let selected_index = *index % providers.len();
+        // Sort providers by max_model_len ascending (smallest context first)
+        // Providers without max_model_len (None) go last
+        let mut sorted_providers: Vec<_> = providers.iter().collect();
+        sorted_providers.sort_by(|a, b| {
+            match (a.max_model_len, b.max_model_len) {
+                (Some(a_len), Some(b_len)) => a_len.cmp(&b_len),
+                (Some(_), None) => std::cmp::Ordering::Less, // Known context goes first
+                (None, Some(_)) => std::cmp::Ordering::Greater, // Unknown goes last
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        });
 
-        // Increment for next request
-        *index = (*index + 1) % providers.len();
-
-        // Build ordered list following round-robin pattern:
-        // selected provider first, then continue round-robin (selected+1, selected+2, ...)
-        let mut ordered_providers = Vec::with_capacity(providers.len());
-        for i in 0..providers.len() {
-            let provider_index = (selected_index + i) % providers.len();
-            ordered_providers.push(providers[provider_index].clone());
-        }
+        let ordered_providers: Vec<_> = sorted_providers
+            .iter()
+            .map(|p| p.provider.clone())
+            .collect();
 
         tracing::debug!(
             model = %model_id,
             providers_count = providers.len(),
-            selected_index = selected_index,
-            "Prepared providers for fallback with round-robin priority"
+            context_lengths = ?sorted_providers.iter().map(|p| p.max_model_len).collect::<Vec<_>>(),
+            "Prepared providers for fallback with context-aware priority (smallest first)"
         );
 
         Some(ordered_providers)

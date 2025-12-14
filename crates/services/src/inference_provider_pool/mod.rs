@@ -41,8 +41,6 @@ pub struct InferenceProviderPool {
     inference_timeout_secs: i64,
     /// Map of model name -> list of providers with context info (for context-aware routing)
     model_mapping: Arc<RwLock<HashMap<String, Vec<ProviderWithContext>>>>,
-    /// Round-robin index for each model
-    load_balancer_index: Arc<RwLock<HashMap<String, usize>>>,
     /// Map of chat_id -> provider for sticky routing
     chat_id_mapping: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
     /// Map of chat_id -> (request_hash, response_hash) for MockProvider signature generation
@@ -65,7 +63,6 @@ impl InferenceProviderPool {
             discovery_timeout: Duration::from_secs(discovery_timeout_secs as u64),
             inference_timeout_secs,
             model_mapping: Arc::new(RwLock::new(HashMap::new())),
-            load_balancer_index: Arc::new(RwLock::new(HashMap::new())),
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
             signature_hashes: Arc::new(RwLock::new(HashMap::new())),
             refresh_task_handle: Arc::new(Mutex::new(None)),
@@ -847,24 +844,16 @@ impl InferenceProviderPool {
         debug!("Cleared {} model mappings", model_count);
         drop(model_mapping);
 
-        // Step 3: Clear load balancer indices
-        debug!("Step 3: Clearing load balancer indices");
-        let mut lb_index = self.load_balancer_index.write().await;
-        let index_count = lb_index.len();
-        lb_index.clear();
-        debug!("Cleared {} load balancer indices", index_count);
-        drop(lb_index);
-
-        // Step 4: Clear chat_id to provider mappings
-        debug!("Step 4: Clearing chat session mappings");
+        // Step 3: Clear chat_id to provider mappings
+        debug!("Step 3: Clearing chat session mappings");
         let mut chat_mapping = self.chat_id_mapping.write().await;
         let chat_count = chat_mapping.len();
         chat_mapping.clear();
         debug!("Cleared {} chat session mappings", chat_count);
         drop(chat_mapping);
 
-        // Step 5: Clear signature hashes
-        debug!("Step 5: Clearing signature hash tracking");
+        // Step 4: Clear signature hashes
+        debug!("Step 4: Clearing signature hash tracking");
         let mut sig_hashes = self.signature_hashes.write().await;
         let sig_count = sig_hashes.len();
         sig_hashes.clear();
@@ -872,8 +861,8 @@ impl InferenceProviderPool {
         drop(sig_hashes);
 
         info!(
-            "Inference provider pool shutdown completed. Cleaned up: {} models, {} load balancer indices, {} chat mappings, {} signatures",
-            model_count, index_count, chat_count, sig_count
+            "Inference provider pool shutdown completed. Cleaned up: {} models, {} chat mappings, {} signatures",
+            model_count, chat_count, sig_count
         );
     }
 }

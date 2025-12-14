@@ -325,9 +325,7 @@ impl InferenceProvider for VLlmProvider {
     ) -> Result<TokenizeResponse, TokenizeError> {
         let url = format!("{}/tokenize", self.config.base_url);
 
-        let headers = self
-            .build_headers()
-            .map_err(TokenizeError::TokenizeError)?;
+        let headers = self.build_headers().map_err(TokenizeError::TokenizeError)?;
 
         let response = self
             .client

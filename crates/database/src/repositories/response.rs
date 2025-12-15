@@ -18,6 +18,101 @@ impl PgResponseRepository {
     pub fn new(pool: DbPool) -> Self {
         Self { pool }
     }
+
+    /// Internal helper: find or create the hidden structural root response
+    /// ("root_response") for a given conversation.
+    ///
+    /// - Root responses are marked with metadata: { "root_response": true }
+    ///   and model "root_response".
+    /// - They never have response_items attached; they're purely structural.
+    async fn get_or_create_root(
+        &self,
+        conversation_uuid: Uuid,
+        workspace_id: &WorkspaceId,
+        api_key_id: &uuid::Uuid,
+    ) -> Result<Uuid, RepositoryError> {
+        // First, try to find an existing root for this conversation
+        let existing_row = retry_db!("get_root_response", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_opt(
+                    r#"
+                    SELECT id
+                    FROM responses
+                    WHERE conversation_id = $1
+                      AND workspace_id = $2
+                      AND COALESCE((metadata->>'root_response')::boolean, false) = true
+                    ORDER BY created_at ASC
+                    LIMIT 1
+                    "#,
+                    &[&conversation_uuid, &workspace_id.0],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        if let Some(row) = existing_row {
+            let root_id: Uuid = row.get("id");
+            return Ok(root_id);
+        }
+
+        // No root yet - create one.
+        let now = Utc::now();
+        let status = "completed"; // Structural node; treat as completed.
+        let usage_json = serde_json::json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0
+        });
+        let metadata_json = serde_json::json!({
+            "root_response": true
+        });
+        let next_response_ids_json = serde_json::json!([]);
+
+        let row = retry_db!("insert_conversation_root", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_one(
+                    r#"
+                    INSERT INTO responses (
+                        workspace_id, api_key_id, model, status, instructions, conversation_id,
+                        previous_response_id, next_response_ids, usage, metadata,
+                        created_at, updated_at
+                    )
+                    VALUES ($1, $2, $3, $4, NULL, $5, NULL, $6, $7, $8, $9, $9)
+                    RETURNING id
+                    "#,
+                    &[
+                        &workspace_id.0,
+                        api_key_id,
+                        &"root_response".to_string(),
+                        &status,
+                        &conversation_uuid,
+                        &next_response_ids_json,
+                        &usage_json,
+                        &metadata_json,
+                        &now,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        let root_id: Uuid = row.get("id");
+        Ok(root_id)
+    }
 }
 
 #[async_trait]
@@ -53,7 +148,9 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         };
 
         // Extract previous_response_id if present (this is the parent response)
-        // If not provided but conversation is provided, find the latest response in the conversation
+        // If not provided but conversation is provided, find the latest "real" response
+        // in the conversation to link to it. If there is no such response yet, we
+        // will attach the first real response to a hidden "root_response" node.
         let previous_response_uuid = if let Some(prev_id) = &request.previous_response_id {
             let uuid_str = prev_id
                 .strip_prefix(services::id_prefixes::PREFIX_RESP)
@@ -100,7 +197,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             Some(prev_uuid)
         } else if let Some(conv_uuid) = conversation_uuid {
             // No explicit previous_response_id, but conversation exists
-            // Find the latest response in this conversation to link to it
+            // Try to find the latest non-root/non-backfill response in this conversation.
             let latest_response = self
                 .get_latest_in_conversation(
                     services::conversations::models::ConversationId(conv_uuid),
@@ -116,7 +213,14 @@ impl ResponseRepositoryTrait for PgResponseRepository {
                     .unwrap_or(&latest.id);
                 Some(Uuid::parse_str(latest_uuid_str).context("Invalid latest response ID")?)
             } else {
-                None
+                // No "real" responses yet in this conversation. Attach this first
+                // real response to the structural root_response node so that
+                // it has a non-empty parent ID (enabling sibling/re-generate
+                // grouping for the first turn in the UI).
+                let root_id = self
+                    .get_or_create_root(conv_uuid, &workspace_id, &api_key_id)
+                    .await?;
+                Some(root_id)
             }
         } else {
             None

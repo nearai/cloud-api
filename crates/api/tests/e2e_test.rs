@@ -182,13 +182,26 @@ async fn test_admin_update_model() {
 async fn test_get_model_by_name() {
     let server = setup_test_server().await;
 
-    // Setup Qwen model with a name containing forward slashes
-    let model_name = setup_qwen_model(&server).await;
-    assert_eq!("Qwen/Qwen3-30B-A3B-Instruct-2507", model_name);
+    // Use a unique model name to avoid conflicts with other parallel tests
+    let model_name = "TestOrg/GetModelByName-Test";
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model_name.to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 1000000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2000000, "currency": "USD" },
+            "modelDisplayName": "Test Model Display Name",
+            "modelDescription": "Test model description for get_model_by_name",
+            "contextLength": 128000,
+            "verifiable": true,
+            "isActive": true
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
 
     // Test retrieving the model by name (public endpoint - no auth required)
-    // Model names may contain forward slashes (e.g., "Qwen/Qwen3-30B-A3B-Instruct-2507")
-    // which must be URL-encoded when used in the path
+    // Model names may contain forward slashes which must be URL-encoded
     println!("Test: Requesting model by name: '{model_name}'");
     let encoded_model_name =
         url::form_urlencoded::byte_serialize(model_name.as_bytes()).collect::<String>();
@@ -205,10 +218,13 @@ async fn test_get_model_by_name() {
     println!("Retrieved model: {model_resp:?}");
 
     // Verify the model details match what we upserted
-    assert_eq!("Qwen/Qwen3-30B-A3B-Instruct-2507", model_resp.model_id);
-    assert_eq!("Updated Model Name", model_resp.metadata.model_display_name);
+    assert_eq!(model_name, model_resp.model_id);
     assert_eq!(
-        "Updated model description",
+        "Test Model Display Name",
+        model_resp.metadata.model_display_name
+    );
+    assert_eq!(
+        "Test model description for get_model_by_name",
         model_resp.metadata.model_description
     );
     assert_eq!(128000, model_resp.metadata.context_length);

@@ -1413,6 +1413,197 @@ async fn test_response_previous_next_relationships() {
 }
 
 #[tokio::test]
+async fn test_first_turn_items_have_root_response_parent() {
+    let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Create a conversation
+    let conversation = create_conversation(&server, api_key.clone()).await;
+    println!("Created conversation: {}", conversation.id);
+
+    // Create the first response in this conversation (no previous_response_id)
+    let first_response = create_response(
+        &server,
+        conversation.id.clone(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        "Hello, world!".to_string(),
+        100,
+        api_key.clone(),
+    )
+    .await;
+
+    println!("Created first response: {}", first_response.id);
+
+    // List conversation items and verify that all items belonging to the first
+    // response share a non-empty previous_response_id that is different from
+    // the response_id itself (i.e., they point to the hidden root_response).
+    let items_list =
+        list_conversation_items(&server, conversation.id.clone(), api_key.clone()).await;
+    assert!(
+        !items_list.data.is_empty(),
+        "Conversation should contain at least the first turn items"
+    );
+
+    let mut parent_ids: Vec<String> = Vec::new();
+
+    for item in &items_list.data {
+        match item {
+            api::models::ConversationItem::Message {
+                response_id,
+                previous_response_id,
+                ..
+            }
+            | api::models::ConversationItem::Reasoning {
+                response_id,
+                previous_response_id,
+                ..
+            } => {
+                if response_id == &first_response.id {
+                    let prev = previous_response_id
+                        .as_ref()
+                        .unwrap_or_else(|| panic!(
+                            "First-turn item {} should have a previous_response_id (root_response parent)",
+                            response_id
+                        ));
+                    parent_ids.push(prev.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        !parent_ids.is_empty(),
+        "Expected at least one item belonging to the first response"
+    );
+
+    // All parent IDs should be the same and different from the first response ID.
+    let root_id = &parent_ids[0];
+    for pid in &parent_ids {
+        assert_eq!(
+            pid, root_id,
+            "All first-turn items should share the same root_response parent"
+        );
+    }
+    assert_ne!(
+        root_id, &first_response.id,
+        "root_response parent ID should be different from the first response ID"
+    );
+}
+
+#[tokio::test]
+async fn test_first_turn_regenerate_creates_siblings_under_root_response() {
+    use std::collections::HashSet;
+
+    let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Create a conversation and the first response (no previous_response_id)
+    let conversation = create_conversation(&server, api_key.clone()).await;
+    let first_response = create_response(
+        &server,
+        conversation.id.clone(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        "Hello, root!".to_string(),
+        100,
+        api_key.clone(),
+    )
+    .await;
+
+    // Fetch items and extract the root_response ID from one of the first-turn items
+    let items_list =
+        list_conversation_items(&server, conversation.id.clone(), api_key.clone()).await;
+    let root_response_id = items_list
+        .data
+        .iter()
+        .find_map(|item| match item {
+            api::models::ConversationItem::Message {
+                response_id,
+                previous_response_id,
+                ..
+            }
+            | api::models::ConversationItem::Reasoning {
+                response_id,
+                previous_response_id,
+                ..
+            } if response_id == &first_response.id => previous_response_id.clone(),
+            _ => None,
+        })
+        .expect("Expected first-turn items to have a root_response previous_response_id");
+
+    println!(
+        "First response {} has root_response parent {}",
+        first_response.id, root_response_id
+    );
+
+    // Create a second first-turn response by using the root_response ID as previous_response_id.
+    // This simulates "regenerate" of the first turn: both responses share the same root parent.
+    let regen_response_http = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "input": "Hello again!",
+            "temperature": 0.7,
+            "max_output_tokens": 100,
+            "stream": false,
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "previous_response_id": root_response_id
+        }))
+        .await;
+
+    assert_eq!(regen_response_http.status_code(), 200);
+    let regen_response = regen_response_http.json::<api::models::ResponseObject>();
+    println!(
+        "Created regenerated first-turn response: {}",
+        regen_response.id
+    );
+
+    // List items again and collect all distinct response_ids that share the same
+    // root_response parent. We expect at least the original first_response and
+    // the regenerated response.
+    let items_after =
+        list_conversation_items(&server, conversation.id.clone(), api_key.clone()).await;
+    let mut first_turn_response_ids: HashSet<String> = HashSet::new();
+
+    for item in &items_after.data {
+        match item {
+            api::models::ConversationItem::Message {
+                response_id,
+                previous_response_id,
+                ..
+            }
+            | api::models::ConversationItem::Reasoning {
+                response_id,
+                previous_response_id,
+                ..
+            } => {
+                if previous_response_id.as_deref() == Some(&root_response_id) {
+                    first_turn_response_ids.insert(response_id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        first_turn_response_ids.contains(&first_response.id),
+        "Original first response should be a child of root_response"
+    );
+    assert!(
+        first_turn_response_ids.contains(&regen_response.id),
+        "Regenerated first-turn response should also be a child of root_response"
+    );
+    assert!(
+        first_turn_response_ids.len() >= 2,
+        "Expected at least two distinct first-turn responses under the same root_response"
+    );
+}
+
+#[tokio::test]
 async fn test_response_previous_next_relationships_streaming() {
     let server = setup_test_server().await;
     setup_qwen_model(&server).await;

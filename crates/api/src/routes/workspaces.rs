@@ -87,7 +87,10 @@ impl UpdateWorkspaceRequest {
             let serialized = serde_json::to_string(settings)
                 .map_err(|_| "Invalid workspace settings JSON".to_string())?;
             if serialized.len() > crate::consts::MAX_SETTINGS_SIZE_BYTES {
-                return Err("workspace settings is too large".to_string());
+                return Err(format!(
+                    "workspace settings is too large (max {} bytes when serialized)",
+                    crate::consts::MAX_SETTINGS_SIZE_BYTES
+                ));
             }
         }
 

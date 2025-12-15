@@ -1007,7 +1007,10 @@ impl CreateConversationRequest {
                 serde_json::to_string(metadata).map_err(|_| "Invalid metadata".to_string())?;
             // Allow reasonably large metadata but cap to protect the database
             if serialized.len() > MAX_METADATA_SIZE_BYTES {
-                return Err("metadata is too large (max 16KB when serialized)".to_string());
+                return Err(format!(
+                    "metadata is too large (max {} bytes when serialized)",
+                    MAX_METADATA_SIZE_BYTES
+                ));
             }
         }
 
@@ -1094,7 +1097,10 @@ impl UpdateOrganizationRequest {
             let serialized =
                 serde_json::to_string(settings).map_err(|_| "Invalid settings JSON".to_string())?;
             if serialized.len() > MAX_SETTINGS_SIZE_BYTES {
-                return Err("settings is too large (max 32KB when serialized)".to_string());
+                return Err(format!(
+                    "settings is too large (max {} bytes when serialized)",
+                    MAX_SETTINGS_SIZE_BYTES
+                ));
             }
         }
 
@@ -1172,7 +1178,10 @@ impl InviteOrganizationMemberByEmailRequest {
 
         // Prevent abuse with very large batches
         if self.invitations.len() > MAX_INVITATIONS_PER_REQUEST {
-            return Err("Maximum 100 invitations per request".to_string());
+            return Err(format!(
+                "Maximum {} invitations per request",
+                MAX_INVITATIONS_PER_REQUEST
+            ));
         }
 
         for (idx, inv) in self.invitations.iter().enumerate() {
@@ -1650,7 +1659,7 @@ impl DecimalPriceRequest {
             return Err("amount must be non-negative".to_string());
         }
         validate_non_empty_field(&self.currency, "currency")?;
-        // Currencies are typically short, e.g. \"USD\"
+        // Currencies are typically short, e.g. "USD"
         validate_max_length(&self.currency, "currency", 16)?;
         Ok(())
     }

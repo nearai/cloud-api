@@ -689,7 +689,9 @@ impl ModelRepository {
             if let Some(row) = result {
                 // Record history: capture the soft delete in history
                 let model_id: uuid::Uuid = row.get("id");
-                let reason = change_reason.clone().or_else(|| Some(DEFAULT_SOFT_DELETE_REASON.to_string()));
+                let reason = change_reason
+                    .clone()
+                    .or_else(|| Some(DEFAULT_SOFT_DELETE_REASON.to_string()));
                 self.record_model_history(
                     &client,
                     model_id,

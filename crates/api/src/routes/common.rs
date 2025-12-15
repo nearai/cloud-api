@@ -62,7 +62,7 @@ pub fn default_limit() -> i64 {
 
 /// Basic non-empty string validation helper
 pub fn validate_non_empty_field(value: &str, field: &str) -> Result<(), String> {
-    if value.trim().is_empty() {
+    if value.is_empty() {
         return Err(format!("{field} cannot be empty"));
     }
     Ok(())

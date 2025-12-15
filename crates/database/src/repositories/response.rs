@@ -64,7 +64,8 @@ impl PgResponseRepository {
 
         // No root yet - create one.
         let now = Utc::now();
-        let status = "completed"; // Structural node; treat as completed.
+        let model = "root_response".to_string();
+        let status = "completed";
         let usage_json = serde_json::json!({
             "input_tokens": 0,
             "output_tokens": 0,
@@ -97,7 +98,7 @@ impl PgResponseRepository {
                     &[
                         &workspace_id.0,
                         api_key_id,
-                        &"root_response".to_string(),
+                        &model,
                         &status,
                         &conversation_uuid,
                         &next_response_ids_json,
@@ -709,7 +710,10 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         conversation_id: services::conversations::models::ConversationId,
         workspace_id: WorkspaceId,
     ) -> Result<Option<ResponseObject>, anyhow::Error> {
-        // Fetch the most recent response in this conversation
+        // Fetch the most recent "real" response in this conversation.
+        // We explicitly exclude structural/root and backfill responses:
+        // - root_response: internal structural parent for the first turn
+        // - backfill: placeholder responses used only for backfilled items
         let row_result = retry_db!("get_latest_response_in_conversation", {
             let client = self
                 .pool
@@ -725,7 +729,9 @@ impl ResponseRepositoryTrait for PgResponseRepository {
                            conversation_id, previous_response_id, next_response_ids,
                            usage, metadata, created_at, updated_at
                     FROM responses
-                    WHERE conversation_id = $1 AND workspace_id = $2
+                    WHERE conversation_id = $1
+                      AND workspace_id = $2
+                      AND COALESCE((metadata->>'root_response')::boolean, false) = false
                     ORDER BY created_at DESC
                     LIMIT 1
                     "#,

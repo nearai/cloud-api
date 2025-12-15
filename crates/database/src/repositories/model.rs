@@ -395,7 +395,7 @@ impl ModelRepository {
                     update_request.changed_by_user_email.clone(),
                 )
                 .await
-                .map_err(|e| RepositoryError::DatabaseError(e))?;
+                .map_err(RepositoryError::DatabaseError)?;
 
                 updated_row
             } else {
@@ -454,7 +454,7 @@ impl ModelRepository {
                     update_request.changed_by_user_email.clone(),
                 )
                 .await
-                .map_err(|e| RepositoryError::DatabaseError(e))?;
+                .map_err(RepositoryError::DatabaseError)?;
 
                 inserted_row
             };
@@ -701,7 +701,7 @@ impl ModelRepository {
                     changed_by_user_email.clone(),
                 )
                 .await
-                .map_err(|e| RepositoryError::DatabaseError(e))?;
+                .map_err(RepositoryError::DatabaseError)?;
 
                 Ok(Some(()))
             } else {

@@ -1018,6 +1018,25 @@ impl CreateConversationRequest {
     }
 }
 
+impl UpdateConversationRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(metadata) = &self.metadata {
+            // Prevent extremely large metadata blobs from being stored
+            let serialized =
+                serde_json::to_string(metadata).map_err(|_| "Invalid metadata".to_string())?;
+            // Allow reasonably large metadata but cap to protect the database
+            if serialized.len() > MAX_METADATA_SIZE_BYTES {
+                return Err(format!(
+                    "metadata is too large (max {} bytes when serialized)",
+                    MAX_METADATA_SIZE_BYTES
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateApiKeyRequest {
     pub name: String,
@@ -1153,12 +1172,38 @@ pub struct InvitationEntry {
     pub role: MemberRole,
 }
 
+fn is_basic_valid_email(email: &str) -> bool {
+    // Reject spaces outright
+    if email.contains(' ') {
+        return false;
+    }
+
+    // Require exactly one '@' and non-empty local/domain parts
+    let (local, domain) = match email.split_once('@') {
+        Some(parts) => parts,
+        None => return false,
+    };
+    if local.is_empty() || domain.is_empty() {
+        return false;
+    }
+
+    // Require at least one dot in the domain, not at start or end
+    if !domain.contains('.') {
+        return false;
+    }
+    if domain.starts_with('.') || domain.ends_with('.') {
+        return false;
+    }
+
+    true
+}
+
 impl InvitationEntry {
     pub fn validate(&self) -> Result<(), String> {
         validate_non_empty_field(&self.email, "email")?;
         validate_max_length(&self.email, "email", MAX_EMAIL_LENGTH)?;
-        if !self.email.contains('@') {
-            return Err("email must contain '@'".to_string());
+        if !is_basic_valid_email(&self.email) {
+            return Err("email is not a valid email address".to_string());
         }
         Ok(())
     }

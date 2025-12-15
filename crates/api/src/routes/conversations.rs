@@ -330,6 +330,17 @@ pub async fn update_conversation(
         conversation_id, api_key.workspace_id.0
     );
 
+    // Validate request metadata to avoid oversized or invalid JSON blobs
+    if let Err(error) = request.validate() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                error,
+                "invalid_request_error".to_string(),
+            )),
+        ));
+    }
+
     let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
         Ok(id) => id,
         Err(error) => {

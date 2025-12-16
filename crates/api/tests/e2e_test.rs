@@ -1147,8 +1147,9 @@ async fn test_completion_cost_calculation() {
     let org = setup_org_with_credits(&server, 1000000000000i64).await; // $1000.00 USD
     println!("Created organization: {}", org.id);
 
-    // Setup test model with known pricing
-    let model_name = setup_qwen_model(&server).await;
+    // Use nearai model to avoid pricing conflicts with other parallel tests
+    // that modify Qwen model pricing (e.g., test_model_alias_consistency)
+    let model_name = setup_glm_model(&server).await;
     println!("Setup model: {model_name}");
 
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;

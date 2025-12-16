@@ -472,6 +472,20 @@ pub async fn oauth_callback(
                                     .into_response();
                             }
 
+                            // Reject URLs with existing query parameters (prevents parameter injection attacks)
+                            // Tokens are passed via fragments (#), not query params
+                            if url.query().is_some() {
+                                error!("Query parameters in frontend_callback not allowed");
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    Json(serde_json::json!({
+                                        "error": "invalid_request",
+                                        "error_description": "Callback URL must not contain query parameters"
+                                    })),
+                                )
+                                    .into_response();
+                            }
+
                             // Now safe to redirect with full URL preserved
                             // Use fragment (#) instead of query parameters to avoid:
                             // - Tokens appearing in browser history

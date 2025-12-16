@@ -1215,12 +1215,24 @@ async fn test_completion_cost_calculation() {
     assert!(input_tokens > 0, "Should have input tokens");
     assert!(output_tokens > 0, "Should have output tokens");
 
-    // Calculate expected cost based on model pricing (all at scale 9)
-    // Input: 1000000 nano-dollars = $0.000001 per token
-    // Output: 2000000 nano-dollars = $0.000002 per token
+    // Get current model pricing from the API (may have been modified by parallel tests)
+    let encoded_model_name =
+        url::form_urlencoded::byte_serialize(model_name.as_bytes()).collect::<String>();
+    let model_response = server
+        .get(format!("/v1/model/{encoded_model_name}").as_str())
+        .await;
+    assert_eq!(
+        model_response.status_code(),
+        200,
+        "Should get model pricing"
+    );
+    let model_pricing = model_response.json::<api::models::ModelWithPricing>();
 
-    let input_cost_per_token = 1000000i64; // nano-dollars
-    let output_cost_per_token = 2000000i64; // nano-dollars
+    let input_cost_per_token = model_pricing.input_cost_per_token.amount;
+    let output_cost_per_token = model_pricing.output_cost_per_token.amount;
+    println!(
+        "Model pricing from API - input: {input_cost_per_token}, output: {output_cost_per_token}"
+    );
 
     // Expected total cost (at scale 9)
     let expected_input_cost = (input_tokens as i64) * input_cost_per_token;

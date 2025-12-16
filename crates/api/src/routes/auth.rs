@@ -400,11 +400,7 @@ pub async fn oauth_callback(
 
                         // Check if the origin is allowed
                         if is_origin_allowed(origin_to_check, &config.cors) {
-                            // Construct callback URL using only the validated origin
-                            // This prevents path manipulation attacks where the frontend_callback
-                            // URL path component could override the intended /auth/callback endpoint
                             let mut callback_url = url.clone();
-                            callback_url.set_path("/auth/callback");
                             callback_url.set_query(Some(&format!(
                                 "token={}&refresh_token={}",
                                 urlencoding::encode(&access_token),

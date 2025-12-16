@@ -6,7 +6,7 @@ use crate::models::ModelsRepository;
 use crate::usage::{RecordUsageServiceRequest, UsageServiceTrait};
 use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, StreamingResult};
 use moka::future::Cache;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -70,6 +70,12 @@ where
     // Pre-allocated low-cardinality metric tags (for Datadog/OTLP)
     metric_tags: Vec<String>,
     concurrent_counter: Option<Arc<AtomicU32>>,
+    /// Last received usage stats from streaming chunks (for disconnect fallback)
+    last_usage_stats: Option<inference_providers::TokenUsage>,
+    /// Unique inference ID for usage tracking and deduplication
+    inference_id: Uuid,
+    /// Flag to prevent double usage recording (set when normal path records usage)
+    usage_recorded: Arc<AtomicBool>,
 }
 
 impl<S> Stream for InterceptStream<S>
@@ -111,121 +117,138 @@ where
 
                 if let StreamChunk::Chat(ref chat_chunk) = event.chunk {
                     if let Some(usage) = &chat_chunk.usage {
-                        // Store attestation signature when completion finishes
-                        let attestation_service = self.attestation_service.clone();
-                        let chat_id = chat_chunk.id.clone();
-                        tokio::spawn(async move {
-                            if attestation_service
-                                .store_chat_signature_from_provider(chat_id.as_str())
-                                .await
-                                .is_err()
-                            {
-                                tracing::error!("Failed to store chat signature");
+                        // Track the latest usage stats for potential disconnect fallback
+                        self.last_usage_stats = Some(usage.clone());
+
+                        // Check if this is the final chunk (has finish_reason)
+                        let is_final_chunk = chat_chunk
+                            .choices
+                            .iter()
+                            .any(|choice| choice.finish_reason.is_some());
+
+                        // Only record usage and attestation on the FINAL chunk to avoid excessive DB writes
+                        if is_final_chunk {
+                            // Store attestation signature when completion finishes
+                            let attestation_service = self.attestation_service.clone();
+                            let chat_id = chat_chunk.id.clone();
+                            tokio::spawn(async move {
+                                if attestation_service
+                                    .store_chat_signature_from_provider(chat_id.as_str())
+                                    .await
+                                    .is_err()
+                                {
+                                    tracing::error!("Failed to store chat signature");
+                                } else {
+                                    tracing::debug!("Stored signature for chat_id: {}", chat_id);
+                                }
+                            });
+
+                            // Calculate average ITL
+                            let avg_itl_ms = if self.token_count > 0 {
+                                Some(self.total_itl_ms / self.token_count as f64)
                             } else {
-                                tracing::debug!("Stored signature for chat_id: {}", chat_id);
-                            }
-                        });
+                                None
+                            };
 
-                        // Calculate average ITL
-                        let avg_itl_ms = if self.token_count > 0 {
-                            Some(self.total_itl_ms / self.token_count as f64)
-                        } else {
-                            None
-                        };
+                            // Record usage with latency metrics
+                            let usage_service = self.usage_service.clone();
+                            let organization_id = self.organization_id;
+                            let workspace_id = self.workspace_id;
+                            let api_key_id = self.api_key_id;
+                            let model_id = self.model_id;
+                            let inference_type = self.inference_type.clone();
+                            let input_tokens = usage.prompt_tokens;
+                            let output_tokens = usage.completion_tokens;
+                            let ttft_ms = self.ttft_ms;
+                            // Use pre-generated inference_id for deduplication
+                            let inference_id = self.inference_id;
 
-                        // Record usage with latency metrics
-                        let usage_service = self.usage_service.clone();
-                        let organization_id = self.organization_id;
-                        let workspace_id = self.workspace_id;
-                        let api_key_id = self.api_key_id;
-                        let model_id = self.model_id;
-                        let inference_type = self.inference_type.clone();
-                        let input_tokens = usage.prompt_tokens;
-                        let output_tokens = usage.completion_tokens;
-                        let ttft_ms = self.ttft_ms;
-                        // Hash the full chat ID to UUID for storage
-                        let inference_id_uuid = Some(hash_inference_id_to_uuid(&chat_chunk.id));
+                            // Mark usage as recorded BEFORE spawning async task
+                            // This prevents Drop handler from attempting to record again
+                            self.usage_recorded.store(true, Ordering::SeqCst);
 
-                        tokio::spawn(async move {
-                            if usage_service
-                                .record_usage(RecordUsageServiceRequest {
-                                    organization_id,
-                                    workspace_id,
-                                    api_key_id,
-                                    model_id,
-                                    input_tokens,
-                                    output_tokens,
-                                    inference_type,
-                                    ttft_ms,
-                                    avg_itl_ms,
-                                    inference_id: inference_id_uuid,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                tracing::error!("Failed to record usage in completion service");
-                            } else {
-                                tracing::debug!(
-                                    "Recorded usage for org {}: {} input, {} output tokens (api_key: {}, ttft: {:?}ms)",
-                                    organization_id,
-                                    input_tokens,
-                                    output_tokens,
-                                    api_key_id,
-                                    ttft_ms
-                                );
-                            }
-                        });
+                            tokio::spawn(async move {
+                                if usage_service
+                                    .record_usage(RecordUsageServiceRequest {
+                                        organization_id,
+                                        workspace_id,
+                                        api_key_id,
+                                        model_id,
+                                        input_tokens,
+                                        output_tokens,
+                                        inference_type,
+                                        ttft_ms,
+                                        avg_itl_ms,
+                                        inference_id: Some(inference_id),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    tracing::error!("Failed to record usage in completion service");
+                                } else {
+                                    tracing::debug!(
+                                        "Recorded usage for org {}: {} input, {} output tokens (api_key: {}, ttft: {:?}ms)",
+                                        organization_id,
+                                        input_tokens,
+                                        output_tokens,
+                                        api_key_id,
+                                        ttft_ms
+                                    );
+                                }
+                            });
 
-                        // Record metrics
-                        let metrics_service = self.metrics_service.clone();
-                        let e2e_duration = self.service_start_time.elapsed();
-                        let input_tokens = usage.prompt_tokens;
-                        let output_tokens = usage.completion_tokens;
-                        let first_token_time = self.first_token_time;
-                        let input_bucket = get_input_bucket(input_tokens);
-                        let mut tags_owned = self.metric_tags.clone();
-                        tags_owned.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
+                            // Record metrics
+                            let metrics_service = self.metrics_service.clone();
+                            let e2e_duration = self.service_start_time.elapsed();
+                            let input_tokens = usage.prompt_tokens;
+                            let output_tokens = usage.completion_tokens;
+                            let first_token_time = self.first_token_time;
+                            let input_bucket = get_input_bucket(input_tokens);
+                            let mut tags_owned = self.metric_tags.clone();
+                            tags_owned.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
 
-                        tokio::spawn(async move {
-                            let tags: Vec<&str> = tags_owned.iter().map(|s| s.as_str()).collect();
+                            tokio::spawn(async move {
+                                let tags: Vec<&str> = tags_owned.iter().map(|s| s.as_str()).collect();
 
-                            metrics_service.record_latency(
-                                METRIC_LATENCY_TOTAL,
-                                e2e_duration,
-                                &tags,
-                            );
-
-                            if let Some(first_token_instant) = first_token_time {
-                                let decoding_duration = first_token_instant.elapsed();
                                 metrics_service.record_latency(
-                                    METRIC_LATENCY_DECODING_TIME,
-                                    decoding_duration,
+                                    METRIC_LATENCY_TOTAL,
+                                    e2e_duration,
                                     &tags,
                                 );
 
-                                let decode_secs = decoding_duration.as_secs_f64();
-                                if decode_secs > 0.0 {
-                                    let tps = output_tokens as f64 / decode_secs;
-                                    metrics_service.record_histogram(
-                                        METRIC_TOKENS_PER_SECOND,
-                                        tps,
+                                if let Some(first_token_instant) = first_token_time {
+                                    let decoding_duration = first_token_instant.elapsed();
+                                    metrics_service.record_latency(
+                                        METRIC_LATENCY_DECODING_TIME,
+                                        decoding_duration,
                                         &tags,
                                     );
-                                }
-                            }
 
-                            // Token counts
-                            metrics_service.record_count(
-                                METRIC_TOKENS_INPUT,
-                                input_tokens as i64,
-                                &tags,
-                            );
-                            metrics_service.record_count(
-                                METRIC_TOKENS_OUTPUT,
-                                output_tokens as i64,
-                                &tags,
-                            );
-                        });
+                                    let decode_secs = decoding_duration.as_secs_f64();
+                                    if decode_secs > 0.0 {
+                                        let tps = output_tokens as f64 / decode_secs;
+                                        metrics_service.record_histogram(
+                                            METRIC_TOKENS_PER_SECOND,
+                                            tps,
+                                            &tags,
+                                        );
+                                    }
+                                }
+
+                                // Token counts
+                                metrics_service.record_count(
+                                    METRIC_TOKENS_INPUT,
+                                    input_tokens as i64,
+                                    &tags,
+                                );
+                                metrics_service.record_count(
+                                    METRIC_TOKENS_OUTPUT,
+                                    output_tokens as i64,
+                                    &tags,
+                                );
+                            });
+                        }
+                        // If not final chunk, we just tracked usage and continue with stream
                     }
                 }
                 Poll::Ready(Some(Ok(event.clone())))
@@ -240,8 +263,61 @@ where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
 {
     fn drop(&mut self) {
+        // Decrement concurrent counter if present
         if let Some(counter) = &self.concurrent_counter {
             counter.fetch_sub(1, Ordering::Release);
+        }
+
+        // Check if usage was already recorded by the normal path (final chunk with finish_reason)
+        let already_recorded = self.usage_recorded.load(Ordering::SeqCst);
+
+        if !already_recorded {
+            // Client disconnected before receiving final chunk
+            // Use the last received usage stats from continuous_usage_stats
+            let (input_tokens, output_tokens) = if let Some(ref usage) = self.last_usage_stats {
+                // Use most recent usage stats from stream
+                (usage.prompt_tokens, usage.completion_tokens)
+            } else {
+                // Fallback: no usage stats available, don't charge
+                tracing::warn!("Client disconnected but no usage stats available, not charging");
+                return;
+            };
+
+            // Only record if we have actual tokens to record
+            if input_tokens == 0 && output_tokens == 0 {
+                return;
+            }
+
+            let usage_service = self.usage_service.clone();
+            let organization_id = self.organization_id;
+            let workspace_id = self.workspace_id;
+            let api_key_id = self.api_key_id;
+            let model_id = self.model_id;
+            let inference_type = self.inference_type.clone();
+            let inference_id = self.inference_id;
+
+            tokio::spawn(async move {
+                if usage_service
+                    .record_usage(RecordUsageServiceRequest {
+                        organization_id,
+                        workspace_id,
+                        api_key_id,
+                        model_id,
+                        input_tokens,
+                        output_tokens,
+                        inference_type,
+                        ttft_ms: None, // TTFT not reliable on disconnect
+                        avg_itl_ms: None,
+                        inference_id: Some(inference_id),
+                    })
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("Failed to record usage on client disconnect");
+                } else {
+                    tracing::debug!("Recorded usage on disconnect");
+                }
+            });
         }
     }
 }
@@ -453,6 +529,9 @@ impl CompletionServiceImpl {
             total_itl_ms: 0.0,
             metric_tags,
             concurrent_counter,
+            last_usage_stats: None,
+            inference_id: Uuid::new_v4(),
+            usage_recorded: Arc::new(AtomicBool::new(false)),
         };
         Box::pin(intercepted_stream)
     }
@@ -791,7 +870,7 @@ mod tests {
     use crate::test_utils::{MockAttestationService, MockUsageService};
     use bytes::Bytes;
     use futures::{stream, StreamExt};
-    use inference_providers::models::{ChatCompletionChunk, TokenUsage};
+    use inference_providers::models::{ChatChoice, ChatCompletionChunk, FinishReason, TokenUsage};
     use std::time::Duration;
 
     #[tokio::test]
@@ -827,7 +906,13 @@ mod tests {
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
                 model: "test-model".to_string(),
-                choices: vec![],
+                choices: vec![ChatChoice {
+                    index: 0,
+                    delta: None,
+                    logprobs: None,
+                    finish_reason: Some(FinishReason::Stop),
+                    token_ids: None,
+                }],
                 usage: Some(TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 20,
@@ -865,6 +950,9 @@ mod tests {
             total_itl_ms: 0.0,
             metric_tags,
             concurrent_counter: None,
+            last_usage_stats: None,
+            inference_id: Uuid::new_v4(),
+            usage_recorded: Arc::new(AtomicBool::new(false)),
         };
 
         // Consume the stream
@@ -962,7 +1050,13 @@ mod tests {
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
                 model: "test-model".to_string(),
-                choices: vec![],
+                choices: vec![ChatChoice {
+                    index: 0,
+                    delta: None,
+                    logprobs: None,
+                    finish_reason: Some(FinishReason::Stop),
+                    token_ids: None,
+                }],
                 usage: Some(TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 20,
@@ -1004,6 +1098,9 @@ mod tests {
             total_itl_ms: 0.0,
             metric_tags,
             concurrent_counter: None,
+            last_usage_stats: None,
+            inference_id: Uuid::new_v4(),
+            usage_recorded: Arc::new(AtomicBool::new(false)),
         };
 
         // Consume the stream
@@ -1069,7 +1166,13 @@ mod tests {
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
                 model: "test-model".to_string(),
-                choices: vec![],
+                choices: vec![ChatChoice {
+                    index: 0,
+                    delta: None,
+                    logprobs: None,
+                    finish_reason: Some(FinishReason::Stop),
+                    token_ids: None,
+                }],
                 usage: Some(TokenUsage {
                     prompt_tokens: 5,
                     completion_tokens: 1,
@@ -1106,6 +1209,9 @@ mod tests {
             total_itl_ms: 0.0,
             metric_tags,
             concurrent_counter: None,
+            last_usage_stats: None,
+            inference_id: Uuid::new_v4(),
+            usage_recorded: Arc::new(AtomicBool::new(false)),
         };
 
         let _ = intercept_stream.collect::<Vec<_>>().await;

@@ -162,12 +162,24 @@ where
                             let ttft_ms = self.ttft_ms;
                             // Use pre-generated inference_id for deduplication
                             let inference_id = self.inference_id;
-
-                            // Mark usage as recorded BEFORE spawning async task
-                            // This prevents Drop handler from attempting to record again
-                            self.usage_recorded.store(true, Ordering::SeqCst);
+                            let usage_recorded = self.usage_recorded.clone();
 
                             tokio::spawn(async move {
+                                // Atomically claim recording to prevent duplicates
+                                // compare_exchange ensures only one path (normal or Drop) records usage
+                                if usage_recorded
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        Ordering::SeqCst,
+                                        Ordering::SeqCst,
+                                    )
+                                    .is_err()
+                                {
+                                    // Another path already claimed recording
+                                    return;
+                                }
+
                                 if usage_service
                                     .record_usage(RecordUsageServiceRequest {
                                         organization_id,
@@ -184,6 +196,8 @@ where
                                     .await
                                     .is_err()
                                 {
+                                    // Reset flag on failure so Drop handler can retry
+                                    usage_recorded.store(false, Ordering::SeqCst);
                                     tracing::error!("Failed to record usage in completion service");
                                 } else {
                                     tracing::debug!(
@@ -269,57 +283,84 @@ where
             counter.fetch_sub(1, Ordering::Release);
         }
 
-        // Check if usage was already recorded by the normal path (final chunk with finish_reason)
-        let already_recorded = self.usage_recorded.load(Ordering::SeqCst);
+        // Quick check - if already recorded, skip early
+        // This is an optimization; the real synchronization happens via compare_exchange in the async block
+        if self.usage_recorded.load(Ordering::SeqCst) {
+            return;
+        }
 
-        if !already_recorded {
-            // Client disconnected before receiving final chunk
-            // Use the last received usage stats from continuous_usage_stats
-            let (input_tokens, output_tokens) = if let Some(ref usage) = self.last_usage_stats {
-                // Use most recent usage stats from stream
-                (usage.prompt_tokens, usage.completion_tokens)
-            } else {
-                // Fallback: no usage stats available, don't charge
-                tracing::warn!("Client disconnected but no usage stats available, not charging");
+        // Check if we're in a Tokio runtime context
+        // Drop can be called outside of an async context (e.g., during shutdown)
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                tracing::error!(
+                    "Cannot record disconnect usage: no Tokio runtime available, inference_id={}",
+                    self.inference_id
+                );
                 return;
-            };
+            }
+        };
 
-            // Only record if we have actual tokens to record
-            if input_tokens == 0 && output_tokens == 0 {
+        // Client disconnected before receiving final chunk
+        // Use the last received usage stats from continuous_usage_stats
+        let (input_tokens, output_tokens) = if let Some(ref usage) = self.last_usage_stats {
+            // Use most recent usage stats from stream
+            (usage.prompt_tokens, usage.completion_tokens)
+        } else {
+            // Fallback: no usage stats available, don't charge
+            tracing::warn!("Client disconnected but no usage stats available, not charging");
+            return;
+        };
+
+        // Only record if we have actual tokens to record
+        if input_tokens == 0 && output_tokens == 0 {
+            return;
+        }
+
+        let usage_service = self.usage_service.clone();
+        let organization_id = self.organization_id;
+        let workspace_id = self.workspace_id;
+        let api_key_id = self.api_key_id;
+        let model_id = self.model_id;
+        let inference_type = self.inference_type.clone();
+        let inference_id = self.inference_id;
+        let usage_recorded = self.usage_recorded.clone();
+
+        handle.spawn(async move {
+            // Atomically claim recording to prevent duplicates
+            // This ensures only one path (normal completion or Drop) actually records usage
+            if usage_recorded
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                // Normal path already claimed recording
                 return;
             }
 
-            let usage_service = self.usage_service.clone();
-            let organization_id = self.organization_id;
-            let workspace_id = self.workspace_id;
-            let api_key_id = self.api_key_id;
-            let model_id = self.model_id;
-            let inference_type = self.inference_type.clone();
-            let inference_id = self.inference_id;
-
-            tokio::spawn(async move {
-                if usage_service
-                    .record_usage(RecordUsageServiceRequest {
-                        organization_id,
-                        workspace_id,
-                        api_key_id,
-                        model_id,
-                        input_tokens,
-                        output_tokens,
-                        inference_type,
-                        ttft_ms: None, // TTFT not reliable on disconnect
-                        avg_itl_ms: None,
-                        inference_id: Some(inference_id),
-                    })
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!("Failed to record usage on client disconnect");
-                } else {
-                    tracing::debug!("Recorded usage on disconnect");
-                }
-            });
-        }
+            if usage_service
+                .record_usage(RecordUsageServiceRequest {
+                    organization_id,
+                    workspace_id,
+                    api_key_id,
+                    model_id,
+                    input_tokens,
+                    output_tokens,
+                    inference_type,
+                    ttft_ms: None, // TTFT not reliable on disconnect
+                    avg_itl_ms: None,
+                    inference_id: Some(inference_id),
+                })
+                .await
+                .is_err()
+            {
+                // Don't reset flag on failure in Drop handler - this is the fallback path
+                // and there's no further retry mechanism
+                tracing::warn!("Failed to record usage on client disconnect");
+            } else {
+                tracing::debug!("Recorded usage on disconnect");
+            }
+        });
     }
 }
 

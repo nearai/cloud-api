@@ -12,6 +12,7 @@ pub fn map_domain_error_to_status(error: &CompletionError) -> StatusCode {
         }
         CompletionError::RateLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
         CompletionError::ProviderError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        CompletionError::ServiceOverloaded(_) => StatusCode::SERVICE_UNAVAILABLE,
         CompletionError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

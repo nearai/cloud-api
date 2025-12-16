@@ -439,20 +439,21 @@ impl ResponseServiceImpl {
                         // Handle clean text (message content)
                         if !clean_text.is_empty() {
                             // First time we receive message text, emit the item.added and content_part.added events
-                            if !message_item_emitted {
+                            if !message_item_emitted && !client_disconnected {
                                 if let Err(e) =
                                     Self::emit_message_started(emitter, ctx, &message_item_id).await
                                 {
                                     tracing::debug!("emit_message_started failed: {}", e);
                                     client_disconnected = true;
+                                } else {
+                                    message_item_emitted = true;
                                 }
-                                message_item_emitted = true;
                             }
 
                             current_text.push_str(&clean_text);
 
                             // Emit delta event for message content
-                            if message_item_emitted {
+                            if !client_disconnected {
                                 if let Err(e) = emitter
                                     .emit_text_delta(
                                         ctx,
@@ -517,8 +518,9 @@ impl ResponseServiceImpl {
             }
         }
 
-        // If we emitted a message, close it with done events
-        if message_item_emitted {
+        // If we have message content, close it with done events and save to DB
+        // Only save if we successfully emitted the message start AND have content
+        if message_item_emitted && !current_text.is_empty() {
             Self::emit_message_completed(
                 emitter,
                 ctx,

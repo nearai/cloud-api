@@ -217,10 +217,12 @@ impl InferenceProvider for VLlmProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let status_code = status.as_u16();
             let error_text = response.text().await.unwrap_or_default();
-            return Err(CompletionError::CompletionError(format!(
-                "HTTP {status}: {error_text}",
-            )));
+            return Err(CompletionError::HttpError {
+                status_code,
+                message: error_text,
+            });
         }
 
         // Use the SSE parser to handle the stream properly
@@ -254,10 +256,12 @@ impl InferenceProvider for VLlmProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let status_code = status.as_u16();
             let error_text = response.text().await.unwrap_or_default();
-            return Err(CompletionError::CompletionError(format!(
-                "HTTP {status}: {error_text}",
-            )));
+            return Err(CompletionError::HttpError {
+                status_code,
+                message: error_text,
+            });
         }
 
         // Get the raw bytes first for exact hash verification
@@ -307,10 +311,12 @@ impl InferenceProvider for VLlmProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let status_code = status.as_u16();
             let error_text = response.text().await.unwrap_or_default();
-            return Err(CompletionError::CompletionError(format!(
-                "HTTP {status}: {error_text}"
-            )));
+            return Err(CompletionError::HttpError {
+                status_code,
+                message: error_text,
+            });
         }
 
         // Use the SSE parser to handle the stream properly

@@ -164,6 +164,9 @@ impl From<CompletionError> for crate::models::ErrorResponse {
                 format!("Provider error: {msg}"),
                 "provider_error".to_string(),
             ),
+            CompletionError::ServiceOverloaded(msg) => {
+                ErrorResponse::new(msg, "service_overloaded".to_string())
+            }
             CompletionError::InternalError(msg) => ErrorResponse::new(
                 format!("Internal server error: {msg}"),
                 "internal_server_error".to_string(),

@@ -275,6 +275,7 @@ impl CompletionServiceImpl {
             ports::CompletionError::InvalidParams(_) => ERROR_TYPE_INVALID_PARAMS,
             ports::CompletionError::RateLimitExceeded => ERROR_TYPE_RATE_LIMIT,
             ports::CompletionError::ProviderError(_) => ERROR_TYPE_INFERENCE_ERROR,
+            ports::CompletionError::ServiceOverloaded(_) => ERROR_TYPE_SERVICE_OVERLOADED,
             ports::CompletionError::InternalError(_) => ERROR_TYPE_INTERNAL_ERROR,
         };
 
@@ -460,22 +461,51 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         {
             Ok(stream) => stream,
             Err(e) => {
-                // Check if this is a client error (HTTP 4xx) from the provider
-                let error_str = e.to_string();
-                let err = if error_str.contains("HTTP 4") || error_str.contains("Bad Request") {
-                    // For client errors (4xx), return detailed message to help user fix their request
-                    ports::CompletionError::InvalidParams(format!(
-                        "Invalid request parameters: {e}"
-                    ))
-                } else {
-                    // For server errors (5xx), log details but return generic message to user
-                    tracing::error!(
-                        model = %request.model,
-                        "Provider error during chat completion stream"
-                    );
-                    ports::CompletionError::ProviderError(
-                        "The model is currently unavailable. Please try again later.".to_string(),
-                    )
+                // Check if this is an HTTP error with a status code
+                let err = match &e {
+                    inference_providers::CompletionError::HttpError {
+                        status_code,
+                        message,
+                    } => {
+                        match *status_code {
+                            503 => {
+                                // Service is overloaded - client should retry with backoff
+                                ports::CompletionError::ServiceOverloaded(
+                                    "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                                )
+                            }
+                            400..=499 => {
+                                // For client errors (4xx), return detailed message to help user fix their request
+                                ports::CompletionError::InvalidParams(format!(
+                                    "Invalid request parameters (HTTP {}): {}",
+                                    status_code, message
+                                ))
+                            }
+                            _ => {
+                                // For server errors (5xx), log details but return generic message to user
+                                tracing::error!(
+                                    model = %request.model,
+                                    status_code = status_code,
+                                    "Provider error during chat completion stream"
+                                );
+                                ports::CompletionError::ProviderError(
+                                    "The model is currently unavailable. Please try again later."
+                                        .to_string(),
+                                )
+                            }
+                        }
+                    }
+                    _ => {
+                        // For non-HTTP errors, return generic provider error
+                        tracing::error!(
+                            model = %request.model,
+                            "Provider error during chat completion stream: {}", e
+                        );
+                        ports::CompletionError::ProviderError(
+                            "The model is currently unavailable. Please try again later."
+                                .to_string(),
+                        )
+                    }
                 };
                 self.record_error(&err, Some(canonical_name));
                 return Err(err);
@@ -597,22 +627,51 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         {
             Ok(response) => response,
             Err(e) => {
-                // Check if this is a client error (HTTP 4xx) from the provider
-                let error_str = e.to_string();
-                let err = if error_str.contains("HTTP 4") || error_str.contains("Bad Request") {
-                    // For client errors (4xx), return detailed message to help user fix their request
-                    ports::CompletionError::InvalidParams(format!(
-                        "Invalid request parameters: {e}"
-                    ))
-                } else {
-                    // For server errors (5xx), log details but return generic message to user
-                    tracing::error!(
-                        model = %request.model,
-                        "Provider error during chat completion"
-                    );
-                    ports::CompletionError::ProviderError(
-                        "The model is currently unavailable. Please try again later.".to_string(),
-                    )
+                // Check if this is an HTTP error with a status code
+                let err = match &e {
+                    inference_providers::CompletionError::HttpError {
+                        status_code,
+                        message,
+                    } => {
+                        match *status_code {
+                            503 => {
+                                // Service is overloaded - client should retry with backoff
+                                ports::CompletionError::ServiceOverloaded(
+                                    "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                                )
+                            }
+                            400..=499 => {
+                                // For client errors (4xx), return detailed message to help user fix their request
+                                ports::CompletionError::InvalidParams(format!(
+                                    "Invalid request parameters (HTTP {}): {}",
+                                    status_code, message
+                                ))
+                            }
+                            _ => {
+                                // For server errors (5xx), log details but return generic message to user
+                                tracing::error!(
+                                    model = %request.model,
+                                    status_code = status_code,
+                                    "Provider error during chat completion"
+                                );
+                                ports::CompletionError::ProviderError(
+                                    "The model is currently unavailable. Please try again later."
+                                        .to_string(),
+                                )
+                            }
+                        }
+                    }
+                    _ => {
+                        // For non-HTTP errors, return generic provider error
+                        tracing::error!(
+                            model = %request.model,
+                            "Provider error during chat completion: {}", e
+                        );
+                        ports::CompletionError::ProviderError(
+                            "The model is currently unavailable. Please try again later."
+                                .to_string(),
+                        )
+                    }
                 };
                 self.record_error(&err, Some(canonical_name));
                 return Err(err);

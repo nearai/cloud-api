@@ -141,7 +141,10 @@ impl InferenceProvider for VLlmProvider {
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
             return Err(AttestationError::FetchError(format!(
                 "HTTP {status}: {error_text}",
             )));

@@ -181,8 +181,8 @@ pub async fn github_login(
     State((oauth, state_store, _auth_service, _config)): State<AuthState>,
 ) -> Result<Redirect, StatusCode> {
     debug!(
-        "Initiating GitHub OAuth flow - frontend_callback: {:?}",
-        params.frontend_callback
+        "Initiating GitHub OAuth flow - frontend_callback: {}",
+        params.frontend_callback.is_some()
     );
 
     let (auth_url, state) = oauth.github_auth_url().map_err(|_| {
@@ -214,8 +214,8 @@ pub async fn google_login(
     State((oauth, state_store, _auth_service, _config)): State<AuthState>,
 ) -> Result<Redirect, StatusCode> {
     debug!(
-        "Initiating Google OAuth flow - frontend_callback: {:?}",
-        params.frontend_callback
+        "Initiating Google OAuth flow - frontend_callback: {}",
+        params.frontend_callback.is_some()
     );
 
     let (auth_url, state, pkce_verifier) = oauth.google_auth_url().map_err(|_| {
@@ -400,15 +400,19 @@ pub async fn oauth_callback(
 
                         // Check if the origin is allowed
                         if is_origin_allowed(origin_to_check, &config.cors) {
-                            let callback_url = format!(
-                                "{}/auth/callback?token={}&refresh_token={}",
-                                frontend_url,
+                            // Construct callback URL using only the validated origin
+                            // This prevents path manipulation attacks where the frontend_callback
+                            // URL path component could override the intended /auth/callback endpoint
+                            let mut callback_url = url.clone();
+                            callback_url.set_path("/auth/callback");
+                            callback_url.set_query(Some(&format!(
+                                "token={}&refresh_token={}",
                                 urlencoding::encode(&access_token),
                                 urlencoding::encode(&refresh_token)
-                            );
+                            )));
 
-                            info!("Redirecting to frontend: {}", frontend_url);
-                            return Redirect::temporary(&callback_url).into_response();
+                            info!("Redirecting to frontend: {}", origin_to_check);
+                            return Redirect::temporary(callback_url.as_str()).into_response();
                         } else {
                             error!("Frontend callback origin not allowed: {}", origin_to_check);
                             return (

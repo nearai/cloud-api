@@ -208,7 +208,8 @@ where
                             tags_owned.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
 
                             tokio::spawn(async move {
-                                let tags: Vec<&str> = tags_owned.iter().map(|s| s.as_str()).collect();
+                                let tags: Vec<&str> =
+                                    tags_owned.iter().map(|s| s.as_str()).collect();
 
                                 metrics_service.record_latency(
                                     METRIC_LATENCY_TOTAL,

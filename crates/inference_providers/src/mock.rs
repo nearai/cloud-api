@@ -81,6 +81,8 @@ impl RequestMatcher {
 pub struct ResponseTemplate {
     content: String,
     reasoning_content: Option<String>,
+    /// Simulate client disconnect after N chunks (stream ends without final usage chunk)
+    disconnect_after_chunks: Option<usize>,
 }
 
 impl ResponseTemplate {
@@ -89,6 +91,7 @@ impl ResponseTemplate {
         Self {
             content: content.into(),
             reasoning_content: None,
+            disconnect_after_chunks: None,
         }
     }
 
@@ -98,8 +101,23 @@ impl ResponseTemplate {
         self
     }
 
+    /// Simulate client disconnect after N chunks
+    /// The stream will be truncated and end without the final usage chunk
+    pub fn with_disconnect_after(mut self, chunks: usize) -> Self {
+        self.disconnect_after_chunks = Some(chunks);
+        self
+    }
+
     /// Generate a ChatCompletionResponse from this template
-    fn generate_response(&self, id: String, created: i64, model: String) -> ChatCompletionResponse {
+    fn generate_response(
+        &self,
+        id: String,
+        created: i64,
+        model: String,
+        input_tokens: i32,
+    ) -> ChatCompletionResponse {
+        // Calculate output tokens as word count of content
+        let output_tokens = self.content.split_whitespace().count() as i32;
         ChatCompletionResponse {
             id,
             object: "chat.completion".to_string(),
@@ -124,7 +142,7 @@ impl ResponseTemplate {
             }],
             service_tier: None,
             system_fingerprint: None,
-            usage: TokenUsage::new(6, 8),
+            usage: TokenUsage::new(input_tokens, output_tokens),
             prompt_logprobs: None,
             prompt_token_ids: None,
             kv_transfer_params: None,
@@ -132,13 +150,28 @@ impl ResponseTemplate {
     }
 
     /// Generate streaming chunks from this template
-    fn generate_chunks(&self, id: String, created: i64, model: String) -> Vec<ChatCompletionChunk> {
+    /// Streams word-by-word (split by spaces) for more realistic tokenization
+    /// Includes cumulative usage in every chunk (simulates continuous_usage_stats: true)
+    fn generate_chunks(
+        &self,
+        id: String,
+        created: i64,
+        model: String,
+        input_tokens: i32,
+    ) -> Vec<ChatCompletionChunk> {
         let mut chunks = Vec::new();
+        let mut output_token_count = 0;
 
-        // Stream reasoning content if present
+        // Stream reasoning content word by word if present
         if let Some(reasoning) = &self.reasoning_content {
-            let chars: Vec<char> = reasoning.chars().collect();
-            for ch in chars.iter() {
+            let words: Vec<&str> = reasoning.split(' ').collect();
+            for (i, word) in words.iter().enumerate() {
+                output_token_count += 1;
+                let word_with_space = if i == 0 {
+                    word.to_string()
+                } else {
+                    format!(" {}", word)
+                };
                 chunks.push(ChatCompletionChunk {
                     id: id.clone(),
                     object: "chat.completion.chunk".to_string(),
@@ -153,22 +186,28 @@ impl ResponseTemplate {
                             name: None,
                             tool_call_id: None,
                             tool_calls: None,
-                            reasoning_content: Some(ch.to_string()),
-                            reasoning: Some(ch.to_string()),
+                            reasoning_content: Some(word_with_space.clone()),
+                            reasoning: Some(word_with_space),
                         }),
                         logprobs: None,
                         finish_reason: None,
                         token_ids: None,
                     }],
-                    usage: None,
+                    usage: Some(TokenUsage::new(input_tokens, output_token_count)),
                     prompt_token_ids: None,
                 });
             }
         }
 
-        // Stream the content character by character
-        let chars: Vec<char> = self.content.chars().collect();
-        for (i, ch) in chars.iter().enumerate() {
+        // Stream the content word by word (split by spaces)
+        let words: Vec<&str> = self.content.split(' ').collect();
+        for (i, word) in words.iter().enumerate() {
+            output_token_count += 1;
+            let word_with_space = if i == 0 {
+                word.to_string()
+            } else {
+                format!(" {}", word)
+            };
             chunks.push(ChatCompletionChunk {
                 id: id.clone(),
                 object: "chat.completion.chunk".to_string(),
@@ -179,7 +218,7 @@ impl ResponseTemplate {
                     index: 0,
                     delta: Some(ChatDelta {
                         role: None,
-                        content: Some(ch.to_string()),
+                        content: Some(word_with_space),
                         name: None,
                         tool_call_id: None,
                         tool_calls: None,
@@ -187,19 +226,19 @@ impl ResponseTemplate {
                         reasoning: None,
                     }),
                     logprobs: None,
-                    finish_reason: if i == chars.len() - 1 {
+                    finish_reason: if i == words.len() - 1 {
                         Some(FinishReason::Stop)
                     } else {
                         None
                     },
                     token_ids: None,
                 }],
-                usage: None,
+                usage: Some(TokenUsage::new(input_tokens, output_token_count)),
                 prompt_token_ids: None,
             });
         }
 
-        // Final chunk with usage
+        // Final chunk with final usage
         chunks.push(ChatCompletionChunk {
             id,
             object: "chat.completion.chunk".to_string(),
@@ -207,7 +246,7 @@ impl ResponseTemplate {
             model,
             system_fingerprint: None,
             choices: vec![],
-            usage: Some(TokenUsage::new(6, 8)),
+            usage: Some(TokenUsage::new(input_tokens, output_token_count)),
             prompt_token_ids: None,
         });
 
@@ -614,16 +653,32 @@ impl crate::InferenceProvider for MockProvider {
                 .unwrap_or_else(|| config.default_response.clone())
         };
 
+        // Calculate input tokens from messages (rough estimate: 1 word ≈ 1 token)
+        let input_tokens: i32 = params
+            .messages
+            .iter()
+            .filter_map(|m| m.content.as_ref())
+            .map(|c| c.split_whitespace().count() as i32)
+            .sum();
+        // Ensure at least some input tokens for very short messages
+        let input_tokens = input_tokens.max(6);
+
         // Generate chunks from the matched response or default
         let has_tools = params.tools.is_some();
-        let chunks = if has_tools && params.tools.is_some() {
+        let mut chunks = if has_tools && params.tools.is_some() {
             self.generate_chat_chunks(&params, true)
         } else {
             let id = self.generate_chat_id();
             let created = self.current_timestamp();
             let model = params.model.clone();
-            response_template.generate_chunks(id, created, model)
+            response_template.generate_chunks(id, created, model, input_tokens)
         };
+
+        // If disconnect simulation is enabled, truncate chunks (simulates client disconnect)
+        // The stream will end abruptly without the final usage chunk
+        if let Some(disconnect_at) = response_template.disconnect_after_chunks {
+            chunks.truncate(disconnect_at);
+        }
 
         // Convert chunks to SSE stream
         let stream = stream::iter(chunks.into_iter().map(move |chunk| {
@@ -666,7 +721,17 @@ impl crate::InferenceProvider for MockProvider {
                 .unwrap_or_else(|| config.default_response.clone())
         };
 
-        let response = response_template.generate_response(id, created, model);
+        // Calculate input tokens from messages (rough estimate: 1 word ≈ 1 token)
+        let input_tokens: i32 = params
+            .messages
+            .iter()
+            .filter_map(|m| m.content.as_ref())
+            .map(|c| c.split_whitespace().count() as i32)
+            .sum();
+        // Ensure at least some input tokens for very short messages
+        let input_tokens = input_tokens.max(6);
+
+        let response = response_template.generate_response(id, created, model, input_tokens);
 
         let raw_bytes = serde_json::to_vec(&response)
             .map_err(|e| CompletionError::CompletionError(format!("Failed to serialize: {e}")))?;

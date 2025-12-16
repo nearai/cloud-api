@@ -120,19 +120,24 @@ async fn test_response_items_saved_on_disconnect() {
     assert!(!text.contains("field"));
 
     // Verify usage recorded with expected token counts
-    // Note: Title generation may also record usage, so we check for a record with 5 output tokens
-    // Input tokens are calculated from message content (varies based on system prompt + user message)
+    // Note: Title generation may also record usage, so we find the specific record by input/output
+    // Input: 127 tokens = system prompt (~122 words) + user message ("Tell me about machine learning" = 5 words)
+    // Output: 5 words before disconnect ("Machine learning is a fascinating")
     let usage = get_usage_records_from_db(&database, org_uuid).await;
-    assert!(!usage.is_empty(), "Should have at least one usage record");
-
-    // Find the main request's usage (5 output tokens from disconnect after 5 words)
-    // Input tokens vary based on message content, but output should be exactly 5
-    let main_request_usage = usage.iter().find(|(_input, output)| *output == 5);
-    assert!(
-        main_request_usage.is_some(),
-        "Should have usage record with 5 output tokens (5 words before disconnect). Found: {:?}",
+    assert_eq!(
+        usage.len(),
+        2,
+        "Should have exactly 2 usage records (main request + title generation). Found: {:?}",
         usage
     );
 
-    println!("Test passed!");
+    // Find the main request's usage (127 input tokens from system prompt + user msg, 5 output tokens)
+    let main_request_usage = usage
+        .iter()
+        .find(|(input, output)| *input == 127 && *output == 5);
+    assert!(
+        main_request_usage.is_some(),
+        "Should have usage record with 127 input tokens and 5 output tokens. Found: {:?}",
+        usage
+    );
 }

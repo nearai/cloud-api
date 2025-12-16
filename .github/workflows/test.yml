@@ -74,6 +74,9 @@ jobs:
         BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
         DEV: "true"
 
+    # Integration tests use isolated databases per test (created from a template)
+    # Template DB is created automatically on first test run with all migrations applied
+    # Each test gets its own database copy for complete isolation
     - name: Run integration tests
       run: cargo test -p api --tests
       env:
@@ -90,7 +93,7 @@ jobs:
         AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
         AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
         BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
-        TEST_DATABASE_NAME: platform_api_test
+        TEST_TEMPLATE_DATABASE_NAME: platform_api_test_template
         RUST_LOG: debug
         DEV: "true"
 

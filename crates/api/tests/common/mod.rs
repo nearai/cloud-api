@@ -11,7 +11,6 @@ pub use services::auth::ports::MOCK_USER_AGENT;
 use services::auth::AccessTokenClaims;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tokio::sync::OnceCell;
 
 #[cfg(test)]
 use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
@@ -20,17 +19,57 @@ use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey};
 #[cfg(test)]
 use sha3::Keccak256;
 
-// Global once cell to ensure migrations only run once across all tests
-static MIGRATIONS_INITIALIZED: OnceCell<()> = OnceCell::const_new();
-
-// Global once cell to ensure database reset happens only once per test run
-static RESET_DONE: OnceCell<()> = OnceCell::const_new();
-
 // Constants for mock test data
 pub const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
 
-/// Helper function to create a test configuration
-pub fn test_config() -> ApiConfig {
+// ============================================
+// TestContext - Isolated test environment with automatic cleanup
+// ============================================
+
+/// A test context that provides an isolated database environment for each test.
+/// When dropped, it will schedule cleanup of the test database.
+pub struct TestContext {
+    pub server: axum_test::TestServer,
+    pub database: Arc<Database>,
+    pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+    pub mock_provider: Arc<inference_providers::mock::MockProvider>,
+    db_name: String,
+    db_config: config::DatabaseConfig,
+}
+
+impl TestContext {
+    /// Get the session ID for the default mock user
+    pub fn session_id(&self) -> String {
+        get_session_id()
+    }
+
+    /// Schedule database cleanup when the test context is dropped.
+    /// Note: We use a blocking task because Drop is not async.
+    fn cleanup(&self) {
+        let db_name = self.db_name.clone();
+        let config = self.db_config.clone();
+
+        // Spawn a blocking task to handle the async cleanup
+        // This is safe because we're only scheduling the cleanup, not waiting for it
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                if let Err(e) = db_setup::drop_test_database(&config, &db_name).await {
+                    eprintln!("Warning: Failed to drop test database '{}': {}", db_name, e);
+                }
+            });
+        });
+    }
+}
+
+impl Drop for TestContext {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+/// Helper function to create a test configuration with a specific database name
+pub fn test_config_with_db(db_name: &str) -> ApiConfig {
     let _ = dotenvy::dotenv();
     ApiConfig {
         server: config::ServerConfig {
@@ -76,7 +115,7 @@ pub fn test_config() -> ApiConfig {
             near: config::NearConfig::default(),
             admin_domains: vec!["test.com".to_string()],
         },
-        database: db_config_for_tests(),
+        database: db_config_for_tests_with_name(db_name),
         s3: config::S3Config {
             mock: true,
             bucket: std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "test-bucket".to_string()),
@@ -94,14 +133,19 @@ pub fn test_config() -> ApiConfig {
     }
 }
 
-/// Helper function to create test database configuration
-fn db_config_for_tests() -> config::DatabaseConfig {
+/// Helper function to create a test configuration (uses default test database name)
+pub fn test_config() -> ApiConfig {
+    test_config_with_db(&db_setup::get_test_db_name())
+}
+
+/// Helper function to create test database configuration with a specific database name
+fn db_config_for_tests_with_name(db_name: &str) -> config::DatabaseConfig {
     config::DatabaseConfig {
         primary_app_id: "postgres-test".to_string(),
         gateway_subdomain: "cvm1.near.ai".to_string(),
         port: 5432,
         host: None,
-        database: db_setup::get_test_db_name(),
+        database: db_name.to_string(),
         username: std::env::var("DATABASE_USERNAME").unwrap_or("postgres".to_string()),
         password: std::env::var("DATABASE_PASSWORD").unwrap_or("postgres".to_string()),
         max_connections: 2,
@@ -110,6 +154,11 @@ fn db_config_for_tests() -> config::DatabaseConfig {
         refresh_interval: 30,
         mock: false,
     }
+}
+
+/// Helper function to create test database configuration (uses default test database name)
+fn db_config_for_tests() -> config::DatabaseConfig {
+    db_config_for_tests_with_name(&db_setup::get_test_db_name())
 }
 
 /// Get the default mock session ID for tests
@@ -139,76 +188,79 @@ pub async fn get_access_token_from_refresh_token(
     refresh_response.access_token
 }
 
-/// Initialize database with migrations running only once
-pub async fn init_test_database(config: &config::DatabaseConfig) -> Arc<Database> {
-    let database = Arc::new(
+/// Initialize a database connection (no migrations - expects database to already have schema)
+async fn init_database_connection(config: &config::DatabaseConfig) -> Arc<Database> {
+    Arc::new(
         Database::from_config(config)
             .await
             .expect("Failed to connect to database"),
-    );
-
-    // Reset database once per test run (before migrations)
-    RESET_DONE
-        .get_or_init(|| async {
-            // Run full database reset
-            db_setup::reset_test_database(config)
-                .await
-                .expect("Failed to reset test database");
-        })
-        .await;
-
-    // Only run migrations for real database, not mock
-    if !config.mock {
-        MIGRATIONS_INITIALIZED
-            .get_or_init(|| async {
-                database
-                    .run_migrations()
-                    .await
-                    .expect("Failed to run database migrations");
-            })
-            .await;
-    }
-
-    database
+    )
 }
 
-/// Setup a complete test server with all components initialized
-/// Returns the test server ready for making requests
-pub async fn setup_test_server() -> axum_test::TestServer {
-    let (server, _) = setup_test_server_with_database().await;
-    server
-}
+// ============================================
+// New Isolated Test Setup Functions
+// ============================================
 
-/// Setup a complete test server and return it along with the database
-/// Useful for tests that need to create test users in the database
-pub async fn setup_test_server_with_database() -> (axum_test::TestServer, Arc<Database>) {
-    let (server, _pool, _mock, db) = setup_test_server_with_pool().await;
-    (server, db)
-}
-
-/// Setup a complete test server with all components initialized
-/// Returns a tuple of (TestServer, InferenceProviderPool, MockProvider, Database) for advanced testing
-pub async fn setup_test_server_with_pool() -> (
-    axum_test::TestServer,
-    std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
-    std::sync::Arc<inference_providers::mock::MockProvider>,
-    Arc<Database>,
-) {
+/// Setup a complete isolated test environment with its own database.
+/// This is the recommended way to run e2e tests as it provides complete isolation.
+/// The database is automatically cleaned up when the TestContext is dropped.
+pub async fn setup_test_context() -> TestContext {
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_max_level(tracing::level_filters::LevelFilter::DEBUG)
         .try_init();
 
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
+    // Generate a unique test ID for this test's database
+    let test_id = uuid::Uuid::new_v4().to_string();
 
+    // Get base config for database connection info
+    let base_db_config = db_config_for_tests();
+
+    // Create a unique database from the template
+    let db_name = db_setup::create_test_database_from_template(&base_db_config, &test_id)
+        .await
+        .expect("Failed to create test database from template");
+
+    // Create config with the new database name
+    let config = test_config_with_db(&db_name);
+    let db_config = config.database.clone();
+
+    // Connect to the new test database
+    let database = init_database_connection(&db_config).await;
+
+    let (server, inference_provider_pool, mock_provider) =
+        build_test_server_components(database.clone(), config).await;
+
+    TestContext {
+        server,
+        database,
+        inference_provider_pool,
+        mock_provider,
+        db_name,
+        db_config,
+    }
+}
+
+// ============================================
+// Legacy Test Setup Functions (for backwards compatibility)
+// These now use isolated databases under the hood
+// ============================================
+
+/// Internal helper to build test server and components from a database and config
+async fn build_test_server_components(
+    database: Arc<Database>,
+    config: ApiConfig,
+) -> (
+    axum_test::TestServer,
+    Arc<services::inference_provider_pool::InferenceProviderPool>,
+    Arc<inference_providers::mock::MockProvider>,
+) {
     // Create mock user in database for foreign key constraints
     assert_mock_user_in_db(&database).await;
 
     let auth_components = init_auth_services(database.clone(), &config);
 
     // Use mock inference providers instead of real VLLM to avoid flakiness
-    // This leverages the existing MockProvider from inference_providers::mock
     let (inference_provider_pool, mock_provider) =
         api::init_inference_providers_with_mocks(&config).await;
     let metrics_service = Arc::new(services::metrics::MockMetricsService);
@@ -228,6 +280,62 @@ pub async fn setup_test_server_with_pool() -> (
         Arc::new(config),
     );
     let server = axum_test::TestServer::new(app).unwrap();
+
+    (server, inference_provider_pool, mock_provider)
+}
+
+/// Setup a complete test server with all components initialized
+/// Returns the test server ready for making requests
+///
+/// Note: This now creates an isolated database per test.
+pub async fn setup_test_server() -> axum_test::TestServer {
+    let (server, _, _, _) = setup_test_server_with_pool().await;
+    server
+}
+
+/// Setup a complete test server and return it along with the database
+/// Useful for tests that need to create test users in the database
+///
+/// Note: This now creates an isolated database per test.
+pub async fn setup_test_server_with_database() -> (axum_test::TestServer, Arc<Database>) {
+    let (server, _, _, database) = setup_test_server_with_pool().await;
+    (server, database)
+}
+
+/// Setup a complete test server with all components initialized
+/// Returns a tuple of (TestServer, InferenceProviderPool, MockProvider, Database) for advanced testing
+///
+/// Note: This now creates an isolated database per test.
+pub async fn setup_test_server_with_pool() -> (
+    axum_test::TestServer,
+    std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
+    std::sync::Arc<inference_providers::mock::MockProvider>,
+    Arc<Database>,
+) {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(tracing::level_filters::LevelFilter::DEBUG)
+        .try_init();
+
+    // Generate a unique test ID for this test's database
+    let test_id = uuid::Uuid::new_v4().to_string();
+
+    // Get base config for database connection info
+    let base_db_config = db_config_for_tests();
+
+    // Create a unique database from the template
+    let db_name = db_setup::create_test_database_from_template(&base_db_config, &test_id)
+        .await
+        .expect("Failed to create test database from template");
+
+    // Create config with the new database name
+    let config = test_config_with_db(&db_name);
+
+    // Connect to the new test database
+    let database = init_database_connection(&config.database).await;
+
+    let (server, inference_provider_pool, mock_provider) =
+        build_test_server_components(database.clone(), config).await;
 
     (server, inference_provider_pool, mock_provider, database)
 }

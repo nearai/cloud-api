@@ -1187,6 +1187,11 @@ fn is_basic_valid_email(email: &str) -> bool {
         return false;
     }
 
+    // Ensure there are no additional '@' characters in the domain part
+    if domain.contains('@') {
+        return false;
+    }
+
     // Require at least one dot in the domain, not at start or end
     if !domain.contains('.') {
         return false;
@@ -2279,5 +2284,15 @@ mod tests {
 
         // String content should pass validation
         assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_is_basic_valid_email_accepts_simple_email() {
+        assert!(is_basic_valid_email("user@example.com"));
+    }
+
+    #[test]
+    fn test_is_basic_valid_email_rejects_multiple_ats() {
+        assert!(!is_basic_valid_email("user@domain@example.com"));
     }
 }

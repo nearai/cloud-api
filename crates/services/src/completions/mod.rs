@@ -268,6 +268,41 @@ impl CompletionServiceImpl {
         ]
     }
 
+    fn map_provider_error(
+        model: &str,
+        error: &inference_providers::CompletionError,
+        operation: &str,
+    ) -> ports::CompletionError {
+        match error {
+            inference_providers::CompletionError::HttpError { status_code, .. } => match *status_code
+            {
+                503 => ports::CompletionError::ServiceOverloaded(
+                    "The service is temporarily overloaded. Please retry with exponential backoff."
+                        .to_string(),
+                ),
+                400..=499 => {
+                    tracing::warn!(model, status_code, "Client error during {}", operation);
+                    ports::CompletionError::InvalidParams(
+                        "Invalid request parameters. Please check your input and try again."
+                            .to_string(),
+                    )
+                }
+                _ => {
+                    tracing::error!(model, status_code, "Provider error during {}", operation);
+                    ports::CompletionError::ProviderError(
+                        "The model is currently unavailable. Please try again later.".to_string(),
+                    )
+                }
+            },
+            _ => {
+                tracing::error!(model, "Provider error during {}: {}", operation, error);
+                ports::CompletionError::ProviderError(
+                    "The model is currently unavailable. Please try again later.".to_string(),
+                )
+            }
+        }
+    }
+
     /// Record an error metric with the appropriate error type tag
     fn record_error(&self, error: &ports::CompletionError, model_name: Option<&str>) {
         let error_type = match error {
@@ -461,58 +496,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         {
             Ok(stream) => stream,
             Err(e) => {
-                // Check if this is an HTTP error with a status code
-                let err = match &e {
-                    inference_providers::CompletionError::HttpError {
-                        status_code,
-                        message,
-                    } => {
-                        match *status_code {
-                            503 => {
-                                // Service is overloaded - client should retry with backoff
-                                ports::CompletionError::ServiceOverloaded(
-                                    "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
-                                )
-                            }
-                            400..=499 => {
-                                // For client errors (4xx), return detailed message to help user fix their request
-                                ports::CompletionError::InvalidParams(format!(
-                                    "Invalid request parameters (HTTP {}): {}",
-                                    status_code, message
-                                ))
-                            }
-                            _ => {
-                                // For server errors (5xx), log details but return generic message to user
-                                tracing::error!(
-                                    model = %request.model,
-                                    status_code = status_code,
-                                    "Provider error during chat completion stream"
-                                );
-                                ports::CompletionError::ProviderError(
-                                    "The model is currently unavailable. Please try again later."
-                                        .to_string(),
-                                )
-                            }
-                        }
-                    }
-                    _ => {
-                        // For non-HTTP errors, return generic provider error
-                        tracing::error!(
-                            model = %request.model,
-                            "Provider error during chat completion stream: {}", e
-                        );
-                        ports::CompletionError::ProviderError(
-                            "The model is currently unavailable. Please try again later."
-                                .to_string(),
-                        )
-                    }
-                };
+                let err = Self::map_provider_error(&request.model, &e, "chat completion stream");
                 self.record_error(&err, Some(canonical_name));
                 return Err(err);
             }
         };
 
-        // Determine inference type
         let inference_type = if is_streaming {
             "chat_completion_stream"
         } else {
@@ -627,52 +616,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         {
             Ok(response) => response,
             Err(e) => {
-                // Check if this is an HTTP error with a status code
-                let err = match &e {
-                    inference_providers::CompletionError::HttpError {
-                        status_code,
-                        message,
-                    } => {
-                        match *status_code {
-                            503 => {
-                                // Service is overloaded - client should retry with backoff
-                                ports::CompletionError::ServiceOverloaded(
-                                    "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
-                                )
-                            }
-                            400..=499 => {
-                                // For client errors (4xx), return detailed message to help user fix their request
-                                ports::CompletionError::InvalidParams(format!(
-                                    "Invalid request parameters (HTTP {}): {}",
-                                    status_code, message
-                                ))
-                            }
-                            _ => {
-                                // For server errors (5xx), log details but return generic message to user
-                                tracing::error!(
-                                    model = %request.model,
-                                    status_code = status_code,
-                                    "Provider error during chat completion"
-                                );
-                                ports::CompletionError::ProviderError(
-                                    "The model is currently unavailable. Please try again later."
-                                        .to_string(),
-                                )
-                            }
-                        }
-                    }
-                    _ => {
-                        // For non-HTTP errors, return generic provider error
-                        tracing::error!(
-                            model = %request.model,
-                            "Provider error during chat completion: {}", e
-                        );
-                        ports::CompletionError::ProviderError(
-                            "The model is currently unavailable. Please try again later."
-                                .to_string(),
-                        )
-                    }
-                };
+                let err = Self::map_provider_error(&request.model, &e, "chat completion");
                 self.record_error(&err, Some(canonical_name));
                 return Err(err);
             }

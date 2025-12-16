@@ -218,7 +218,7 @@ impl InferenceProvider for VLlmProvider {
         if !response.status().is_success() {
             let status = response.status();
             let status_code = status.as_u16();
-            let error_text = response.text().await.unwrap_or_default();
+            let error_text = response.text().await.unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
             return Err(CompletionError::HttpError {
                 status_code,
                 message: error_text,

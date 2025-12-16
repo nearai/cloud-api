@@ -1,3 +1,4 @@
+use crate::is_origin_allowed;
 use crate::middleware::AuthenticatedUser;
 use axum::{
     extract::{Query, Request, State},
@@ -13,6 +14,7 @@ use services::auth::near::NearAuthError;
 use services::auth::{AuthServiceTrait, OAuthManager};
 use std::sync::Arc;
 use tracing::{debug, error, info};
+use url::Url;
 
 /// OAuth state storage backed by PostgreSQL for multi-instance support
 pub type StateStore = Arc<OAuthStateRepository>;
@@ -386,17 +388,51 @@ pub async fn oauth_callback(
         Ok((access_token, refresh_session, refresh_token)) => {
             debug!("Session created successfully for user: {}", user.email);
 
-            // If frontend_callback was provided, redirect to it with token as query params
+            // If frontend_callback was provided, validate and redirect to it with token as query params
             if let Some(frontend_url) = oauth_state_row.frontend_callback {
-                let callback_url = format!(
-                    "{}/auth/callback?token={}&refresh_token={}",
-                    frontend_url,
-                    urlencoding::encode(&access_token),
-                    urlencoding::encode(&refresh_token)
-                );
+                // Extract origin from frontend_callback URL and validate it
+                match Url::parse(&frontend_url) {
+                    Ok(url) => {
+                        // Get the origin (format: scheme://host:port)
+                        let origin_str = url.origin().unicode_serialization();
+                        // Remove trailing slash for comparison with CORS config
+                        let origin_to_check = origin_str.strip_suffix('/').unwrap_or(&origin_str);
 
-                info!("Redirecting to frontend: {}", frontend_url);
-                return Redirect::temporary(&callback_url).into_response();
+                        // Check if the origin is allowed
+                        if is_origin_allowed(origin_to_check, &config.cors) {
+                            let callback_url = format!(
+                                "{}/auth/callback?token={}&refresh_token={}",
+                                frontend_url,
+                                urlencoding::encode(&access_token),
+                                urlencoding::encode(&refresh_token)
+                            );
+
+                            info!("Redirecting to frontend: {}", frontend_url);
+                            return Redirect::temporary(&callback_url).into_response();
+                        } else {
+                            error!("Frontend callback origin not allowed: {}", origin_to_check);
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": "invalid_request",
+                                    "error_description": "Frontend callback origin is not allowed"
+                                })),
+                            )
+                                .into_response();
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to parse frontend_callback URL: {}", e);
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "invalid_request",
+                                "error_description": "Invalid frontend callback URL format"
+                            })),
+                        )
+                            .into_response();
+                    }
+                }
             }
 
             // Fallback: return JSON response if no frontend_callback

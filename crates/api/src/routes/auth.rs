@@ -178,12 +178,33 @@ pub struct NearAuthResponse {
 /// Initiate GitHub OAuth flow - redirects to GitHub
 pub async fn github_login(
     Query(params): Query<OAuthInitQuery>,
-    State((oauth, state_store, _auth_service, _config)): State<AuthState>,
+    State((oauth, state_store, _auth_service, config)): State<AuthState>,
 ) -> Result<Redirect, StatusCode> {
     debug!(
         "Initiating GitHub OAuth flow - frontend_callback: {}",
         params.frontend_callback.is_some()
     );
+
+    // Validate frontend_callback early if provided
+    if let Some(ref callback_url) = params.frontend_callback {
+        match Url::parse(callback_url) {
+            Ok(url) => {
+                let origin_str = url.origin().unicode_serialization();
+                let origin = origin_str.strip_suffix('/').unwrap_or(&origin_str);
+                if !is_origin_allowed(origin, &config.cors) {
+                    error!(
+                        "frontend_callback origin not allowed at GitHub login: {}",
+                        origin
+                    );
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+            }
+            Err(_) => {
+                error!("Invalid frontend_callback URL format at GitHub login");
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    }
 
     let (auth_url, state) = oauth.github_auth_url().map_err(|_| {
         error!("Failed to generate GitHub auth URL");
@@ -211,12 +232,33 @@ pub async fn github_login(
 /// Initiate Google OAuth flow - redirects to Google
 pub async fn google_login(
     Query(params): Query<OAuthInitQuery>,
-    State((oauth, state_store, _auth_service, _config)): State<AuthState>,
+    State((oauth, state_store, _auth_service, config)): State<AuthState>,
 ) -> Result<Redirect, StatusCode> {
     debug!(
         "Initiating Google OAuth flow - frontend_callback: {}",
         params.frontend_callback.is_some()
     );
+
+    // Validate frontend_callback early if provided
+    if let Some(ref callback_url) = params.frontend_callback {
+        match Url::parse(callback_url) {
+            Ok(url) => {
+                let origin_str = url.origin().unicode_serialization();
+                let origin = origin_str.strip_suffix('/').unwrap_or(&origin_str);
+                if !is_origin_allowed(origin, &config.cors) {
+                    error!(
+                        "frontend_callback origin not allowed at Google login: {}",
+                        origin
+                    );
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+            }
+            Err(_) => {
+                error!("Invalid frontend_callback URL format at Google login");
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    }
 
     let (auth_url, state, pkce_verifier) = oauth.google_auth_url().map_err(|_| {
         error!("Failed to generate Google auth URL");
@@ -400,8 +442,43 @@ pub async fn oauth_callback(
 
                         // Check if the origin is allowed
                         if is_origin_allowed(origin_to_check, &config.cors) {
+                            // CRITICAL: Validate path doesn't contain traversal patterns
+                            let path = url.path();
+                            if path.contains("../")
+                                || path.contains("%2e%2e")
+                                || path.contains("%2E%2E")
+                            {
+                                error!("Path traversal attempt in frontend_callback");
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    Json(serde_json::json!({
+                                        "error": "invalid_request",
+                                        "error_description": "Invalid path in callback URL"
+                                    })),
+                                )
+                                    .into_response();
+                            }
+
+                            // Verify no username in URL (prevents: https://app.example.com@evil.com tricks)
+                            if !url.username().is_empty() || frontend_url.contains('@') {
+                                error!("Username in frontend_callback URL detected");
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    Json(serde_json::json!({
+                                        "error": "invalid_request",
+                                        "error_description": "Invalid callback URL format"
+                                    })),
+                                )
+                                    .into_response();
+                            }
+
+                            // Now safe to redirect with full URL preserved
+                            // Use fragment (#) instead of query parameters to avoid:
+                            // - Tokens appearing in browser history
+                            // - Tokens being logged in server access logs
+                            // - Token leakage via Referer headers
                             let mut callback_url = url.clone();
-                            callback_url.set_query(Some(&format!(
+                            callback_url.set_fragment(Some(&format!(
                                 "token={}&refresh_token={}",
                                 urlencoding::encode(&access_token),
                                 urlencoding::encode(&refresh_token)

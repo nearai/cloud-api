@@ -488,6 +488,7 @@ impl CompletionServiceImpl {
     async fn handle_stream_with_context(
         &self,
         llm_stream: StreamingResult,
+        inference_id: Uuid,
         organization_id: Uuid,
         workspace_id: Uuid,
         api_key_id: Uuid,
@@ -531,7 +532,7 @@ impl CompletionServiceImpl {
             metric_tags,
             concurrent_counter,
             last_usage_stats: None,
-            inference_id: Uuid::new_v4(),
+            inference_id,
             usage_recorded: Arc::new(AtomicBool::new(false)),
         };
         Box::pin(intercepted_stream)
@@ -543,8 +544,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
     async fn create_chat_completion_stream(
         &self,
         request: ports::CompletionRequest,
-    ) -> Result<StreamingResult, ports::CompletionError> {
+    ) -> Result<ports::StreamingCompletionResult, ports::CompletionError> {
         let service_start_time = Instant::now();
+        // Generate unique inference_id upfront for usage tracking and deduplication
+        let inference_id = Uuid::new_v4();
 
         // Extract context for usage tracking
         let organization_id = request.organization_id;
@@ -657,6 +660,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let event_stream = self
             .handle_stream_with_context(
                 llm_stream,
+                inference_id,
                 organization_id,
                 workspace_id,
                 api_key_id,
@@ -669,14 +673,19 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             )
             .await;
 
-        Ok(event_stream)
+        Ok(ports::StreamingCompletionResult {
+            stream: event_stream,
+            inference_id,
+        })
     }
 
     async fn create_chat_completion(
         &self,
         request: ports::CompletionRequest,
-    ) -> Result<inference_providers::ChatCompletionResponseWithBytes, ports::CompletionError> {
+    ) -> Result<ports::ChatCompletionResult, ports::CompletionError> {
         let service_start_time = Instant::now();
+        // Generate unique inference_id upfront for usage tracking
+        let inference_id = Uuid::new_v4();
         let chat_messages = Self::prepare_chat_messages(&request.messages);
 
         let mut chat_params = inference_providers::ChatCompletionParams {
@@ -826,8 +835,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let model_id = model.id;
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
         let output_tokens = response_with_bytes.response.usage.completion_tokens;
-        // Hash the full chat ID to UUID for storage
-        let inference_id_uuid = Some(hash_inference_id_to_uuid(&response_with_bytes.response.id));
 
         tokio::spawn(async move {
             if usage_service
@@ -841,7 +848,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     inference_type: "chat_completion".to_string(),
                     ttft_ms: None,    // N/A for non-streaming
                     avg_itl_ms: None, // N/A for non-streaming
-                    inference_id: inference_id_uuid,
+                    inference_id: Some(inference_id),
                 })
                 .await
                 .is_err()
@@ -858,7 +865,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             }
         });
 
-        Ok(response_with_bytes)
+        Ok(ports::ChatCompletionResult {
+            response: response_with_bytes,
+            inference_id,
+        })
     }
 }
 

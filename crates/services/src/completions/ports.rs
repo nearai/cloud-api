@@ -20,6 +20,18 @@ impl std::fmt::Display for CompletionId {
     }
 }
 
+/// Result for streaming completions - includes inference_id for header and usage tracking
+pub struct StreamingCompletionResult {
+    pub stream: StreamingResult,
+    pub inference_id: Uuid,
+}
+
+/// Result for non-streaming completions - includes inference_id for header and usage tracking
+pub struct ChatCompletionResult {
+    pub response: inference_providers::ChatCompletionResponseWithBytes,
+    pub inference_id: Uuid,
+}
+
 // Error types
 #[derive(Debug, thiserror::Error)]
 pub enum CompletionError {
@@ -91,10 +103,10 @@ pub trait CompletionServiceTrait: Send + Sync {
     async fn create_chat_completion_stream(
         &self,
         request: CompletionRequest,
-    ) -> Result<StreamingResult, CompletionError>;
+    ) -> Result<StreamingCompletionResult, CompletionError>;
 
     async fn create_chat_completion(
         &self,
         request: CompletionRequest,
-    ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError>;
+    ) -> Result<ChatCompletionResult, CompletionError>;
 }

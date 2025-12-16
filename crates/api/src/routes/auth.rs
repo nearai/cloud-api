@@ -1,4 +1,3 @@
-use crate::is_origin_allowed;
 use crate::middleware::AuthenticatedUser;
 use axum::{
     extract::{Query, Request, State},
@@ -27,6 +26,42 @@ pub type AuthState = (
 );
 
 pub type NearAuthState = (Arc<services::auth::NearAuthService>, Arc<ApiConfig>);
+
+fn validate_frontend_callback(
+    url_str: &str,
+    cors_config: &config::CorsConfig,
+) -> Result<Url, &'static str> {
+    if url_str.len() > 2048 {
+        return Err("URL too long");
+    }
+
+    let url = Url::parse(url_str).map_err(|_| "Invalid URL format")?;
+
+    let origin_str = url.origin().unicode_serialization();
+    let origin = origin_str.strip_suffix('/').unwrap_or(&origin_str);
+    if !crate::is_origin_allowed(origin, cors_config) {
+        return Err("Origin not allowed");
+    }
+
+    let path = url.path();
+    if path.contains("../") || path.contains("%2e%2e") || path.contains("%2E%2E") {
+        return Err("Invalid path in callback URL");
+    }
+
+    if !url.username().is_empty() || url_str.contains('@') {
+        return Err("Invalid callback URL format");
+    }
+
+    if url.query().is_some() {
+        return Err("Callback URL must not contain query parameters");
+    }
+
+    if url.fragment().is_some() {
+        return Err("Callback URL must not contain fragments");
+    }
+
+    Ok(url)
+}
 
 #[derive(Deserialize)]
 pub struct OAuthCallback {
@@ -185,24 +220,13 @@ pub async fn github_login(
         params.frontend_callback.is_some()
     );
 
-    // Validate frontend_callback early if provided
     if let Some(ref callback_url) = params.frontend_callback {
-        match Url::parse(callback_url) {
-            Ok(url) => {
-                let origin_str = url.origin().unicode_serialization();
-                let origin = origin_str.strip_suffix('/').unwrap_or(&origin_str);
-                if !is_origin_allowed(origin, &config.cors) {
-                    error!(
-                        "frontend_callback origin not allowed at GitHub login: {}",
-                        origin
-                    );
-                    return Err(StatusCode::BAD_REQUEST);
-                }
-            }
-            Err(_) => {
-                error!("Invalid frontend_callback URL format at GitHub login");
-                return Err(StatusCode::BAD_REQUEST);
-            }
+        if let Err(err_msg) = validate_frontend_callback(callback_url, &config.cors) {
+            error!(
+                "frontend_callback validation failed at GitHub login: {}",
+                err_msg
+            );
+            return Err(StatusCode::BAD_REQUEST);
         }
     }
 
@@ -239,24 +263,13 @@ pub async fn google_login(
         params.frontend_callback.is_some()
     );
 
-    // Validate frontend_callback early if provided
     if let Some(ref callback_url) = params.frontend_callback {
-        match Url::parse(callback_url) {
-            Ok(url) => {
-                let origin_str = url.origin().unicode_serialization();
-                let origin = origin_str.strip_suffix('/').unwrap_or(&origin_str);
-                if !is_origin_allowed(origin, &config.cors) {
-                    error!(
-                        "frontend_callback origin not allowed at Google login: {}",
-                        origin
-                    );
-                    return Err(StatusCode::BAD_REQUEST);
-                }
-            }
-            Err(_) => {
-                error!("Invalid frontend_callback URL format at Google login");
-                return Err(StatusCode::BAD_REQUEST);
-            }
+        if let Err(err_msg) = validate_frontend_callback(callback_url, &config.cors) {
+            error!(
+                "frontend_callback validation failed at Google login: {}",
+                err_msg
+            );
+            return Err(StatusCode::BAD_REQUEST);
         }
     }
 
@@ -430,103 +443,36 @@ pub async fn oauth_callback(
         Ok((access_token, refresh_session, refresh_token)) => {
             debug!("Session created successfully for user: {}", user.email);
 
-            // If frontend_callback was provided, validate and redirect to it with token as query params
             if let Some(frontend_url) = oauth_state_row.frontend_callback {
-                // Extract origin from frontend_callback URL and validate it
-                match Url::parse(&frontend_url) {
-                    Ok(url) => {
-                        // Get the origin (format: scheme://host:port)
-                        let origin_str = url.origin().unicode_serialization();
-                        // Remove trailing slash for comparison with CORS config
-                        let origin_to_check = origin_str.strip_suffix('/').unwrap_or(&origin_str);
-
-                        // Check if the origin is allowed
-                        if is_origin_allowed(origin_to_check, &config.cors) {
-                            // CRITICAL: Validate path doesn't contain traversal patterns
-                            let path = url.path();
-                            if path.contains("../")
-                                || path.contains("%2e%2e")
-                                || path.contains("%2E%2E")
-                            {
-                                error!("Path traversal attempt in frontend_callback");
-                                return (
-                                    StatusCode::BAD_REQUEST,
-                                    Json(serde_json::json!({
-                                        "error": "invalid_request",
-                                        "error_description": "Invalid path in callback URL"
-                                    })),
-                                )
-                                    .into_response();
-                            }
-
-                            // Verify no username in URL (prevents: https://app.example.com@evil.com tricks)
-                            if !url.username().is_empty() || frontend_url.contains('@') {
-                                error!("Username in frontend_callback URL detected");
-                                return (
-                                    StatusCode::BAD_REQUEST,
-                                    Json(serde_json::json!({
-                                        "error": "invalid_request",
-                                        "error_description": "Invalid callback URL format"
-                                    })),
-                                )
-                                    .into_response();
-                            }
-
-                            // Reject URLs with existing query parameters (prevents parameter injection attacks)
-                            // Tokens are passed via fragments (#), not query params
-                            if url.query().is_some() {
-                                error!("Query parameters in frontend_callback not allowed");
-                                return (
-                                    StatusCode::BAD_REQUEST,
-                                    Json(serde_json::json!({
-                                        "error": "invalid_request",
-                                        "error_description": "Callback URL must not contain query parameters"
-                                    })),
-                                )
-                                    .into_response();
-                            }
-
-                            // Now safe to redirect with full URL preserved
-                            // Use fragment (#) instead of query parameters to avoid:
-                            // - Tokens appearing in browser history
-                            // - Tokens being logged in server access logs
-                            // - Token leakage via Referer headers
-                            let mut callback_url = url.clone();
-                            callback_url.set_fragment(Some(&format!(
-                                "token={}&refresh_token={}",
-                                urlencoding::encode(&access_token),
-                                urlencoding::encode(&refresh_token)
-                            )));
-
-                            info!("Redirecting to frontend: {}", origin_to_check);
-                            return Redirect::temporary(callback_url.as_str()).into_response();
-                        } else {
-                            error!("Frontend callback origin not allowed: {}", origin_to_check);
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                Json(serde_json::json!({
-                                    "error": "invalid_request",
-                                    "error_description": "Frontend callback origin is not allowed"
-                                })),
-                            )
-                                .into_response();
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to parse frontend_callback URL: {}", e);
+                let validated_url = match validate_frontend_callback(&frontend_url, &config.cors) {
+                    Ok(url) => url,
+                    Err(err_msg) => {
+                        error!(
+                            "frontend_callback validation failed at callback: {}",
+                            err_msg
+                        );
                         return (
                             StatusCode::BAD_REQUEST,
                             Json(serde_json::json!({
                                 "error": "invalid_request",
-                                "error_description": "Invalid frontend callback URL format"
+                                "error_description": "Invalid frontend callback URL"
                             })),
                         )
                             .into_response();
                     }
-                }
+                };
+
+                let mut callback_url = validated_url.clone();
+                callback_url.set_fragment(Some(&format!(
+                    "token={}&refresh_token={}",
+                    urlencoding::encode(&access_token),
+                    urlencoding::encode(&refresh_token)
+                )));
+
+                info!("Redirecting to frontend callback");
+                return Redirect::temporary(callback_url.as_str()).into_response();
             }
 
-            // Fallback: return JSON response if no frontend_callback
             let response = TokenExchangeResponse {
                 access_token,
                 refresh_token,

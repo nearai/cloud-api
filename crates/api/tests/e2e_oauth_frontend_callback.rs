@@ -1,9 +1,4 @@
 // E2E tests for OAuth frontend_callback redirect logic
-// Tests the implementation of dynamic frontend redirect URLs during OAuth callback
-//
-// These tests focus on the database layer (OAuthStateRepository) which handles
-// storing and retrieving the frontend_callback URL during the OAuth flow.
-// The route handlers are tested through their integration with the repository.
 
 mod common;
 
@@ -110,10 +105,6 @@ async fn test_oauth_state_without_frontend_callback() {
 
 #[tokio::test]
 async fn test_oauth_callback_with_valid_state_and_frontend_callback() {
-    // This test verifies the OAuth callback flow with a valid state
-    // Note: In test/mock mode, the OAuth callback returns JSON
-    // In production with real OAuth providers and frontend_callback set,
-    // the server would redirect to the frontend_callback URL with token in query params
     let (_server, db) = setup_test_server_with_database().await;
     let repo = OAuthStateRepository::new(db.pool().clone());
 
@@ -195,12 +186,12 @@ async fn test_multiple_oauth_states_with_different_frontend_callbacks() {
 }
 
 #[tokio::test]
-async fn test_frontend_callback_with_special_characters_and_query_params() {
+async fn test_frontend_callback_with_special_characters_in_path() {
     let (_server, db) = setup_test_server_with_database().await;
     let repo = OAuthStateRepository::new(db.pool().clone());
 
-    // Frontend URL with special characters and query parameters
-    let callback_url = "https://app.example.com/auth/callback?next=/dashboard&utm_source=oauth";
+    // Frontend URL with special characters in path (no query parameters - those are rejected by validation)
+    let callback_url = "https://app.example.com/auth/callback-success";
 
     let state = format!("test-state-{}", uuid::Uuid::new_v4());
     let created = repo
@@ -220,6 +211,41 @@ async fn test_frontend_callback_with_special_characters_and_query_params() {
     assert_eq!(retrieved.frontend_callback, Some(callback_url.to_string()));
 
     println!("✅ Frontend callback URL with special characters is preserved correctly");
+}
+
+#[tokio::test]
+async fn test_frontend_callback_url_can_store_any_valid_url() {
+    // Repository stores any URL; validation happens at route layer
+    let (_server, db) = setup_test_server_with_database().await;
+    let repo = OAuthStateRepository::new(db.pool().clone());
+
+    let callback_url_with_params = "https://app.example.com/callback?param=value";
+    let state = format!("test-state-{}", uuid::Uuid::new_v4());
+
+    let created = repo
+        .create(
+            state.clone(),
+            "github".to_string(),
+            None,
+            Some(callback_url_with_params.to_string()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        created.frontend_callback,
+        Some(callback_url_with_params.to_string())
+    );
+
+    let retrieved = repo.get_and_delete(&state).await.unwrap().unwrap();
+    assert_eq!(
+        retrieved.frontend_callback,
+        Some(callback_url_with_params.to_string())
+    );
+
+    println!(
+        "✅ Repository layer can store various URL formats (validation happens at route layer)"
+    );
 }
 
 #[tokio::test]

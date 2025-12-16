@@ -32,6 +32,11 @@ pub struct OAuthCallback {
     state: String,
 }
 
+#[derive(Deserialize)]
+pub struct OAuthInitQuery {
+    pub frontend_callback: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct TokenExchangeResponse {
     access_token: String,
@@ -170,9 +175,13 @@ pub struct NearAuthResponse {
 
 /// Initiate GitHub OAuth flow - redirects to GitHub
 pub async fn github_login(
+    Query(params): Query<OAuthInitQuery>,
     State((oauth, state_store, _auth_service, _config)): State<AuthState>,
 ) -> Result<Redirect, StatusCode> {
-    debug!("Initiating GitHub OAuth flow");
+    debug!(
+        "Initiating GitHub OAuth flow - frontend_callback: {:?}",
+        params.frontend_callback
+    );
 
     let (auth_url, state) = oauth.github_auth_url().map_err(|_| {
         error!("Failed to generate GitHub auth URL");
@@ -181,7 +190,12 @@ pub async fn github_login(
 
     // Store state in database for multi-instance support
     state_store
-        .create(state.clone(), "github".to_string(), None)
+        .create(
+            state.clone(),
+            "github".to_string(),
+            None,
+            params.frontend_callback.clone(),
+        )
         .await
         .map_err(|e| {
             error!("Failed to store OAuth state: {}", e);
@@ -194,9 +208,13 @@ pub async fn github_login(
 
 /// Initiate Google OAuth flow - redirects to Google
 pub async fn google_login(
+    Query(params): Query<OAuthInitQuery>,
     State((oauth, state_store, _auth_service, _config)): State<AuthState>,
 ) -> Result<Redirect, StatusCode> {
-    debug!("Initiating Google OAuth flow");
+    debug!(
+        "Initiating Google OAuth flow - frontend_callback: {:?}",
+        params.frontend_callback
+    );
 
     let (auth_url, state, pkce_verifier) = oauth.google_auth_url().map_err(|_| {
         error!("Failed to generate Google auth URL");
@@ -205,7 +223,12 @@ pub async fn google_login(
 
     // Store state and PKCE verifier in database for multi-instance support
     state_store
-        .create(state.clone(), "google".to_string(), Some(pkce_verifier))
+        .create(
+            state.clone(),
+            "google".to_string(),
+            Some(pkce_verifier),
+            params.frontend_callback.clone(),
+        )
         .await
         .map_err(|e| {
             error!("Failed to store OAuth state: {}", e);
@@ -363,6 +386,20 @@ pub async fn oauth_callback(
         Ok((access_token, refresh_session, refresh_token)) => {
             debug!("Session created successfully for user: {}", user.email);
 
+            // If frontend_callback was provided, redirect to it with token as query params
+            if let Some(frontend_url) = oauth_state_row.frontend_callback {
+                let callback_url = format!(
+                    "{}/auth/callback?token={}&refresh_token={}",
+                    frontend_url,
+                    urlencoding::encode(&access_token),
+                    urlencoding::encode(&refresh_token)
+                );
+
+                info!("Redirecting to frontend: {}", frontend_url);
+                return Redirect::temporary(&callback_url).into_response();
+            }
+
+            // Fallback: return JSON response if no frontend_callback
             let response = TokenExchangeResponse {
                 access_token,
                 refresh_token,

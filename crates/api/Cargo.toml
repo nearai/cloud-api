@@ -49,6 +49,8 @@ base64 = "0.22"
 # Ordered collections
 indexmap = "2"
 moka = { version = "0.12.11", features = ["future"] }
+# URL encoding
+urlencoding = "2.1"
 
 [dev-dependencies]
 axum-test = "18"

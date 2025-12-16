@@ -1153,18 +1153,23 @@ async fn test_completion_cost_calculation() {
 
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
-    // Verify model exists and get its current pricing from the database
-    let models_response = server
-        .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {api_key}"))
+    // Get the model pricing BEFORE making the completion request
+    // This is critical because parallel tests may modify pricing, and billing uses
+    // the pricing at the time of the request
+    let encoded_model_name =
+        url::form_urlencoded::byte_serialize(model_name.as_bytes()).collect::<String>();
+    let model_response = server
+        .get(format!("/v1/model/{encoded_model_name}").as_str())
         .await;
-    assert_eq!(models_response.status_code(), 200);
-    let models: api::models::ModelsResponse = models_response.json();
-    let qwen_model = models.data.iter().find(|m| m.id == model_name);
-    assert!(qwen_model.is_some(), "Model {model_name} not found in list");
-    println!("Verified model exists: {qwen_model:?}");
-    // Note: We'll use hardcoded prices for now since /models endpoint doesn't return pricing
-    // The setup_qwen_model() function ensures the database has the correct pricing
+    assert_eq!(
+        model_response.status_code(),
+        200,
+        "Should get model pricing"
+    );
+    let model_pricing = model_response.json::<api::models::ModelWithPricing>();
+    let input_cost_per_token = model_pricing.input_cost_per_token.amount;
+    let output_cost_per_token = model_pricing.output_cost_per_token.amount;
+    println!("Model pricing BEFORE completion - input: {input_cost_per_token}, output: {output_cost_per_token}");
 
     // Get initial balance (should be 0 or not found)
     let initial_balance_response = server
@@ -1215,26 +1220,7 @@ async fn test_completion_cost_calculation() {
     assert!(input_tokens > 0, "Should have input tokens");
     assert!(output_tokens > 0, "Should have output tokens");
 
-    // Get current model pricing from the API (may have been modified by parallel tests)
-    let encoded_model_name =
-        url::form_urlencoded::byte_serialize(model_name.as_bytes()).collect::<String>();
-    let model_response = server
-        .get(format!("/v1/model/{encoded_model_name}").as_str())
-        .await;
-    assert_eq!(
-        model_response.status_code(),
-        200,
-        "Should get model pricing"
-    );
-    let model_pricing = model_response.json::<api::models::ModelWithPricing>();
-
-    let input_cost_per_token = model_pricing.input_cost_per_token.amount;
-    let output_cost_per_token = model_pricing.output_cost_per_token.amount;
-    println!(
-        "Model pricing from API - input: {input_cost_per_token}, output: {output_cost_per_token}"
-    );
-
-    // Expected total cost (at scale 9)
+    // Expected total cost (at scale 9) - use pricing captured BEFORE the completion request
     let expected_input_cost = (input_tokens as i64) * input_cost_per_token;
     let expected_output_cost = (output_tokens as i64) * output_cost_per_token;
     let expected_total_cost = expected_input_cost + expected_output_cost;

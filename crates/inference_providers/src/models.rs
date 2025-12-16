@@ -669,6 +669,8 @@ pub enum ListModelsError {
 pub enum CompletionError {
     #[error("Failed to perform completion: {0}")]
     CompletionError(String),
+    #[error("HTTP error {status_code}: {message}")]
+    HttpError { status_code: u16, message: String },
     #[error("Invalid response format")]
     InvalidResponse(String),
     #[error("Unknown error")]

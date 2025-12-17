@@ -344,7 +344,7 @@ pub async fn remove_organization_member(
             Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
         Err(OrganizationError::InvalidParams(msg)) => {
-            error!("Cannot remove member: {}", msg);
+            warn!("Cannot remove member: {}", msg);
             Err((
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(msg, "bad_request".to_string())),

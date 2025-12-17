@@ -56,7 +56,7 @@ pub async fn upload_file(
 
                 // Read file data (size limit enforced by DefaultBodyLimit layer at framework level)
                 let data = field.bytes().await.map_err(|e| {
-                    error!("Failed to read file data: {}", e);
+                    tracing::warn!("Failed to read file data: {}", e);
                     (
                         StatusCode::BAD_REQUEST,
                         Json(ErrorResponse::new(
@@ -85,7 +85,7 @@ pub async fn upload_file(
             }
             "purpose" => {
                 let text = field.text().await.map_err(|e| {
-                    error!("Failed to read purpose: {}", e);
+                    tracing::warn!("Failed to read purpose: {}", e);
                     (
                         StatusCode::BAD_REQUEST,
                         Json(ErrorResponse::new(
@@ -98,7 +98,7 @@ pub async fn upload_file(
             }
             "expires_after[anchor]" => {
                 let text = field.text().await.map_err(|e| {
-                    error!("Failed to read expires_after[anchor]: {}", e);
+                    tracing::warn!("Failed to read expires_after[anchor]: {}", e);
                     (
                         StatusCode::BAD_REQUEST,
                         Json(ErrorResponse::new(
@@ -111,7 +111,7 @@ pub async fn upload_file(
             }
             "expires_after[seconds]" => {
                 let text = field.text().await.map_err(|e| {
-                    error!("Failed to read expires_after[seconds]: {}", e);
+                    tracing::warn!("Failed to read expires_after[seconds]: {}", e);
                     (
                         StatusCode::BAD_REQUEST,
                         Json(ErrorResponse::new(
@@ -121,7 +121,7 @@ pub async fn upload_file(
                     )
                 })?;
                 expires_after_seconds = Some(text.parse::<i64>().map_err(|e| {
-                    error!("Failed to parse expires_after[seconds]: {}", e);
+                    tracing::warn!("Failed to parse expires_after[seconds]: {}", e);
                     (
                         StatusCode::BAD_REQUEST,
                         Json(ErrorResponse::new(
@@ -215,7 +215,6 @@ pub async fn upload_file(
         })
         .await
         .map_err(|e| {
-            error!("Failed to upload file: {}", e);
             let (status, error_type) = match e {
                 services::files::FileServiceError::FileTooLarge(_, _) => {
                     (StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error")
@@ -229,6 +228,14 @@ pub async fn upload_file(
                 }
                 _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
             };
+
+            // Log client errors as warn, server errors as error
+            if status.is_client_error() {
+                tracing::warn!("File upload failed with client error: {}", e);
+            } else {
+                tracing::error!("File upload failed with server error: {}", e);
+            }
+
             (
                 status,
                 Json(ErrorResponse::new(e.to_string(), error_type.to_string())),
@@ -410,13 +417,20 @@ pub async fn get_file(
         .get_file(file_uuid, api_key.workspace_id.0)
         .await
         .map_err(|e| {
-            error!("Failed to retrieve file: {}", e);
             let (status, error_type) = match e {
                 services::files::FileServiceError::NotFound => {
                     (StatusCode::NOT_FOUND, "not_found_error")
                 }
                 _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
             };
+
+            // Log client errors as warn, server errors as error
+            if status.is_client_error() {
+                tracing::warn!("Failed to retrieve file: {}", e);
+            } else {
+                tracing::error!("Failed to retrieve file: {}", e);
+            }
+
             (
                 status,
                 Json(ErrorResponse::new(
@@ -483,13 +497,20 @@ pub async fn delete_file(
         .delete_file(file_uuid, api_key.workspace_id.0)
         .await
         .map_err(|e| {
-            error!("Failed to delete file: {}", e);
             let (status, error_type) = match e {
                 services::files::FileServiceError::NotFound => {
                     (StatusCode::NOT_FOUND, "not_found_error")
                 }
                 _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
             };
+
+            // Log client errors as warn, server errors as error
+            if status.is_client_error() {
+                tracing::warn!("Failed to delete file: {}", e);
+            } else {
+                tracing::error!("Failed to delete file: {}", e);
+            }
+
             (
                 status,
                 Json(ErrorResponse::new(
@@ -564,13 +585,20 @@ pub async fn get_file_content(
         .get_file_content(file_uuid, api_key.workspace_id.0)
         .await
         .map_err(|e| {
-            error!("Failed to retrieve file content: {}", e);
             let (status, error_type) = match e {
                 services::files::FileServiceError::NotFound => {
                     (StatusCode::NOT_FOUND, "not_found_error")
                 }
                 _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
             };
+
+            // Log client errors as warn, server errors as error
+            if status.is_client_error() {
+                tracing::warn!("Failed to retrieve file content: {}", e);
+            } else {
+                tracing::error!("Failed to retrieve file content: {}", e);
+            }
+
             (
                 status,
                 Json(ErrorResponse::new(

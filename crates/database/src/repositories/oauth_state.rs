@@ -12,6 +12,7 @@ pub struct OAuthStateRow {
     pub state: String,
     pub provider: String,
     pub pkce_verifier: Option<String>,
+    pub frontend_callback: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -27,6 +28,7 @@ impl OAuthStateRepository {
         state: String,
         provider: String,
         pkce_verifier: Option<String>,
+        frontend_callback: Option<String>,
     ) -> Result<OAuthStateRow> {
         let client = self
             .pool
@@ -40,11 +42,11 @@ impl OAuthStateRepository {
         let row = client
             .query_one(
                 r#"
-                INSERT INTO oauth_states (state, provider, pkce_verifier, created_at, expires_at)
-                VALUES ($1, $2, $3, $4, $5)
-                RETURNING state, provider, pkce_verifier, created_at, expires_at
+                INSERT INTO oauth_states (state, provider, pkce_verifier, frontend_callback, created_at, expires_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING state, provider, pkce_verifier, frontend_callback, created_at, expires_at
                 "#,
-                &[&state, &provider, &pkce_verifier, &now, &expires_at],
+                &[&state, &provider, &pkce_verifier, &frontend_callback, &now, &expires_at],
             )
             .await
             .context("Failed to create OAuth state")?;
@@ -73,7 +75,7 @@ impl OAuthStateRepository {
                 r#"
                 DELETE FROM oauth_states
                 WHERE state = $1 AND expires_at > $2
-                RETURNING state, provider, pkce_verifier, created_at, expires_at
+                RETURNING state, provider, pkce_verifier, frontend_callback, created_at, expires_at
                 "#,
                 &[&state, &now],
             )
@@ -120,6 +122,7 @@ impl OAuthStateRepository {
             state: row.get("state"),
             provider: row.get("provider"),
             pkce_verifier: row.get("pkce_verifier"),
+            frontend_callback: row.get("frontend_callback"),
             created_at: row.get("created_at"),
             expires_at: row.get("expires_at"),
         }

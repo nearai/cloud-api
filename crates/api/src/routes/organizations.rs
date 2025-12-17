@@ -323,7 +323,7 @@ pub async fn get_organization(
             )),
         )),
         Err(OrganizationError::NotFound) => {
-            error!("Organization not found");
+            tracing::warn!("Organization not found");
             Err((
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse::new(
@@ -586,7 +586,7 @@ pub async fn delete_organization(
             })))
         }
         Ok(false) | Err(OrganizationError::NotFound) => {
-            error!("Organization not found {}", organization_id.0);
+            tracing::warn!("Organization not found {}", organization_id.0);
             Err((
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse::new(

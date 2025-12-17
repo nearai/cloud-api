@@ -26,12 +26,13 @@ async fn test_create_and_get_oauth_state() {
 
     // Create state
     let created = repo
-        .create(state.clone(), provider.clone(), None)
+        .create(state.clone(), provider.clone(), None, None)
         .await
         .unwrap();
     assert_eq!(created.state, state);
     assert_eq!(created.provider, provider);
     assert_eq!(created.pkce_verifier, None);
+    assert_eq!(created.frontend_callback, None);
 
     // Get and delete state
     let retrieved = repo.get_and_delete(&state).await.unwrap();
@@ -82,10 +83,11 @@ async fn test_google_with_pkce_verifier() {
 
     // Create state with PKCE verifier
     let created = repo
-        .create(state.clone(), provider.clone(), verifier.clone())
+        .create(state.clone(), provider.clone(), verifier.clone(), None)
         .await
         .unwrap();
     assert_eq!(created.pkce_verifier, verifier);
+    assert_eq!(created.frontend_callback, None);
 
     // Get and verify PKCE verifier is preserved
     let retrieved = repo.get_and_delete(&state).await.unwrap().unwrap();
@@ -101,7 +103,9 @@ async fn test_state_replay_protection() {
     let provider = "github".to_string();
 
     // Create one state
-    repo.create(state.clone(), provider, None).await.unwrap();
+    repo.create(state.clone(), provider, None, None)
+        .await
+        .unwrap();
 
     // First get should succeed
     let first = repo.get_and_delete(&state).await.unwrap();

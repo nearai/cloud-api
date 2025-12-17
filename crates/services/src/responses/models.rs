@@ -63,8 +63,6 @@ pub struct CreateResponseRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<ResponseTextConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ResponseReasoningConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include: Option<Vec<String>>,
@@ -199,25 +197,6 @@ pub struct ResponseToolChoiceFunction {
     pub name: String,
 }
 
-/// Text format configuration
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ResponseTextConfig {
-    pub format: ResponseTextFormat,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub verbosity: Option<String>, // "low", "medium", "high"
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type")]
-pub enum ResponseTextFormat {
-    #[serde(rename = "text")]
-    Text,
-    #[serde(rename = "json_object")]
-    JsonObject,
-    #[serde(rename = "json_schema")]
-    JsonSchema { json_schema: serde_json::Value },
-}
-
 /// Reasoning configuration
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct ResponseReasoningConfig {
@@ -265,8 +244,6 @@ pub struct ResponseObject {
     pub service_tier: String,
     pub store: bool,
     pub temperature: f32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<ResponseTextConfig>,
     pub tool_choice: ResponseToolChoiceOutput,
     pub tools: Vec<ResponseTool>,
     #[serde(default)]

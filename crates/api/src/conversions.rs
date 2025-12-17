@@ -62,7 +62,6 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
             logprobs: None,
             top_logprobs: None,
             user: None,
-            response_format: None,
             seed: None,
             tool_choice: None,
             parallel_tool_calls: None,
@@ -618,8 +617,6 @@ mod tests {
             stop: Some(vec!["\\n".to_string()]),
             presence_penalty: None,
             frequency_penalty: None,
-            response_format: None,
-
             extra: HashMap::new(),
         };
 

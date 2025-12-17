@@ -2,7 +2,7 @@ use axum::{body::Body, extract::Request, http::StatusCode, middleware::Next, res
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use sha2::{Digest, Sha256};
-use tracing::{debug, error};
+use tracing::debug;
 
 /// Hashed request body information passed to route handlers
 #[derive(Clone, Debug)]

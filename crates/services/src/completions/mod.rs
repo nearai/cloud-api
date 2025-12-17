@@ -8,7 +8,6 @@ use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, Strea
 use moka::future::Cache;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use uuid::Uuid;
 
 // Create a new stream that intercepts messages, but passes the original ones through
@@ -18,7 +17,6 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-/// Maximum concurrent requests per organization per model (protects service from being overwhelmed)
 const DEFAULT_CONCURRENT_LIMIT: u32 = 64;
 
 /// Hash inference ID to UUID deterministically using MD5 (v5)
@@ -71,7 +69,6 @@ where
     total_itl_ms: f64,
     // Pre-allocated low-cardinality metric tags (for Datadog/OTLP)
     metric_tags: Vec<String>,
-    /// Counter to decrement on drop (for concurrent request limiting per org)
     concurrent_counter: Option<Arc<AtomicU32>>,
 }
 
@@ -244,7 +241,7 @@ where
 {
     fn drop(&mut self) {
         if let Some(counter) = &self.concurrent_counter {
-            counter.fetch_sub(1, Ordering::Relaxed);
+            counter.fetch_sub(1, Ordering::Release);
         }
     }
 }
@@ -255,7 +252,6 @@ pub struct CompletionServiceImpl {
     pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     pub metrics_service: Arc<dyn MetricsServiceTrait>,
     pub models_repository: Arc<dyn ModelsRepository>,
-    /// Tracks concurrent requests per (organization, model) to prevent any single org from overwhelming a model
     concurrent_counts: Cache<(Uuid, Uuid), Arc<AtomicU32>>,
     concurrent_limit: u32,
 }
@@ -268,9 +264,7 @@ impl CompletionServiceImpl {
         metrics_service: Arc<dyn MetricsServiceTrait>,
         models_repository: Arc<dyn ModelsRepository>,
     ) -> Self {
-        let concurrent_counts = Cache::builder()
-            .time_to_idle(Duration::from_secs(300))
-            .build();
+        let concurrent_counts = Cache::builder().max_capacity(100_000).build();
 
         Self {
             inference_provider_pool,
@@ -523,20 +517,27 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .get_with(limit_key, async { Arc::new(AtomicU32::new(0)) })
             .await;
 
-        let current = counter.fetch_add(1, Ordering::Relaxed);
-        if current >= self.concurrent_limit {
-            counter.fetch_sub(1, Ordering::Relaxed);
-            tracing::warn!(
-                organization_id = %organization_id,
-                model_id = %model.id,
-                model_name = %canonical_name,
-                current_count = current + 1,
-                limit = self.concurrent_limit,
-                "Organization concurrent request limit exceeded for model"
-            );
-            let err = ports::CompletionError::RateLimitExceeded;
-            self.record_error(&err, Some(canonical_name));
-            return Err(err);
+        loop {
+            let current = counter.load(Ordering::Acquire);
+            if current >= self.concurrent_limit {
+                tracing::warn!(
+                    organization_id = %organization_id,
+                    model_id = %model.id,
+                    model_name = %canonical_name,
+                    current_count = current,
+                    limit = self.concurrent_limit,
+                    "Organization concurrent request limit exceeded for model"
+                );
+                let err = ports::CompletionError::RateLimitExceeded;
+                self.record_error(&err, Some(canonical_name));
+                return Err(err);
+            }
+            if counter
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
         }
 
         let provider_start_time = Instant::now();
@@ -549,7 +550,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         {
             Ok(stream) => stream,
             Err(e) => {
-                counter.fetch_sub(1, Ordering::Relaxed);
+                counter.fetch_sub(1, Ordering::Release);
                 let err = Self::map_provider_error(&request.model, &e, "chat completion stream");
                 self.record_error(&err, Some(canonical_name));
                 return Err(err);
@@ -671,20 +672,27 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .get_with(limit_key, async { Arc::new(AtomicU32::new(0)) })
             .await;
 
-        let current = counter.fetch_add(1, Ordering::Relaxed);
-        if current >= self.concurrent_limit {
-            counter.fetch_sub(1, Ordering::Relaxed);
-            tracing::warn!(
-                organization_id = %organization_id,
-                model_id = %model.id,
-                model_name = %canonical_name,
-                current_count = current + 1,
-                limit = self.concurrent_limit,
-                "Organization concurrent request limit exceeded for model"
-            );
-            let err = ports::CompletionError::RateLimitExceeded;
-            self.record_error(&err, Some(canonical_name));
-            return Err(err);
+        loop {
+            let current = counter.load(Ordering::Acquire);
+            if current >= self.concurrent_limit {
+                tracing::warn!(
+                    organization_id = %organization_id,
+                    model_id = %model.id,
+                    model_name = %canonical_name,
+                    current_count = current,
+                    limit = self.concurrent_limit,
+                    "Organization concurrent request limit exceeded for model"
+                );
+                let err = ports::CompletionError::RateLimitExceeded;
+                self.record_error(&err, Some(canonical_name));
+                return Err(err);
+            }
+            if counter
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
         }
 
         let provider_start_time = Instant::now();
@@ -694,11 +702,11 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .await
         {
             Ok(response) => {
-                counter.fetch_sub(1, Ordering::Relaxed);
+                counter.fetch_sub(1, Ordering::Release);
                 response
             }
             Err(e) => {
-                counter.fetch_sub(1, Ordering::Relaxed);
+                counter.fetch_sub(1, Ordering::Release);
                 let err = Self::map_provider_error(&request.model, &e, "chat completion");
                 self.record_error(&err, Some(canonical_name));
                 return Err(err);
@@ -1139,29 +1147,39 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_limit_state() {
-        // Test the concurrent counting mechanism directly (keyed by org_id + model_id)
-        let cache: Cache<(Uuid, Uuid), Arc<AtomicU32>> = Cache::builder()
-            .time_to_idle(Duration::from_secs(60))
-            .build();
+        let cache: Cache<(Uuid, Uuid), Arc<AtomicU32>> =
+            Cache::builder().max_capacity(1000).build();
 
         let org_id = Uuid::new_v4();
         let model_id = Uuid::new_v4();
         let key = (org_id, model_id);
         let limit: u32 = 3;
 
-        // Acquire 3 slots (should all succeed)
         let mut counters = Vec::new();
         for i in 0..3 {
             let counter = cache
                 .get_with(key, async { Arc::new(AtomicU32::new(0)) })
                 .await;
-            let current = counter.fetch_add(1, Ordering::Relaxed);
-            assert!(
-                current < limit,
-                "Request {} should be under limit, got count {}",
-                i,
-                current
-            );
+            loop {
+                let current = counter.load(Ordering::Acquire);
+                assert!(
+                    current < limit,
+                    "Request {} should be under limit, got count {}",
+                    i,
+                    current
+                );
+                if counter
+                    .compare_exchange_weak(
+                        current,
+                        current + 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    break;
+                }
+            }
             counters.push(counter);
         }
 
@@ -1169,23 +1187,21 @@ mod tests {
         let counter = cache
             .get_with(key, async { Arc::new(AtomicU32::new(0)) })
             .await;
-        let current = counter.fetch_add(1, Ordering::Relaxed);
+        let current = counter.load(Ordering::Acquire);
         assert!(
             current >= limit,
             "4th request should be over limit, got count {}",
             current
         );
-        // Rollback
-        counter.fetch_sub(1, Ordering::Relaxed);
 
         // Release one slot
-        counters[0].fetch_sub(1, Ordering::Relaxed);
+        counters[0].fetch_sub(1, Ordering::Release);
 
         // Now another request should succeed
         let counter = cache
             .get_with(key, async { Arc::new(AtomicU32::new(0)) })
             .await;
-        let current = counter.fetch_add(1, Ordering::Relaxed);
+        let current = counter.load(Ordering::Acquire);
         assert!(
             current < limit,
             "Request after release should succeed, got count {}",
@@ -1195,10 +1211,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_limit_different_orgs_and_models_independent() {
-        // Test that different org+model combinations have independent limits
-        let cache: Cache<(Uuid, Uuid), Arc<AtomicU32>> = Cache::builder()
-            .time_to_idle(Duration::from_secs(60))
-            .build();
+        let cache: Cache<(Uuid, Uuid), Arc<AtomicU32>> =
+            Cache::builder().max_capacity(1000).build();
 
         let org1 = Uuid::new_v4();
         let org2 = Uuid::new_v4();
@@ -1209,13 +1223,13 @@ mod tests {
         let counter1 = cache
             .get_with((org1, model_a), async { Arc::new(AtomicU32::new(0)) })
             .await;
-        counter1.fetch_add(64, Ordering::Relaxed);
+        counter1.fetch_add(64, Ordering::AcqRel);
 
         // org1 + model_b should still be able to make requests (different model)
         let counter2 = cache
             .get_with((org1, model_b), async { Arc::new(AtomicU32::new(0)) })
             .await;
-        let current = counter2.fetch_add(1, Ordering::Relaxed);
+        let current = counter2.load(Ordering::Acquire);
         assert_eq!(
             current, 0,
             "org1+model_b should start at 0, got {}",
@@ -1226,7 +1240,7 @@ mod tests {
         let counter3 = cache
             .get_with((org2, model_a), async { Arc::new(AtomicU32::new(0)) })
             .await;
-        let current = counter3.fetch_add(1, Ordering::Relaxed);
+        let current = counter3.load(Ordering::Acquire);
         assert_eq!(
             current, 0,
             "org2+model_a should start at 0, got {}",

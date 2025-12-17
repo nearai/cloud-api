@@ -37,25 +37,41 @@ fn validate_frontend_callback(
 
     let url = Url::parse(url_str).map_err(|_| "Invalid URL format")?;
 
+    // Validate URL structure first (defense-in-depth)
+    // Check scheme - must be HTTPS
+    if url.scheme() != "https" {
+        return Err("Callback URL must use HTTPS");
+    }
+
+    // Block userinfo BEFORE origin check to prevent potential parsing inconsistencies
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Invalid callback URL format");
+    }
+
+    // Check path for directory traversal attempts
+    let path = url.path();
+    if path.contains("../") || path.contains("%2e%2e") || path.contains("%2E%2E") {
+        return Err("Invalid path in callback URL");
+    }
+
+    // Double-check for @ character (defense-in-depth)
+    if url_str.contains('@') {
+        return Err("Invalid callback URL format");
+    }
+
+    // Then check origin against allowlist
     let origin_str = url.origin().unicode_serialization();
     let origin = origin_str.strip_suffix('/').unwrap_or(&origin_str);
     if !crate::is_origin_allowed(origin, cors_config) {
         return Err("Origin not allowed");
     }
 
-    let path = url.path();
-    if path.contains("../") || path.contains("%2e%2e") || path.contains("%2E%2E") {
-        return Err("Invalid path in callback URL");
-    }
-
-    if !url.username().is_empty() || url_str.contains('@') {
-        return Err("Invalid callback URL format");
-    }
-
+    // Reject query parameters
     if url.query().is_some() {
         return Err("Callback URL must not contain query parameters");
     }
 
+    // Reject fragments
     if url.fragment().is_some() {
         return Err("Callback URL must not contain fragments");
     }

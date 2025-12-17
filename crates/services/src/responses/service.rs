@@ -218,6 +218,72 @@ impl ResponseServiceImpl {
         }
     }
 
+    /// Filter conversation items to only include those in the ancestor chain
+    /// If target_response_id is None, returns all items unchanged
+    fn filter_to_ancestor_branch(
+        items: Vec<models::ResponseOutputItem>,
+        target_response_id: &Option<String>,
+    ) -> Vec<models::ResponseOutputItem> {
+        let Some(target_id) = target_response_id else {
+            return items;
+        };
+
+        // Build map of response_id -> previous_response_id from items
+        // Multiple items can share the same response_id (tool calls, messages, web searches
+        // from the same agent loop), so we use entry() to only insert once per response_id
+        let mut response_parent_map: std::collections::HashMap<String, Option<String>> =
+            std::collections::HashMap::new();
+        for item in &items {
+            let (resp_id, prev_id) = match item {
+                models::ResponseOutputItem::Message {
+                    response_id,
+                    previous_response_id,
+                    ..
+                }
+                | models::ResponseOutputItem::ToolCall {
+                    response_id,
+                    previous_response_id,
+                    ..
+                }
+                | models::ResponseOutputItem::WebSearchCall {
+                    response_id,
+                    previous_response_id,
+                    ..
+                }
+                | models::ResponseOutputItem::Reasoning {
+                    response_id,
+                    previous_response_id,
+                    ..
+                } => (response_id, previous_response_id),
+            };
+            response_parent_map
+                .entry(resp_id.clone())
+                .or_insert_with(|| prev_id.clone());
+        }
+
+        // Walk up from target to collect ancestor response IDs
+        let mut ancestors: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut current = Some(target_id.clone());
+        while let Some(resp_id) = current {
+            ancestors.insert(resp_id.clone());
+            current = response_parent_map.get(&resp_id).and_then(|p| p.clone());
+        }
+
+        // Filter items to only those in ancestor chain
+        items
+            .into_iter()
+            .filter(|item| {
+                let resp_id = match item {
+                    models::ResponseOutputItem::Message { response_id, .. }
+                    | models::ResponseOutputItem::ToolCall { response_id, .. }
+                    | models::ResponseOutputItem::WebSearchCall { response_id, .. }
+                    | models::ResponseOutputItem::Reasoning { response_id, .. } => response_id,
+                };
+                ancestors.contains(resp_id)
+            })
+            .collect()
+    }
+
     /// Extract content from a vector of content parts, handling text and files
     /// Returns a string with all parts joined by "\n\n"
     async fn extract_content_parts(
@@ -1448,6 +1514,10 @@ impl ResponseServiceImpl {
                     ))
                 })?;
 
+            // Filter to ancestor branch if previous_response_id is specified
+            let conversation_items =
+                Self::filter_to_ancestor_branch(conversation_items, &request.previous_response_id);
+
             // Convert response items to completion messages
             let messages_before = messages.len();
             for item in conversation_items {
@@ -1518,11 +1588,6 @@ impl ResponseServiceImpl {
                 conversation_id
             );
         }
-
-        // TODO: Load from previous_response_id if present
-        // if let Some(prev_response_id) = &request.previous_response_id {
-        //     // Load previous response
-        // }
 
         // Add input messages
         if let Some(input) = &request.input {
@@ -3212,5 +3277,188 @@ mod tests {
         );
         // Verify that searching for index 3 gets fourth result
         assert_eq!(final_registry.web_sources[3].url, "https://example.com/4");
+    }
+
+    #[test]
+    fn test_filter_to_ancestor_branch_no_filter() {
+        // When target_response_id is None, all items should be returned unchanged
+        let items = vec![
+            models::ResponseOutputItem::Message {
+                id: "msg_1".to_string(),
+                response_id: "resp_a".to_string(),
+                previous_response_id: None,
+                next_response_ids: vec!["resp_b".to_string()],
+                created_at: 1000,
+                role: "user".to_string(),
+                content: vec![],
+                status: models::ResponseItemStatus::Completed,
+                model: "test-model".to_string(),
+            },
+            models::ResponseOutputItem::Message {
+                id: "msg_2".to_string(),
+                response_id: "resp_b".to_string(),
+                previous_response_id: Some("resp_a".to_string()),
+                next_response_ids: vec![],
+                created_at: 2000,
+                role: "assistant".to_string(),
+                content: vec![],
+                status: models::ResponseItemStatus::Completed,
+                model: "test-model".to_string(),
+            },
+        ];
+
+        let result = ResponseServiceImpl::filter_to_ancestor_branch(items.clone(), &None);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_to_ancestor_branch_filters_to_chain() {
+        // Create a tree structure:
+        //     resp_a (root)
+        //     /    \
+        //  resp_b  resp_c
+        //    |
+        //  resp_d
+        //
+        // resp_b has multiple items (message + tool call) to verify all items
+        // from the same response are included.
+        // Filtering to resp_d should only include resp_a, resp_b (all items), resp_d
+        let items = vec![
+            models::ResponseOutputItem::Message {
+                id: "msg_a".to_string(),
+                response_id: "resp_a".to_string(),
+                previous_response_id: None,
+                next_response_ids: vec!["resp_b".to_string(), "resp_c".to_string()],
+                created_at: 1000,
+                role: "user".to_string(),
+                content: vec![],
+                status: models::ResponseItemStatus::Completed,
+                model: "test-model".to_string(),
+            },
+            // resp_b has a message
+            models::ResponseOutputItem::Message {
+                id: "msg_b".to_string(),
+                response_id: "resp_b".to_string(),
+                previous_response_id: Some("resp_a".to_string()),
+                next_response_ids: vec!["resp_d".to_string()],
+                created_at: 2000,
+                role: "assistant".to_string(),
+                content: vec![],
+                status: models::ResponseItemStatus::Completed,
+                model: "test-model".to_string(),
+            },
+            // resp_b also has a tool call (same response_id, multiple items)
+            models::ResponseOutputItem::ToolCall {
+                id: "tool_b".to_string(),
+                response_id: "resp_b".to_string(),
+                previous_response_id: Some("resp_a".to_string()),
+                next_response_ids: vec!["resp_d".to_string()],
+                created_at: 2001,
+                status: models::ResponseItemStatus::Completed,
+                tool_type: "function".to_string(),
+                function: models::ResponseOutputFunction {
+                    name: "web_search".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                model: "test-model".to_string(),
+            },
+            models::ResponseOutputItem::Message {
+                id: "msg_c".to_string(),
+                response_id: "resp_c".to_string(),
+                previous_response_id: Some("resp_a".to_string()),
+                next_response_ids: vec![],
+                created_at: 2000,
+                role: "assistant".to_string(),
+                content: vec![],
+                status: models::ResponseItemStatus::Completed,
+                model: "test-model".to_string(),
+            },
+            models::ResponseOutputItem::Message {
+                id: "msg_d".to_string(),
+                response_id: "resp_d".to_string(),
+                previous_response_id: Some("resp_b".to_string()),
+                next_response_ids: vec![],
+                created_at: 3000,
+                role: "user".to_string(),
+                content: vec![],
+                status: models::ResponseItemStatus::Completed,
+                model: "test-model".to_string(),
+            },
+        ];
+
+        // Filter to resp_d - should include:
+        // - resp_a (1 item)
+        // - resp_b (2 items: message + tool call)
+        // - resp_d (1 item)
+        // - NOT resp_c
+        let result = ResponseServiceImpl::filter_to_ancestor_branch(
+            items.clone(),
+            &Some("resp_d".to_string()),
+        );
+
+        // Total: 4 items (1 from resp_a, 2 from resp_b, 1 from resp_d)
+        assert_eq!(result.len(), 4);
+
+        let item_ids: Vec<&str> = result
+            .iter()
+            .map(|item| match item {
+                models::ResponseOutputItem::Message { id, .. } => id.as_str(),
+                models::ResponseOutputItem::ToolCall { id, .. } => id.as_str(),
+                _ => "",
+            })
+            .collect();
+
+        // Verify all items from ancestor responses are included
+        assert!(item_ids.contains(&"msg_a"));
+        assert!(item_ids.contains(&"msg_b"));
+        assert!(item_ids.contains(&"tool_b")); // Both items from resp_b
+        assert!(item_ids.contains(&"msg_d"));
+        // resp_c should be excluded
+        assert!(!item_ids.contains(&"msg_c"));
+    }
+
+    #[test]
+    fn test_filter_to_ancestor_branch_single_item() {
+        // Test with a single root item
+        let items = vec![models::ResponseOutputItem::Message {
+            id: "msg_1".to_string(),
+            response_id: "resp_a".to_string(),
+            previous_response_id: None,
+            next_response_ids: vec![],
+            created_at: 1000,
+            role: "user".to_string(),
+            content: vec![],
+            status: models::ResponseItemStatus::Completed,
+            model: "test-model".to_string(),
+        }];
+
+        let result = ResponseServiceImpl::filter_to_ancestor_branch(
+            items.clone(),
+            &Some("resp_a".to_string()),
+        );
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_to_ancestor_branch_nonexistent_target() {
+        // Test with a target that doesn't exist in the items
+        let items = vec![models::ResponseOutputItem::Message {
+            id: "msg_1".to_string(),
+            response_id: "resp_a".to_string(),
+            previous_response_id: None,
+            next_response_ids: vec![],
+            created_at: 1000,
+            role: "user".to_string(),
+            content: vec![],
+            status: models::ResponseItemStatus::Completed,
+            model: "test-model".to_string(),
+        }];
+
+        // Target "resp_z" doesn't exist - should return only items for "resp_z" (none)
+        let result = ResponseServiceImpl::filter_to_ancestor_branch(
+            items.clone(),
+            &Some("resp_z".to_string()),
+        );
+        assert_eq!(result.len(), 0);
     }
 }

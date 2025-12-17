@@ -444,7 +444,7 @@ pub async fn create_access_token(
             }))
         }
         Err(AuthError::Unauthorized) => {
-            error!("Token rotation failed: invalid or already rotated token");
+            tracing::warn!("Token rotation failed: invalid or already rotated token");
             Err((
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorResponse::new(

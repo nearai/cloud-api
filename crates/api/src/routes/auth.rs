@@ -236,7 +236,7 @@ pub async fn oauth_callback(
     {
         Some(ua) => ua,
         None => {
-            error!("Missing User-Agent header in OAuth callback");
+            tracing::warn!("Missing User-Agent header in OAuth callback");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -252,7 +252,7 @@ pub async fn oauth_callback(
     let oauth_state_row = match state_store.get_and_delete(&params.state).await {
         Ok(Some(row)) => row,
         Ok(None) => {
-            error!("Invalid or expired OAuth state: {}", params.state);
+            tracing::warn!("Invalid or expired OAuth state: {}", params.state);
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -433,7 +433,7 @@ pub async fn near_login(
     let signed_message = match auth_request.signed_message.try_into() {
         Ok(msg) => msg,
         Err(e) => {
-            error!("Failed to parse signed message: {}", e);
+            tracing::warn!("Failed to parse signed message: {}", e);
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -448,7 +448,7 @@ pub async fn near_login(
     let payload = match auth_request.payload.try_into() {
         Ok(p) => p,
         Err(e) => {
-            error!("Failed to parse payload: {}", e);
+            tracing::warn!("Failed to parse payload: {}", e);
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -464,7 +464,7 @@ pub async fn near_login(
     let user_agent_header = match headers.get("User-Agent").and_then(|h| h.to_str().ok()) {
         Some(ua) => ua,
         None => {
-            error!("Missing User-Agent header");
+            tracing::warn!("Missing User-Agent header");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({

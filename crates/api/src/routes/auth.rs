@@ -38,8 +38,12 @@ fn validate_frontend_callback(
     let url = Url::parse(url_str).map_err(|_| "Invalid URL format")?;
 
     // Validate URL structure first (defense-in-depth)
-    // Check scheme - must be HTTPS
-    if url.scheme() != "https" {
+    // Check scheme - must be HTTPS (except localhost/127.0.0.1 for development)
+    let origin_str = url.origin().unicode_serialization();
+    let is_localhost =
+        origin_str.starts_with("http://localhost") || origin_str.starts_with("http://127.0.0.1");
+
+    if url.scheme() != "https" && !is_localhost {
         return Err("Callback URL must use HTTPS");
     }
 
@@ -49,8 +53,13 @@ fn validate_frontend_callback(
     }
 
     // Check path for directory traversal attempts
+    // The url crate normalizes most paths (e.g., %2e%2e → ..), but cannot normalize paths
+    // where encoding prevents it (e.g., ..%2f../). Also catches double-encoded sequences.
     let path = url.path();
-    if path.contains("../") || path.contains("%2e%2e") || path.contains("%2E%2E") {
+    if path.contains("..")     // Catches cases where encoding prevented normalization
+        || path.contains("%25")
+    // Encoded percent sign indicates double-encoding
+    {
         return Err("Invalid path in callback URL");
     }
 
@@ -60,7 +69,6 @@ fn validate_frontend_callback(
     }
 
     // Then check origin against allowlist
-    let origin_str = url.origin().unicode_serialization();
     let origin = origin_str.strip_suffix('/').unwrap_or(&origin_str);
     if !crate::is_origin_allowed(origin, cors_config) {
         return Err("Origin not allowed");

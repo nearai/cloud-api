@@ -228,14 +228,14 @@ pub async fn upload_file(
                 }
                 _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
             };
-            
+
             // Log client errors as warn, server errors as error
             if status.is_client_error() {
                 tracing::warn!("File upload failed with client error: {}", e);
             } else {
                 tracing::error!("File upload failed with server error: {}", e);
             }
-            
+
             (
                 status,
                 Json(ErrorResponse::new(e.to_string(), error_type.to_string())),
@@ -423,14 +423,14 @@ pub async fn get_file(
                 }
                 _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
             };
-            
+
             // Log client errors as warn, server errors as error
             if status.is_client_error() {
                 tracing::warn!("Failed to retrieve file: {}", e);
             } else {
                 tracing::error!("Failed to retrieve file: {}", e);
             }
-            
+
             (
                 status,
                 Json(ErrorResponse::new(
@@ -503,14 +503,14 @@ pub async fn delete_file(
                 }
                 _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
             };
-            
+
             // Log client errors as warn, server errors as error
             if status.is_client_error() {
                 tracing::warn!("Failed to delete file: {}", e);
             } else {
                 tracing::error!("Failed to delete file: {}", e);
             }
-            
+
             (
                 status,
                 Json(ErrorResponse::new(
@@ -591,14 +591,14 @@ pub async fn get_file_content(
                 }
                 _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
             };
-            
+
             // Log client errors as warn, server errors as error
             if status.is_client_error() {
                 tracing::warn!("Failed to retrieve file content: {}", e);
             } else {
                 tracing::error!("Failed to retrieve file content: {}", e);
             }
-            
+
             (
                 status,
                 Json(ErrorResponse::new(

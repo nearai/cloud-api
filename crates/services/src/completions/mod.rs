@@ -5,7 +5,10 @@ use crate::inference_provider_pool::InferenceProviderPool;
 use crate::models::ModelsRepository;
 use crate::usage::{RecordUsageServiceRequest, UsageServiceTrait};
 use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, StreamingResult};
+use moka::future::Cache;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
 // Create a new stream that intercepts messages, but passes the original ones through
@@ -14,6 +17,9 @@ use futures_util::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
+
+/// Maximum concurrent requests per organization per model (protects service from being overwhelmed)
+const DEFAULT_CONCURRENT_LIMIT: u32 = 64;
 
 /// Hash inference ID to UUID deterministically using MD5 (v5)
 /// Takes the full ID including prefix (e.g., "chatcmpl-abc123") and returns a stable UUID
@@ -65,6 +71,8 @@ where
     total_itl_ms: f64,
     // Pre-allocated low-cardinality metric tags (for Datadog/OTLP)
     metric_tags: Vec<String>,
+    /// Counter to decrement on drop (for concurrent request limiting per org)
+    concurrent_counter: Option<Arc<AtomicU32>>,
 }
 
 impl<S> Stream for InterceptStream<S>
@@ -230,12 +238,26 @@ where
     }
 }
 
+impl<S> Drop for InterceptStream<S>
+where
+    S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
+{
+    fn drop(&mut self) {
+        if let Some(counter) = &self.concurrent_counter {
+            counter.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
 pub struct CompletionServiceImpl {
     pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub attestation_service: Arc<dyn AttestationServiceTrait>,
     pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     pub metrics_service: Arc<dyn MetricsServiceTrait>,
     pub models_repository: Arc<dyn ModelsRepository>,
+    /// Tracks concurrent requests per (organization, model) to prevent any single org from overwhelming a model
+    concurrent_counts: Cache<(Uuid, Uuid), Arc<AtomicU32>>,
+    concurrent_limit: u32,
 }
 
 impl CompletionServiceImpl {
@@ -246,12 +268,18 @@ impl CompletionServiceImpl {
         metrics_service: Arc<dyn MetricsServiceTrait>,
         models_repository: Arc<dyn ModelsRepository>,
     ) -> Self {
+        let concurrent_counts = Cache::builder()
+            .time_to_idle(Duration::from_secs(300))
+            .build();
+
         Self {
             inference_provider_pool,
             attestation_service,
             usage_service,
             metrics_service,
             models_repository,
+            concurrent_counts,
+            concurrent_limit: DEFAULT_CONCURRENT_LIMIT,
         }
     }
 
@@ -361,6 +389,7 @@ impl CompletionServiceImpl {
         inference_type: &str,
         service_start_time: Instant,
         provider_start_time: Instant,
+        concurrent_counter: Option<Arc<AtomicU32>>,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
         let metric_tags = Self::create_metric_tags(&model_name);
@@ -393,6 +422,7 @@ impl CompletionServiceImpl {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
+            concurrent_counter,
         };
         Box::pin(intercepted_stream)
     }
@@ -486,6 +516,29 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             chat_params.model = canonical_name.clone();
         }
 
+        // Check concurrent request limit for this organization + model combination
+        let limit_key = (organization_id, model.id);
+        let counter = self
+            .concurrent_counts
+            .get_with(limit_key, async { Arc::new(AtomicU32::new(0)) })
+            .await;
+
+        let current = counter.fetch_add(1, Ordering::Relaxed);
+        if current >= self.concurrent_limit {
+            counter.fetch_sub(1, Ordering::Relaxed);
+            tracing::warn!(
+                organization_id = %organization_id,
+                model_id = %model.id,
+                model_name = %canonical_name,
+                current_count = current + 1,
+                limit = self.concurrent_limit,
+                "Organization concurrent request limit exceeded for model"
+            );
+            let err = ports::CompletionError::RateLimitExceeded;
+            self.record_error(&err, Some(canonical_name));
+            return Err(err);
+        }
+
         let provider_start_time = Instant::now();
 
         // Get the LLM stream
@@ -496,6 +549,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         {
             Ok(stream) => stream,
             Err(e) => {
+                counter.fetch_sub(1, Ordering::Relaxed);
                 let err = Self::map_provider_error(&request.model, &e, "chat completion stream");
                 self.record_error(&err, Some(canonical_name));
                 return Err(err);
@@ -521,6 +575,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 inference_type,
                 service_start_time,
                 provider_start_time,
+                Some(counter),
             )
             .await;
 
@@ -608,14 +663,42 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             chat_params.model = canonical_name.clone();
         }
 
+        // Check concurrent request limit for this organization + model combination
+        let organization_id = request.organization_id;
+        let limit_key = (organization_id, model.id);
+        let counter = self
+            .concurrent_counts
+            .get_with(limit_key, async { Arc::new(AtomicU32::new(0)) })
+            .await;
+
+        let current = counter.fetch_add(1, Ordering::Relaxed);
+        if current >= self.concurrent_limit {
+            counter.fetch_sub(1, Ordering::Relaxed);
+            tracing::warn!(
+                organization_id = %organization_id,
+                model_id = %model.id,
+                model_name = %canonical_name,
+                current_count = current + 1,
+                limit = self.concurrent_limit,
+                "Organization concurrent request limit exceeded for model"
+            );
+            let err = ports::CompletionError::RateLimitExceeded;
+            self.record_error(&err, Some(canonical_name));
+            return Err(err);
+        }
+
         let provider_start_time = Instant::now();
         let response_with_bytes = match self
             .inference_provider_pool
             .chat_completion(chat_params, request.body_hash.clone())
             .await
         {
-            Ok(response) => response,
+            Ok(response) => {
+                counter.fetch_sub(1, Ordering::Relaxed);
+                response
+            }
             Err(e) => {
+                counter.fetch_sub(1, Ordering::Relaxed);
                 let err = Self::map_provider_error(&request.model, &e, "chat completion");
                 self.record_error(&err, Some(canonical_name));
                 return Err(err);
@@ -671,7 +754,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // Record usage with model UUID
         // Note: TTFT doesn't apply to non-streaming (you get all tokens at once)
         let usage_service = self.usage_service.clone();
-        let organization_id = request.organization_id;
         let workspace_id = request.workspace_id;
         let model_id = model.id;
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
@@ -794,6 +876,7 @@ mod tests {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
+            concurrent_counter: None,
         };
 
         // Consume the stream
@@ -932,6 +1015,7 @@ mod tests {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
+            concurrent_counter: None,
         };
 
         // Consume the stream
@@ -1033,6 +1117,7 @@ mod tests {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
+            concurrent_counter: None,
         };
 
         let _ = intercept_stream.collect::<Vec<_>>().await;
@@ -1049,6 +1134,149 @@ mod tests {
             req.avg_itl_ms.is_none(),
             "avg_itl_ms should be None for single chunk, got {:?}",
             req.avg_itl_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_limit_state() {
+        // Test the concurrent counting mechanism directly (keyed by org_id + model_id)
+        let cache: Cache<(Uuid, Uuid), Arc<AtomicU32>> = Cache::builder()
+            .time_to_idle(Duration::from_secs(60))
+            .build();
+
+        let org_id = Uuid::new_v4();
+        let model_id = Uuid::new_v4();
+        let key = (org_id, model_id);
+        let limit: u32 = 3;
+
+        // Acquire 3 slots (should all succeed)
+        let mut counters = Vec::new();
+        for i in 0..3 {
+            let counter = cache
+                .get_with(key, async { Arc::new(AtomicU32::new(0)) })
+                .await;
+            let current = counter.fetch_add(1, Ordering::Relaxed);
+            assert!(
+                current < limit,
+                "Request {} should be under limit, got count {}",
+                i,
+                current
+            );
+            counters.push(counter);
+        }
+
+        // 4th request should be over limit
+        let counter = cache
+            .get_with(key, async { Arc::new(AtomicU32::new(0)) })
+            .await;
+        let current = counter.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            current >= limit,
+            "4th request should be over limit, got count {}",
+            current
+        );
+        // Rollback
+        counter.fetch_sub(1, Ordering::Relaxed);
+
+        // Release one slot
+        counters[0].fetch_sub(1, Ordering::Relaxed);
+
+        // Now another request should succeed
+        let counter = cache
+            .get_with(key, async { Arc::new(AtomicU32::new(0)) })
+            .await;
+        let current = counter.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            current < limit,
+            "Request after release should succeed, got count {}",
+            current
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_limit_different_orgs_and_models_independent() {
+        // Test that different org+model combinations have independent limits
+        let cache: Cache<(Uuid, Uuid), Arc<AtomicU32>> = Cache::builder()
+            .time_to_idle(Duration::from_secs(60))
+            .build();
+
+        let org1 = Uuid::new_v4();
+        let org2 = Uuid::new_v4();
+        let model_a = Uuid::new_v4();
+        let model_b = Uuid::new_v4();
+
+        // Fill up org1 + model_a's limit
+        let counter1 = cache
+            .get_with((org1, model_a), async { Arc::new(AtomicU32::new(0)) })
+            .await;
+        counter1.fetch_add(64, Ordering::Relaxed);
+
+        // org1 + model_b should still be able to make requests (different model)
+        let counter2 = cache
+            .get_with((org1, model_b), async { Arc::new(AtomicU32::new(0)) })
+            .await;
+        let current = counter2.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(
+            current, 0,
+            "org1+model_b should start at 0, got {}",
+            current
+        );
+
+        // org2 + model_a should still be able to make requests (different org)
+        let counter3 = cache
+            .get_with((org2, model_a), async { Arc::new(AtomicU32::new(0)) })
+            .await;
+        let current = counter3.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(
+            current, 0,
+            "org2+model_a should start at 0, got {}",
+            current
+        );
+    }
+
+    #[tokio::test]
+    async fn test_intercept_stream_decrements_on_drop() {
+        // Test that InterceptStream decrements the counter when dropped
+        let counter = Arc::new(AtomicU32::new(1)); // Start at 1 (simulating acquired slot)
+
+        {
+            let metrics_service = Arc::new(CapturingMetricsService::new());
+            let attestation_service = Arc::new(MockAttestationService);
+            let usage_service = Arc::new(MockUsageService);
+
+            let stream =
+                stream::iter::<Vec<Result<SSEEvent, inference_providers::CompletionError>>>(vec![]);
+
+            let _intercept_stream = InterceptStream {
+                inner: stream,
+                attestation_service,
+                usage_service,
+                metrics_service,
+                organization_id: Uuid::new_v4(),
+                workspace_id: Uuid::new_v4(),
+                api_key_id: Uuid::new_v4(),
+                model_id: Uuid::new_v4(),
+                model_name: "test-model".to_string(),
+                inference_type: "chat_completion_stream".to_string(),
+                service_start_time: Instant::now(),
+                provider_start_time: Instant::now(),
+                first_token_received: false,
+                first_token_time: None,
+                ttft_ms: None,
+                token_count: 0,
+                last_token_time: None,
+                total_itl_ms: 0.0,
+                metric_tags: vec![],
+                concurrent_counter: Some(counter.clone()),
+            };
+            // InterceptStream goes out of scope here and Drop is called
+        }
+
+        // Counter should be decremented to 0
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "Counter should be 0 after stream dropped"
         );
     }
 }

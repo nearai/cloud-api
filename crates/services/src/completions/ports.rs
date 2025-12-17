@@ -35,6 +35,9 @@ pub enum CompletionError {
     #[error("Provider error: {0}")]
     ProviderError(String),
 
+    #[error("Service overloaded: {0}")]
+    ServiceOverloaded(String),
+
     #[error("Internal error: {0}")]
     InternalError(String),
 }

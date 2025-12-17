@@ -41,6 +41,7 @@ pub const ERROR_TYPE_INVALID_MODEL: &str = "invalid_model";
 pub const ERROR_TYPE_INVALID_PARAMS: &str = "invalid_params";
 pub const ERROR_TYPE_RATE_LIMIT: &str = "rate_limit";
 pub const ERROR_TYPE_INFERENCE_ERROR: &str = "inference_error";
+pub const ERROR_TYPE_SERVICE_OVERLOADED: &str = "service_overloaded";
 pub const ERROR_TYPE_INTERNAL_ERROR: &str = "internal_error";
 
 // Failure reasons (for verification)

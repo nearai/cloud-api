@@ -371,6 +371,42 @@ impl CompletionServiceImpl {
             .collect()
     }
 
+    async fn try_acquire_concurrent_slot(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+    ) -> Result<Arc<AtomicU32>, ports::CompletionError> {
+        let counter = self
+            .concurrent_counts
+            .get_with((organization_id, model_id), async {
+                Arc::new(AtomicU32::new(0))
+            })
+            .await;
+
+        loop {
+            let current = counter.load(Ordering::Acquire);
+            if current >= self.concurrent_limit {
+                tracing::warn!(
+                    organization_id = %organization_id,
+                    model_id = %model_id,
+                    model_name = %model_name,
+                    current_count = current,
+                    limit = self.concurrent_limit,
+                    "Organization concurrent request limit exceeded for model"
+                );
+                self.record_error(&ports::CompletionError::RateLimitExceeded, Some(model_name));
+                return Err(ports::CompletionError::RateLimitExceeded);
+            }
+            if counter
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(counter);
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn handle_stream_with_context(
         &self,
@@ -510,35 +546,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             chat_params.model = canonical_name.clone();
         }
 
-        // Check concurrent request limit for this organization + model combination
-        let limit_key = (organization_id, model.id);
         let counter = self
-            .concurrent_counts
-            .get_with(limit_key, async { Arc::new(AtomicU32::new(0)) })
-            .await;
-
-        loop {
-            let current = counter.load(Ordering::Acquire);
-            if current >= self.concurrent_limit {
-                tracing::warn!(
-                    organization_id = %organization_id,
-                    model_id = %model.id,
-                    model_name = %canonical_name,
-                    current_count = current,
-                    limit = self.concurrent_limit,
-                    "Organization concurrent request limit exceeded for model"
-                );
-                let err = ports::CompletionError::RateLimitExceeded;
-                self.record_error(&err, Some(canonical_name));
-                return Err(err);
-            }
-            if counter
-                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                break;
-            }
-        }
+            .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
+            .await?;
 
         let provider_start_time = Instant::now();
 
@@ -664,49 +674,21 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             chat_params.model = canonical_name.clone();
         }
 
-        // Check concurrent request limit for this organization + model combination
         let organization_id = request.organization_id;
-        let limit_key = (organization_id, model.id);
         let counter = self
-            .concurrent_counts
-            .get_with(limit_key, async { Arc::new(AtomicU32::new(0)) })
-            .await;
-
-        loop {
-            let current = counter.load(Ordering::Acquire);
-            if current >= self.concurrent_limit {
-                tracing::warn!(
-                    organization_id = %organization_id,
-                    model_id = %model.id,
-                    model_name = %canonical_name,
-                    current_count = current,
-                    limit = self.concurrent_limit,
-                    "Organization concurrent request limit exceeded for model"
-                );
-                let err = ports::CompletionError::RateLimitExceeded;
-                self.record_error(&err, Some(canonical_name));
-                return Err(err);
-            }
-            if counter
-                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                break;
-            }
-        }
+            .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
+            .await?;
 
         let provider_start_time = Instant::now();
-        let response_with_bytes = match self
+        let result = self
             .inference_provider_pool
             .chat_completion(chat_params, request.body_hash.clone())
-            .await
-        {
-            Ok(response) => {
-                counter.fetch_sub(1, Ordering::Release);
-                response
-            }
+            .await;
+        counter.fetch_sub(1, Ordering::Release);
+
+        let response_with_bytes = match result {
+            Ok(response) => response,
             Err(e) => {
-                counter.fetch_sub(1, Ordering::Release);
                 let err = Self::map_provider_error(&request.model, &e, "chat completion");
                 self.record_error(&err, Some(canonical_name));
                 return Err(err);

@@ -47,7 +47,7 @@ impl PgResponseRepository {
                     FROM responses
                     WHERE conversation_id = $1
                       AND workspace_id = $2
-                      AND COALESCE((metadata->>'root_response')::boolean, false) = true
+                      AND metadata->>'root_response' = 'true'
                     ORDER BY created_at ASC
                     LIMIT 1
                     "#,
@@ -84,8 +84,11 @@ impl PgResponseRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
-                .query_one(
+            // Try to insert the root response. If another concurrent request has already
+            // created it, the unique index on (conversation_id) for root responses will
+            // cause a conflict; in that case we do nothing and re-query the existing root.
+            let inserted_row_opt = client
+                .query_opt(
                     r#"
                     INSERT INTO responses (
                         workspace_id, api_key_id, model, status, instructions, conversation_id,
@@ -93,6 +96,8 @@ impl PgResponseRepository {
                         created_at, updated_at
                     )
                     VALUES ($1, $2, $3, $4, NULL, $5, NULL, $6, $7, $8, $9, $9)
+                    ON CONFLICT (conversation_id) WHERE metadata->>'root_response' = 'true'
+                    DO NOTHING
                     RETURNING id
                     "#,
                     &[
@@ -108,7 +113,28 @@ impl PgResponseRepository {
                     ],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+
+            if let Some(row) = inserted_row_opt {
+                Ok(row)
+            } else {
+                // Another request created the root concurrently; fetch and return it.
+                client
+                    .query_one(
+                        r#"
+                        SELECT id
+                        FROM responses
+                        WHERE conversation_id = $1
+                          AND workspace_id = $2
+                          AND metadata->>'root_response' = 'true'
+                        ORDER BY created_at ASC
+                        LIMIT 1
+                        "#,
+                        &[&conversation_uuid, &workspace_id.0],
+                    )
+                    .await
+                    .map_err(map_db_error)
+            }
         })?;
 
         let root_id: Uuid = row.get("id");
@@ -711,9 +737,8 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         workspace_id: WorkspaceId,
     ) -> Result<Option<ResponseObject>, anyhow::Error> {
         // Fetch the most recent "real" response in this conversation.
-        // We explicitly exclude structural/root and backfill responses:
+        // We explicitly exclude root responses:
         // - root_response: internal structural parent for the first turn
-        // - backfill: placeholder responses used only for backfilled items
         let row_result = retry_db!("get_latest_response_in_conversation", {
             let client = self
                 .pool

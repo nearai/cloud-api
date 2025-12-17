@@ -1420,6 +1420,9 @@ mod tests {
                 total_itl_ms: 0.0,
                 metric_tags: vec![],
                 concurrent_counter: Some(counter.clone()),
+                last_usage_stats: None,
+                inference_id: Uuid::new_v4(),
+                usage_recorded: Arc::new(AtomicBool::new(false)),
             };
             // InterceptStream goes out of scope here and Drop is called
         }

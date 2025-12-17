@@ -304,7 +304,7 @@ pub async fn admin_middleware(
             let is_admin = check_admin_access(&state, &user);
 
             if !is_admin {
-                error!("User attempted admin action without admin privileges");
+                tracing::warn!("User attempted admin action without admin privileges");
                 return Err((
                     StatusCode::FORBIDDEN,
                     axum::Json(crate::models::ErrorResponse::new(
@@ -558,7 +558,7 @@ async fn authenticate_api_key(
             ))
         }
         Err(AuthError::UserNotFound) => {
-            error!("API key references non-existent user");
+            tracing::warn!("API key references non-existent user");
             Err((
                 StatusCode::UNAUTHORIZED,
                 axum::Json(crate::models::ErrorResponse::new(
@@ -614,7 +614,7 @@ async fn authenticate_api_key_with_context(
             })
         }
         Ok(None) => {
-            error!("Workspace not found for API key");
+            tracing::warn!("Workspace not found for API key");
             Err((
                 StatusCode::UNAUTHORIZED,
                 axum::Json(crate::models::ErrorResponse::new(

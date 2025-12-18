@@ -107,29 +107,6 @@ pub struct FunctionDefinition {
     pub parameters: serde_json::Value,
 }
 
-/// Response format specification
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ResponseFormat {
-    #[serde(rename = "text")]
-    Text,
-    #[serde(rename = "json_object")]
-    JsonObject,
-    #[serde(rename = "json_schema")]
-    JsonSchema { json_schema: JsonSchema },
-}
-
-/// JSON schema specification for structured outputs
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JsonSchema {
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub schema: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub strict: Option<bool>,
-}
-
 /// Tool choice specification
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -216,10 +193,6 @@ pub struct ChatCompletionParams {
     /// Unique identifier for the end-user
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
-
-    /// Response format specification
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response_format: Option<ResponseFormat>,
 
     /// Random seed for deterministic sampling
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -13,6 +13,7 @@ use services::auth::near::NearAuthError;
 use services::auth::{AuthServiceTrait, OAuthManager};
 use std::sync::Arc;
 use tracing::{debug, error, info};
+use url::Url;
 
 /// OAuth state storage backed by PostgreSQL for multi-instance support
 pub type StateStore = Arc<OAuthStateRepository>;
@@ -26,10 +27,75 @@ pub type AuthState = (
 
 pub type NearAuthState = (Arc<services::auth::NearAuthService>, Arc<ApiConfig>);
 
+fn validate_frontend_callback(
+    url_str: &str,
+    cors_config: &config::CorsConfig,
+) -> Result<Url, &'static str> {
+    if url_str.len() > 2048 {
+        return Err("URL too long");
+    }
+
+    let url = Url::parse(url_str).map_err(|_| "Invalid URL format")?;
+
+    // Validate URL structure first (defense-in-depth)
+    // Check scheme - must be HTTPS (except localhost/127.0.0.1 for development)
+    let origin_str = url.origin().unicode_serialization();
+    let is_localhost =
+        origin_str.starts_with("http://localhost") || origin_str.starts_with("http://127.0.0.1");
+
+    if url.scheme() != "https" && !is_localhost {
+        return Err("Callback URL must use HTTPS");
+    }
+
+    // Block userinfo BEFORE origin check to prevent potential parsing inconsistencies
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Invalid callback URL format");
+    }
+
+    // Check path for directory traversal attempts
+    // The url crate normalizes most paths (e.g., %2e%2e → ..), but cannot normalize paths
+    // where encoding prevents it (e.g., ..%2f../). Also catches double-encoded sequences.
+    let path = url.path();
+    if path.contains("..")     // Catches cases where encoding prevented normalization
+        || path.contains("%25")
+    // Encoded percent sign indicates double-encoding
+    {
+        return Err("Invalid path in callback URL");
+    }
+
+    // Double-check for @ character (defense-in-depth)
+    if url_str.contains('@') {
+        return Err("Invalid callback URL format");
+    }
+
+    // Then check origin against allowlist
+    let origin = origin_str.strip_suffix('/').unwrap_or(&origin_str);
+    if !crate::is_origin_allowed(origin, cors_config) {
+        return Err("Origin not allowed");
+    }
+
+    // Reject query parameters
+    if url.query().is_some() {
+        return Err("Callback URL must not contain query parameters");
+    }
+
+    // Reject fragments
+    if url.fragment().is_some() {
+        return Err("Callback URL must not contain fragments");
+    }
+
+    Ok(url)
+}
+
 #[derive(Deserialize)]
 pub struct OAuthCallback {
     code: String,
     state: String,
+}
+
+#[derive(Deserialize)]
+pub struct OAuthInitQuery {
+    pub frontend_callback: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -170,9 +236,23 @@ pub struct NearAuthResponse {
 
 /// Initiate GitHub OAuth flow - redirects to GitHub
 pub async fn github_login(
-    State((oauth, state_store, _auth_service, _config)): State<AuthState>,
+    Query(params): Query<OAuthInitQuery>,
+    State((oauth, state_store, _auth_service, config)): State<AuthState>,
 ) -> Result<Redirect, StatusCode> {
-    debug!("Initiating GitHub OAuth flow");
+    debug!(
+        "Initiating GitHub OAuth flow - frontend_callback: {}",
+        params.frontend_callback.is_some()
+    );
+
+    if let Some(ref callback_url) = params.frontend_callback {
+        if let Err(err_msg) = validate_frontend_callback(callback_url, &config.cors) {
+            error!(
+                "frontend_callback validation failed at GitHub login: {}",
+                err_msg
+            );
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
 
     let (auth_url, state) = oauth.github_auth_url().map_err(|_| {
         error!("Failed to generate GitHub auth URL");
@@ -181,7 +261,12 @@ pub async fn github_login(
 
     // Store state in database for multi-instance support
     state_store
-        .create(state.clone(), "github".to_string(), None)
+        .create(
+            state.clone(),
+            "github".to_string(),
+            None,
+            params.frontend_callback.clone(),
+        )
         .await
         .map_err(|e| {
             error!("Failed to store OAuth state: {}", e);
@@ -194,9 +279,23 @@ pub async fn github_login(
 
 /// Initiate Google OAuth flow - redirects to Google
 pub async fn google_login(
-    State((oauth, state_store, _auth_service, _config)): State<AuthState>,
+    Query(params): Query<OAuthInitQuery>,
+    State((oauth, state_store, _auth_service, config)): State<AuthState>,
 ) -> Result<Redirect, StatusCode> {
-    debug!("Initiating Google OAuth flow");
+    debug!(
+        "Initiating Google OAuth flow - frontend_callback: {}",
+        params.frontend_callback.is_some()
+    );
+
+    if let Some(ref callback_url) = params.frontend_callback {
+        if let Err(err_msg) = validate_frontend_callback(callback_url, &config.cors) {
+            error!(
+                "frontend_callback validation failed at Google login: {}",
+                err_msg
+            );
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
 
     let (auth_url, state, pkce_verifier) = oauth.google_auth_url().map_err(|_| {
         error!("Failed to generate Google auth URL");
@@ -205,7 +304,12 @@ pub async fn google_login(
 
     // Store state and PKCE verifier in database for multi-instance support
     state_store
-        .create(state.clone(), "google".to_string(), Some(pkce_verifier))
+        .create(
+            state.clone(),
+            "google".to_string(),
+            Some(pkce_verifier),
+            params.frontend_callback.clone(),
+        )
         .await
         .map_err(|e| {
             error!("Failed to store OAuth state: {}", e);
@@ -236,7 +340,7 @@ pub async fn oauth_callback(
     {
         Some(ua) => ua,
         None => {
-            error!("Missing User-Agent header in OAuth callback");
+            tracing::warn!("Missing User-Agent header in OAuth callback");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -252,7 +356,7 @@ pub async fn oauth_callback(
     let oauth_state_row = match state_store.get_and_delete(&params.state).await {
         Ok(Some(row)) => row,
         Ok(None) => {
-            error!("Invalid or expired OAuth state: {}", params.state);
+            tracing::warn!("Invalid or expired OAuth state: {}", params.state);
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -363,6 +467,36 @@ pub async fn oauth_callback(
         Ok((access_token, refresh_session, refresh_token)) => {
             debug!("Session created successfully for user: {}", user.email);
 
+            if let Some(frontend_url) = oauth_state_row.frontend_callback {
+                let validated_url = match validate_frontend_callback(&frontend_url, &config.cors) {
+                    Ok(url) => url,
+                    Err(err_msg) => {
+                        error!(
+                            "frontend_callback validation failed at callback: {}",
+                            err_msg
+                        );
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "invalid_request",
+                                "error_description": "Invalid frontend callback URL"
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
+
+                let mut callback_url = validated_url.clone();
+                callback_url.set_fragment(Some(&format!(
+                    "token={}&refresh_token={}",
+                    urlencoding::encode(&access_token),
+                    urlencoding::encode(&refresh_token)
+                )));
+
+                info!("Redirecting to frontend callback");
+                return Redirect::temporary(callback_url.as_str()).into_response();
+            }
+
             let response = TokenExchangeResponse {
                 access_token,
                 refresh_token,
@@ -433,7 +567,7 @@ pub async fn near_login(
     let signed_message = match auth_request.signed_message.try_into() {
         Ok(msg) => msg,
         Err(e) => {
-            error!("Failed to parse signed message: {}", e);
+            tracing::warn!("Failed to parse signed message: {}", e);
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -448,7 +582,7 @@ pub async fn near_login(
     let payload = match auth_request.payload.try_into() {
         Ok(p) => p,
         Err(e) => {
-            error!("Failed to parse payload: {}", e);
+            tracing::warn!("Failed to parse payload: {}", e);
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -464,7 +598,7 @@ pub async fn near_login(
     let user_agent_header = match headers.get("User-Agent").and_then(|h| h.to_str().ok()) {
         Some(ua) => ua,
         None => {
-            error!("Missing User-Agent header");
+            tracing::warn!("Missing User-Agent header");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({

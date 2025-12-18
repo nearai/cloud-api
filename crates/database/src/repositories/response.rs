@@ -362,10 +362,6 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             service_tier: "default".to_string(),
             store: request.store.unwrap_or(false),
             temperature: request.temperature.unwrap_or(1.0),
-            text: request.text.or(Some(ResponseTextConfig {
-                format: ResponseTextFormat::Text,
-                verbosity: Some("medium".to_string()),
-            })),
             tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
             tools: request.tools.clone().unwrap_or_else(|| {
                 vec![ResponseTool::WebSearch {
@@ -504,7 +500,6 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             service_tier: "default".to_string(),
             store: false,
             temperature: 1.0,
-            text: None,
             tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
             tools: vec![],
             top_logprobs: 0,
@@ -665,10 +660,6 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             service_tier: "default".to_string(),
             store: false,     // Not stored in DB
             temperature: 1.0, // Not stored in DB
-            text: Some(ResponseTextConfig {
-                format: ResponseTextFormat::Text,
-                verbosity: Some("medium".to_string()),
-            }),
             tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
             tools: vec![], // Not stored in DB
             top_logprobs: 0,
@@ -843,7 +834,6 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             service_tier: "default".to_string(),
             store: false,
             temperature: 1.0,
-            text: None,
             tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
             tools: vec![],
             top_logprobs: 0,

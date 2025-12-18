@@ -3329,3 +3329,161 @@ async fn test_conversation_title_strips_thinking_tags() {
     );
     println!("✅ Title stripped thinking tags: {title}");
 }
+
+#[tokio::test]
+async fn test_chat_completions_with_json_schema() {
+    use common::mock_prompts;
+    use inference_providers::mock::{RequestMatcher, ResponseTemplate};
+
+    let (server, _pool, mock, _db) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Configure mock to match exact prompt and return structured JSON
+    // Chat completions API sends messages directly without language instruction
+    let user_message = "Generate a user profile";
+    let expected_prompt = mock_prompts::build_simple_prompt(user_message);
+    let expected_json = r#"{"name": "Alice Johnson", "age": 28, "email": "alice@example.com"}"#;
+
+    mock.when(RequestMatcher::ExactPrompt(expected_prompt))
+        .respond_with(ResponseTemplate::new(expected_json))
+        .await;
+
+    // Make a chat completion request with response_format
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": user_message
+                }
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "user_profile",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "age": {"type": "integer"},
+                            "email": {"type": "string"}
+                        },
+                        "required": ["name", "age", "email"]
+                    },
+                    "strict": true
+                }
+            }
+        }))
+        .await;
+
+    if response.status_code() != 200 {
+        let error = response.text();
+        println!("Error response: {}", error);
+    }
+    assert_eq!(response.status_code(), 200);
+    let completion = response.json::<serde_json::Value>();
+
+    // Verify the response contains the expected JSON
+    let content = completion["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("Expected content in response");
+
+    assert_eq!(content, expected_json);
+
+    // Verify it's valid JSON matching the schema
+    let json_obj: serde_json::Value =
+        serde_json::from_str(content).expect("Content should be valid JSON");
+    assert_eq!(json_obj["name"], "Alice Johnson");
+    assert_eq!(json_obj["age"], 28);
+    assert_eq!(json_obj["email"], "alice@example.com");
+
+    println!("✅ Chat completions with JSON schema returned structured output");
+}
+
+#[tokio::test]
+async fn test_responses_api_with_json_schema() {
+    use common::mock_prompts;
+    use inference_providers::mock::{RequestMatcher, ResponseTemplate};
+
+    let (server, _pool, mock, _db) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Configure mock to match exact prompt and return structured JSON
+    let user_message = "Generate a book description";
+    let expected_prompt = mock_prompts::build_prompt(user_message);
+    let expected_json = r#"{"title": "The Great Adventure", "author": "John Smith", "year": 2024, "genre": "Fiction"}"#;
+
+    mock.when(RequestMatcher::ExactPrompt(expected_prompt))
+        .respond_with(ResponseTemplate::new(expected_json))
+        .await;
+
+    // Create a conversation
+    let conversation = create_conversation(&server, api_key.clone()).await;
+
+    // Make a response request with text.format.json_schema
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "conversation": {
+                "id": conversation.id,
+            },
+            "input": user_message,
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "max_output_tokens": 100,
+            "stream": false,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "book",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "author": {"type": "string"},
+                                "year": {"type": "integer"},
+                                "genre": {"type": "string"}
+                            },
+                            "required": ["title", "author", "year", "genre"]
+                        },
+                        "strict": true
+                    }
+                }
+            }
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    let response_obj = response.json::<api::models::ResponseObject>();
+
+    // Verify the response contains structured output
+    assert!(!response_obj.output.is_empty());
+
+    if let ResponseOutputItem::Message { content, .. } = &response_obj.output[0] {
+        assert!(!content.is_empty());
+
+        if let ResponseOutputContent::OutputText { text, .. } = &content[0] {
+            // Verify it's valid JSON matching the schema
+            let json_obj: serde_json::Value =
+                serde_json::from_str(text).expect("Content should be valid JSON");
+            assert_eq!(json_obj["title"], "The Great Adventure");
+            assert_eq!(json_obj["author"], "John Smith");
+            assert_eq!(json_obj["year"], 2024);
+            assert_eq!(json_obj["genre"], "Fiction");
+
+            println!("✅ Responses API with JSON schema returned structured output");
+        } else {
+            panic!("Expected OutputText content");
+        }
+    } else {
+        panic!("Expected Message output item");
+    }
+}

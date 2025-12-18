@@ -144,10 +144,6 @@ pub async fn create_response(
     request.max_tool_calls = request.max_tool_calls.or(Some(10));
     request.store = request.store.or(Some(true));
     request.background = request.background.or(Some(false));
-    request.text = request.text.or(Some(ResponseTextConfig {
-        format: ResponseTextFormat::Text,
-        verbosity: Some("medium".to_string()),
-    }));
     request.reasoning = request
         .reasoning
         .or(Some(ResponseReasoningConfig { effort: None }));
@@ -458,7 +454,6 @@ pub async fn create_response(
                         service_tier: "default".to_string(),
                         store: request.store.unwrap_or(false),
                         temperature: request.temperature.unwrap_or(1.0),
-                        text: request.text,
                         tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
                         tools: request.tools.unwrap_or_default(),
                         top_logprobs: 0,

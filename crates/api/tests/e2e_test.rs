@@ -3207,15 +3207,10 @@ async fn test_update_organization_name() {
     println!("Update response status: {}", status);
     println!("Update response body: {}", &body);
 
-    assert_eq!(
-        status,
-        200,
-        "Organization update should succeed"
-    );
+    assert_eq!(status, 200, "Organization update should succeed");
 
-    let updated_org =
-        serde_json::from_str::<api::models::OrganizationResponse>(&body)
-            .expect("Failed to parse response");
+    let updated_org = serde_json::from_str::<api::models::OrganizationResponse>(&body)
+        .expect("Failed to parse response");
 
     println!(
         "Updated organization name in response: {}",

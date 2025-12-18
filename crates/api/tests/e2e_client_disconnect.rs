@@ -1,4 +1,7 @@
 // E2E tests for client disconnect scenarios
+//
+// The mock's with_disconnect_after() simulates a truncated stream (provider ends early),
+// which tests that partial responses and usage are correctly saved.
 mod common;
 
 use common::*;

@@ -1033,7 +1033,7 @@ impl ResponseServiceImpl {
                     errors::ResponseError::InternalError(format!("Completion error: {e}"))
                 })?;
 
-            let mut completion_stream = completion_result.stream;
+            let mut completion_stream = completion_result;
 
             // Process the completion stream and extract text + tool calls
             let (current_text, tool_calls_detected) = Self::process_completion_stream(
@@ -2479,7 +2479,6 @@ DO NOT USE THESE FORMATS:
 
         // Extract title from completion result
         let raw_title = completion_result
-            .response
             .response
             .choices
             .first()

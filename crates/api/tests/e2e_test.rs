@@ -3162,3 +3162,88 @@ async fn test_admin_list_users_default_parameters() {
 
     println!("✅ Admin list users uses correct default parameters");
 }
+
+#[tokio::test]
+async fn test_update_organization_name() {
+    let server = setup_test_server().await;
+
+    // Create an organization with an initial name
+    let initial_name = format!("Test Org {}", uuid::Uuid::new_v4());
+    let request = api::models::CreateOrganizationRequest {
+        name: initial_name.clone(),
+        description: Some("Initial description".to_string()),
+    };
+
+    let create_response = server
+        .post("/v1/organizations")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!(request))
+        .await;
+
+    assert_eq!(create_response.status_code(), 200);
+    let org = create_response.json::<api::models::OrganizationResponse>();
+    println!("Created organization with name: {}", org.name);
+    assert_eq!(org.name, initial_name);
+
+    // Update the organization name
+    let updated_name = format!("Updated Org {}", uuid::Uuid::new_v4());
+    let update_request = api::models::UpdateOrganizationRequest {
+        name: Some(updated_name.clone()),
+        description: Some("Updated description".to_string()),
+        rate_limit: None,
+        settings: None,
+    };
+
+    let update_response = server
+        .put(format!("/v1/organizations/{}", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!(update_request))
+        .await;
+
+    let status = update_response.status_code();
+    let body = update_response.text();
+    println!("Update response status: {}", status);
+    println!("Update response body: {}", &body);
+
+    assert_eq!(status, 200, "Organization update should succeed");
+
+    let updated_org = serde_json::from_str::<api::models::OrganizationResponse>(&body)
+        .expect("Failed to parse response");
+
+    println!(
+        "Updated organization name in response: {}",
+        updated_org.name
+    );
+
+    // Verify the response contains the updated name
+    assert_eq!(
+        updated_org.name, updated_name,
+        "Response should contain the updated name, not the old one"
+    );
+    assert_eq!(
+        updated_org.description,
+        Some("Updated description".to_string())
+    );
+
+    // Get the organization again to verify the name was persisted
+    let get_response = server
+        .get(format!("/v1/organizations/{}", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+
+    assert_eq!(get_response.status_code(), 200);
+    let fetched_org = get_response.json::<api::models::OrganizationResponse>();
+
+    println!("Fetched organization name: {}", fetched_org.name);
+
+    // Verify the persisted organization has the updated name
+    assert_eq!(
+        fetched_org.name, updated_name,
+        "Persisted organization should have the updated name"
+    );
+
+    println!("✅ Organization name update works correctly");
+}

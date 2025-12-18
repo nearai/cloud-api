@@ -200,6 +200,7 @@ impl InferenceProvider for VLlmProvider {
         streaming_params.stream = Some(true);
         streaming_params.stream_options = Some(StreamOptions {
             include_usage: Some(true),
+            continuous_usage_stats: Some(true),
         });
 
         let mut headers = self
@@ -304,6 +305,7 @@ impl InferenceProvider for VLlmProvider {
         streaming_params.stream = Some(true);
         streaming_params.stream_options = Some(StreamOptions {
             include_usage: Some(true),
+            continuous_usage_stats: Some(true),
         });
 
         let headers = self

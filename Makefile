@@ -1,4 +1,4 @@
-.PHONY: help seed api dev build test lint fmt check-clippy check-fmt preflight clean
+.PHONY: help seed api dev build test test-unit test-integration lint fmt check-clippy check-fmt preflight clean
 
 help:
 	@echo "NEAR AI Cloud API - Development Commands"
@@ -15,7 +15,9 @@ help:
 	@echo "Code Quality:"
 	@echo "  make preflight     Run all checks before committing (lint, fmt, test, build)"
 	@echo "  make build         Build all crates"
-	@echo "  make test          Run all unit tests"
+	@echo "  make test          Run all tests (unit + integration)"
+	@echo "  make test-unit     Run unit tests only"
+	@echo "  make test-integration  Run integration/e2e tests (requires database)"
 	@echo "  make lint          Run clippy linter (strict mode)"
 	@echo "  make fmt           Format code with rustfmt"
 	@echo "  make check-clippy  Check clippy without fixing"
@@ -56,9 +58,16 @@ build:
 	@echo "Building all crates..."
 	cargo build
 
-test:
-	@echo "Running unit and integration tests..."
+test: test-unit test-integration
+	@echo "All tests completed."
+
+test-unit:
+	@echo "Running unit tests..."
 	cargo test --lib --bins
+
+test-integration:
+	@echo "Running integration/e2e tests..."
+	cargo test --test '*'
 
 lint:
 	@echo "Running clippy linter (strict mode)..."

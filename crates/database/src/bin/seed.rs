@@ -7,6 +7,9 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load .env file if present (ignore errors if not found)
+    let _ = dotenvy::dotenv();
+
     // Initialize tracing for CLI output
     tracing_subscriber::fmt()
         .compact()

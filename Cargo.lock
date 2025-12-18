@@ -2047,6 +2047,7 @@ dependencies = [
  "config",
  "deadpool",
  "deadpool-postgres",
+ "dotenvy",
  "native-tls",
  "postgres-native-tls",
  "postgres-types",

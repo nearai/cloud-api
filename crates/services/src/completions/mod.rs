@@ -15,7 +15,7 @@ use crate::metrics::{consts::*, MetricsServiceTrait};
 use futures_util::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const DEFAULT_CONCURRENT_LIMIT: u32 = 64;
 
@@ -206,61 +206,74 @@ where
         let mut metric_tags = self.metric_tags.clone();
         metric_tags.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
 
-        handle.spawn(async move {
-            // Record usage
-            if usage_service
-                .record_usage(RecordUsageServiceRequest {
-                    organization_id,
-                    workspace_id,
-                    api_key_id,
-                    model_id,
-                    input_tokens,
-                    output_tokens,
-                    inference_type,
-                    ttft_ms,
-                    avg_itl_ms,
-                    inference_id: Some(inference_id),
-                })
-                .await
-                .is_err()
-            {
-                tracing::error!("Failed to record usage, inference_id={}", inference_id);
-            }
-
-            // Only store attestation signature if stream completed normally
-            // (skip if client disconnected mid-stream)
-            if stream_completed
-                && attestation_service
-                    .store_chat_signature_from_provider(&chat_id)
+        // Block until critical billing operations complete (with timeout)
+        // This ensures usage data is recorded even during graceful shutdown
+        let result = handle.block_on(async move {
+            tokio::time::timeout(Duration::from_secs(2), async move {
+                // Record usage (critical for billing accuracy)
+                if usage_service
+                    .record_usage(RecordUsageServiceRequest {
+                        organization_id,
+                        workspace_id,
+                        api_key_id,
+                        model_id,
+                        input_tokens,
+                        output_tokens,
+                        inference_type,
+                        ttft_ms,
+                        avg_itl_ms,
+                        inference_id: Some(inference_id),
+                    })
                     .await
                     .is_err()
-            {
-                tracing::error!("Failed to store chat signature");
-            }
-
-            // Record metrics
-            let tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
-
-            metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
-
-            if let Some(first_token_instant) = first_token_time {
-                let decoding_duration = first_token_instant.elapsed();
-                metrics_service.record_latency(
-                    METRIC_LATENCY_DECODING_TIME,
-                    decoding_duration,
-                    &tags,
-                );
-
-                let decode_secs = decoding_duration.as_secs_f64();
-                if decode_secs > 0.0 {
-                    let tps = output_tokens as f64 / decode_secs;
-                    metrics_service.record_histogram(METRIC_TOKENS_PER_SECOND, tps, &tags);
+                {
+                    tracing::error!("Failed to record usage, inference_id={}", inference_id);
                 }
-            }
 
-            metrics_service.record_count(METRIC_TOKENS_INPUT, input_tokens as i64, &tags);
-            metrics_service.record_count(METRIC_TOKENS_OUTPUT, output_tokens as i64, &tags);
+                // Only store attestation signature if stream completed normally
+                // (skip if client disconnected mid-stream)
+                if stream_completed
+                    && attestation_service
+                        .store_chat_signature_from_provider(&chat_id)
+                        .await
+                        .is_err()
+                {
+                    tracing::error!("Failed to store chat signature");
+                }
+
+                // Record metrics
+                let tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
+
+                metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
+
+                if let Some(first_token_instant) = first_token_time {
+                    let decoding_duration = first_token_instant.elapsed();
+                    metrics_service.record_latency(
+                        METRIC_LATENCY_DECODING_TIME,
+                        decoding_duration,
+                        &tags,
+                    );
+
+                    let decode_secs = decoding_duration.as_secs_f64();
+                    if decode_secs > 0.0 {
+                        let tps = output_tokens as f64 / decode_secs;
+                        metrics_service.record_histogram(METRIC_TOKENS_PER_SECOND, tps, &tags);
+                    }
+                }
+
+                metrics_service.record_count(METRIC_TOKENS_INPUT, input_tokens as i64, &tags);
+                metrics_service.record_count(METRIC_TOKENS_OUTPUT, output_tokens as i64, &tags);
+            })
+            .await
         });
+
+        // Log timeout errors
+        if result.is_err() {
+            tracing::error!(
+                "Timeout recording usage and metrics (2s exceeded), inference_id={}",
+                inference_id
+            );
+        }
     }
 }
 

@@ -323,7 +323,7 @@ pub trait OrganizationServiceTrait: Send + Sync {
         &self,
         id: OrganizationId,
         user_id: UserId,
-        display_name: Option<String>,
+        name: Option<String>,
         description: Option<String>,
         rate_limit: Option<i32>,
         settings: Option<serde_json::Value>,

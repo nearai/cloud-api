@@ -233,8 +233,6 @@ impl AuthServiceTrait for AuthService {
 
     async fn get_or_create_oauth_user(&self, oauth_info: OAuthUserInfo) -> Result<User, AuthError> {
         use crate::organization::OrganizationId;
-        use rand::Rng;
-
         // Check if user already exists
         let existing_user = self
             .user_repository
@@ -290,12 +288,13 @@ impl AuthServiceTrait for AuthService {
 
         // Generate organization name from user email with random suffix
         let org_name = {
+            use rand::Rng;
             let username = oauth_info.email.split('@').next().unwrap_or("user");
             const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             let suffix: String = (0..4)
                 .map(|_| {
-                    let idx = rng.gen_range(0..CHARSET.len());
+                    let idx = rng.random_range(0..CHARSET.len());
                     CHARSET[idx] as char
                 })
                 .collect();

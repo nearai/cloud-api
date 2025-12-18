@@ -6,7 +6,7 @@ use opentelemetry::{
     metrics::{Counter, Histogram, Meter, MeterProvider as _},
     KeyValue,
 };
-use opentelemetry_sdk::metrics::MeterProvider;
+use opentelemetry_sdk::metrics::SdkMeterProvider;
 use std::time::Duration;
 
 #[async_trait]
@@ -25,7 +25,7 @@ pub struct OtlpMetricsService {
 }
 
 impl OtlpMetricsService {
-    pub fn new(meter_provider: &MeterProvider) -> Self {
+    pub fn new(meter_provider: &SdkMeterProvider) -> Self {
         let meter = meter_provider.meter("cloud-api");
         Self {
             meter,
@@ -76,8 +76,8 @@ impl MetricsServiceTrait for OtlpMetricsService {
             self.meter
                 .u64_histogram(name.to_string())
                 .with_description(description)
-                .with_unit(opentelemetry::metrics::Unit::new("ms"))
-                .init()
+                .with_unit("ms")
+                .build()
         });
 
         let kv_tags = Self::parse_tags(tags);
@@ -104,7 +104,7 @@ impl MetricsServiceTrait for OtlpMetricsService {
             self.meter
                 .u64_counter(name.to_string())
                 .with_description(description)
-                .init()
+                .build()
         });
 
         let kv_tags = Self::parse_tags(tags);
@@ -125,12 +125,12 @@ impl MetricsServiceTrait for OtlpMetricsService {
                 .with_description(description);
 
             let builder = if !unit.is_empty() {
-                builder.with_unit(opentelemetry::metrics::Unit::new(unit))
+                builder.with_unit(unit)
             } else {
                 builder
             };
 
-            builder.init()
+            builder.build()
         });
 
         let kv_tags = Self::parse_tags(tags);

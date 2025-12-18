@@ -116,12 +116,36 @@ If not set, tests will use default values but may fail if vLLM is not running at
 
 The application uses YAML configuration files located in the `config/` directory.
 
+## Security
+
+This project uses [cargo-audit](https://github.com/RustSec/cargo-audit) to check for security vulnerabilities in dependencies. The audit runs automatically:
+
+- On every push/PR that modifies `Cargo.toml` or `Cargo.lock`
+- Daily at midnight UTC to catch newly published advisories
+
+Failed audits will block PRs. To run locally:
+
+```bash
+cargo install cargo-audit
+cargo audit
+```
+
+Known advisories without available fixes are documented and ignored in `.cargo/audit.toml`.
+
+### Dependabot
+
+[Dependabot](https://docs.github.com/en/code-security/dependabot) is enabled to automatically create PRs for:
+
+- **Cargo dependencies**: Weekly updates for Rust crates
+- **GitHub Actions**: Weekly updates for workflow actions
+
 ## Contributing
 
 1. Ensure all tests pass: `cargo test`
 2. Check code formatting: `cargo fmt --check`
 3. Run linting: `cargo clippy`
 4. Ensure database migrations work with test setup
+5. Ensure no security vulnerabilities: `cargo audit`
 
 
 ## API Documentation

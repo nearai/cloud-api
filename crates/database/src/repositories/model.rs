@@ -523,7 +523,7 @@ impl ModelRepository {
                     SELECT
                         id, model_id, input_cost_per_token, output_cost_per_token,
                         context_length, model_name, model_display_name, model_description,
-                        model_icon, verifiable, is_active,
+                        model_icon, verifiable, is_active, owned_by,
                         effective_from, effective_until, changed_by_user_id, changed_by_user_email,
                         change_reason, created_at
                     FROM model_history
@@ -563,7 +563,7 @@ impl ModelRepository {
                     SELECT
                         id, model_id, input_cost_per_token, output_cost_per_token,
                         context_length, model_name, model_display_name, model_description,
-                        model_icon, verifiable, is_active,
+                        model_icon, verifiable, is_active, owned_by,
                         effective_from, effective_until, changed_by_user_id, changed_by_user_email,
                         change_reason, created_at
                     FROM model_history
@@ -633,7 +633,7 @@ impl ModelRepository {
                     SELECT
                         h.id, h.model_id, h.input_cost_per_token, h.output_cost_per_token,
                         h.context_length, h.model_name, h.model_display_name, h.model_description,
-                        h.model_icon, h.verifiable, h.is_active,
+                        h.model_icon, h.verifiable, h.is_active, h.owned_by,
                         h.effective_from, h.effective_until, h.changed_by_user_id, h.changed_by_user_email,
                         h.change_reason, h.created_at
                     FROM model_history h
@@ -751,6 +751,7 @@ impl ModelRepository {
                     model_icon,
                     verifiable,
                     is_active,
+                    owned_by,
                     effective_from,
                     effective_until,
                     changed_by_user_id,
@@ -758,8 +759,8 @@ impl ModelRepository {
                     change_reason,
                     created_at
                 ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                    NOW(), NULL, $11, $12, $13, NOW()
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                    NOW(), NULL, $12, $13, $14, NOW()
                 )
                 "#,
                 &[
@@ -773,6 +774,7 @@ impl ModelRepository {
                     &model_row.get::<_, Option<String>>("model_icon"),
                     &model_row.get::<_, bool>("verifiable"),
                     &model_row.get::<_, bool>("is_active"),
+                    &model_row.get::<_, String>("owned_by"),
                     &changed_by_user_id,
                     &changed_by_user_email,
                     change_reason,
@@ -911,6 +913,7 @@ impl ModelRepository {
             model_icon: row.get("model_icon"),
             verifiable: row.get("verifiable"),
             is_active: row.get("is_active"),
+            owned_by: row.get("owned_by"),
             effective_from: row.get("effective_from"),
             effective_until: row.get("effective_until"),
             changed_by_user_id: row.get("changed_by_user_id"),

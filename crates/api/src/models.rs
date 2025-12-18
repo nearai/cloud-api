@@ -1803,6 +1803,8 @@ pub struct ModelHistoryEntry {
     pub verifiable: bool,
     #[serde(rename = "isActive")]
     pub is_active: bool,
+    #[serde(rename = "ownedBy")]
+    pub owned_by: String,
     #[serde(rename = "effectiveFrom")]
     pub effective_from: String,
     #[serde(rename = "effectiveUntil")]

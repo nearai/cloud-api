@@ -113,6 +113,7 @@ impl AdminRepository for AdminCompositeRepository {
                 model_icon: h.model_icon,
                 verifiable: h.verifiable,
                 is_active: h.is_active,
+                owned_by: h.owned_by,
                 effective_from: h.effective_from,
                 effective_until: h.effective_until,
                 changed_by_user_id: h.changed_by_user_id,

@@ -459,6 +459,7 @@ pub struct ModelHistory {
     pub model_icon: Option<String>,
     pub verifiable: bool,
     pub is_active: bool,
+    pub owned_by: String,
 
     // Temporal fields
     pub effective_from: DateTime<Utc>,

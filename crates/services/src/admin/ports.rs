@@ -57,6 +57,7 @@ pub struct ModelHistoryEntry {
     pub model_icon: Option<String>,
     pub verifiable: bool,
     pub is_active: bool,
+    pub owned_by: String,
     pub effective_from: chrono::DateTime<chrono::Utc>,
     pub effective_until: Option<chrono::DateTime<chrono::Utc>>,
     pub changed_by_user_id: Option<uuid::Uuid>,

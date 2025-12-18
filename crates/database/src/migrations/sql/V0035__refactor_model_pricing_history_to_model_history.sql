@@ -9,6 +9,7 @@ ALTER TABLE model_history ADD COLUMN model_name VARCHAR(500);
 ALTER TABLE model_history ADD COLUMN model_icon VARCHAR(500);
 ALTER TABLE model_history ADD COLUMN verifiable BOOLEAN;
 ALTER TABLE model_history ADD COLUMN is_active BOOLEAN;
+ALTER TABLE model_history ADD COLUMN owned_by TEXT;
 
 -- Step 3: Backfill missing fields from current models table
 UPDATE model_history mh
@@ -16,7 +17,8 @@ SET
     model_name = m.model_name,
     model_icon = m.model_icon,
     verifiable = m.verifiable,
-    is_active = m.is_active
+    is_active = m.is_active,
+    owned_by = m.owned_by
 FROM models m
 WHERE mh.model_id = m.id;
 
@@ -24,6 +26,7 @@ WHERE mh.model_id = m.id;
 ALTER TABLE model_history ALTER COLUMN model_name SET NOT NULL;
 ALTER TABLE model_history ALTER COLUMN verifiable SET NOT NULL;
 ALTER TABLE model_history ALTER COLUMN is_active SET NOT NULL;
+ALTER TABLE model_history ALTER COLUMN owned_by SET NOT NULL;
 -- model_icon remains NULLABLE
 
 -- Step 5: Rename indexes to match new table name

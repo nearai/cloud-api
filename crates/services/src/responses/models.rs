@@ -395,6 +395,38 @@ impl ResponseOutputItem {
             ResponseOutputItem::Reasoning { model, .. } => model,
         }
     }
+
+    /// Get the response_id of the output item
+    pub fn response_id(&self) -> &str {
+        match self {
+            ResponseOutputItem::Message { response_id, .. } => response_id,
+            ResponseOutputItem::ToolCall { response_id, .. } => response_id,
+            ResponseOutputItem::WebSearchCall { response_id, .. } => response_id,
+            ResponseOutputItem::Reasoning { response_id, .. } => response_id,
+        }
+    }
+
+    /// Get the previous_response_id of the output item
+    pub fn previous_response_id(&self) -> &Option<String> {
+        match self {
+            ResponseOutputItem::Message {
+                previous_response_id,
+                ..
+            } => previous_response_id,
+            ResponseOutputItem::ToolCall {
+                previous_response_id,
+                ..
+            } => previous_response_id,
+            ResponseOutputItem::WebSearchCall {
+                previous_response_id,
+                ..
+            } => previous_response_id,
+            ResponseOutputItem::Reasoning {
+                previous_response_id,
+                ..
+            } => previous_response_id,
+        }
+    }
 }
 
 /// Web search action details

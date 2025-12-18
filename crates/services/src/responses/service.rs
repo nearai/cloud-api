@@ -234,31 +234,9 @@ impl ResponseServiceImpl {
         let mut response_parent_map: std::collections::HashMap<String, Option<String>> =
             std::collections::HashMap::new();
         for item in &items {
-            let (resp_id, prev_id) = match item {
-                models::ResponseOutputItem::Message {
-                    response_id,
-                    previous_response_id,
-                    ..
-                }
-                | models::ResponseOutputItem::ToolCall {
-                    response_id,
-                    previous_response_id,
-                    ..
-                }
-                | models::ResponseOutputItem::WebSearchCall {
-                    response_id,
-                    previous_response_id,
-                    ..
-                }
-                | models::ResponseOutputItem::Reasoning {
-                    response_id,
-                    previous_response_id,
-                    ..
-                } => (response_id, previous_response_id),
-            };
             response_parent_map
-                .entry(resp_id.clone())
-                .or_insert_with(|| prev_id.clone());
+                .entry(item.response_id().to_string())
+                .or_insert_with(|| item.previous_response_id().clone());
         }
 
         // Walk up from target to collect ancestor response IDs
@@ -266,21 +244,13 @@ impl ResponseServiceImpl {
         let mut current = Some(target_id.clone());
         while let Some(resp_id) = current {
             ancestors.insert(resp_id.clone());
-            current = response_parent_map.get(&resp_id).and_then(|p| p.clone());
+            current = response_parent_map.get(&resp_id).cloned().flatten();
         }
 
         // Filter items to only those in ancestor chain
         items
             .into_iter()
-            .filter(|item| {
-                let resp_id = match item {
-                    models::ResponseOutputItem::Message { response_id, .. }
-                    | models::ResponseOutputItem::ToolCall { response_id, .. }
-                    | models::ResponseOutputItem::WebSearchCall { response_id, .. }
-                    | models::ResponseOutputItem::Reasoning { response_id, .. } => response_id,
-                };
-                ancestors.contains(resp_id)
-            })
+            .filter(|item| ancestors.contains(item.response_id()))
             .collect()
     }
 

@@ -9,34 +9,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
 
 jobs:
-  # Fast lint job - runs in parallel with everything else
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v6
-    
-    - name: Install Rust
-      uses: actions-rust-lang/setup-rust-toolchain@v1
-      with:
-        components: rustfmt, clippy
-
-    - name: Cache Rust
-      uses: swatinem/rust-cache@v2
-      with:
-        cache-on-failure: true
-
-    - name: Check formatting
-      run: cargo fmt --all -- --check
-
-    - name: Run clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
-
-  # Unit tests - fast, no database needed
-  unit-tests:
-    name: Unit Tests
+  # First: compile all dependencies and test binaries once
+  build:
+    name: Build
     runs-on: ubuntu-latest
     environment: Cloud API test env
     steps:
@@ -44,11 +22,84 @@ jobs:
     
     - name: Install Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
-
-    - name: Cache Rust
-      uses: swatinem/rust-cache@v2
       with:
-        cache-on-failure: true
+        components: rustfmt, clippy
+        cache: true  # Only the build job saves cache
+
+    # Build everything including test binaries
+    - name: Build all targets
+      run: cargo test --no-run --all-targets
+      env:
+        POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
+        DATABASE_HOST: localhost
+        DATABASE_PORT: 5432
+        DATABASE_NAME: platform_api
+        DATABASE_USERNAME: postgres
+        DATABASE_PASSWORD: postgres
+        MODEL_DISCOVERY_SERVER_URL: ${{ secrets.MODEL_DISCOVERY_SERVER_URL }}
+        AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
+
+    # Compress and upload target directory for other jobs
+    - name: Compress target directory
+      run: tar -czf target.tar.gz target/
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-artifacts
+        path: target.tar.gz
+        retention-days: 1
+        compression-level: 0  # Already compressed
+
+  # Fast lint job - uses build artifacts (no caching needed)
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    - uses: actions/checkout@v6
+    
+    - name: Install Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        components: rustfmt, clippy
+        cache: false  # Using artifacts instead
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: build-artifacts
+
+    - name: Extract target directory
+      run: tar -xzf target.tar.gz
+
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+
+    - name: Run clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # Unit tests - uses build artifacts (no caching needed)
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: build
+    environment: Cloud API test env
+    steps:
+    - uses: actions/checkout@v6
+    
+    - name: Install Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        cache: false  # Using artifacts instead
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: build-artifacts
+
+    - name: Extract target directory
+      run: tar -xzf target.tar.gz
 
     - name: Run unit tests
       run: cargo test --lib --bins
@@ -68,10 +119,11 @@ jobs:
         BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
         DEV: "true"
 
-  # Integration tests - split into parallel shards
+  # Integration tests - split into parallel shards (no caching needed)
   integration-tests:
     name: Integration Tests (Shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
+    needs: build
     environment: Cloud API test env
     strategy:
       fail-fast: false
@@ -98,13 +150,16 @@ jobs:
     
     - name: Install Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
-
-    - name: Cache Rust
-      uses: swatinem/rust-cache@v2
       with:
-        cache-on-failure: true
-        # Separate cache per shard to avoid conflicts
-        key: integration-shard-${{ matrix.shard }}
+        cache: false  # Using artifacts instead
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: build-artifacts
+
+    - name: Extract target directory
+      run: tar -xzf target.tar.gz
 
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
@@ -135,21 +190,27 @@ jobs:
         RUST_LOG: debug
         DEV: "true"
 
-  # vLLM integration tests - separate job
+  # vLLM integration tests (no caching needed)
   vllm-tests:
     name: vLLM Integration Tests
     runs-on: ubuntu-latest
+    needs: build
     environment: Cloud API test env
     steps:
     - uses: actions/checkout@v6
     
     - name: Install Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
-
-    - name: Cache Rust
-      uses: swatinem/rust-cache@v2
       with:
-        cache-on-failure: true
+        cache: false  # Using artifacts instead
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: build-artifacts
+
+    - name: Extract target directory
+      run: tar -xzf target.tar.gz
 
     - name: Run vLLM integration tests
       run: cargo test --test integration_tests -- --nocapture
@@ -157,7 +218,7 @@ jobs:
         VLLM_BASE_URL: ${{ secrets.VLLM_BASE_URL }}
         VLLM_API_KEY: ${{ secrets.VLLM_API_KEY }}
 
-  # Release build - only on main branch pushes, not on PRs
+  # Release build - only on main branch pushes
   build-release:
     name: Build Release
     runs-on: ubuntu-latest
@@ -169,11 +230,8 @@ jobs:
     
     - name: Install Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
-
-    - name: Cache Rust
-      uses: swatinem/rust-cache@v2
       with:
-        cache-on-failure: true
+        cache: true  # Release build uses its own cache
 
     - name: Build release
       run: cargo build --release

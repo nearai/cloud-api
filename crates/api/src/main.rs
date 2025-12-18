@@ -1,12 +1,9 @@
 use api::{build_app_with_config, init_auth_services, init_database, init_domain_services};
 use config::{ApiConfig, LoggingConfig};
 use database::{Database, ShutdownCoordinator, ShutdownStage};
-use opentelemetry::global;
-use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::{
-    metrics::{MeterProvider, PeriodicReader},
-    runtime, Resource,
-};
+use opentelemetry::{global, KeyValue};
+use opentelemetry_otlp::{MetricExporter, WithExportConfig};
+use opentelemetry_sdk::{metrics::SdkMeterProvider, Resource};
 use services::inference_provider_pool::InferenceProviderPool;
 use services::metrics::{MetricsServiceTrait, OtlpMetricsService};
 use std::sync::Arc;
@@ -24,26 +21,25 @@ async fn main() {
     let auth_components = init_auth_services(database.clone(), &config);
 
     // Initialize OpenTelemetry pipeline
-    let exporter = opentelemetry_otlp::new_exporter()
-        .tonic()
+    let exporter = MetricExporter::builder()
+        .with_tonic()
         .with_endpoint(&config.otlp.endpoint)
-        .build_metrics_exporter(
-            Box::new(opentelemetry_sdk::metrics::reader::DefaultAggregationSelector::new()),
-            Box::new(opentelemetry_sdk::metrics::reader::DefaultTemporalitySelector::new()),
-        )
+        .build()
         .expect("Failed to build OTLP metrics exporter");
-
-    let reader = PeriodicReader::builder(exporter, runtime::Tokio).build();
 
     // Get environment from env var (local, dev, staging, prod)
     let environment = std::env::var("ENVIRONMENT").unwrap_or_else(|_| "local".to_string());
 
-    let meter_provider = MeterProvider::builder()
-        .with_reader(reader)
-        .with_resource(Resource::new(vec![
-            opentelemetry::KeyValue::new("service.name", "cloud-api"),
-            opentelemetry::KeyValue::new("environment", environment.clone()),
-        ]))
+    let resource = Resource::builder()
+        .with_attributes(vec![
+            KeyValue::new("service.name", "cloud-api"),
+            KeyValue::new("environment", environment.clone()),
+        ])
+        .build();
+
+    let meter_provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter)
+        .with_resource(resource)
         .build();
 
     tracing::info!(

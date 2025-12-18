@@ -27,7 +27,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1.19", features = ["v4", "serde"] }
 opentelemetry = { version = "0.31", features = ["metrics"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", features = ["metrics"] }
+opentelemetry-otlp = { version = "0.31", features = ["metrics", "grpc-tonic"] }
 url = "2.5"
 chrono = { version = "0.4", features = ["serde"] }
 # For TypedHeader support

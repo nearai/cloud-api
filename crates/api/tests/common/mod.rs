@@ -855,7 +855,7 @@ pub fn create_near_test_nonce(timestamp_offset_ms: i64) -> Vec<u8> {
     nonce.extend_from_slice(&nonce_timestamp_ms.to_be_bytes());
 
     // Remaining 24 bytes: random data
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut random_bytes = [0u8; 24];
     rng.fill(&mut random_bytes);
     nonce.extend_from_slice(&random_bytes);

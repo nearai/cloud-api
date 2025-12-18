@@ -8,7 +8,7 @@ description.workspace = true
 
 [dependencies]
 axum = { version = "0.8", features = ["macros", "multipart"] }
-axum-extra = { version = "0.10", features = ["typed-header"] }
+axum-extra = { version = "0.12", features = ["typed-header"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 futures = "0.3"
@@ -24,10 +24,10 @@ inference_providers = { path = "../inference_providers" }
 # Authentication dependencies
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
-uuid = { version = "1.6", features = ["v4", "serde"] }
-opentelemetry = { version = "0.21", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.21", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.14", features = ["metrics"] }
+uuid = { version = "1.19", features = ["v4", "serde"] }
+opentelemetry = { version = "0.31", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = ["metrics", "grpc-tonic"] }
 url = "2.5"
 chrono = { version = "0.4", features = ["serde"] }
 # For TypedHeader support
@@ -38,13 +38,13 @@ thiserror = "2.0"
 # Body hashing middleware dependencies
 sha2 = "0.10"
 hex = "0.4"
-bytes = "1.5"
+bytes = "1.11"
 http-body-util = "0.1"
 # AWS S3 for file storage
-aws-config = { version = "1.5", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1.70"
+aws-config = { version = "1.8", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.118"
 # NEAR wallet authentication
-near-api = "0.8.0"
+near-api = "0.8.2"
 base64 = "0.22"
 # Ordered collections
 indexmap = "2"
@@ -65,4 +65,4 @@ sha3 = "0.10"
 hmac = "0.12"
 tokio-postgres = "0.7"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-rand = "0.8"
+rand = "0.9"

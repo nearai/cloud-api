@@ -15,7 +15,7 @@ use crate::metrics::{consts::*, MetricsServiceTrait};
 use futures_util::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const DEFAULT_CONCURRENT_LIMIT: u32 = 64;
 
@@ -70,6 +70,13 @@ where
     // Pre-allocated low-cardinality metric tags (for Datadog/OTLP)
     metric_tags: Vec<String>,
     concurrent_counter: Option<Arc<AtomicU32>>,
+    /// Last received usage stats from streaming chunks
+    last_usage_stats: Option<inference_providers::TokenUsage>,
+    /// Last chat ID from streaming chunks (for attestation and inference_id)
+    last_chat_id: Option<String>,
+    /// Flag indicating the stream completed normally (received None from inner stream)
+    /// If false when Drop is called, the client disconnected mid-stream
+    stream_completed: bool,
 }
 
 impl<S> Stream for InterceptStream<S>
@@ -110,125 +117,20 @@ where
                 }
 
                 if let StreamChunk::Chat(ref chat_chunk) = event.chunk {
+                    // Track chat_id for attestation (updated on each chunk)
+                    self.last_chat_id = Some(chat_chunk.id.clone());
+
+                    // Track usage stats (updated on each chunk that has usage)
                     if let Some(usage) = &chat_chunk.usage {
-                        // Store attestation signature when completion finishes
-                        let attestation_service = self.attestation_service.clone();
-                        let chat_id = chat_chunk.id.clone();
-                        tokio::spawn(async move {
-                            if attestation_service
-                                .store_chat_signature_from_provider(chat_id.as_str())
-                                .await
-                                .is_err()
-                            {
-                                tracing::error!("Failed to store chat signature");
-                            } else {
-                                tracing::debug!("Stored signature for chat_id: {}", chat_id);
-                            }
-                        });
-
-                        // Calculate average ITL
-                        let avg_itl_ms = if self.token_count > 0 {
-                            Some(self.total_itl_ms / self.token_count as f64)
-                        } else {
-                            None
-                        };
-
-                        // Record usage with latency metrics
-                        let usage_service = self.usage_service.clone();
-                        let organization_id = self.organization_id;
-                        let workspace_id = self.workspace_id;
-                        let api_key_id = self.api_key_id;
-                        let model_id = self.model_id;
-                        let inference_type = self.inference_type.clone();
-                        let input_tokens = usage.prompt_tokens;
-                        let output_tokens = usage.completion_tokens;
-                        let ttft_ms = self.ttft_ms;
-                        // Hash the full chat ID to UUID for storage
-                        let inference_id_uuid = Some(hash_inference_id_to_uuid(&chat_chunk.id));
-
-                        tokio::spawn(async move {
-                            if usage_service
-                                .record_usage(RecordUsageServiceRequest {
-                                    organization_id,
-                                    workspace_id,
-                                    api_key_id,
-                                    model_id,
-                                    input_tokens,
-                                    output_tokens,
-                                    inference_type,
-                                    ttft_ms,
-                                    avg_itl_ms,
-                                    inference_id: inference_id_uuid,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                tracing::error!("Failed to record usage in completion service");
-                            } else {
-                                tracing::debug!(
-                                    "Recorded usage for org {}: {} input, {} output tokens (api_key: {}, ttft: {:?}ms)",
-                                    organization_id,
-                                    input_tokens,
-                                    output_tokens,
-                                    api_key_id,
-                                    ttft_ms
-                                );
-                            }
-                        });
-
-                        // Record metrics
-                        let metrics_service = self.metrics_service.clone();
-                        let e2e_duration = self.service_start_time.elapsed();
-                        let input_tokens = usage.prompt_tokens;
-                        let output_tokens = usage.completion_tokens;
-                        let first_token_time = self.first_token_time;
-                        let input_bucket = get_input_bucket(input_tokens);
-                        let mut tags_owned = self.metric_tags.clone();
-                        tags_owned.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
-
-                        tokio::spawn(async move {
-                            let tags: Vec<&str> = tags_owned.iter().map(|s| s.as_str()).collect();
-
-                            metrics_service.record_latency(
-                                METRIC_LATENCY_TOTAL,
-                                e2e_duration,
-                                &tags,
-                            );
-
-                            if let Some(first_token_instant) = first_token_time {
-                                let decoding_duration = first_token_instant.elapsed();
-                                metrics_service.record_latency(
-                                    METRIC_LATENCY_DECODING_TIME,
-                                    decoding_duration,
-                                    &tags,
-                                );
-
-                                let decode_secs = decoding_duration.as_secs_f64();
-                                if decode_secs > 0.0 {
-                                    let tps = output_tokens as f64 / decode_secs;
-                                    metrics_service.record_histogram(
-                                        METRIC_TOKENS_PER_SECOND,
-                                        tps,
-                                        &tags,
-                                    );
-                                }
-                            }
-
-                            // Token counts
-                            metrics_service.record_count(
-                                METRIC_TOKENS_INPUT,
-                                input_tokens as i64,
-                                &tags,
-                            );
-                            metrics_service.record_count(
-                                METRIC_TOKENS_OUTPUT,
-                                output_tokens as i64,
-                                &tags,
-                            );
-                        });
+                        self.last_usage_stats = Some(usage.clone());
                     }
                 }
                 Poll::Ready(Some(Ok(event.clone())))
+            }
+            Poll::Ready(None) => {
+                // Stream completed normally
+                self.stream_completed = true;
+                Poll::Ready(None)
             }
             other => other,
         }
@@ -240,9 +142,165 @@ where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
 {
     fn drop(&mut self) {
+        let organization_id = self.organization_id;
+        let workspace_id = self.workspace_id;
+        let api_key_id = self.api_key_id;
+        let model_id = self.model_id;
+        let inference_type = self.inference_type.clone();
+
+        // Create a span with common fields for all logging in this method
+        let _span = tracing::error_span!(
+            "stream_drop",
+            %organization_id,
+            %workspace_id,
+            %api_key_id,
+            %model_id,
+            %inference_type
+        )
+        .entered();
+
+        // Decrement concurrent counter if present
         if let Some(counter) = &self.concurrent_counter {
             counter.fetch_sub(1, Ordering::Release);
         }
+
+        // Check if we're in a Tokio runtime context
+        // Drop can be called outside of an async context (e.g., during shutdown)
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                tracing::error!("Cannot record usage: no Tokio runtime available");
+                return;
+            }
+        };
+
+        // Get usage stats and chat_id from stream
+        let (input_tokens, output_tokens, chat_id) =
+            match (&self.last_usage_stats, &self.last_chat_id) {
+                (Some(usage), Some(chat_id)) => (
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    chat_id.clone(),
+                ),
+                (None, None) => {
+                    // No usage stats or chat_id available, nothing to record
+                    tracing::error!("Stream ended but no usage stats and no chat_id available");
+                    return;
+                }
+                (None, Some(chat_id)) => {
+                    tracing::error!(%chat_id, "Stream ended but no usage stats available");
+                    return;
+                }
+                (Some(usage), None) => {
+                    tracing::error!(?usage, "Stream ended but no chat_id available");
+                    return;
+                }
+            };
+
+        // Only record if we have actual tokens to record
+        if input_tokens == 0 && output_tokens == 0 {
+            return;
+        }
+
+        // Calculate average ITL
+        let avg_itl_ms = if self.token_count > 0 {
+            Some(self.total_itl_ms / self.token_count as f64)
+        } else {
+            None
+        };
+
+        // Derive inference_id from chat_id (deterministic hash)
+        let inference_id = hash_inference_id_to_uuid(&chat_id);
+
+        // Check if stream completed normally (vs client disconnect)
+        let stream_completed = self.stream_completed;
+
+        // Capture all values needed for async tasks
+        let usage_service = self.usage_service.clone();
+        let attestation_service = self.attestation_service.clone();
+        let metrics_service = self.metrics_service.clone();
+        let ttft_ms = self.ttft_ms;
+        let e2e_duration = self.service_start_time.elapsed();
+        let first_token_time = self.first_token_time;
+        let input_bucket = get_input_bucket(input_tokens);
+        let mut metric_tags = self.metric_tags.clone();
+        metric_tags.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
+
+        let span = tracing::Span::current();
+
+        // Spawn critical billing operations on blocking thread pool with timeout
+        // The tokio runtime waits for blocking tasks during graceful shutdown,
+        // which helps prevent data loss compared to regular spawn
+        let handle_clone = handle.clone();
+        handle.spawn_blocking(move || {
+            let _span_guard = span.enter();
+            handle_clone.block_on(async move {
+                let result = tokio::time::timeout(Duration::from_secs(2), async move {
+                    // Record usage (critical for billing accuracy)
+                    if usage_service
+                        .record_usage(RecordUsageServiceRequest {
+                            organization_id,
+                            workspace_id,
+                            api_key_id,
+                            model_id,
+                            input_tokens,
+                            output_tokens,
+                            inference_type,
+                            ttft_ms,
+                            avg_itl_ms,
+                            inference_id: Some(inference_id),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!("Failed to record usage, inference_id={}", inference_id);
+                    }
+
+                    // Only store attestation signature if stream completed normally
+                    // (skip if client disconnected mid-stream)
+                    if stream_completed
+                        && attestation_service
+                            .store_chat_signature_from_provider(&chat_id)
+                            .await
+                            .is_err()
+                    {
+                        tracing::error!("Failed to store chat signature");
+                    }
+
+                    // Record metrics
+                    let tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
+
+                    metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
+
+                    if let Some(first_token_instant) = first_token_time {
+                        let decoding_duration = first_token_instant.elapsed();
+                        metrics_service.record_latency(
+                            METRIC_LATENCY_DECODING_TIME,
+                            decoding_duration,
+                            &tags,
+                        );
+
+                        let decode_secs = decoding_duration.as_secs_f64();
+                        if decode_secs > 0.0 {
+                            let tps = output_tokens as f64 / decode_secs;
+                            metrics_service.record_histogram(METRIC_TOKENS_PER_SECOND, tps, &tags);
+                        }
+                    }
+
+                    metrics_service.record_count(METRIC_TOKENS_INPUT, input_tokens as i64, &tags);
+                    metrics_service.record_count(METRIC_TOKENS_OUTPUT, output_tokens as i64, &tags);
+                })
+                .await;
+
+                // Log timeout errors
+                if result.is_err() {
+                    tracing::error!(
+                        "Timeout recording usage and metrics (2s exceeded), inference_id={}",
+                        inference_id
+                    );
+                }
+            })
+        });
     }
 }
 
@@ -453,6 +511,9 @@ impl CompletionServiceImpl {
             total_itl_ms: 0.0,
             metric_tags,
             concurrent_counter,
+            last_usage_stats: None,
+            last_chat_id: None,
+            stream_completed: false,
         };
         Box::pin(intercepted_stream)
     }
@@ -747,7 +808,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
         let output_tokens = response_with_bytes.response.usage.completion_tokens;
         // Hash the full chat ID to UUID for storage
-        let inference_id_uuid = Some(hash_inference_id_to_uuid(&response_with_bytes.response.id));
+        let inference_id = hash_inference_id_to_uuid(&response_with_bytes.response.id);
 
         tokio::spawn(async move {
             if usage_service
@@ -761,7 +822,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     inference_type: "chat_completion".to_string(),
                     ttft_ms: None,    // N/A for non-streaming
                     avg_itl_ms: None, // N/A for non-streaming
-                    inference_id: inference_id_uuid,
+                    inference_id: Some(inference_id),
                 })
                 .await
                 .is_err()
@@ -791,7 +852,7 @@ mod tests {
     use crate::test_utils::{MockAttestationService, MockUsageService};
     use bytes::Bytes;
     use futures::{stream, StreamExt};
-    use inference_providers::models::{ChatCompletionChunk, TokenUsage};
+    use inference_providers::models::{ChatChoice, ChatCompletionChunk, FinishReason, TokenUsage};
     use std::time::Duration;
 
     #[tokio::test]
@@ -827,7 +888,13 @@ mod tests {
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
                 model: "test-model".to_string(),
-                choices: vec![],
+                choices: vec![ChatChoice {
+                    index: 0,
+                    delta: None,
+                    logprobs: None,
+                    finish_reason: Some(FinishReason::Stop),
+                    token_ids: None,
+                }],
                 usage: Some(TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 20,
@@ -865,6 +932,9 @@ mod tests {
             total_itl_ms: 0.0,
             metric_tags,
             concurrent_counter: None,
+            last_usage_stats: None,
+            last_chat_id: None,
+            stream_completed: false,
         };
 
         // Consume the stream
@@ -879,8 +949,8 @@ mod tests {
         // Should have:
         // 1. latency.time_to_first_token (Backend TTFT from first chunk)
         // 2. latency.time_to_first_token_total (E2E TTFT from first chunk)
-        // 3. latency.total (from usage chunk)
-        // 4. tokens_per_second (from usage chunk)
+        // 3. latency.total (from Drop handler)
+        // 4. tokens_per_second (from Drop handler)
         assert!(
             metrics.len() >= 4,
             "Expected at least 4 metrics, got {}",
@@ -962,7 +1032,13 @@ mod tests {
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
                 model: "test-model".to_string(),
-                choices: vec![],
+                choices: vec![ChatChoice {
+                    index: 0,
+                    delta: None,
+                    logprobs: None,
+                    finish_reason: Some(FinishReason::Stop),
+                    token_ids: None,
+                }],
                 usage: Some(TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 20,
@@ -1004,12 +1080,15 @@ mod tests {
             total_itl_ms: 0.0,
             metric_tags,
             concurrent_counter: None,
+            last_usage_stats: None,
+            last_chat_id: None,
+            stream_completed: false,
         };
 
         // Consume the stream
         let _ = intercept_stream.collect::<Vec<_>>().await;
 
-        // Wait for async usage recording to complete
+        // Wait for async usage recording to complete (Drop handler spawns async task)
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Verify usage was recorded with latency metrics
@@ -1069,7 +1148,13 @@ mod tests {
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
                 model: "test-model".to_string(),
-                choices: vec![],
+                choices: vec![ChatChoice {
+                    index: 0,
+                    delta: None,
+                    logprobs: None,
+                    finish_reason: Some(FinishReason::Stop),
+                    token_ids: None,
+                }],
                 usage: Some(TokenUsage {
                     prompt_tokens: 5,
                     completion_tokens: 1,
@@ -1106,6 +1191,9 @@ mod tests {
             total_itl_ms: 0.0,
             metric_tags,
             concurrent_counter: None,
+            last_usage_stats: None,
+            last_chat_id: None,
+            stream_completed: false,
         };
 
         let _ = intercept_stream.collect::<Vec<_>>().await;
@@ -1262,6 +1350,9 @@ mod tests {
                 total_itl_ms: 0.0,
                 metric_tags: vec![],
                 concurrent_counter: Some(counter.clone()),
+                last_usage_stats: None,
+                last_chat_id: None,
+                stream_completed: false,
             };
             // InterceptStream goes out of scope here and Drop is called
         }

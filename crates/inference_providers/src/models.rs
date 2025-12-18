@@ -131,6 +131,10 @@ pub struct StreamOptions {
     /// Whether to include usage statistics in the final chunk
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_usage: Option<bool>,
+
+    /// Whether to send incremental usage stats in every chunk (vLLM-specific)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuous_usage_stats: Option<bool>,
 }
 
 /// Parameters for chat completion requests (matches OpenAI API)

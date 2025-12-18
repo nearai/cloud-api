@@ -38,7 +38,7 @@ async-trait = "0.1"
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = { version = "1.5", features = ["v4", "serde"] }
+uuid = { version = "1.19", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 anyhow = "1.0"
@@ -46,7 +46,7 @@ services = { path = "../services" }
 config = { path = "../config" }
 
 # For database migrations
-refinery = { version = "0.8", features = ["tokio-postgres"] }
+refinery = { version = "0.9", features = ["tokio-postgres"] }
 
 # For hashing API keys and session tokens
 sha2 = "0.10"
@@ -56,7 +56,7 @@ rand = "0.9.2"
 regex = "1.10"
 
 # For Patroni discovery
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.12", features = ["json"] }
 
 # For TLS connections to PostgreSQL
 postgres-native-tls = "0.5"

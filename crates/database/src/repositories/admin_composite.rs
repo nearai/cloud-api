@@ -52,6 +52,9 @@ impl AdminRepository for AdminCompositeRepository {
             is_active: request.is_active,
             aliases: request.aliases.clone(),
             owned_by: request.owned_by,
+            change_reason: request.change_reason,
+            changed_by_user_id: request.changed_by_user_id,
+            changed_by_user_email: request.changed_by_user_email,
         };
 
         let model = self
@@ -104,11 +107,17 @@ impl AdminRepository for AdminCompositeRepository {
                 input_cost_per_token: h.input_cost_per_token,
                 output_cost_per_token: h.output_cost_per_token,
                 context_length: h.context_length,
+                model_name: h.model_name,
                 model_display_name: h.model_display_name,
                 model_description: h.model_description,
+                model_icon: h.model_icon,
+                verifiable: h.verifiable,
+                is_active: h.is_active,
+                owned_by: h.owned_by,
                 effective_from: h.effective_from,
                 effective_until: h.effective_until,
-                changed_by: h.changed_by,
+                changed_by_user_id: h.changed_by_user_id,
+                changed_by_user_email: h.changed_by_user_email,
                 change_reason: h.change_reason,
                 created_at: h.created_at,
             })
@@ -117,8 +126,21 @@ impl AdminRepository for AdminCompositeRepository {
         Ok((entries, total))
     }
 
-    async fn soft_delete_model(&self, model_name: &str) -> Result<bool> {
-        self.model_repo.soft_delete_model(model_name).await
+    async fn soft_delete_model(
+        &self,
+        model_name: &str,
+        change_reason: Option<String>,
+        changed_by_user_id: Option<Uuid>,
+        changed_by_user_email: Option<String>,
+    ) -> Result<bool> {
+        self.model_repo
+            .soft_delete_model(
+                model_name,
+                change_reason,
+                changed_by_user_id,
+                changed_by_user_email,
+            )
+            .await
     }
 
     async fn update_organization_limits(

@@ -1,5 +1,5 @@
 use crate::constants::DEFAULT_MODEL_OWNED_BY;
-use crate::models::{Model, ModelPricingHistory, UpdateModelPricingRequest};
+use crate::models::{Model, ModelHistory, UpdateModelPricingRequest};
 use crate::pool::DbPool;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
@@ -8,6 +8,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use services::common::RepositoryError;
 use tokio_postgres::Row;
+
+// Default reason for soft delete operations
+const DEFAULT_SOFT_DELETE_REASON: &str = "Model soft deleted";
 
 #[derive(Debug, Clone)]
 pub struct ModelRepository {
@@ -344,9 +347,9 @@ impl ModelRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            if existing.is_some() {
+            let row = if existing.is_some() {
                 // Model exists - do UPDATE (partial updates work)
-                client
+                let updated_row = client
                     .query_one(
                         r#"
                         UPDATE models SET
@@ -379,12 +382,27 @@ impl ModelRepository {
                         ],
                     )
                     .await
-                    .map_err(map_db_error)
+                    .map_err(map_db_error)?;
+
+                // Record history: close previous history record and insert new one
+                let model_id: uuid::Uuid = updated_row.get("id");
+                self.record_model_history(
+                    &client,
+                    model_id,
+                    &updated_row,
+                    &update_request.change_reason,
+                    update_request.changed_by_user_id,
+                    update_request.changed_by_user_email.clone(),
+                )
+                .await
+                .map_err(RepositoryError::DatabaseError)?;
+
+                updated_row
             } else {
                 // Model doesn't exist - do INSERT with ON CONFLICT to handle race conditions
                 // Use INSERT ... ON CONFLICT to handle race conditions where another
                 // transaction inserts the same model between our check and insert
-                client
+                let inserted_row = client
                     .query_one(
                         r#"
                         INSERT INTO models (
@@ -423,8 +441,25 @@ impl ModelRepository {
                         ],
                     )
                     .await
-                    .map_err(map_db_error)
-            }
+                    .map_err(map_db_error)?;
+
+                // Record history for new model
+                let model_id: uuid::Uuid = inserted_row.get("id");
+                self.record_model_history(
+                    &client,
+                    model_id,
+                    &inserted_row,
+                    &update_request.change_reason,
+                    update_request.changed_by_user_id,
+                    update_request.changed_by_user_email.clone(),
+                )
+                .await
+                .map_err(RepositoryError::DatabaseError)?;
+
+                inserted_row
+            };
+
+            Ok(row)
         })?;
 
         Ok(self.row_to_model(&row))
@@ -472,12 +507,9 @@ impl ModelRepository {
         Ok(self.row_to_model(&row))
     }
 
-    /// Get pricing history for a specific model
-    pub async fn get_pricing_history(
-        &self,
-        model_id: &uuid::Uuid,
-    ) -> Result<Vec<ModelPricingHistory>> {
-        let rows = retry_db!("get_pricing_history", {
+    /// Get history for a specific model
+    pub async fn get_model_history(&self, model_id: &uuid::Uuid) -> Result<Vec<ModelHistory>> {
+        let rows = retry_db!("get_model_history", {
             let client = self
                 .pool
                 .get()
@@ -490,9 +522,11 @@ impl ModelRepository {
                     r#"
                     SELECT
                         id, model_id, input_cost_per_token, output_cost_per_token,
-                        context_length, model_display_name, model_description,
-                        effective_from, effective_until, changed_by, change_reason, created_at
-                    FROM model_pricing_history
+                        context_length, model_name, model_display_name, model_description,
+                        model_icon, verifiable, is_active, owned_by,
+                        effective_from, effective_until, changed_by_user_id, changed_by_user_email,
+                        change_reason, created_at
+                    FROM model_history
                     WHERE model_id = $1
                     ORDER BY effective_from DESC
                     "#,
@@ -504,18 +538,18 @@ impl ModelRepository {
 
         let history = rows
             .into_iter()
-            .map(|row| self.row_to_pricing_history(&row))
+            .map(|row| self.row_to_model_history(&row))
             .collect();
         Ok(history)
     }
 
-    /// Get pricing that was effective at a specific timestamp
-    pub async fn get_pricing_at_time(
+    /// Get model state that was effective at a specific timestamp
+    pub async fn get_model_state_at_time(
         &self,
         model_id: &uuid::Uuid,
         timestamp: DateTime<Utc>,
-    ) -> Result<Option<ModelPricingHistory>> {
-        let rows = retry_db!("get_pricing_at_time", {
+    ) -> Result<Option<ModelHistory>> {
+        let rows = retry_db!("get_model_state_at_time", {
             let client = self
                 .pool
                 .get()
@@ -528,9 +562,11 @@ impl ModelRepository {
                     r#"
                     SELECT
                         id, model_id, input_cost_per_token, output_cost_per_token,
-                        context_length, model_display_name, model_description,
-                        effective_from, effective_until, changed_by, change_reason, created_at
-                    FROM model_pricing_history
+                        context_length, model_name, model_display_name, model_description,
+                        model_icon, verifiable, is_active, owned_by,
+                        effective_from, effective_until, changed_by_user_id, changed_by_user_email,
+                        change_reason, created_at
+                    FROM model_history
                     WHERE model_id = $1
                     AND effective_from <= $2
                     AND (effective_until IS NULL OR effective_until > $2)
@@ -544,7 +580,7 @@ impl ModelRepository {
         })?;
 
         if let Some(row) = rows.first() {
-            Ok(Some(self.row_to_pricing_history(row)))
+            Ok(Some(self.row_to_model_history(row)))
         } else {
             Ok(None)
         }
@@ -564,7 +600,7 @@ impl ModelRepository {
                 .query_one(
                     r#"
                     SELECT COUNT(*) as count
-                    FROM model_pricing_history h
+                    FROM model_history h
                     JOIN models m ON h.model_id = m.id
                     WHERE m.model_name = $1
                     "#,
@@ -582,7 +618,7 @@ impl ModelRepository {
         model_name: &str,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<ModelPricingHistory>> {
+    ) -> Result<Vec<ModelHistory>> {
         let rows = retry_db!("get_model_history_by_name", {
             let client = self
                 .pool
@@ -596,9 +632,11 @@ impl ModelRepository {
                     r#"
                     SELECT
                         h.id, h.model_id, h.input_cost_per_token, h.output_cost_per_token,
-                        h.context_length, h.model_display_name, h.model_description,
-                        h.effective_from, h.effective_until, h.changed_by, h.change_reason, h.created_at
-                    FROM model_pricing_history h
+                        h.context_length, h.model_name, h.model_display_name, h.model_description,
+                        h.model_icon, h.verifiable, h.is_active, h.owned_by,
+                        h.effective_from, h.effective_until, h.changed_by_user_id, h.changed_by_user_email,
+                        h.change_reason, h.created_at
+                    FROM model_history h
                     JOIN models m ON h.model_id = m.id
                     WHERE m.model_name = $1
                     ORDER BY h.effective_from DESC
@@ -612,13 +650,19 @@ impl ModelRepository {
 
         let history = rows
             .into_iter()
-            .map(|row| self.row_to_pricing_history(&row))
+            .map(|row| self.row_to_model_history(&row))
             .collect();
         Ok(history)
     }
 
     /// Soft delete a model by setting is_active to false
-    pub async fn soft_delete_model(&self, model_name: &str) -> Result<bool> {
+    pub async fn soft_delete_model(
+        &self,
+        model_name: &str,
+        change_reason: Option<String>,
+        changed_by_user_id: Option<uuid::Uuid>,
+        changed_by_user_email: Option<String>,
+    ) -> Result<bool> {
         let result = retry_db!("soft_delete_model", {
             let client = self
                 .pool
@@ -627,20 +671,119 @@ impl ModelRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
-                .execute(
+            let result = client
+                .query_opt(
                     r#"
                     UPDATE models
                     SET is_active = false, updated_at = NOW()
                     WHERE model_name = $1 AND is_active = true
+                    RETURNING id, model_name, model_display_name, model_description, model_icon,
+                              input_cost_per_token, output_cost_per_token,
+                              context_length, verifiable, is_active, owned_by, created_at, updated_at
                     "#,
                     &[&model_name],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+
+            if let Some(row) = result {
+                // Record history: capture the soft delete in history
+                let model_id: uuid::Uuid = row.get("id");
+                let reason = change_reason
+                    .clone()
+                    .or_else(|| Some(DEFAULT_SOFT_DELETE_REASON.to_string()));
+                self.record_model_history(
+                    &client,
+                    model_id,
+                    &row,
+                    &reason,
+                    changed_by_user_id,
+                    changed_by_user_email.clone(),
+                )
+                .await
+                .map_err(RepositoryError::DatabaseError)?;
+
+                Ok(Some(()))
+            } else {
+                Ok(None)
+            }
         })?;
 
-        Ok(result > 0)
+        Ok(result.is_some())
+    }
+
+    /// Helper method to record a model history entry
+    /// Closes the previous history record and creates a new one
+    async fn record_model_history(
+        &self,
+        client: &tokio_postgres::Client,
+        model_id: uuid::Uuid,
+        model_row: &Row,
+        change_reason: &Option<String>,
+        changed_by_user_id: Option<uuid::Uuid>,
+        changed_by_user_email: Option<String>,
+    ) -> Result<()> {
+        // Close previous history record (set effective_until to NOW)
+        client
+            .execute(
+                r#"
+                UPDATE model_history
+                SET effective_until = NOW()
+                WHERE model_id = $1 AND effective_until IS NULL
+                "#,
+                &[&model_id],
+            )
+            .await
+            .context("Failed to close previous model history record")?;
+
+        // Insert new history record with current model state
+        client
+            .execute(
+                r#"
+                INSERT INTO model_history (
+                    model_id,
+                    input_cost_per_token,
+                    output_cost_per_token,
+                    context_length,
+                    model_name,
+                    model_display_name,
+                    model_description,
+                    model_icon,
+                    verifiable,
+                    is_active,
+                    owned_by,
+                    effective_from,
+                    effective_until,
+                    changed_by_user_id,
+                    changed_by_user_email,
+                    change_reason,
+                    created_at
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                    NOW(), NULL, $12, $13, $14, NOW()
+                )
+                "#,
+                &[
+                    &model_id,
+                    &model_row.get::<_, i64>("input_cost_per_token"),
+                    &model_row.get::<_, i64>("output_cost_per_token"),
+                    &model_row.get::<_, i32>("context_length"),
+                    &model_row.get::<_, String>("model_name"),
+                    &model_row.get::<_, String>("model_display_name"),
+                    &model_row.get::<_, String>("model_description"),
+                    &model_row.get::<_, Option<String>>("model_icon"),
+                    &model_row.get::<_, bool>("verifiable"),
+                    &model_row.get::<_, bool>("is_active"),
+                    &model_row.get::<_, String>("owned_by"),
+                    &changed_by_user_id,
+                    &changed_by_user_email,
+                    change_reason,
+                ],
+            )
+            .await
+            .context("Failed to insert model history record")?;
+
+        Ok(())
     }
 
     /// Get list of configured model names (canonical names)
@@ -756,19 +899,25 @@ impl ModelRepository {
         }
     }
 
-    /// Helper method to convert database row to ModelPricingHistory
-    fn row_to_pricing_history(&self, row: &Row) -> ModelPricingHistory {
-        ModelPricingHistory {
+    /// Helper method to convert database row to ModelHistory
+    fn row_to_model_history(&self, row: &Row) -> ModelHistory {
+        ModelHistory {
             id: row.get("id"),
             model_id: row.get("model_id"),
             input_cost_per_token: row.get("input_cost_per_token"),
             output_cost_per_token: row.get("output_cost_per_token"),
             context_length: row.get("context_length"),
+            model_name: row.get("model_name"),
             model_display_name: row.get("model_display_name"),
             model_description: row.get("model_description"),
+            model_icon: row.get("model_icon"),
+            verifiable: row.get("verifiable"),
+            is_active: row.get("is_active"),
+            owned_by: row.get("owned_by"),
             effective_from: row.get("effective_from"),
             effective_until: row.get("effective_until"),
-            changed_by: row.get("changed_by"),
+            changed_by_user_id: row.get("changed_by_user_id"),
+            changed_by_user_email: row.get("changed_by_user_email"),
             change_reason: row.get("change_reason"),
             created_at: row.get("created_at"),
         }

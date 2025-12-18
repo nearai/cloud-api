@@ -29,9 +29,13 @@ A Rust-based cloud API for AI model inference, conversation management, and orga
 
 3. **Run without Docker**:
    ```bash
-   # Set up PostgreSQL database first, then:
-   cargo run --bin api
+   make dev
    ```
+
+   This automatically:
+   - Runs all database migrations
+   - Seeds the database with development data
+   - Starts the API server on http://localhost:3000
 
 ## Testing
 
@@ -43,11 +47,14 @@ A Rust-based cloud API for AI model inference, conversation management, and orga
 ### Run Tests
 
 ```bash
-# Run unit tests
-cargo test --lib --bins
+# Run unit tests only
+make test-unit
 
-# Run integration/e2e tests (requires database)
-cargo test --test e2e_test
+# Run integration/e2e tests only (requires database)
+make test-integration
+
+# Run both unit and integration tests
+make test
 ```
 
 ### Test Database Setup
@@ -65,7 +72,7 @@ docker run --name test-postgres \
   -d postgres:latest
 
 # Run tests with default values (or override with env vars)
-cargo test --test e2e_test
+make test-integration
 
 # Or with custom database settings
 DATABASE_HOST=localhost \
@@ -73,7 +80,7 @@ DATABASE_PORT=5432 \
 DATABASE_NAME=platform_api \
 DATABASE_USERNAME=postgres \
 DATABASE_PASSWORD=postgres \
-cargo test --test e2e_test
+make test-integration
 ```
 
 #### Option 2: Using existing PostgreSQL
@@ -93,7 +100,7 @@ Copy `env.example` to `.env` and configure your test database:
 ```bash
 cp env.example .env
 # Edit .env with your database credentials
-cargo test --test e2e_test
+make test-integration
 ```
 
 ### vLLM Integration Tests
@@ -141,11 +148,21 @@ Known advisories without available fixes are documented and ignored in `.cargo/a
 
 ## Contributing
 
-1. Ensure all tests pass: `cargo test`
-2. Check code formatting: `cargo fmt --check`
-3. Run linting: `cargo clippy`
-4. Ensure database migrations work with test setup
-5. Ensure no security vulnerabilities: `cargo audit`
+Before committing code:
+
+Run all checks with a single command:
+
+```bash
+make preflight
+```
+
+This runs:
+- Clippy linter (strict mode with `-D warnings`)
+- Code formatting check and fix
+- Unit tests
+- Full build
+
+Once all checks pass, you're ready to commit!
 
 
 ## API Documentation

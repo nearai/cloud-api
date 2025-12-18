@@ -2047,6 +2047,7 @@ dependencies = [
  "config",
  "deadpool",
  "deadpool-postgres",
+ "dotenvy",
  "native-tls",
  "postgres-native-tls",
  "postgres-types",
@@ -2066,6 +2067,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-postgres-rustls",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

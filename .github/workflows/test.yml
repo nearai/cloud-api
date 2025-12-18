@@ -11,10 +11,72 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  test:
-    name: Test Suite
+  # Fast lint job - runs in parallel with everything else
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    
+    - name: Install Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        components: rustfmt, clippy
+
+    - name: Cache Rust
+      uses: swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+
+    - name: Run clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # Unit tests - fast, no database needed
+  unit-tests:
+    name: Unit Tests
     runs-on: ubuntu-latest
     environment: Cloud API test env
+    steps:
+    - uses: actions/checkout@v6
+    
+    - name: Install Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+
+    - name: Cache Rust
+      uses: swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+
+    - name: Run unit tests
+      run: cargo test --lib --bins
+      env:
+        POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
+        DATABASE_HOST: localhost
+        DATABASE_PORT: 5432
+        DATABASE_NAME: platform_api
+        DATABASE_USERNAME: postgres
+        DATABASE_PASSWORD: postgres
+        DATABASE_MAX_CONNECTIONS: 5
+        DATABASE_TLS_ENABLED: "false"
+        MODEL_DISCOVERY_SERVER_URL: ${{ secrets.MODEL_DISCOVERY_SERVER_URL }}
+        MODEL_DISCOVERY_API_KEY: ${{ secrets.MODEL_DISCOVERY_API_KEY }}
+        AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
+        AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
+        BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
+        DEV: "true"
+
+  # Integration tests - split into parallel shards
+  integration-tests:
+    name: Integration Tests (Shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    environment: Cloud API test env
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     
     services:
       postgres:
@@ -36,46 +98,25 @@ jobs:
     
     - name: Install Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
+
+    - name: Cache Rust
+      uses: swatinem/rust-cache@v2
       with:
-        components: rustfmt, clippy
+        cache-on-failure: true
+        # Separate cache per shard to avoid conflicts
+        key: integration-shard-${{ matrix.shard }}
 
-    - name: Cache dependencies
-      uses: actions/cache@v5
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@nextest
 
-    - name: Run cargo fmt
-      run: cargo fmt --all -- --check
-
-    - name: Run cargo clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
-
-    - name: Run unit tests
-      run: cargo test --lib --bins
-      env:
-        POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
-        DATABASE_HOST: localhost
-        DATABASE_PORT: 5432
-        DATABASE_NAME: platform_api
-        DATABASE_USERNAME: postgres
-        DATABASE_PASSWORD: postgres
-        DATABASE_MAX_CONNECTIONS: 5
-        DATABASE_TLS_ENABLED: "false"
-        MODEL_DISCOVERY_SERVER_URL: ${{ secrets.MODEL_DISCOVERY_SERVER_URL }}
-        MODEL_DISCOVERY_API_KEY: ${{ secrets.MODEL_DISCOVERY_API_KEY }}
-        AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
-        AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
-        BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
-        DEV: "true"
-
-    - name: Run integration tests
-      run: cargo test -p api --tests
+    - name: Run integration tests (shard ${{ matrix.shard }}/4)
+      run: |
+        cargo nextest run \
+          -p api \
+          --tests \
+          --partition count:${{ matrix.shard }}/4 \
+          --failure-output immediate-final \
+          --no-fail-fast
       env:
         POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
         DATABASE_HOST: localhost
@@ -90,16 +131,50 @@ jobs:
         AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
         AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
         BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
-        TEST_DATABASE_NAME: platform_api_test
+        TEST_DATABASE_NAME: platform_api_test_${{ matrix.shard }}
         RUST_LOG: debug
         DEV: "true"
+
+  # vLLM integration tests - separate job
+  vllm-tests:
+    name: vLLM Integration Tests
+    runs-on: ubuntu-latest
+    environment: Cloud API test env
+    steps:
+    - uses: actions/checkout@v6
+    
+    - name: Install Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+
+    - name: Cache Rust
+      uses: swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
 
     - name: Run vLLM integration tests
       run: cargo test --test integration_tests -- --nocapture
       env:
         VLLM_BASE_URL: ${{ secrets.VLLM_BASE_URL }}
         VLLM_API_KEY: ${{ secrets.VLLM_API_KEY }}
-        
+
+  # Release build - only on main branch pushes, not on PRs
+  build-release:
+    name: Build Release
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [lint, unit-tests, integration-tests, vllm-tests]
+    environment: Cloud API test env
+    steps:
+    - uses: actions/checkout@v6
+    
+    - name: Install Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+
+    - name: Cache Rust
+      uses: swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+
     - name: Build release
       run: cargo build --release
       env:

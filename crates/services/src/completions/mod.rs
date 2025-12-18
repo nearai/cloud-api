@@ -142,6 +142,23 @@ where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
 {
     fn drop(&mut self) {
+        let organization_id = self.organization_id;
+        let workspace_id = self.workspace_id;
+        let api_key_id = self.api_key_id;
+        let model_id = self.model_id;
+        let inference_type = self.inference_type.clone();
+
+        // Create a span with common fields for all logging in this method
+        let _span = tracing::error_span!(
+            "stream_drop",
+            %organization_id,
+            %workspace_id,
+            %api_key_id,
+            %model_id,
+            %inference_type
+        )
+        .entered();
+
         // Decrement concurrent counter if present
         if let Some(counter) = &self.concurrent_counter {
             counter.fetch_sub(1, Ordering::Release);
@@ -165,9 +182,17 @@ where
                     usage.completion_tokens,
                     chat_id.clone(),
                 ),
-                _ => {
+                (None, None) => {
                     // No usage stats or chat_id available, nothing to record
-                    tracing::warn!("Stream ended but no usage stats or chat_id available");
+                    tracing::error!("Stream ended but no usage stats and no chat_id available");
+                    return;
+                }
+                (None, Some(chat_id)) => {
+                    tracing::error!(%chat_id, "Stream ended but no usage stats available");
+                    return;
+                }
+                (Some(usage), None) => {
+                    tracing::error!(?usage, "Stream ended but no chat_id available");
                     return;
                 }
             };
@@ -194,11 +219,6 @@ where
         let usage_service = self.usage_service.clone();
         let attestation_service = self.attestation_service.clone();
         let metrics_service = self.metrics_service.clone();
-        let organization_id = self.organization_id;
-        let workspace_id = self.workspace_id;
-        let api_key_id = self.api_key_id;
-        let model_id = self.model_id;
-        let inference_type = self.inference_type.clone();
         let ttft_ms = self.ttft_ms;
         let e2e_duration = self.service_start_time.elapsed();
         let first_token_time = self.first_token_time;
@@ -206,11 +226,14 @@ where
         let mut metric_tags = self.metric_tags.clone();
         metric_tags.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
 
+        let span = tracing::Span::current();
+
         // Spawn critical billing operations on blocking thread pool with timeout
         // The tokio runtime waits for blocking tasks during graceful shutdown,
         // which helps prevent data loss compared to regular spawn
         let handle_clone = handle.clone();
         handle.spawn_blocking(move || {
+            let _span_guard = span.enter();
             handle_clone.block_on(async move {
                 let result = tokio::time::timeout(Duration::from_secs(2), async move {
                     // Record usage (critical for billing accuracy)

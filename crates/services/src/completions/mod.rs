@@ -265,11 +265,7 @@ where
                     }
 
                     metrics_service.record_count(METRIC_TOKENS_INPUT, input_tokens as i64, &tags);
-                    metrics_service.record_count(
-                        METRIC_TOKENS_OUTPUT,
-                        output_tokens as i64,
-                        &tags,
-                    );
+                    metrics_service.record_count(METRIC_TOKENS_OUTPUT, output_tokens as i64, &tags);
                 })
                 .await;
 

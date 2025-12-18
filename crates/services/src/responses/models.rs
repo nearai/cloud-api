@@ -63,8 +63,6 @@ pub struct CreateResponseRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<ResponseTextConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ResponseReasoningConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include: Option<Vec<String>>,
@@ -199,25 +197,6 @@ pub struct ResponseToolChoiceFunction {
     pub name: String,
 }
 
-/// Text format configuration
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ResponseTextConfig {
-    pub format: ResponseTextFormat,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub verbosity: Option<String>, // "low", "medium", "high"
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type")]
-pub enum ResponseTextFormat {
-    #[serde(rename = "text")]
-    Text,
-    #[serde(rename = "json_object")]
-    JsonObject,
-    #[serde(rename = "json_schema")]
-    JsonSchema { json_schema: serde_json::Value },
-}
-
 /// Reasoning configuration
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct ResponseReasoningConfig {
@@ -265,8 +244,6 @@ pub struct ResponseObject {
     pub service_tier: String,
     pub store: bool,
     pub temperature: f32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<ResponseTextConfig>,
     pub tool_choice: ResponseToolChoiceOutput,
     pub tools: Vec<ResponseTool>,
     #[serde(default)]
@@ -416,6 +393,38 @@ impl ResponseOutputItem {
             ResponseOutputItem::ToolCall { model, .. } => model,
             ResponseOutputItem::WebSearchCall { model, .. } => model,
             ResponseOutputItem::Reasoning { model, .. } => model,
+        }
+    }
+
+    /// Get the response_id of the output item
+    pub fn response_id(&self) -> &str {
+        match self {
+            ResponseOutputItem::Message { response_id, .. } => response_id,
+            ResponseOutputItem::ToolCall { response_id, .. } => response_id,
+            ResponseOutputItem::WebSearchCall { response_id, .. } => response_id,
+            ResponseOutputItem::Reasoning { response_id, .. } => response_id,
+        }
+    }
+
+    /// Get the previous_response_id of the output item
+    pub fn previous_response_id(&self) -> &Option<String> {
+        match self {
+            ResponseOutputItem::Message {
+                previous_response_id,
+                ..
+            } => previous_response_id,
+            ResponseOutputItem::ToolCall {
+                previous_response_id,
+                ..
+            } => previous_response_id,
+            ResponseOutputItem::WebSearchCall {
+                previous_response_id,
+                ..
+            } => previous_response_id,
+            ResponseOutputItem::Reasoning {
+                previous_response_id,
+                ..
+            } => previous_response_id,
         }
     }
 }
@@ -807,11 +816,6 @@ impl CreateResponseRequest {
             if top_p <= 0.0 || top_p > 1.0 {
                 return Err("top_p must be between 0.0 and 1.0".to_string());
             }
-        }
-
-        // Validate mutual exclusivity
-        if self.conversation.is_some() && self.previous_response_id.is_some() {
-            return Err("Cannot specify both conversation and previous_response_id".to_string());
         }
 
         Ok(())

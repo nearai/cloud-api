@@ -28,12 +28,74 @@ pub struct CreateWorkspaceRequest {
     pub description: Option<String>,
 }
 
+impl CreateWorkspaceRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        crate::routes::common::validate_non_empty_field(&self.name, "workspace name")?;
+        crate::routes::common::validate_max_length(
+            &self.name,
+            "workspace name",
+            crate::consts::MAX_NAME_LENGTH,
+        )?;
+
+        if let Some(display_name) = &self.display_name {
+            crate::routes::common::validate_max_length(
+                display_name,
+                "workspace display_name",
+                crate::consts::MAX_NAME_LENGTH,
+            )?;
+        }
+
+        if let Some(description) = &self.description {
+            crate::routes::common::validate_max_length(
+                description,
+                "workspace description",
+                crate::consts::MAX_DESCRIPTION_LENGTH,
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
 /// Request to update a workspace
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateWorkspaceRequest {
     pub display_name: Option<String>,
     pub description: Option<String>,
     pub settings: Option<serde_json::Value>,
+}
+
+impl UpdateWorkspaceRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(display_name) = &self.display_name {
+            crate::routes::common::validate_max_length(
+                display_name,
+                "workspace display_name",
+                crate::consts::MAX_NAME_LENGTH,
+            )?;
+        }
+
+        if let Some(description) = &self.description {
+            crate::routes::common::validate_max_length(
+                description,
+                "workspace description",
+                crate::consts::MAX_DESCRIPTION_LENGTH,
+            )?;
+        }
+
+        if let Some(settings) = &self.settings {
+            let serialized = serde_json::to_string(settings)
+                .map_err(|_| "Invalid workspace settings JSON".to_string())?;
+            if serialized.len() > crate::consts::MAX_SETTINGS_SIZE_BYTES {
+                return Err(format!(
+                    "workspace settings is too large (max {} bytes when serialized)",
+                    crate::consts::MAX_SETTINGS_SIZE_BYTES
+                ));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Workspace response model
@@ -139,6 +201,13 @@ pub async fn create_workspace(
         "Creating workspace: {} in organization: {} by user: {}",
         request.name, org_id, user.0.id
     );
+
+    if let Err(msg) = request.validate() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
+        ));
+    }
 
     let user_id = authenticated_user_to_user_id(user);
     let organization_id = OrganizationId(org_id);
@@ -442,6 +511,13 @@ pub async fn update_workspace(
         workspace_id, user.0.id
     );
 
+    if let Err(msg) = request.validate() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
+        ));
+    }
+
     let user_id = authenticated_user_to_user_id(user);
     let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
 
@@ -604,6 +680,13 @@ pub async fn create_workspace_api_key(
         "Creating API key for workspace: {} by user: {}",
         workspace_id, user.0.id
     );
+
+    if let Err(msg) = request.validate() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
+        ));
+    }
 
     let user_id = authenticated_user_to_user_id(user.clone());
     let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
@@ -978,6 +1061,13 @@ pub async fn update_api_key_spend_limit(
         api_key_id, workspace_id, user.0.id
     );
 
+    if let Err(msg) = request.validate() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
+        ));
+    }
+
     let user_id = authenticated_user_to_user_id(user.clone());
     let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);
     let api_key_id_typed = services::workspace::ApiKeyId(api_key_id.to_string());
@@ -1067,6 +1157,13 @@ pub async fn update_workspace_api_key(
         "Updating API key: {} in workspace: {} by user: {}",
         api_key_id, workspace_id, user.0.id
     );
+
+    if let Err(msg) = request.validate() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
+        ));
+    }
 
     let user_id = authenticated_user_to_user_id(user.clone());
     let workspace_id_typed = services::workspace::WorkspaceId(workspace_id);

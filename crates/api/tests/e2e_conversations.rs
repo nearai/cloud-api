@@ -1279,13 +1279,25 @@ async fn test_conversation_items_pagination() {
 
 #[tokio::test]
 async fn test_response_previous_next_relationships() {
-    let server = setup_test_server().await;
+    use common::mock_prompts;
+    use inference_providers::mock::{RequestMatcher, ResponseTemplate};
+
+    // Use setup_test_server_with_pool to get access to mock provider
+    let (server, _pool, mock, _db) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Create a conversation
     let conversation = create_conversation(&server, api_key.clone()).await;
     println!("Created conversation: {}", conversation.id);
+
+    // Set up mock expectations for each request in the conversation tree
+    // Parent request: "What is the capital of France?"
+    let parent_prompt = mock_prompts::build_prompt("What is the capital of France?");
+    mock.when(RequestMatcher::ExactPrompt(parent_prompt))
+        .respond_with(ResponseTemplate::new("Paris is the capital of France."))
+        .await;
 
     // Create first response (parent)
     let parent_response = create_response(
@@ -1310,11 +1322,25 @@ async fn test_response_previous_next_relationships() {
         "Parent response should have no previous_response_id"
     );
 
-    // Create first follow-up response (conversation inherited from parent)
+    // Branch 1: First follow-up from parent
+    // Expected context: parent user + parent assistant + new user message
+    let response1_prompt = mock_prompts::build_prompt(
+        "What is the capital of France? Paris is the capital of France. Tell me more about that.",
+    );
+    mock.when(RequestMatcher::ExactPrompt(response1_prompt))
+        .respond_with(ResponseTemplate::new(
+            "Paris is known for the Eiffel Tower and rich history.",
+        ))
+        .await;
+
+    // Create first follow-up response (with conversation + previous_response_id for context filtering)
     let response1 = server
         .post("/v1/responses")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
+            "conversation": {
+                "id": conversation.id
+            },
             "input": "Tell me more about that.",
             "temperature": 0.7,
             "max_output_tokens": 100,
@@ -1339,11 +1365,26 @@ async fn test_response_previous_next_relationships() {
         "Response1 should have no next responses initially"
     );
 
-    // Create second follow-up response from the same parent (conversation inherited)
+    // Branch 2: Second follow-up from parent (creates a sibling branch)
+    // Expected context: parent user + parent assistant + new user message
+    // This should be the SAME context as response1 (both branch from parent)
+    let response2_prompt = mock_prompts::build_prompt(
+        "What is the capital of France? Paris is the capital of France. What about its history?",
+    );
+    mock.when(RequestMatcher::ExactPrompt(response2_prompt))
+        .respond_with(ResponseTemplate::new(
+            "Paris has a long history dating back to Roman times.",
+        ))
+        .await;
+
+    // Create second follow-up response from the same parent (with conversation + previous_response_id)
     let response2 = server
         .post("/v1/responses")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
+            "conversation": {
+                "id": conversation.id
+            },
             "input": "What about its history?",
             "temperature": 0.7,
             "max_output_tokens": 100,
@@ -1364,11 +1405,27 @@ async fn test_response_previous_next_relationships() {
         "Response2 should reference parent as previous_response_id"
     );
 
-    // Create nested response (follows 1, conversation inherited)
+    // CRITICAL TEST: Nested response following branch 1
+    // This verifies that context filtering works correctly
+    // Expected context: parent → response1 path ONLY (should NOT include response2)
+    // Format: parent_user + parent_assistant + response1_user + response1_assistant + nested_user
+    let nested_prompt = mock_prompts::build_prompt(
+        "What is the capital of France? Paris is the capital of France. Tell me more about that. Paris is known for the Eiffel Tower and rich history. Can you elaborate?"
+    );
+    mock.when(RequestMatcher::ExactPrompt(nested_prompt))
+        .respond_with(ResponseTemplate::new(
+            "The Eiffel Tower was built in 1889 for the World's Fair.",
+        ))
+        .await;
+
+    // Create nested response (follows response1, with conversation + previous_response_id for filtering)
     let nested_response = server
         .post("/v1/responses")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
+            "conversation": {
+                "id": conversation.id
+            },
             "input": "Can you elaborate?",
             "temperature": 0.7,
             "max_output_tokens": 100,
@@ -1378,7 +1435,11 @@ async fn test_response_previous_next_relationships() {
         }))
         .await;
 
-    assert_eq!(nested_response.status_code(), 200);
+    assert_eq!(
+        nested_response.status_code(),
+        200,
+        "Nested response should succeed"
+    );
     let nested_response = nested_response.json::<api::models::ResponseObject>();
     println!("Created nested response: {}", nested_response.id);
 
@@ -1389,11 +1450,27 @@ async fn test_response_previous_next_relationships() {
         "Nested response should reference response1 as previous_response_id"
     );
 
-    // Now fetch the parent response again to verify next_response_ids was updated
-    // Note: We need to implement a GET endpoint to verify this properly
-    // For now, we'll verify through the database by creating a new response and checking
+    // Verify the response content to ensure the mock was matched
+    // This confirms that the correct context was passed (parent → response1 path, excluding response2)
+    let has_expected_content = nested_response.output.iter().any(|item| {
+        if let api::models::ResponseOutputItem::Message { content, .. } = item {
+            content.iter().any(|part| {
+                if let api::models::ResponseOutputContent::OutputText { text, .. } = part {
+                    text.contains("Eiffel Tower was built in 1889")
+                } else {
+                    false
+                }
+            })
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_expected_content,
+        "Nested response should contain expected content from the mock, confirming correct context filtering"
+    );
 
-    println!("✅ Response previous-next relationships working correctly");
+    println!("✅ Response previous-next relationships and context filtering working correctly");
     println!("   - Parent: {}", parent_response.id);
     println!(
         "   - Response1: {} (previous: {})",
@@ -1406,9 +1483,200 @@ async fn test_response_previous_next_relationships() {
         response2.previous_response_id.as_ref().unwrap()
     );
     println!(
-        "   - Nested: {} (previous: {})",
+        "   - Nested: {} (previous: {}) - context filtered to parent→response1 path only",
         nested_response.id,
         nested_response.previous_response_id.as_ref().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_first_turn_items_have_root_response_parent() {
+    let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Create a conversation
+    let conversation = create_conversation(&server, api_key.clone()).await;
+    println!("Created conversation: {}", conversation.id);
+
+    // Create the first response in this conversation (no previous_response_id)
+    let first_response = create_response(
+        &server,
+        conversation.id.clone(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        "Hello, world!".to_string(),
+        100,
+        api_key.clone(),
+    )
+    .await;
+
+    println!("Created first response: {}", first_response.id);
+
+    // List conversation items and verify that all items belonging to the first
+    // response share a non-empty previous_response_id that is different from
+    // the response_id itself (i.e., they point to the hidden root_response).
+    let items_list =
+        list_conversation_items(&server, conversation.id.clone(), api_key.clone()).await;
+    assert!(
+        !items_list.data.is_empty(),
+        "Conversation should contain at least the first turn items"
+    );
+
+    let mut parent_ids: Vec<String> = Vec::new();
+
+    for item in &items_list.data {
+        match item {
+            api::models::ConversationItem::Message {
+                response_id,
+                previous_response_id,
+                ..
+            }
+            | api::models::ConversationItem::Reasoning {
+                response_id,
+                previous_response_id,
+                ..
+            } => {
+                if response_id == &first_response.id {
+                    let prev = previous_response_id
+                        .as_ref()
+                        .unwrap_or_else(|| panic!(
+                            "First-turn item {} should have a previous_response_id (root_response parent)",
+                            response_id
+                        ));
+                    parent_ids.push(prev.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        !parent_ids.is_empty(),
+        "Expected at least one item belonging to the first response"
+    );
+
+    // All parent IDs should be the same and different from the first response ID.
+    let root_id = &parent_ids[0];
+    for pid in &parent_ids {
+        assert_eq!(
+            pid, root_id,
+            "All first-turn items should share the same root_response parent"
+        );
+    }
+    assert_ne!(
+        root_id, &first_response.id,
+        "root_response parent ID should be different from the first response ID"
+    );
+}
+
+#[tokio::test]
+async fn test_first_turn_regenerate_creates_siblings_under_root_response() {
+    use std::collections::HashSet;
+
+    let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Create a conversation and the first response (no previous_response_id)
+    let conversation = create_conversation(&server, api_key.clone()).await;
+    let first_response = create_response(
+        &server,
+        conversation.id.clone(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        "Hello, root!".to_string(),
+        100,
+        api_key.clone(),
+    )
+    .await;
+
+    // Fetch items and extract the root_response ID from one of the first-turn items
+    let items_list =
+        list_conversation_items(&server, conversation.id.clone(), api_key.clone()).await;
+    let root_response_id = items_list
+        .data
+        .iter()
+        .find_map(|item| match item {
+            api::models::ConversationItem::Message {
+                response_id,
+                previous_response_id,
+                ..
+            }
+            | api::models::ConversationItem::Reasoning {
+                response_id,
+                previous_response_id,
+                ..
+            } if response_id == &first_response.id => previous_response_id.clone(),
+            _ => None,
+        })
+        .expect("Expected first-turn items to have a root_response previous_response_id");
+
+    println!(
+        "First response {} has root_response parent {}",
+        first_response.id, root_response_id
+    );
+
+    // Create a second first-turn response by using the root_response ID as previous_response_id.
+    // This simulates "regenerate" of the first turn: both responses share the same root parent.
+    let regen_response_http = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "input": "Hello again!",
+            "temperature": 0.7,
+            "max_output_tokens": 100,
+            "stream": false,
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "previous_response_id": root_response_id
+        }))
+        .await;
+
+    assert_eq!(regen_response_http.status_code(), 200);
+    let regen_response = regen_response_http.json::<api::models::ResponseObject>();
+    println!(
+        "Created regenerated first-turn response: {}",
+        regen_response.id
+    );
+
+    // List items again and collect all distinct response_ids that share the same
+    // root_response parent. We expect at least the original first_response and
+    // the regenerated response.
+    let items_after =
+        list_conversation_items(&server, conversation.id.clone(), api_key.clone()).await;
+    let mut first_turn_response_ids: HashSet<String> = HashSet::new();
+
+    for item in &items_after.data {
+        match item {
+            api::models::ConversationItem::Message {
+                response_id,
+                previous_response_id,
+                ..
+            }
+            | api::models::ConversationItem::Reasoning {
+                response_id,
+                previous_response_id,
+                ..
+            } => {
+                if previous_response_id.as_deref() == Some(&root_response_id) {
+                    first_turn_response_ids.insert(response_id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        first_turn_response_ids.contains(&first_response.id),
+        "Original first response should be a child of root_response"
+    );
+    assert!(
+        first_turn_response_ids.contains(&regen_response.id),
+        "Regenerated first-turn response should also be a child of root_response"
+    );
+    assert!(
+        first_turn_response_ids.len() >= 2,
+        "Expected at least two distinct first-turn responses under the same root_response"
     );
 }
 
@@ -3137,4 +3405,162 @@ async fn test_conversation_title_strips_thinking_tags() {
         "Title should not contain </think> tags, got: {title}"
     );
     println!("✅ Title stripped thinking tags: {title}");
+}
+
+#[tokio::test]
+async fn test_chat_completions_with_json_schema() {
+    use common::mock_prompts;
+    use inference_providers::mock::{RequestMatcher, ResponseTemplate};
+
+    let (server, _pool, mock, _db) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Configure mock to match exact prompt and return structured JSON
+    // Chat completions API sends messages directly without language instruction
+    let user_message = "Generate a user profile";
+    let expected_prompt = mock_prompts::build_simple_prompt(user_message);
+    let expected_json = r#"{"name": "Alice Johnson", "age": 28, "email": "alice@example.com"}"#;
+
+    mock.when(RequestMatcher::ExactPrompt(expected_prompt))
+        .respond_with(ResponseTemplate::new(expected_json))
+        .await;
+
+    // Make a chat completion request with response_format
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": user_message
+                }
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "user_profile",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "age": {"type": "integer"},
+                            "email": {"type": "string"}
+                        },
+                        "required": ["name", "age", "email"]
+                    },
+                    "strict": true
+                }
+            }
+        }))
+        .await;
+
+    if response.status_code() != 200 {
+        let error = response.text();
+        println!("Error response: {}", error);
+    }
+    assert_eq!(response.status_code(), 200);
+    let completion = response.json::<serde_json::Value>();
+
+    // Verify the response contains the expected JSON
+    let content = completion["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("Expected content in response");
+
+    assert_eq!(content, expected_json);
+
+    // Verify it's valid JSON matching the schema
+    let json_obj: serde_json::Value =
+        serde_json::from_str(content).expect("Content should be valid JSON");
+    assert_eq!(json_obj["name"], "Alice Johnson");
+    assert_eq!(json_obj["age"], 28);
+    assert_eq!(json_obj["email"], "alice@example.com");
+
+    println!("✅ Chat completions with JSON schema returned structured output");
+}
+
+#[tokio::test]
+async fn test_responses_api_with_json_schema() {
+    use common::mock_prompts;
+    use inference_providers::mock::{RequestMatcher, ResponseTemplate};
+
+    let (server, _pool, mock, _db) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Configure mock to match exact prompt and return structured JSON
+    let user_message = "Generate a book description";
+    let expected_prompt = mock_prompts::build_prompt(user_message);
+    let expected_json = r#"{"title": "The Great Adventure", "author": "John Smith", "year": 2024, "genre": "Fiction"}"#;
+
+    mock.when(RequestMatcher::ExactPrompt(expected_prompt))
+        .respond_with(ResponseTemplate::new(expected_json))
+        .await;
+
+    // Create a conversation
+    let conversation = create_conversation(&server, api_key.clone()).await;
+
+    // Make a response request with text.format.json_schema
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "conversation": {
+                "id": conversation.id,
+            },
+            "input": user_message,
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "max_output_tokens": 100,
+            "stream": false,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "book",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "author": {"type": "string"},
+                                "year": {"type": "integer"},
+                                "genre": {"type": "string"}
+                            },
+                            "required": ["title", "author", "year", "genre"]
+                        },
+                        "strict": true
+                    }
+                }
+            }
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    let response_obj = response.json::<api::models::ResponseObject>();
+
+    // Verify the response contains structured output
+    assert!(!response_obj.output.is_empty());
+
+    if let ResponseOutputItem::Message { content, .. } = &response_obj.output[0] {
+        assert!(!content.is_empty());
+
+        if let ResponseOutputContent::OutputText { text, .. } = &content[0] {
+            // Verify it's valid JSON matching the schema
+            let json_obj: serde_json::Value =
+                serde_json::from_str(text).expect("Content should be valid JSON");
+            assert_eq!(json_obj["title"], "The Great Adventure");
+            assert_eq!(json_obj["author"], "John Smith");
+            assert_eq!(json_obj["year"], 2024);
+            assert_eq!(json_obj["genre"], "Fiction");
+
+            println!("✅ Responses API with JSON schema returned structured output");
+        } else {
+            panic!("Expected OutputText content");
+        }
+    } else {
+        panic!("Expected Message output item");
+    }
 }

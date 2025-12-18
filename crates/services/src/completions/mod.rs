@@ -5,6 +5,8 @@ use crate::inference_provider_pool::InferenceProviderPool;
 use crate::models::ModelsRepository;
 use crate::usage::{RecordUsageServiceRequest, UsageServiceTrait};
 use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, StreamingResult};
+use moka::future::Cache;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -13,7 +15,9 @@ use crate::metrics::{consts::*, MetricsServiceTrait};
 use futures_util::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const DEFAULT_CONCURRENT_LIMIT: u32 = 64;
 
 /// Hash inference ID to UUID deterministically using MD5 (v5)
 /// Takes the full ID including prefix (e.g., "chatcmpl-abc123") and returns a stable UUID
@@ -65,6 +69,14 @@ where
     total_itl_ms: f64,
     // Pre-allocated low-cardinality metric tags (for Datadog/OTLP)
     metric_tags: Vec<String>,
+    concurrent_counter: Option<Arc<AtomicU32>>,
+    /// Last received usage stats from streaming chunks
+    last_usage_stats: Option<inference_providers::TokenUsage>,
+    /// Last chat ID from streaming chunks (for attestation and inference_id)
+    last_chat_id: Option<String>,
+    /// Flag indicating the stream completed normally (received None from inner stream)
+    /// If false when Drop is called, the client disconnected mid-stream
+    stream_completed: bool,
 }
 
 impl<S> Stream for InterceptStream<S>
@@ -105,128 +117,190 @@ where
                 }
 
                 if let StreamChunk::Chat(ref chat_chunk) = event.chunk {
+                    // Track chat_id for attestation (updated on each chunk)
+                    self.last_chat_id = Some(chat_chunk.id.clone());
+
+                    // Track usage stats (updated on each chunk that has usage)
                     if let Some(usage) = &chat_chunk.usage {
-                        // Store attestation signature when completion finishes
-                        let attestation_service = self.attestation_service.clone();
-                        let chat_id = chat_chunk.id.clone();
-                        tokio::spawn(async move {
-                            if attestation_service
-                                .store_chat_signature_from_provider(chat_id.as_str())
-                                .await
-                                .is_err()
-                            {
-                                tracing::error!("Failed to store chat signature");
-                            } else {
-                                tracing::debug!("Stored signature for chat_id: {}", chat_id);
-                            }
-                        });
-
-                        // Calculate average ITL
-                        let avg_itl_ms = if self.token_count > 0 {
-                            Some(self.total_itl_ms / self.token_count as f64)
-                        } else {
-                            None
-                        };
-
-                        // Record usage with latency metrics
-                        let usage_service = self.usage_service.clone();
-                        let organization_id = self.organization_id;
-                        let workspace_id = self.workspace_id;
-                        let api_key_id = self.api_key_id;
-                        let model_id = self.model_id;
-                        let inference_type = self.inference_type.clone();
-                        let input_tokens = usage.prompt_tokens;
-                        let output_tokens = usage.completion_tokens;
-                        let ttft_ms = self.ttft_ms;
-                        // Hash the full chat ID to UUID for storage
-                        let inference_id_uuid = Some(hash_inference_id_to_uuid(&chat_chunk.id));
-
-                        tokio::spawn(async move {
-                            if usage_service
-                                .record_usage(RecordUsageServiceRequest {
-                                    organization_id,
-                                    workspace_id,
-                                    api_key_id,
-                                    model_id,
-                                    input_tokens,
-                                    output_tokens,
-                                    inference_type,
-                                    ttft_ms,
-                                    avg_itl_ms,
-                                    inference_id: inference_id_uuid,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                tracing::error!("Failed to record usage in completion service");
-                            } else {
-                                tracing::debug!(
-                                    "Recorded usage for org {}: {} input, {} output tokens (api_key: {}, ttft: {:?}ms)",
-                                    organization_id,
-                                    input_tokens,
-                                    output_tokens,
-                                    api_key_id,
-                                    ttft_ms
-                                );
-                            }
-                        });
-
-                        // Record metrics
-                        let metrics_service = self.metrics_service.clone();
-                        let e2e_duration = self.service_start_time.elapsed();
-                        let input_tokens = usage.prompt_tokens;
-                        let output_tokens = usage.completion_tokens;
-                        let first_token_time = self.first_token_time;
-                        let input_bucket = get_input_bucket(input_tokens);
-                        let mut tags_owned = self.metric_tags.clone();
-                        tags_owned.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
-
-                        tokio::spawn(async move {
-                            let tags: Vec<&str> = tags_owned.iter().map(|s| s.as_str()).collect();
-
-                            metrics_service.record_latency(
-                                METRIC_LATENCY_TOTAL,
-                                e2e_duration,
-                                &tags,
-                            );
-
-                            if let Some(first_token_instant) = first_token_time {
-                                let decoding_duration = first_token_instant.elapsed();
-                                metrics_service.record_latency(
-                                    METRIC_LATENCY_DECODING_TIME,
-                                    decoding_duration,
-                                    &tags,
-                                );
-
-                                let decode_secs = decoding_duration.as_secs_f64();
-                                if decode_secs > 0.0 {
-                                    let tps = output_tokens as f64 / decode_secs;
-                                    metrics_service.record_histogram(
-                                        METRIC_TOKENS_PER_SECOND,
-                                        tps,
-                                        &tags,
-                                    );
-                                }
-                            }
-
-                            // Token counts
-                            metrics_service.record_count(
-                                METRIC_TOKENS_INPUT,
-                                input_tokens as i64,
-                                &tags,
-                            );
-                            metrics_service.record_count(
-                                METRIC_TOKENS_OUTPUT,
-                                output_tokens as i64,
-                                &tags,
-                            );
-                        });
+                        self.last_usage_stats = Some(usage.clone());
                     }
                 }
                 Poll::Ready(Some(Ok(event.clone())))
             }
+            Poll::Ready(None) => {
+                // Stream completed normally
+                self.stream_completed = true;
+                Poll::Ready(None)
+            }
             other => other,
         }
+    }
+}
+
+impl<S> Drop for InterceptStream<S>
+where
+    S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
+{
+    fn drop(&mut self) {
+        let organization_id = self.organization_id;
+        let workspace_id = self.workspace_id;
+        let api_key_id = self.api_key_id;
+        let model_id = self.model_id;
+        let inference_type = self.inference_type.clone();
+
+        // Create a span with common fields for all logging in this method
+        let _span = tracing::error_span!(
+            "stream_drop",
+            %organization_id,
+            %workspace_id,
+            %api_key_id,
+            %model_id,
+            %inference_type
+        )
+        .entered();
+
+        // Decrement concurrent counter if present
+        if let Some(counter) = &self.concurrent_counter {
+            counter.fetch_sub(1, Ordering::Release);
+        }
+
+        // Check if we're in a Tokio runtime context
+        // Drop can be called outside of an async context (e.g., during shutdown)
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                tracing::error!("Cannot record usage: no Tokio runtime available");
+                return;
+            }
+        };
+
+        // Get usage stats and chat_id from stream
+        let (input_tokens, output_tokens, chat_id) =
+            match (&self.last_usage_stats, &self.last_chat_id) {
+                (Some(usage), Some(chat_id)) => (
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    chat_id.clone(),
+                ),
+                (None, None) => {
+                    // No usage stats or chat_id available, nothing to record
+                    tracing::error!("Stream ended but no usage stats and no chat_id available");
+                    return;
+                }
+                (None, Some(chat_id)) => {
+                    tracing::error!(%chat_id, "Stream ended but no usage stats available");
+                    return;
+                }
+                (Some(usage), None) => {
+                    tracing::error!(?usage, "Stream ended but no chat_id available");
+                    return;
+                }
+            };
+
+        // Only record if we have actual tokens to record
+        if input_tokens == 0 && output_tokens == 0 {
+            return;
+        }
+
+        // Calculate average ITL
+        let avg_itl_ms = if self.token_count > 0 {
+            Some(self.total_itl_ms / self.token_count as f64)
+        } else {
+            None
+        };
+
+        // Derive inference_id from chat_id (deterministic hash)
+        let inference_id = hash_inference_id_to_uuid(&chat_id);
+
+        // Check if stream completed normally (vs client disconnect)
+        let stream_completed = self.stream_completed;
+
+        // Capture all values needed for async tasks
+        let usage_service = self.usage_service.clone();
+        let attestation_service = self.attestation_service.clone();
+        let metrics_service = self.metrics_service.clone();
+        let ttft_ms = self.ttft_ms;
+        let e2e_duration = self.service_start_time.elapsed();
+        let first_token_time = self.first_token_time;
+        let input_bucket = get_input_bucket(input_tokens);
+        let mut metric_tags = self.metric_tags.clone();
+        metric_tags.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
+
+        let span = tracing::Span::current();
+
+        // Spawn critical billing operations on blocking thread pool with timeout
+        // The tokio runtime waits for blocking tasks during graceful shutdown,
+        // which helps prevent data loss compared to regular spawn
+        let handle_clone = handle.clone();
+        handle.spawn_blocking(move || {
+            let _span_guard = span.enter();
+            handle_clone.block_on(async move {
+                let result = tokio::time::timeout(Duration::from_secs(2), async move {
+                    // Record usage (critical for billing accuracy)
+                    if usage_service
+                        .record_usage(RecordUsageServiceRequest {
+                            organization_id,
+                            workspace_id,
+                            api_key_id,
+                            model_id,
+                            input_tokens,
+                            output_tokens,
+                            inference_type,
+                            ttft_ms,
+                            avg_itl_ms,
+                            inference_id: Some(inference_id),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!("Failed to record usage, inference_id={}", inference_id);
+                    }
+
+                    // Only store attestation signature if stream completed normally
+                    // (skip if client disconnected mid-stream)
+                    if stream_completed
+                        && attestation_service
+                            .store_chat_signature_from_provider(&chat_id)
+                            .await
+                            .is_err()
+                    {
+                        tracing::error!("Failed to store chat signature");
+                    }
+
+                    // Record metrics
+                    let tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
+
+                    metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
+
+                    if let Some(first_token_instant) = first_token_time {
+                        let decoding_duration = first_token_instant.elapsed();
+                        metrics_service.record_latency(
+                            METRIC_LATENCY_DECODING_TIME,
+                            decoding_duration,
+                            &tags,
+                        );
+
+                        let decode_secs = decoding_duration.as_secs_f64();
+                        if decode_secs > 0.0 {
+                            let tps = output_tokens as f64 / decode_secs;
+                            metrics_service.record_histogram(METRIC_TOKENS_PER_SECOND, tps, &tags);
+                        }
+                    }
+
+                    metrics_service.record_count(METRIC_TOKENS_INPUT, input_tokens as i64, &tags);
+                    metrics_service.record_count(METRIC_TOKENS_OUTPUT, output_tokens as i64, &tags);
+                })
+                .await;
+
+                // Log timeout errors
+                if result.is_err() {
+                    tracing::error!(
+                        "Timeout recording usage and metrics (2s exceeded), inference_id={}",
+                        inference_id
+                    );
+                }
+            })
+        });
     }
 }
 
@@ -236,6 +310,8 @@ pub struct CompletionServiceImpl {
     pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     pub metrics_service: Arc<dyn MetricsServiceTrait>,
     pub models_repository: Arc<dyn ModelsRepository>,
+    concurrent_counts: Cache<(Uuid, Uuid), Arc<AtomicU32>>,
+    concurrent_limit: u32,
 }
 
 impl CompletionServiceImpl {
@@ -246,12 +322,16 @@ impl CompletionServiceImpl {
         metrics_service: Arc<dyn MetricsServiceTrait>,
         models_repository: Arc<dyn ModelsRepository>,
     ) -> Self {
+        let concurrent_counts = Cache::builder().max_capacity(100_000).build();
+
         Self {
             inference_provider_pool,
             attestation_service,
             usage_service,
             metrics_service,
             models_repository,
+            concurrent_counts,
+            concurrent_limit: DEFAULT_CONCURRENT_LIMIT,
         }
     }
 
@@ -268,6 +348,41 @@ impl CompletionServiceImpl {
         ]
     }
 
+    fn map_provider_error(
+        model: &str,
+        error: &inference_providers::CompletionError,
+        operation: &str,
+    ) -> ports::CompletionError {
+        match error {
+            inference_providers::CompletionError::HttpError { status_code, .. } => match *status_code
+            {
+                503 => ports::CompletionError::ServiceOverloaded(
+                    "The service is temporarily overloaded. Please retry with exponential backoff."
+                        .to_string(),
+                ),
+                400..=499 => {
+                    tracing::warn!(model, status_code, "Client error during {}", operation);
+                    ports::CompletionError::InvalidParams(
+                        "Invalid request parameters. Please check your input and try again."
+                            .to_string(),
+                    )
+                }
+                _ => {
+                    tracing::error!(model, status_code, "Provider error during {}", operation);
+                    ports::CompletionError::ProviderError(
+                        "The model is currently unavailable. Please try again later.".to_string(),
+                    )
+                }
+            },
+            _ => {
+                tracing::error!(model, "Provider error during {}: {}", operation, error);
+                ports::CompletionError::ProviderError(
+                    "The model is currently unavailable. Please try again later.".to_string(),
+                )
+            }
+        }
+    }
+
     /// Record an error metric with the appropriate error type tag
     fn record_error(&self, error: &ports::CompletionError, model_name: Option<&str>) {
         let error_type = match error {
@@ -275,6 +390,7 @@ impl CompletionServiceImpl {
             ports::CompletionError::InvalidParams(_) => ERROR_TYPE_INVALID_PARAMS,
             ports::CompletionError::RateLimitExceeded => ERROR_TYPE_RATE_LIMIT,
             ports::CompletionError::ProviderError(_) => ERROR_TYPE_INFERENCE_ERROR,
+            ports::CompletionError::ServiceOverloaded(_) => ERROR_TYPE_SERVICE_OVERLOADED,
             ports::CompletionError::InternalError(_) => ERROR_TYPE_INTERNAL_ERROR,
         };
 
@@ -313,6 +429,42 @@ impl CompletionServiceImpl {
             .collect()
     }
 
+    async fn try_acquire_concurrent_slot(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+    ) -> Result<Arc<AtomicU32>, ports::CompletionError> {
+        let counter = self
+            .concurrent_counts
+            .get_with((organization_id, model_id), async {
+                Arc::new(AtomicU32::new(0))
+            })
+            .await;
+
+        loop {
+            let current = counter.load(Ordering::Acquire);
+            if current >= self.concurrent_limit {
+                tracing::warn!(
+                    organization_id = %organization_id,
+                    model_id = %model_id,
+                    model_name = %model_name,
+                    current_count = current,
+                    limit = self.concurrent_limit,
+                    "Organization concurrent request limit exceeded for model"
+                );
+                self.record_error(&ports::CompletionError::RateLimitExceeded, Some(model_name));
+                return Err(ports::CompletionError::RateLimitExceeded);
+            }
+            if counter
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(counter);
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn handle_stream_with_context(
         &self,
@@ -325,6 +477,7 @@ impl CompletionServiceImpl {
         inference_type: &str,
         service_start_time: Instant,
         provider_start_time: Instant,
+        concurrent_counter: Option<Arc<AtomicU32>>,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
         let metric_tags = Self::create_metric_tags(&model_name);
@@ -357,6 +510,10 @@ impl CompletionServiceImpl {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
+            concurrent_counter,
+            last_usage_stats: None,
+            last_chat_id: None,
+            stream_completed: false,
         };
         Box::pin(intercepted_stream)
     }
@@ -402,7 +559,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             logprobs: None,
             top_logprobs: None,
             user: Some(request.user_id.to_string()),
-            response_format: None,
             seed: None,
             tool_choice: None,
             parallel_tool_calls: None,
@@ -450,6 +606,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             chat_params.model = canonical_name.clone();
         }
 
+        let counter = self
+            .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
+            .await?;
+
         let provider_start_time = Instant::now();
 
         // Get the LLM stream
@@ -460,29 +620,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         {
             Ok(stream) => stream,
             Err(e) => {
-                // Check if this is a client error (HTTP 4xx) from the provider
-                let error_str = e.to_string();
-                let err = if error_str.contains("HTTP 4") || error_str.contains("Bad Request") {
-                    // For client errors (4xx), return detailed message to help user fix their request
-                    ports::CompletionError::InvalidParams(format!(
-                        "Invalid request parameters: {e}"
-                    ))
-                } else {
-                    // For server errors (5xx), log details but return generic message to user
-                    tracing::error!(
-                        model = %request.model,
-                        "Provider error during chat completion stream"
-                    );
-                    ports::CompletionError::ProviderError(
-                        "The model is currently unavailable. Please try again later.".to_string(),
-                    )
-                };
+                counter.fetch_sub(1, Ordering::Release);
+                let err = Self::map_provider_error(&request.model, &e, "chat completion stream");
                 self.record_error(&err, Some(canonical_name));
                 return Err(err);
             }
         };
 
-        // Determine inference type
         let inference_type = if is_streaming {
             "chat_completion_stream"
         } else {
@@ -502,6 +646,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 inference_type,
                 service_start_time,
                 provider_start_time,
+                Some(counter),
             )
             .await;
 
@@ -532,7 +677,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             logprobs: None,
             top_logprobs: None,
             user: Some(request.user_id.to_string()),
-            response_format: None,
             seed: None,
             tool_choice: None,
             parallel_tool_calls: None,
@@ -589,31 +733,22 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             chat_params.model = canonical_name.clone();
         }
 
+        let organization_id = request.organization_id;
+        let counter = self
+            .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
+            .await?;
+
         let provider_start_time = Instant::now();
-        let response_with_bytes = match self
+        let result = self
             .inference_provider_pool
             .chat_completion(chat_params, request.body_hash.clone())
-            .await
-        {
+            .await;
+        counter.fetch_sub(1, Ordering::Release);
+
+        let response_with_bytes = match result {
             Ok(response) => response,
             Err(e) => {
-                // Check if this is a client error (HTTP 4xx) from the provider
-                let error_str = e.to_string();
-                let err = if error_str.contains("HTTP 4") || error_str.contains("Bad Request") {
-                    // For client errors (4xx), return detailed message to help user fix their request
-                    ports::CompletionError::InvalidParams(format!(
-                        "Invalid request parameters: {e}"
-                    ))
-                } else {
-                    // For server errors (5xx), log details but return generic message to user
-                    tracing::error!(
-                        model = %request.model,
-                        "Provider error during chat completion"
-                    );
-                    ports::CompletionError::ProviderError(
-                        "The model is currently unavailable. Please try again later.".to_string(),
-                    )
-                };
+                let err = Self::map_provider_error(&request.model, &e, "chat completion");
                 self.record_error(&err, Some(canonical_name));
                 return Err(err);
             }
@@ -668,13 +803,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // Record usage with model UUID
         // Note: TTFT doesn't apply to non-streaming (you get all tokens at once)
         let usage_service = self.usage_service.clone();
-        let organization_id = request.organization_id;
         let workspace_id = request.workspace_id;
         let model_id = model.id;
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
         let output_tokens = response_with_bytes.response.usage.completion_tokens;
         // Hash the full chat ID to UUID for storage
-        let inference_id_uuid = Some(hash_inference_id_to_uuid(&response_with_bytes.response.id));
+        let inference_id = hash_inference_id_to_uuid(&response_with_bytes.response.id);
 
         tokio::spawn(async move {
             if usage_service
@@ -688,7 +822,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     inference_type: "chat_completion".to_string(),
                     ttft_ms: None,    // N/A for non-streaming
                     avg_itl_ms: None, // N/A for non-streaming
-                    inference_id: inference_id_uuid,
+                    inference_id: Some(inference_id),
                 })
                 .await
                 .is_err()
@@ -718,7 +852,7 @@ mod tests {
     use crate::test_utils::{MockAttestationService, MockUsageService};
     use bytes::Bytes;
     use futures::{stream, StreamExt};
-    use inference_providers::models::{ChatCompletionChunk, TokenUsage};
+    use inference_providers::models::{ChatChoice, ChatCompletionChunk, FinishReason, TokenUsage};
     use std::time::Duration;
 
     #[tokio::test]
@@ -754,7 +888,13 @@ mod tests {
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
                 model: "test-model".to_string(),
-                choices: vec![],
+                choices: vec![ChatChoice {
+                    index: 0,
+                    delta: None,
+                    logprobs: None,
+                    finish_reason: Some(FinishReason::Stop),
+                    token_ids: None,
+                }],
                 usage: Some(TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 20,
@@ -791,6 +931,10 @@ mod tests {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
+            concurrent_counter: None,
+            last_usage_stats: None,
+            last_chat_id: None,
+            stream_completed: false,
         };
 
         // Consume the stream
@@ -805,8 +949,8 @@ mod tests {
         // Should have:
         // 1. latency.time_to_first_token (Backend TTFT from first chunk)
         // 2. latency.time_to_first_token_total (E2E TTFT from first chunk)
-        // 3. latency.total (from usage chunk)
-        // 4. tokens_per_second (from usage chunk)
+        // 3. latency.total (from Drop handler)
+        // 4. tokens_per_second (from Drop handler)
         assert!(
             metrics.len() >= 4,
             "Expected at least 4 metrics, got {}",
@@ -888,7 +1032,13 @@ mod tests {
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
                 model: "test-model".to_string(),
-                choices: vec![],
+                choices: vec![ChatChoice {
+                    index: 0,
+                    delta: None,
+                    logprobs: None,
+                    finish_reason: Some(FinishReason::Stop),
+                    token_ids: None,
+                }],
                 usage: Some(TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 20,
@@ -929,12 +1079,16 @@ mod tests {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
+            concurrent_counter: None,
+            last_usage_stats: None,
+            last_chat_id: None,
+            stream_completed: false,
         };
 
         // Consume the stream
         let _ = intercept_stream.collect::<Vec<_>>().await;
 
-        // Wait for async usage recording to complete
+        // Wait for async usage recording to complete (Drop handler spawns async task)
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Verify usage was recorded with latency metrics
@@ -994,7 +1148,13 @@ mod tests {
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
                 model: "test-model".to_string(),
-                choices: vec![],
+                choices: vec![ChatChoice {
+                    index: 0,
+                    delta: None,
+                    logprobs: None,
+                    finish_reason: Some(FinishReason::Stop),
+                    token_ids: None,
+                }],
                 usage: Some(TokenUsage {
                     prompt_tokens: 5,
                     completion_tokens: 1,
@@ -1030,6 +1190,10 @@ mod tests {
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
+            concurrent_counter: None,
+            last_usage_stats: None,
+            last_chat_id: None,
+            stream_completed: false,
         };
 
         let _ = intercept_stream.collect::<Vec<_>>().await;
@@ -1046,6 +1210,158 @@ mod tests {
             req.avg_itl_ms.is_none(),
             "avg_itl_ms should be None for single chunk, got {:?}",
             req.avg_itl_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_limit_state() {
+        let cache: Cache<(Uuid, Uuid), Arc<AtomicU32>> =
+            Cache::builder().max_capacity(1000).build();
+
+        let org_id = Uuid::new_v4();
+        let model_id = Uuid::new_v4();
+        let key = (org_id, model_id);
+        let limit: u32 = 3;
+
+        let mut counters = Vec::new();
+        for i in 0..3 {
+            let counter = cache
+                .get_with(key, async { Arc::new(AtomicU32::new(0)) })
+                .await;
+            loop {
+                let current = counter.load(Ordering::Acquire);
+                assert!(
+                    current < limit,
+                    "Request {} should be under limit, got count {}",
+                    i,
+                    current
+                );
+                if counter
+                    .compare_exchange_weak(
+                        current,
+                        current + 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+            counters.push(counter);
+        }
+
+        // 4th request should be over limit
+        let counter = cache
+            .get_with(key, async { Arc::new(AtomicU32::new(0)) })
+            .await;
+        let current = counter.load(Ordering::Acquire);
+        assert!(
+            current >= limit,
+            "4th request should be over limit, got count {}",
+            current
+        );
+
+        // Release one slot
+        counters[0].fetch_sub(1, Ordering::Release);
+
+        // Now another request should succeed
+        let counter = cache
+            .get_with(key, async { Arc::new(AtomicU32::new(0)) })
+            .await;
+        let current = counter.load(Ordering::Acquire);
+        assert!(
+            current < limit,
+            "Request after release should succeed, got count {}",
+            current
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_limit_different_orgs_and_models_independent() {
+        let cache: Cache<(Uuid, Uuid), Arc<AtomicU32>> =
+            Cache::builder().max_capacity(1000).build();
+
+        let org1 = Uuid::new_v4();
+        let org2 = Uuid::new_v4();
+        let model_a = Uuid::new_v4();
+        let model_b = Uuid::new_v4();
+
+        // Fill up org1 + model_a's limit
+        let counter1 = cache
+            .get_with((org1, model_a), async { Arc::new(AtomicU32::new(0)) })
+            .await;
+        counter1.fetch_add(64, Ordering::AcqRel);
+
+        // org1 + model_b should still be able to make requests (different model)
+        let counter2 = cache
+            .get_with((org1, model_b), async { Arc::new(AtomicU32::new(0)) })
+            .await;
+        let current = counter2.load(Ordering::Acquire);
+        assert_eq!(
+            current, 0,
+            "org1+model_b should start at 0, got {}",
+            current
+        );
+
+        // org2 + model_a should still be able to make requests (different org)
+        let counter3 = cache
+            .get_with((org2, model_a), async { Arc::new(AtomicU32::new(0)) })
+            .await;
+        let current = counter3.load(Ordering::Acquire);
+        assert_eq!(
+            current, 0,
+            "org2+model_a should start at 0, got {}",
+            current
+        );
+    }
+
+    #[tokio::test]
+    async fn test_intercept_stream_decrements_on_drop() {
+        // Test that InterceptStream decrements the counter when dropped
+        let counter = Arc::new(AtomicU32::new(1)); // Start at 1 (simulating acquired slot)
+
+        {
+            let metrics_service = Arc::new(CapturingMetricsService::new());
+            let attestation_service = Arc::new(MockAttestationService);
+            let usage_service = Arc::new(MockUsageService);
+
+            let stream =
+                stream::iter::<Vec<Result<SSEEvent, inference_providers::CompletionError>>>(vec![]);
+
+            let _intercept_stream = InterceptStream {
+                inner: stream,
+                attestation_service,
+                usage_service,
+                metrics_service,
+                organization_id: Uuid::new_v4(),
+                workspace_id: Uuid::new_v4(),
+                api_key_id: Uuid::new_v4(),
+                model_id: Uuid::new_v4(),
+                model_name: "test-model".to_string(),
+                inference_type: "chat_completion_stream".to_string(),
+                service_start_time: Instant::now(),
+                provider_start_time: Instant::now(),
+                first_token_received: false,
+                first_token_time: None,
+                ttft_ms: None,
+                token_count: 0,
+                last_token_time: None,
+                total_itl_ms: 0.0,
+                metric_tags: vec![],
+                concurrent_counter: Some(counter.clone()),
+                last_usage_stats: None,
+                last_chat_id: None,
+                stream_completed: false,
+            };
+            // InterceptStream goes out of scope here and Drop is called
+        }
+
+        // Counter should be decremented to 0
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "Counter should be 0 after stream dropped"
         );
     }
 }

@@ -436,7 +436,6 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
-            text: None,
             reasoning: None,
             include: None,
             metadata: Some(serde_json::json!({

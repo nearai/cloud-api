@@ -218,6 +218,42 @@ impl ResponseServiceImpl {
         }
     }
 
+    /// Filter conversation items to only include those in the ancestor chain
+    /// If target_response_id is None, returns all items unchanged
+    fn filter_to_ancestor_branch(
+        items: Vec<models::ResponseOutputItem>,
+        target_response_id: &Option<String>,
+    ) -> Vec<models::ResponseOutputItem> {
+        let Some(target_id) = target_response_id else {
+            return items;
+        };
+
+        // Build map of response_id -> previous_response_id from items
+        // Multiple items can share the same response_id (tool calls, messages, web searches
+        // from the same agent loop), so we use entry() to only insert once per response_id
+        let mut response_parent_map: std::collections::HashMap<String, Option<String>> =
+            std::collections::HashMap::new();
+        for item in &items {
+            response_parent_map
+                .entry(item.response_id().to_string())
+                .or_insert_with(|| item.previous_response_id().clone());
+        }
+
+        // Walk up from target to collect ancestor response IDs
+        let mut ancestors: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut current = Some(target_id.clone());
+        while let Some(resp_id) = current {
+            ancestors.insert(resp_id.clone());
+            current = response_parent_map.get(&resp_id).cloned().flatten();
+        }
+
+        // Filter items to only those in ancestor chain
+        items
+            .into_iter()
+            .filter(|item| ancestors.contains(item.response_id()))
+            .collect()
+    }
+
     /// Extract content from a vector of content parts, handling text and files
     /// Returns a string with all parts joined by "\n\n"
     async fn extract_content_parts(
@@ -295,6 +331,9 @@ impl ResponseServiceImpl {
         let mut reasoning_item_emitted = false;
         let reasoning_item_id = format!("rs_{}", uuid::Uuid::new_v4().simple());
 
+        // Client disconnect tracking - when client disconnects, we save partial response and stop
+        let mut client_disconnected = false;
+
         while let Some(event) = completion_stream.next().await {
             match event {
                 Ok(sse_event) => {
@@ -308,18 +347,24 @@ impl ResponseServiceImpl {
                         if let Some(reasoning) = delta_reasoning_opt {
                             if !reasoning.is_empty() {
                                 if !reasoning_item_emitted {
-                                    emitter
+                                    if let Err(e) = emitter
                                         .emit_reasoning_started(ctx, &reasoning_item_id)
-                                        .await?;
+                                        .await
+                                    {
+                                        tracing::debug!("emit_reasoning_started failed: {}", e);
+                                    }
                                     reasoning_item_emitted = true;
                                 }
-                                emitter
+                                if let Err(e) = emitter
                                     .emit_reasoning_delta(
                                         ctx,
                                         reasoning_item_id.clone(),
                                         reasoning.clone(),
                                     )
-                                    .await?;
+                                    .await
+                                {
+                                    tracing::debug!("emit_reasoning_delta failed: {}", e);
+                                }
                                 reasoning_buffer.push_str(&reasoning);
                             }
                         }
@@ -339,14 +384,17 @@ impl ResponseServiceImpl {
                             && !inside_reasoning
                         {
                             // Close explicit reasoning item
-                            emitter
+                            if let Err(e) = emitter
                                 .emit_reasoning_completed(
                                     ctx,
                                     &reasoning_item_id,
                                     &reasoning_buffer,
                                     response_items_repository,
                                 )
-                                .await?;
+                                .await
+                            {
+                                tracing::debug!("emit_reasoning_completed failed: {}", e);
+                            }
 
                             let reasoning_token_count =
                                 crate::responses::service_helpers::ResponseStreamContext::estimate_tokens(
@@ -368,23 +416,29 @@ impl ResponseServiceImpl {
                             TagTransition::OpeningTag(_) => {
                                 if !reasoning_item_emitted {
                                     // Emit reasoning item.added
-                                    emitter
+                                    if let Err(e) = emitter
                                         .emit_reasoning_started(ctx, &reasoning_item_id)
-                                        .await?;
+                                        .await
+                                    {
+                                        tracing::debug!("emit_reasoning_started failed: {}", e);
+                                    }
                                     reasoning_item_emitted = true;
                                 }
                             }
                             TagTransition::ClosingTag(_) => {
                                 if reasoning_item_emitted {
                                     // Emit reasoning item.done and store
-                                    emitter
+                                    if let Err(e) = emitter
                                         .emit_reasoning_completed(
                                             ctx,
                                             &reasoning_item_id,
                                             &reasoning_buffer,
                                             response_items_repository,
                                         )
-                                        .await?;
+                                        .await
+                                    {
+                                        tracing::debug!("emit_reasoning_completed failed: {}", e);
+                                    }
 
                                     // Count reasoning tokens
                                     let reasoning_token_count =
@@ -405,36 +459,55 @@ impl ResponseServiceImpl {
                         // Emit reasoning deltas if inside reasoning block
                         if let Some(reasoning_content) = reasoning_delta {
                             if reasoning_item_emitted {
-                                emitter
+                                if let Err(e) = emitter
                                     .emit_reasoning_delta(
                                         ctx,
                                         reasoning_item_id.clone(),
                                         reasoning_content,
                                     )
-                                    .await?;
+                                    .await
+                                {
+                                    tracing::debug!("emit_reasoning_delta failed: {}", e);
+                                }
                             }
                         }
 
                         // Handle clean text (message content)
                         if !clean_text.is_empty() {
                             // First time we receive message text, emit the item.added and content_part.added events
-                            if !message_item_emitted {
-                                Self::emit_message_started(emitter, ctx, &message_item_id).await?;
-                                message_item_emitted = true;
+                            if !message_item_emitted && !client_disconnected {
+                                if let Err(e) =
+                                    Self::emit_message_started(emitter, ctx, &message_item_id).await
+                                {
+                                    tracing::debug!("emit_message_started failed: {}", e);
+                                    client_disconnected = true;
+                                } else {
+                                    message_item_emitted = true;
+                                }
                             }
 
                             current_text.push_str(&clean_text);
 
                             // Emit delta event for message content
-                            if message_item_emitted {
-                                emitter
+                            if !client_disconnected {
+                                if let Err(e) = emitter
                                     .emit_text_delta(
                                         ctx,
                                         message_item_id.clone(),
                                         clean_text.clone(),
                                     )
-                                    .await?;
+                                    .await
+                                {
+                                    tracing::debug!("emit_text_delta failed: {}", e);
+                                    // Client disconnected - save partial response and stop consuming stream
+                                    client_disconnected = true;
+                                }
                             }
+                        }
+
+                        // If client disconnected, break out of loop to save partial response
+                        if client_disconnected {
+                            break;
                         }
 
                         // If a citation just closed, emit annotation event immediately
@@ -449,13 +522,16 @@ impl ResponseServiceImpl {
                                         title: source.title.clone(),
                                         url: source.url.clone(),
                                     };
-                                    emitter
+                                    if let Err(e) = emitter
                                         .emit_citation_annotation(
                                             ctx,
                                             message_item_id.clone(),
                                             annotation,
                                         )
-                                        .await?;
+                                        .await
+                                    {
+                                        tracing::debug!("emit_citation_annotation failed: {}", e);
+                                    }
                                 }
                             }
                         }
@@ -468,16 +544,19 @@ impl ResponseServiceImpl {
                     Self::accumulate_tool_calls(&sse_event, &mut tool_call_accumulator);
                 }
                 Err(e) => {
-                    tracing::error!("Error in completion stream: {}", e);
-                    return Err(errors::ResponseError::InternalError(format!(
-                        "Stream error: {e}"
-                    )));
+                    tracing::warn!(
+                        "Error in completion stream (client disconnect or stream error): {}",
+                        e
+                    );
+                    // Don't return early - save partial response below
+                    break;
                 }
             }
         }
 
-        // If we emitted a message, close it with done events
-        if message_item_emitted {
+        // If we have message content, close it with done events and save to DB
+        // Only save if we successfully emitted the message start AND have content
+        if message_item_emitted && !current_text.is_empty() {
             Self::emit_message_completed(
                 emitter,
                 ctx,
@@ -561,22 +640,7 @@ impl ResponseServiceImpl {
             vec![]
         };
 
-        // Event: response.output_text.done
-        emitter
-            .emit_text_done(ctx, message_item_id.to_string(), clean_text.clone())
-            .await?;
-
-        // Event: response.content_part.done
-        let part = models::ResponseOutputContent::OutputText {
-            text: clean_text.clone(),
-            annotations: annotations.clone(),
-            logprobs: vec![],
-        };
-        emitter
-            .emit_content_part_done(ctx, message_item_id.to_string(), part)
-            .await?;
-
-        // Event: response.output_item.done
+        // Build the message item to save
         let item = models::ResponseOutputItem::Message {
             id: message_item_id.to_string(),
             response_id: ctx.response_id_str.clone(),
@@ -586,27 +650,55 @@ impl ResponseServiceImpl {
             status: models::ResponseItemStatus::Completed,
             role: "assistant".to_string(),
             content: vec![models::ResponseContentItem::OutputText {
-                text: clean_text,
-                annotations,
+                text: clean_text.clone(),
+                annotations: annotations.clone(),
                 logprobs: vec![],
             }],
             model: ctx.model.clone(),
         };
-        emitter
-            .emit_item_done(ctx, item.clone(), message_item_id.to_string())
-            .await?;
 
-        // Store the message item in the database
+        // CRITICAL: Store to database FIRST before emitting events
+        // This ensures the message is persisted even if client disconnected and emit calls fail
         if let Err(e) = response_items_repository
             .create(
                 ctx.response_id.clone(),
                 ctx.api_key_id,
                 ctx.conversation_id,
-                item,
+                item.clone(),
             )
             .await
         {
             tracing::warn!("Failed to store message item: {}", e);
+        }
+
+        // Try to emit events (may fail if client disconnected, but data is already saved)
+        // Event: response.output_text.done
+        if let Err(e) = emitter
+            .emit_text_done(ctx, message_item_id.to_string(), clean_text.clone())
+            .await
+        {
+            tracing::debug!("Failed to emit text_done event: {}", e);
+        }
+
+        // Event: response.content_part.done
+        let part = models::ResponseOutputContent::OutputText {
+            text: clean_text,
+            annotations: annotations.clone(),
+            logprobs: vec![],
+        };
+        if let Err(e) = emitter
+            .emit_content_part_done(ctx, message_item_id.to_string(), part)
+            .await
+        {
+            tracing::debug!("Failed to emit content_part_done event: {}", e);
+        }
+
+        // Event: response.output_item.done
+        if let Err(e) = emitter
+            .emit_item_done(ctx, item, message_item_id.to_string())
+            .await
+        {
+            tracing::debug!("Failed to emit item_done event: {}", e);
         }
 
         Ok(())
@@ -812,7 +904,8 @@ impl ResponseServiceImpl {
         let mut final_response_text = String::new();
 
         // Run the agent loop to process completion and tool calls
-        Self::run_agent_loop(
+        // Capture errors but continue to save partial data if client disconnected
+        let agent_loop_result = Self::run_agent_loop(
             &mut ctx,
             &mut emitter,
             &mut messages,
@@ -823,7 +916,12 @@ impl ResponseServiceImpl {
             max_iterations,
             &mut iteration,
         )
-        .await?;
+        .await;
+
+        // Log error but continue - we want to save partial response even on disconnect
+        if let Err(ref e) = agent_loop_result {
+            tracing::warn!("Agent loop error (may be client disconnect): {:?}", e);
+        }
 
         // Build final response
         let mut final_response = initial_response;
@@ -963,13 +1061,15 @@ impl ResponseServiceImpl {
             };
 
             // Get completion stream
-            let mut completion_stream = process_context
+            let completion_result = process_context
                 .completion_service
                 .create_chat_completion_stream(completion_request)
                 .await
                 .map_err(|e| {
                     errors::ResponseError::InternalError(format!("Completion error: {e}"))
                 })?;
+
+            let mut completion_stream = completion_result;
 
             // Process the completion stream and extract text + tool calls
             let (current_text, tool_calls_detected) = Self::process_completion_stream(
@@ -1448,6 +1548,10 @@ impl ResponseServiceImpl {
                     ))
                 })?;
 
+            // Filter to ancestor branch if previous_response_id is specified
+            let conversation_items =
+                Self::filter_to_ancestor_branch(conversation_items, &request.previous_response_id);
+
             // Convert response items to completion messages
             let messages_before = messages.len();
             for item in conversation_items {
@@ -1518,11 +1622,6 @@ impl ResponseServiceImpl {
                 conversation_id
             );
         }
-
-        // TODO: Load from previous_response_id if present
-        // if let Some(prev_response_id) = &request.previous_response_id {
-        //     // Load previous response
-        // }
 
         // Add input messages
         if let Some(input) = &request.input {
@@ -3212,5 +3311,188 @@ mod tests {
         );
         // Verify that searching for index 3 gets fourth result
         assert_eq!(final_registry.web_sources[3].url, "https://example.com/4");
+    }
+
+    #[test]
+    fn test_filter_to_ancestor_branch_no_filter() {
+        // When target_response_id is None, all items should be returned unchanged
+        let items = vec![
+            models::ResponseOutputItem::Message {
+                id: "msg_1".to_string(),
+                response_id: "resp_a".to_string(),
+                previous_response_id: None,
+                next_response_ids: vec!["resp_b".to_string()],
+                created_at: 1000,
+                role: "user".to_string(),
+                content: vec![],
+                status: models::ResponseItemStatus::Completed,
+                model: "test-model".to_string(),
+            },
+            models::ResponseOutputItem::Message {
+                id: "msg_2".to_string(),
+                response_id: "resp_b".to_string(),
+                previous_response_id: Some("resp_a".to_string()),
+                next_response_ids: vec![],
+                created_at: 2000,
+                role: "assistant".to_string(),
+                content: vec![],
+                status: models::ResponseItemStatus::Completed,
+                model: "test-model".to_string(),
+            },
+        ];
+
+        let result = ResponseServiceImpl::filter_to_ancestor_branch(items.clone(), &None);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_to_ancestor_branch_filters_to_chain() {
+        // Create a tree structure:
+        //     resp_a (root)
+        //     /    \
+        //  resp_b  resp_c
+        //    |
+        //  resp_d
+        //
+        // resp_b has multiple items (message + tool call) to verify all items
+        // from the same response are included.
+        // Filtering to resp_d should only include resp_a, resp_b (all items), resp_d
+        let items = vec![
+            models::ResponseOutputItem::Message {
+                id: "msg_a".to_string(),
+                response_id: "resp_a".to_string(),
+                previous_response_id: None,
+                next_response_ids: vec!["resp_b".to_string(), "resp_c".to_string()],
+                created_at: 1000,
+                role: "user".to_string(),
+                content: vec![],
+                status: models::ResponseItemStatus::Completed,
+                model: "test-model".to_string(),
+            },
+            // resp_b has a message
+            models::ResponseOutputItem::Message {
+                id: "msg_b".to_string(),
+                response_id: "resp_b".to_string(),
+                previous_response_id: Some("resp_a".to_string()),
+                next_response_ids: vec!["resp_d".to_string()],
+                created_at: 2000,
+                role: "assistant".to_string(),
+                content: vec![],
+                status: models::ResponseItemStatus::Completed,
+                model: "test-model".to_string(),
+            },
+            // resp_b also has a tool call (same response_id, multiple items)
+            models::ResponseOutputItem::ToolCall {
+                id: "tool_b".to_string(),
+                response_id: "resp_b".to_string(),
+                previous_response_id: Some("resp_a".to_string()),
+                next_response_ids: vec!["resp_d".to_string()],
+                created_at: 2001,
+                status: models::ResponseItemStatus::Completed,
+                tool_type: "function".to_string(),
+                function: models::ResponseOutputFunction {
+                    name: "web_search".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                model: "test-model".to_string(),
+            },
+            models::ResponseOutputItem::Message {
+                id: "msg_c".to_string(),
+                response_id: "resp_c".to_string(),
+                previous_response_id: Some("resp_a".to_string()),
+                next_response_ids: vec![],
+                created_at: 2000,
+                role: "assistant".to_string(),
+                content: vec![],
+                status: models::ResponseItemStatus::Completed,
+                model: "test-model".to_string(),
+            },
+            models::ResponseOutputItem::Message {
+                id: "msg_d".to_string(),
+                response_id: "resp_d".to_string(),
+                previous_response_id: Some("resp_b".to_string()),
+                next_response_ids: vec![],
+                created_at: 3000,
+                role: "user".to_string(),
+                content: vec![],
+                status: models::ResponseItemStatus::Completed,
+                model: "test-model".to_string(),
+            },
+        ];
+
+        // Filter to resp_d - should include:
+        // - resp_a (1 item)
+        // - resp_b (2 items: message + tool call)
+        // - resp_d (1 item)
+        // - NOT resp_c
+        let result = ResponseServiceImpl::filter_to_ancestor_branch(
+            items.clone(),
+            &Some("resp_d".to_string()),
+        );
+
+        // Total: 4 items (1 from resp_a, 2 from resp_b, 1 from resp_d)
+        assert_eq!(result.len(), 4);
+
+        let item_ids: Vec<&str> = result
+            .iter()
+            .map(|item| match item {
+                models::ResponseOutputItem::Message { id, .. } => id.as_str(),
+                models::ResponseOutputItem::ToolCall { id, .. } => id.as_str(),
+                _ => "",
+            })
+            .collect();
+
+        // Verify all items from ancestor responses are included
+        assert!(item_ids.contains(&"msg_a"));
+        assert!(item_ids.contains(&"msg_b"));
+        assert!(item_ids.contains(&"tool_b")); // Both items from resp_b
+        assert!(item_ids.contains(&"msg_d"));
+        // resp_c should be excluded
+        assert!(!item_ids.contains(&"msg_c"));
+    }
+
+    #[test]
+    fn test_filter_to_ancestor_branch_single_item() {
+        // Test with a single root item
+        let items = vec![models::ResponseOutputItem::Message {
+            id: "msg_1".to_string(),
+            response_id: "resp_a".to_string(),
+            previous_response_id: None,
+            next_response_ids: vec![],
+            created_at: 1000,
+            role: "user".to_string(),
+            content: vec![],
+            status: models::ResponseItemStatus::Completed,
+            model: "test-model".to_string(),
+        }];
+
+        let result = ResponseServiceImpl::filter_to_ancestor_branch(
+            items.clone(),
+            &Some("resp_a".to_string()),
+        );
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_to_ancestor_branch_nonexistent_target() {
+        // Test with a target that doesn't exist in the items
+        let items = vec![models::ResponseOutputItem::Message {
+            id: "msg_1".to_string(),
+            response_id: "resp_a".to_string(),
+            previous_response_id: None,
+            next_response_ids: vec![],
+            created_at: 1000,
+            role: "user".to_string(),
+            content: vec![],
+            status: models::ResponseItemStatus::Completed,
+            model: "test-model".to_string(),
+        }];
+
+        // Target "resp_z" doesn't exist - should return only items for "resp_z" (none)
+        let result = ResponseServiceImpl::filter_to_ancestor_branch(
+            items.clone(),
+            &Some("resp_z".to_string()),
+        );
+        assert_eq!(result.len(), 0);
     }
 }

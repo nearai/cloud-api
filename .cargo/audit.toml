@@ -1,0 +1,15 @@
+# Cargo audit configuration
+# https://github.com/rustsec/rustsec/blob/main/cargo-audit/audit.toml.example
+
+[advisories]
+# Advisories to ignore (with justification)
+ignore = [
+    # rsa timing side-channel (Marvin Attack) - no fix available.
+    # We only use HS256 (HMAC) for JWT, not RSA algorithms, so this doesn't affect us.
+    # https://rustsec.org/advisories/RUSTSEC-2023-0071
+    "RUSTSEC-2023-0071",
+]
+
+# Treat unmaintained crates as warnings (not errors)
+# These are informational and don't block the build
+informational_warnings = ["unmaintained"]

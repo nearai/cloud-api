@@ -76,7 +76,13 @@ impl AdminService for AdminServiceImpl {
         Ok((history, total))
     }
 
-    async fn delete_model(&self, model_name: &str) -> Result<(), AdminError> {
+    async fn delete_model(
+        &self,
+        model_name: &str,
+        change_reason: Option<String>,
+        changed_by_user_id: Option<uuid::Uuid>,
+        changed_by_user_email: Option<String>,
+    ) -> Result<(), AdminError> {
         // Validate model name
         if model_name.trim().is_empty() {
             return Err(AdminError::InvalidPricing(
@@ -86,7 +92,12 @@ impl AdminService for AdminServiceImpl {
 
         let deleted = self
             .repository
-            .soft_delete_model(model_name)
+            .soft_delete_model(
+                model_name,
+                change_reason,
+                changed_by_user_id,
+                changed_by_user_email,
+            )
             .await
             .map_err(|e| AdminError::InternalError(e.to_string()))?;
 

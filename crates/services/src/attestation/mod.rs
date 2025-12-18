@@ -10,8 +10,7 @@ use k256::ecdsa::{
     RecoveryId, Signature as EcdsaSignature, SigningKey as EcdsaSigningKey,
     VerifyingKey as EcdsaVerifyingKey,
 };
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand_core::{OsRng, RngCore};
 use sha3::{Digest, Keccak256};
 
 use crate::{
@@ -477,7 +476,7 @@ impl ports::AttestationServiceTrait for AttestationService {
             Some(n) => n,
             None => {
                 let mut nonce_bytes = [0u8; 32];
-                rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+                OsRng.fill_bytes(&mut nonce_bytes);
                 let generated_nonce = nonce_bytes
                     .into_iter()
                     .map(|byte| format!("{byte:02x}"))

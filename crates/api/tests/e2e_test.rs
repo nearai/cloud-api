@@ -182,13 +182,26 @@ async fn test_admin_update_model() {
 async fn test_get_model_by_name() {
     let server = setup_test_server().await;
 
-    // Setup Qwen model with a name containing forward slashes
-    let model_name = setup_qwen_model(&server).await;
-    assert_eq!("Qwen/Qwen3-30B-A3B-Instruct-2507", model_name);
+    // Use a unique model name to avoid conflicts with other parallel tests
+    let model_name = "TestOrg/GetModelByName-Test";
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model_name.to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 1000000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2000000, "currency": "USD" },
+            "modelDisplayName": "Test Model Display Name",
+            "modelDescription": "Test model description for get_model_by_name",
+            "contextLength": 128000,
+            "verifiable": true,
+            "isActive": true
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
 
     // Test retrieving the model by name (public endpoint - no auth required)
-    // Model names may contain forward slashes (e.g., "Qwen/Qwen3-30B-A3B-Instruct-2507")
-    // which must be URL-encoded when used in the path
+    // Model names may contain forward slashes which must be URL-encoded
     println!("Test: Requesting model by name: '{model_name}'");
     let encoded_model_name =
         url::form_urlencoded::byte_serialize(model_name.as_bytes()).collect::<String>();
@@ -205,10 +218,13 @@ async fn test_get_model_by_name() {
     println!("Retrieved model: {model_resp:?}");
 
     // Verify the model details match what we upserted
-    assert_eq!("Qwen/Qwen3-30B-A3B-Instruct-2507", model_resp.model_id);
-    assert_eq!("Updated Model Name", model_resp.metadata.model_display_name);
+    assert_eq!(model_name, model_resp.model_id);
     assert_eq!(
-        "Updated model description",
+        "Test Model Display Name",
+        model_resp.metadata.model_display_name
+    );
+    assert_eq!(
+        "Test model description for get_model_by_name",
         model_resp.metadata.model_description
     );
     assert_eq!(128000, model_resp.metadata.context_length);
@@ -1131,24 +1147,30 @@ async fn test_completion_cost_calculation() {
     let org = setup_org_with_credits(&server, 1000000000000i64).await; // $1000.00 USD
     println!("Created organization: {}", org.id);
 
-    // Setup test model with known pricing
-    let model_name = setup_qwen_model(&server).await;
+    // Use nearai model to avoid pricing conflicts with other parallel tests
+    // that modify Qwen model pricing (e.g., test_model_alias_consistency)
+    let model_name = setup_glm_model(&server).await;
     println!("Setup model: {model_name}");
 
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
-    // Verify model exists and get its current pricing from the database
-    let models_response = server
-        .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {api_key}"))
+    // Get the model pricing BEFORE making the completion request
+    // This is critical because parallel tests may modify pricing, and billing uses
+    // the pricing at the time of the request
+    let encoded_model_name =
+        url::form_urlencoded::byte_serialize(model_name.as_bytes()).collect::<String>();
+    let model_response = server
+        .get(format!("/v1/model/{encoded_model_name}").as_str())
         .await;
-    assert_eq!(models_response.status_code(), 200);
-    let models: api::models::ModelsResponse = models_response.json();
-    let qwen_model = models.data.iter().find(|m| m.id == model_name);
-    assert!(qwen_model.is_some(), "Model {model_name} not found in list");
-    println!("Verified model exists: {qwen_model:?}");
-    // Note: We'll use hardcoded prices for now since /models endpoint doesn't return pricing
-    // The setup_qwen_model() function ensures the database has the correct pricing
+    assert_eq!(
+        model_response.status_code(),
+        200,
+        "Should get model pricing"
+    );
+    let model_pricing = model_response.json::<api::models::ModelWithPricing>();
+    let input_cost_per_token = model_pricing.input_cost_per_token.amount;
+    let output_cost_per_token = model_pricing.output_cost_per_token.amount;
+    println!("Model pricing BEFORE completion - input: {input_cost_per_token}, output: {output_cost_per_token}");
 
     // Get initial balance (should be 0 or not found)
     let initial_balance_response = server
@@ -1199,14 +1221,7 @@ async fn test_completion_cost_calculation() {
     assert!(input_tokens > 0, "Should have input tokens");
     assert!(output_tokens > 0, "Should have output tokens");
 
-    // Calculate expected cost based on model pricing (all at scale 9)
-    // Input: 1000000 nano-dollars = $0.000001 per token
-    // Output: 2000000 nano-dollars = $0.000002 per token
-
-    let input_cost_per_token = 1000000i64; // nano-dollars
-    let output_cost_per_token = 2000000i64; // nano-dollars
-
-    // Expected total cost (at scale 9)
+    // Expected total cost (at scale 9) - use pricing captured BEFORE the completion request
     let expected_input_cost = (input_tokens as i64) * input_cost_per_token;
     let expected_output_cost = (output_tokens as i64) * output_cost_per_token;
     let expected_total_cost = expected_input_cost + expected_output_cost;
@@ -3146,4 +3161,89 @@ async fn test_admin_list_users_default_parameters() {
     }
 
     println!("✅ Admin list users uses correct default parameters");
+}
+
+#[tokio::test]
+async fn test_update_organization_name() {
+    let server = setup_test_server().await;
+
+    // Create an organization with an initial name
+    let initial_name = format!("Test Org {}", uuid::Uuid::new_v4());
+    let request = api::models::CreateOrganizationRequest {
+        name: initial_name.clone(),
+        description: Some("Initial description".to_string()),
+    };
+
+    let create_response = server
+        .post("/v1/organizations")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!(request))
+        .await;
+
+    assert_eq!(create_response.status_code(), 200);
+    let org = create_response.json::<api::models::OrganizationResponse>();
+    println!("Created organization with name: {}", org.name);
+    assert_eq!(org.name, initial_name);
+
+    // Update the organization name
+    let updated_name = format!("Updated Org {}", uuid::Uuid::new_v4());
+    let update_request = api::models::UpdateOrganizationRequest {
+        name: Some(updated_name.clone()),
+        description: Some("Updated description".to_string()),
+        rate_limit: None,
+        settings: None,
+    };
+
+    let update_response = server
+        .put(format!("/v1/organizations/{}", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!(update_request))
+        .await;
+
+    let status = update_response.status_code();
+    let body = update_response.text();
+    println!("Update response status: {}", status);
+    println!("Update response body: {}", &body);
+
+    assert_eq!(status, 200, "Organization update should succeed");
+
+    let updated_org = serde_json::from_str::<api::models::OrganizationResponse>(&body)
+        .expect("Failed to parse response");
+
+    println!(
+        "Updated organization name in response: {}",
+        updated_org.name
+    );
+
+    // Verify the response contains the updated name
+    assert_eq!(
+        updated_org.name, updated_name,
+        "Response should contain the updated name, not the old one"
+    );
+    assert_eq!(
+        updated_org.description,
+        Some("Updated description".to_string())
+    );
+
+    // Get the organization again to verify the name was persisted
+    let get_response = server
+        .get(format!("/v1/organizations/{}", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+
+    assert_eq!(get_response.status_code(), 200);
+    let fetched_org = get_response.json::<api::models::OrganizationResponse>();
+
+    println!("Fetched organization name: {}", fetched_org.name);
+
+    // Verify the persisted organization has the updated name
+    assert_eq!(
+        fetched_org.name, updated_name,
+        "Persisted organization should have the updated name"
+    );
+
+    println!("✅ Organization name update works correctly");
 }

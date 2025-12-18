@@ -1,3 +1,4 @@
+pub mod consts;
 pub mod conversions;
 pub mod middleware;
 pub mod models;
@@ -495,7 +496,7 @@ pub async fn init_inference_providers_with_mocks(
     (pool, mock_provider)
 }
 
-fn is_origin_allowed(origin_str: &str, cors_config: &config::CorsConfig) -> bool {
+pub fn is_origin_allowed(origin_str: &str, cors_config: &config::CorsConfig) -> bool {
     if cors_config.exact_matches.iter().any(|o| o == origin_str) {
         return true;
     }

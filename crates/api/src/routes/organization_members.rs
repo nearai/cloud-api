@@ -151,14 +151,11 @@ pub async fn invite_organization_member_by_email(
         user.0.id
     );
 
-    // Validate request
-    if request.invitations.is_empty() {
+    // Validate request (basic constraints and email length)
+    if let Err(msg) = request.validate() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "Empty invitations".to_string(),
-                "bad_request".to_string(),
-            )),
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
         ));
     }
 
@@ -347,7 +344,7 @@ pub async fn remove_organization_member(
             Json(ErrorResponse::new(msg, "forbidden".to_string())),
         )),
         Err(OrganizationError::InvalidParams(msg)) => {
-            error!("Cannot remove member: {}", msg);
+            warn!("Cannot remove member: {}", msg);
             Err((
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(msg, "bad_request".to_string())),

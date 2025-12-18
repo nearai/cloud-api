@@ -40,6 +40,29 @@ pub struct UpdateUserProfileRequest {
     pub avatar_url: Option<String>,
 }
 
+impl UpdateUserProfileRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(display_name) = &self.display_name {
+            crate::routes::common::validate_max_length(
+                display_name,
+                "user display_name",
+                crate::consts::MAX_NAME_LENGTH,
+            )?;
+        }
+
+        if let Some(avatar_url) = &self.avatar_url {
+            // URLs can be long, but we still cap to a reasonable length
+            crate::routes::common::validate_max_length(
+                avatar_url,
+                "avatar_url",
+                crate::consts::MAX_AVATAR_URL_LENGTH,
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
 /// Get current user
 ///
 /// Returns the profile of the currently authenticated user, including their organizations and workspaces.
@@ -181,6 +204,13 @@ pub async fn update_current_user_profile(
     Json(request): Json<UpdateUserProfileRequest>,
 ) -> Result<Json<crate::models::UserResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!("Updating profile for user: {}", user.0.id);
+
+    if let Err(msg) = request.validate() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
+        ));
+    }
 
     let user_id = UserId(user.0.id);
 
@@ -414,7 +444,7 @@ pub async fn create_access_token(
             }))
         }
         Err(AuthError::Unauthorized) => {
-            error!("Token rotation failed: invalid or already rotated token");
+            tracing::warn!("Token rotation failed: invalid or already rotated token");
             Err((
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorResponse::new(

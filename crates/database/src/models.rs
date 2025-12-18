@@ -434,12 +434,16 @@ pub struct UpdateModelPricingRequest {
     pub is_active: Option<bool>,
     pub aliases: Option<Vec<String>>,
     pub owned_by: Option<String>,
+    // User audit tracking for history
+    pub change_reason: Option<String>,
+    pub changed_by_user_id: Option<Uuid>,
+    pub changed_by_user_email: Option<String>,
 }
 
-/// Model pricing history - stores historical pricing data for models
+/// Model history - stores complete historical snapshot of model state
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelPricingHistory {
+pub struct ModelHistory {
     pub id: Uuid,
     pub model_id: Uuid,
 
@@ -449,15 +453,21 @@ pub struct ModelPricingHistory {
 
     // Model metadata snapshot
     pub context_length: i32,
+    pub model_name: String,
     pub model_display_name: String,
     pub model_description: String,
+    pub model_icon: Option<String>,
+    pub verifiable: bool,
+    pub is_active: bool,
+    pub owned_by: String,
 
     // Temporal fields
     pub effective_from: DateTime<Utc>,
     pub effective_until: Option<DateTime<Utc>>,
 
     // Tracking fields
-    pub changed_by: Option<String>,
+    pub changed_by_user_id: Option<Uuid>,
+    pub changed_by_user_email: Option<String>,
     pub change_reason: Option<String>,
     pub created_at: DateTime<Utc>,
 }

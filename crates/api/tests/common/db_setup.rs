@@ -8,12 +8,37 @@ use tracing::{debug, error, info, warn};
 const TEMPLATE_DB_NAME: &str = "platform_api_test_template";
 static TEMPLATE_INITIALIZED: OnceCell<()> = OnceCell::const_new();
 
+/// Validate that a database identifier only contains safe characters (alphanumeric + underscore).
+/// PostgreSQL identifiers with only these characters don't need quoting and are safe from injection.
+/// This prevents any potential SQL injection via format! strings.
+fn validate_db_identifier(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Database name cannot be empty".to_string());
+    }
+    if name.len() > 63 {
+        return Err(format!("Database name too long (max 63 chars): {}", name));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(format!(
+            "Database name contains invalid characters (only alphanumeric and _ allowed): {}",
+            name
+        ));
+    }
+    Ok(())
+}
+
 pub fn get_test_db_name() -> String {
-    env::var("TEST_DATABASE_NAME").unwrap_or_else(|_| "platform_api_test".to_string())
+    let name = env::var("TEST_DATABASE_NAME").unwrap_or_else(|_| "platform_api_test".to_string());
+    validate_db_identifier(&name).unwrap_or_else(|e| panic!("Invalid TEST_DATABASE_NAME: {}", e));
+    name
 }
 
 pub fn get_template_db_name() -> String {
-    env::var("TEST_TEMPLATE_DATABASE_NAME").unwrap_or_else(|_| TEMPLATE_DB_NAME.to_string())
+    let name =
+        env::var("TEST_TEMPLATE_DATABASE_NAME").unwrap_or_else(|_| TEMPLATE_DB_NAME.to_string());
+    validate_db_identifier(&name)
+        .unwrap_or_else(|e| panic!("Invalid TEST_TEMPLATE_DATABASE_NAME: {}", e));
+    name
 }
 
 /// Get admin database name - try 'postgres' first, fallback to 'template1' if not available
@@ -96,10 +121,6 @@ const TEMPLATE_DB_LOCK_ID: i64 = 0x5445_5354_5450_4C00;
 /// Uses PostgreSQL advisory locks to coordinate across multiple test processes.
 async fn create_template_database_internal(config: &config::DatabaseConfig) -> Result<(), String> {
     let template_db_name = get_template_db_name();
-
-    if !template_db_name.contains("test") {
-        panic!("Safety: Template database name must contain 'test'. Got: {template_db_name}");
-    }
 
     if check_template_database_ready(config, &template_db_name).await {
         debug!(
@@ -242,9 +263,9 @@ pub async fn create_test_database_from_template(
     let sanitized_id = test_id.replace('-', "_");
     let test_db_name = format!("test_{sanitized_id}");
 
-    if !test_db_name.starts_with("test_") {
-        panic!("Safety: Test database name must start with 'test_'. Got: {test_db_name}");
-    }
+    // Validate the generated database name for safety
+    validate_db_identifier(&test_db_name)
+        .map_err(|e| format!("Invalid test database name: {}", e))?;
 
     debug!("Creating test database '{}' from template...", test_db_name);
 
@@ -292,8 +313,15 @@ pub async fn drop_test_database(
     config: &config::DatabaseConfig,
     db_name: &str,
 ) -> Result<(), String> {
+    // Validate database name to prevent injection
+    validate_db_identifier(db_name).map_err(|e| format!("Invalid database name: {}", e))?;
+
+    // Ensure it's a test database (safety check)
     if !db_name.starts_with("test_") {
-        panic!("Safety: Can only drop databases starting with 'test_'. Got: {db_name}");
+        return Err(format!(
+            "Safety check: Can only drop databases starting with 'test_'. Got: {}",
+            db_name
+        ));
     }
 
     debug!("Dropping test database '{}'...", db_name);
@@ -344,6 +372,12 @@ pub async fn drop_all_test_databases(config: &config::DatabaseConfig) -> Result<
         // Skip the template database
         if db_name == get_template_db_name() {
             debug!("Skipping template database '{}'", db_name);
+            continue;
+        }
+
+        // Validate database name (defensive check - should be valid from pg_database)
+        if let Err(e) = validate_db_identifier(&db_name) {
+            warn!("Skipping database with invalid name: {} ({})", db_name, e);
             continue;
         }
 

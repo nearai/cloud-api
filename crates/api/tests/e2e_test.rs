@@ -35,6 +35,7 @@ async fn test_models_api() {
 #[tokio::test]
 async fn test_chat_completions_api() {
     let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -979,6 +980,7 @@ async fn test_unconfigured_model_rejected() {
 #[tokio::test]
 async fn test_usage_tracking_on_completion() {
     let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 1000000000i64).await; // $1.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -1016,6 +1018,7 @@ async fn test_usage_tracking_on_completion() {
 #[tokio::test]
 async fn test_usage_limit_enforcement() {
     let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 1).await; // 1 nano-dollar (minimal)
     println!("Created organization: {org:?}");
     let api_key = get_api_key_for_org(&server, org.id).await;

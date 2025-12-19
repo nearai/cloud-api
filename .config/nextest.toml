@@ -1,0 +1,9 @@
+# Nextest configuration for faster parallel tests
+# See https://nexte.st/book/configuration.html
+
+[profile.default]
+# Run more tests in parallel - safe since each test has isolated database
+test-threads = "num-cpus"
+
+# Longer timeout for e2e tests
+slow-timeout = { period = "60s", terminate-after = 2 }

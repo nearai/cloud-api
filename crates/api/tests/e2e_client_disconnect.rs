@@ -110,8 +110,13 @@ async fn test_response_items_saved_on_disconnect() {
     assert_eq!(response.status_code(), 200);
     let _stream = response.text();
 
-    // Wait for async DB writes
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // Wait for async DB writes to complete.
+    // This needs to be long enough for:
+    // 1. Stream to complete and drop
+    // 2. Title generation to run (triggered after stream completes)
+    // 3. Both usage records to be written (stream + title generation)
+    // Using 1 second to ensure all background tasks complete before test cleanup.
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
     // Verify assistant response saved with partial text
     let item = get_assistant_item_from_db(&database, &conversation.id)

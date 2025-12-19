@@ -3310,6 +3310,7 @@ async fn test_conversation_title_strips_thinking_tags() {
     use inference_providers::mock::ResponseTemplate;
 
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 

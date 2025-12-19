@@ -159,7 +159,11 @@ pub async fn ensure_template_database(config: &config::DatabaseConfig) -> Result
     Ok(())
 }
 
-/// Internal function to create the template database with migrations
+/// Advisory lock ID for template database creation (arbitrary but unique)
+const TEMPLATE_DB_LOCK_ID: i64 = 0x5445_5354_5450_4C00; // "TESTTPL\0" in hex
+
+/// Internal function to create the template database with migrations.
+/// Uses PostgreSQL advisory locks to coordinate across multiple test processes.
 async fn create_template_database_internal(config: &config::DatabaseConfig) -> Result<(), String> {
     let template_db_name = get_template_db_name();
 
@@ -168,9 +172,45 @@ async fn create_template_database_internal(config: &config::DatabaseConfig) -> R
         panic!("Safety: Template database name must contain 'test'. Got: {template_db_name}");
     }
 
-    info!("Creating template database '{}'...", template_db_name);
+    // Fast path: Check if template already exists before acquiring lock.
+    // This avoids lock contention when many tests run in parallel.
+    if check_template_database_ready(config, &template_db_name).await {
+        debug!(
+            "Template database '{}' already exists (fast path), skipping creation",
+            template_db_name
+        );
+        return Ok(());
+    }
 
+    // Slow path: Template doesn't exist or isn't ready, need to create it.
+    // Acquire advisory lock to prevent multiple processes from creating simultaneously.
     let client = connect_to_admin_db(config).await?;
+
+    debug!("Acquiring advisory lock for template database creation...");
+    client
+        .execute(
+            &format!("SELECT pg_advisory_lock({TEMPLATE_DB_LOCK_ID})"),
+            &[],
+        )
+        .await
+        .map_err(|e| format!("Failed to acquire advisory lock: {e}"))?;
+
+    // Double-check after acquiring lock (another process may have created it while we waited)
+    if check_template_database_ready(config, &template_db_name).await {
+        debug!(
+            "Template database '{}' already exists (after lock), skipping creation",
+            template_db_name
+        );
+        let _ = client
+            .execute(
+                &format!("SELECT pg_advisory_unlock({TEMPLATE_DB_LOCK_ID})"),
+                &[],
+            )
+            .await;
+        return Ok(());
+    }
+
+    info!("Creating template database '{}'...", template_db_name);
 
     // Terminate existing connections to the template database
     let _ = client
@@ -192,7 +232,14 @@ async fn create_template_database_internal(config: &config::DatabaseConfig) -> R
     client
         .execute(&format!("CREATE DATABASE {template_db_name}"), &[])
         .await
-        .map_err(|e| format!("Failed to create template database: {e}"))?;
+        .map_err(|e| {
+            // Release lock on error
+            let _ = futures::executor::block_on(client.execute(
+                &format!("SELECT pg_advisory_unlock({TEMPLATE_DB_LOCK_ID})"),
+                &[],
+            ));
+            format!("Failed to create template database: {e}")
+        })?;
 
     info!(
         "Template database '{}' created, running migrations...",
@@ -221,7 +268,63 @@ async fn create_template_database_internal(config: &config::DatabaseConfig) -> R
         template_db_name
     );
 
+    // CRITICAL: Close all connections to the template database before releasing lock.
+    // PostgreSQL requires zero active connections to use a database as a template.
+    // Drop the database to start closing its connection pool.
+    drop(database);
+
+    // Small delay to let graceful shutdown start
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Force-terminate any remaining connections to the template database.
+    // This ensures the template has zero active connections for CREATE DATABASE ... TEMPLATE.
+    let _ = client
+        .execute(
+            &format!(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+                 WHERE datname = '{template_db_name}' AND pid <> pg_backend_pid()"
+            ),
+            &[],
+        )
+        .await;
+
+    debug!("Terminated all connections to template database");
+
+    // Release the advisory lock
+    let _ = client
+        .execute(
+            &format!("SELECT pg_advisory_unlock({TEMPLATE_DB_LOCK_ID})"),
+            &[],
+        )
+        .await;
+
     Ok(())
+}
+
+/// Check if the template database exists by querying the admin database.
+/// Returns true if the template exists, false if it needs to be created.
+///
+/// NOTE: This function does NOT connect to the template database itself to avoid
+/// leaving connections open (which would prevent using it as a template).
+/// We simply check if the database exists in pg_database.
+async fn check_template_database_ready(config: &config::DatabaseConfig, db_name: &str) -> bool {
+    // Connect to admin database to query system catalogs
+    let client = match connect_to_admin_db(config).await {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    // Check if template database exists in pg_database system catalog
+    let exists = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
+            &[&db_name],
+        )
+        .await
+        .map(|row| row.get::<_, bool>(0))
+        .unwrap_or(false);
+
+    exists
 }
 
 /// Create a unique test database from the template.
@@ -261,6 +364,19 @@ pub async fn create_test_database_from_template(
     // Drop if exists (cleanup from previous failed test)
     let _ = client
         .execute(&format!("DROP DATABASE IF EXISTS {test_db_name}"), &[])
+        .await;
+
+    // CRITICAL: Terminate any connections to the template database.
+    // PostgreSQL requires zero active connections to use a database as a template.
+    // This handles connections opened by check_template_database_ready() in the fast path.
+    let _ = client
+        .execute(
+            &format!(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+                 WHERE datname = '{template_db_name}' AND pid <> pg_backend_pid()"
+            ),
+            &[],
+        )
         .await;
 
     // Create database from template (this is very fast in PostgreSQL)

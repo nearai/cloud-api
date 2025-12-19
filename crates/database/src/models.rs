@@ -526,6 +526,9 @@ pub struct UpdateOrganizationLimitsDbRequest {
 // Organization Usage Tracking Models
 // ============================================
 
+// Re-export StopReason from services for convenience
+pub use services::usage::StopReason;
+
 /// Organization usage log entry - records individual API calls with costs
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -548,8 +551,14 @@ pub struct OrganizationUsageLog {
     pub ttft_ms: Option<i32>,
     /// Average inter-token latency in milliseconds
     pub avg_itl_ms: Option<f64>,
-    /// Inference UUID
+    /// Inference UUID (hashed from provider_request_id)
     pub inference_id: Option<Uuid>,
+    /// Raw request ID from the inference provider (e.g., vLLM chat_id)
+    pub provider_request_id: Option<String>,
+    /// Why the inference stream ended
+    pub stop_reason: Option<StopReason>,
+    /// Response ID for Response API calls (FK to responses table)
+    pub response_id: Option<Uuid>,
 }
 
 /// Organization balance summary - cached aggregate spending
@@ -583,8 +592,14 @@ pub struct RecordUsageRequest {
     pub ttft_ms: Option<i32>,
     /// Average inter-token latency in milliseconds
     pub avg_itl_ms: Option<f64>,
-    /// Inference UUID
+    /// Inference UUID (hashed from provider_request_id)
     pub inference_id: Option<Uuid>,
+    /// Raw request ID from the inference provider (e.g., vLLM chat_id)
+    pub provider_request_id: Option<String>,
+    /// Why the inference stream ended
+    pub stop_reason: Option<StopReason>,
+    /// Response ID for Response API calls (FK to responses table)
+    pub response_id: Option<Uuid>,
 }
 
 // ============================================

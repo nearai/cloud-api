@@ -1343,6 +1343,35 @@ async fn test_completion_cost_calculation() {
         expected_total_cost,
         latest_entry.total_cost
     );
+
+    // Verify stop_reason is "completed" for successful non-streaming completion
+    assert_eq!(
+        latest_entry.stop_reason.as_deref(),
+        Some("completed"),
+        "Stop reason should be 'completed' for successful completion. Found: {:?}",
+        latest_entry.stop_reason
+    );
+
+    // Verify provider_request_id is set (raw ID from provider)
+    assert!(
+        latest_entry.provider_request_id.is_some(),
+        "Provider request ID should be set. Found: {:?}",
+        latest_entry
+    );
+
+    // Verify inference_id is set (hashed from provider_request_id)
+    assert!(
+        latest_entry.inference_id.is_some(),
+        "Inference ID should be set. Found: {:?}",
+        latest_entry
+    );
+
+    // Note: response_id should be None for direct chat completions API (not Responses API)
+    assert!(
+        latest_entry.response_id.is_none(),
+        "Response ID should be None for direct chat completions API. Found: {:?}",
+        latest_entry.response_id
+    );
 }
 
 // ============================================
@@ -1496,7 +1525,7 @@ async fn test_high_context_length_completion() {
                     "content": very_long_input
                 },
                 {
-                    "role": "user", 
+                    "role": "user",
                     "content": "Based on all the context above, please respond with a short summary."
                 }
             ],

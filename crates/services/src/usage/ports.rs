@@ -1,5 +1,109 @@
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Why an inference stream ended
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    /// Stream completed normally (model emitted stop token)
+    Completed,
+    /// Hit max tokens limit
+    Length,
+    /// Content was filtered by safety systems
+    ContentFilter,
+    /// Client closed connection mid-stream
+    ClientDisconnect,
+    /// Provider returned an error during stream
+    ProviderError,
+    /// Request timed out
+    Timeout,
+    /// Tool/function call requested by model
+    ToolCalls,
+    /// Model decided to stop (explicit stop sequence)
+    Stop,
+    /// Request was rate limited (HTTP 429)
+    RateLimited,
+    /// Unmapped stop reason - stores the original value
+    Other(String),
+}
+
+impl StopReason {
+    /// Convert to database string representation
+    pub fn as_str(&self) -> &str {
+        match self {
+            StopReason::Completed => "completed",
+            StopReason::Length => "length",
+            StopReason::ContentFilter => "content_filter",
+            StopReason::ClientDisconnect => "client_disconnect",
+            StopReason::ProviderError => "provider_error",
+            StopReason::Timeout => "timeout",
+            StopReason::ToolCalls => "tool_calls",
+            StopReason::Stop => "stop",
+            StopReason::RateLimited => "rate_limited",
+            StopReason::Other(s) => s.as_str(),
+        }
+    }
+
+    /// Parse from database string representation
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "completed" => StopReason::Completed,
+            "length" => StopReason::Length,
+            "content_filter" => StopReason::ContentFilter,
+            "client_disconnect" => StopReason::ClientDisconnect,
+            "provider_error" => StopReason::ProviderError,
+            "timeout" => StopReason::Timeout,
+            "tool_calls" => StopReason::ToolCalls,
+            "stop" => StopReason::Stop,
+            "rate_limited" => StopReason::RateLimited,
+            other => StopReason::Other(other.to_string()),
+        }
+    }
+
+    /// Parse from OpenAI-compatible finish_reason field
+    pub fn from_finish_reason(reason: &str) -> Self {
+        match reason {
+            "stop" => StopReason::Completed,
+            "length" => StopReason::Length,
+            "content_filter" => StopReason::ContentFilter,
+            "tool_calls" | "function_call" => StopReason::ToolCalls,
+            other => StopReason::Other(other.to_string()),
+        }
+    }
+
+    /// Map from inference provider CompletionError to StopReason
+    pub fn from_completion_error(err: &inference_providers::CompletionError) -> Self {
+        match err {
+            inference_providers::CompletionError::HttpError { status_code, .. } => {
+                match status_code {
+                    408 => StopReason::Timeout,
+                    429 => StopReason::RateLimited,
+                    500..=599 => StopReason::ProviderError,
+                    _ => StopReason::ProviderError,
+                }
+            }
+            inference_providers::CompletionError::CompletionError(msg) => {
+                let msg_lower = msg.to_lowercase();
+                if msg_lower.contains("timeout") {
+                    StopReason::Timeout
+                } else if msg_lower.contains("rate limit") || msg_lower.contains("too many") {
+                    StopReason::RateLimited
+                } else {
+                    StopReason::ProviderError
+                }
+            }
+            inference_providers::CompletionError::InvalidResponse(_) => StopReason::ProviderError,
+            inference_providers::CompletionError::Unknown(_) => StopReason::ProviderError,
+        }
+    }
+}
+
+impl std::fmt::Display for StopReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
 
 // ============================================
 // Service Traits
@@ -153,8 +257,14 @@ pub struct RecordUsageServiceRequest {
     pub ttft_ms: Option<i32>,
     /// Average inter-token latency in milliseconds
     pub avg_itl_ms: Option<f64>,
-    /// Inference UUID
+    /// Inference UUID (hashed from provider_request_id)
     pub inference_id: Option<Uuid>,
+    /// Raw request ID from the inference provider (e.g., vLLM chat_id)
+    pub provider_request_id: Option<String>,
+    /// Why the inference stream ended
+    pub stop_reason: Option<StopReason>,
+    /// Response ID for Response API calls (FK to responses table)
+    pub response_id: Option<Uuid>,
 }
 
 /// Request to record usage (database layer)
@@ -176,8 +286,14 @@ pub struct RecordUsageDbRequest {
     pub ttft_ms: Option<i32>,
     /// Average inter-token latency in milliseconds
     pub avg_itl_ms: Option<f64>,
-    /// Inference UUID
+    /// Inference UUID (hashed from provider_request_id)
     pub inference_id: Option<Uuid>,
+    /// Raw request ID from the inference provider (e.g., vLLM chat_id)
+    pub provider_request_id: Option<String>,
+    /// Why the inference stream ended
+    pub stop_reason: Option<StopReason>,
+    /// Response ID for Response API calls (FK to responses table)
+    pub response_id: Option<Uuid>,
 }
 
 /// Model pricing information
@@ -258,8 +374,14 @@ pub struct UsageLogEntry {
     pub ttft_ms: Option<i32>,
     /// Average inter-token latency in milliseconds
     pub avg_itl_ms: Option<f64>,
-    /// Inference UUID
+    /// Inference UUID (hashed from provider_request_id)
     pub inference_id: Option<Uuid>,
+    /// Raw request ID from the inference provider (e.g., vLLM chat_id)
+    pub provider_request_id: Option<String>,
+    /// Why the inference stream ended
+    pub stop_reason: Option<StopReason>,
+    /// Response ID for Response API calls (FK to responses table)
+    pub response_id: Option<Uuid>,
 }
 
 // ============================================

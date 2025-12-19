@@ -59,6 +59,8 @@ pub struct CompletionRequest {
     pub workspace_id: Uuid,
     pub metadata: Option<serde_json::Value>,
     pub body_hash: String,
+    /// Response ID when called from Responses API (for usage tracking FK)
+    pub response_id: Option<Uuid>,
 
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }

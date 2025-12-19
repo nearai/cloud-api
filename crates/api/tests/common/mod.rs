@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-mod db_setup;
+pub mod db_setup;
 
 use api::{build_app_with_config, init_auth_services, models::BatchUpdateModelApiRequest};
 use base64::Engine;
@@ -23,35 +23,28 @@ use sha3::Keccak256;
 pub const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
 
 // ============================================
-// TestContext - Isolated test environment with automatic cleanup
+// Database Cleanup Guard
 // ============================================
 
-/// A test context that provides an isolated database environment for each test.
-/// When dropped, it will schedule cleanup of the test database.
-pub struct TestContext {
-    pub server: axum_test::TestServer,
-    pub database: Arc<Database>,
-    pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
-    pub mock_provider: Arc<inference_providers::mock::MockProvider>,
+/// A guard that automatically cleans up a test database when dropped.
+/// The cleanup is synchronous (joins the thread) to ensure it completes before process exit.
+pub struct TestDatabaseGuard {
     db_name: String,
     db_config: config::DatabaseConfig,
 }
 
-impl TestContext {
-    /// Get the session ID for the default mock user
-    pub fn session_id(&self) -> String {
-        get_session_id()
-    }
-
-    /// Schedule database cleanup when the test context is dropped.
-    /// Note: We use a blocking task because Drop is not async.
-    fn cleanup(&self) {
+impl Drop for TestDatabaseGuard {
+    fn drop(&mut self) {
         let db_name = self.db_name.clone();
         let config = self.db_config.clone();
 
-        // Spawn a blocking task to handle the async cleanup
-        // This is safe because we're only scheduling the cleanup, not waiting for it
-        std::thread::spawn(move || {
+        // Skip cleanup if empty name (shouldn't happen, but safety check)
+        if db_name.is_empty() {
+            return;
+        }
+
+        // Spawn a thread and JOIN it to ensure cleanup completes
+        let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 if let Err(e) = db_setup::drop_test_database(&config, &db_name).await {
@@ -59,12 +52,32 @@ impl TestContext {
                 }
             });
         });
+
+        // Wait for cleanup to complete
+        if handle.join().is_err() {
+            eprintln!("Warning: Database cleanup thread panicked");
+        }
     }
 }
 
-impl Drop for TestContext {
-    fn drop(&mut self) {
-        self.cleanup();
+// ============================================
+// TestContext - Isolated test environment with automatic cleanup
+// ============================================
+
+/// A test context that provides an isolated database environment for each test.
+/// When dropped, the database is automatically cleaned up via the internal guard.
+pub struct TestContext {
+    pub server: axum_test::TestServer,
+    pub database: Arc<Database>,
+    pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+    pub mock_provider: Arc<inference_providers::mock::MockProvider>,
+    _guard: TestDatabaseGuard, // Handles cleanup on drop
+}
+
+impl TestContext {
+    /// Get the session ID for the default mock user
+    pub fn session_id(&self) -> String {
+        get_session_id()
     }
 }
 
@@ -236,8 +249,7 @@ pub async fn setup_test_context() -> TestContext {
         database,
         inference_provider_pool,
         mock_provider,
-        db_name,
-        db_config,
+        _guard: TestDatabaseGuard { db_name, db_config },
     }
 }
 
@@ -288,29 +300,34 @@ async fn build_test_server_components(
 /// Returns the test server ready for making requests
 ///
 /// Note: This now creates an isolated database per test.
-pub async fn setup_test_server() -> axum_test::TestServer {
-    let (server, _, _, _) = setup_test_server_with_pool().await;
-    server
+/// IMPORTANT: You must hold onto the returned guard (`_guard`) to ensure cleanup!
+pub async fn setup_test_server() -> (axum_test::TestServer, TestDatabaseGuard) {
+    let (server, _, _, _, guard) = setup_test_server_with_pool().await;
+    (server, guard)
 }
 
 /// Setup a complete test server and return it along with the database
 /// Useful for tests that need to create test users in the database
 ///
 /// Note: This now creates an isolated database per test.
-pub async fn setup_test_server_with_database() -> (axum_test::TestServer, Arc<Database>) {
-    let (server, _, _, database) = setup_test_server_with_pool().await;
-    (server, database)
+/// IMPORTANT: You must hold onto the returned guard (`_guard`) to ensure cleanup!
+pub async fn setup_test_server_with_database(
+) -> (axum_test::TestServer, Arc<Database>, TestDatabaseGuard) {
+    let (server, _, _, database, guard) = setup_test_server_with_pool().await;
+    (server, database, guard)
 }
 
 /// Setup a complete test server with all components initialized
-/// Returns a tuple of (TestServer, InferenceProviderPool, MockProvider, Database) for advanced testing
+/// Returns a tuple of (TestServer, InferenceProviderPool, MockProvider, Database, TestDatabaseGuard) for advanced testing
 ///
 /// Note: This now creates an isolated database per test.
+/// IMPORTANT: You must hold onto the returned guard to ensure database cleanup!
 pub async fn setup_test_server_with_pool() -> (
     axum_test::TestServer,
     std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
     std::sync::Arc<inference_providers::mock::MockProvider>,
     Arc<Database>,
+    TestDatabaseGuard,
 ) {
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
@@ -330,6 +347,7 @@ pub async fn setup_test_server_with_pool() -> (
 
     // Create config with the new database name
     let config = test_config_with_db(&db_name);
+    let db_config = config.database.clone();
 
     // Connect to the new test database
     let database = init_database_connection(&config.database).await;
@@ -337,7 +355,16 @@ pub async fn setup_test_server_with_pool() -> (
     let (server, inference_provider_pool, mock_provider) =
         build_test_server_components(database.clone(), config).await;
 
-    (server, inference_provider_pool, mock_provider, database)
+    // Create cleanup guard
+    let guard = TestDatabaseGuard { db_name, db_config };
+
+    (
+        server,
+        inference_provider_pool,
+        mock_provider,
+        database,
+        guard,
+    )
 }
 
 /// Create a unique test user in the database and return (session_id, email)

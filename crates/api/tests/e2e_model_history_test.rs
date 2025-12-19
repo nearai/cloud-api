@@ -47,7 +47,7 @@ async fn get_model_history_from_db(
 /// Test 1: Creating a new model should create a history record
 #[tokio::test]
 async fn test_upsert_model_creates_history_record() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     let mut batch = HashMap::new();
     let model_name = format!("test-model-history-1-{}", uuid::Uuid::new_v4());
@@ -115,7 +115,7 @@ async fn test_upsert_model_creates_history_record() {
 /// Test 2: Updating a model should close previous history and create new record
 #[tokio::test]
 async fn test_second_upsert_closes_previous_history() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let model_name = format!("test-model-history-2-{}", uuid::Uuid::new_v4());
 
     // First upsert - create the model
@@ -216,7 +216,7 @@ async fn test_second_upsert_closes_previous_history() {
 /// Test 3: Soft delete should create history record with is_active=false
 #[tokio::test]
 async fn test_soft_delete_creates_history_record() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let model_name = format!("test-model-delete-1-{}", uuid::Uuid::new_v4());
 
     // Create a model
@@ -297,7 +297,7 @@ async fn test_soft_delete_creates_history_record() {
 /// Test 4: Verify user tracking is correctly recorded
 #[tokio::test]
 async fn test_user_tracking_in_history() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let model_name = format!("test-model-user-tracking-{}", uuid::Uuid::new_v4());
 
     // Create model with explicit change reason
@@ -352,7 +352,7 @@ async fn test_user_tracking_in_history() {
 /// Test 5: Multiple updates should show progression in history
 #[tokio::test]
 async fn test_history_progression_multiple_updates() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let model_name = format!("test-model-progression-{}", uuid::Uuid::new_v4());
 
     let update_reasons = [
@@ -418,7 +418,7 @@ async fn test_history_progression_multiple_updates() {
 /// Test 6: Soft delete with custom change_reason
 #[tokio::test]
 async fn test_soft_delete_with_custom_reason() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let model_name = format!("test-model-delete-custom-{}", uuid::Uuid::new_v4());
 
     // Create a model
@@ -477,7 +477,7 @@ async fn test_soft_delete_with_custom_reason() {
 /// Test 7: Soft delete without change_reason (backward compatibility)
 #[tokio::test]
 async fn test_soft_delete_without_reason_backward_compatibility() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let model_name = format!("test-model-delete-no-reason-{}", uuid::Uuid::new_v4());
 
     // Create a model

@@ -376,3 +376,61 @@ pub async fn drop_test_database(
 
     Ok(())
 }
+
+/// Drop ALL test databases (databases starting with 'test_').
+/// This is useful for cleaning up orphaned test databases.
+/// Returns the number of databases dropped.
+pub async fn drop_all_test_databases(config: &config::DatabaseConfig) -> Result<usize, String> {
+    info!("Cleaning up all test databases...");
+
+    let client = connect_to_admin_db(config).await?;
+
+    // Find all databases starting with 'test_'
+    let rows = client
+        .query(
+            "SELECT datname FROM pg_database WHERE datname LIKE 'test_%'",
+            &[],
+        )
+        .await
+        .map_err(|e| format!("Failed to list test databases: {e}"))?;
+
+    let mut dropped_count = 0;
+    for row in rows {
+        let db_name: String = row.get(0);
+
+        // Skip the template database
+        if db_name == get_template_db_name() {
+            debug!("Skipping template database '{}'", db_name);
+            continue;
+        }
+
+        // Terminate connections
+        let _ = client
+            .execute(
+                &format!(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+                     WHERE datname = '{db_name}' AND pid <> pg_backend_pid()"
+                ),
+                &[],
+            )
+            .await;
+
+        // Drop the database
+        match client
+            .execute(&format!("DROP DATABASE IF EXISTS {db_name}"), &[])
+            .await
+        {
+            Ok(_) => {
+                debug!("Dropped test database '{}'", db_name);
+                dropped_count += 1;
+            }
+            Err(e) => {
+                warn!("Failed to drop test database '{}': {}", db_name, e);
+            }
+        }
+    }
+
+    info!("Cleaned up {} test database(s)", dropped_count);
+
+    Ok(dropped_count)
+}

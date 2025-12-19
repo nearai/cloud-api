@@ -11,7 +11,7 @@ use common::*;
 /// Verifies: unsigned/invalid signature requests return 401 UNAUTHORIZED
 #[tokio::test]
 async fn test_near_login_rejects_invalid_signature() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let account_id = "alice.near";
 
     let response = test_near_login(&server, account_id, 0).await;
@@ -29,7 +29,7 @@ async fn test_near_login_rejects_invalid_signature() {
 /// Test that missing User-Agent header is rejected
 #[tokio::test]
 async fn test_near_login_missing_user_agent() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let request_body = create_near_auth_request_json("alice.near", 0);
 
     let response = server.post("/v1/auth/near").json(&request_body).await;
@@ -51,7 +51,7 @@ async fn test_near_login_missing_user_agent() {
 /// Test that expired nonces (>5 minutes old) are rejected
 #[tokio::test]
 async fn test_near_login_expired_nonce() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let account_id = "bob.near";
 
     // Create nonce that is 6 minutes in the past (exceeds 5-minute window)
@@ -71,7 +71,7 @@ async fn test_near_login_expired_nonce() {
 /// Test that nonces with future timestamps are rejected
 #[tokio::test]
 async fn test_near_login_future_timestamp() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let account_id = "charlie.near";
 
     // Create nonce with timestamp 1 minute in the future
@@ -92,7 +92,7 @@ async fn test_near_login_future_timestamp() {
 /// Note: Will still fail on signature verification without real wallet
 #[tokio::test]
 async fn test_near_login_valid_nonce_window() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let account_id = "dave.near";
 
     // Create nonce that is 3 minutes in the past (within 5-minute window)
@@ -117,7 +117,7 @@ async fn test_near_login_valid_nonce_window() {
 /// Test that invalid message text is rejected
 #[tokio::test]
 async fn test_near_login_invalid_message() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let account_id = "eve.near";
 
     // Create request with wrong message text
@@ -143,7 +143,7 @@ async fn test_near_login_invalid_message() {
 /// Test that invalid recipient is rejected
 #[tokio::test]
 async fn test_near_login_invalid_recipient() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let account_id = "frank.near";
 
     // Create request with wrong recipient
@@ -173,7 +173,7 @@ async fn test_near_login_invalid_recipient() {
 /// Test that malformed JSON is rejected
 #[tokio::test]
 async fn test_near_login_malformed_json() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     // Use an invalid JSON structure (missing required fields)
     let invalid_request = serde_json::json!({
@@ -199,7 +199,7 @@ async fn test_near_login_malformed_json() {
 /// Test that invalid nonce length is rejected
 #[tokio::test]
 async fn test_near_login_invalid_nonce_length() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let account_id = "grace.near";
 
     // Create request with wrong nonce length (not 32 bytes)
@@ -225,7 +225,7 @@ async fn test_near_login_invalid_nonce_length() {
 /// Test that missing payload fields are rejected
 #[tokio::test]
 async fn test_near_login_missing_fields() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     // Create incomplete request (missing payload)
     // Create a test signature using the helper (since NEAR_TEST_SIGNATURE is removed)
@@ -254,7 +254,7 @@ async fn test_near_login_missing_fields() {
 /// Test that zero-timestamp nonce is rejected (security fix)
 #[tokio::test]
 async fn test_near_login_zero_timestamp_nonce() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let account_id = "hacker.near";
 
     // Create request with zero-timestamp nonce (all zeros in first 8 bytes)

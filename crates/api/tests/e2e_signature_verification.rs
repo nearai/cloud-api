@@ -215,7 +215,10 @@ async fn test_streaming_chat_completion_signature_verification() {
     println!("✅ Signature stored and retrieved");
     println!("✅ Request hash matches: {expected_request_hash}");
     println!("✅ Response hash matches: {expected_response_hash}");
-    println!("✅ Signature is present: {}", &signature[..20]);
+    println!(
+        "✅ Signature is present: {}...",
+        &signature[..signature.len().min(20)]
+    );
     println!("✅ Signing address: {signing_address}");
     println!("✅ Signing algorithm: {signing_algo}");
 }

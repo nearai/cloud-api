@@ -47,63 +47,6 @@ async fn can_connect_to_db(
     tokio_postgres::connect(&conn_string, NoTls).await.is_ok()
 }
 
-pub async fn reset_test_database(config: &config::DatabaseConfig) -> Result<(), String> {
-    let test_db_name = get_test_db_name();
-
-    if !test_db_name.contains("test") {
-        panic!("Safety: Can only reset databases with 'test' in the name. Got: {test_db_name}");
-    }
-
-    let host = config
-        .host
-        .clone()
-        .unwrap_or_else(|| "localhost".to_string());
-    let port = config.port;
-    let username = config.username.clone();
-    let password = config.password.clone();
-
-    let admin_db = get_admin_db_name(&host, port, &username, &password).await?;
-
-    let conn_string =
-        format!("host={host} port={port} user={username} password={password} dbname={admin_db}");
-
-    let (client, connection) = tokio_postgres::connect(&conn_string, NoTls)
-        .await
-        .map_err(|e| format!("Failed to connect to admin database: {e}"))?;
-
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            error!("Database connection error: {}", e);
-        }
-    });
-
-    let _ = client
-        .execute(
-            &format!(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-             WHERE datname = '{test_db_name}' AND pid <> pg_backend_pid()"
-            ),
-            &[],
-        )
-        .await;
-
-    let drop_result = client
-        .execute(&format!("DROP DATABASE IF EXISTS {test_db_name}"), &[])
-        .await;
-
-    if let Err(e) = drop_result {
-        warn!("Failed to drop test database (may not exist): {}", e);
-    }
-
-    client
-        .execute(&format!("CREATE DATABASE {test_db_name}"), &[])
-        .await
-        .map_err(|e| format!("Failed to create test database: {e}"))?;
-
-    info!("Test database '{}' reset successfully", test_db_name);
-    Ok(())
-}
-
 /// Connect to the admin database and return the client
 async fn connect_to_admin_db(
     config: &config::DatabaseConfig,

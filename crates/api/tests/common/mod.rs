@@ -60,27 +60,6 @@ impl Drop for TestDatabaseGuard {
     }
 }
 
-// ============================================
-// TestContext - Isolated test environment with automatic cleanup
-// ============================================
-
-/// A test context that provides an isolated database environment for each test.
-/// When dropped, the database is automatically cleaned up via the internal guard.
-pub struct TestContext {
-    pub server: axum_test::TestServer,
-    pub database: Arc<Database>,
-    pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
-    pub mock_provider: Arc<inference_providers::mock::MockProvider>,
-    _guard: TestDatabaseGuard, // Handles cleanup on drop
-}
-
-impl TestContext {
-    /// Get the session ID for the default mock user
-    pub fn session_id(&self) -> String {
-        get_session_id()
-    }
-}
-
 /// Helper function to create a test configuration with a specific database name
 pub fn test_config_with_db(db_name: &str) -> ApiConfig {
     let _ = dotenvy::dotenv();
@@ -211,51 +190,7 @@ async fn init_database_connection(config: &config::DatabaseConfig) -> Arc<Databa
 }
 
 // ============================================
-// New Isolated Test Setup Functions
-// ============================================
-
-/// Setup a complete isolated test environment with its own database.
-/// This is the recommended way to run e2e tests as it provides complete isolation.
-/// The database is automatically cleaned up when the TestContext is dropped.
-pub async fn setup_test_context() -> TestContext {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(tracing::level_filters::LevelFilter::DEBUG)
-        .try_init();
-
-    // Generate a unique test ID for this test's database
-    let test_id = uuid::Uuid::new_v4().to_string();
-
-    // Get base config for database connection info
-    let base_db_config = db_config_for_tests();
-
-    // Create a unique database from the template
-    let db_name = db_setup::create_test_database_from_template(&base_db_config, &test_id)
-        .await
-        .expect("Failed to create test database from template");
-
-    // Create config with the new database name
-    let config = test_config_with_db(&db_name);
-    let db_config = config.database.clone();
-
-    // Connect to the new test database
-    let database = init_database_connection(&db_config).await;
-
-    let (server, inference_provider_pool, mock_provider) =
-        build_test_server_components(database.clone(), config).await;
-
-    TestContext {
-        server,
-        database,
-        inference_provider_pool,
-        mock_provider,
-        _guard: TestDatabaseGuard { db_name, db_config },
-    }
-}
-
-// ============================================
-// Legacy Test Setup Functions (for backwards compatibility)
-// These now use isolated databases under the hood
+// Test Setup Functions (with isolated databases)
 // ============================================
 
 /// Internal helper to build test server and components from a database and config

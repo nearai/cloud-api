@@ -9,7 +9,7 @@ use inference_providers::StreamChunk;
 // End-to-End Encryption Tests
 // ============================================
 //
-// These tests verify that encryption headers (X-Signing-Algo and X-Signing-Pub-Key)
+// These tests verify that encryption headers (X-Signing-Algo, X-Client-Pub-Key, and X-Model-Pub-Key)
 // are properly extracted and passed through from cloud-api to vllm-proxy.
 //
 // Note: These tests are currently skipped because they require a running vllm-proxy
@@ -17,6 +17,45 @@ use inference_providers::StreamChunk;
 // 1. Start vllm-proxy with encryption enabled
 // 2. Remove the #[ignore] attribute from the tests
 // 3. Ensure the test environment has proper encryption keys configured
+
+/// Helper function to fetch the model public key from the attestation report endpoint
+async fn get_model_public_key(
+    server: &TestServer,
+    model: &str,
+    signing_algo: Option<&str>,
+) -> Option<String> {
+    let encoded_model = url::form_urlencoded::byte_serialize(model.as_bytes()).collect::<String>();
+    let mut url = format!("/v1/attestation/report?model={}", encoded_model);
+    if let Some(algo) = signing_algo {
+        let encoded_algo =
+            url::form_urlencoded::byte_serialize(algo.as_bytes()).collect::<String>();
+        url.push_str(&format!("&signing_algo={}", encoded_algo));
+    }
+
+    let response = server.get(&url).await;
+
+    if response.status_code() != 200 {
+        return None;
+    }
+
+    let response_json: serde_json::Value = response.json();
+
+    // Try to get signing_public_key from model_attestations
+    if let Some(model_attestations) = response_json
+        .get("model_attestations")
+        .and_then(|v| v.as_array())
+    {
+        for attestation in model_attestations {
+            if let Some(signing_public_key) = attestation.get("signing_public_key") {
+                if let Some(key_str) = signing_public_key.as_str() {
+                    return Some(key_str.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
 
 /// Test that chat completions with ECDSA encryption headers are passed through correctly
 #[tokio::test]
@@ -27,11 +66,17 @@ async fn test_chat_completions_with_ecdsa_encryption_headers() {
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
+    // Fetch model public key from attestation report
+    let model = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+    let model_pub_key = get_model_public_key(&server, model, Some("ecdsa"))
+        .await
+        .expect("Failed to fetch model public key from attestation report");
+
     // Mock ECDSA public key (64 hex characters = 32 bytes)
     let mock_ecdsa_pub_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     let request_body = serde_json::json!({
-        "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "model": model,
         "messages": [
             {
                 "role": "user",
@@ -46,7 +91,8 @@ async fn test_chat_completions_with_ecdsa_encryption_headers() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("X-Signing-Algo", "ecdsa")
-        .add_header("X-Signing-Pub-Key", mock_ecdsa_pub_key)
+        .add_header("X-Client-Pub-Key", mock_ecdsa_pub_key)
+        .add_header("X-Model-Pub-Key", model_pub_key)
         .json(&request_body)
         .await;
 
@@ -73,11 +119,17 @@ async fn test_chat_completions_with_ed25519_encryption_headers() {
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
+    // Fetch model public key from attestation report
+    let model = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+    let model_pub_key = get_model_public_key(&server, model, Some("ed25519"))
+        .await
+        .expect("Failed to fetch model public key from attestation report");
+
     // Mock Ed25519 public key (64 hex characters = 32 bytes)
     let mock_ed25519_pub_key = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
     let request_body = serde_json::json!({
-        "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "model": model,
         "messages": [
             {
                 "role": "user",
@@ -92,7 +144,8 @@ async fn test_chat_completions_with_ed25519_encryption_headers() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("X-Signing-Algo", "ed25519")
-        .add_header("X-Signing-Pub-Key", mock_ed25519_pub_key)
+        .add_header("X-Client-Pub-Key", mock_ed25519_pub_key)
+        .add_header("X-Model-Pub-Key", model_pub_key)
         .json(&request_body)
         .await;
 
@@ -119,11 +172,17 @@ async fn test_streaming_chat_completions_with_encryption_headers() {
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
+    // Fetch model public key from attestation report
+    let model = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+    let model_pub_key = get_model_public_key(&server, model, Some("ecdsa"))
+        .await
+        .expect("Failed to fetch model public key from attestation report");
+
     // Mock ECDSA public key
     let mock_ecdsa_pub_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     let request_body = serde_json::json!({
-        "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "model": model,
         "messages": [
             {
                 "role": "user",
@@ -138,7 +197,8 @@ async fn test_streaming_chat_completions_with_encryption_headers() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("X-Signing-Algo", "ecdsa")
-        .add_header("X-Signing-Pub-Key", mock_ecdsa_pub_key)
+        .add_header("X-Client-Pub-Key", mock_ecdsa_pub_key)
+        .add_header("X-Model-Pub-Key", model_pub_key)
         .json(&request_body)
         .await;
 
@@ -169,7 +229,10 @@ async fn test_streaming_chat_completions_with_encryption_headers() {
             }
         }
     }
-    assert!(found_chunk, "Should have received at least one valid SSE chunk");
+    assert!(
+        found_chunk,
+        "Should have received at least one valid SSE chunk"
+    );
 }
 
 /// Test that requests without encryption headers still work (backward compatibility)
@@ -222,10 +285,15 @@ async fn test_chat_completions_with_partial_encryption_headers() {
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
+    let model = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+    let model_pub_key = get_model_public_key(&server, model, Some("ecdsa"))
+        .await
+        .expect("Failed to fetch model public key from attestation report");
+
     let mock_pub_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     let request_body = serde_json::json!({
-        "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "model": model,
         "messages": [
             {
                 "role": "user",
@@ -236,12 +304,13 @@ async fn test_chat_completions_with_partial_encryption_headers() {
         "max_tokens": 50
     });
 
-    // Test with only X-Signing-Algo (missing X-Signing-Pub-Key)
+    // Test with only X-Signing-Algo (missing X-Client-Pub-Key)
     let response1 = server
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("X-Signing-Algo", "ecdsa")
-        // Missing X-Signing-Pub-Key
+        .add_header("X-Model-Pub-Key", &model_pub_key)
+        // Missing X-Client-Pub-Key
         .json(&request_body)
         .await;
 
@@ -252,11 +321,12 @@ async fn test_chat_completions_with_partial_encryption_headers() {
         "Request with partial encryption headers should either succeed or return 400"
     );
 
-    // Test with only X-Signing-Pub-Key (missing X-Signing-Algo)
+    // Test with only X-Client-Pub-Key (missing X-Signing-Algo)
     let response2 = server
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
-        .add_header("X-Signing-Pub-Key", mock_pub_key)
+        .add_header("X-Client-Pub-Key", mock_pub_key)
+        .add_header("X-Model-Pub-Key", &model_pub_key)
         // Missing X-Signing-Algo
         .json(&request_body)
         .await;
@@ -277,10 +347,15 @@ async fn test_chat_completions_with_case_insensitive_encryption_headers() {
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
+    let model = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+    let model_pub_key = get_model_public_key(&server, model, Some("ecdsa"))
+        .await
+        .expect("Failed to fetch model public key from attestation report");
+
     let mock_pub_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     let request_body = serde_json::json!({
-        "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "model": model,
         "messages": [
             {
                 "role": "user",
@@ -296,7 +371,8 @@ async fn test_chat_completions_with_case_insensitive_encryption_headers() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("x-signing-algo", "ecdsa") // lowercase
-        .add_header("x-signing-pub-key", mock_pub_key) // lowercase
+        .add_header("x-client-pub-key", mock_pub_key) // lowercase
+        .add_header("x-model-pub-key", &model_pub_key) // lowercase
         .json(&request_body)
         .await;
 
@@ -318,10 +394,15 @@ async fn test_chat_completions_with_invalid_encryption_algorithm() {
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
+    let model = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+    let model_pub_key = get_model_public_key(&server, model, None)
+        .await
+        .expect("Failed to fetch model public key from attestation report");
+
     let mock_pub_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     let request_body = serde_json::json!({
-        "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "model": model,
         "messages": [
             {
                 "role": "user",
@@ -336,7 +417,8 @@ async fn test_chat_completions_with_invalid_encryption_algorithm() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("X-Signing-Algo", "invalid-algorithm")
-        .add_header("X-Signing-Pub-Key", mock_pub_key)
+        .add_header("X-Client-Pub-Key", mock_pub_key)
+        .add_header("X-Model-Pub-Key", model_pub_key)
         .json(&request_body)
         .await;
 
@@ -347,4 +429,3 @@ async fn test_chat_completions_with_invalid_encryption_algorithm() {
         "Request with invalid algorithm should either succeed or return 400"
     );
 }
-

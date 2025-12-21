@@ -5,7 +5,7 @@ use crate::{
 };
 use axum::{
     body::{Body, Bytes},
-    extract::{Extension, Json, State, HeaderMap},
+    extract::{Extension, HeaderMap, Json, State},
     http::{header, StatusCode},
     response::{IntoResponse, Json as ResponseJson, Response},
 };
@@ -183,7 +183,11 @@ pub async fn chat_completions(
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
     let signing_pub_key = headers
-        .get("x-signing-pub-key")
+        .get("x-client-pub-key")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+    let model_pub_key = headers
+        .get("x-model-pub-key")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
@@ -200,10 +204,22 @@ pub async fn chat_completions(
 
     // Store encryption headers in extra field for passing to inference provider
     if let Some(algo) = signing_algo {
-        service_request.extra.insert("x_signing_algo".to_string(), serde_json::Value::String(algo));
+        service_request.extra.insert(
+            "x_signing_algo".to_string(),
+            serde_json::Value::String(algo),
+        );
     }
     if let Some(pub_key) = signing_pub_key {
-        service_request.extra.insert("x_signing_pub_key".to_string(), serde_json::Value::String(pub_key));
+        service_request.extra.insert(
+            "x_client_pub_key".to_string(),
+            serde_json::Value::String(pub_key),
+        );
+    }
+    if let Some(pub_key) = model_pub_key {
+        service_request.extra.insert(
+            "x_model_pub_key".to_string(),
+            serde_json::Value::String(pub_key),
+        );
     }
 
     // Check if streaming is requested

@@ -5,7 +5,12 @@ use inference_providers::{
 };
 use regex::Regex;
 use serde::Deserialize;
-use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    sync::{Arc, RwLock as StdRwLock},
+    time::Duration,
+};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info};
 
@@ -39,6 +44,8 @@ pub struct InferenceProviderPool {
     chat_id_mapping: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
     /// Map of chat_id -> (request_hash, response_hash) for MockProvider signature generation
     signature_hashes: Arc<RwLock<HashMap<String, (String, String)>>>,
+    /// Map of model signing public key -> provider for routing by model public key
+    model_pub_key_mapping: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
     /// Background task handle for periodic model discovery refresh
     refresh_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -60,6 +67,7 @@ impl InferenceProviderPool {
             load_balancer_index: Arc::new(RwLock::new(HashMap::new())),
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
             signature_hashes: Arc::new(RwLock::new(HashMap::new())),
+            model_pub_key_mapping: Arc::new(RwLock::new(HashMap::new())),
             refresh_task_handle: Arc::new(Mutex::new(None)),
         }
     }
@@ -242,7 +250,17 @@ impl InferenceProviderPool {
                     .get_attestation_report(model_name.clone(), None, None, None)
                     .await
                 {
-                    Ok(_) => {
+                    Ok(attestation_report) => {
+                        // Extract signing_public_key from attestation report to register provider by model public key
+                        if let Some(signing_public_key) =
+                            attestation_report.get("signing_public_key")
+                        {
+                            self.register_provider_by_model_pub_key(
+                                signing_public_key.to_string(),
+                                provider.clone(),
+                            )
+                            .await;
+                        }
                         providers_for_model.push(provider);
                     }
                     Err(e) => {
@@ -326,6 +344,31 @@ impl InferenceProviderPool {
         hashes.get(chat_id).cloned()
     }
 
+    /// Register a provider for a model by its signing public key
+    /// This allows routing requests to specific model providers based on X-Model-Pub-Key header
+    pub async fn register_provider_by_model_pub_key(
+        &self,
+        model_pub_key: String,
+        provider: Arc<InferenceProviderTrait>,
+    ) {
+        let mut mapping = self.model_pub_key_mapping.write().await;
+        mapping.insert(model_pub_key.clone(), provider);
+        tracing::debug!(
+            "Registered provider for model public key: {}",
+            model_pub_key
+        );
+    }
+
+    /// Lookup provider by model signing public key
+    /// Used when X-Model-Pub-Key header is provided to route to a specific model provider
+    pub async fn get_provider_by_model_pub_key(
+        &self,
+        model_pub_key: &str,
+    ) -> Option<Arc<InferenceProviderTrait>> {
+        let mapping = self.model_pub_key_mapping.read().await;
+        mapping.get(model_pub_key).cloned()
+    }
+
     /// Get providers for a model in priority order for fallback
     /// Returns providers with the round-robin selected one first, followed by others
     async fn get_providers_with_fallback(
@@ -402,10 +445,12 @@ impl InferenceProviderPool {
 
     /// Generic retry helper that tries each provider in order with automatic fallback
     /// Returns both the result and the provider that succeeded (for chat_id mapping)
+    /// If model_pub_key is provided, routes to the specific provider by signing public key first
     async fn retry_with_fallback<T, F, Fut>(
         &self,
         model_id: &str,
         operation_name: &str,
+        model_pub_key: Option<&str>,
         provider_fn: F,
     ) -> Result<(T, Arc<InferenceProviderTrait>), CompletionError>
     where
@@ -414,6 +459,35 @@ impl InferenceProviderPool {
     {
         // Ensure models are discovered first
         self.ensure_models_discovered().await?;
+
+        // If model_pub_key is provided, try to route to specific provider first
+        if let Some(pub_key) = model_pub_key {
+            if let Some(provider) = self.get_provider_by_model_pub_key(pub_key).await {
+                match provider_fn(provider.clone()).await {
+                    Ok(result) => {
+                        return Ok((result, provider));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            model_id = %model_id,
+                            model_pub_key = %pub_key,
+                            operation = operation_name,
+                            error = %e,
+                            "Provider by model public key failed, falling back to model_id routing"
+                        );
+                        // Fall through to model_id routing
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    model_id = %model_id,
+                    model_pub_key = %pub_key,
+                    operation = operation_name,
+                    "No provider found for model public key, falling back to model_id routing"
+                );
+                // Fall through to model_id routing
+            }
+        }
 
         // Get all providers with fallback priority
         let providers = match self.get_providers_with_fallback(model_id).await {
@@ -569,17 +643,26 @@ impl InferenceProviderPool {
     ) -> Result<StreamingResult, CompletionError> {
         let model_id = params.model.clone();
 
+        // Extract model_pub_key from params.extra for routing
+        let model_pub_key = params.extra.get("x_model_pub_key").and_then(|v| v.as_str());
+
         tracing::debug!(
             model = %model_id,
+            model_pub_key = ?model_pub_key,
             "Starting chat completion stream request"
         );
 
         let (stream, provider) = self
-            .retry_with_fallback(&model_id, "chat_completion_stream", |provider| {
-                let params = params.clone();
-                let request_hash = request_hash.clone();
-                async move { provider.chat_completion_stream(params, request_hash).await }
-            })
+            .retry_with_fallback(
+                &model_id,
+                "chat_completion_stream",
+                model_pub_key,
+                |provider| {
+                    let params = params.clone();
+                    let request_hash = request_hash.clone();
+                    async move { provider.chat_completion_stream(params, request_hash).await }
+                },
+            )
             .await?;
 
         // Store chat_id mapping for sticky routing by peeking at the first event
@@ -607,8 +690,17 @@ impl InferenceProviderPool {
     ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError> {
         let model_id = params.model.clone();
 
+        // Extract model_pub_key from params.extra for routing
+        let model_pub_key = params.extra.get("x_model_pub_key").and_then(|v| v.as_str());
+
+        tracing::debug!(
+            model = %model_id,
+            model_pub_key = ?model_pub_key,
+            "Starting chat completion request"
+        );
+
         let (response, provider) = self
-            .retry_with_fallback(&model_id, "chat_completion", |provider| {
+            .retry_with_fallback(&model_id, "chat_completion", model_pub_key, |provider| {
                 let params = params.clone();
                 let request_hash = request_hash.clone();
                 async move { provider.chat_completion(params, request_hash).await }

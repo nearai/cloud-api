@@ -210,18 +210,22 @@ impl InferenceProvider for VLlmProvider {
             .map_err(|e| CompletionError::CompletionError(format!("Invalid request hash: {e}")))?;
         headers.insert("X-Request-Hash", request_hash_value);
 
-        // Add encryption headers if present in extra field
-        if let Some(algo) = streaming_params.extra.get("x_signing_algo") {
+        // Extract encryption headers from extra field and remove them to avoid affecting request body hash
+        let signing_algo = streaming_params.extra.remove("x_signing_algo");
+        let client_pub_key = streaming_params.extra.remove("x_client_pub_key");
+
+        // Add encryption headers if present
+        if let Some(algo) = signing_algo {
             if let Some(algo_str) = algo.as_str() {
                 if let Ok(algo_value) = HeaderValue::from_str(algo_str) {
                     headers.insert("X-Signing-Algo", algo_value);
                 }
             }
         }
-        if let Some(pub_key) = streaming_params.extra.get("x_signing_pub_key") {
+        if let Some(pub_key) = client_pub_key {
             if let Some(pub_key_str) = pub_key.as_str() {
                 if let Ok(pub_key_value) = HeaderValue::from_str(pub_key_str) {
-                    headers.insert("X-Signing-Pub-Key", pub_key_value);
+                    headers.insert("X-Client-Pub-Key", pub_key_value);
                 }
             }
         }
@@ -268,18 +272,23 @@ impl InferenceProvider for VLlmProvider {
             .map_err(|e| CompletionError::CompletionError(format!("Invalid request hash: {e}")))?;
         headers.insert("X-Request-Hash", request_hash_value);
 
-        // Add encryption headers if present in extra field
-        if let Some(algo) = params.extra.get("x_signing_algo") {
+        // Extract encryption headers from extra field and remove them to avoid affecting request body hash
+        let mut params = params;
+        let signing_algo = params.extra.remove("x_signing_algo");
+        let client_pub_key = params.extra.remove("x_client_pub_key");
+
+        // Add encryption headers if present
+        if let Some(algo) = signing_algo {
             if let Some(algo_str) = algo.as_str() {
                 if let Ok(algo_value) = HeaderValue::from_str(algo_str) {
                     headers.insert("X-Signing-Algo", algo_value);
                 }
             }
         }
-        if let Some(pub_key) = params.extra.get("x_signing_pub_key") {
+        if let Some(pub_key) = client_pub_key {
             if let Some(pub_key_str) = pub_key.as_str() {
                 if let Ok(pub_key_value) = HeaderValue::from_str(pub_key_str) {
-                    headers.insert("X-Signing-Pub-Key", pub_key_value);
+                    headers.insert("X-Client-Pub-Key", pub_key_value);
                 }
             }
         }

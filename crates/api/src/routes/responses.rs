@@ -5,7 +5,7 @@ use crate::{
 use axum::{
     body::Body,
     extract::{Extension, Json, Path, Query, State},
-    http::{header, Response, StatusCode},
+    http::{header, HeaderMap, Response, StatusCode},
     response::{IntoResponse, Json as ResponseJson},
 };
 use bytes::Bytes;
@@ -119,6 +119,7 @@ pub async fn create_response(
     State(state): State<ResponseRouteState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    headers: HeaderMap,
     Json(mut request): Json<CreateResponseRequest>,
 ) -> axum::response::Response {
     let service = state.response_service.clone();
@@ -139,6 +140,20 @@ pub async fn create_response(
         )
             .into_response();
     }
+
+    // Extract encryption headers if present
+    let signing_algo = headers
+        .get("x-signing-algo")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+    let client_pub_key = headers
+        .get("x-client-pub-key")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+    let model_pub_key = headers
+        .get("x-model-pub-key")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
 
     // Set defaults for internal fields
     request.max_tool_calls = request.max_tool_calls.or(Some(10));
@@ -168,6 +183,9 @@ pub async fn create_response(
                 api_key.organization.id.0,
                 api_key.workspace.id.0,
                 body_hash.hash.clone(),
+                signing_algo.clone(),
+                client_pub_key.clone(),
+                model_pub_key.clone(),
             )
             .await
         {
@@ -287,6 +305,9 @@ pub async fn create_response(
                 api_key.organization.id.0,
                 api_key.workspace.id.0,
                 body_hash.hash.clone(),
+                signing_algo.clone(),
+                client_pub_key.clone(),
+                model_pub_key.clone(),
             )
             .await
         {

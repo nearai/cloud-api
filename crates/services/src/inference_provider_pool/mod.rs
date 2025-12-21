@@ -5,12 +5,7 @@ use inference_providers::{
 };
 use regex::Regex;
 use serde::Deserialize;
-use std::{
-    collections::HashMap,
-    net::IpAddr,
-    sync::{Arc, RwLock as StdRwLock},
-    time::Duration,
-};
+use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info};
 

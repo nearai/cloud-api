@@ -5,7 +5,7 @@ use crate::{
 };
 use axum::{
     body::{Body, Bytes},
-    extract::{Extension, HeaderMap, Json, State},
+    extract::{Extension, Json, State},
     http::{header, StatusCode},
     response::{IntoResponse, Json as ResponseJson, Response},
 };
@@ -147,7 +147,7 @@ pub async fn chat_completions(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
-    headers: HeaderMap,
+    headers: header::HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     debug!(

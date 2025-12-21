@@ -29,6 +29,9 @@ struct ProcessStreamContext {
     organization_id: uuid::Uuid,
     workspace_id: uuid::Uuid,
     body_hash: String,
+    signing_algo: Option<String>,
+    client_pub_key: Option<String>,
+    model_pub_key: Option<String>,
     response_repository: Arc<dyn ports::ResponseRepositoryTrait>,
     response_items_repository: Arc<dyn ports::ResponseItemRepositoryTrait>,
     completion_service: Arc<dyn CompletionServiceTrait>,
@@ -98,6 +101,9 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
         body_hash: String,
+        signing_algo: Option<String>,
+        client_pub_key: Option<String>,
+        model_pub_key: Option<String>,
     ) -> Result<
         Pin<Box<dyn Stream<Item = models::ResponseStreamEvent> + Send>>,
         errors::ResponseError,
@@ -117,6 +123,9 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let file_search_provider = self.file_search_provider.clone();
         let file_service = self.file_service.clone();
         let organization_service = self.organization_service.clone();
+        let signing_algo_clone = signing_algo.clone();
+        let client_pub_key_clone = client_pub_key.clone();
+        let model_pub_key_clone = model_pub_key.clone();
 
         tokio::spawn(async move {
             let context = ProcessStreamContext {
@@ -126,6 +135,9 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 organization_id,
                 workspace_id,
                 body_hash,
+                signing_algo: signing_algo_clone,
+                client_pub_key: client_pub_key_clone,
+                model_pub_key: model_pub_key_clone,
                 response_repository,
                 response_items_repository,
                 completion_service,
@@ -1032,13 +1044,32 @@ impl ResponseServiceImpl {
 
             tracing::debug!("Agent loop iteration {}", iteration);
 
-            // Prepare extra params with tools
+            // Prepare extra params with tools and encryption headers
             let mut extra = std::collections::HashMap::new();
             if !tools.is_empty() {
                 extra.insert("tools".to_string(), serde_json::to_value(tools).unwrap());
             }
             if let Some(tc) = tool_choice {
                 extra.insert("tool_choice".to_string(), serde_json::to_value(tc).unwrap());
+            }
+            // Add encryption headers to extra for passing to completion service
+            if let Some(algo) = &process_context.signing_algo {
+                extra.insert(
+                    "x_signing_algo".to_string(),
+                    serde_json::Value::String(algo.clone()),
+                );
+            }
+            if let Some(pub_key) = &process_context.client_pub_key {
+                extra.insert(
+                    "x_client_pub_key".to_string(),
+                    serde_json::Value::String(pub_key.clone()),
+                );
+            }
+            if let Some(pub_key) = &process_context.model_pub_key {
+                extra.insert(
+                    "x_model_pub_key".to_string(),
+                    serde_json::Value::String(pub_key.clone()),
+                );
             }
 
             // Create completion request (names not included - tracked via database analytics)

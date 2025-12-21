@@ -5,7 +5,7 @@ use crate::{
 };
 use axum::{
     body::{Body, Bytes},
-    extract::{Extension, Json, State},
+    extract::{Extension, Json, State, HeaderMap},
     http::{header, StatusCode},
     response::{IntoResponse, Json as ResponseJson, Response},
 };
@@ -147,6 +147,7 @@ pub async fn chat_completions(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     debug!(
@@ -176,9 +177,19 @@ pub async fn chat_completions(
     // Clone request_hash before moving body_hash
     let request_hash = body_hash.hash.clone();
 
+    // Extract encryption headers if present
+    let signing_algo = headers
+        .get("x-signing-algo")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+    let signing_pub_key = headers
+        .get("x-signing-pub-key")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
-    let service_request = convert_chat_request_to_service(
+    let mut service_request = convert_chat_request_to_service(
         &request,
         api_key.api_key.created_by_user_id.0,
         api_key.api_key.id.0.clone(),
@@ -186,6 +197,14 @@ pub async fn chat_completions(
         api_key.workspace.id.0,
         body_hash,
     );
+
+    // Store encryption headers in extra field for passing to inference provider
+    if let Some(algo) = signing_algo {
+        service_request.extra.insert("x_signing_algo".to_string(), serde_json::Value::String(algo));
+    }
+    if let Some(pub_key) = signing_pub_key {
+        service_request.extra.insert("x_signing_pub_key".to_string(), serde_json::Value::String(pub_key));
+    }
 
     // Check if streaming is requested
     if request.stream == Some(true) {

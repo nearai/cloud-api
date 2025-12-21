@@ -210,6 +210,22 @@ impl InferenceProvider for VLlmProvider {
             .map_err(|e| CompletionError::CompletionError(format!("Invalid request hash: {e}")))?;
         headers.insert("X-Request-Hash", request_hash_value);
 
+        // Add encryption headers if present in extra field
+        if let Some(algo) = streaming_params.extra.get("x_signing_algo") {
+            if let Some(algo_str) = algo.as_str() {
+                if let Ok(algo_value) = HeaderValue::from_str(algo_str) {
+                    headers.insert("X-Signing-Algo", algo_value);
+                }
+            }
+        }
+        if let Some(pub_key) = streaming_params.extra.get("x_signing_pub_key") {
+            if let Some(pub_key_str) = pub_key.as_str() {
+                if let Ok(pub_key_value) = HeaderValue::from_str(pub_key_str) {
+                    headers.insert("X-Signing-Pub-Key", pub_key_value);
+                }
+            }
+        }
+
         let response = self
             .client
             .post(&url)
@@ -251,6 +267,22 @@ impl InferenceProvider for VLlmProvider {
         let request_hash_value = HeaderValue::from_str(&request_hash)
             .map_err(|e| CompletionError::CompletionError(format!("Invalid request hash: {e}")))?;
         headers.insert("X-Request-Hash", request_hash_value);
+
+        // Add encryption headers if present in extra field
+        if let Some(algo) = params.extra.get("x_signing_algo") {
+            if let Some(algo_str) = algo.as_str() {
+                if let Ok(algo_value) = HeaderValue::from_str(algo_str) {
+                    headers.insert("X-Signing-Algo", algo_value);
+                }
+            }
+        }
+        if let Some(pub_key) = params.extra.get("x_signing_pub_key") {
+            if let Some(pub_key_str) = pub_key.as_str() {
+                if let Ok(pub_key_value) = HeaderValue::from_str(pub_key_str) {
+                    headers.insert("X-Signing-Pub-Key", pub_key_value);
+                }
+            }
+        }
 
         let response = self
             .client

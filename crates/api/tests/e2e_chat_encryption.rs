@@ -1,6 +1,7 @@
 // Import common test utilities
 mod common;
 
+use axum_test::TestServer;
 use common::*;
 
 use inference_providers::StreamChunk;

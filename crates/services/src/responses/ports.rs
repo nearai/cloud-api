@@ -106,6 +106,7 @@ pub trait ResponseItemRepositoryTrait: Send + Sync {
     ) -> anyhow::Result<Vec<models::ResponseOutputItem>>;
 }
 
+#[allow(clippy::too_many_arguments)]
 #[async_trait]
 pub trait ResponseServiceTrait: Send + Sync {
     async fn create_response_stream(

@@ -68,7 +68,7 @@ fn extract_text(item: &serde_json::Value) -> Option<String> {
 
 #[tokio::test]
 async fn test_response_items_saved_on_disconnect() {
-    let (server, _pool, mock, database) = setup_test_server_with_pool().await;
+    let (server, _pool, mock, database, _guard) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
@@ -110,8 +110,8 @@ async fn test_response_items_saved_on_disconnect() {
     assert_eq!(response.status_code(), 200);
     let _stream = response.text();
 
-    // Wait for async DB writes
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // Wait for async DB writes (stream completion + title generation)
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
     // Verify assistant response saved with partial text
     let item = get_assistant_item_from_db(&database, &conversation.id)

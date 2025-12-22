@@ -14,7 +14,7 @@ use uuid::Uuid;
 /// requiring fallback to the deprecated request_type column
 #[tokio::test]
 async fn test_usage_api_with_old_v0029_records() {
-    let server = setup_test_server().await;
+    let (server, _pool, _mock, db, _guard) = setup_test_server_with_pool().await;
     let org = create_org(&server).await;
 
     // Get workspace and create API key
@@ -27,12 +27,7 @@ async fn test_usage_api_with_old_v0029_records() {
     // Setup model with pricing
     let model_name = setup_qwen_model(&server).await;
 
-    // Get database connection to insert old data directly
-    let db_config = test_config().database;
-    let db = database::Database::from_config(&db_config)
-        .await
-        .expect("Failed to create database connection");
-
+    // Use the database from the test server (per-test isolated database)
     let pool = db.pool();
     let client = pool.get().await.expect("Failed to get database connection");
 

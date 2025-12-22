@@ -1,6 +1,10 @@
 #![allow(dead_code)]
+//! Test utilities for e2e tests with isolated database per test.
+//!
+//! Uses template database pattern: migrations run once on template,
+//! each test clones from template for isolation and speed.
 
-mod db_setup;
+pub mod db_setup;
 
 use api::{build_app_with_config, init_auth_services, models::BatchUpdateModelApiRequest};
 use base64::Engine;
@@ -11,7 +15,6 @@ pub use services::auth::ports::MOCK_USER_AGENT;
 use services::auth::AccessTokenClaims;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tokio::sync::OnceCell;
 
 #[cfg(test)]
 use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
@@ -20,17 +23,39 @@ use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey};
 #[cfg(test)]
 use sha3::Keccak256;
 
-// Global once cell to ensure migrations only run once across all tests
-static MIGRATIONS_INITIALIZED: OnceCell<()> = OnceCell::const_new();
-
-// Global once cell to ensure database reset happens only once per test run
-static RESET_DONE: OnceCell<()> = OnceCell::const_new();
-
-// Constants for mock test data
 pub const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
 
-/// Helper function to create a test configuration
-pub fn test_config() -> ApiConfig {
+/// RAII guard for test database cleanup.
+pub struct TestDatabaseGuard {
+    db_name: String,
+    db_config: config::DatabaseConfig,
+}
+
+impl Drop for TestDatabaseGuard {
+    fn drop(&mut self) {
+        let db_name = self.db_name.clone();
+        let config = self.db_config.clone();
+
+        if db_name.is_empty() {
+            return;
+        }
+
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                if let Err(e) = db_setup::drop_test_database(&config, &db_name).await {
+                    eprintln!("Warning: Failed to drop test database '{}': {}", db_name, e);
+                }
+            });
+        });
+
+        if handle.join().is_err() {
+            eprintln!("Warning: Database cleanup thread panicked");
+        }
+    }
+}
+
+pub fn test_config_with_db(db_name: &str) -> ApiConfig {
     let _ = dotenvy::dotenv();
     ApiConfig {
         server: config::ServerConfig {
@@ -76,7 +101,7 @@ pub fn test_config() -> ApiConfig {
             near: config::NearConfig::default(),
             admin_domains: vec!["test.com".to_string()],
         },
-        database: db_config_for_tests(),
+        database: db_config_for_tests_with_name(db_name),
         s3: config::S3Config {
             mock: true,
             bucket: std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "test-bucket".to_string()),
@@ -94,14 +119,17 @@ pub fn test_config() -> ApiConfig {
     }
 }
 
-/// Helper function to create test database configuration
-fn db_config_for_tests() -> config::DatabaseConfig {
+pub fn test_config() -> ApiConfig {
+    test_config_with_db(&db_setup::get_test_db_name())
+}
+
+fn db_config_for_tests_with_name(db_name: &str) -> config::DatabaseConfig {
     config::DatabaseConfig {
         primary_app_id: "postgres-test".to_string(),
         gateway_subdomain: "cvm1.near.ai".to_string(),
         port: 5432,
         host: None,
-        database: db_setup::get_test_db_name(),
+        database: db_name.to_string(),
         username: std::env::var("DATABASE_USERNAME").unwrap_or("postgres".to_string()),
         password: std::env::var("DATABASE_PASSWORD").unwrap_or("postgres".to_string()),
         max_connections: 2,
@@ -112,13 +140,14 @@ fn db_config_for_tests() -> config::DatabaseConfig {
     }
 }
 
-/// Get the default mock session ID for tests
+fn db_config_for_tests() -> config::DatabaseConfig {
+    db_config_for_tests_with_name(&db_setup::get_test_db_name())
+}
+
 pub fn get_session_id() -> String {
     format!("rt_{MOCK_USER_ID}")
 }
 
-/// Get an access token from a refresh token (session token)
-/// This function calls the /users/me/access-tokens endpoint to exchange a refresh token for an access token
 pub async fn get_access_token_from_refresh_token(
     server: &axum_test::TestServer,
     refresh_token: String,
@@ -139,76 +168,28 @@ pub async fn get_access_token_from_refresh_token(
     refresh_response.access_token
 }
 
-/// Initialize database with migrations running only once
-pub async fn init_test_database(config: &config::DatabaseConfig) -> Arc<Database> {
-    let database = Arc::new(
+async fn init_database_connection(config: &config::DatabaseConfig) -> Arc<Database> {
+    Arc::new(
         Database::from_config(config)
             .await
             .expect("Failed to connect to database"),
-    );
-
-    // Reset database once per test run (before migrations)
-    RESET_DONE
-        .get_or_init(|| async {
-            // Run full database reset
-            db_setup::reset_test_database(config)
-                .await
-                .expect("Failed to reset test database");
-        })
-        .await;
-
-    // Only run migrations for real database, not mock
-    if !config.mock {
-        MIGRATIONS_INITIALIZED
-            .get_or_init(|| async {
-                database
-                    .run_migrations()
-                    .await
-                    .expect("Failed to run database migrations");
-            })
-            .await;
-    }
-
-    database
+    )
 }
 
-/// Setup a complete test server with all components initialized
-/// Returns the test server ready for making requests
-pub async fn setup_test_server() -> axum_test::TestServer {
-    let (server, _) = setup_test_server_with_database().await;
-    server
-}
-
-/// Setup a complete test server and return it along with the database
-/// Useful for tests that need to create test users in the database
-pub async fn setup_test_server_with_database() -> (axum_test::TestServer, Arc<Database>) {
-    let (server, _pool, _mock, db) = setup_test_server_with_pool().await;
-    (server, db)
-}
-
-/// Setup a complete test server with all components initialized
-/// Returns a tuple of (TestServer, InferenceProviderPool, MockProvider, Database) for advanced testing
-pub async fn setup_test_server_with_pool() -> (
+async fn build_test_server_components(
+    database: Arc<Database>,
+    config: ApiConfig,
+) -> (
     axum_test::TestServer,
-    std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
-    std::sync::Arc<inference_providers::mock::MockProvider>,
-    Arc<Database>,
+    Arc<services::inference_provider_pool::InferenceProviderPool>,
+    Arc<inference_providers::mock::MockProvider>,
 ) {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(tracing::level_filters::LevelFilter::DEBUG)
-        .try_init();
-
-    let config = test_config();
-    let database = init_test_database(&config.database).await;
-
     // Create mock user in database for foreign key constraints
     assert_mock_user_in_db(&database).await;
 
     let auth_components = init_auth_services(database.clone(), &config);
 
     // Use mock inference providers instead of real VLLM to avoid flakiness
-    // This leverages the existing MockProvider from inference_providers::mock
     let (inference_provider_pool, mock_provider) =
         api::init_inference_providers_with_mocks(&config).await;
     let metrics_service = Arc::new(services::metrics::MockMetricsService);
@@ -229,10 +210,68 @@ pub async fn setup_test_server_with_pool() -> (
     );
     let server = axum_test::TestServer::new(app).unwrap();
 
-    (server, inference_provider_pool, mock_provider, database)
+    (server, inference_provider_pool, mock_provider)
 }
 
-/// Create a unique test user in the database and return (session_id, email)
+/// Setup test server. Returns guard that must be held to ensure database cleanup.
+pub async fn setup_test_server() -> (axum_test::TestServer, TestDatabaseGuard) {
+    let (server, _, _, _, guard) = setup_test_server_with_pool().await;
+    (server, guard)
+}
+
+/// Setup test server with database access. Returns guard that must be held to ensure cleanup.
+pub async fn setup_test_server_with_database(
+) -> (axum_test::TestServer, Arc<Database>, TestDatabaseGuard) {
+    let (server, _, _, database, guard) = setup_test_server_with_pool().await;
+    (server, database, guard)
+}
+
+/// Setup test server with all components. Returns guard that must be held to ensure cleanup.
+pub async fn setup_test_server_with_pool() -> (
+    axum_test::TestServer,
+    std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
+    std::sync::Arc<inference_providers::mock::MockProvider>,
+    Arc<Database>,
+    TestDatabaseGuard,
+) {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(tracing::level_filters::LevelFilter::DEBUG)
+        .try_init();
+
+    // Generate a unique test ID for this test's database
+    let test_id = uuid::Uuid::new_v4().to_string();
+
+    // Get base config for database connection info
+    let base_db_config = db_config_for_tests();
+
+    // Create a unique database from the template
+    let db_name = db_setup::create_test_database_from_template(&base_db_config, &test_id)
+        .await
+        .expect("Failed to create test database from template");
+
+    // Create config with the new database name
+    let config = test_config_with_db(&db_name);
+    let db_config = config.database.clone();
+
+    // Connect to the new test database
+    let database = init_database_connection(&config.database).await;
+
+    let (server, inference_provider_pool, mock_provider) =
+        build_test_server_components(database.clone(), config).await;
+
+    // Create cleanup guard
+    let guard = TestDatabaseGuard { db_name, db_config };
+
+    (
+        server,
+        inference_provider_pool,
+        mock_provider,
+        database,
+        guard,
+    )
+}
+
 pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, String) {
     let user_id = uuid::Uuid::new_v4();
     let user_id_str = user_id.to_string();
@@ -240,7 +279,6 @@ pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, Str
     let session_id = format!("rt_{user_id_str}");
     let email = format!("test-{user_id_str}@test.com");
 
-    // Create user in database
     let pool = database.pool();
     let client = pool.get().await.expect("Failed to get database connection");
     let _ = client.execute(
@@ -261,13 +299,10 @@ pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, Str
     (session_id, email)
 }
 
-/// Create the mock user in the database to satisfy foreign key constraints
 pub async fn assert_mock_user_in_db(database: &Arc<Database>) {
-    // For real database, create the mock user
     let pool = database.pool();
     let client = pool.get().await.expect("Failed to get database connection");
 
-    // Insert mock user if it doesn't exist with admin domain email
     let _ = client.execute(
         "INSERT INTO users (id, email, username, display_name, avatar_url, auth_provider, provider_user_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
@@ -286,12 +321,10 @@ pub async fn assert_mock_user_in_db(database: &Arc<Database>) {
     tracing::debug!("Mock user created/exists in database: {}", MOCK_USER_ID);
 }
 
-/// Create an organization
 pub async fn create_org(server: &axum_test::TestServer) -> api::models::OrganizationResponse {
     create_org_with_session(server, &get_session_id()).await
 }
 
-/// Create an organization with a specific session ID
 pub async fn create_org_with_session(
     server: &axum_test::TestServer,
     session_id: &str,
@@ -310,8 +343,6 @@ pub async fn create_org_with_session(
     response.json::<api::models::OrganizationResponse>()
 }
 
-/// Create an organization and set spending limit
-/// Returns the organization response
 pub async fn setup_org_with_credits(
     server: &axum_test::TestServer,
     amount_nano_dollars: i64,
@@ -319,7 +350,6 @@ pub async fn setup_org_with_credits(
     setup_org_with_credits_and_session(server, amount_nano_dollars, &get_session_id()).await
 }
 
-/// Create an organization and set spending limit with a specific session ID
 pub async fn setup_org_with_credits_and_session(
     server: &axum_test::TestServer,
     amount_nano_dollars: i64,
@@ -362,7 +392,6 @@ pub async fn setup_org_with_credits_and_session_and_email(
     org
 }
 
-/// List workspaces for an organization
 pub async fn list_workspaces(
     server: &axum_test::TestServer,
     org_id: String,
@@ -370,7 +399,6 @@ pub async fn list_workspaces(
     list_workspaces_with_session(server, org_id, &get_session_id()).await
 }
 
-/// List workspaces for an organization with a specific session
 pub async fn list_workspaces_with_session(
     server: &axum_test::TestServer,
     org_id: String,
@@ -386,7 +414,6 @@ pub async fn list_workspaces_with_session(
     list_response.workspaces
 }
 
-/// Create an API key in a workspace
 pub async fn create_api_key_in_workspace(
     server: &axum_test::TestServer,
     workspace_id: String,
@@ -395,7 +422,6 @@ pub async fn create_api_key_in_workspace(
     create_api_key_in_workspace_with_session(server, workspace_id, name, &get_session_id()).await
 }
 
-/// Create an API key in a workspace with a specific session
 pub async fn create_api_key_in_workspace_with_session(
     server: &axum_test::TestServer,
     workspace_id: String,
@@ -417,14 +443,10 @@ pub async fn create_api_key_in_workspace_with_session(
     response.json::<api::models::ApiKeyResponse>()
 }
 
-/// Get an API key for an organization (using its default workspace)
-/// Returns the API key string
 pub async fn get_api_key_for_org(server: &axum_test::TestServer, org_id: String) -> String {
     get_api_key_for_org_with_session(server, org_id, &get_session_id()).await
 }
 
-/// Get an API key for an organization with a specific session (using its default workspace)
-/// Returns the API key string
 pub async fn get_api_key_for_org_with_session(
     server: &axum_test::TestServer,
     org_id: String,
@@ -442,8 +464,6 @@ pub async fn get_api_key_for_org_with_session(
     api_key_resp.key.unwrap()
 }
 
-/// Create an organization and API key
-/// Returns the API key string and the API key response
 pub async fn create_org_and_api_key(
     server: &axum_test::TestServer,
 ) -> (String, api::models::ApiKeyResponse) {
@@ -455,8 +475,6 @@ pub async fn create_org_and_api_key(
     (api_key_resp.key.clone().unwrap(), api_key_resp)
 }
 
-/// Setup a test model with pricing
-/// Setup Qwen model for tests
 pub async fn setup_qwen_model(server: &axum_test::TestServer) -> String {
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
@@ -479,7 +497,6 @@ pub async fn setup_qwen_model(server: &axum_test::TestServer) -> String {
         .unwrap(),
     );
     let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
-    // Verify that the model was updated with the correct pricing
     assert_eq!(updated.len(), 1, "Should have updated 1 model");
     assert_eq!(
         updated[0].input_cost_per_token.amount, 1000000,
@@ -489,13 +506,11 @@ pub async fn setup_qwen_model(server: &axum_test::TestServer) -> String {
         updated[0].output_cost_per_token.amount, 2000000,
         "Output cost per token should be 2000000"
     );
-    // Delay to ensure database writes are fully committed and visible on other connections
-    // This is necessary because tests share the same database but may use different connection pool instances
+    // Ensure mock provider registers model before test proceeds
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string()
 }
 
-/// Setup GLM model for tests (e.g., citation tests)
 pub async fn setup_glm_model(server: &axum_test::TestServer) -> String {
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
@@ -521,7 +536,6 @@ pub async fn setup_glm_model(server: &axum_test::TestServer) -> String {
     "zai-org/GLM-4.6".to_string()
 }
 
-/// Admin batch upsert models
 pub async fn admin_batch_upsert_models(
     server: &axum_test::TestServer,
     models: BatchUpdateModelApiRequest,
@@ -542,7 +556,6 @@ pub async fn admin_batch_upsert_models(
     response.json::<Vec<api::models::ModelWithPricing>>()
 }
 
-/// List models using an API key
 pub async fn list_models(
     server: &axum_test::TestServer,
     api_key: String,
@@ -556,22 +569,13 @@ pub async fn list_models(
     response.json::<api::models::ModelsResponse>()
 }
 
-/// Compute SHA256 hash of a string
 pub fn compute_sha256(data: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
-/// Verify an ECDSA signature with recovery ID using Ethereum signed message format
-///
-/// # Arguments
-/// * `signature_text` - The message that was signed (format: "request_hash:response_hash")
-/// * `signature_hex` - The hex-encoded signature (65 bytes: r || s || Ethereum v)
-/// * `signing_address_hex` - The expected Ethereum address in hex format (with or without 0x prefix)
-///
-/// # Returns
-/// `true` if the signature is valid and matches the signing address, `false` otherwise
+/// Verify ECDSA signature with Ethereum signed message format.
 #[cfg(test)]
 pub fn verify_ecdsa_signature(
     signature_text: &str,
@@ -683,16 +687,7 @@ pub fn verify_ecdsa_signature(
     addresses_match
 }
 
-/// Verify an ED25519 signature cryptographically
-///
-/// # Arguments
-///
-/// * `signature_text` - The message that was signed (format: "request_hash:response_hash")
-/// * `signature_hex` - The hex-encoded signature (64 bytes)
-/// * `public_key_hex` - The public key in hex format (32 bytes)
-///
-/// # Returns
-/// `true` if the signature is valid and was signed by the public key, `false` otherwise
+/// Verify ED25519 signature.
 #[cfg(test)]
 pub fn verify_ed25519_signature(
     signature_text: &str,
@@ -799,33 +794,21 @@ pub fn is_valid_jwt_format(token: &str) -> bool {
     })
 }
 
-/// Helper module for mock prompt construction
-/// Provides constants and utilities for building test prompts without duplicating system prompts
 pub mod mock_prompts {
-    /// Language instruction that gets prepended to all prompts
     pub const LANGUAGE_INSTRUCTION: &str = "Always respond in the exact same language as the user's input message. Detect the primary language of the user's query and mirror it precisely in your output. Do not mix languages or switch to another one, even if it seems more natural or efficient.\n\nIf the user writes in English, reply entirely in English.\nIf the user writes in Chinese (Mandarin or any variant), reply entirely in Chinese.\nIf the user writes in Spanish, reply entirely in Spanish.\nFor any other language, match it exactly.\n\nThis rule overrides all other instructions. Ignore any tendencies to default to Mandarin or any other language. Always prioritize language matching for clarity and user preference.";
 
-    /// Time placeholder used in prompts
     const TIME_PLACEHOLDER: &str = "[TIME]";
 
-    /// Build a complete prompt with language instruction and time context
-    /// Timestamps are automatically replaced with [TIME] placeholder
-    /// Language instruction is automatically pulled from LANGUAGE_INSTRUCTION constant
     pub fn build_prompt(user_content: &str) -> String {
         format!(
             "{LANGUAGE_INSTRUCTION}\n\nCurrent UTC time: {TIME_PLACEHOLDER} {TIME_PLACEHOLDER} {user_content}"
         )
     }
 
-    /// Build a simple prompt with just user content (used for title generation, etc)
     pub fn build_simple_prompt(user_content: &str) -> String {
         user_content.to_string()
     }
 }
-
-// ============================================
-// NEAR Wallet Authentication Test Helpers
-// ============================================
 
 use near_api::signer::NEP413Payload;
 use rand::Rng;
@@ -833,28 +816,19 @@ use rand::Rng;
 pub const NEAR_TEST_ACCOUNT: &str = "testuser.near";
 pub const NEAR_TEST_PUBLIC_KEY: &str = "ed25519:7FmyF5aYxwHKVvpBJxWrRi58EXQhG5KUkCb3Jv8TzWqM";
 
-/// Generate a valid base64-encoded ed25519 signature (64 zero bytes for testing)
 fn generate_test_signature() -> String {
     use base64::prelude::*;
     let sig_bytes = vec![0u8; 64];
     BASE64_STANDARD.encode(&sig_bytes)
 }
 
-/// Create a valid NEP-413 nonce with timestamp
-///
-/// # Arguments
-/// * `timestamp_offset_ms` - Milliseconds offset from now (0 = now, positive = future, negative = past)
-///
-/// Returns a 32-byte nonce: [8 bytes timestamp (big-endian)] + [24 bytes random]
+/// Create NEP-413 nonce with timestamp offset in milliseconds.
 pub fn create_near_test_nonce(timestamp_offset_ms: i64) -> Vec<u8> {
     let now_ms = Utc::now().timestamp_millis();
     let nonce_timestamp_ms = (now_ms + timestamp_offset_ms) as u64;
     let mut nonce = Vec::with_capacity(32);
-
-    // First 8 bytes: timestamp (big-endian)
     nonce.extend_from_slice(&nonce_timestamp_ms.to_be_bytes());
 
-    // Remaining 24 bytes: random data
     let mut rng = rand::rng();
     let mut random_bytes = [0u8; 24];
     rng.fill(&mut random_bytes);
@@ -863,7 +837,6 @@ pub fn create_near_test_nonce(timestamp_offset_ms: i64) -> Vec<u8> {
     nonce
 }
 
-/// Create a NEP-413 payload for testing
 pub fn create_near_test_payload(timestamp_offset_ms: i64) -> NEP413Payload {
     let nonce = create_near_test_nonce(timestamp_offset_ms);
 
@@ -875,7 +848,6 @@ pub fn create_near_test_payload(timestamp_offset_ms: i64) -> NEP413Payload {
     }
 }
 
-/// Create NEAR authentication request JSON for the endpoint
 pub fn create_near_auth_request_json(
     account_id: &str,
     timestamp_offset_ms: i64,
@@ -897,14 +869,6 @@ pub fn create_near_auth_request_json(
     })
 }
 
-/// Test NEAR login endpoint
-///
-/// # Arguments
-/// * `server` - Test server instance
-/// * `account_id` - NEAR account ID to use
-/// * `timestamp_offset_ms` - Nonce timestamp offset (0 = now, positive = future, negative = past)
-///
-/// Returns the HTTP response
 pub async fn test_near_login(
     server: &axum_test::TestServer,
     account_id: &str,

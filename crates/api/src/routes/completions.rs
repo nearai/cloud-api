@@ -207,7 +207,6 @@ pub async fn chat_completions(
     // Check if streaming is requested
     if request.stream == Some(true) {
         let inference_provider_pool = app_state.inference_provider_pool.clone();
-        let attestation_service = app_state.attestation_service.clone();
 
         // Call the streaming completion service
         match app_state
@@ -245,13 +244,10 @@ pub async fn chat_completions(
                 let req_hash_clone = request_hash.clone();
                 let pool_clone2 = pool_clone.clone();
                 let req_hash_clone2 = req_hash_clone.clone();
-                let attestation_clone = attestation_service.clone();
                 let byte_stream = peekable_stream
                     .then(move |result| {
                         let accumulated_inner = accumulated_clone.clone();
                         let chat_id_inner = chat_id_clone.clone();
-                        let pool_inner = pool_clone.clone();
-                        let req_hash_inner = req_hash_clone.clone();
                         async move {
                             match result {
                                 Ok(event) => {
@@ -268,24 +264,11 @@ pub async fn chat_completions(
                                                 if let Some(serde_json::Value::String(id)) =
                                                     obj.get("id")
                                                 {
-                                                    let id_clone = id.clone();
+                                                    // Capture chat_id for use in the chain combinator
+                                                    // The real hash will be registered there after accumulating all bytes
                                                     let mut cid = chat_id_inner.lock().await;
                                                     if cid.is_none() {
-                                                        *cid = Some(id_clone.clone());
-                                                        // Register request hash immediately (response hash will be registered later)
-                                                        // This ensures InterceptStream can find the hashes when it stores the signature
-                                                        let pool_reg = pool_inner.clone();
-                                                        let req_hash_reg = req_hash_inner.clone();
-                                                        tokio::spawn(async move {
-                                                            // Register with empty response hash for now, will update later
-                                                            pool_reg
-                                                                .register_signature_hashes_for_chat(
-                                                                    &id_clone,
-                                                                    req_hash_reg,
-                                                                    "pending".to_string(),
-                                                                )
-                                                                .await;
-                                                        });
+                                                        *cid = Some(id.clone());
                                                     }
                                                 }
                                             }
@@ -330,37 +313,16 @@ pub async fn chat_completions(
                             format!("{:x}", hasher.finalize())
                         };
 
-                        // Update response hash in InferenceProviderPool and database
+                        // Update response hash in InferenceProviderPool
+                        // InterceptStream::Drop will read this and store to database
                         if let Some(chat_id) = chat_id_state.lock().await.clone() {
-                            let pool_final = pool_clone2.clone();
-                            let req_hash_final = req_hash_clone2.clone();
-                            let resp_hash_final = response_hash.clone();
-                            let attestation_final = attestation_clone.clone();
-
-                            // Update the hashes in the pool
-                            pool_final
+                            pool_clone2
                                 .register_signature_hashes_for_chat(
                                     &chat_id,
-                                    req_hash_final.clone(),
-                                    resp_hash_final.clone(),
+                                    req_hash_clone2.clone(),
+                                    response_hash,
                                 )
                                 .await;
-
-                            // Update the signature in the database using store_response_signature
-                            // This ensures the correct signature overwrites any "pending" signature stored by InterceptStream
-                            // The database has ON CONFLICT DO UPDATE, so this will update the existing signature
-                            let chat_id_for_update = chat_id.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = attestation_final.store_response_signature(
-                                    &chat_id_for_update,
-                                    req_hash_final,
-                                    resp_hash_final,
-                                ).await {
-                                    tracing::error!("Failed to update signature with real response hash: {}", e);
-                                } else {
-                                    tracing::debug!("Successfully updated signature with real response hash for chat_id: {}", chat_id_for_update);
-                                }
-                            });
                         }
 
                         Ok::<Bytes, Infallible>(done_bytes)

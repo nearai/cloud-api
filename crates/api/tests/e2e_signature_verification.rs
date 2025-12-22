@@ -11,7 +11,7 @@ use inference_providers::StreamChunk;
 
 #[tokio::test]
 async fn test_streaming_chat_completion_signature_verification() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     println!("Created organization: {}", org.id);
@@ -215,7 +215,10 @@ async fn test_streaming_chat_completion_signature_verification() {
     println!("✅ Signature stored and retrieved");
     println!("✅ Request hash matches: {expected_request_hash}");
     println!("✅ Response hash matches: {expected_response_hash}");
-    println!("✅ Signature is present: {}", &signature[..20]);
+    println!(
+        "✅ Signature is present: {}...",
+        &signature[..signature.len().min(20)]
+    );
     println!("✅ Signing address: {signing_address}");
     println!("✅ Signing algorithm: {signing_algo}");
 }

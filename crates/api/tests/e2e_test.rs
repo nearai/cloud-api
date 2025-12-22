@@ -1344,11 +1344,12 @@ async fn test_completion_cost_calculation() {
         latest_entry.total_cost
     );
 
-    // Verify stop_reason is "completed" for successful non-streaming completion
+    // Verify stop_reason is "stop" for successful non-streaming completion
+    // (maps from OpenAI's finish_reason: "stop")
     assert_eq!(
         latest_entry.stop_reason.as_deref(),
-        Some("completed"),
-        "Stop reason should be 'completed' for successful completion. Found: {:?}",
+        Some("stop"),
+        "Stop reason should be 'stop' for successful completion. Found: {:?}",
         latest_entry.stop_reason
     );
 

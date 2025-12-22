@@ -64,7 +64,7 @@ impl StopReason {
     /// Parse from OpenAI-compatible finish_reason field
     pub fn from_finish_reason(reason: &str) -> Self {
         match reason {
-            "stop" => StopReason::Completed,
+            "stop" => StopReason::Stop,
             "length" => StopReason::Length,
             "content_filter" => StopReason::ContentFilter,
             "tool_calls" | "function_call" => StopReason::ToolCalls,

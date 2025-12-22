@@ -59,6 +59,31 @@ impl VLlmProvider {
 
         Ok(headers)
     }
+
+    fn prepare_encryption_headers(
+        &self,
+        headers: &mut reqwest::header::HeaderMap,
+        extra: &mut std::collections::HashMap<String, serde_json::Value>,
+    ) {
+        if let Some(algo) = extra
+            .remove("x_signing_algo")
+            .as_ref()
+            .and_then(|v| v.as_str())
+        {
+            if let Ok(value) = HeaderValue::from_str(algo) {
+                headers.insert("X-Signing-Algo", value);
+            }
+        }
+        if let Some(pub_key) = extra
+            .remove("x_client_pub_key")
+            .as_ref()
+            .and_then(|v| v.as_str())
+        {
+            if let Ok(value) = HeaderValue::from_str(pub_key) {
+                headers.insert("X-Client-Pub-Key", value);
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -210,25 +235,8 @@ impl InferenceProvider for VLlmProvider {
             .map_err(|e| CompletionError::CompletionError(format!("Invalid request hash: {e}")))?;
         headers.insert("X-Request-Hash", request_hash_value);
 
-        // Extract encryption headers from extra field and remove them to avoid affecting request body hash
-        let signing_algo = streaming_params.extra.remove("x_signing_algo");
-        let client_pub_key = streaming_params.extra.remove("x_client_pub_key");
-
-        // Add encryption headers if present
-        if let Some(algo) = signing_algo {
-            if let Some(algo_str) = algo.as_str() {
-                if let Ok(algo_value) = HeaderValue::from_str(algo_str) {
-                    headers.insert("X-Signing-Algo", algo_value);
-                }
-            }
-        }
-        if let Some(pub_key) = client_pub_key {
-            if let Some(pub_key_str) = pub_key.as_str() {
-                if let Ok(pub_key_value) = HeaderValue::from_str(pub_key_str) {
-                    headers.insert("X-Client-Pub-Key", pub_key_value);
-                }
-            }
-        }
+        // Prepare encryption headers
+        self.prepare_encryption_headers(&mut headers, &mut streaming_params.extra);
 
         let response = self
             .client
@@ -265,6 +273,8 @@ impl InferenceProvider for VLlmProvider {
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
         let url = format!("{}/v1/chat/completions", self.config.base_url);
 
+        let mut non_streaming_params = params;
+
         let mut headers = self
             .build_headers()
             .map_err(CompletionError::CompletionError)?;
@@ -272,32 +282,14 @@ impl InferenceProvider for VLlmProvider {
             .map_err(|e| CompletionError::CompletionError(format!("Invalid request hash: {e}")))?;
         headers.insert("X-Request-Hash", request_hash_value);
 
-        // Extract encryption headers from extra field and remove them to avoid affecting request body hash
-        let mut params = params;
-        let signing_algo = params.extra.remove("x_signing_algo");
-        let client_pub_key = params.extra.remove("x_client_pub_key");
-
-        // Add encryption headers if present
-        if let Some(algo) = signing_algo {
-            if let Some(algo_str) = algo.as_str() {
-                if let Ok(algo_value) = HeaderValue::from_str(algo_str) {
-                    headers.insert("X-Signing-Algo", algo_value);
-                }
-            }
-        }
-        if let Some(pub_key) = client_pub_key {
-            if let Some(pub_key_str) = pub_key.as_str() {
-                if let Ok(pub_key_value) = HeaderValue::from_str(pub_key_str) {
-                    headers.insert("X-Client-Pub-Key", pub_key_value);
-                }
-            }
-        }
+        // Prepare encryption headers
+        self.prepare_encryption_headers(&mut headers, &mut non_streaming_params.extra);
 
         let response = self
             .client
             .post(&url)
             .headers(headers)
-            .json(&params)
+            .json(&non_streaming_params)
             .send()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;

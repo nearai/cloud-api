@@ -247,8 +247,9 @@ impl InferenceProviderPool {
                 {
                     Ok(attestation_report) => {
                         // Extract signing_public_key from attestation report to register provider by model public key
-                        if let Some(signing_public_key) =
-                            attestation_report.get("signing_public_key")
+                        if let Some(signing_public_key) = attestation_report
+                            .get("signing_public_key")
+                            .and_then(|v| v.as_str())
                         {
                             self.register_provider_by_model_pub_key(
                                 signing_public_key.to_string(),
@@ -633,13 +634,17 @@ impl InferenceProviderPool {
 
     pub async fn chat_completion_stream(
         &self,
-        params: ChatCompletionParams,
+        mut params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
         let model_id = params.model.clone();
 
         // Extract model_pub_key from params.extra for routing
-        let model_pub_key = params.extra.get("x_model_pub_key").and_then(|v| v.as_str());
+        let model_pub_key_str = params
+            .extra
+            .remove("x_model_pub_key")
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
+        let model_pub_key = model_pub_key_str.as_deref();
 
         tracing::debug!(
             model = %model_id,
@@ -680,13 +685,17 @@ impl InferenceProviderPool {
 
     pub async fn chat_completion(
         &self,
-        params: ChatCompletionParams,
+        mut params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError> {
         let model_id = params.model.clone();
 
         // Extract model_pub_key from params.extra for routing
-        let model_pub_key = params.extra.get("x_model_pub_key").and_then(|v| v.as_str());
+        let model_pub_key_str = params
+            .extra
+            .remove("x_model_pub_key")
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
+        let model_pub_key = model_pub_key_str.as_deref();
 
         tracing::debug!(
             model = %model_id,

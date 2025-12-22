@@ -1052,24 +1052,17 @@ impl ResponseServiceImpl {
             if let Some(tc) = tool_choice {
                 extra.insert("tool_choice".to_string(), serde_json::to_value(tc).unwrap());
             }
+
             // Add encryption headers to extra for passing to completion service
-            if let Some(algo) = &process_context.signing_algo {
-                extra.insert(
-                    "x_signing_algo".to_string(),
-                    serde_json::Value::String(algo.clone()),
-                );
-            }
-            if let Some(pub_key) = &process_context.client_pub_key {
-                extra.insert(
-                    "x_client_pub_key".to_string(),
-                    serde_json::Value::String(pub_key.clone()),
-                );
-            }
-            if let Some(pub_key) = &process_context.model_pub_key {
-                extra.insert(
-                    "x_model_pub_key".to_string(),
-                    serde_json::Value::String(pub_key.clone()),
-                );
+            let encryption_params = [
+                ("x_signing_algo", &process_context.signing_algo),
+                ("x_client_pub_key", &process_context.client_pub_key),
+                ("x_model_pub_key", &process_context.model_pub_key),
+            ];
+            for (key, value) in encryption_params {
+                if let Some(val) = value {
+                    extra.insert(key.to_string(), serde_json::Value::String(val.clone()));
+                }
             }
 
             // Create completion request (names not included - tracked via database analytics)

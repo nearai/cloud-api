@@ -6,10 +6,11 @@ use chrono::{Duration, Utc};
 use database::OAuthStateRepository;
 
 // Helper to get database pool for repository testing
-async fn get_test_pool() -> database::pool::DbPool {
-    let (_server, _inference_provider_pool, _mock_provider, database) =
+// Returns pool and guard - guard must be kept alive for cleanup
+async fn get_test_pool() -> (database::pool::DbPool, common::TestDatabaseGuard) {
+    let (_server, _inference_provider_pool, _mock_provider, database, guard) =
         common::setup_test_server_with_pool().await;
-    database.pool().clone()
+    (database.pool().clone(), guard)
 }
 
 // ============================================
@@ -18,7 +19,7 @@ async fn get_test_pool() -> database::pool::DbPool {
 
 #[tokio::test]
 async fn test_create_and_get_oauth_state() {
-    let pool = get_test_pool().await;
+    let (pool, _guard) = get_test_pool().await;
     let repo = OAuthStateRepository::new(pool.clone());
 
     let state = format!("test-state-{}", uuid::Uuid::new_v4());
@@ -48,7 +49,7 @@ async fn test_create_and_get_oauth_state() {
 
 #[tokio::test]
 async fn test_expired_state_not_returned() {
-    let pool = get_test_pool().await;
+    let (pool, _guard) = get_test_pool().await;
     let repo = OAuthStateRepository::new(pool.clone());
 
     let state = format!("test-state-{}", uuid::Uuid::new_v4());
@@ -74,7 +75,7 @@ async fn test_expired_state_not_returned() {
 
 #[tokio::test]
 async fn test_google_with_pkce_verifier() {
-    let pool = get_test_pool().await;
+    let (pool, _guard) = get_test_pool().await;
     let repo = OAuthStateRepository::new(pool.clone());
 
     let state = format!("test-state-{}", uuid::Uuid::new_v4());
@@ -96,7 +97,7 @@ async fn test_google_with_pkce_verifier() {
 
 #[tokio::test]
 async fn test_state_replay_protection() {
-    let pool = get_test_pool().await;
+    let (pool, _guard) = get_test_pool().await;
     let repo = OAuthStateRepository::new(pool.clone());
 
     let state = format!("test-state-{}", uuid::Uuid::new_v4());

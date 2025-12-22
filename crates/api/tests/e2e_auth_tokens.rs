@@ -8,7 +8,7 @@ use common::*;
 
 #[tokio::test]
 async fn test_create_access_token_from_refresh_token() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let refresh_token = get_session_id();
 
     let response = server
@@ -30,7 +30,7 @@ async fn test_create_access_token_from_refresh_token() {
 
 #[tokio::test]
 async fn test_create_access_token_without_auth() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     let response = server
         .post("/v1/users/me/access-tokens")
@@ -48,7 +48,7 @@ async fn test_create_access_token_without_auth() {
 
 #[tokio::test]
 async fn test_create_access_token_with_invalid_refresh_token() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     let response = server
         .post("/v1/users/me/access-tokens")
@@ -68,7 +68,7 @@ async fn test_create_access_token_with_invalid_refresh_token() {
 #[tokio::test]
 #[ignore] // MockAuthService doesn't distinguish between token types
 async fn test_access_token_cannot_create_new_access_token() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     // First get an access token
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
@@ -92,7 +92,7 @@ async fn test_access_token_cannot_create_new_access_token() {
 #[tokio::test]
 #[ignore] // MockAuthService doesn't distinguish between token types
 async fn test_refresh_token_cannot_access_regular_endpoints() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let refresh_token = get_session_id();
 
     // Try to use refresh token on a regular endpoint (should fail in production)
@@ -112,7 +112,7 @@ async fn test_refresh_token_cannot_access_regular_endpoints() {
 
 #[tokio::test]
 async fn test_list_user_refresh_tokens() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
     let response = server
@@ -143,7 +143,7 @@ async fn test_list_user_refresh_tokens() {
 
 #[tokio::test]
 async fn test_list_refresh_tokens_without_auth() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     let response = server.get("/v1/users/me/refresh-tokens").await;
 
@@ -154,7 +154,7 @@ async fn test_list_refresh_tokens_without_auth() {
 
 #[tokio::test]
 async fn test_revoke_all_tokens() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
     let response = server
@@ -187,7 +187,7 @@ async fn test_revoke_all_tokens() {
 #[tokio::test]
 #[ignore] // MockAuthService doesn't track tokens_revoked_at
 async fn test_revoke_all_tokens_invalidates_access_token() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let refresh_token = get_session_id();
 
     // Create an access token
@@ -225,7 +225,7 @@ async fn test_revoke_all_tokens_invalidates_access_token() {
 #[tokio::test]
 #[ignore] // MockAuthService doesn't track deleted refresh tokens
 async fn test_revoke_all_tokens_prevents_refresh_token_use() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let refresh_token = get_session_id();
 
     // Create an access token first
@@ -256,7 +256,7 @@ async fn test_revoke_all_tokens_prevents_refresh_token_use() {
 
 #[tokio::test]
 async fn test_revoke_all_tokens_without_auth() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     let response = server.delete("/v1/users/me/tokens").await;
 
@@ -267,7 +267,7 @@ async fn test_revoke_all_tokens_without_auth() {
 
 #[tokio::test]
 async fn test_access_token_works_on_regular_endpoints() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
     // Test on user endpoint
@@ -287,7 +287,7 @@ async fn test_access_token_works_on_regular_endpoints() {
 
 #[tokio::test]
 async fn test_access_token_can_create_organization() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
     let create_request = serde_json::json!({
@@ -318,7 +318,7 @@ async fn test_access_token_can_create_organization() {
 #[tokio::test]
 async fn test_create_access_token_success_user_agent_match() {
     // Spin up full test server (with MockAuthService, DB, etc.)
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     // Simulate refresh token for user
     let refresh_token = "rt_mock_refresh_token";
@@ -349,7 +349,7 @@ async fn test_create_access_token_success_user_agent_match() {
 
 #[tokio::test]
 async fn test_create_access_token_success_user_agent_mismatch() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     let refresh_token = "rt_mock_refresh_token";
     let user_agent = "Different User Agent";
@@ -367,7 +367,7 @@ async fn test_create_access_token_success_user_agent_mismatch() {
 #[tokio::test]
 #[ignore] // Requires real database to test token rotation properly
 async fn test_refresh_token_rotation_invalidates_old_token() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let old_refresh_token = get_session_id();
 
     // Create an access token using the old refresh token

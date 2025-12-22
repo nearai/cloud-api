@@ -8,7 +8,7 @@ use common::*;
 
 #[tokio::test]
 async fn test_users_refresh_tokens_missing_authorization_message() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     let response = server.get("/v1/users/me/refresh-tokens").await;
 
@@ -20,7 +20,7 @@ async fn test_users_refresh_tokens_missing_authorization_message() {
 
 #[tokio::test]
 async fn test_users_me_missing_authorization_message() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     let response = server.get("/v1/users/me").await;
 
@@ -32,7 +32,7 @@ async fn test_users_me_missing_authorization_message() {
 
 #[tokio::test]
 async fn test_users_me_wrong_bearer_prefix_message() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     let response = server
         .get("/v1/users/me")
@@ -54,7 +54,7 @@ async fn test_users_me_wrong_bearer_prefix_message() {
 
 #[tokio::test]
 async fn test_list_organizations_missing_authorization_message() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     let response = server.get("/v1/organizations").await;
 
@@ -66,7 +66,7 @@ async fn test_list_organizations_missing_authorization_message() {
 
 #[tokio::test]
 async fn test_organizations_duplicate_name_conflict_message() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     let org_name = format!("test-org-{}", uuid::Uuid::new_v4());
 
@@ -96,7 +96,7 @@ async fn test_organizations_duplicate_name_conflict_message() {
 
 #[tokio::test]
 async fn test_organizations_not_found() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     let random_org_id = uuid::Uuid::new_v4();
 
@@ -117,7 +117,7 @@ async fn test_organizations_not_found() {
 
 #[tokio::test]
 async fn test_org_members_list_missing_authorization_message() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let random_org_id = uuid::Uuid::new_v4();
 
     let response = server
@@ -132,7 +132,7 @@ async fn test_org_members_list_missing_authorization_message() {
 
 #[tokio::test]
 async fn test_org_members_list_not_found_message() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let random_org_id = uuid::Uuid::new_v4();
 
     let response = server
@@ -148,7 +148,7 @@ async fn test_org_members_list_not_found_message() {
 
 #[tokio::test]
 async fn test_org_members_add_bad_request_invalid_user_id_message() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let org = create_org(&server).await;
 
     let response = server
@@ -168,7 +168,7 @@ async fn test_org_members_add_bad_request_invalid_user_id_message() {
 
 #[tokio::test]
 async fn test_org_members_remove_not_found_message() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let org = create_org(&server).await;
 
     let response = server
@@ -195,7 +195,7 @@ async fn test_org_members_remove_not_found_message() {
 
 #[tokio::test]
 async fn test_workspaces_duplicate_name_conflict_message() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let org = create_org(&server).await;
 
     let ws_name = format!("ws-{}", uuid::Uuid::new_v4());
@@ -230,7 +230,7 @@ async fn test_workspaces_duplicate_name_conflict_message() {
 
 #[tokio::test]
 async fn test_workspace_get_not_found_message() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     let random_ws_id = uuid::Uuid::new_v4();
 
@@ -247,7 +247,7 @@ async fn test_workspace_get_not_found_message() {
 
 #[tokio::test]
 async fn test_list_workspace_api_keys_not_found_message() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     let random_ws_id = uuid::Uuid::new_v4();
 
@@ -264,7 +264,7 @@ async fn test_list_workspace_api_keys_not_found_message() {
 
 #[tokio::test]
 async fn test_create_workspace_missing_authorization_message() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let org = create_org(&server).await;
 
     let req = api::routes::workspaces::CreateWorkspaceRequest {
@@ -286,7 +286,7 @@ async fn test_create_workspace_missing_authorization_message() {
 
 #[tokio::test]
 async fn test_list_workspace_api_keys_missing_authorization_message() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let org = create_org(&server).await;
     let workspaces = list_workspaces(&server, org.id.clone()).await;
     let workspace = workspaces.first().unwrap();
@@ -303,7 +303,7 @@ async fn test_list_workspace_api_keys_missing_authorization_message() {
 
 #[tokio::test]
 async fn test_create_api_key_duplicate_name_conflict_message() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     let org = create_org(&server).await;
     let workspaces = list_workspaces(&server, org.id.clone()).await;
     let workspace = workspaces.first().unwrap();
@@ -342,7 +342,7 @@ async fn test_create_api_key_duplicate_name_conflict_message() {
 
 #[tokio::test]
 async fn test_models_missing_auth_header_message() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     let response = server.get("/v1/models").await;
 
@@ -354,7 +354,7 @@ async fn test_models_missing_auth_header_message() {
 
 #[tokio::test]
 async fn test_models_invalid_auth_header_format_message() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     let response = server
         .get("/v1/models")
@@ -369,7 +369,7 @@ async fn test_models_invalid_auth_header_format_message() {
 
 #[tokio::test]
 async fn test_models_invalid_api_key_message() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
 
     let response = server
         .get("/v1/models")

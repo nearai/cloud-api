@@ -61,7 +61,7 @@ impl StopReason {
         }
     }
 
-    /// Parse from OpenAI-compatible finish_reason field
+    /// Parse from OpenAI-compatible finish_reason field (string version)
     pub fn from_finish_reason(reason: &str) -> Self {
         match reason {
             "stop" => StopReason::Stop,
@@ -69,6 +69,16 @@ impl StopReason {
             "content_filter" => StopReason::ContentFilter,
             "tool_calls" | "function_call" => StopReason::ToolCalls,
             other => StopReason::Other(other.to_string()),
+        }
+    }
+
+    /// Convert from inference provider's FinishReason enum
+    pub fn from_provider_finish_reason(reason: &inference_providers::FinishReason) -> Self {
+        match reason {
+            inference_providers::FinishReason::Stop => StopReason::Stop,
+            inference_providers::FinishReason::Length => StopReason::Length,
+            inference_providers::FinishReason::ContentFilter => StopReason::ContentFilter,
+            inference_providers::FinishReason::ToolCalls => StopReason::ToolCalls,
         }
     }
 

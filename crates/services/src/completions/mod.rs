@@ -270,22 +270,11 @@ where
                     } else if !stream_completed {
                         // Client disconnected before stream finished
                         Some(crate::usage::StopReason::ClientDisconnect)
-                    } else if let Some(finish_reason) = last_finish_reason {
+                    } else if let Some(ref finish_reason) = last_finish_reason {
                         // Map provider's finish_reason to our StopReason
-                        Some(match finish_reason {
-                            inference_providers::FinishReason::Stop => {
-                                crate::usage::StopReason::Completed
-                            }
-                            inference_providers::FinishReason::Length => {
-                                crate::usage::StopReason::Length
-                            }
-                            inference_providers::FinishReason::ContentFilter => {
-                                crate::usage::StopReason::ContentFilter
-                            }
-                            inference_providers::FinishReason::ToolCalls => {
-                                crate::usage::StopReason::ToolCalls
-                            }
-                        })
+                        Some(crate::usage::StopReason::from_provider_finish_reason(
+                            finish_reason,
+                        ))
                     } else {
                         // Stream completed but no finish_reason - treat as completed
                         Some(crate::usage::StopReason::Completed)

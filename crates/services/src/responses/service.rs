@@ -906,6 +906,8 @@ impl ResponseServiceImpl {
             context.conversation_service.clone(),
             context.completion_service.clone(),
             emitter.tx.clone(),
+            context.signing_algo.clone(),
+            context.client_pub_key.clone(),
         );
 
         let tools = Self::prepare_tools(&context.request);
@@ -2389,7 +2391,14 @@ DO NOT USE THESE FORMATS:
         conversation_service: Arc<dyn ConversationServiceTrait>,
         completion_service: Arc<dyn CompletionServiceTrait>,
         tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
+        signing_algo: Option<String>,
+        client_pub_key: Option<String>,
     ) -> Option<tokio::task::JoinHandle<Result<(), errors::ResponseError>>> {
+        // Skip title generation if request is encrypted (both headers are set)
+        if signing_algo.is_some() && client_pub_key.is_some() {
+            return None;
+        }
+
         // Only proceed if we have a conversation_id
         let conv_id = conversation_id?;
 

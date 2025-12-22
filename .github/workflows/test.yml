@@ -97,6 +97,17 @@ jobs:
         RUST_LOG: debug
         DEV: "true"
 
+    - name: Cleanup orphaned test databases
+      if: always()
+      continue-on-error: true
+      run: cargo test --test cleanup_test_databases -- --ignored --nocapture
+      env:
+        DATABASE_HOST: localhost
+        DATABASE_PORT: 5432
+        DATABASE_USERNAME: postgres
+        DATABASE_PASSWORD: postgres
+        TEST_TEMPLATE_DATABASE_NAME: platform_api_test_template
+
     - name: Run vLLM integration tests
       run: cargo test --test integration_tests -- --nocapture
       env:

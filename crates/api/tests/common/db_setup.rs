@@ -263,7 +263,6 @@ pub async fn create_test_database_from_template(
     let sanitized_id = test_id.replace('-', "_");
     let test_db_name = format!("test_{sanitized_id}");
 
-    // Validate the generated database name for safety
     validate_db_identifier(&test_db_name)
         .map_err(|e| format!("Invalid test database name: {}", e))?;
 
@@ -313,10 +312,8 @@ pub async fn drop_test_database(
     config: &config::DatabaseConfig,
     db_name: &str,
 ) -> Result<(), String> {
-    // Validate database name to prevent injection
     validate_db_identifier(db_name).map_err(|e| format!("Invalid database name: {}", e))?;
 
-    // Ensure it's a test database (safety check)
     if !db_name.starts_with("test_") {
         return Err(format!(
             "Safety check: Can only drop databases starting with 'test_'. Got: {}",
@@ -356,7 +353,6 @@ pub async fn drop_all_test_databases(config: &config::DatabaseConfig) -> Result<
 
     let client = connect_to_admin_db(config).await?;
 
-    // Find all databases starting with 'test_'
     let rows = client
         .query(
             "SELECT datname FROM pg_database WHERE datname LIKE 'test_%'",
@@ -369,19 +365,17 @@ pub async fn drop_all_test_databases(config: &config::DatabaseConfig) -> Result<
     for row in rows {
         let db_name: String = row.get(0);
 
-        // Skip the template database
         if db_name == get_template_db_name() {
             debug!("Skipping template database '{}'", db_name);
             continue;
         }
 
-        // Validate database name (defensive check - should be valid from pg_database)
+        // Defensive check - should be valid from pg_database
         if let Err(e) = validate_db_identifier(&db_name) {
             warn!("Skipping database with invalid name: {} ({})", db_name, e);
             continue;
         }
 
-        // Terminate connections
         let _ = client
             .execute(
                 &format!(
@@ -392,7 +386,6 @@ pub async fn drop_all_test_databases(config: &config::DatabaseConfig) -> Result<
             )
             .await;
 
-        // Drop the database
         match client
             .execute(&format!("DROP DATABASE IF EXISTS {db_name}"), &[])
             .await

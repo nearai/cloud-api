@@ -1,13 +1,10 @@
-// Utility test to clean up orphaned test databases
-// Run with: cargo test --test cleanup_test_databases -- --nocapture
+// Utility to clean up orphaned test databases.
+// Run with: cargo test --test cleanup_test_databases -- --ignored --nocapture
 
 mod common;
 
-/// Clean up ALL test databases (databases starting with 'test_')
-/// This is useful for cleaning up orphaned databases from previous test runs.
-///
-/// Run with: cargo test --test cleanup_test_databases -- --nocapture
 #[tokio::test]
+#[ignore] // Don't run during normal test suite to avoid interfering with parallel tests
 async fn cleanup_all_test_databases() {
     let _ = tracing_subscriber::fmt()
         .with_test_writer()

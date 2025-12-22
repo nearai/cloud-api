@@ -799,9 +799,17 @@ impl InferenceProviderPool {
         debug!("Cleared {} signature hash entries", sig_count);
         drop(sig_hashes);
 
+        // Step 6: Clear model public key mappings
+        debug!("Step 6: Clearing model public key mappings");
+        let mut model_pub_key_mapping = self.model_pub_key_mapping.write().await;
+        let model_pub_key_count = model_pub_key_mapping.len();
+        model_pub_key_mapping.clear();
+        debug!("Cleared {} model public key mappings", model_pub_key_count);
+        drop(model_pub_key_mapping);
+
         info!(
-            "Inference provider pool shutdown completed. Cleaned up: {} models, {} load balancer indices, {} chat mappings, {} signatures",
-            model_count, index_count, chat_count, sig_count
+            "Inference provider pool shutdown completed. Cleaned up: {} models, {} load balancer indices, {} chat mappings, {} signatures, {} model public key mappings",
+            model_count, index_count, chat_count, sig_count, model_pub_key_count
         );
     }
 }

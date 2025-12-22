@@ -648,7 +648,6 @@ impl InferenceProviderPool {
 
         tracing::debug!(
             model = %model_id,
-            model_pub_key = ?model_pub_key,
             "Starting chat completion stream request"
         );
 
@@ -699,7 +698,6 @@ impl InferenceProviderPool {
 
         tracing::debug!(
             model = %model_id,
-            model_pub_key = ?model_pub_key,
             "Starting chat completion request"
         );
 

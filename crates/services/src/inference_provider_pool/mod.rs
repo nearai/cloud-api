@@ -254,11 +254,8 @@ impl InferenceProviderPool {
                             .get("signing_public_key")
                             .and_then(|v| v.as_str())
                         {
-                            self.register_provider_by_model_pub_key(
-                                signing_public_key.to_string(),
-                                provider.clone(),
-                            )
-                            .await;
+                            model_pub_key_mapping
+                                .insert(signing_public_key.to_string(), provider.clone());
                         }
                         providers_for_model.push(provider);
                     }
@@ -341,21 +338,6 @@ impl InferenceProviderPool {
     pub async fn get_signature_hashes_for_chat(&self, chat_id: &str) -> Option<(String, String)> {
         let hashes = self.signature_hashes.read().await;
         hashes.get(chat_id).cloned()
-    }
-
-    /// Register a provider for a model by its signing public key
-    /// This allows routing requests to specific model providers based on X-Model-Pub-Key header
-    pub async fn register_provider_by_model_pub_key(
-        &self,
-        model_pub_key: String,
-        provider: Arc<InferenceProviderTrait>,
-    ) {
-        let mut mapping = self.model_pub_key_mapping.write().await;
-        mapping.insert(model_pub_key.clone(), provider);
-        tracing::debug!(
-            "Registered provider for model public key: {}",
-            model_pub_key
-        );
     }
 
     /// Lookup provider by model signing public key

@@ -470,7 +470,8 @@ impl ports::AttestationServiceTrait for AttestationService {
         signing_address: Option<String>,
     ) -> Result<AttestationReport, AttestationError> {
         // Resolve model name (could be an alias) and get model details
-        let mut model_attestations = vec![];
+        let mut model_attestations = Vec::new();
+        let mut router_attestation = None;
         // Create a nonce if none was provided
         let nonce = match nonce {
             Some(n) => n,
@@ -539,7 +540,7 @@ impl ports::AttestationServiceTrait for AttestationService {
                 );
             }
 
-            model_attestations = self
+            let mut provider_attestation = self
                 .inference_provider_pool
                 .get_attestation_report(
                     canonical_name.clone(),
@@ -549,6 +550,20 @@ impl ports::AttestationServiceTrait for AttestationService {
                 )
                 .await
                 .map_err(|e| AttestationError::ProviderError(e.to_string()))?;
+
+            // Extract model attestations from "all_attestations" field if present
+            if let Some(all_attestations_value) = provider_attestation.remove("all_attestations") {
+                if let Some(all_attestations_array) = all_attestations_value.as_array() {
+                    for attestation in all_attestations_array {
+                        if let Some(obj) = attestation.as_object() {
+                            model_attestations.push(obj.clone());
+                        }
+                    }
+                }
+            }
+
+            // The remaining provider_attestation is the router attestation
+            router_attestation = Some(provider_attestation);
         }
 
         // Use VPC info loaded at initialization
@@ -642,6 +657,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         Ok(AttestationReport {
             gateway_attestation,
             model_attestations,
+            router_attestation,
         })
     }
 

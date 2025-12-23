@@ -91,6 +91,7 @@ impl DstackCpuQuote {
 pub struct AttestationReport {
     pub gateway_attestation: DstackCpuQuote,
     pub model_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
+    pub router_attestation: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 pub type DstackAppInfo = dstack_sdk::dstack_client::InfoResponse;

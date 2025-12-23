@@ -15,6 +15,12 @@ impl From<Uuid> for ResponseId {
     }
 }
 
+impl ResponseId {
+    pub fn as_uuid(&self) -> &Uuid {
+        &self.0
+    }
+}
+
 impl std::fmt::Display for ResponseId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "resp_{}", self.0)

@@ -36,24 +36,43 @@ async fn get_assistant_item_from_db(
     None
 }
 
+/// Usage record with all relevant fields for testing
+#[derive(Debug)]
+struct UsageRecord {
+    input_tokens: i32,
+    output_tokens: i32,
+    stop_reason: Option<String>,
+    response_id: Option<uuid::Uuid>,
+    provider_request_id: Option<String>,
+    inference_id: Option<uuid::Uuid>,
+}
+
 /// Get usage records for an organization
 async fn get_usage_records_from_db(
     database: &database::Database,
     organization_id: uuid::Uuid,
-) -> Vec<(i32, i32)> {
+) -> Vec<UsageRecord> {
     let pool = database.pool();
     let client = pool.get().await.expect("Failed to get database connection");
 
     let rows = client
         .query(
-            "SELECT input_tokens, output_tokens FROM organization_usage_log WHERE organization_id = $1 ORDER BY created_at DESC",
+            "SELECT input_tokens, output_tokens, stop_reason, response_id, provider_request_id, inference_id
+             FROM organization_usage_log WHERE organization_id = $1 ORDER BY created_at DESC",
             &[&organization_id],
         )
         .await
         .expect("Failed to query usage");
 
     rows.into_iter()
-        .map(|row| (row.get("input_tokens"), row.get("output_tokens")))
+        .map(|row| UsageRecord {
+            input_tokens: row.get("input_tokens"),
+            output_tokens: row.get("output_tokens"),
+            stop_reason: row.get("stop_reason"),
+            response_id: row.get("response_id"),
+            provider_request_id: row.get("provider_request_id"),
+            inference_id: row.get("inference_id"),
+        })
         .collect()
 }
 
@@ -137,10 +156,44 @@ async fn test_response_items_saved_on_disconnect() {
     // Find the main request's usage (127 input tokens from system prompt + user msg, 5 output tokens)
     let main_request_usage = usage
         .iter()
-        .find(|(input, output)| *input == 127 && *output == 5);
+        .find(|r| r.input_tokens == 127 && r.output_tokens == 5);
     assert!(
         main_request_usage.is_some(),
         "Should have usage record with 127 input tokens and 5 output tokens. Found: {:?}",
         usage
+    );
+
+    let main_usage = main_request_usage.unwrap();
+
+    // Note: The mock's with_disconnect_after() truncates the stream but it still ends normally
+    // (returns None), so from our perspective it's a "completed" stream. A true client disconnect
+    // would occur if the client dropped the connection before consuming all chunks, which would
+    // cause stream_completed to remain false when Drop is called.
+    assert_eq!(
+        main_usage.stop_reason.as_deref(),
+        Some("completed"),
+        "Stop reason should be 'completed' for stream that ended normally. Found: {:?}",
+        main_usage.stop_reason
+    );
+
+    // Verify response_id is set (this was called from Responses API)
+    assert!(
+        main_usage.response_id.is_some(),
+        "Response ID should be set for Responses API calls. Found: {:?}",
+        main_usage
+    );
+
+    // Verify provider_request_id is set (raw ID from provider)
+    assert!(
+        main_usage.provider_request_id.is_some(),
+        "Provider request ID should be set. Found: {:?}",
+        main_usage
+    );
+
+    // Verify inference_id is set (hashed from provider_request_id)
+    assert!(
+        main_usage.inference_id.is_some(),
+        "Inference ID should be set. Found: {:?}",
+        main_usage
     );
 }

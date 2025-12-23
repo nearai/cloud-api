@@ -25,6 +25,9 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             ttft_ms: request.ttft_ms,
             avg_itl_ms: request.avg_itl_ms,
             inference_id: request.inference_id,
+            provider_request_id: request.provider_request_id,
+            stop_reason: request.stop_reason,
+            response_id: request.response_id,
         };
 
         let log = self.record_usage(db_request).await?;
@@ -47,6 +50,9 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             ttft_ms: log.ttft_ms,
             avg_itl_ms: log.avg_itl_ms,
             inference_id: log.inference_id,
+            provider_request_id: log.provider_request_id,
+            stop_reason: log.stop_reason,
+            response_id: log.response_id,
         })
     }
 
@@ -98,6 +104,9 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 ttft_ms: log.ttft_ms,
                 avg_itl_ms: log.avg_itl_ms,
                 inference_id: log.inference_id,
+                provider_request_id: log.provider_request_id,
+                stop_reason: log.stop_reason,
+                response_id: log.response_id,
             })
             .collect();
 
@@ -136,6 +145,9 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 ttft_ms: log.ttft_ms,
                 avg_itl_ms: log.avg_itl_ms,
                 inference_id: log.inference_id,
+                provider_request_id: log.provider_request_id,
+                stop_reason: log.stop_reason,
+                response_id: log.response_id,
             })
             .collect();
 

@@ -62,7 +62,7 @@ async fn get_model_public_key(
 #[tokio::test]
 #[ignore] // Skip by default - requires vllm-proxy with encryption support
 async fn test_chat_completions_with_ecdsa_encryption_headers() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -115,7 +115,7 @@ async fn test_chat_completions_with_ecdsa_encryption_headers() {
 #[tokio::test]
 #[ignore] // Skip by default - requires vllm-proxy with encryption support
 async fn test_chat_completions_with_ed25519_encryption_headers() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -168,7 +168,7 @@ async fn test_chat_completions_with_ed25519_encryption_headers() {
 #[tokio::test]
 #[ignore] // Skip by default - requires vllm-proxy with encryption support
 async fn test_streaming_chat_completions_with_encryption_headers() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -224,7 +224,7 @@ async fn test_streaming_chat_completions_with_encryption_headers() {
             if data.trim() == "[DONE]" {
                 break;
             }
-            if let Ok(StreamChunk::Chat(_)) = serde_json::from_str::<StreamChunk>(data) {
+            if let Ok(StreamChunk::Chat(_)) = serde_json::from_str::<StreamChunk>(data.trim()) {
                 found_chunk = true;
                 break;
             }
@@ -239,7 +239,7 @@ async fn test_streaming_chat_completions_with_encryption_headers() {
 /// Test that requests without encryption headers still work (backward compatibility)
 #[tokio::test]
 async fn test_chat_completions_without_encryption_headers() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -281,7 +281,7 @@ async fn test_chat_completions_without_encryption_headers() {
 #[tokio::test]
 #[ignore] // Skip by default - requires vllm-proxy with encryption support
 async fn test_chat_completions_with_partial_encryption_headers() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -343,7 +343,7 @@ async fn test_chat_completions_with_partial_encryption_headers() {
 #[tokio::test]
 #[ignore] // Skip by default - requires vllm-proxy with encryption support
 async fn test_chat_completions_with_case_insensitive_encryption_headers() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -390,7 +390,7 @@ async fn test_chat_completions_with_case_insensitive_encryption_headers() {
 #[tokio::test]
 #[ignore] // Skip by default - requires vllm-proxy with encryption support
 async fn test_chat_completions_with_invalid_encryption_algorithm() {
-    let server = setup_test_server().await;
+    let (server, _guard) = setup_test_server().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;

@@ -185,6 +185,9 @@ impl InferenceProviderPool {
         let mut model_mapping = self.model_mapping.write().await;
         model_mapping.clear();
 
+        let mut model_pub_key_mapping = self.model_pub_key_mapping.write().await;
+        model_pub_key_mapping.clear();
+
         // Group by model name
         let mut model_to_endpoints: HashMap<String, Vec<(String, u16)>> = HashMap::new();
 

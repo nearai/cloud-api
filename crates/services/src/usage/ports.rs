@@ -1,3 +1,4 @@
+use crate::responses::models::ResponseId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -274,7 +275,7 @@ pub struct RecordUsageServiceRequest {
     /// Why the inference stream ended
     pub stop_reason: Option<StopReason>,
     /// Response ID for Response API calls (FK to responses table)
-    pub response_id: Option<Uuid>,
+    pub response_id: Option<ResponseId>,
 }
 
 /// Request to record usage (database layer)
@@ -303,7 +304,7 @@ pub struct RecordUsageDbRequest {
     /// Why the inference stream ended
     pub stop_reason: Option<StopReason>,
     /// Response ID for Response API calls (FK to responses table)
-    pub response_id: Option<Uuid>,
+    pub response_id: Option<ResponseId>,
 }
 
 /// Model pricing information
@@ -391,7 +392,7 @@ pub struct UsageLogEntry {
     /// Why the inference stream ended
     pub stop_reason: Option<StopReason>,
     /// Response ID for Response API calls (FK to responses table)
-    pub response_id: Option<Uuid>,
+    pub response_id: Option<ResponseId>,
 }
 
 // ============================================

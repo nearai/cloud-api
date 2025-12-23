@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use services::responses::models::ResponseId;
 use uuid::Uuid;
 
 /// Organization model - top level entity
@@ -558,7 +559,7 @@ pub struct OrganizationUsageLog {
     /// Why the inference stream ended
     pub stop_reason: Option<StopReason>,
     /// Response ID for Response API calls (FK to responses table)
-    pub response_id: Option<Uuid>,
+    pub response_id: Option<ResponseId>,
 }
 
 /// Organization balance summary - cached aggregate spending
@@ -599,7 +600,7 @@ pub struct RecordUsageRequest {
     /// Why the inference stream ended
     pub stop_reason: Option<StopReason>,
     /// Response ID for Response API calls (FK to responses table)
-    pub response_id: Option<Uuid>,
+    pub response_id: Option<ResponseId>,
 }
 
 // ============================================

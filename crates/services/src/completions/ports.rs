@@ -1,3 +1,4 @@
+use crate::responses::models::ResponseId;
 use crate::UserId;
 use async_trait::async_trait;
 use inference_providers::StreamingResult;
@@ -60,7 +61,7 @@ pub struct CompletionRequest {
     pub metadata: Option<serde_json::Value>,
     pub body_hash: String,
     /// Response ID when called from Responses API (for usage tracking FK)
-    pub response_id: Option<Uuid>,
+    pub response_id: Option<ResponseId>,
 
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }

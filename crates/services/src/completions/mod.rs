@@ -3,6 +3,7 @@ pub mod ports;
 use crate::attestation::ports::AttestationServiceTrait;
 use crate::inference_provider_pool::InferenceProviderPool;
 use crate::models::ModelsRepository;
+use crate::responses::models::ResponseId;
 use crate::usage::{RecordUsageServiceRequest, UsageServiceTrait};
 use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, StreamingResult};
 use moka::future::Cache;
@@ -78,7 +79,7 @@ where
     /// If false when Drop is called, the client disconnected mid-stream
     stream_completed: bool,
     /// Response ID when called from Responses API (for usage tracking FK)
-    response_id: Option<Uuid>,
+    response_id: Option<ResponseId>,
     /// Last finish_reason from provider (e.g., "stop", "length", "tool_calls")
     last_finish_reason: Option<inference_providers::FinishReason>,
     /// Last error from provider (for determining stop_reason)
@@ -240,7 +241,7 @@ where
         let last_error = self.last_error.clone();
 
         // Capture response_id for usage tracking (when called from Responses API)
-        let response_id = self.response_id;
+        let response_id = self.response_id.clone();
 
         // Capture all values needed for async tasks
         let usage_service = self.usage_service.clone();
@@ -525,7 +526,7 @@ impl CompletionServiceImpl {
         service_start_time: Instant,
         provider_start_time: Instant,
         concurrent_counter: Option<Arc<AtomicU32>>,
-        response_id: Option<Uuid>,
+        response_id: Option<ResponseId>,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
         let metric_tags = Self::create_metric_tags(&model_name);

@@ -1056,7 +1056,7 @@ impl ResponseServiceImpl {
                 workspace_id: process_context.workspace_id,
                 metadata: process_context.request.metadata.clone(),
                 body_hash: process_context.body_hash.to_string(),
-                response_id: Some(ctx.response_id.0),
+                response_id: Some(ctx.response_id.clone()),
                 n: None,
                 extra,
             };

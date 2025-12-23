@@ -5,6 +5,7 @@ use crate::retry_db;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use services::common::RepositoryError;
+use services::responses::models::ResponseId;
 use std::collections::HashMap;
 use tokio_postgres::Row;
 use uuid::Uuid;
@@ -64,6 +65,7 @@ impl OrganizationUsageRepository {
 
             // Insert usage log entry (model_name is denormalized for performance)
             let stop_reason_str = request.stop_reason.as_ref().map(|r| r.as_str());
+            let response_id_uuid = request.response_id.as_ref().map(|r| r.as_uuid());
             let row = transaction
                 .query_one(
                     r#"
@@ -96,7 +98,7 @@ impl OrganizationUsageRepository {
                         &request.inference_id,
                         &request.provider_request_id,
                         &stop_reason_str,
-                        &request.response_id,
+                        &response_id_uuid,
                     ],
                 )
                 .await
@@ -346,6 +348,10 @@ impl OrganizationUsageRepository {
         let stop_reason_str: Option<String> = row.get("stop_reason");
         let stop_reason = stop_reason_str.as_deref().map(StopReason::parse);
 
+        // Convert response_id from UUID to ResponseId
+        let response_id_uuid: Option<Uuid> = row.get("response_id");
+        let response_id = response_id_uuid.map(ResponseId::from);
+
         Ok(OrganizationUsageLog {
             id: row.get("id"),
             organization_id: row.get("organization_id"),
@@ -366,7 +372,7 @@ impl OrganizationUsageRepository {
             inference_id: row.get("inference_id"),
             provider_request_id: row.get("provider_request_id"),
             stop_reason,
-            response_id: row.get("response_id"),
+            response_id,
         })
     }
 

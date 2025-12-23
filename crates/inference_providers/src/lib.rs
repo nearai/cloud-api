@@ -71,7 +71,8 @@ pub use models::{
     ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionResponseWithBytes, ChatDelta, ChatMessage, ChatResponseMessage, ChatSignature,
     CompletionError, CompletionParams, FinishReason, FunctionChoice, FunctionDefinition,
-    MessageRole, ModelInfo, StreamChunk, StreamOptions, TokenUsage, ToolChoice, ToolDefinition,
+    MessageRole, ModelInfo, StreamChunk, StreamOptions, TokenUsage, TokenizeChatRequest,
+    TokenizeError, TokenizeResponse, ToolChoice, ToolDefinition,
 };
 pub use sse_parser::SSEEvent;
 pub use vllm::{VLlmConfig, VLlmProvider};
@@ -145,4 +146,13 @@ pub trait InferenceProvider {
         nonce: Option<String>,
         signing_address: Option<String>,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError>;
+
+    /// Tokenize chat messages and return the token count
+    ///
+    /// Used for context-aware routing to determine if a request fits within
+    /// a provider's max context length.
+    async fn tokenize_chat(
+        &self,
+        request: TokenizeChatRequest,
+    ) -> Result<TokenizeResponse, TokenizeError>;
 }

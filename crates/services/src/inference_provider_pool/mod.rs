@@ -70,18 +70,51 @@ impl InferenceProviderPool {
 
     /// Register a provider for a model manually (useful for testing with mock providers)
     /// Also populates model_pub_key_mapping by fetching the attestation report
+    /// Fetches attestation reports for both ECDSA and Ed25519 to support both signing algorithms
     pub async fn register_provider(&self, model_id: String, provider: Arc<InferenceProviderTrait>) {
-        // Fetch attestation report to populate model_pub_key_mapping
+        // Fetch attestation reports for both signing algorithms to populate model_pub_key_mapping
         // Use "mock" as URL identifier for logging (since this is typically used for mock providers)
-        if let Some(attestation_report) =
-            Self::fetch_attestation_report_with_retry(&provider, &model_id, "mock").await
+        let mut pub_key_updates: Vec<(String, Arc<InferenceProviderTrait>)> = Vec::new();
+
+        // Fetch for ECDSA
+        if let Some(attestation_report) = Self::fetch_attestation_report_with_retry_for_algo(
+            &provider,
+            &model_id,
+            "mock",
+            Some("ecdsa"),
+        )
+        .await
         {
             if let Some(signing_public_key) = attestation_report
                 .get("signing_public_key")
                 .and_then(|v| v.as_str())
             {
-                let mut model_pub_key_mapping = self.model_pub_key_mapping.write().await;
-                model_pub_key_mapping.insert(signing_public_key.to_string(), provider.clone());
+                pub_key_updates.push((signing_public_key.to_string(), provider.clone()));
+            }
+        }
+
+        // Fetch for Ed25519
+        if let Some(attestation_report) = Self::fetch_attestation_report_with_retry_for_algo(
+            &provider,
+            &model_id,
+            "mock",
+            Some("ed25519"),
+        )
+        .await
+        {
+            if let Some(signing_public_key) = attestation_report
+                .get("signing_public_key")
+                .and_then(|v| v.as_str())
+            {
+                pub_key_updates.push((signing_public_key.to_string(), provider.clone()));
+            }
+        }
+
+        // Update model_pub_key_mapping
+        {
+            let mut model_pub_key_mapping = self.model_pub_key_mapping.write().await;
+            for (key, provider) in pub_key_updates {
+                model_pub_key_mapping.insert(key, provider);
             }
         }
 
@@ -94,16 +127,41 @@ impl InferenceProviderPool {
 
     /// Register multiple providers for multiple models (useful for testing)
     /// Also populates model_pub_key_mapping by fetching attestation reports
+    /// Fetches attestation reports for both ECDSA and Ed25519 to support both signing algorithms
     pub async fn register_providers(&self, providers: Vec<(String, Arc<InferenceProviderTrait>)>) {
         // Phase 1: Collect attestation reports and public keys (no locks held)
         let mut pub_key_updates: Vec<(String, Arc<InferenceProviderTrait>)> = Vec::new();
         let mut model_providers: HashMap<String, Vec<Arc<InferenceProviderTrait>>> = HashMap::new();
 
         for (model_id, provider) in providers {
-            // Fetch attestation report to populate model_pub_key_mapping
+            // Fetch attestation reports for both signing algorithms to populate model_pub_key_mapping
             // Use "mock" as URL identifier for logging (since this is typically used for mock providers)
-            if let Some(attestation_report) =
-                Self::fetch_attestation_report_with_retry(&provider, &model_id, "mock").await
+
+            // Fetch for ECDSA
+            if let Some(attestation_report) = Self::fetch_attestation_report_with_retry_for_algo(
+                &provider,
+                &model_id,
+                "mock",
+                Some("ecdsa"),
+            )
+            .await
+            {
+                if let Some(signing_public_key) = attestation_report
+                    .get("signing_public_key")
+                    .and_then(|v| v.as_str())
+                {
+                    pub_key_updates.push((signing_public_key.to_string(), provider.clone()));
+                }
+            }
+
+            // Fetch for Ed25519
+            if let Some(attestation_report) = Self::fetch_attestation_report_with_retry_for_algo(
+                &provider,
+                &model_id,
+                "mock",
+                Some("ed25519"),
+            )
+            .await
             {
                 if let Some(signing_public_key) = attestation_report
                     .get("signing_public_key")
@@ -226,12 +284,40 @@ impl InferenceProviderPool {
         model_name: &str,
         url: &str,
     ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        Self::fetch_attestation_report_with_retry_for_algo(provider, model_name, url, None).await
+    }
+
+    /// Fetch attestation report with retries for a specific signing algorithm
+    ///
+    /// Retries up to 3 times with exponential backoff (100ms, 200ms, 400ms).
+    /// This prevents providers from being excluded from the pool due to transient network issues.
+    ///
+    /// # Arguments
+    /// * `provider` - The inference provider to fetch the attestation report from
+    /// * `model_name` - The model name to request attestation for
+    /// * `url` - Optional URL for logging purposes (can be empty string if not available)
+    /// * `signing_algo` - Optional signing algorithm ("ecdsa" or "ed25519")
+    ///
+    /// # Returns
+    /// * `Some(attestation_report)` if successful after retries
+    /// * `None` if all retry attempts failed
+    async fn fetch_attestation_report_with_retry_for_algo(
+        provider: &Arc<InferenceProviderTrait>,
+        model_name: &str,
+        url: &str,
+        signing_algo: Option<&str>,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
         const MAX_ATTEMPTS: u32 = 3;
         const INITIAL_DELAY_MS: u64 = 100;
 
         for attempt in 0..MAX_ATTEMPTS {
             match provider
-                .get_attestation_report(model_name.to_string(), None, None, None)
+                .get_attestation_report(
+                    model_name.to_string(),
+                    signing_algo.map(|s| s.to_string()),
+                    None,
+                    None,
+                )
                 .await
             {
                 Ok(report) => {

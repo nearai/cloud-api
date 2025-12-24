@@ -73,15 +73,18 @@ impl VLlmProvider {
         Ok(headers)
     }
 
-    /// NOTE: `x_model_pub_key` (used to build the `X-Model-Pub-Key` header) is intentionally
-    /// not forwarded to vllm-proxy. It is consumed by the cloud API layer for provider routing and
-    /// is not needed to send to the downstream vllm-proxy, so it is stripped from `extra`
-    /// without being added as an HTTP header.
+    /// Prepare encryption headers by extracting them from `extra` and forwarding as HTTP headers.
+    /// Also removes encryption-related keys from `extra` to prevent them from leaking into the JSON body.
+    ///
+    /// NOTE: `x_model_pub_key` is intentionally not forwarded to vllm-proxy. It is consumed by the
+    /// cloud API layer for provider routing and is not needed by the downstream vllm-proxy, so it
+    /// is stripped from `extra` without being added as an HTTP header.
     fn prepare_encryption_headers(
         &self,
         headers: &mut reqwest::header::HeaderMap,
         extra: &mut std::collections::HashMap<String, serde_json::Value>,
     ) {
+        // Extract and forward x_signing_algo as HTTP header, then remove from extra
         if let Some(algo) = extra
             .remove(encryption_headers::SIGNING_ALGO)
             .as_ref()
@@ -91,6 +94,8 @@ impl VLlmProvider {
                 headers.insert("X-Signing-Algo", value);
             }
         }
+
+        // Extract and forward x_client_pub_key as HTTP header, then remove from extra
         if let Some(pub_key) = extra
             .remove(encryption_headers::CLIENT_PUB_KEY)
             .as_ref()
@@ -100,6 +105,9 @@ impl VLlmProvider {
                 headers.insert("X-Client-Pub-Key", value);
             }
         }
+
+        // Remove x_model_pub_key from extra (not forwarded to vllm-proxy, used only for routing)
+        extra.remove(encryption_headers::MODEL_PUB_KEY);
     }
 }
 

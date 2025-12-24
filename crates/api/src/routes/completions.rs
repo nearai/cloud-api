@@ -225,8 +225,12 @@ pub async fn chat_completions(
                 // Convert to raw bytes stream with proper SSE formatting
                 let pool_clone = inference_provider_pool.clone();
                 let req_hash_clone = request_hash.clone();
+
+                #[allow(unused, reason = "Maybe needed in mock signature logic")]
                 let pool_clone2 = pool_clone.clone();
+                #[allow(unused, reason = "Maybe needed in mock signature logic")]
                 let req_hash_clone2 = req_hash_clone.clone();
+
                 let byte_stream = peekable_stream
                     .then(move |result| {
                         let accumulated_inner = accumulated_clone.clone();
@@ -289,6 +293,8 @@ pub async fn chat_completions(
 
                         // Compute response hash from accumulated bytes
                         let bytes_accumulated = accumulated_bytes.lock().await.clone();
+
+                        #[allow(unused, reason = "Maybe needed in mock signature logic")]
                         let response_hash = {
                             use sha2::{Digest, Sha256};
                             let mut hasher = Sha256::new();
@@ -296,17 +302,19 @@ pub async fn chat_completions(
                             format!("{:x}", hasher.finalize())
                         };
 
+                        // TODO: This will cause mock signature in production with `stream` mode
+                        // TODO: Not sure whether to keep this
                         // Update response hash in InferenceProviderPool
                         // InterceptStream::Drop will read this and store to database
-                        if let Some(chat_id) = chat_id_state.lock().await.clone() {
-                            pool_clone2
-                                .register_signature_hashes_for_chat(
-                                    &chat_id,
-                                    req_hash_clone2.clone(),
-                                    response_hash,
-                                )
-                                .await;
-                        }
+                        // if let Some(chat_id) = chat_id_state.lock().await.clone() {
+                        //     pool_clone2
+                        //         .register_signature_hashes_for_chat(
+                        //             &chat_id,
+                        //             req_hash_clone2.clone(),
+                        //             response_hash,
+                        //         )
+                        //         .await;
+                        // }
 
                         Ok::<Bytes, Infallible>(done_bytes)
                     }));

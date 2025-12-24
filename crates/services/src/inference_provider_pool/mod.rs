@@ -161,6 +161,73 @@ impl InferenceProviderPool {
         Some((ip.to_string(), port))
     }
 
+    /// Fetch attestation report with retries to handle transient network failures
+    ///
+    /// Retries up to 3 times with exponential backoff (100ms, 200ms, 400ms).
+    /// This prevents providers from being excluded from the pool due to transient network issues.
+    ///
+    /// # Arguments
+    /// * `provider` - The inference provider to fetch the attestation report from
+    /// * `model_name` - The model name to request attestation for
+    /// * `url` - Optional URL for logging purposes (can be empty string if not available)
+    ///
+    /// # Returns
+    /// * `Some(attestation_report)` if successful after retries
+    /// * `None` if all retry attempts failed
+    async fn fetch_attestation_report_with_retry(
+        provider: &Arc<InferenceProviderTrait>,
+        model_name: &str,
+        url: &str,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        const MAX_ATTEMPTS: u32 = 3;
+        const INITIAL_DELAY_MS: u64 = 100;
+
+        for attempt in 0..MAX_ATTEMPTS {
+            match provider
+                .get_attestation_report(model_name.to_string(), None, None, None)
+                .await
+            {
+                Ok(report) => {
+                    if attempt > 0 {
+                        tracing::debug!(
+                            model = %model_name,
+                            url = %url,
+                            attempt = attempt + 1,
+                            "Successfully fetched attestation report after retry"
+                        );
+                    }
+                    return Some(report);
+                }
+                Err(e) => {
+                    if attempt < MAX_ATTEMPTS - 1 {
+                        // Exponential backoff: 100ms, 200ms, 400ms
+                        let delay_ms = INITIAL_DELAY_MS * (1 << attempt);
+                        tracing::debug!(
+                            model = %model_name,
+                            url = %url,
+                            attempt = attempt + 1,
+                            max_attempts = MAX_ATTEMPTS,
+                            delay_ms = delay_ms,
+                            error = %e,
+                            "Failed to fetch attestation report, retrying..."
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    } else {
+                        tracing::warn!(
+                            model = %model_name,
+                            url = %url,
+                            attempts = MAX_ATTEMPTS,
+                            error = %e,
+                            "Provider failed to return attestation report after retries, excluding from pool"
+                        );
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
     /// Ensure models are discovered before using them
     async fn ensure_models_discovered(&self) -> Result<(), CompletionError> {
         let model_mapping = self.model_mapping.read().await;
@@ -242,30 +309,19 @@ impl InferenceProviderPool {
                     Some(self.inference_timeout_secs),
                 ))) as Arc<InferenceProviderTrait>;
 
-                // Fetch attestation report without holding locks
-                match provider
-                    .get_attestation_report(model_name.clone(), None, None, None)
-                    .await
+                // Fetch attestation report with retries to handle transient network failures
+                if let Some(attestation_report) =
+                    Self::fetch_attestation_report_with_retry(&provider, &model_name, &url).await
                 {
-                    Ok(attestation_report) => {
-                        // Extract signing_public_key from attestation report to register provider by model public key
-                        if let Some(signing_public_key) = attestation_report
-                            .get("signing_public_key")
-                            .and_then(|v| v.as_str())
-                        {
-                            model_pub_key_updates
-                                .push((signing_public_key.to_string(), provider.clone()));
-                        }
-                        providers_for_model.push(provider);
+                    // Extract signing_public_key from attestation report to register provider by model public key
+                    if let Some(signing_public_key) = attestation_report
+                        .get("signing_public_key")
+                        .and_then(|v| v.as_str())
+                    {
+                        model_pub_key_updates
+                            .push((signing_public_key.to_string(), provider.clone()));
                     }
-                    Err(e) => {
-                        tracing::debug!(
-                            model = %model_name,
-                            url = %url,
-                            error = %e,
-                            "Provider failed to return attestation report, excluding from pool"
-                        );
-                    }
+                    providers_for_model.push(provider);
                 }
             }
 

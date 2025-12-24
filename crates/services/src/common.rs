@@ -4,6 +4,17 @@ use uuid::Uuid;
 pub const API_KEY_PREFIX: &str = "sk-";
 pub const API_KEY_LENGTH: usize = 35;
 
+/// Encryption header keys used in params.extra for passing encryption information
+/// These keys are used to pass encryption headers from API routes to completion services
+pub mod encryption_headers {
+    /// Key for signing algorithm (x-signing-algo header)
+    pub const SIGNING_ALGO: &str = "x_signing_algo";
+    /// Key for client public key (x-client-pub-key header)
+    pub const CLIENT_PUB_KEY: &str = "x_client_pub_key";
+    /// Key for model public key (x-model-pub-key header)
+    pub const MODEL_PUB_KEY: &str = "x_model_pub_key";
+}
+
 pub fn generate_api_key() -> String {
     format!(
         "{}{}",

@@ -1,3 +1,4 @@
+use crate::common::encryption_headers;
 use inference_providers::{
     models::{AttestationError, CompletionError, ListModelsError, ModelsResponse},
     ChatCompletionParams, InferenceProvider, StreamingResult, StreamingResultExt, VLlmConfig,
@@ -627,7 +628,7 @@ impl InferenceProviderPool {
         // Extract model_pub_key from params.extra for routing
         let model_pub_key_str = params
             .extra
-            .remove("x_model_pub_key")
+            .remove(encryption_headers::MODEL_PUB_KEY)
             .and_then(|v| v.as_str().map(|s| s.to_string()));
         let model_pub_key = model_pub_key_str.as_deref();
 
@@ -677,7 +678,7 @@ impl InferenceProviderPool {
         // Extract model_pub_key from params.extra for routing
         let model_pub_key_str = params
             .extra
-            .remove("x_model_pub_key")
+            .remove(encryption_headers::MODEL_PUB_KEY)
             .and_then(|v| v.as_str().map(|s| s.to_string()));
         let model_pub_key = model_pub_key_str.as_deref();
 

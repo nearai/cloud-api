@@ -3,6 +3,19 @@ use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
 
+/// Encryption header keys used in params.extra for passing encryption information
+mod encryption_headers {
+    /// Key for signing algorithm (x-signing-algo header)
+    pub const SIGNING_ALGO: &str = "x_signing_algo";
+    /// Key for client public key (x-client-pub-key header)
+    pub const CLIENT_PUB_KEY: &str = "x_client_pub_key";
+    /// Key for model public key (x-model-pub-key header)
+    /// Note: This is not forwarded to vllm-proxy (vllm-proxy doesn't accept it),
+    /// but kept here for consistency with other encryption header constants
+    #[allow(dead_code)]
+    pub const MODEL_PUB_KEY: &str = "x_model_pub_key";
+}
+
 /// Configuration for vLLM provider
 #[derive(Debug, Clone)]
 pub struct VLlmConfig {
@@ -60,13 +73,17 @@ impl VLlmProvider {
         Ok(headers)
     }
 
+    /// NOTE: `x_model_pub_key` (used to build the `X-Model-Pub-Key` header) is intentionally
+    /// not forwarded to vllm-proxy. It is consumed by the cloud API layer for provider routing and
+    /// is not needed to send to the downstream vllm-proxy, so it is stripped from `extra`
+    /// without being added as an HTTP header.
     fn prepare_encryption_headers(
         &self,
         headers: &mut reqwest::header::HeaderMap,
         extra: &mut std::collections::HashMap<String, serde_json::Value>,
     ) {
         if let Some(algo) = extra
-            .remove("x_signing_algo")
+            .remove(encryption_headers::SIGNING_ALGO)
             .as_ref()
             .and_then(|v| v.as_str())
         {
@@ -75,7 +92,7 @@ impl VLlmProvider {
             }
         }
         if let Some(pub_key) = extra
-            .remove("x_client_pub_key")
+            .remove(encryption_headers::CLIENT_PUB_KEY)
             .as_ref()
             .and_then(|v| v.as_str())
         {

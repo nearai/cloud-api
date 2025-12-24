@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Json as ResponseJson, Response},
 };
 use futures::stream::StreamExt;
+use services::common::encryption_headers as service_encryption_headers;
 use services::completions::{
     hash_inference_id_to_uuid,
     ports::{CompletionMessage, CompletionRequest as ServiceCompletionRequest},
@@ -197,19 +198,19 @@ pub async fn chat_completions(
     // Add validated headers to service_request.extra
     if let Some(ref signing_algo) = encryption_headers.signing_algo {
         service_request.extra.insert(
-            "x_signing_algo".to_string(),
+            service_encryption_headers::SIGNING_ALGO.to_string(),
             serde_json::Value::String(signing_algo.clone()),
         );
     }
     if let Some(ref client_pub_key) = encryption_headers.client_pub_key {
         service_request.extra.insert(
-            "x_client_pub_key".to_string(),
+            service_encryption_headers::CLIENT_PUB_KEY.to_string(),
             serde_json::Value::String(client_pub_key.clone()),
         );
     }
     if let Some(ref model_pub_key) = encryption_headers.model_pub_key {
         service_request.extra.insert(
-            "x_model_pub_key".to_string(),
+            service_encryption_headers::MODEL_PUB_KEY.to_string(),
             serde_json::Value::String(model_pub_key.clone()),
         );
     }

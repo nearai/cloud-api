@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use uuid::Uuid;
 
+use crate::common::encryption_headers;
 use crate::completions::ports::CompletionServiceTrait;
 use crate::conversations::models::ConversationId;
 use crate::conversations::ports::ConversationServiceTrait;
@@ -1056,15 +1057,23 @@ impl ResponseServiceImpl {
             }
 
             // Add encryption headers to extra for passing to completion service
-            let encryption_params = [
-                ("x_signing_algo", &process_context.signing_algo),
-                ("x_client_pub_key", &process_context.client_pub_key),
-                ("x_model_pub_key", &process_context.model_pub_key),
-            ];
-            for (key, value) in encryption_params {
-                if let Some(val) = value {
-                    extra.insert(key.to_string(), serde_json::Value::String(val.clone()));
-                }
+            if let Some(ref signing_algo) = process_context.signing_algo {
+                extra.insert(
+                    encryption_headers::SIGNING_ALGO.to_string(),
+                    serde_json::Value::String(signing_algo.clone()),
+                );
+            }
+            if let Some(ref client_pub_key) = process_context.client_pub_key {
+                extra.insert(
+                    encryption_headers::CLIENT_PUB_KEY.to_string(),
+                    serde_json::Value::String(client_pub_key.clone()),
+                );
+            }
+            if let Some(ref model_pub_key) = process_context.model_pub_key {
+                extra.insert(
+                    encryption_headers::MODEL_PUB_KEY.to_string(),
+                    serde_json::Value::String(model_pub_key.clone()),
+                );
             }
 
             // Create completion request (names not included - tracked via database analytics)

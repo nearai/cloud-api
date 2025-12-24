@@ -113,10 +113,7 @@ impl InferenceProviderPool {
                 }
             }
 
-            model_providers
-                .entry(model_id)
-                .or_default()
-                .push(provider);
+            model_providers.entry(model_id).or_default().push(provider);
         }
 
         // Phase 2: Bulk update mappings under lock (minimal lock duration)

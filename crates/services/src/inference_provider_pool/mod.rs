@@ -118,11 +118,9 @@ impl InferenceProviderPool {
             }
         }
 
+        // Replace existing providers for this model_id (consistent with discover_models behavior)
         let mut model_mapping = self.model_mapping.write().await;
-        model_mapping
-            .entry(model_id)
-            .or_insert_with(Vec::new)
-            .push(provider);
+        model_mapping.insert(model_id, vec![provider]);
     }
 
     /// Register multiple providers for multiple models (useful for testing)
@@ -175,13 +173,11 @@ impl InferenceProviderPool {
         }
 
         // Phase 2: Bulk update mappings under lock (minimal lock duration)
+        // Replace existing providers for each model_id (consistent with discover_models behavior)
         {
             let mut model_mapping = self.model_mapping.write().await;
             for (model_id, providers) in model_providers {
-                model_mapping
-                    .entry(model_id)
-                    .or_insert_with(Vec::new)
-                    .extend(providers);
+                model_mapping.insert(model_id, providers);
             }
         }
 

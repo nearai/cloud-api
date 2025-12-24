@@ -151,6 +151,19 @@ pub async fn create_response(
     let client_pub_key = encryption_headers.client_pub_key;
     let model_pub_key = encryption_headers.model_pub_key;
 
+    // Encryption requires streaming mode because encrypted chunks from vLLM are independently
+    // encrypted and cannot be concatenated. Non-streaming mode would produce corrupted data.
+    if signing_algo.is_some() && client_pub_key.is_some() && request.stream != Some(true) {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Non-streaming mode is not supported with encryption. Use stream=true.".to_string(),
+                "encryption_requires_streaming".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
     // Set defaults for internal fields
     request.max_tool_calls = request.max_tool_calls.or(Some(10));
     request.store = request.store.or(Some(true));

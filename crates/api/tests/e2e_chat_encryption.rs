@@ -423,3 +423,60 @@ async fn test_chat_completions_with_invalid_encryption_algorithm() {
         "Request with invalid algorithm should either succeed or return 400"
     );
 }
+
+/// Test that non-streaming mode with encryption returns an error
+/// Encryption requires streaming mode because encrypted chunks cannot be concatenated
+#[tokio::test]
+async fn test_responses_non_streaming_with_encryption_returns_error() {
+    let (server, _guard) = setup_test_server().await;
+    setup_deepseek_model(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let model = "deepseek-ai/DeepSeek-V3.1";
+    let model_pub_key = get_model_public_key(&server, model, Some("ecdsa"))
+        .await
+        .expect("Failed to fetch model public key from attestation report");
+
+    // Mock ECDSA public key (128 hex characters = 64 bytes - uncompressed point)
+    let mock_pub_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    let request_body = serde_json::json!({
+        "model": model,
+        "input": {
+            "type": "text",
+            "text": "Test message"
+        },
+        "stream": false, // Non-streaming mode
+        "max_output_tokens": 50
+    });
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("X-Signing-Algo", "ecdsa")
+        .add_header("X-Client-Pub-Key", mock_pub_key)
+        .add_header("X-Model-Pub-Key", model_pub_key)
+        .json(&request_body)
+        .await;
+
+    // Should return 400 Bad Request with clear error message
+    assert_eq!(
+        response.status_code(),
+        400,
+        "Non-streaming mode with encryption should return 400 Bad Request"
+    );
+
+    let response_json: serde_json::Value = response.json();
+    assert_eq!(
+        response_json["error"]["type"], "encryption_requires_streaming",
+        "Error type should be 'encryption_requires_streaming'"
+    );
+    assert!(
+        response_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Non-streaming mode is not supported with encryption"),
+        "Error message should explain that non-streaming mode is not supported with encryption"
+    );
+}

@@ -2394,7 +2394,8 @@ DO NOT USE THESE FORMATS:
         signing_algo: Option<String>,
         client_pub_key: Option<String>,
     ) -> Option<tokio::task::JoinHandle<Result<(), errors::ResponseError>>> {
-        // Skip title generation if request is encrypted (both headers are set)
+        // Skip title generation if request is encrypted
+        // (both headers X-Signing-Algo and X-Client-Pub-Key are set)
         if signing_algo.is_some() && client_pub_key.is_some() {
             return None;
         }

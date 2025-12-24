@@ -188,20 +188,30 @@ pub async fn chat_completions(
         body_hash,
     );
 
-    // Extract encryption headers if present
-    const ENCRYPTION_HEADERS: [(&str, &str); 3] = [
-        ("x-signing-algo", "x_signing_algo"),
-        ("x-client-pub-key", "x_client_pub_key"),
-        ("x-model-pub-key", "x_model_pub_key"),
-    ];
+    // Extract and validate encryption headers if present
+    let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
+        Ok(headers) => headers,
+        Err(err) => return err.into_response(),
+    };
 
-    for (header_name, extra_key) in ENCRYPTION_HEADERS {
-        if let Some(value) = headers.get(header_name).and_then(|h| h.to_str().ok()) {
-            service_request.extra.insert(
-                extra_key.to_string(),
-                serde_json::Value::String(value.to_string()),
-            );
-        }
+    // Add validated headers to service_request.extra
+    if let Some(ref signing_algo) = encryption_headers.signing_algo {
+        service_request.extra.insert(
+            "x_signing_algo".to_string(),
+            serde_json::Value::String(signing_algo.clone()),
+        );
+    }
+    if let Some(ref client_pub_key) = encryption_headers.client_pub_key {
+        service_request.extra.insert(
+            "x_client_pub_key".to_string(),
+            serde_json::Value::String(client_pub_key.clone()),
+        );
+    }
+    if let Some(ref model_pub_key) = encryption_headers.model_pub_key {
+        service_request.extra.insert(
+            "x_model_pub_key".to_string(),
+            serde_json::Value::String(model_pub_key.clone()),
+        );
     }
 
     // Check if streaming is requested

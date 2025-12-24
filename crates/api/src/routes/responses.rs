@@ -141,19 +141,15 @@ pub async fn create_response(
             .into_response();
     }
 
-    // Extract encryption headers if present
-    let signing_algo = headers
-        .get("x-signing-algo")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
-    let client_pub_key = headers
-        .get("x-client-pub-key")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
-    let model_pub_key = headers
-        .get("x-model-pub-key")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
+    // Extract and validate encryption headers if present
+    let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
+        Ok(headers) => headers,
+        Err(err) => return err.into_response(),
+    };
+
+    let signing_algo = encryption_headers.signing_algo;
+    let client_pub_key = encryption_headers.client_pub_key;
+    let model_pub_key = encryption_headers.model_pub_key;
 
     // Set defaults for internal fields
     request.max_tool_calls = request.max_tool_calls.or(Some(10));

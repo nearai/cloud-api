@@ -72,43 +72,10 @@ impl InferenceProviderPool {
     /// Also populates model_pub_key_mapping by fetching the attestation report
     /// Fetches attestation reports for both ECDSA and Ed25519 to support both signing algorithms
     pub async fn register_provider(&self, model_id: String, provider: Arc<InferenceProviderTrait>) {
-        // Fetch attestation reports for both signing algorithms to populate model_pub_key_mapping
+        // Fetch signing public keys for both algorithms
         // Use "mock" as URL identifier for logging (since this is typically used for mock providers)
-        let mut pub_key_updates: Vec<(String, Arc<InferenceProviderTrait>)> = Vec::new();
-
-        // Fetch for ECDSA
-        if let Some(attestation_report) = Self::fetch_attestation_report_with_retry_for_algo(
-            &provider,
-            &model_id,
-            "mock",
-            Some("ecdsa"),
-        )
-        .await
-        {
-            if let Some(signing_public_key) = attestation_report
-                .get("signing_public_key")
-                .and_then(|v| v.as_str())
-            {
-                pub_key_updates.push((signing_public_key.to_string(), provider.clone()));
-            }
-        }
-
-        // Fetch for Ed25519
-        if let Some(attestation_report) = Self::fetch_attestation_report_with_retry_for_algo(
-            &provider,
-            &model_id,
-            "mock",
-            Some("ed25519"),
-        )
-        .await
-        {
-            if let Some(signing_public_key) = attestation_report
-                .get("signing_public_key")
-                .and_then(|v| v.as_str())
-            {
-                pub_key_updates.push((signing_public_key.to_string(), provider.clone()));
-            }
-        }
+        let (pub_key_updates, _has_valid_attestation) =
+            Self::fetch_signing_public_keys_for_both_algorithms(&provider, &model_id, "mock").await;
 
         // Update model_pub_key_mapping
         {
@@ -132,42 +99,12 @@ impl InferenceProviderPool {
         let mut model_providers: HashMap<String, Vec<Arc<InferenceProviderTrait>>> = HashMap::new();
 
         for (model_id, provider) in providers {
-            // Fetch attestation reports for both signing algorithms to populate model_pub_key_mapping
+            // Fetch signing public keys for both algorithms to populate model_pub_key_mapping
             // Use "mock" as URL identifier for logging (since this is typically used for mock providers)
-
-            // Fetch for ECDSA
-            if let Some(attestation_report) = Self::fetch_attestation_report_with_retry_for_algo(
-                &provider,
-                &model_id,
-                "mock",
-                Some("ecdsa"),
-            )
-            .await
-            {
-                if let Some(signing_public_key) = attestation_report
-                    .get("signing_public_key")
-                    .and_then(|v| v.as_str())
-                {
-                    pub_key_updates.push((signing_public_key.to_string(), provider.clone()));
-                }
-            }
-
-            // Fetch for Ed25519
-            if let Some(attestation_report) = Self::fetch_attestation_report_with_retry_for_algo(
-                &provider,
-                &model_id,
-                "mock",
-                Some("ed25519"),
-            )
-            .await
-            {
-                if let Some(signing_public_key) = attestation_report
-                    .get("signing_public_key")
-                    .and_then(|v| v.as_str())
-                {
-                    pub_key_updates.push((signing_public_key.to_string(), provider.clone()));
-                }
-            }
+            let (keys, _has_valid_attestation) =
+                Self::fetch_signing_public_keys_for_both_algorithms(&provider, &model_id, "mock")
+                    .await;
+            pub_key_updates.extend(keys);
 
             model_providers.entry(model_id).or_default().push(provider);
         }
@@ -262,25 +199,66 @@ impl InferenceProviderPool {
         Some((ip.to_string(), port))
     }
 
-    /// Fetch attestation report with retries to handle transient network failures
+    /// Fetch signing public keys for both ECDSA and Ed25519 algorithms
     ///
-    /// Retries up to 3 times with exponential backoff (100ms, 200ms, 400ms).
-    /// This prevents providers from being excluded from the pool due to transient network issues.
+    /// Attempts to fetch attestation reports for both signing algorithms and returns
+    /// all available signing public keys. This ensures that providers are registered
+    /// for both algorithms if they support them.
     ///
     /// # Arguments
-    /// * `provider` - The inference provider to fetch the attestation report from
+    /// * `provider` - The inference provider to fetch the attestation reports from
     /// * `model_name` - The model name to request attestation for
     /// * `url` - Optional URL for logging purposes (can be empty string if not available)
     ///
     /// # Returns
-    /// * `Some(attestation_report)` if successful after retries
-    /// * `None` if all retry attempts failed
-    async fn fetch_attestation_report_with_retry(
+    /// * Tuple of (signing_public_keys, has_valid_attestation) where:
+    ///   - `signing_public_keys`: Vector of (signing_public_key, provider) tuples for all available algorithms
+    ///   - `has_valid_attestation`: True if at least one attestation report was successfully fetched
+    async fn fetch_signing_public_keys_for_both_algorithms(
         provider: &Arc<InferenceProviderTrait>,
         model_name: &str,
         url: &str,
-    ) -> Option<serde_json::Map<String, serde_json::Value>> {
-        Self::fetch_attestation_report_with_retry_for_algo(provider, model_name, url, None).await
+    ) -> (Vec<(String, Arc<InferenceProviderTrait>)>, bool) {
+        let mut pub_key_updates = Vec::new();
+        let mut has_valid_attestation = false;
+
+        // Fetch for ECDSA
+        if let Some(attestation_report) = Self::fetch_attestation_report_with_retry_for_algo(
+            provider,
+            model_name,
+            url,
+            Some("ecdsa"),
+        )
+        .await
+        {
+            has_valid_attestation = true;
+            if let Some(signing_public_key) = attestation_report
+                .get("signing_public_key")
+                .and_then(|v| v.as_str())
+            {
+                pub_key_updates.push((signing_public_key.to_string(), provider.clone()));
+            }
+        }
+
+        // Fetch for Ed25519
+        if let Some(attestation_report) = Self::fetch_attestation_report_with_retry_for_algo(
+            provider,
+            model_name,
+            url,
+            Some("ed25519"),
+        )
+        .await
+        {
+            has_valid_attestation = true;
+            if let Some(signing_public_key) = attestation_report
+                .get("signing_public_key")
+                .and_then(|v| v.as_str())
+            {
+                pub_key_updates.push((signing_public_key.to_string(), provider.clone()));
+            }
+        }
+
+        (pub_key_updates, has_valid_attestation)
     }
 
     /// Fetch attestation report with retries for a specific signing algorithm
@@ -439,17 +417,20 @@ impl InferenceProviderPool {
                 ))) as Arc<InferenceProviderTrait>;
 
                 // Fetch attestation report with retries to handle transient network failures
-                if let Some(attestation_report) =
-                    Self::fetch_attestation_report_with_retry(&provider, &model_name, &url).await
-                {
-                    // Extract signing_public_key from attestation report to register provider by model public key
-                    if let Some(signing_public_key) = attestation_report
-                        .get("signing_public_key")
-                        .and_then(|v| v.as_str())
-                    {
-                        model_pub_key_updates
-                            .push((signing_public_key.to_string(), provider.clone()));
-                    }
+                // We need at least one successful attestation report to include the provider
+                // But we fetch both ECDSA and Ed25519 keys to register the provider for both algorithms
+                let (pub_keys, has_valid_attestation) =
+                    Self::fetch_signing_public_keys_for_both_algorithms(
+                        &provider,
+                        &model_name,
+                        &url,
+                    )
+                    .await;
+
+                // If we got at least one successful attestation report, the provider is valid and should be included
+                // Note: signing_public_key may not be present in the attestation report (e.g., for non-encrypted providers)
+                if has_valid_attestation {
+                    model_pub_key_updates.extend(pub_keys);
                     providers_for_model.push(provider);
                 }
             }

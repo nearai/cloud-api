@@ -536,6 +536,34 @@ pub async fn setup_glm_model(server: &axum_test::TestServer) -> String {
     "zai-org/GLM-4.6".to_string()
 }
 
+pub async fn setup_deepseek_model(server: &axum_test::TestServer) -> String {
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        "deepseek-ai/DeepSeek-V3.1".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 1000000,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 2000000,
+                "currency": "USD"
+            },
+            "modelDisplayName": "DeepSeek V3.1",
+            "modelDescription": "DeepSeek V3.1 model with encryption support",
+            "contextLength": 128000,
+            "verifiable": true,
+            "isActive": true
+        }))
+        .unwrap(),
+    );
+    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    assert_eq!(updated.len(), 1, "Should have updated 1 model");
+    // Ensure mock provider registers model before test proceeds
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    "deepseek-ai/DeepSeek-V3.1".to_string()
+}
+
 pub async fn admin_batch_upsert_models(
     server: &axum_test::TestServer,
     models: BatchUpdateModelApiRequest,

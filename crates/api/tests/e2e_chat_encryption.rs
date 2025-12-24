@@ -13,11 +13,8 @@ use inference_providers::StreamChunk;
 // These tests verify that encryption headers (X-Signing-Algo, X-Client-Pub-Key, and X-Model-Pub-Key)
 // are properly extracted and passed through from cloud-api to vllm-proxy.
 //
-// Note: These tests are currently skipped because they require a running vllm-proxy
-// instance with encryption support. To run these tests:
-// 1. Start vllm-proxy with encryption enabled
-// 2. Remove the #[ignore] attribute from the tests
-// 3. Ensure the test environment has proper encryption keys configured
+// These tests use the deepseek-ai/DeepSeek-V3.1 model which has encryption support enabled.
+// The tests run in CI and require a running vllm-proxy instance with encryption support.
 
 /// Helper function to fetch the model public key from the attestation report endpoint
 async fn get_model_public_key(
@@ -60,21 +57,20 @@ async fn get_model_public_key(
 
 /// Test that chat completions with ECDSA encryption headers are passed through correctly
 #[tokio::test]
-#[ignore] // Skip by default - requires vllm-proxy with encryption support
 async fn test_chat_completions_with_ecdsa_encryption_headers() {
     let (server, _guard) = setup_test_server().await;
-    setup_qwen_model(&server).await;
+    setup_deepseek_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Fetch model public key from attestation report
-    let model = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+    let model = "deepseek-ai/DeepSeek-V3.1";
     let model_pub_key = get_model_public_key(&server, model, Some("ecdsa"))
         .await
         .expect("Failed to fetch model public key from attestation report");
 
-    // Mock ECDSA public key (64 hex characters = 32 bytes)
-    let mock_ecdsa_pub_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    // Mock ECDSA public key (128 hex characters = 64 bytes - uncompressed point)
+    let mock_ecdsa_pub_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     let request_body = serde_json::json!({
         "model": model,
@@ -113,15 +109,14 @@ async fn test_chat_completions_with_ecdsa_encryption_headers() {
 
 /// Test that chat completions with Ed25519 encryption headers are passed through correctly
 #[tokio::test]
-#[ignore] // Skip by default - requires vllm-proxy with encryption support
 async fn test_chat_completions_with_ed25519_encryption_headers() {
     let (server, _guard) = setup_test_server().await;
-    setup_qwen_model(&server).await;
+    setup_deepseek_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Fetch model public key from attestation report
-    let model = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+    let model = "deepseek-ai/DeepSeek-V3.1";
     let model_pub_key = get_model_public_key(&server, model, Some("ed25519"))
         .await
         .expect("Failed to fetch model public key from attestation report");
@@ -166,21 +161,20 @@ async fn test_chat_completions_with_ed25519_encryption_headers() {
 
 /// Test that streaming chat completions with encryption headers work correctly
 #[tokio::test]
-#[ignore] // Skip by default - requires vllm-proxy with encryption support
 async fn test_streaming_chat_completions_with_encryption_headers() {
     let (server, _guard) = setup_test_server().await;
-    setup_qwen_model(&server).await;
+    setup_deepseek_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Fetch model public key from attestation report
-    let model = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+    let model = "deepseek-ai/DeepSeek-V3.1";
     let model_pub_key = get_model_public_key(&server, model, Some("ecdsa"))
         .await
         .expect("Failed to fetch model public key from attestation report");
 
-    // Mock ECDSA public key
-    let mock_ecdsa_pub_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    // Mock ECDSA public key (128 hex characters = 64 bytes - uncompressed point)
+    let mock_ecdsa_pub_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     let request_body = serde_json::json!({
         "model": model,
@@ -240,12 +234,12 @@ async fn test_streaming_chat_completions_with_encryption_headers() {
 #[tokio::test]
 async fn test_chat_completions_without_encryption_headers() {
     let (server, _guard) = setup_test_server().await;
-    setup_qwen_model(&server).await;
+    setup_deepseek_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     let request_body = serde_json::json!({
-        "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "model": "deepseek-ai/DeepSeek-V3.1",
         "messages": [
             {
                 "role": "user",
@@ -279,19 +273,19 @@ async fn test_chat_completions_without_encryption_headers() {
 
 /// Test that requests with only one encryption header are handled gracefully
 #[tokio::test]
-#[ignore] // Skip by default - requires vllm-proxy with encryption support
 async fn test_chat_completions_with_partial_encryption_headers() {
     let (server, _guard) = setup_test_server().await;
-    setup_qwen_model(&server).await;
+    setup_deepseek_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
-    let model = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+    let model = "deepseek-ai/DeepSeek-V3.1";
     let model_pub_key = get_model_public_key(&server, model, Some("ecdsa"))
         .await
         .expect("Failed to fetch model public key from attestation report");
 
-    let mock_pub_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    // Mock ECDSA public key (128 hex characters = 64 bytes - uncompressed point)
+    let mock_pub_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     let request_body = serde_json::json!({
         "model": model,
@@ -318,8 +312,8 @@ async fn test_chat_completions_with_partial_encryption_headers() {
     // Should still work (headers are passed through, vllm-proxy will handle validation)
     // The actual behavior depends on vllm-proxy implementation
     assert!(
-        response1.status_code() == 200 || response1.status_code() == 400,
-        "Request with partial encryption headers should either succeed or return 400"
+        response1.status_code() == 200,
+        "Request with partial encryption headers should either succeed without encryption"
     );
 
     // Test with only X-Client-Pub-Key (missing X-Signing-Algo)
@@ -334,26 +328,26 @@ async fn test_chat_completions_with_partial_encryption_headers() {
 
     // Should still work (headers are passed through, vllm-proxy will handle validation)
     assert!(
-        response2.status_code() == 200 || response2.status_code() == 400,
-        "Request with partial encryption headers should either succeed or return 400"
+        response2.status_code() == 200,
+        "Request with partial encryption headers should either succeed without encryption"
     );
 }
 
 /// Test that case-insensitive header names work correctly
 #[tokio::test]
-#[ignore] // Skip by default - requires vllm-proxy with encryption support
 async fn test_chat_completions_with_case_insensitive_encryption_headers() {
     let (server, _guard) = setup_test_server().await;
-    setup_qwen_model(&server).await;
+    setup_deepseek_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
-    let model = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+    let model = "deepseek-ai/DeepSeek-V3.1";
     let model_pub_key = get_model_public_key(&server, model, Some("ecdsa"))
         .await
         .expect("Failed to fetch model public key from attestation report");
 
-    let mock_pub_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    // Mock ECDSA public key (128 hex characters = 64 bytes - uncompressed point)
+    let mock_pub_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     let request_body = serde_json::json!({
         "model": model,
@@ -388,14 +382,13 @@ async fn test_chat_completions_with_case_insensitive_encryption_headers() {
 /// Test that invalid encryption algorithm values are passed through
 /// (vllm-proxy will validate and return appropriate error)
 #[tokio::test]
-#[ignore] // Skip by default - requires vllm-proxy with encryption support
 async fn test_chat_completions_with_invalid_encryption_algorithm() {
     let (server, _guard) = setup_test_server().await;
-    setup_qwen_model(&server).await;
+    setup_deepseek_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
-    let model = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+    let model = "deepseek-ai/DeepSeek-V3.1";
     let model_pub_key = get_model_public_key(&server, model, None)
         .await
         .expect("Failed to fetch model public key from attestation report");
@@ -426,7 +419,7 @@ async fn test_chat_completions_with_invalid_encryption_algorithm() {
     // Headers are passed through, vllm-proxy will validate and return error
     // The actual status code depends on vllm-proxy's validation
     assert!(
-        response.status_code() == 200 || response.status_code() == 400,
+        response.status_code() == 400,
         "Request with invalid algorithm should either succeed or return 400"
     );
 }

@@ -183,12 +183,6 @@ impl InferenceProviderPool {
         // Fetch from discovery server
         let discovery_map = self.fetch_from_discovery().await?;
 
-        let mut model_mapping = self.model_mapping.write().await;
-        model_mapping.clear();
-
-        let mut model_pub_key_mapping = self.model_pub_key_mapping.write().await;
-        model_pub_key_mapping.clear();
-
         // Group by model name
         let mut model_to_endpoints: HashMap<String, Vec<(String, u16)>> = HashMap::new();
 
@@ -218,8 +212,11 @@ impl InferenceProviderPool {
             }
         }
 
-        // Create providers for each endpoint
+        // Phase 1: Collect all attestation reports and create providers (no locks held)
+        // This minimizes lock duration by doing all network I/O before acquiring locks
         let mut all_models = Vec::new();
+        let mut model_providers: HashMap<String, Vec<Arc<InferenceProviderTrait>>> = HashMap::new();
+        let mut model_pub_key_updates: Vec<(String, Arc<InferenceProviderTrait>)> = Vec::new();
 
         for (model_name, endpoints) in model_to_endpoints {
             tracing::info!(
@@ -245,6 +242,7 @@ impl InferenceProviderPool {
                     Some(self.inference_timeout_secs),
                 ))) as Arc<InferenceProviderTrait>;
 
+                // Fetch attestation report without holding locks
                 match provider
                     .get_attestation_report(model_name.clone(), None, None, None)
                     .await
@@ -255,8 +253,8 @@ impl InferenceProviderPool {
                             .get("signing_public_key")
                             .and_then(|v| v.as_str())
                         {
-                            model_pub_key_mapping
-                                .insert(signing_public_key.to_string(), provider.clone());
+                            model_pub_key_updates
+                                .push((signing_public_key.to_string(), provider.clone()));
                         }
                         providers_for_model.push(provider);
                     }
@@ -271,19 +269,41 @@ impl InferenceProviderPool {
                 }
             }
 
-            model_mapping.insert(model_name.clone(), providers_for_model);
+            if !providers_for_model.is_empty() {
+                model_providers.insert(model_name.clone(), providers_for_model);
 
-            all_models.push(inference_providers::models::ModelInfo {
-                id: model_name,
-                object: "model".to_string(),
-                created: 0,
-                owned_by: "discovered".to_string(),
-            });
+                all_models.push(inference_providers::models::ModelInfo {
+                    id: model_name,
+                    object: "model".to_string(),
+                    created: 0,
+                    owned_by: "discovered".to_string(),
+                });
+            }
+        }
+
+        // Calculate metrics before acquiring locks
+        let total_providers: usize = model_providers.values().map(|v| v.len()).sum();
+
+        // Phase 2: Bulk update mappings under lock (minimal lock duration)
+        {
+            let mut model_mapping = self.model_mapping.write().await;
+            model_mapping.clear();
+            for (model_name, providers) in model_providers {
+                model_mapping.insert(model_name, providers);
+            }
+        }
+
+        {
+            let mut model_pub_key_mapping = self.model_pub_key_mapping.write().await;
+            model_pub_key_mapping.clear();
+            for (key, provider) in model_pub_key_updates {
+                model_pub_key_mapping.insert(key, provider);
+            }
         }
 
         tracing::info!(
             total_models = all_models.len(),
-            total_providers = model_mapping.values().map(|v| v.len()).sum::<usize>(),
+            total_providers = total_providers,
             model_ids = ?all_models.iter().map(|m| &m.id).collect::<Vec<_>>(),
             "Model discovery from endpoint completed"
         );

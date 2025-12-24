@@ -69,7 +69,22 @@ impl InferenceProviderPool {
     }
 
     /// Register a provider for a model manually (useful for testing with mock providers)
+    /// Also populates model_pub_key_mapping by fetching the attestation report
     pub async fn register_provider(&self, model_id: String, provider: Arc<InferenceProviderTrait>) {
+        // Fetch attestation report to populate model_pub_key_mapping
+        // Use "mock" as URL identifier for logging (since this is typically used for mock providers)
+        if let Some(attestation_report) =
+            Self::fetch_attestation_report_with_retry(&provider, &model_id, "mock").await
+        {
+            if let Some(signing_public_key) = attestation_report
+                .get("signing_public_key")
+                .and_then(|v| v.as_str())
+            {
+                let mut model_pub_key_mapping = self.model_pub_key_mapping.write().await;
+                model_pub_key_mapping.insert(signing_public_key.to_string(), provider.clone());
+            }
+        }
+
         let mut model_mapping = self.model_mapping.write().await;
         model_mapping
             .entry(model_id)
@@ -78,13 +93,48 @@ impl InferenceProviderPool {
     }
 
     /// Register multiple providers for multiple models (useful for testing)
+    /// Also populates model_pub_key_mapping by fetching attestation reports
     pub async fn register_providers(&self, providers: Vec<(String, Arc<InferenceProviderTrait>)>) {
-        let mut model_mapping = self.model_mapping.write().await;
+        // Phase 1: Collect attestation reports and public keys (no locks held)
+        let mut pub_key_updates: Vec<(String, Arc<InferenceProviderTrait>)> = Vec::new();
+        let mut model_providers: HashMap<String, Vec<Arc<InferenceProviderTrait>>> = HashMap::new();
+
         for (model_id, provider) in providers {
-            model_mapping
+            // Fetch attestation report to populate model_pub_key_mapping
+            // Use "mock" as URL identifier for logging (since this is typically used for mock providers)
+            if let Some(attestation_report) =
+                Self::fetch_attestation_report_with_retry(&provider, &model_id, "mock").await
+            {
+                if let Some(signing_public_key) = attestation_report
+                    .get("signing_public_key")
+                    .and_then(|v| v.as_str())
+                {
+                    pub_key_updates.push((signing_public_key.to_string(), provider.clone()));
+                }
+            }
+
+            model_providers
                 .entry(model_id)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(provider);
+        }
+
+        // Phase 2: Bulk update mappings under lock (minimal lock duration)
+        {
+            let mut model_mapping = self.model_mapping.write().await;
+            for (model_id, providers) in model_providers {
+                model_mapping
+                    .entry(model_id)
+                    .or_insert_with(Vec::new)
+                    .extend(providers);
+            }
+        }
+
+        {
+            let mut model_pub_key_mapping = self.model_pub_key_mapping.write().await;
+            for (key, provider) in pub_key_updates {
+                model_pub_key_mapping.insert(key, provider);
+            }
         }
     }
 

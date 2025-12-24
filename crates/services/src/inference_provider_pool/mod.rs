@@ -442,10 +442,19 @@ impl InferenceProviderPool {
         // Ensure models are discovered first
         self.ensure_models_discovered().await?;
 
-        // If model_pub_key is provided, try to route to specific provider first
+        // If model_pub_key is provided, route to the specific provider by signing public key.
+        // This is required for encryption - the client expects a specific provider with a specific
+        // public key. We must not fall back to model_id routing as that could route to a different
+        // provider that doesn't support the expected encryption.
         if let Some(pub_key) = model_pub_key {
-            if let Some(provider) = self.get_provider_by_model_pub_key(pub_key).await {
-                match provider_fn(provider.clone()).await {
+            tracing::debug!(
+                model_id = %model_id,
+                model_pub_key = %pub_key,
+                operation = operation_name,
+                "Attempting to get provider by model public key"
+            );
+            match self.get_provider_by_model_pub_key(pub_key).await {
+                Some(provider) => match provider_fn(provider.clone()).await {
                     Ok(result) => {
                         return Ok((result, provider));
                     }
@@ -455,19 +464,27 @@ impl InferenceProviderPool {
                             model_pub_key = %pub_key,
                             operation = operation_name,
                             error = %e,
-                            "Provider by model public key failed, falling back to model_id routing"
+                            "Getting provider by model public key failed. Cannot fall back to model_id routing as encryption requirements must be met."
                         );
-                        // Fall through to model_id routing
+                        return Err(CompletionError::CompletionError(format!(
+                            "Getting provider for model public key '{}...' failed: {}. Encryption requires routing to the specific provider with this public key.",
+                            pub_key.chars().take(32).collect::<String>(),
+                            e
+                        )));
                     }
+                },
+                None => {
+                    tracing::warn!(
+                        model_id = %model_id,
+                        model_pub_key = %pub_key,
+                        operation = operation_name,
+                        "No provider found for model public key. Cannot fall back to model_id routing as encryption requirements must be met."
+                    );
+                    return Err(CompletionError::CompletionError(format!(
+                        "No provider found for model public key '{}...'. Encryption requires routing to the specific provider with this public key.",
+                        pub_key.chars().take(32).collect::<String>()
+                    )));
                 }
-            } else {
-                tracing::warn!(
-                    model_id = %model_id,
-                    model_pub_key = %pub_key,
-                    operation = operation_name,
-                    "No provider found for model public key, falling back to model_id routing"
-                );
-                // Fall through to model_id routing
             }
         }
 

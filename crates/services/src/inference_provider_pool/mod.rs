@@ -22,6 +22,25 @@ struct DiscoveryEntry {
     tags: Vec<String>,
 }
 
+/// Combined provider mappings updated atomically to prevent race conditions
+/// Both mappings are updated together under a single lock to ensure consistency
+#[derive(Clone)]
+struct ProviderMappings {
+    /// Map of model name -> list of providers (for load balancing)
+    model_to_providers: HashMap<String, Vec<Arc<InferenceProviderTrait>>>,
+    /// Map of model signing public key -> provider for routing by model public key
+    pubkey_to_provider: HashMap<String, Arc<InferenceProviderTrait>>,
+}
+
+impl ProviderMappings {
+    fn new() -> Self {
+        Self {
+            model_to_providers: HashMap::new(),
+            pubkey_to_provider: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct InferenceProviderPool {
     /// Discovery URL for dynamic model discovery
@@ -32,16 +51,14 @@ pub struct InferenceProviderPool {
     discovery_timeout: Duration,
     /// HTTP timeout for model inference requests
     inference_timeout_secs: i64,
-    /// Map of model name -> list of providers (for load balancing)
-    model_mapping: Arc<RwLock<HashMap<String, Vec<Arc<InferenceProviderTrait>>>>>,
+    /// Combined provider mappings (updated atomically to prevent race conditions)
+    provider_mappings: Arc<RwLock<ProviderMappings>>,
     /// Round-robin index for each model
     load_balancer_index: Arc<RwLock<HashMap<String, usize>>>,
     /// Map of chat_id -> provider for sticky routing
     chat_id_mapping: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
     /// Map of chat_id -> (request_hash, response_hash) for MockProvider signature generation
     signature_hashes: Arc<RwLock<HashMap<String, (String, String)>>>,
-    /// Map of model signing public key -> provider for routing by model public key
-    model_pub_key_mapping: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
     /// Background task handle for periodic model discovery refresh
     refresh_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -59,11 +76,10 @@ impl InferenceProviderPool {
             api_key,
             discovery_timeout: Duration::from_secs(discovery_timeout_secs as u64),
             inference_timeout_secs,
-            model_mapping: Arc::new(RwLock::new(HashMap::new())),
+            provider_mappings: Arc::new(RwLock::new(ProviderMappings::new())),
             load_balancer_index: Arc::new(RwLock::new(HashMap::new())),
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
             signature_hashes: Arc::new(RwLock::new(HashMap::new())),
-            model_pub_key_mapping: Arc::new(RwLock::new(HashMap::new())),
             refresh_task_handle: Arc::new(Mutex::new(None)),
         }
     }
@@ -77,17 +93,14 @@ impl InferenceProviderPool {
         let (pub_key_updates, _has_valid_attestation) =
             Self::fetch_signing_public_keys_for_both_algorithms(&provider, &model_id, "mock").await;
 
-        // Update model_pub_key_mapping
-        {
-            let mut model_pub_key_mapping = self.model_pub_key_mapping.write().await;
-            for (key, provider) in pub_key_updates {
-                model_pub_key_mapping.insert(key, provider);
-            }
+        // Atomic update: update both mappings together under a single lock
+        let mut mappings = self.provider_mappings.write().await;
+        mappings
+            .model_to_providers
+            .insert(model_id, vec![provider.clone()]);
+        for (key, provider) in pub_key_updates {
+            mappings.pubkey_to_provider.insert(key, provider);
         }
-
-        // Replace existing providers for this model_id (consistent with discover_models behavior)
-        let mut model_mapping = self.model_mapping.write().await;
-        model_mapping.insert(model_id, vec![provider]);
     }
 
     /// Register multiple providers for multiple models (useful for testing)
@@ -109,19 +122,15 @@ impl InferenceProviderPool {
             model_providers.entry(model_id).or_default().push(provider);
         }
 
-        // Phase 2: Bulk update mappings under lock (minimal lock duration)
-        // Replace existing providers for each model_id (consistent with discover_models behavior)
+        // Phase 2: Atomic bulk update of both mappings under a single lock
+        // This ensures consistency - both mappings are updated together
         {
-            let mut model_mapping = self.model_mapping.write().await;
+            let mut mappings = self.provider_mappings.write().await;
             for (model_id, providers) in model_providers {
-                model_mapping.insert(model_id, providers);
+                mappings.model_to_providers.insert(model_id, providers);
             }
-        }
-
-        {
-            let mut model_pub_key_mapping = self.model_pub_key_mapping.write().await;
             for (key, provider) in pub_key_updates {
-                model_pub_key_mapping.insert(key, provider);
+                mappings.pubkey_to_provider.insert(key, provider);
             }
         }
     }
@@ -337,11 +346,11 @@ impl InferenceProviderPool {
 
     /// Ensure models are discovered before using them
     async fn ensure_models_discovered(&self) -> Result<(), CompletionError> {
-        let model_mapping = self.model_mapping.read().await;
+        let mappings = self.provider_mappings.read().await;
 
         // If mapping is empty, we need to discover models
-        if model_mapping.is_empty() {
-            drop(model_mapping); // Release read lock
+        if mappings.model_to_providers.is_empty() {
+            drop(mappings); // Release read lock
             tracing::warn!("Model mapping is empty, triggering model discovery");
             self.discover_models().await.map_err(|e| {
                 CompletionError::CompletionError(format!("Failed to discover models: {e}"))
@@ -450,21 +459,23 @@ impl InferenceProviderPool {
         // Calculate metrics before acquiring locks
         let total_providers: usize = model_providers.values().map(|v| v.len()).sum();
 
-        // Phase 2: Bulk update mappings under lock (minimal lock duration)
-        {
-            let mut model_mapping = self.model_mapping.write().await;
-            model_mapping.clear();
-            for (model_name, providers) in model_providers {
-                model_mapping.insert(model_name, providers);
-            }
+        // Phase 2: Atomic bulk update of both mappings under a single lock
+        // This ensures consistency - both mappings are updated together atomically
+        // Build new mappings structure
+        let mut new_mappings = ProviderMappings::new();
+        for (model_name, providers) in model_providers {
+            new_mappings
+                .model_to_providers
+                .insert(model_name, providers);
+        }
+        for (key, provider) in model_pub_key_updates {
+            new_mappings.pubkey_to_provider.insert(key, provider);
         }
 
+        // Atomic swap: replace entire mappings structure in one operation
         {
-            let mut model_pub_key_mapping = self.model_pub_key_mapping.write().await;
-            model_pub_key_mapping.clear();
-            for (key, provider) in model_pub_key_updates {
-                model_pub_key_mapping.insert(key, provider);
-            }
+            let mut mappings = self.provider_mappings.write().await;
+            *mappings = new_mappings;
         }
 
         tracing::info!(
@@ -484,8 +495,8 @@ impl InferenceProviderPool {
         &self,
         model_id: &str,
     ) -> Option<Vec<Arc<InferenceProviderTrait>>> {
-        let model_mapping = self.model_mapping.read().await;
-        model_mapping.get(model_id).cloned()
+        let mappings = self.provider_mappings.read().await;
+        mappings.model_to_providers.get(model_id).cloned()
     }
 
     /// Store a mapping of chat_id to provider
@@ -533,8 +544,8 @@ impl InferenceProviderPool {
         &self,
         model_pub_key: &str,
     ) -> Option<Arc<InferenceProviderTrait>> {
-        let mapping = self.model_pub_key_mapping.read().await;
-        mapping.get(model_pub_key).cloned()
+        let mappings = self.provider_mappings.read().await;
+        mappings.pubkey_to_provider.get(model_pub_key).cloned()
     }
 
     /// Get providers for a model in priority order for fallback
@@ -543,8 +554,8 @@ impl InferenceProviderPool {
         &self,
         model_id: &str,
     ) -> Option<Vec<Arc<InferenceProviderTrait>>> {
-        let model_mapping = self.model_mapping.read().await;
-        let providers = model_mapping.get(model_id)?;
+        let mappings = self.provider_mappings.read().await;
+        let providers = mappings.model_to_providers.get(model_id)?;
 
         if providers.is_empty() {
             return None;
@@ -678,8 +689,8 @@ impl InferenceProviderPool {
         let providers = match self.get_providers_with_fallback(model_id).await {
             Some(p) => p,
             None => {
-                let model_mapping = self.model_mapping.read().await;
-                let available_models: Vec<_> = model_mapping.keys().collect();
+                let mappings = self.provider_mappings.read().await;
+                let available_models: Vec<_> = mappings.model_to_providers.keys().collect();
 
                 tracing::error!(
                     model_id = %model_id,
@@ -963,13 +974,17 @@ impl InferenceProviderPool {
         }
         drop(task_handle); // Explicitly drop the lock
 
-        // Step 2: Clear model mappings and provider references
-        debug!("Step 2: Clearing model mappings");
-        let mut model_mapping = self.model_mapping.write().await;
-        let model_count = model_mapping.len();
-        model_mapping.clear();
-        debug!("Cleared {} model mappings", model_count);
-        drop(model_mapping);
+        // Step 2: Clear provider mappings (both model and pubkey mappings cleared atomically)
+        debug!("Step 2: Clearing provider mappings");
+        let mut mappings = self.provider_mappings.write().await;
+        let model_count = mappings.model_to_providers.len();
+        let pubkey_count = mappings.pubkey_to_provider.len();
+        *mappings = ProviderMappings::new();
+        debug!(
+            "Cleared {} model mappings and {} pubkey mappings",
+            model_count, pubkey_count
+        );
+        drop(mappings);
 
         // Step 3: Clear load balancer indices
         debug!("Step 3: Clearing load balancer indices");
@@ -995,17 +1010,9 @@ impl InferenceProviderPool {
         debug!("Cleared {} signature hash entries", sig_count);
         drop(sig_hashes);
 
-        // Step 6: Clear model public key mappings
-        debug!("Step 6: Clearing model public key mappings");
-        let mut model_pub_key_mapping = self.model_pub_key_mapping.write().await;
-        let model_pub_key_count = model_pub_key_mapping.len();
-        model_pub_key_mapping.clear();
-        debug!("Cleared {} model public key mappings", model_pub_key_count);
-        drop(model_pub_key_mapping);
-
         info!(
-            "Inference provider pool shutdown completed. Cleaned up: {} models, {} load balancer indices, {} chat mappings, {} signatures, {} model public key mappings",
-            model_count, index_count, chat_count, sig_count, model_pub_key_count
+            "Inference provider pool shutdown completed. Cleaned up: {} models, {} pubkeys, {} load balancer indices, {} chat mappings, {} signatures",
+            model_count, pubkey_count, index_count, chat_count, sig_count
         );
     }
 }

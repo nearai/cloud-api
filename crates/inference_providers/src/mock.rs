@@ -810,7 +810,7 @@ impl crate::InferenceProvider for MockProvider {
     async fn get_attestation_report(
         &self,
         model: String,
-        _signing_algo: Option<String>,
+        signing_algo: Option<String>,
         _nonce: Option<String>,
         _signing_address: Option<String>,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
@@ -820,6 +820,20 @@ impl crate::InferenceProvider for MockProvider {
             "attestation".to_string(),
             serde_json::Value::String("mock-attestation".to_string()),
         );
+
+        // Include signing_public_key for encryption tests
+        // ECDSA: 128 hex chars (64 bytes) - uncompressed point (x and y coordinates, 32 bytes each)
+        // Ed25519: 64 hex chars (32 bytes) - public key bytes
+        let mock_signing_public_key = match signing_algo.as_deref() {
+            Some("ecdsa") => "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            Some("ed25519") => "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+            _ => "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", // default to ecdsa format (128 hex chars)
+        };
+        report.insert(
+            "signing_public_key".to_string(),
+            serde_json::Value::String(mock_signing_public_key.to_string()),
+        );
+
         Ok(report)
     }
 }

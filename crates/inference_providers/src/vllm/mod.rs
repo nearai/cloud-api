@@ -3,6 +3,19 @@ use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
 
+/// Encryption header keys used in params.extra for passing encryption information
+mod encryption_headers {
+    /// Key for signing algorithm (x-signing-algo header)
+    pub const SIGNING_ALGO: &str = "x_signing_algo";
+    /// Key for client public key (x-client-pub-key header)
+    pub const CLIENT_PUB_KEY: &str = "x_client_pub_key";
+    /// Key for model public key (x-model-pub-key header)
+    /// Note: This is not forwarded to vllm-proxy (vllm-proxy doesn't accept it),
+    /// but kept here for consistency with other encryption header constants
+    #[allow(dead_code)]
+    pub const MODEL_PUB_KEY: &str = "x_model_pub_key";
+}
+
 /// Configuration for vLLM provider
 #[derive(Debug, Clone)]
 pub struct VLlmConfig {
@@ -58,6 +71,43 @@ impl VLlmProvider {
         }
 
         Ok(headers)
+    }
+
+    /// Prepare encryption headers by extracting them from `extra` and forwarding as HTTP headers.
+    /// Also removes encryption-related keys from `extra` to prevent them from leaking into the JSON body.
+    ///
+    /// NOTE: `x_model_pub_key` is intentionally not forwarded to vllm-proxy. It is consumed by the
+    /// cloud API layer for provider routing and is not needed by the downstream vllm-proxy, so it
+    /// is stripped from `extra` without being added as an HTTP header.
+    fn prepare_encryption_headers(
+        &self,
+        headers: &mut reqwest::header::HeaderMap,
+        extra: &mut std::collections::HashMap<String, serde_json::Value>,
+    ) {
+        // Extract and forward x_signing_algo as HTTP header, then remove from extra
+        if let Some(algo) = extra
+            .remove(encryption_headers::SIGNING_ALGO)
+            .as_ref()
+            .and_then(|v| v.as_str())
+        {
+            if let Ok(value) = HeaderValue::from_str(algo) {
+                headers.insert("X-Signing-Algo", value);
+            }
+        }
+
+        // Extract and forward x_client_pub_key as HTTP header, then remove from extra
+        if let Some(pub_key) = extra
+            .remove(encryption_headers::CLIENT_PUB_KEY)
+            .as_ref()
+            .and_then(|v| v.as_str())
+        {
+            if let Ok(value) = HeaderValue::from_str(pub_key) {
+                headers.insert("X-Client-Pub-Key", value);
+            }
+        }
+
+        // Remove x_model_pub_key from extra (not forwarded to vllm-proxy, used only for routing)
+        extra.remove(encryption_headers::MODEL_PUB_KEY);
     }
 }
 
@@ -210,6 +260,9 @@ impl InferenceProvider for VLlmProvider {
             .map_err(|e| CompletionError::CompletionError(format!("Invalid request hash: {e}")))?;
         headers.insert("X-Request-Hash", request_hash_value);
 
+        // Prepare encryption headers
+        self.prepare_encryption_headers(&mut headers, &mut streaming_params.extra);
+
         let response = self
             .client
             .post(&url)
@@ -245,6 +298,8 @@ impl InferenceProvider for VLlmProvider {
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
         let url = format!("{}/v1/chat/completions", self.config.base_url);
 
+        let mut non_streaming_params = params;
+
         let mut headers = self
             .build_headers()
             .map_err(CompletionError::CompletionError)?;
@@ -252,11 +307,14 @@ impl InferenceProvider for VLlmProvider {
             .map_err(|e| CompletionError::CompletionError(format!("Invalid request hash: {e}")))?;
         headers.insert("X-Request-Hash", request_hash_value);
 
+        // Prepare encryption headers
+        self.prepare_encryption_headers(&mut headers, &mut non_streaming_params.extra);
+
         let response = self
             .client
             .post(&url)
             .headers(headers)
-            .json(&params)
+            .json(&non_streaming_params)
             .send()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;

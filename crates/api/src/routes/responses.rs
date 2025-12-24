@@ -5,7 +5,7 @@ use crate::{
 use axum::{
     body::Body,
     extract::{Extension, Json, Path, Query, State},
-    http::{header, Response, StatusCode},
+    http::{header, HeaderMap, Response, StatusCode},
     response::{IntoResponse, Json as ResponseJson},
 };
 use bytes::Bytes;
@@ -119,6 +119,7 @@ pub async fn create_response(
     State(state): State<ResponseRouteState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    headers: HeaderMap,
     Json(mut request): Json<CreateResponseRequest>,
 ) -> axum::response::Response {
     let service = state.response_service.clone();
@@ -135,6 +136,29 @@ pub async fn create_response(
             ResponseJson(ErrorResponse::new(
                 error,
                 "invalid_request_error".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
+    // Extract and validate encryption headers if present
+    let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
+        Ok(headers) => headers,
+        Err(err) => return err.into_response(),
+    };
+
+    let signing_algo = encryption_headers.signing_algo;
+    let client_pub_key = encryption_headers.client_pub_key;
+    let model_pub_key = encryption_headers.model_pub_key;
+
+    // Encryption requires streaming mode because encrypted chunks from vLLM are independently
+    // encrypted and cannot be concatenated. Non-streaming mode would produce corrupted data.
+    if signing_algo.is_some() && client_pub_key.is_some() && request.stream != Some(true) {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Non-streaming mode is not supported with encryption. Use stream=true.".to_string(),
+                "encryption_requires_streaming".to_string(),
             )),
         )
             .into_response();
@@ -168,6 +192,9 @@ pub async fn create_response(
                 api_key.organization.id.0,
                 api_key.workspace.id.0,
                 body_hash.hash.clone(),
+                signing_algo.clone(),
+                client_pub_key.clone(),
+                model_pub_key.clone(),
             )
             .await
         {
@@ -287,6 +314,9 @@ pub async fn create_response(
                 api_key.organization.id.0,
                 api_key.workspace.id.0,
                 body_hash.hash.clone(),
+                signing_algo.clone(),
+                client_pub_key.clone(),
+                model_pub_key.clone(),
             )
             .await
         {

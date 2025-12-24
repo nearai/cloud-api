@@ -639,10 +639,7 @@ async fn test_responses_with_case_insensitive_encryption_headers() {
 
     let request_body = serde_json::json!({
         "model": model,
-        "input": {
-            "type": "text",
-            "text": "Test message"
-        },
+        "input": "Test message",
         "stream": true,
         "max_output_tokens": 50
     });

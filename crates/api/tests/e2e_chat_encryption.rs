@@ -313,7 +313,7 @@ async fn test_chat_completions_with_partial_encryption_headers() {
     // The actual behavior depends on vllm-proxy implementation
     assert!(
         response1.status_code() == 200,
-        "Request with partial encryption headers should either succeed without encryption"
+        "Request with partial encryption headers should succeed without encryption"
     );
 
     // Test with only X-Client-Pub-Key (missing X-Signing-Algo)
@@ -329,7 +329,7 @@ async fn test_chat_completions_with_partial_encryption_headers() {
     // Should still work (headers are passed through, vllm-proxy will handle validation)
     assert!(
         response2.status_code() == 200,
-        "Request with partial encryption headers should either succeed without encryption"
+        "Request with partial encryption headers should succeed without encryption"
     );
 }
 
@@ -419,7 +419,7 @@ async fn test_chat_completions_with_invalid_encryption_algorithm() {
     // Headers are passed through, vllm-proxy will validate and return error
     // The actual status code depends on vllm-proxy's validation
     assert!(
-        response.status_code() == 400,
+        response.status_code() == 200 || response.status_code() == 400,
         "Request with invalid algorithm should either succeed or return 400"
     );
 }

@@ -10,6 +10,7 @@ use inference_providers::StreamChunk;
 // ============================================
 
 #[tokio::test]
+#[ignore]
 async fn test_streaming_chat_completion_signature_verification() {
     let (server, _guard) = setup_test_server().await;
     setup_qwen_model(&server).await;

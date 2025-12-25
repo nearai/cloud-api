@@ -57,8 +57,6 @@ pub struct InferenceProviderPool {
     load_balancer_index: Arc<RwLock<HashMap<String, usize>>>,
     /// Map of chat_id -> provider for sticky routing
     chat_id_mapping: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
-    /// Map of chat_id -> (request_hash, response_hash) for MockProvider signature generation
-    signature_hashes: Arc<RwLock<HashMap<String, (String, String)>>>,
     /// Background task handle for periodic model discovery refresh
     refresh_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -79,7 +77,6 @@ impl InferenceProviderPool {
             provider_mappings: Arc::new(RwLock::new(ProviderMappings::new())),
             load_balancer_index: Arc::new(RwLock::new(HashMap::new())),
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
-            signature_hashes: Arc::new(RwLock::new(HashMap::new())),
             refresh_task_handle: Arc::new(Mutex::new(None)),
         }
     }
@@ -517,25 +514,6 @@ impl InferenceProviderPool {
     ) -> Option<Arc<dyn InferenceProvider + Send + Sync>> {
         let mapping = self.chat_id_mapping.read().await;
         mapping.get(chat_id).cloned()
-    }
-
-    /// Register signature hashes for a chat_id
-    /// MockProvider will check this when get_signature is called
-    pub async fn register_signature_hashes_for_chat(
-        &self,
-        chat_id: &str,
-        request_hash: String,
-        response_hash: String,
-    ) {
-        let mut hashes = self.signature_hashes.write().await;
-        hashes.insert(chat_id.to_string(), (request_hash, response_hash));
-        tracing::debug!("Registered signature hashes for chat_id: {}", chat_id);
-    }
-
-    /// Get signature hashes for a chat_id (used by MockProvider)
-    pub async fn get_signature_hashes_for_chat(&self, chat_id: &str) -> Option<(String, String)> {
-        let hashes = self.signature_hashes.read().await;
-        hashes.get(chat_id).cloned()
     }
 
     /// Lookup provider by model signing public key
@@ -1002,17 +980,9 @@ impl InferenceProviderPool {
         debug!("Cleared {} chat session mappings", chat_count);
         drop(chat_mapping);
 
-        // Step 5: Clear signature hashes
-        debug!("Step 5: Clearing signature hash tracking");
-        let mut sig_hashes = self.signature_hashes.write().await;
-        let sig_count = sig_hashes.len();
-        sig_hashes.clear();
-        debug!("Cleared {} signature hash entries", sig_count);
-        drop(sig_hashes);
-
         info!(
-            "Inference provider pool shutdown completed. Cleaned up: {} models, {} pubkeys, {} load balancer indices, {} chat mappings, {} signatures",
-            model_count, pubkey_count, index_count, chat_count, sig_count
+            "Inference provider pool shutdown completed. Cleaned up: {} models, {} pubkeys, {} load balancer indices, {} chat mappings",
+            model_count, pubkey_count, index_count, chat_count
         );
     }
 }

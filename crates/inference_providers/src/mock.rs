@@ -17,6 +17,13 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 
+fn compute_sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
+}
+
 /// Hash pair for signature generation
 #[derive(Clone, Debug)]
 struct SignatureHashes {
@@ -111,7 +118,7 @@ impl ResponseTemplate {
     /// Generate a ChatCompletionResponse from this template
     fn generate_response(
         &self,
-        id: String,
+        chat_id: String,
         created: i64,
         model: String,
         input_tokens: i32,
@@ -119,7 +126,7 @@ impl ResponseTemplate {
         // Calculate output tokens as word count of content
         let output_tokens = self.content.split_whitespace().count() as i32;
         ChatCompletionResponse {
-            id,
+            id: chat_id,
             object: "chat.completion".to_string(),
             created,
             model,
@@ -632,7 +639,7 @@ impl crate::InferenceProvider for MockProvider {
     async fn chat_completion_stream(
         &self,
         params: ChatCompletionParams,
-        _request_hash: String,
+        request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
         // Check for invalid model
         if !self.is_valid_model(&params.model) {
@@ -668,16 +675,33 @@ impl crate::InferenceProvider for MockProvider {
         let mut chunks = if has_tools && params.tools.is_some() {
             self.generate_chat_chunks(&params, true)
         } else {
-            let id = self.generate_chat_id();
+            let chat_id = self.generate_chat_id();
             let created = self.current_timestamp();
             let model = params.model.clone();
-            response_template.generate_chunks(id, created, model, input_tokens)
+            response_template.generate_chunks(chat_id, created, model, input_tokens)
         };
 
         // If disconnect simulation is enabled, truncate chunks (simulates client disconnect)
         // The stream will end abruptly without the final usage chunk
         if let Some(disconnect_at) = response_template.disconnect_after_chunks {
             chunks.truncate(disconnect_at);
+        }
+
+        // Register signature hashes for this chat_id.
+        // response_hash is computed over the exact SSE bytes returned by the API:
+        // concatenated "data: {json}\n\n" lines plus the final "data: [DONE]\n\n" terminator.
+        let chat_id_opt = chunks.first().map(|c| c.id.clone());
+        if let Some(chat_id) = chat_id_opt {
+            let mut accumulated: Vec<u8> = Vec::new();
+            for chunk in &chunks {
+                let json = serde_json::to_value(chunk).unwrap();
+                let raw_bytes = Self::sse_data_static(&json);
+                accumulated.extend_from_slice(&raw_bytes);
+            }
+            accumulated.extend_from_slice(b"data: [DONE]\n\n");
+            let response_hash = compute_sha256_hex(&accumulated);
+            self.register_signature_hashes(chat_id, request_hash, response_hash)
+                .await;
         }
 
         // Convert chunks to SSE stream
@@ -696,7 +720,7 @@ impl crate::InferenceProvider for MockProvider {
     async fn chat_completion(
         &self,
         params: ChatCompletionParams,
-        _request_hash: String,
+        request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
         // Check for invalid model
         if !self.is_valid_model(&params.model) {
@@ -706,7 +730,7 @@ impl crate::InferenceProvider for MockProvider {
             )));
         }
 
-        let id = self.generate_chat_id();
+        let chat_id = self.generate_chat_id();
         let created = self.current_timestamp();
         let model = params.model.clone();
 
@@ -731,10 +755,17 @@ impl crate::InferenceProvider for MockProvider {
         // Ensure at least some input tokens for very short messages
         let input_tokens = input_tokens.max(6);
 
-        let response = response_template.generate_response(id, created, model, input_tokens);
+        // Keep a stable chat_id for both the response and signature registration.
+        let response =
+            response_template.generate_response(chat_id.clone(), created, model, input_tokens);
 
         let raw_bytes = serde_json::to_vec(&response)
             .map_err(|e| CompletionError::CompletionError(format!("Failed to serialize: {e}")))?;
+
+        // Register signature hashes for non-streaming chat completions (hash of exact JSON bytes).
+        let response_hash = compute_sha256_hex(&raw_bytes);
+        self.register_signature_hashes(chat_id.clone(), request_hash, response_hash)
+            .await;
 
         Ok(ChatCompletionResponseWithBytes {
             response,

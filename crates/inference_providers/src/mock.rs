@@ -118,7 +118,7 @@ impl ResponseTemplate {
     /// Generate a ChatCompletionResponse from this template
     fn generate_response(
         &self,
-        chat_id: String,
+        id: String,
         created: i64,
         model: String,
         input_tokens: i32,
@@ -126,7 +126,7 @@ impl ResponseTemplate {
         // Calculate output tokens as word count of content
         let output_tokens = self.content.split_whitespace().count() as i32;
         ChatCompletionResponse {
-            id: chat_id,
+            id,
             object: "chat.completion".to_string(),
             created,
             model,
@@ -675,10 +675,10 @@ impl crate::InferenceProvider for MockProvider {
         let mut chunks = if has_tools && params.tools.is_some() {
             self.generate_chat_chunks(&params, true)
         } else {
-            let chat_id = self.generate_chat_id();
+            let id = self.generate_chat_id();
             let created = self.current_timestamp();
             let model = params.model.clone();
-            response_template.generate_chunks(chat_id, created, model, input_tokens)
+            response_template.generate_chunks(id, created, model, input_tokens)
         };
 
         // If disconnect simulation is enabled, truncate chunks (simulates client disconnect)
@@ -734,7 +734,7 @@ impl crate::InferenceProvider for MockProvider {
             )));
         }
 
-        let chat_id = self.generate_chat_id();
+        let id = self.generate_chat_id();
         let created = self.current_timestamp();
         let model = params.model.clone();
 
@@ -761,14 +761,14 @@ impl crate::InferenceProvider for MockProvider {
 
         // Keep a stable chat_id for both the response and signature registration.
         let response =
-            response_template.generate_response(chat_id.clone(), created, model, input_tokens);
+            response_template.generate_response(id.clone(), created, model, input_tokens);
 
         let raw_bytes = serde_json::to_vec(&response)
             .map_err(|e| CompletionError::CompletionError(format!("Failed to serialize: {e}")))?;
 
         // Register signature hashes for non-streaming chat completions (hash of exact JSON bytes).
         let response_hash = compute_sha256_hex(&raw_bytes);
-        self.register_signature_hashes(chat_id.clone(), request_hash, response_hash)
+        self.register_signature_hashes(id, request_hash, response_hash)
             .await;
 
         Ok(ChatCompletionResponseWithBytes {

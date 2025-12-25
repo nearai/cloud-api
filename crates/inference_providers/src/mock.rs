@@ -702,7 +702,9 @@ impl crate::InferenceProvider for MockProvider {
                 let raw_bytes = Self::sse_data_static(&json);
                 accumulated.extend_from_slice(&raw_bytes);
             }
-            accumulated.extend_from_slice(b"data: [DONE]\n\n");
+            if response_template.disconnect_after_chunks.is_none() {
+                accumulated.extend_from_slice(b"data: [DONE]\n\n");
+            }
             let response_hash = compute_sha256_hex(&accumulated);
             self.register_signature_hashes(chat_id, request_hash, response_hash)
                 .await;

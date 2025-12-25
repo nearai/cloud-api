@@ -688,7 +688,7 @@ impl crate::InferenceProvider for MockProvider {
         }
 
         // Register signature hashes for this chat_id.
-        // response_hash is computed over the exact SSE bytes returned by the API:
+        // response_hash is computed over SSE bytes in the same format as returned by the API:
         // concatenated "data: {json}\n\n" lines plus the final "data: [DONE]\n\n" terminator.
         let chat_id_opt = chunks.first().map(|c| c.id.clone());
         if let Some(chat_id) = chat_id_opt {

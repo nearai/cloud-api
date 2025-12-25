@@ -694,7 +694,11 @@ impl crate::InferenceProvider for MockProvider {
         if let Some(chat_id) = chat_id_opt {
             let mut accumulated: Vec<u8> = Vec::new();
             for chunk in &chunks {
-                let json = serde_json::to_value(chunk).unwrap();
+                let json = serde_json::to_value(chunk).map_err(|e| {
+                    CompletionError::CompletionError(format!(
+                        "Failed to serialize mock chunk to JSON for hashing: {e}"
+                    ))
+                })?;
                 let raw_bytes = Self::sse_data_static(&json);
                 accumulated.extend_from_slice(&raw_bytes);
             }

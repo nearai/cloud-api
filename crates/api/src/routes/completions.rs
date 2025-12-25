@@ -175,9 +175,6 @@ pub async fn chat_completions(
             .into_response();
     }
 
-    // Clone request_hash before moving body_hash
-    let request_hash = body_hash.hash.clone();
-
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
     let mut service_request = convert_chat_request_to_service(
@@ -217,8 +214,6 @@ pub async fn chat_completions(
 
     // Check if streaming is requested
     if request.stream == Some(true) {
-        let inference_provider_pool = app_state.inference_provider_pool.clone();
-
         // Call the streaming completion service
         match app_state
             .completion_service
@@ -251,10 +246,6 @@ pub async fn chat_completions(
                 let chat_id_clone = chat_id_state.clone();
 
                 // Convert to raw bytes stream with proper SSE formatting
-                let pool_clone = inference_provider_pool.clone();
-                let req_hash_clone = request_hash.clone();
-                let pool_clone2 = pool_clone.clone();
-                let req_hash_clone2 = req_hash_clone.clone();
                 let byte_stream = peekable_stream
                     .then(move |result| {
                         let accumulated_inner = accumulated_clone.clone();
@@ -314,27 +305,6 @@ pub async fn chat_completions(
                             .lock()
                             .await
                             .extend_from_slice(&done_bytes);
-
-                        // Compute response hash from accumulated bytes
-                        let bytes_accumulated = accumulated_bytes.lock().await.clone();
-                        let response_hash = {
-                            use sha2::{Digest, Sha256};
-                            let mut hasher = Sha256::new();
-                            hasher.update(&bytes_accumulated);
-                            format!("{:x}", hasher.finalize())
-                        };
-
-                        // Update response hash in InferenceProviderPool
-                        // InterceptStream::Drop will read this and store to database
-                        if let Some(chat_id) = chat_id_state.lock().await.clone() {
-                            pool_clone2
-                                .register_signature_hashes_for_chat(
-                                    &chat_id,
-                                    req_hash_clone2.clone(),
-                                    response_hash,
-                                )
-                                .await;
-                        }
 
                         Ok::<Bytes, Infallible>(done_bytes)
                     }));

@@ -13,12 +13,12 @@ use crate::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 
 fn compute_sha256_hex(data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())

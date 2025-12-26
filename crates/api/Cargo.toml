@@ -42,13 +42,13 @@ bytes = "1.11"
 http-body-util = "0.1"
 # AWS S3 for file storage
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1.118"
+aws-sdk-s3 = "1.119"
 # NEAR wallet authentication
 near-api = "0.8.2"
 base64 = "0.22"
 # Ordered collections
 indexmap = "2"
-moka = { version = "0.12.11", features = ["future"] }
+moka = { version = "0.12.12", features = ["future"] }
 # URL encoding
 urlencoding = "2.1"
 

@@ -22,6 +22,7 @@ dstack-sdk = "0.1.2"
 dstack-sdk-types = "0.1.2"
 serde_urlencoded = "0.7.1"
 regex = "1"
+sha2 = "0.10"
 
 # Dev dependencies for testing and examples
 [dev-dependencies]

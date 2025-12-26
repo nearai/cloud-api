@@ -479,6 +479,7 @@ pub async fn init_inference_providers_with_mocks(
         "zai-org/GLM-4.6".to_string(),
         "nearai/gpt-oss-120b".to_string(),
         "dphn/Dolphin-Mistral-24B-Venice-Edition".to_string(),
+        "deepseek-ai/DeepSeek-V3.1".to_string(),
     ];
 
     let providers: Vec<(

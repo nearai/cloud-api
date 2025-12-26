@@ -106,6 +106,7 @@ pub trait ResponseItemRepositoryTrait: Send + Sync {
     ) -> anyhow::Result<Vec<models::ResponseOutputItem>>;
 }
 
+#[allow(clippy::too_many_arguments)]
 #[async_trait]
 pub trait ResponseServiceTrait: Send + Sync {
     async fn create_response_stream(
@@ -116,6 +117,9 @@ pub trait ResponseServiceTrait: Send + Sync {
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
         body_hash: String,
+        signing_algo: Option<String>,
+        client_pub_key: Option<String>,
+        model_pub_key: Option<String>,
     ) -> Result<
         Pin<Box<dyn Stream<Item = models::ResponseStreamEvent> + Send>>,
         errors::ResponseError,

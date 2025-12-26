@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use uuid::Uuid;
 
+use crate::common::encryption_headers;
 use crate::completions::ports::CompletionServiceTrait;
 use crate::conversations::models::ConversationId;
 use crate::conversations::ports::ConversationServiceTrait;
@@ -29,6 +30,9 @@ struct ProcessStreamContext {
     organization_id: uuid::Uuid,
     workspace_id: uuid::Uuid,
     body_hash: String,
+    signing_algo: Option<String>,
+    client_pub_key: Option<String>,
+    model_pub_key: Option<String>,
     response_repository: Arc<dyn ports::ResponseRepositoryTrait>,
     response_items_repository: Arc<dyn ports::ResponseItemRepositoryTrait>,
     completion_service: Arc<dyn CompletionServiceTrait>,
@@ -98,6 +102,9 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
         body_hash: String,
+        signing_algo: Option<String>,
+        client_pub_key: Option<String>,
+        model_pub_key: Option<String>,
     ) -> Result<
         Pin<Box<dyn Stream<Item = models::ResponseStreamEvent> + Send>>,
         errors::ResponseError,
@@ -117,6 +124,9 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let file_search_provider = self.file_search_provider.clone();
         let file_service = self.file_service.clone();
         let organization_service = self.organization_service.clone();
+        let signing_algo_clone = signing_algo.clone();
+        let client_pub_key_clone = client_pub_key.clone();
+        let model_pub_key_clone = model_pub_key.clone();
 
         tokio::spawn(async move {
             let context = ProcessStreamContext {
@@ -126,6 +136,9 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 organization_id,
                 workspace_id,
                 body_hash,
+                signing_algo: signing_algo_clone,
+                client_pub_key: client_pub_key_clone,
+                model_pub_key: model_pub_key_clone,
                 response_repository,
                 response_items_repository,
                 completion_service,
@@ -894,6 +907,8 @@ impl ResponseServiceImpl {
             context.conversation_service.clone(),
             context.completion_service.clone(),
             emitter.tx.clone(),
+            context.signing_algo.clone(),
+            context.client_pub_key.clone(),
         );
 
         let tools = Self::prepare_tools(&context.request);
@@ -1032,13 +1047,33 @@ impl ResponseServiceImpl {
 
             tracing::debug!("Agent loop iteration {}", iteration);
 
-            // Prepare extra params with tools
+            // Prepare extra params with tools and encryption headers
             let mut extra = std::collections::HashMap::new();
             if !tools.is_empty() {
                 extra.insert("tools".to_string(), serde_json::to_value(tools).unwrap());
             }
             if let Some(tc) = tool_choice {
                 extra.insert("tool_choice".to_string(), serde_json::to_value(tc).unwrap());
+            }
+
+            // Add encryption headers to extra for passing to completion service
+            if let Some(ref signing_algo) = process_context.signing_algo {
+                extra.insert(
+                    encryption_headers::SIGNING_ALGO.to_string(),
+                    serde_json::Value::String(signing_algo.clone()),
+                );
+            }
+            if let Some(ref client_pub_key) = process_context.client_pub_key {
+                extra.insert(
+                    encryption_headers::CLIENT_PUB_KEY.to_string(),
+                    serde_json::Value::String(client_pub_key.clone()),
+                );
+            }
+            if let Some(ref model_pub_key) = process_context.model_pub_key {
+                extra.insert(
+                    encryption_headers::MODEL_PUB_KEY.to_string(),
+                    serde_json::Value::String(model_pub_key.clone()),
+                );
             }
 
             // Create completion request (names not included - tracked via database analytics)
@@ -2365,7 +2400,15 @@ DO NOT USE THESE FORMATS:
         conversation_service: Arc<dyn ConversationServiceTrait>,
         completion_service: Arc<dyn CompletionServiceTrait>,
         tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
+        signing_algo: Option<String>,
+        client_pub_key: Option<String>,
     ) -> Option<tokio::task::JoinHandle<Result<(), errors::ResponseError>>> {
+        // Skip title generation if request is encrypted
+        // (both headers X-Signing-Algo and X-Client-Pub-Key are set)
+        if signing_algo.is_some() && client_pub_key.is_some() {
+            return None;
+        }
+
         // Only proceed if we have a conversation_id
         let conv_id = conversation_id?;
 

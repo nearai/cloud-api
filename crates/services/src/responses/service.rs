@@ -43,6 +43,8 @@ struct ProcessStreamContext {
     organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
     /// Source registry for citation resolution
     source_registry: Option<models::SourceRegistry>,
+    /// Counter for consecutive web search failures (for retry tracking)
+    web_search_failure_count: u32,
 }
 
 pub struct ResponseServiceImpl {
@@ -148,6 +150,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 file_service,
                 organization_service,
                 source_registry: None,
+                web_search_failure_count: 0,
             };
 
             if let Err(e) = Self::process_response_stream(tx.clone(), context).await {
@@ -1187,11 +1190,38 @@ impl ResponseServiceImpl {
             Err(e) => {
                 // Convert tool execution errors into error messages for the LLM
                 let error_message = format!("ERROR: {e}");
-                tracing::warn!(
-                    "Tool execution error for '{}': {}. Returning error message to LLM.",
-                    tool_call.tool_type,
-                    error_message
-                );
+
+                // Track failures for web_search tool with retry-aware logging
+                if tool_call.tool_type == "web_search" {
+                    process_context.web_search_failure_count += 1;
+                    const MAX_RETRIES: u32 = 3;
+
+                    if process_context.web_search_failure_count >= MAX_RETRIES {
+                        tracing::error!(
+                            tool = %tool_call.tool_type,
+                            failures = %process_context.web_search_failure_count,
+                            "Web search failed after {} attempts: {}. Feeding error back to LLM.",
+                            MAX_RETRIES,
+                            e
+                        );
+                    } else {
+                        tracing::warn!(
+                            tool = %tool_call.tool_type,
+                            attempt = %process_context.web_search_failure_count,
+                            "Web search failed (attempt {}/{}), feeding error back to LLM: {}",
+                            process_context.web_search_failure_count,
+                            MAX_RETRIES,
+                            e
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        "Tool execution error for '{}': {}. Returning error message to LLM.",
+                        tool_call.tool_type,
+                        error_message
+                    );
+                }
+
                 ToolExecutionResult {
                     content: error_message,
                     citation_instruction: None,
@@ -2306,6 +2336,9 @@ DO NOT USE THESE FORMATS:
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
+
+                    // Reset failure counter on successful web search
+                    context.web_search_failure_count = 0;
 
                     Ok(ToolExecutionResult {
                         content: formatted,

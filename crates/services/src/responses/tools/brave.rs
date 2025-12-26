@@ -159,7 +159,7 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unable to read error body".to_string());
-            tracing::error!("Brave API error (status {}): {}", status, error_body);
+            tracing::warn!("Brave API error (status {}): {}", status, error_body);
             return Err(WebSearchError::WebSearchRequestFailed(format!(
                 "HTTP {status}: {error_body}"
             )));

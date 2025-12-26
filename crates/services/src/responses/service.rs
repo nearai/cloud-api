@@ -1195,6 +1195,8 @@ impl ResponseServiceImpl {
                 let error_message = format!("ERROR: {e}");
 
                 // Track failures for web_search tool with retry-aware logging
+                // Note: We intentionally do NOT log the error details to avoid leaking user query data
+                // The error is fed back to the LLM via ToolExecutionResult for self-correction
                 if tool_call.tool_type == WEB_SEARCH_TOOL_NAME {
                     process_context.web_search_failure_count += 1;
                     const MAX_RETRIES: u32 = 3;
@@ -1203,25 +1205,21 @@ impl ResponseServiceImpl {
                         tracing::error!(
                             tool = %tool_call.tool_type,
                             failures = %process_context.web_search_failure_count,
-                            "Web search failed after {} attempts: {}. Feeding error back to LLM.",
+                            "Web search failed after {} attempts. Error fed back to LLM for correction.",
                             MAX_RETRIES,
-                            e
                         );
                     } else {
                         tracing::warn!(
                             tool = %tool_call.tool_type,
                             attempt = %process_context.web_search_failure_count,
-                            "Web search failed (attempt {}/{}), feeding error back to LLM: {}",
-                            process_context.web_search_failure_count,
-                            MAX_RETRIES,
-                            e
+                            max_retries = MAX_RETRIES,
+                            "Web search failed, feeding error back to LLM for retry",
                         );
                     }
                 } else {
                     tracing::warn!(
-                        "Tool execution error for '{}': {}. Returning error message to LLM.",
-                        tool_call.tool_type,
-                        error_message
+                        tool = %tool_call.tool_type,
+                        "Tool execution failed. Error fed back to LLM for correction.",
                     );
                 }
 

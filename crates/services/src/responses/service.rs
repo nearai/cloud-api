@@ -1199,7 +1199,7 @@ impl ResponseServiceImpl {
                     process_context.web_search_failure_count += 1;
                     const MAX_RETRIES: u32 = 3;
 
-                    if process_context.web_search_failure_count >= MAX_RETRIES {
+                    if process_context.web_search_failure_count > MAX_RETRIES {
                         tracing::error!(
                             tool = %tool_call.tool_type,
                             failures = %process_context.web_search_failure_count,

@@ -845,18 +845,16 @@ impl InferenceProviderPool {
             .await?;
 
         // Store chat_id mapping for sticky routing by peeking at the first event
+        // Must be synchronous to ensure attestation service can find the provider
         let mut peekable = StreamingResultExt::peekable(stream);
         if let Some(Ok(event)) = peekable.peek().await {
             if let inference_providers::StreamChunk::Chat(chat_chunk) = &event.chunk {
                 let chat_id = chat_chunk.id.clone();
-                let pool = self.clone();
-                tokio::spawn(async move {
-                    tracing::info!(
-                        chat_id = %chat_id,
-                        "Storing chat_id mapping"
-                    );
-                    pool.store_chat_id_mapping(chat_id, provider).await;
-                });
+                tracing::info!(
+                    chat_id = %chat_id,
+                    "Storing chat_id mapping for streaming completion"
+                );
+                self.store_chat_id_mapping(chat_id, provider).await;
             }
         }
         Ok(Box::pin(peekable))
@@ -1064,5 +1062,68 @@ mod tests {
 
         // HTTP status should still be present (not sensitive)
         assert!(sanitized.contains("401 Unauthorized"));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chat_id_mapping_available_immediately() {
+        use futures_util::StreamExt;
+        use inference_providers::mock::MockProvider;
+
+        let pool =
+            InferenceProviderPool::new("http://localhost:8080/models".to_string(), None, 5, 30);
+
+        let mock_provider = Arc::new(MockProvider::new());
+        let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
+        pool.register_provider(model_id.clone(), mock_provider)
+            .await;
+
+        let params = inference_providers::ChatCompletionParams {
+            model: model_id,
+            messages: vec![inference_providers::ChatMessage {
+                role: inference_providers::MessageRole::User,
+                content: Some("Hello".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: Some(true),
+            tools: None,
+            max_completion_tokens: None,
+            n: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            user: None,
+            seed: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            metadata: None,
+            store: None,
+            stream_options: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        let mut stream = pool
+            .chat_completion_stream(params, "test-request-hash".to_string())
+            .await
+            .expect("Should create stream");
+
+        let first_event = stream.next().await.unwrap().unwrap();
+        let chat_id = match first_event.chunk {
+            inference_providers::StreamChunk::Chat(chunk) => chunk.id,
+            _ => panic!("Expected chat chunk"),
+        };
+
+        // Mapping must be available immediately (no race with spawn)
+        assert!(pool.get_provider_by_chat_id(&chat_id).await.is_some());
+
+        while stream.next().await.is_some() {}
+        assert!(pool.get_provider_by_chat_id(&chat_id).await.is_some());
     }
 }

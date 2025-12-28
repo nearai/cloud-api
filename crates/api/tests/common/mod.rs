@@ -213,6 +213,44 @@ async fn build_test_server_components(
     (server, inference_provider_pool, mock_provider)
 }
 
+async fn build_test_server_components_with_real_provider(
+    database: Arc<Database>,
+    config: ApiConfig,
+) -> (
+    axum_test::TestServer,
+    Arc<services::inference_provider_pool::InferenceProviderPool>,
+) {
+    // Ensure the mock user exists even when using a real inference provider
+    assert_mock_user_in_db(&database).await;
+
+    // Initialize auth components based on the provided config
+    let auth_components = init_auth_services(database.clone(), &config);
+
+    // Use the real inference provider pool instead of mocks
+    let inference_provider_pool = api::init_inference_providers(&config).await;
+
+    let metrics_service = Arc::new(services::metrics::MockMetricsService);
+    let domain_services = api::init_domain_services_with_pool(
+        database.clone(),
+        &config,
+        auth_components.organization_service.clone(),
+        inference_provider_pool.clone(),
+        metrics_service,
+    )
+    .await;
+
+    let config_arc = Arc::new(config);
+    let app = build_app_with_config(
+        database.clone(),
+        auth_components,
+        domain_services,
+        config_arc.clone(),
+    );
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    (server, inference_provider_pool)
+}
+
 /// Setup test server. Returns guard that must be held to ensure database cleanup.
 pub async fn setup_test_server() -> (axum_test::TestServer, TestDatabaseGuard) {
     let (server, _, _, _, guard) = setup_test_server_with_pool().await;
@@ -270,6 +308,36 @@ pub async fn setup_test_server_with_pool() -> (
         database,
         guard,
     )
+}
+
+/// Setup test server backed by the real inference provider pool
+pub async fn setup_test_server_with_real_provider() -> (
+    axum_test::TestServer,
+    std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
+    TestDatabaseGuard,
+) {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(tracing::level_filters::LevelFilter::DEBUG)
+        .try_init();
+
+    let test_id = uuid::Uuid::new_v4().to_string();
+    let base_db_config = db_config_for_tests();
+    let db_name = db_setup::create_test_database_from_template(&base_db_config, &test_id)
+        .await
+        .expect("Failed to create test database from template");
+
+    let config = test_config_with_db(&db_name);
+    let db_config = config.database.clone();
+
+    let database = init_database_connection(&config.database).await;
+
+    let (server, inference_provider_pool) =
+        build_test_server_components_with_real_provider(database.clone(), config).await;
+
+    let guard = TestDatabaseGuard { db_name, db_config };
+
+    (server, inference_provider_pool, guard)
 }
 
 pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, String) {

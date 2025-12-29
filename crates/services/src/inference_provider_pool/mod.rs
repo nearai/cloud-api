@@ -548,10 +548,8 @@ impl InferenceProviderPool {
 
         // Filter by model_pub_key if provided
         let providers = if let Some(pub_key) = model_pub_key {
-            let pub_key_providers = {
-                let mappings = self.provider_mappings.read().await;
-                mappings.pubkey_to_providers.get(pub_key)?.clone()
-            };
+            // Use the existing 'mappings' lock instead of acquiring it again
+            let pub_key_providers = mappings.pubkey_to_providers.get(pub_key)?.clone();
 
             // Find intersection: providers that are in both lists
             let filtered: Vec<Arc<InferenceProviderTrait>> = model_providers
@@ -677,7 +675,8 @@ impl InferenceProviderPool {
                         "No provider found for model public key."
                     );
                     return Err(CompletionError::CompletionError(format!(
-                        "No provider found for model public key '{}...'. Encryption requires routing to the specific provider with this public key.",
+                        "No provider found for model {} with public key '{}...'. Encryption requires routing to the specific provider with this public key.",
+                        model_id,
                         pub_key.chars().take(32).collect::<String>()
                     )));
                 } else {

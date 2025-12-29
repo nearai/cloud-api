@@ -28,15 +28,15 @@ struct DiscoveryEntry {
 struct ProviderMappings {
     /// Map of model name -> list of providers (for load balancing)
     model_to_providers: HashMap<String, Vec<Arc<InferenceProviderTrait>>>,
-    /// Map of model signing public key -> provider for routing by model public key
-    pubkey_to_provider: HashMap<String, Arc<InferenceProviderTrait>>,
+    /// Map of model signing public key -> list of providers (for load balancing when multiple instances share the same key)
+    pubkey_to_providers: HashMap<String, Vec<Arc<InferenceProviderTrait>>>,
 }
 
 impl ProviderMappings {
     fn new() -> Self {
         Self {
             model_to_providers: HashMap::new(),
-            pubkey_to_provider: HashMap::new(),
+            pubkey_to_providers: HashMap::new(),
         }
     }
 }
@@ -96,7 +96,11 @@ impl InferenceProviderPool {
             .model_to_providers
             .insert(model_id, vec![provider.clone()]);
         for (key, provider) in pub_key_updates {
-            mappings.pubkey_to_provider.insert(key, provider);
+            mappings
+                .pubkey_to_providers
+                .entry(key)
+                .or_default()
+                .push(provider);
         }
     }
 
@@ -127,7 +131,11 @@ impl InferenceProviderPool {
                 mappings.model_to_providers.insert(model_id, providers);
             }
             for (key, provider) in pub_key_updates {
-                mappings.pubkey_to_provider.insert(key, provider);
+                mappings
+                    .pubkey_to_providers
+                    .entry(key)
+                    .or_default()
+                    .push(provider);
             }
         }
     }
@@ -466,7 +474,11 @@ impl InferenceProviderPool {
                 .insert(model_name, providers);
         }
         for (key, provider) in model_pub_key_updates {
-            new_mappings.pubkey_to_provider.insert(key, provider);
+            new_mappings
+                .pubkey_to_providers
+                .entry(key)
+                .or_default()
+                .push(provider);
         }
 
         // Atomic swap: replace entire mappings structure in one operation
@@ -516,36 +528,69 @@ impl InferenceProviderPool {
         mapping.get(chat_id).cloned()
     }
 
-    /// Lookup provider by model signing public key
-    /// Used when X-Model-Pub-Key header is provided to route to a specific model provider
-    pub async fn get_provider_by_model_pub_key(
-        &self,
-        model_pub_key: &str,
-    ) -> Option<Arc<InferenceProviderTrait>> {
-        let mappings = self.provider_mappings.read().await;
-        mappings.pubkey_to_provider.get(model_pub_key).cloned()
-    }
-
-    /// Get providers for a model in priority order for fallback
-    /// Returns providers with the round-robin selected one first, followed by others
+    /// Get providers with load balancing support
+    ///
+    /// This function handles provider selection based on model_id and optional model_pub_key:
+    /// - Gets providers by model_id first
+    /// - If model_pub_key is provided: Filters providers by public key
+    /// - Applies round-robin load balancing
+    ///
+    /// Returns providers with the round-robin selected one first, followed by others for fallback.
     async fn get_providers_with_fallback(
         &self,
         model_id: &str,
+        model_pub_key: Option<&str>,
     ) -> Option<Vec<Arc<InferenceProviderTrait>>> {
         let mappings = self.provider_mappings.read().await;
-        let providers = mappings.model_to_providers.get(model_id)?;
+
+        // Get providers by model_id first
+        let model_providers = mappings.model_to_providers.get(model_id)?.clone();
+
+        // Filter by model_pub_key if provided
+        let providers = if let Some(pub_key) = model_pub_key {
+            let pub_key_providers = {
+                let mappings = self.provider_mappings.read().await;
+                mappings.pubkey_to_providers.get(pub_key)?.clone()
+            };
+
+            // Find intersection: providers that are in both lists
+            // Use Arc::ptr_eq for pointer comparison since providers are Arc pointers
+            let filtered: Vec<Arc<InferenceProviderTrait>> = model_providers
+                .iter()
+                .filter(|model_provider| {
+                    pub_key_providers
+                        .iter()
+                        .any(|pub_provider| Arc::ptr_eq(model_provider, pub_provider))
+                })
+                .cloned()
+                .collect();
+
+            if filtered.is_empty() {
+                return None;
+            }
+
+            filtered
+        } else {
+            model_providers
+        };
 
         if providers.is_empty() {
             return None;
         }
 
         if providers.len() == 1 {
-            return Some(vec![providers[0].clone()]);
+            return Some(providers);
         }
 
-        // Get current index for round-robin
+        // Apply round-robin load balancing
+        let index_key = if let Some(pub_key) = model_pub_key {
+            format!("pubkey:{}", pub_key)
+        } else {
+            format!("id:{}", model_id)
+        };
+
         let mut indices = self.load_balancer_index.write().await;
-        let index = indices.entry(model_id.to_string()).or_insert(0);
+        let index = indices.entry(index_key).or_insert(0);
         let selected_index = *index % providers.len();
 
         // Increment for next request
@@ -558,13 +603,6 @@ impl InferenceProviderPool {
             let provider_index = (selected_index + i) % providers.len();
             ordered_providers.push(providers[provider_index].clone());
         }
-
-        tracing::debug!(
-            model = %model_id,
-            providers_count = providers.len(),
-            selected_index = selected_index,
-            "Prepared providers for fallback with round-robin priority"
-        );
 
         Some(ordered_providers)
     }
@@ -617,146 +655,75 @@ impl InferenceProviderPool {
         // Ensure models are discovered first
         self.ensure_models_discovered().await?;
 
-        // If model_pub_key is provided, route to the specific provider by signing public key.
-        // This is required for encryption - the client expects a specific provider with a specific
-        // public key. We must not fall back to model_id routing as that could route to a different
-        // provider that doesn't support the expected encryption.
-        if let Some(pub_key) = model_pub_key {
-            tracing::debug!(
-                model_id = %model_id,
-                model_pub_key = %pub_key,
-                operation = operation_name,
-                "Attempting to get provider by model public key"
-            );
-            match self.get_provider_by_model_pub_key(pub_key).await {
-                Some(provider) => match provider_fn(provider.clone()).await {
-                    Ok(result) => {
-                        return Ok((result, provider));
-                    }
-                    Err(e) => {
-                        tracing::warn!(
+        // Get providers with load balancing (handles both model_id and model_pub_key cases)
+        let providers = match self
+            .get_providers_with_fallback(model_id, model_pub_key)
+            .await
+        {
+            Some(p) => p,
+            None => {
+                // Handle error cases based on whether model_pub_key was provided
+                if let Some(pub_key) = model_pub_key {
+                    tracing::warn!(
                             model_id = %model_id,
                             model_pub_key = %pub_key,
                             operation = operation_name,
-                            error = %e,
-                            "Getting provider by model public key failed. Cannot fall back to model_id routing as encryption requirements must be met."
-                        );
-                        return Err(CompletionError::CompletionError(format!(
-                            "Getting provider for model public key '{}...' failed: {}. Encryption requires routing to the specific provider with this public key.",
-                            pub_key.chars().take(32).collect::<String>(),
-                            e
-                        )));
-                    }
-                },
-                None => {
-                    tracing::warn!(
-                        model_id = %model_id,
-                        model_pub_key = %pub_key,
-                        operation = operation_name,
-                        "No provider found for model public key. Cannot fall back to model_id routing as encryption requirements must be met."
+                        "No provider found for model public key."
                     );
                     return Err(CompletionError::CompletionError(format!(
                         "No provider found for model public key '{}...'. Encryption requires routing to the specific provider with this public key.",
                         pub_key.chars().take(32).collect::<String>()
                     )));
+                } else {
+                    let mappings = self.provider_mappings.read().await;
+                    let available_models: Vec<_> = mappings.model_to_providers.keys().collect();
+
+                    tracing::error!(
+                        model_id = %model_id,
+                        available_models = ?available_models,
+                        operation = operation_name,
+                        "Model not found in provider pool"
+                    );
+                    return Err(CompletionError::CompletionError(format!(
+                        "Model '{model_id}' not found in any configured provider"
+                    )));
                 }
-            }
-        }
-
-        // Get all providers with fallback priority
-        let providers = match self.get_providers_with_fallback(model_id).await {
-            Some(p) => p,
-            None => {
-                let mappings = self.provider_mappings.read().await;
-                let available_models: Vec<_> = mappings.model_to_providers.keys().collect();
-
-                tracing::error!(
-                    model_id = %model_id,
-                    available_models = ?available_models,
-                    operation = operation_name,
-                    "Model not found in provider pool"
-                );
-                return Err(CompletionError::CompletionError(format!(
-                    "Model '{model_id}' not found in any configured provider"
-                )));
             }
         };
 
-        tracing::info!(
-            model_id = %model_id,
-            providers_count = providers.len(),
-            operation = operation_name,
-            "Attempting {} with {} provider(s)",
-            operation_name,
-            providers.len()
-        );
-
-        // Collect sanitized errors for user-facing message
-        let mut sanitized_errors = Vec::new();
-        // Keep detailed errors for logging only
-        let mut detailed_errors = Vec::new();
-
         // Try each provider in order until one succeeds
+        let mut sanitized_errors = Vec::new();
         for (attempt, provider) in providers.iter().enumerate() {
-            tracing::debug!(
-                model_id = %model_id,
-                attempt = attempt + 1,
-                total_providers = providers.len(),
-                operation = operation_name,
-                "Trying provider {} of {}",
-                attempt + 1,
-                providers.len()
-            );
-
             match provider_fn(provider.clone()).await {
                 Ok(result) => {
-                    tracing::info!(
-                        model_id = %model_id,
-                        attempt = attempt + 1,
-                        operation = operation_name,
-                        "Successfully completed request with provider"
-                    );
                     return Ok((result, provider.clone()));
                 }
                 Err(e) => {
-                    let error_str = e.to_string();
-
-                    // Log the full detailed error for debugging
-                    tracing::warn!(
-                        model_id = %model_id,
-                        attempt = attempt + 1,
-                        operation = operation_name,
-                        "Provider failed, will try next provider if available"
-                    );
-
-                    // Store detailed error for logging
-                    detailed_errors.push(format!("Provider {}: {}", attempt + 1, error_str));
-
-                    // Store sanitized error for user-facing response
-                    let sanitized = Self::sanitize_error_message(&error_str);
+                    let sanitized = Self::sanitize_error_message(&e.to_string());
                     sanitized_errors.push(format!("Provider {}: {}", attempt + 1, sanitized));
                 }
             }
         }
 
-        // All providers failed - log detailed errors but return sanitized message to user
-        // let detailed_error_msg = detailed_errors.join("; ");
+        // All providers failed
         let sanitized_error_msg = sanitized_errors.join("; ");
+        let error_msg = if let Some(pub_key) = model_pub_key {
+            format!(
+                "All {} provider(s) failed for model public key '{}...': {}",
+                providers.len(),
+                pub_key.chars().take(32).collect::<String>(),
+                sanitized_error_msg
+            )
+        } else {
+            format!(
+                "All {} provider(s) failed for model '{}': {}",
+                providers.len(),
+                model_id,
+                sanitized_error_msg
+            )
+        };
 
-        tracing::error!(
-            model_id = %model_id,
-            providers_tried = providers.len(),
-            operation = operation_name,
-            "All providers failed for model"
-        );
-
-        // Return sanitized error to user
-        Err(CompletionError::CompletionError(format!(
-            "All {} provider(s) failed for model '{}': {}",
-            providers.len(),
-            model_id,
-            sanitized_error_msg
-        )))
+        Err(CompletionError::CompletionError(error_msg))
     }
 
     pub async fn get_attestation_report(
@@ -954,7 +921,7 @@ impl InferenceProviderPool {
         debug!("Step 2: Clearing provider mappings");
         let mut mappings = self.provider_mappings.write().await;
         let model_count = mappings.model_to_providers.len();
-        let pubkey_count = mappings.pubkey_to_provider.len();
+        let pubkey_count = mappings.pubkey_to_providers.len();
         *mappings = ProviderMappings::new();
         debug!(
             "Cleared {} model mappings and {} pubkey mappings",

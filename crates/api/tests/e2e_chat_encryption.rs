@@ -424,6 +424,193 @@ async fn test_chat_completions_with_invalid_encryption_algorithm() {
     );
 }
 
+/// Test that multiple providers sharing the same public key work correctly
+/// When X-Model-Pub-Key is provided, load balancing should work across providers with that key
+#[tokio::test]
+async fn test_multiple_providers_sharing_same_pub_key() {
+    use common::setup_test_server_with_pool;
+    use inference_providers::MockProvider;
+    use std::sync::Arc;
+
+    let (server, pool, _mock_provider, _database, _guard) = setup_test_server_with_pool().await;
+    setup_deepseek_model(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let model = "deepseek-ai/DeepSeek-V3.1";
+
+    // Register multiple providers for the same model
+    // All mock providers will return the same public key for the same algorithm
+    let provider1 = Arc::new(MockProvider::new_accept_all());
+    let provider2 = Arc::new(MockProvider::new_accept_all());
+    let provider3 = Arc::new(MockProvider::new_accept_all());
+
+    let provider1_trait: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
+        provider1.clone();
+    let provider2_trait: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
+        provider2.clone();
+    let provider3_trait: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
+        provider3.clone();
+
+    pool.register_providers(vec![
+        (model.to_string(), provider1_trait),
+        (model.to_string(), provider2_trait),
+        (model.to_string(), provider3_trait),
+    ])
+    .await;
+
+    // Fetch model public key (all providers should return the same key)
+    let model_pub_key = get_model_public_key(&server, model, Some("ecdsa"))
+        .await
+        .expect("Failed to fetch model public key from attestation report");
+
+    // Mock ECDSA public key (should match what mock provider returns)
+    let mock_ecdsa_pub_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    // Make multiple requests with X-Model-Pub-Key
+    // Load balancing should distribute requests across the 3 providers
+    for i in 0..5 {
+        let request_body = serde_json::json!({
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": format!("Request {}", i)
+                }
+            ],
+            "stream": false,
+            "max_tokens": 50
+        });
+
+        let response = server
+            .post("/v1/chat/completions")
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .add_header("X-Signing-Algo", "ecdsa")
+            .add_header("X-Client-Pub-Key", mock_ecdsa_pub_key)
+            .add_header("X-Model-Pub-Key", &model_pub_key)
+            .json(&request_body)
+            .await;
+
+        // All requests should succeed (load balancing across providers with same key)
+        assert_eq!(
+            response.status_code(),
+            200,
+            "Request {} with X-Model-Pub-Key should succeed when multiple providers share the key",
+            i
+        );
+
+        let response_json: serde_json::Value = response.json();
+        assert!(
+            response_json.get("choices").is_some(),
+            "Response {} should contain choices",
+            i
+        );
+    }
+}
+
+/// Test that requests work without X-Model-Pub-Key when all providers share the same public key
+/// When X-Model-Pub-Key is not provided, the system should route to any provider for the model
+#[tokio::test]
+async fn test_chat_completions_without_model_pub_key_when_all_share_same_key() {
+    use common::setup_test_server_with_pool;
+    use inference_providers::MockProvider;
+    use std::sync::Arc;
+
+    let (server, pool, _mock_provider, _database, _guard) = setup_test_server_with_pool().await;
+    setup_deepseek_model(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let model = "deepseek-ai/DeepSeek-V3.1";
+
+    // Register multiple providers for the same model
+    // All mock providers will return the same public key
+    let provider1 = Arc::new(MockProvider::new_accept_all());
+    let provider2 = Arc::new(MockProvider::new_accept_all());
+
+    let provider1_trait: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
+        provider1.clone();
+    let provider2_trait: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
+        provider2.clone();
+
+    pool.register_providers(vec![
+        (model.to_string(), provider1_trait),
+        (model.to_string(), provider2_trait),
+    ])
+    .await;
+
+    // Mock ECDSA public key
+    let mock_ecdsa_pub_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    // Make request WITHOUT X-Model-Pub-Key
+    // Should still work because we route by model_id when pub_key is not provided
+    let request_body = serde_json::json!({
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": "Hello, how are you?"
+            }
+        ],
+        "stream": false,
+        "max_tokens": 50
+    });
+
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("X-Signing-Algo", "ecdsa")
+        .add_header("X-Client-Pub-Key", mock_ecdsa_pub_key)
+        // No X-Model-Pub-Key header - should route by model_id only
+        .json(&request_body)
+        .await;
+
+    // Request should succeed (routing by model_id works even without X-Model-Pub-Key)
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Request without X-Model-Pub-Key should succeed when routing by model_id"
+    );
+
+    let response_json: serde_json::Value = response.json();
+    assert!(
+        response_json.get("choices").is_some(),
+        "Response should contain choices"
+    );
+
+    // Make another request to verify load balancing works
+    let request_body2 = serde_json::json!({
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": "What is the weather?"
+            }
+        ],
+        "stream": false,
+        "max_tokens": 50
+    });
+
+    let response2 = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("X-Signing-Algo", "ecdsa")
+        .add_header("X-Client-Pub-Key", mock_ecdsa_pub_key)
+        // No X-Model-Pub-Key header
+        .json(&request_body2)
+        .await;
+
+    assert_eq!(
+        response2.status_code(),
+        200,
+        "Second request without X-Model-Pub-Key should also succeed"
+    );
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// Responses API tests
+/// ------------------------------------------------------------------------------------------------
+
 /// Test that streaming responses with ECDSA encryption headers are passed through correctly
 #[tokio::test]
 async fn test_responses_streaming_with_ecdsa_encryption_headers() {
@@ -765,5 +952,182 @@ async fn test_responses_non_streaming_with_encryption_returns_error() {
             .unwrap()
             .contains("Non-streaming mode is not supported with encryption"),
         "Error message should explain that non-streaming mode is not supported with encryption"
+    );
+}
+
+/// Test that multiple providers sharing the same public key work correctly for Responses API
+/// When X-Model-Pub-Key is provided, load balancing should work across providers with that key
+#[tokio::test]
+async fn test_responses_multiple_providers_sharing_same_pub_key() {
+    use common::setup_test_server_with_pool;
+    use inference_providers::MockProvider;
+    use std::sync::Arc;
+
+    let (server, pool, _mock_provider, _database, _guard) = setup_test_server_with_pool().await;
+    setup_deepseek_model(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let model = "deepseek-ai/DeepSeek-V3.1";
+
+    // Register multiple providers for the same model
+    // All mock providers will return the same public key for the same algorithm
+    let provider1 = Arc::new(MockProvider::new_accept_all());
+    let provider2 = Arc::new(MockProvider::new_accept_all());
+    let provider3 = Arc::new(MockProvider::new_accept_all());
+
+    let provider1_trait: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
+        provider1.clone();
+    let provider2_trait: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
+        provider2.clone();
+    let provider3_trait: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
+        provider3.clone();
+
+    pool.register_providers(vec![
+        (model.to_string(), provider1_trait),
+        (model.to_string(), provider2_trait),
+        (model.to_string(), provider3_trait),
+    ])
+    .await;
+
+    // Fetch model public key (all providers should return the same key)
+    let model_pub_key = get_model_public_key(&server, model, Some("ecdsa"))
+        .await
+        .expect("Failed to fetch model public key from attestation report");
+
+    // Mock ECDSA public key (should match what mock provider returns)
+    let mock_ecdsa_pub_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    // Make multiple requests with X-Model-Pub-Key
+    // Load balancing should distribute requests across the 3 providers
+    for i in 0..5 {
+        let request_body = serde_json::json!({
+            "model": model,
+            "input": format!("Request {}", i),
+            "stream": true, // Streaming mode required for encryption
+            "max_output_tokens": 50
+        });
+
+        let response = server
+            .post("/v1/responses")
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .add_header("X-Signing-Algo", "ecdsa")
+            .add_header("X-Client-Pub-Key", mock_ecdsa_pub_key)
+            .add_header("X-Model-Pub-Key", &model_pub_key)
+            .json(&request_body)
+            .await;
+
+        // All requests should succeed (load balancing across providers with same key)
+        assert_eq!(
+            response.status_code(),
+            200,
+            "Request {} with X-Model-Pub-Key should succeed when multiple providers share the key",
+            i
+        );
+
+        // Verify we get SSE stream
+        let response_text = response.text();
+        assert!(
+            response_text.contains("event: ") || response_text.contains("data: "),
+            "Response {} should contain SSE events or data",
+            i
+        );
+    }
+}
+
+/// Test that requests work without X-Model-Pub-Key when all providers share the same public key for Responses API
+/// When X-Model-Pub-Key is not provided, the system should route to any provider for the model
+#[tokio::test]
+async fn test_responses_without_model_pub_key_when_all_share_same_key() {
+    use common::setup_test_server_with_pool;
+    use inference_providers::MockProvider;
+    use std::sync::Arc;
+
+    let (server, pool, _mock_provider, _database, _guard) = setup_test_server_with_pool().await;
+    setup_deepseek_model(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let model = "deepseek-ai/DeepSeek-V3.1";
+
+    // Register multiple providers for the same model
+    // All mock providers will return the same public key
+    let provider1 = Arc::new(MockProvider::new_accept_all());
+    let provider2 = Arc::new(MockProvider::new_accept_all());
+
+    let provider1_trait: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
+        provider1.clone();
+    let provider2_trait: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
+        provider2.clone();
+
+    pool.register_providers(vec![
+        (model.to_string(), provider1_trait),
+        (model.to_string(), provider2_trait),
+    ])
+    .await;
+
+    // Mock ECDSA public key
+    let mock_ecdsa_pub_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    // Make request WITHOUT X-Model-Pub-Key
+    // Should still work because we route by model_id when pub_key is not provided
+    let request_body = serde_json::json!({
+        "model": model,
+        "input": "Hello, how are you?",
+        "stream": true, // Streaming mode required for encryption
+        "max_output_tokens": 50
+    });
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("X-Signing-Algo", "ecdsa")
+        .add_header("X-Client-Pub-Key", mock_ecdsa_pub_key)
+        // No X-Model-Pub-Key header - should route by model_id only
+        .json(&request_body)
+        .await;
+
+    // Request should succeed (routing by model_id works even without X-Model-Pub-Key)
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Request without X-Model-Pub-Key should succeed when routing by model_id"
+    );
+
+    // Verify we get SSE stream
+    let response_text = response.text();
+    assert!(
+        response_text.contains("event: ") || response_text.contains("data: "),
+        "Response should contain SSE events or data"
+    );
+
+    // Make another request to verify load balancing works
+    let request_body2 = serde_json::json!({
+        "model": model,
+        "input": "What is the weather?",
+        "stream": true,
+        "max_output_tokens": 50
+    });
+
+    let response2 = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("X-Signing-Algo", "ecdsa")
+        .add_header("X-Client-Pub-Key", mock_ecdsa_pub_key)
+        // No X-Model-Pub-Key header
+        .json(&request_body2)
+        .await;
+
+    assert_eq!(
+        response2.status_code(),
+        200,
+        "Second request without X-Model-Pub-Key should also succeed"
+    );
+
+    // Verify we get SSE stream
+    let response_text2 = response2.text();
+    assert!(
+        response_text2.contains("event: ") || response_text2.contains("data: "),
+        "Second response should contain SSE events or data"
     );
 }

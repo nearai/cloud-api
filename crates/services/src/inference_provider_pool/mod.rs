@@ -554,7 +554,6 @@ impl InferenceProviderPool {
             };
 
             // Find intersection: providers that are in both lists
-            // Use Arc::ptr_eq for pointer comparison since providers are Arc pointers
             let filtered: Vec<Arc<InferenceProviderTrait>> = model_providers
                 .iter()
                 .filter(|model_provider| {

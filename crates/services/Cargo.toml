@@ -49,13 +49,13 @@ jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 regex = "1.11"
 # AWS S3 for file storage
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1.118"
+aws-sdk-s3 = "1.119"
 # Encryption for file storage
 aes-gcm = "0.10"
 # HMAC for VPC signature verification
 hmac = "0.12"
 sha2 = "0.10"
-moka = { version = "0.12.11", features = ["future"] }
+moka = { version = "0.12.12", features = ["future"] }
 bloomfilter = "3.0.1"
 
 [dev-dependencies]

@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use uuid::Uuid;
 
+use crate::common::encryption_headers;
 use crate::completions::ports::CompletionServiceTrait;
 use crate::conversations::models::ConversationId;
 use crate::conversations::ports::ConversationServiceTrait;
@@ -12,6 +13,9 @@ use crate::files::FileServiceTrait;
 use crate::inference_provider_pool::InferenceProviderPool;
 use crate::responses::tools;
 use crate::responses::{citation_tracker, errors, models, ports};
+
+/// Tool name constant for web search to avoid typos and improve maintainability
+const WEB_SEARCH_TOOL_NAME: &str = "web_search";
 
 /// Result of tool execution including optional citation instruction
 struct ToolExecutionResult {
@@ -29,6 +33,9 @@ struct ProcessStreamContext {
     organization_id: uuid::Uuid,
     workspace_id: uuid::Uuid,
     body_hash: String,
+    signing_algo: Option<String>,
+    client_pub_key: Option<String>,
+    model_pub_key: Option<String>,
     response_repository: Arc<dyn ports::ResponseRepositoryTrait>,
     response_items_repository: Arc<dyn ports::ResponseItemRepositoryTrait>,
     completion_service: Arc<dyn CompletionServiceTrait>,
@@ -39,6 +46,8 @@ struct ProcessStreamContext {
     organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
     /// Source registry for citation resolution
     source_registry: Option<models::SourceRegistry>,
+    /// Counter for consecutive web search failures (for retry tracking)
+    web_search_failure_count: u32,
 }
 
 pub struct ResponseServiceImpl {
@@ -98,6 +107,9 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
         body_hash: String,
+        signing_algo: Option<String>,
+        client_pub_key: Option<String>,
+        model_pub_key: Option<String>,
     ) -> Result<
         Pin<Box<dyn Stream<Item = models::ResponseStreamEvent> + Send>>,
         errors::ResponseError,
@@ -117,6 +129,9 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let file_search_provider = self.file_search_provider.clone();
         let file_service = self.file_service.clone();
         let organization_service = self.organization_service.clone();
+        let signing_algo_clone = signing_algo.clone();
+        let client_pub_key_clone = client_pub_key.clone();
+        let model_pub_key_clone = model_pub_key.clone();
 
         tokio::spawn(async move {
             let context = ProcessStreamContext {
@@ -126,6 +141,9 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 organization_id,
                 workspace_id,
                 body_hash,
+                signing_algo: signing_algo_clone,
+                client_pub_key: client_pub_key_clone,
+                model_pub_key: model_pub_key_clone,
                 response_repository,
                 response_items_repository,
                 completion_service,
@@ -135,6 +153,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 file_service,
                 organization_service,
                 source_registry: None,
+                web_search_failure_count: 0,
             };
 
             if let Err(e) = Self::process_response_stream(tx.clone(), context).await {
@@ -894,6 +913,8 @@ impl ResponseServiceImpl {
             context.conversation_service.clone(),
             context.completion_service.clone(),
             emitter.tx.clone(),
+            context.signing_algo.clone(),
+            context.client_pub_key.clone(),
         );
 
         let tools = Self::prepare_tools(&context.request);
@@ -1032,13 +1053,33 @@ impl ResponseServiceImpl {
 
             tracing::debug!("Agent loop iteration {}", iteration);
 
-            // Prepare extra params with tools
+            // Prepare extra params with tools and encryption headers
             let mut extra = std::collections::HashMap::new();
             if !tools.is_empty() {
                 extra.insert("tools".to_string(), serde_json::to_value(tools).unwrap());
             }
             if let Some(tc) = tool_choice {
                 extra.insert("tool_choice".to_string(), serde_json::to_value(tc).unwrap());
+            }
+
+            // Add encryption headers to extra for passing to completion service
+            if let Some(ref signing_algo) = process_context.signing_algo {
+                extra.insert(
+                    encryption_headers::SIGNING_ALGO.to_string(),
+                    serde_json::Value::String(signing_algo.clone()),
+                );
+            }
+            if let Some(ref client_pub_key) = process_context.client_pub_key {
+                extra.insert(
+                    encryption_headers::CLIENT_PUB_KEY.to_string(),
+                    serde_json::Value::String(client_pub_key.clone()),
+                );
+            }
+            if let Some(ref model_pub_key) = process_context.model_pub_key {
+                extra.insert(
+                    encryption_headers::MODEL_PUB_KEY.to_string(),
+                    serde_json::Value::String(model_pub_key.clone()),
+                );
             }
 
             // Create completion request (names not included - tracked via database analytics)
@@ -1143,7 +1184,7 @@ impl ResponseServiceImpl {
         }
 
         // Emit tool-specific start events
-        if tool_call.tool_type == "web_search" {
+        if tool_call.tool_type == WEB_SEARCH_TOOL_NAME {
             Self::emit_web_search_start(ctx, emitter, &tool_call_id, tool_call).await?;
         }
 
@@ -1153,11 +1194,36 @@ impl ResponseServiceImpl {
             Err(e) => {
                 // Convert tool execution errors into error messages for the LLM
                 let error_message = format!("ERROR: {e}");
-                tracing::warn!(
-                    "Tool execution error for '{}': {}. Returning error message to LLM.",
-                    tool_call.tool_type,
-                    error_message
-                );
+
+                // Track failures for web_search tool with retry-aware logging
+                // Note: We intentionally do NOT log the error details to avoid leaking user query data
+                // The error is fed back to the LLM via ToolExecutionResult for self-correction
+                if tool_call.tool_type == WEB_SEARCH_TOOL_NAME {
+                    process_context.web_search_failure_count += 1;
+                    const MAX_RETRIES: u32 = 3;
+
+                    if process_context.web_search_failure_count > MAX_RETRIES {
+                        tracing::error!(
+                            tool = %tool_call.tool_type,
+                            failures = %process_context.web_search_failure_count,
+                            "Web search failed after {} attempts. Error fed back to LLM for correction.",
+                            MAX_RETRIES,
+                        );
+                    } else {
+                        tracing::warn!(
+                            tool = %tool_call.tool_type,
+                            attempt = %process_context.web_search_failure_count,
+                            max_retries = MAX_RETRIES,
+                            "Web search failed, feeding error back to LLM for retry",
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        tool = %tool_call.tool_type,
+                        "Tool execution failed. Error fed back to LLM for correction.",
+                    );
+                }
+
                 ToolExecutionResult {
                     content: error_message,
                     citation_instruction: None,
@@ -1166,7 +1232,7 @@ impl ResponseServiceImpl {
         };
 
         // Emit tool-specific completion events
-        if tool_call.tool_type == "web_search" {
+        if tool_call.tool_type == WEB_SEARCH_TOOL_NAME {
             Self::emit_web_search_complete(
                 ctx,
                 emitter,
@@ -1669,7 +1735,7 @@ impl ResponseServiceImpl {
                         tool_definitions.push(inference_providers::ToolDefinition {
                             type_: "function".to_string(),
                             function: inference_providers::FunctionDefinition {
-                                name: "web_search".to_string(),
+                                name: WEB_SEARCH_TOOL_NAME.to_string(),
                                 description: Some(
                                     "Search the web for current information. Use this when you need up-to-date information or facts that you don't have. \
                                     \n\nIMPORTANT PARAMETERS TO CONSIDER:\
@@ -2162,7 +2228,7 @@ impl ResponseServiceImpl {
         }
 
         match tool_call.tool_type.as_str() {
-            "web_search" => {
+            WEB_SEARCH_TOOL_NAME => {
                 if let Some(provider) = &context.web_search_provider {
                     // Build WebSearchParams from tool call parameters
                     let mut search_params = tools::WebSearchParams::new(tool_call.query.clone());
@@ -2273,12 +2339,17 @@ DO NOT USE THESE FORMATS:
                         .collect::<Vec<_>>()
                         .join("\n");
 
+                    // Reset failure counter on successful web search
+                    context.web_search_failure_count = 0;
+
                     Ok(ToolExecutionResult {
                         content: formatted,
                         citation_instruction,
                     })
                 } else {
-                    Err(errors::ResponseError::UnknownTool("web_search".to_string()))
+                    Err(errors::ResponseError::UnknownTool(
+                        WEB_SEARCH_TOOL_NAME.to_string(),
+                    ))
                 }
             }
             "file_search" => {
@@ -2366,7 +2437,15 @@ DO NOT USE THESE FORMATS:
         conversation_service: Arc<dyn ConversationServiceTrait>,
         completion_service: Arc<dyn CompletionServiceTrait>,
         tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
+        signing_algo: Option<String>,
+        client_pub_key: Option<String>,
     ) -> Option<tokio::task::JoinHandle<Result<(), errors::ResponseError>>> {
+        // Skip title generation if request is encrypted
+        // (both headers X-Signing-Algo and X-Client-Pub-Key are set)
+        if signing_algo.is_some() && client_pub_key.is_some() {
+            return None;
+        }
+
         // Only proceed if we have a conversation_id
         let conv_id = conversation_id?;
 
@@ -3393,7 +3472,7 @@ mod tests {
                 status: models::ResponseItemStatus::Completed,
                 tool_type: "function".to_string(),
                 function: models::ResponseOutputFunction {
-                    name: "web_search".to_string(),
+                    name: WEB_SEARCH_TOOL_NAME.to_string(),
                     arguments: "{}".to_string(),
                 },
                 model: "test-model".to_string(),

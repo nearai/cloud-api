@@ -1,3 +1,4 @@
+use crate::common::encryption_headers;
 use inference_providers::{
     models::{AttestationError, CompletionError, ListModelsError, ModelsResponse},
     ChatCompletionParams, InferenceProvider, StreamingResult, StreamingResultExt, VLlmConfig,
@@ -21,6 +22,25 @@ struct DiscoveryEntry {
     tags: Vec<String>,
 }
 
+/// Combined provider mappings updated atomically to prevent race conditions
+/// Both mappings are updated together under a single lock to ensure consistency
+#[derive(Clone)]
+struct ProviderMappings {
+    /// Map of model name -> list of providers (for load balancing)
+    model_to_providers: HashMap<String, Vec<Arc<InferenceProviderTrait>>>,
+    /// Map of model signing public key -> list of providers (for load balancing when multiple instances share the same key)
+    pubkey_to_providers: HashMap<String, Vec<Arc<InferenceProviderTrait>>>,
+}
+
+impl ProviderMappings {
+    fn new() -> Self {
+        Self {
+            model_to_providers: HashMap::new(),
+            pubkey_to_providers: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct InferenceProviderPool {
     /// Discovery URL for dynamic model discovery
@@ -31,14 +51,12 @@ pub struct InferenceProviderPool {
     discovery_timeout: Duration,
     /// HTTP timeout for model inference requests
     inference_timeout_secs: i64,
-    /// Map of model name -> list of providers (for load balancing)
-    model_mapping: Arc<RwLock<HashMap<String, Vec<Arc<InferenceProviderTrait>>>>>,
+    /// Combined provider mappings (updated atomically to prevent race conditions)
+    provider_mappings: Arc<RwLock<ProviderMappings>>,
     /// Round-robin index for each model
     load_balancer_index: Arc<RwLock<HashMap<String, usize>>>,
     /// Map of chat_id -> provider for sticky routing
     chat_id_mapping: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
-    /// Map of chat_id -> (request_hash, response_hash) for MockProvider signature generation
-    signature_hashes: Arc<RwLock<HashMap<String, (String, String)>>>,
     /// Background task handle for periodic model discovery refresh
     refresh_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -56,31 +74,69 @@ impl InferenceProviderPool {
             api_key,
             discovery_timeout: Duration::from_secs(discovery_timeout_secs as u64),
             inference_timeout_secs,
-            model_mapping: Arc::new(RwLock::new(HashMap::new())),
+            provider_mappings: Arc::new(RwLock::new(ProviderMappings::new())),
             load_balancer_index: Arc::new(RwLock::new(HashMap::new())),
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
-            signature_hashes: Arc::new(RwLock::new(HashMap::new())),
             refresh_task_handle: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Register a provider for a model manually (useful for testing with mock providers)
+    /// Also populates model_pub_key_mapping by fetching the attestation report
+    /// Fetches attestation reports for both ECDSA and Ed25519 to support both signing algorithms
     pub async fn register_provider(&self, model_id: String, provider: Arc<InferenceProviderTrait>) {
-        let mut model_mapping = self.model_mapping.write().await;
-        model_mapping
-            .entry(model_id)
-            .or_insert_with(Vec::new)
-            .push(provider);
+        // Fetch signing public keys for both algorithms
+        // Use "mock" as URL identifier for logging (since this is typically used for mock providers)
+        let (pub_key_updates, _has_valid_attestation) =
+            Self::fetch_signing_public_keys_for_both_algorithms(&provider, &model_id, "mock").await;
+
+        // Atomic update: update both mappings together under a single lock
+        let mut mappings = self.provider_mappings.write().await;
+        mappings
+            .model_to_providers
+            .insert(model_id, vec![provider.clone()]);
+        for (key, provider) in pub_key_updates {
+            mappings
+                .pubkey_to_providers
+                .entry(key)
+                .or_default()
+                .push(provider);
+        }
     }
 
     /// Register multiple providers for multiple models (useful for testing)
+    /// Also populates model_pub_key_mapping by fetching attestation reports
+    /// Fetches attestation reports for both ECDSA and Ed25519 to support both signing algorithms
     pub async fn register_providers(&self, providers: Vec<(String, Arc<InferenceProviderTrait>)>) {
-        let mut model_mapping = self.model_mapping.write().await;
+        // Phase 1: Collect attestation reports and public keys (no locks held)
+        let mut pub_key_updates: Vec<(String, Arc<InferenceProviderTrait>)> = Vec::new();
+        let mut model_providers: HashMap<String, Vec<Arc<InferenceProviderTrait>>> = HashMap::new();
+
         for (model_id, provider) in providers {
-            model_mapping
-                .entry(model_id)
-                .or_insert_with(Vec::new)
-                .push(provider);
+            // Fetch signing public keys for both algorithms to populate model_pub_key_mapping
+            // Use "mock" as URL identifier for logging (since this is typically used for mock providers)
+            let (keys, _has_valid_attestation) =
+                Self::fetch_signing_public_keys_for_both_algorithms(&provider, &model_id, "mock")
+                    .await;
+            pub_key_updates.extend(keys);
+
+            model_providers.entry(model_id).or_default().push(provider);
+        }
+
+        // Phase 2: Atomic bulk update of both mappings under a single lock
+        // This ensures consistency - both mappings are updated together
+        {
+            let mut mappings = self.provider_mappings.write().await;
+            for (model_id, providers) in model_providers {
+                mappings.model_to_providers.insert(model_id, providers);
+            }
+            for (key, provider) in pub_key_updates {
+                mappings
+                    .pubkey_to_providers
+                    .entry(key)
+                    .or_default()
+                    .push(provider);
+            }
         }
     }
 
@@ -157,13 +213,149 @@ impl InferenceProviderPool {
         Some((ip.to_string(), port))
     }
 
+    /// Fetch signing public keys for both ECDSA and Ed25519 algorithms
+    ///
+    /// Attempts to fetch attestation reports for both signing algorithms and returns
+    /// all available signing public keys. This ensures that providers are registered
+    /// for both algorithms if they support them.
+    ///
+    /// # Arguments
+    /// * `provider` - The inference provider to fetch the attestation reports from
+    /// * `model_name` - The model name to request attestation for
+    /// * `url` - Optional URL for logging purposes (can be empty string if not available)
+    ///
+    /// # Returns
+    /// * Tuple of (signing_public_keys, has_valid_attestation) where:
+    ///   - `signing_public_keys`: Vector of (signing_public_key, provider) tuples for all available algorithms
+    ///   - `has_valid_attestation`: True if at least one attestation report was successfully fetched
+    async fn fetch_signing_public_keys_for_both_algorithms(
+        provider: &Arc<InferenceProviderTrait>,
+        model_name: &str,
+        url: &str,
+    ) -> (Vec<(String, Arc<InferenceProviderTrait>)>, bool) {
+        let mut pub_key_updates = Vec::new();
+        let mut has_valid_attestation = false;
+
+        // Fetch for ECDSA
+        if let Some(attestation_report) = Self::fetch_attestation_report_with_retry_for_algo(
+            provider,
+            model_name,
+            url,
+            Some("ecdsa"),
+        )
+        .await
+        {
+            has_valid_attestation = true;
+            if let Some(signing_public_key) = attestation_report
+                .get("signing_public_key")
+                .and_then(|v| v.as_str())
+            {
+                pub_key_updates.push((signing_public_key.to_string(), provider.clone()));
+            }
+        }
+
+        // Fetch for Ed25519
+        if let Some(attestation_report) = Self::fetch_attestation_report_with_retry_for_algo(
+            provider,
+            model_name,
+            url,
+            Some("ed25519"),
+        )
+        .await
+        {
+            has_valid_attestation = true;
+            if let Some(signing_public_key) = attestation_report
+                .get("signing_public_key")
+                .and_then(|v| v.as_str())
+            {
+                pub_key_updates.push((signing_public_key.to_string(), provider.clone()));
+            }
+        }
+
+        (pub_key_updates, has_valid_attestation)
+    }
+
+    /// Fetch attestation report with retries for a specific signing algorithm
+    ///
+    /// Retries up to 3 times with exponential backoff (100ms, 200ms, 400ms).
+    /// This prevents providers from being excluded from the pool due to transient network issues.
+    ///
+    /// # Arguments
+    /// * `provider` - The inference provider to fetch the attestation report from
+    /// * `model_name` - The model name to request attestation for
+    /// * `url` - Optional URL for logging purposes (can be empty string if not available)
+    /// * `signing_algo` - Optional signing algorithm ("ecdsa" or "ed25519")
+    ///
+    /// # Returns
+    /// * `Some(attestation_report)` if successful after retries
+    /// * `None` if all retry attempts failed
+    async fn fetch_attestation_report_with_retry_for_algo(
+        provider: &Arc<InferenceProviderTrait>,
+        model_name: &str,
+        url: &str,
+        signing_algo: Option<&str>,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        const MAX_ATTEMPTS: u32 = 3;
+        const INITIAL_DELAY_MS: u64 = 100;
+
+        for attempt in 0..MAX_ATTEMPTS {
+            match provider
+                .get_attestation_report(
+                    model_name.to_string(),
+                    signing_algo.map(|s| s.to_string()),
+                    None,
+                    None,
+                )
+                .await
+            {
+                Ok(report) => {
+                    if attempt > 0 {
+                        tracing::debug!(
+                            model = %model_name,
+                            url = %url,
+                            attempt = attempt + 1,
+                            "Successfully fetched attestation report after retry"
+                        );
+                    }
+                    return Some(report);
+                }
+                Err(e) => {
+                    if attempt < MAX_ATTEMPTS - 1 {
+                        // Exponential backoff: 100ms, 200ms, 400ms
+                        let delay_ms = INITIAL_DELAY_MS * (1 << attempt);
+                        tracing::debug!(
+                            model = %model_name,
+                            url = %url,
+                            attempt = attempt + 1,
+                            max_attempts = MAX_ATTEMPTS,
+                            delay_ms = delay_ms,
+                            error = %e,
+                            "Failed to fetch attestation report, retrying..."
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    } else {
+                        tracing::warn!(
+                            model = %model_name,
+                            url = %url,
+                            attempts = MAX_ATTEMPTS,
+                            error = %e,
+                            "Provider failed to return attestation report after retries, excluding from pool"
+                        );
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
     /// Ensure models are discovered before using them
     async fn ensure_models_discovered(&self) -> Result<(), CompletionError> {
-        let model_mapping = self.model_mapping.read().await;
+        let mappings = self.provider_mappings.read().await;
 
         // If mapping is empty, we need to discover models
-        if model_mapping.is_empty() {
-            drop(model_mapping); // Release read lock
+        if mappings.model_to_providers.is_empty() {
+            drop(mappings); // Release read lock
             tracing::warn!("Model mapping is empty, triggering model discovery");
             self.discover_models().await.map_err(|e| {
                 CompletionError::CompletionError(format!("Failed to discover models: {e}"))
@@ -178,9 +370,6 @@ impl InferenceProviderPool {
 
         // Fetch from discovery server
         let discovery_map = self.fetch_from_discovery().await?;
-
-        let mut model_mapping = self.model_mapping.write().await;
-        model_mapping.clear();
 
         // Group by model name
         let mut model_to_endpoints: HashMap<String, Vec<(String, u16)>> = HashMap::new();
@@ -211,8 +400,11 @@ impl InferenceProviderPool {
             }
         }
 
-        // Create providers for each endpoint
+        // Phase 1: Collect all attestation reports and create providers (no locks held)
+        // This minimizes lock duration by doing all network I/O before acquiring locks
         let mut all_models = Vec::new();
+        let mut model_providers: HashMap<String, Vec<Arc<InferenceProviderTrait>>> = HashMap::new();
+        let mut model_pub_key_updates: Vec<(String, Arc<InferenceProviderTrait>)> = Vec::new();
 
         for (model_name, endpoints) in model_to_endpoints {
             tracing::info!(
@@ -238,37 +430,66 @@ impl InferenceProviderPool {
                     Some(self.inference_timeout_secs),
                 ))) as Arc<InferenceProviderTrait>;
 
-                match provider
-                    .get_attestation_report(model_name.clone(), None, None, None)
-                    .await
-                {
-                    Ok(_) => {
-                        providers_for_model.push(provider);
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            model = %model_name,
-                            url = %url,
-                            error = %e,
-                            "Provider failed to return attestation report, excluding from pool"
-                        );
-                    }
+                // Fetch attestation report with retries to handle transient network failures
+                // We need at least one successful attestation report to include the provider
+                // But we fetch both ECDSA and Ed25519 keys to register the provider for both algorithms
+                let (pub_keys, has_valid_attestation) =
+                    Self::fetch_signing_public_keys_for_both_algorithms(
+                        &provider,
+                        &model_name,
+                        &url,
+                    )
+                    .await;
+
+                // If we got at least one successful attestation report, the provider is valid and should be included
+                // Note: signing_public_key may not be present in the attestation report (e.g., for non-encrypted providers)
+                if has_valid_attestation {
+                    model_pub_key_updates.extend(pub_keys);
+                    providers_for_model.push(provider);
                 }
             }
 
-            model_mapping.insert(model_name.clone(), providers_for_model);
+            if !providers_for_model.is_empty() {
+                model_providers.insert(model_name.clone(), providers_for_model);
 
-            all_models.push(inference_providers::models::ModelInfo {
-                id: model_name,
-                object: "model".to_string(),
-                created: 0,
-                owned_by: "discovered".to_string(),
-            });
+                all_models.push(inference_providers::models::ModelInfo {
+                    id: model_name,
+                    object: "model".to_string(),
+                    created: 0,
+                    owned_by: "discovered".to_string(),
+                });
+            }
+        }
+
+        // Calculate metrics before acquiring locks
+        let total_providers: usize = model_providers.values().map(|v| v.len()).sum();
+
+        // Phase 2: Atomic bulk update of both mappings under a single lock
+        // This ensures consistency - both mappings are updated together atomically
+        // Build new mappings structure
+        let mut new_mappings = ProviderMappings::new();
+        for (model_name, providers) in model_providers {
+            new_mappings
+                .model_to_providers
+                .insert(model_name, providers);
+        }
+        for (key, provider) in model_pub_key_updates {
+            new_mappings
+                .pubkey_to_providers
+                .entry(key)
+                .or_default()
+                .push(provider);
+        }
+
+        // Atomic swap: replace entire mappings structure in one operation
+        {
+            let mut mappings = self.provider_mappings.write().await;
+            *mappings = new_mappings;
         }
 
         tracing::info!(
             total_models = all_models.len(),
-            total_providers = model_mapping.values().map(|v| v.len()).sum::<usize>(),
+            total_providers = total_providers,
             model_ids = ?all_models.iter().map(|m| &m.id).collect::<Vec<_>>(),
             "Model discovery from endpoint completed"
         );
@@ -283,8 +504,8 @@ impl InferenceProviderPool {
         &self,
         model_id: &str,
     ) -> Option<Vec<Arc<InferenceProviderTrait>>> {
-        let model_mapping = self.model_mapping.read().await;
-        model_mapping.get(model_id).cloned()
+        let mappings = self.provider_mappings.read().await;
+        mappings.model_to_providers.get(model_id).cloned()
     }
 
     /// Store a mapping of chat_id to provider
@@ -307,45 +528,66 @@ impl InferenceProviderPool {
         mapping.get(chat_id).cloned()
     }
 
-    /// Register signature hashes for a chat_id
-    /// MockProvider will check this when get_signature is called
-    pub async fn register_signature_hashes_for_chat(
-        &self,
-        chat_id: &str,
-        request_hash: String,
-        response_hash: String,
-    ) {
-        let mut hashes = self.signature_hashes.write().await;
-        hashes.insert(chat_id.to_string(), (request_hash, response_hash));
-        tracing::debug!("Registered signature hashes for chat_id: {}", chat_id);
-    }
-
-    /// Get signature hashes for a chat_id (used by MockProvider)
-    pub async fn get_signature_hashes_for_chat(&self, chat_id: &str) -> Option<(String, String)> {
-        let hashes = self.signature_hashes.read().await;
-        hashes.get(chat_id).cloned()
-    }
-
-    /// Get providers for a model in priority order for fallback
-    /// Returns providers with the round-robin selected one first, followed by others
+    /// Get providers with load balancing support
+    ///
+    /// This function handles provider selection based on model_id and optional model_pub_key:
+    /// - Gets providers by model_id first
+    /// - If model_pub_key is provided: Filters providers by public key
+    /// - Applies round-robin load balancing
+    ///
+    /// Returns providers with the round-robin selected one first, followed by others for fallback.
     async fn get_providers_with_fallback(
         &self,
         model_id: &str,
+        model_pub_key: Option<&str>,
     ) -> Option<Vec<Arc<InferenceProviderTrait>>> {
-        let model_mapping = self.model_mapping.read().await;
-        let providers = model_mapping.get(model_id)?;
+        let mappings = self.provider_mappings.read().await;
+
+        // Get providers by model_id first
+        let model_providers = mappings.model_to_providers.get(model_id)?.clone();
+
+        // Filter by model_pub_key if provided
+        let providers = if let Some(pub_key) = model_pub_key {
+            // Use the existing 'mappings' lock instead of acquiring it again
+            let pub_key_providers = mappings.pubkey_to_providers.get(pub_key)?.clone();
+
+            // Find intersection: providers that are in both lists
+            let filtered: Vec<Arc<InferenceProviderTrait>> = model_providers
+                .iter()
+                .filter(|model_provider| {
+                    pub_key_providers
+                        .iter()
+                        .any(|pub_provider| Arc::ptr_eq(model_provider, pub_provider))
+                })
+                .cloned()
+                .collect();
+
+            if filtered.is_empty() {
+                return None;
+            }
+
+            filtered
+        } else {
+            model_providers
+        };
 
         if providers.is_empty() {
             return None;
         }
 
         if providers.len() == 1 {
-            return Some(vec![providers[0].clone()]);
+            return Some(providers);
         }
 
-        // Get current index for round-robin
+        // Apply round-robin load balancing
+        let index_key = if let Some(pub_key) = model_pub_key {
+            format!("pubkey:{}", pub_key)
+        } else {
+            format!("id:{}", model_id)
+        };
+
         let mut indices = self.load_balancer_index.write().await;
-        let index = indices.entry(model_id.to_string()).or_insert(0);
+        let index = indices.entry(index_key.clone()).or_insert(0);
         let selected_index = *index % providers.len();
 
         // Increment for next request
@@ -360,7 +602,7 @@ impl InferenceProviderPool {
         }
 
         tracing::debug!(
-            model = %model_id,
+            index_key = %index_key,
             providers_count = providers.len(),
             selected_index = selected_index,
             "Prepared providers for fallback with round-robin priority"
@@ -402,10 +644,12 @@ impl InferenceProviderPool {
 
     /// Generic retry helper that tries each provider in order with automatic fallback
     /// Returns both the result and the provider that succeeded (for chat_id mapping)
+    /// If model_pub_key is provided, routes to the specific provider by signing public key first
     async fn retry_with_fallback<T, F, Fut>(
         &self,
         model_id: &str,
         operation_name: &str,
+        model_pub_key: Option<&str>,
         provider_fn: F,
     ) -> Result<(T, Arc<InferenceProviderTrait>), CompletionError>
     where
@@ -415,22 +659,40 @@ impl InferenceProviderPool {
         // Ensure models are discovered first
         self.ensure_models_discovered().await?;
 
-        // Get all providers with fallback priority
-        let providers = match self.get_providers_with_fallback(model_id).await {
+        // Get providers with load balancing (handles both model_id and model_pub_key cases)
+        let providers = match self
+            .get_providers_with_fallback(model_id, model_pub_key)
+            .await
+        {
             Some(p) => p,
             None => {
-                let model_mapping = self.model_mapping.read().await;
-                let available_models: Vec<_> = model_mapping.keys().collect();
+                // Handle error cases based on whether model_pub_key was provided
+                if let Some(pub_key) = model_pub_key {
+                    tracing::warn!(
+                            model_id = %model_id,
+                            model_pub_key = %pub_key,
+                            operation = operation_name,
+                        "No provider found for model public key."
+                    );
+                    return Err(CompletionError::CompletionError(format!(
+                        "No provider found for model {} with public key '{}...'. Encryption requires routing to the specific provider with this public key.",
+                        model_id,
+                        pub_key.chars().take(32).collect::<String>()
+                    )));
+                } else {
+                    let mappings = self.provider_mappings.read().await;
+                    let available_models: Vec<_> = mappings.model_to_providers.keys().collect();
 
-                tracing::error!(
-                    model_id = %model_id,
-                    available_models = ?available_models,
-                    operation = operation_name,
-                    "Model not found in provider pool"
-                );
-                return Err(CompletionError::CompletionError(format!(
-                    "Model '{model_id}' not found in any configured provider"
-                )));
+                    tracing::error!(
+                        model_id = %model_id,
+                        available_models = ?available_models,
+                        operation = operation_name,
+                        "Model not found in provider pool"
+                    );
+                    return Err(CompletionError::CompletionError(format!(
+                        "Model '{model_id}' not found in any configured provider"
+                    )));
+                }
             }
         };
 
@@ -495,12 +757,22 @@ impl InferenceProviderPool {
         // let detailed_error_msg = detailed_errors.join("; ");
         let sanitized_error_msg = sanitized_errors.join("; ");
 
-        tracing::error!(
-            model_id = %model_id,
-            providers_tried = providers.len(),
-            operation = operation_name,
-            "All providers failed for model"
-        );
+        if let Some(pub_key) = model_pub_key {
+            tracing::error!(
+                model_id = %model_id,
+                model_pub_key_prefix = %pub_key.chars().take(32).collect::<String>(),
+                providers_tried = providers.len(),
+                operation = operation_name,
+                "All providers failed for model with public key"
+            );
+        } else {
+            tracing::error!(
+                model_id = %model_id,
+                providers_tried = providers.len(),
+                operation = operation_name,
+                "All providers failed for model"
+            );
+        }
 
         // Return sanitized error to user
         Err(CompletionError::CompletionError(format!(
@@ -564,10 +836,19 @@ impl InferenceProviderPool {
 
     pub async fn chat_completion_stream(
         &self,
-        params: ChatCompletionParams,
+        mut params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
         let model_id = params.model.clone();
+
+        // Extract model_pub_key from params.extra for routing
+        let model_pub_key_str = params
+            .extra
+            .remove(encryption_headers::MODEL_PUB_KEY)
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
+        let model_pub_key = model_pub_key_str.as_deref();
+
+        let params_for_provider = params.clone();
 
         tracing::debug!(
             model = %model_id,
@@ -575,26 +856,29 @@ impl InferenceProviderPool {
         );
 
         let (stream, provider) = self
-            .retry_with_fallback(&model_id, "chat_completion_stream", |provider| {
-                let params = params.clone();
-                let request_hash = request_hash.clone();
-                async move { provider.chat_completion_stream(params, request_hash).await }
-            })
+            .retry_with_fallback(
+                &model_id,
+                "chat_completion_stream",
+                model_pub_key,
+                |provider| {
+                    let params = params_for_provider.clone();
+                    let request_hash = request_hash.clone();
+                    async move { provider.chat_completion_stream(params, request_hash).await }
+                },
+            )
             .await?;
 
         // Store chat_id mapping for sticky routing by peeking at the first event
+        // Must be synchronous to ensure attestation service can find the provider
         let mut peekable = StreamingResultExt::peekable(stream);
         if let Some(Ok(event)) = peekable.peek().await {
             if let inference_providers::StreamChunk::Chat(chat_chunk) = &event.chunk {
                 let chat_id = chat_chunk.id.clone();
-                let pool = self.clone();
-                tokio::spawn(async move {
-                    tracing::info!(
-                        chat_id = %chat_id,
-                        "Storing chat_id mapping"
-                    );
-                    pool.store_chat_id_mapping(chat_id, provider).await;
-                });
+                tracing::info!(
+                    chat_id = %chat_id,
+                    "Storing chat_id mapping for streaming completion"
+                );
+                self.store_chat_id_mapping(chat_id, provider).await;
             }
         }
         Ok(Box::pin(peekable))
@@ -602,14 +886,31 @@ impl InferenceProviderPool {
 
     pub async fn chat_completion(
         &self,
-        params: ChatCompletionParams,
+        mut params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError> {
         let model_id = params.model.clone();
 
+        // Extract model_pub_key from params.extra for routing before any cloning.
+        // This ensures the key is removed from params.extra so it won't be passed to the provider,
+        // and we have a stable reference for routing even if retries occur.
+        let model_pub_key_str = params
+            .extra
+            .remove(encryption_headers::MODEL_PUB_KEY)
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
+        let model_pub_key = model_pub_key_str.as_deref();
+
+        tracing::debug!(
+            model = %model_id,
+            "Starting chat completion request"
+        );
+
+        // Clone params after removing model_pub_key to ensure it's not in the cloned version
+        let params_for_provider = params.clone();
+
         let (response, provider) = self
-            .retry_with_fallback(&model_id, "chat_completion", |provider| {
-                let params = params.clone();
+            .retry_with_fallback(&model_id, "chat_completion", model_pub_key, |provider| {
+                let params = params_for_provider.clone();
                 let request_hash = request_hash.clone();
                 async move { provider.chat_completion(params, request_hash).await }
             })
@@ -673,13 +974,17 @@ impl InferenceProviderPool {
         }
         drop(task_handle); // Explicitly drop the lock
 
-        // Step 2: Clear model mappings and provider references
-        debug!("Step 2: Clearing model mappings");
-        let mut model_mapping = self.model_mapping.write().await;
-        let model_count = model_mapping.len();
-        model_mapping.clear();
-        debug!("Cleared {} model mappings", model_count);
-        drop(model_mapping);
+        // Step 2: Clear provider mappings (both model and pubkey mappings cleared atomically)
+        debug!("Step 2: Clearing provider mappings");
+        let mut mappings = self.provider_mappings.write().await;
+        let model_count = mappings.model_to_providers.len();
+        let pubkey_count = mappings.pubkey_to_providers.len();
+        *mappings = ProviderMappings::new();
+        debug!(
+            "Cleared {} model mappings and {} pubkey mappings",
+            model_count, pubkey_count
+        );
+        drop(mappings);
 
         // Step 3: Clear load balancer indices
         debug!("Step 3: Clearing load balancer indices");
@@ -697,17 +1002,9 @@ impl InferenceProviderPool {
         debug!("Cleared {} chat session mappings", chat_count);
         drop(chat_mapping);
 
-        // Step 5: Clear signature hashes
-        debug!("Step 5: Clearing signature hash tracking");
-        let mut sig_hashes = self.signature_hashes.write().await;
-        let sig_count = sig_hashes.len();
-        sig_hashes.clear();
-        debug!("Cleared {} signature hash entries", sig_count);
-        drop(sig_hashes);
-
         info!(
-            "Inference provider pool shutdown completed. Cleaned up: {} models, {} load balancer indices, {} chat mappings, {} signatures",
-            model_count, index_count, chat_count, sig_count
+            "Inference provider pool shutdown completed. Cleaned up: {} models, {} pubkeys, {} load balancer indices, {} chat mappings",
+            model_count, pubkey_count, index_count, chat_count
         );
     }
 }
@@ -789,5 +1086,68 @@ mod tests {
 
         // HTTP status should still be present (not sensitive)
         assert!(sanitized.contains("401 Unauthorized"));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chat_id_mapping_available_immediately() {
+        use futures_util::StreamExt;
+        use inference_providers::mock::MockProvider;
+
+        let pool =
+            InferenceProviderPool::new("http://localhost:8080/models".to_string(), None, 5, 30);
+
+        let mock_provider = Arc::new(MockProvider::new());
+        let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
+        pool.register_provider(model_id.clone(), mock_provider)
+            .await;
+
+        let params = inference_providers::ChatCompletionParams {
+            model: model_id,
+            messages: vec![inference_providers::ChatMessage {
+                role: inference_providers::MessageRole::User,
+                content: Some("Hello".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: Some(true),
+            tools: None,
+            max_completion_tokens: None,
+            n: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            user: None,
+            seed: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            metadata: None,
+            store: None,
+            stream_options: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        let mut stream = pool
+            .chat_completion_stream(params, "test-request-hash".to_string())
+            .await
+            .expect("Should create stream");
+
+        let first_event = stream.next().await.unwrap().unwrap();
+        let chat_id = match first_event.chunk {
+            inference_providers::StreamChunk::Chat(chunk) => chunk.id,
+            _ => panic!("Expected chat chunk"),
+        };
+
+        // Mapping must be available immediately (no race with spawn)
+        assert!(pool.get_provider_by_chat_id(&chat_id).await.is_some());
+
+        while stream.next().await.is_some() {}
+        assert!(pool.get_provider_by_chat_id(&chat_id).await.is_some());
     }
 }

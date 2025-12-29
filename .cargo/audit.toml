@@ -8,6 +8,23 @@ ignore = [
     # We only use HS256 (HMAC) for JWT, not RSA algorithms, so this doesn't affect us.
     # https://rustsec.org/advisories/RUSTSEC-2023-0071
     "RUSTSEC-2023-0071",
+
+    # ruint reciprocal_mg10 OOB - no fix available.
+    # The affected function is unused in alloy (ref: recmo/uint#550, alloy-rs/alloy#3416).
+    # https://rustsec.org/advisories/RUSTSEC-2025-0137
+    "RUSTSEC-2025-0137",
+    
+    # paste is unmaintained - transitive dependency from dstack-sdk -> alloy -> alloy-primitives.
+    # This is informational only (no security issue). We cannot update it directly.
+    # Tracking: waiting for upstream crates to migrate to pastey.
+    # https://rustsec.org/advisories/RUSTSEC-2024-0436
+    "RUSTSEC-2024-0436",
+
+    # derivative is unmaintained - transitive dependency from dstack-sdk -> alloy -> ruint -> ark-ff.
+    # This is informational only (no security issue). We cannot update it directly.
+    # Tracking: waiting for upstream crates to migrate to derive_more or similar.
+    # https://rustsec.org/advisories/RUSTSEC-2024-0388
+    "RUSTSEC-2024-0388",
 ]
 
 # Treat unmaintained crates as warnings (not errors)

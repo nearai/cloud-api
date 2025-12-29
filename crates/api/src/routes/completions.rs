@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Json as ResponseJson, Response},
 };
 use futures::stream::StreamExt;
+use services::common::encryption_headers as service_encryption_headers;
 use services::completions::{
     hash_inference_id_to_uuid,
     ports::{CompletionMessage, CompletionRequest as ServiceCompletionRequest},
@@ -149,6 +150,7 @@ pub async fn chat_completions(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    headers: header::HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     debug!(
@@ -175,12 +177,9 @@ pub async fn chat_completions(
             .into_response();
     }
 
-    // Clone request_hash before moving body_hash
-    let request_hash = body_hash.hash.clone();
-
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
-    let service_request = convert_chat_request_to_service(
+    let mut service_request = convert_chat_request_to_service(
         &request,
         api_key.api_key.created_by_user_id.0,
         api_key.api_key.id.0.clone(),
@@ -189,10 +188,34 @@ pub async fn chat_completions(
         body_hash,
     );
 
+    // Extract and validate encryption headers if present
+    let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
+        Ok(headers) => headers,
+        Err(err) => return err.into_response(),
+    };
+
+    // Add validated headers to service_request.extra
+    if let Some(ref signing_algo) = encryption_headers.signing_algo {
+        service_request.extra.insert(
+            service_encryption_headers::SIGNING_ALGO.to_string(),
+            serde_json::Value::String(signing_algo.clone()),
+        );
+    }
+    if let Some(ref client_pub_key) = encryption_headers.client_pub_key {
+        service_request.extra.insert(
+            service_encryption_headers::CLIENT_PUB_KEY.to_string(),
+            serde_json::Value::String(client_pub_key.clone()),
+        );
+    }
+    if let Some(ref model_pub_key) = encryption_headers.model_pub_key {
+        service_request.extra.insert(
+            service_encryption_headers::MODEL_PUB_KEY.to_string(),
+            serde_json::Value::String(model_pub_key.clone()),
+        );
+    }
+
     // Check if streaming is requested
     if request.stream == Some(true) {
-        let inference_provider_pool = app_state.inference_provider_pool.clone();
-
         // Call the streaming completion service
         match app_state
             .completion_service
@@ -225,10 +248,6 @@ pub async fn chat_completions(
                 let chat_id_clone = chat_id_state.clone();
 
                 // Convert to raw bytes stream with proper SSE formatting
-                let pool_clone = inference_provider_pool.clone();
-                let req_hash_clone = request_hash.clone();
-                let pool_clone2 = pool_clone.clone();
-                let req_hash_clone2 = req_hash_clone.clone();
                 let byte_stream = peekable_stream
                     .then(move |result| {
                         let accumulated_inner = accumulated_clone.clone();
@@ -288,27 +307,6 @@ pub async fn chat_completions(
                             .lock()
                             .await
                             .extend_from_slice(&done_bytes);
-
-                        // Compute response hash from accumulated bytes
-                        let bytes_accumulated = accumulated_bytes.lock().await.clone();
-                        let response_hash = {
-                            use sha2::{Digest, Sha256};
-                            let mut hasher = Sha256::new();
-                            hasher.update(&bytes_accumulated);
-                            format!("{:x}", hasher.finalize())
-                        };
-
-                        // Update response hash in InferenceProviderPool
-                        // InterceptStream::Drop will read this and store to database
-                        if let Some(chat_id) = chat_id_state.lock().await.clone() {
-                            pool_clone2
-                                .register_signature_hashes_for_chat(
-                                    &chat_id,
-                                    req_hash_clone2.clone(),
-                                    response_hash,
-                                )
-                                .await;
-                        }
 
                         Ok::<Bytes, Infallible>(done_bytes)
                     }));

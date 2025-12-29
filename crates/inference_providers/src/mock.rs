@@ -13,9 +13,16 @@ use crate::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
+
+fn compute_sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
+}
 
 /// Hash pair for signature generation
 #[derive(Clone, Debug)]
@@ -632,7 +639,7 @@ impl crate::InferenceProvider for MockProvider {
     async fn chat_completion_stream(
         &self,
         params: ChatCompletionParams,
-        _request_hash: String,
+        request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
         // Check for invalid model
         if !self.is_valid_model(&params.model) {
@@ -680,6 +687,29 @@ impl crate::InferenceProvider for MockProvider {
             chunks.truncate(disconnect_at);
         }
 
+        // Register signature hashes for this chat_id.
+        // response_hash is computed over SSE bytes in the same format as returned by the API:
+        // concatenated "data: {json}\n\n" lines plus the final "data: [DONE]\n\n" terminator.
+        let chat_id_opt = chunks.first().map(|c| c.id.clone());
+        if let Some(chat_id) = chat_id_opt {
+            let mut accumulated: Vec<u8> = Vec::new();
+            for chunk in &chunks {
+                let json = serde_json::to_value(chunk).map_err(|e| {
+                    CompletionError::CompletionError(format!(
+                        "Failed to serialize mock chunk to JSON for hashing: {e}"
+                    ))
+                })?;
+                let raw_bytes = Self::sse_data_static(&json);
+                accumulated.extend_from_slice(&raw_bytes);
+            }
+            if response_template.disconnect_after_chunks.is_none() {
+                accumulated.extend_from_slice(b"data: [DONE]\n\n");
+            }
+            let response_hash = compute_sha256_hex(&accumulated);
+            self.register_signature_hashes(chat_id, request_hash, response_hash)
+                .await;
+        }
+
         // Convert chunks to SSE stream
         let stream = stream::iter(chunks.into_iter().map(move |chunk| {
             let json = serde_json::to_value(&chunk).unwrap();
@@ -696,7 +726,7 @@ impl crate::InferenceProvider for MockProvider {
     async fn chat_completion(
         &self,
         params: ChatCompletionParams,
-        _request_hash: String,
+        request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
         // Check for invalid model
         if !self.is_valid_model(&params.model) {
@@ -731,10 +761,17 @@ impl crate::InferenceProvider for MockProvider {
         // Ensure at least some input tokens for very short messages
         let input_tokens = input_tokens.max(6);
 
-        let response = response_template.generate_response(id, created, model, input_tokens);
+        // Keep a stable chat_id for both the response and signature registration.
+        let response =
+            response_template.generate_response(id.clone(), created, model, input_tokens);
 
         let raw_bytes = serde_json::to_vec(&response)
             .map_err(|e| CompletionError::CompletionError(format!("Failed to serialize: {e}")))?;
+
+        // Register signature hashes for non-streaming chat completions (hash of exact JSON bytes).
+        let response_hash = compute_sha256_hex(&raw_bytes);
+        self.register_signature_hashes(id, request_hash, response_hash)
+            .await;
 
         Ok(ChatCompletionResponseWithBytes {
             response,
@@ -810,7 +847,7 @@ impl crate::InferenceProvider for MockProvider {
     async fn get_attestation_report(
         &self,
         model: String,
-        _signing_algo: Option<String>,
+        signing_algo: Option<String>,
         _nonce: Option<String>,
         _signing_address: Option<String>,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
@@ -820,6 +857,20 @@ impl crate::InferenceProvider for MockProvider {
             "attestation".to_string(),
             serde_json::Value::String("mock-attestation".to_string()),
         );
+
+        // Include signing_public_key for encryption tests
+        // ECDSA: 128 hex chars (64 bytes) - uncompressed point (x and y coordinates, 32 bytes each)
+        // Ed25519: 64 hex chars (32 bytes) - public key bytes
+        let mock_signing_public_key = match signing_algo.as_deref() {
+            Some("ecdsa") => "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            Some("ed25519") => "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+            _ => "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", // default to ecdsa format (128 hex chars)
+        };
+        report.insert(
+            "signing_public_key".to_string(),
+            serde_json::Value::String(mock_signing_public_key.to_string()),
+        );
+
         Ok(report)
     }
 }

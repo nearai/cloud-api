@@ -4,6 +4,19 @@ use uuid::Uuid;
 pub const API_KEY_PREFIX: &str = "sk-";
 pub const API_KEY_LENGTH: usize = 35;
 
+/// Encryption header keys used in params.extra for passing encryption information
+/// These keys are used to pass encryption headers from API routes to completion services.
+/// Note: These use underscores (x_signing_algo) for params.extra HashMap keys,
+/// while HTTP headers use hyphens (x-signing-algo).
+pub mod encryption_headers {
+    /// Key for signing algorithm in params.extra (corresponds to x-signing-algo HTTP header)
+    pub const SIGNING_ALGO: &str = "x_signing_algo";
+    /// Key for client public key in params.extra (corresponds to x-client-pub-key HTTP header)
+    pub const CLIENT_PUB_KEY: &str = "x_client_pub_key";
+    /// Key for model public key in params.extra (corresponds to x-model-pub-key HTTP header)
+    pub const MODEL_PUB_KEY: &str = "x_model_pub_key";
+}
+
 pub fn generate_api_key() -> String {
     format!(
         "{}{}",

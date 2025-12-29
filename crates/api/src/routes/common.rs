@@ -1,5 +1,5 @@
 use crate::models::ErrorResponse;
-use axum::{http::StatusCode, response::Json as ResponseJson};
+use axum::{http::HeaderMap, http::StatusCode, response::Json as ResponseJson};
 use services::completions::CompletionError;
 use services::organization::OrganizationError;
 use uuid::Uuid;
@@ -124,6 +124,165 @@ pub fn format_amount(amount: i64) -> String {
         let trimmed = frac_str.trim_end_matches('0');
         format!("${whole}.{trimmed}")
     }
+}
+
+/// Validated encryption headers extracted from HTTP request
+#[derive(Debug, Clone)]
+pub struct EncryptionHeaders {
+    pub signing_algo: Option<String>,
+    pub client_pub_key: Option<String>,
+    pub model_pub_key: Option<String>,
+}
+
+/// Validate and extract encryption headers from HTTP request
+///
+/// Validates:
+/// - `x-signing-algo`: Must be "ecdsa" or "ed25519" (case-insensitive)
+/// - `x-client-pub-key`: Must be a valid hex string with correct length based on algorithm
+///   - Ed25519: 64 hex characters (32 bytes)
+///   - ECDSA: 128 hex characters (64 bytes) or 130 hex characters (65 bytes with 0x04 prefix)
+/// - `x-model-pub-key`: Must be a valid hex string (reasonable length: 64-130 hex characters)
+///
+/// Returns:
+/// - `Ok(EncryptionHeaders)` if all provided headers are valid
+/// - `Err((StatusCode, ResponseJson<ErrorResponse>))` if validation fails
+pub fn validate_encryption_headers(
+    headers: &HeaderMap,
+) -> Result<EncryptionHeaders, (StatusCode, ResponseJson<ErrorResponse>)> {
+    // Extract headers (case-insensitive)
+    let signing_algo = headers
+        .get("x-signing-algo")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+    let client_pub_key = headers
+        .get("x-client-pub-key")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+    let model_pub_key = headers
+        .get("x-model-pub-key")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Validate signing algorithm if provided
+    if let Some(ref algo) = signing_algo {
+        let algo_lower = algo.to_lowercase();
+        if algo_lower != "ecdsa" && algo_lower != "ed25519" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    format!(
+                        "Invalid X-Signing-Algo: '{}'. Must be 'ecdsa' or 'ed25519'",
+                        algo
+                    ),
+                    "invalid_parameter".to_string(),
+                )),
+            ));
+        }
+    }
+
+    // Validate client public key if provided
+    if let Some(ref pub_key) = client_pub_key {
+        // Check if it's a valid hex string
+        let pub_key_bytes = match hex::decode(pub_key) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        "X-Client-Pub-Key must be a valid hex string".to_string(),
+                        "invalid_parameter".to_string(),
+                    )),
+                ));
+            }
+        };
+
+        // If signing_algo is provided, validate length based on algorithm
+        if let Some(ref algo) = signing_algo {
+            let algo_lower = algo.to_lowercase();
+            if algo_lower == "ed25519" {
+                // Ed25519: 32 bytes = 64 hex characters
+                if pub_key_bytes.len() != 32 {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!(
+                                "Ed25519 public key must be 64 hex characters (32 bytes), got {} characters",
+                                pub_key.len()
+                            ),
+                            "invalid_parameter".to_string(),
+                        )),
+                    ));
+                }
+            } else if algo_lower == "ecdsa" {
+                // ECDSA: 64 bytes (128 hex chars) or 65 bytes with 0x04 prefix (130 hex chars)
+                if pub_key_bytes.len() == 65 && pub_key_bytes[0] == 0x04 {
+                    // Uncompressed format with 0x04 prefix - valid
+                } else if pub_key_bytes.len() == 64 {
+                    // Uncompressed format without 0x04 prefix - valid
+                } else {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!(
+                                "ECDSA public key must be 128 hex characters (64 bytes) or 130 hex characters (65 bytes with 0x04 prefix), got {} characters",
+                                pub_key.len()
+                            ),
+                            "invalid_parameter".to_string(),
+                        )),
+                    ));
+                }
+            }
+        } else {
+            // If no signing_algo provided, just check it's a reasonable length
+            // (between 64 and 130 hex characters, which covers both Ed25519 and ECDSA)
+            if pub_key.len() < 64 || pub_key.len() > 130 {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        format!(
+                            "X-Client-Pub-Key must be between 64 and 130 hex characters, got {} characters",
+                            pub_key.len()
+                        ),
+                        "invalid_parameter".to_string(),
+                    )),
+                ));
+            }
+        }
+    }
+
+    // Validate model public key if provided
+    if let Some(ref pub_key) = model_pub_key {
+        // Check if it's a valid hex string
+        if hex::decode(pub_key).is_err() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "X-Model-Pub-Key must be a valid hex string".to_string(),
+                    "invalid_parameter".to_string(),
+                )),
+            ));
+        }
+
+        // Check reasonable length (64-130 hex characters, which covers both Ed25519 and ECDSA)
+        if pub_key.len() < 64 || pub_key.len() > 130 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    format!(
+                        "X-Model-Pub-Key must be between 64 and 130 hex characters, got {} characters",
+                        pub_key.len()
+                    ),
+                    "invalid_parameter".to_string(),
+                )),
+            ));
+        }
+    }
+
+    Ok(EncryptionHeaders {
+        signing_algo,
+        client_pub_key,
+        model_pub_key,
+    })
 }
 
 /// Map OrganizationError to HTTP response

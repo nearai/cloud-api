@@ -1,4 +1,5 @@
 use deadpool_postgres::{Config, Pool, Runtime};
+use rustls::pki_types::{pem::PemObject, CertificateDer};
 use std::fs::File;
 use std::io::BufReader;
 use tracing::{debug, info};
@@ -25,8 +26,8 @@ pub fn create_pool_with_rustls(cfg: Config, cert_path: Option<&str>) -> anyhow::
             .map_err(|e| anyhow::anyhow!("Failed to open certificate file {cert_path}: {e}"))?;
         let mut reader = BufReader::new(cert_file);
 
-        // Parse the PEM certificates
-        let certs = rustls_pemfile::certs(&mut reader)
+        // Parse the PEM certificates using rustls-pki-types (replacing deprecated rustls-pemfile)
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(&mut reader)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| anyhow::anyhow!("Failed to parse certificate: {e}"))?;
 

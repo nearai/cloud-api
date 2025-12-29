@@ -29,3 +29,9 @@ COMMENT ON COLUMN organization_usage_log.stop_reason IS
 -- This allows new code to stop writing to request_type while old records still have values
 ALTER TABLE organization_usage_log
     ALTER COLUMN request_type DROP NOT NULL;
+
+-- Backfill inference_type from request_type for existing records
+-- This preserves historical data before eventual removal of request_type column
+UPDATE organization_usage_log
+SET inference_type = request_type
+WHERE inference_type IS NULL AND request_type IS NOT NULL;

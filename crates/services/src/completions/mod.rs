@@ -264,7 +264,6 @@ where
             let _span_guard = span.enter();
             handle_clone.block_on(async move {
                 let result = tokio::time::timeout(Duration::from_secs(2), async move {
-                    // Determine stop reason based on: error > client disconnect > finish_reason > default
                     let stop_reason = if let Some(ref err) = last_error {
                         // Provider returned an error during stream
                         Some(crate::usage::StopReason::from_completion_error(err))

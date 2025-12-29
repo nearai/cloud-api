@@ -49,6 +49,18 @@ pub struct UsageHistoryEntryResponse {
     pub total_cost_display: String, // Human readable, e.g., "$0.00123"
     pub inference_type: String,
     pub created_at: String,
+    /// Why the inference ended (e.g., "completed", "length", "client_disconnect")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    /// Response ID when called from Responses API
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
+    /// Raw request ID from the inference provider
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_request_id: Option<String>,
+    /// Inference UUID (hashed from provider_request_id)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inference_id: Option<String>,
 }
 
 /// Usage history response
@@ -339,6 +351,10 @@ pub async fn get_organization_usage_history(
             total_cost_display: format_amount(entry.total_cost),
             inference_type: entry.inference_type,
             created_at: entry.created_at.to_rfc3339(),
+            stop_reason: entry.stop_reason.map(|r| r.to_string()),
+            response_id: entry.response_id.map(|id| id.to_string()),
+            provider_request_id: entry.provider_request_id,
+            inference_id: entry.inference_id.map(|id| id.to_string()),
         })
         .collect();
 
@@ -464,6 +480,10 @@ pub async fn get_api_key_usage_history(
             total_cost_display: format_amount(entry.total_cost),
             inference_type: entry.inference_type,
             created_at: entry.created_at.to_rfc3339(),
+            stop_reason: entry.stop_reason.map(|r| r.to_string()),
+            response_id: entry.response_id.map(|id| id.to_string()),
+            provider_request_id: entry.provider_request_id,
+            inference_id: entry.inference_id.map(|id| id.to_string()),
         })
         .collect();
 

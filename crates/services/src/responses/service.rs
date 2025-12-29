@@ -1097,6 +1097,7 @@ impl ResponseServiceImpl {
                 workspace_id: process_context.workspace_id,
                 metadata: process_context.request.metadata.clone(),
                 body_hash: process_context.body_hash.to_string(),
+                response_id: Some(ctx.response_id.clone()),
                 n: None,
                 extra,
             };
@@ -2576,6 +2577,7 @@ DO NOT USE THESE FORMATS:
             workspace_id,
             metadata: None,
             body_hash: String::new(),
+            response_id: None, // Title generation is not tied to a specific response
             n: None,
             extra: std::collections::HashMap::from([(
                 "chat_template_kwargs".to_string(),

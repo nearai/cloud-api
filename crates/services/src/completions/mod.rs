@@ -3,6 +3,7 @@ pub mod ports;
 use crate::attestation::ports::AttestationServiceTrait;
 use crate::inference_provider_pool::InferenceProviderPool;
 use crate::models::ModelsRepository;
+use crate::responses::models::ResponseId;
 use crate::usage::{RecordUsageServiceRequest, UsageServiceTrait};
 use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, StreamingResult};
 use moka::future::Cache;
@@ -77,6 +78,12 @@ where
     /// Flag indicating the stream completed normally (received None from inner stream)
     /// If false when Drop is called, the client disconnected mid-stream
     stream_completed: bool,
+    /// Response ID when called from Responses API (for usage tracking FK)
+    response_id: Option<ResponseId>,
+    /// Last finish_reason from provider (e.g., "stop", "length", "tool_calls")
+    last_finish_reason: Option<inference_providers::FinishReason>,
+    /// Last error from provider (for determining stop_reason)
+    last_error: Option<inference_providers::CompletionError>,
 }
 
 impl<S> Stream for InterceptStream<S>
@@ -124,6 +131,13 @@ where
                     if let Some(usage) = &chat_chunk.usage {
                         self.last_usage_stats = Some(usage.clone());
                     }
+
+                    // Track finish_reason from the final chunk (only set once at end)
+                    if let Some(choice) = chat_chunk.choices.first() {
+                        if let Some(ref reason) = choice.finish_reason {
+                            self.last_finish_reason = Some(reason.clone());
+                        }
+                    }
                 }
                 Poll::Ready(Some(Ok(event.clone())))
             }
@@ -131,6 +145,11 @@ where
                 // Stream completed normally
                 self.stream_completed = true;
                 Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(ref err))) => {
+                // Capture error for stop_reason mapping
+                self.last_error = Some(err.clone());
+                Poll::Ready(Some(Err(err.clone())))
             }
             other => other,
         }
@@ -215,6 +234,15 @@ where
         // Check if stream completed normally (vs client disconnect)
         let stream_completed = self.stream_completed;
 
+        // Capture finish_reason from provider for stop_reason mapping
+        let last_finish_reason = self.last_finish_reason.clone();
+
+        // Capture last error for stop_reason mapping
+        let last_error = self.last_error.clone();
+
+        // Capture response_id for usage tracking (when called from Responses API)
+        let response_id = self.response_id.clone();
+
         // Capture all values needed for async tasks
         let usage_service = self.usage_service.clone();
         let attestation_service = self.attestation_service.clone();
@@ -236,6 +264,22 @@ where
             let _span_guard = span.enter();
             handle_clone.block_on(async move {
                 let result = tokio::time::timeout(Duration::from_secs(2), async move {
+                    let stop_reason = if let Some(ref err) = last_error {
+                        // Provider returned an error during stream
+                        Some(crate::usage::StopReason::from_completion_error(err))
+                    } else if !stream_completed {
+                        // Client disconnected before stream finished
+                        Some(crate::usage::StopReason::ClientDisconnect)
+                    } else if let Some(ref finish_reason) = last_finish_reason {
+                        // Map provider's finish_reason to our StopReason
+                        Some(crate::usage::StopReason::from_provider_finish_reason(
+                            finish_reason,
+                        ))
+                    } else {
+                        // Stream completed but no finish_reason - treat as completed
+                        Some(crate::usage::StopReason::Completed)
+                    };
+
                     // Record usage (critical for billing accuracy)
                     if usage_service
                         .record_usage(RecordUsageServiceRequest {
@@ -249,6 +293,9 @@ where
                             ttft_ms,
                             avg_itl_ms,
                             inference_id: Some(inference_id),
+                            provider_request_id: Some(chat_id.clone()),
+                            stop_reason,
+                            response_id,
                         })
                         .await
                         .is_err()
@@ -478,6 +525,7 @@ impl CompletionServiceImpl {
         service_start_time: Instant,
         provider_start_time: Instant,
         concurrent_counter: Option<Arc<AtomicU32>>,
+        response_id: Option<ResponseId>,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
         let metric_tags = Self::create_metric_tags(&model_name);
@@ -514,6 +562,9 @@ impl CompletionServiceImpl {
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
+            response_id,
+            last_finish_reason: None,
+            last_error: None,
         };
         Box::pin(intercepted_stream)
     }
@@ -647,6 +698,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 service_start_time,
                 provider_start_time,
                 Some(counter),
+                request.response_id,
             )
             .await;
 
@@ -808,7 +860,18 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
         let output_tokens = response_with_bytes.response.usage.completion_tokens;
         // Hash the full chat ID to UUID for storage
-        let inference_id = hash_inference_id_to_uuid(&response_with_bytes.response.id);
+        let provider_request_id = response_with_bytes.response.id.clone();
+        let inference_id = hash_inference_id_to_uuid(&provider_request_id);
+        let response_id = request.response_id;
+
+        // Extract finish_reason from provider response
+        let stop_reason = response_with_bytes
+            .response
+            .choices
+            .first()
+            .and_then(|c| c.finish_reason.as_ref())
+            .map(|reason| crate::usage::StopReason::from_finish_reason(reason))
+            .unwrap_or(crate::usage::StopReason::Completed);
 
         tokio::spawn(async move {
             if usage_service
@@ -823,6 +886,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     ttft_ms: None,    // N/A for non-streaming
                     avg_itl_ms: None, // N/A for non-streaming
                     inference_id: Some(inference_id),
+                    provider_request_id: Some(provider_request_id),
+                    stop_reason: Some(stop_reason),
+                    response_id,
                 })
                 .await
                 .is_err()
@@ -935,6 +1001,9 @@ mod tests {
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
+            response_id: None,
+            last_finish_reason: None,
+            last_error: None,
         };
 
         // Consume the stream
@@ -1083,6 +1152,9 @@ mod tests {
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
+            response_id: None,
+            last_finish_reason: None,
+            last_error: None,
         };
 
         // Consume the stream
@@ -1194,6 +1266,9 @@ mod tests {
             last_usage_stats: None,
             last_chat_id: None,
             stream_completed: false,
+            response_id: None,
+            last_finish_reason: None,
+            last_error: None,
         };
 
         let _ = intercept_stream.collect::<Vec<_>>().await;
@@ -1353,6 +1428,9 @@ mod tests {
                 last_usage_stats: None,
                 last_chat_id: None,
                 stream_completed: false,
+                response_id: None,
+                last_finish_reason: None,
+                last_error: None,
             };
             // InterceptStream goes out of scope here and Drop is called
         }

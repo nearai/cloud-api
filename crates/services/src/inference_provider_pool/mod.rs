@@ -589,7 +589,7 @@ impl InferenceProviderPool {
         };
 
         let mut indices = self.load_balancer_index.write().await;
-        let index = indices.entry(index_key).or_insert(0);
+        let index = indices.entry(index_key.clone()).or_insert(0);
         let selected_index = *index % providers.len();
 
         // Increment for next request
@@ -602,6 +602,13 @@ impl InferenceProviderPool {
             let provider_index = (selected_index + i) % providers.len();
             ordered_providers.push(providers[provider_index].clone());
         }
+
+        tracing::debug!(
+            index_key = %index_key,
+            providers_count = providers.len(),
+            selected_index = selected_index,
+            "Prepared providers for fallback with round-robin priority"
+        );
 
         Some(ordered_providers)
     }
@@ -690,39 +697,91 @@ impl InferenceProviderPool {
             }
         };
 
-        // Try each provider in order until one succeeds
+        tracing::info!(
+            model_id = %model_id,
+            providers_count = providers.len(),
+            operation = operation_name,
+            "Attempting {} with {} provider(s)",
+            operation_name,
+            providers.len()
+        );
+
+        // Collect sanitized errors for user-facing message
         let mut sanitized_errors = Vec::new();
+        // Keep detailed errors for logging only
+        let mut detailed_errors = Vec::new();
+
+        // Try each provider in order until one succeeds
         for (attempt, provider) in providers.iter().enumerate() {
+            tracing::debug!(
+                model_id = %model_id,
+                attempt = attempt + 1,
+                total_providers = providers.len(),
+                operation = operation_name,
+                "Trying provider {} of {}",
+                attempt + 1,
+                providers.len()
+            );
+
             match provider_fn(provider.clone()).await {
                 Ok(result) => {
+                    tracing::info!(
+                        model_id = %model_id,
+                        attempt = attempt + 1,
+                        operation = operation_name,
+                        "Successfully completed request with provider"
+                    );
                     return Ok((result, provider.clone()));
                 }
                 Err(e) => {
-                    let sanitized = Self::sanitize_error_message(&e.to_string());
+                    let error_str = e.to_string();
+
+                    // Log the full detailed error for debugging
+                    tracing::warn!(
+                        model_id = %model_id,
+                        attempt = attempt + 1,
+                        operation = operation_name,
+                        "Provider failed, will try next provider if available"
+                    );
+
+                    // Store detailed error for logging
+                    detailed_errors.push(format!("Provider {}: {}", attempt + 1, error_str));
+
+                    // Store sanitized error for user-facing response
+                    let sanitized = Self::sanitize_error_message(&error_str);
                     sanitized_errors.push(format!("Provider {}: {}", attempt + 1, sanitized));
                 }
             }
         }
 
-        // All providers failed
+        // All providers failed - log detailed errors but return sanitized message to user
+        // let detailed_error_msg = detailed_errors.join("; ");
         let sanitized_error_msg = sanitized_errors.join("; ");
-        let error_msg = if let Some(pub_key) = model_pub_key {
-            format!(
-                "All {} provider(s) failed for model public key '{}...': {}",
-                providers.len(),
-                pub_key.chars().take(32).collect::<String>(),
-                sanitized_error_msg
-            )
-        } else {
-            format!(
-                "All {} provider(s) failed for model '{}': {}",
-                providers.len(),
-                model_id,
-                sanitized_error_msg
-            )
-        };
 
-        Err(CompletionError::CompletionError(error_msg))
+        if let Some(pub_key) = model_pub_key {
+            tracing::error!(
+                model_id = %model_id,
+                model_pub_key_prefix = %pub_key.chars().take(32).collect::<String>(),
+                providers_tried = providers.len(),
+                operation = operation_name,
+                "All providers failed for model with public key"
+            );
+        } else {
+            tracing::error!(
+                model_id = %model_id,
+                providers_tried = providers.len(),
+                operation = operation_name,
+                "All providers failed for model"
+            );
+        }
+
+        // Return sanitized error to user
+        Err(CompletionError::CompletionError(format!(
+            "All {} provider(s) failed for model '{}': {}",
+            providers.len(),
+            model_id,
+            sanitized_error_msg
+        )))
     }
 
     pub async fn get_attestation_report(

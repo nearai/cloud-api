@@ -167,17 +167,15 @@ impl EncryptionTestHarnessWithPool {
     }
 
     /// Register multiple providers for the same model
-    async fn register_providers(
-        &self,
-        count: usize,
-    ) -> Vec<std::sync::Arc<dyn inference_providers::InferenceProvider + Send + Sync>> {
+    async fn register_providers(&self, count: usize) {
         use inference_providers::MockProvider;
         use std::sync::Arc;
 
-        let providers: Vec<_> = (0..count)
+        let providers: Vec<Arc<dyn inference_providers::InferenceProvider + Send + Sync>> = (0
+            ..count)
             .map(|_| {
-                let provider = Arc::new(MockProvider::new_accept_all());
-                Arc::new(provider) as Arc<dyn inference_providers::InferenceProvider + Send + Sync>
+                Arc::new(MockProvider::new_accept_all())
+                    as Arc<dyn inference_providers::InferenceProvider + Send + Sync>
             })
             .collect();
 
@@ -187,7 +185,6 @@ impl EncryptionTestHarnessWithPool {
             .collect();
 
         self.pool.register_providers(providers_to_register).await;
-        providers
     }
 }
 

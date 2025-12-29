@@ -1,6 +1,7 @@
 // Import common test utilities
 mod common;
 
+use api::routes::attestation::{AttestationResponse, SignatureResponse};
 use common::*;
 
 use inference_providers::StreamChunk;
@@ -285,11 +286,8 @@ async fn test_signature_signing_address_matches_model_attestation() {
         "Signature endpoint should return success"
     );
 
-    let signature_json = signature_response.json::<serde_json::Value>();
-    let signing_address = signature_json
-        .get("signing_address")
-        .and_then(|v| v.as_str())
-        .expect("Signature response must include signing_address");
+    let signature = signature_response.json::<SignatureResponse>();
+    let signing_address = signature.signing_address;
     assert!(
         !signing_address.is_empty(),
         "Signing address should not be empty"
@@ -308,22 +306,17 @@ async fn test_signature_signing_address_matches_model_attestation() {
         "Attestation report should return successfully"
     );
 
-    let attestation_json = attestation_response.json::<serde_json::Value>();
-    let attestation_addresses: Vec<String> = attestation_json
-        .get("model_attestations")
-        .and_then(|v| v.as_array())
-        .map(|array| {
-            array
-                .iter()
-                .filter_map(|attestation| {
-                    attestation
-                        .get("signing_address")
-                        .and_then(|value| value.as_str())
-                        .map(|value| value.to_string())
-                })
-                .collect()
+    let attestation = attestation_response.json::<AttestationResponse>();
+    let attestation_addresses: Vec<String> = attestation
+        .model_attestations
+        .iter()
+        .filter_map(|attestation| {
+            attestation
+                .get("signing_address")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
         })
-        .unwrap_or_default();
+        .collect();
 
     assert!(
         !attestation_addresses.is_empty(),

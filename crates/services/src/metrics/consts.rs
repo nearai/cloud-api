@@ -4,6 +4,7 @@ pub const METRIC_LATENCY_TTFT_TOTAL: &str = "cloud_api.latency.time_to_first_tok
 pub const METRIC_LATENCY_TOTAL: &str = "cloud_api.latency.total";
 pub const METRIC_LATENCY_QUEUE_TIME: &str = "cloud_api.latency.queue_time";
 pub const METRIC_LATENCY_DECODING_TIME: &str = "cloud_api.latency.decoding_time";
+pub const METRIC_LATENCY_FINALIZATION: &str = "cloud_api.latency.finalization";
 pub const METRIC_TOKENS_PER_SECOND: &str = "cloud_api.tokens_per_second";
 
 // Verification metrics (optional - for signature verification)

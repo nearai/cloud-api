@@ -1,13 +1,3 @@
-//! Real-provider E2E tests for Conversations + Responses integration.
-//!
-//! These tests mirror the style of other `real_e2e_*` tests in this repo: they use
-//! `setup_test_server_with_real_provider()` and rely on whatever real-provider discovery
-//! environment is configured for running real E2E tests.
-//!
-//! The main goal is to validate behaviors that mocks cannot: that a real inference run
-//! (streaming and non-streaming) actually persists items that are readable via
-//! `GET /v1/conversations/{id}/items`.
-
 mod common;
 
 use common::endpoints;

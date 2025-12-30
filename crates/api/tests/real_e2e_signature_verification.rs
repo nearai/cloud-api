@@ -1,4 +1,3 @@
-// Integration test that uses the real inference provider pool to validate signature metadata.
 mod common;
 
 use api::routes::attestation::{AttestationResponse, SignatureResponse};

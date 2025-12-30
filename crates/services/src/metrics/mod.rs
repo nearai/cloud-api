@@ -68,9 +68,6 @@ impl MetricsServiceTrait for OtlpMetricsService {
                 consts::METRIC_LATENCY_DECODING_TIME => {
                     "Time from first token to last token (decoding phase)"
                 }
-                consts::METRIC_LATENCY_FINALIZATION => {
-                    "Time to store signature and usage before sending [DONE]"
-                }
                 consts::METRIC_VERIFICATION_DURATION => "Time to complete verification operation",
                 consts::METRIC_HTTP_DURATION => "HTTP request processing time",
                 _ => "Latency measurement",

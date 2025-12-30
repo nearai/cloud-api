@@ -101,27 +101,78 @@ impl<S> InterceptStream<S>
 where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
 {
-    fn create_finalize_future(&self) -> FinalizeFuture {
-        let organization_id = self.organization_id;
-        let workspace_id = self.workspace_id;
-        let api_key_id = self.api_key_id;
-        let model_id = self.model_id;
-        let inference_type = self.inference_type.clone();
+    /// Store attestation signature before sending [DONE] to client.
+    /// This runs in the hot path to ensure signature is available when client receives [DONE].
+    fn create_signature_future(&self) -> FinalizeFuture {
+        let chat_id = match &self.last_chat_id {
+            Some(id) => id.clone(),
+            None => return Box::pin(async {}),
+        };
 
-        // Get usage stats and chat_id from stream
+        let attestation_service = self.attestation_service.clone();
+
+        Box::pin(async move {
+            if let Err(e) = tokio::time::timeout(
+                Duration::from_secs(FINALIZE_TIMEOUT_SECS),
+                attestation_service.store_chat_signature_from_provider(&chat_id),
+            )
+            .await
+            {
+                tracing::error!("Timeout/error storing chat signature: {:?}", e);
+            }
+        })
+    }
+
+    /// Record usage and metrics. Called from Drop to ensure it always runs.
+    fn record_usage_and_metrics(&self) {
         let (input_tokens, output_tokens, chat_id) =
             match (&self.last_usage_stats, &self.last_chat_id) {
                 (Some(usage), Some(chat_id)) => (
                     usage.prompt_tokens,
                     usage.completion_tokens,
-                    Some(chat_id.clone()),
+                    chat_id.clone(),
                 ),
-                _ => return Box::pin(async {}),
+                _ => return,
             };
 
         if input_tokens == 0 && output_tokens == 0 {
-            return Box::pin(async {});
+            return;
         }
+
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                tracing::warn!("Cannot record usage: no Tokio runtime");
+                return;
+            }
+        };
+
+        let organization_id = self.organization_id;
+        let workspace_id = self.workspace_id;
+        let api_key_id = self.api_key_id;
+        let model_id = self.model_id;
+        let inference_type = self.inference_type.clone();
+        let inference_id = hash_inference_id_to_uuid(&chat_id);
+
+        // Create span with full context for async task
+        let span = tracing::info_span!(
+            "record_usage",
+            %organization_id,
+            %workspace_id,
+            %api_key_id,
+            %model_id,
+            %inference_type,
+            %inference_id
+        );
+        let last_finish_reason = self.last_finish_reason.clone();
+        let last_error = self.last_error.clone();
+        let response_id = self.response_id.clone();
+        let usage_service = self.usage_service.clone();
+        let metrics_service = self.metrics_service.clone();
+        let ttft_ms = self.ttft_ms;
+        let e2e_duration = self.service_start_time.elapsed();
+        let first_token_time = self.first_token_time;
+        let stream_completed = self.stream_completed;
 
         let avg_itl_ms = if self.token_count > 0 {
             Some(self.total_itl_ms / self.token_count as f64)
@@ -129,27 +180,17 @@ where
             None
         };
 
-        let chat_id = chat_id.expect("chat_id checked above");
-        let inference_id = hash_inference_id_to_uuid(&chat_id);
-        let last_finish_reason = self.last_finish_reason.clone();
-        let last_error = self.last_error.clone();
-        let response_id = self.response_id.clone();
-        let usage_service = self.usage_service.clone();
-        let attestation_service = self.attestation_service.clone();
-        let metrics_service = self.metrics_service.clone();
-        let ttft_ms = self.ttft_ms;
-        let e2e_duration = self.service_start_time.elapsed();
-        let first_token_time = self.first_token_time;
         let input_bucket = get_input_bucket(input_tokens);
         let mut metric_tags = self.metric_tags.clone();
         metric_tags.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
 
-        Box::pin(async move {
-            let finalize_start = Instant::now();
-
-            let result = tokio::time::timeout(Duration::from_secs(FINALIZE_TIMEOUT_SECS), async {
+        use tracing::Instrument;
+        handle.spawn(
+            async move {
                 let stop_reason = if let Some(ref err) = last_error {
                     Some(crate::usage::StopReason::from_completion_error(err))
+                } else if !stream_completed {
+                    Some(crate::usage::StopReason::ClientDisconnect)
                 } else if let Some(ref finish_reason) = last_finish_reason {
                     Some(crate::usage::StopReason::from_provider_finish_reason(
                         finish_reason,
@@ -158,44 +199,30 @@ where
                     Some(crate::usage::StopReason::Completed)
                 };
 
-                let signature_fut = async {
-                    if attestation_service
-                        .store_chat_signature_from_provider(&chat_id)
-                        .await
-                        .is_err()
-                    {
-                        tracing::error!("Failed to store chat signature");
-                    }
-                };
+                if usage_service
+                    .record_usage(RecordUsageServiceRequest {
+                        organization_id,
+                        workspace_id,
+                        api_key_id,
+                        model_id,
+                        input_tokens,
+                        output_tokens,
+                        inference_type,
+                        ttft_ms,
+                        avg_itl_ms,
+                        inference_id: Some(inference_id),
+                        provider_request_id: Some(chat_id),
+                        stop_reason,
+                        response_id,
+                    })
+                    .await
+                    .is_err()
+                {
+                    tracing::error!("Failed to record usage");
+                }
 
-                let usage_fut = async {
-                    if usage_service
-                        .record_usage(RecordUsageServiceRequest {
-                            organization_id,
-                            workspace_id,
-                            api_key_id,
-                            model_id,
-                            input_tokens,
-                            output_tokens,
-                            inference_type,
-                            ttft_ms,
-                            avg_itl_ms,
-                            inference_id: Some(inference_id),
-                            provider_request_id: Some(chat_id.clone()),
-                            stop_reason,
-                            response_id,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        tracing::error!("Failed to record usage, inference_id={}", inference_id);
-                    }
-                };
-
-                tokio::join!(signature_fut, usage_fut);
-
+                // Record metrics
                 let tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
-
                 metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
 
                 if let Some(first_token_instant) = first_token_time {
@@ -215,21 +242,9 @@ where
 
                 metrics_service.record_count(METRIC_TOKENS_INPUT, input_tokens as i64, &tags);
                 metrics_service.record_count(METRIC_TOKENS_OUTPUT, output_tokens as i64, &tags);
-            })
-            .await;
-
-            let finalize_duration = finalize_start.elapsed();
-            let tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
-            metrics_service.record_latency(METRIC_LATENCY_FINALIZATION, finalize_duration, &tags);
-
-            if result.is_err() {
-                tracing::error!(
-                    "Timeout storing signature/usage ({}s exceeded), inference_id={}",
-                    FINALIZE_TIMEOUT_SECS,
-                    inference_id
-                );
             }
-        })
+            .instrument(span),
+        );
     }
 }
 
@@ -294,8 +309,8 @@ where
                         }
                         Poll::Ready(None) => {
                             self.stream_completed = true;
-                            let finalize_future = self.create_finalize_future();
-                            self.state = StreamState::Finalizing(finalize_future);
+                            let signature_future = self.create_signature_future();
+                            self.state = StreamState::Finalizing(signature_future);
                         }
                         Poll::Ready(Some(Err(ref err))) => {
                             self.last_error = Some(err.clone());
@@ -322,155 +337,13 @@ where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
 {
     fn drop(&mut self) {
-        let organization_id = self.organization_id;
-        let workspace_id = self.workspace_id;
-        let api_key_id = self.api_key_id;
-        let model_id = self.model_id;
-        let inference_type = self.inference_type.clone();
-
-        // Create a span with common fields for all logging in this method
-        let _span = tracing::error_span!(
-            "stream_drop",
-            %organization_id,
-            %workspace_id,
-            %api_key_id,
-            %model_id,
-            %inference_type
-        )
-        .entered();
-
         // Decrement concurrent counter if present
         if let Some(counter) = &self.concurrent_counter {
             counter.fetch_sub(1, Ordering::Release);
         }
 
-        if matches!(self.state, StreamState::Done) {
-            return;
-        }
-
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => {
-                tracing::warn!("Cannot record usage on abnormal drop: no Tokio runtime available");
-                return;
-            }
-        };
-
-        // Get usage stats and chat_id from stream
-        let (input_tokens, output_tokens, chat_id) =
-            match (&self.last_usage_stats, &self.last_chat_id) {
-                (Some(usage), Some(chat_id)) => (
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    chat_id.clone(),
-                ),
-                _ => return,
-            };
-
-        if input_tokens == 0 && output_tokens == 0 {
-            return;
-        }
-
-        let avg_itl_ms = if self.token_count > 0 {
-            Some(self.total_itl_ms / self.token_count as f64)
-        } else {
-            None
-        };
-
-        let inference_id = hash_inference_id_to_uuid(&chat_id);
-        let last_finish_reason = self.last_finish_reason.clone();
-        let last_error = self.last_error.clone();
-        let response_id = self.response_id.clone();
-        let usage_service = self.usage_service.clone();
-        let metrics_service = self.metrics_service.clone();
-        let ttft_ms = self.ttft_ms;
-        let e2e_duration = self.service_start_time.elapsed();
-        let first_token_time = self.first_token_time;
-        let input_bucket = get_input_bucket(input_tokens);
-        let mut metric_tags = self.metric_tags.clone();
-        metric_tags.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
-
-        let span = tracing::Span::current();
-
-        let handle_clone = handle.clone();
-        handle.spawn_blocking(move || {
-            let _span_guard = span.enter();
-            handle_clone.block_on(async move {
-                let result = tokio::time::timeout(
-                    Duration::from_secs(FINALIZE_TIMEOUT_SECS),
-                    async {
-                        let stop_reason = if let Some(ref err) = last_error {
-                            Some(crate::usage::StopReason::from_completion_error(err))
-                        } else if let Some(ref finish_reason) = last_finish_reason {
-                            Some(crate::usage::StopReason::from_provider_finish_reason(
-                                finish_reason,
-                            ))
-                        } else {
-                            Some(crate::usage::StopReason::ClientDisconnect)
-                        };
-
-                        if usage_service
-                            .record_usage(RecordUsageServiceRequest {
-                                organization_id,
-                                workspace_id,
-                                api_key_id,
-                                model_id,
-                                input_tokens,
-                                output_tokens,
-                                inference_type,
-                                ttft_ms,
-                                avg_itl_ms,
-                                inference_id: Some(inference_id),
-                                provider_request_id: Some(chat_id.clone()),
-                                stop_reason,
-                                response_id,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            tracing::error!(
-                                "Failed to record usage on client disconnect, inference_id={}",
-                                inference_id
-                            );
-                        }
-
-                        let tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
-
-                        metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
-
-                        if let Some(first_token_instant) = first_token_time {
-                            let decoding_duration = first_token_instant.elapsed();
-                            metrics_service.record_latency(
-                                METRIC_LATENCY_DECODING_TIME,
-                                decoding_duration,
-                                &tags,
-                            );
-
-                            let decode_secs = decoding_duration.as_secs_f64();
-                            if decode_secs > 0.0 {
-                                let tps = output_tokens as f64 / decode_secs;
-                                metrics_service
-                                    .record_histogram(METRIC_TOKENS_PER_SECOND, tps, &tags);
-                            }
-                        }
-
-                        metrics_service
-                            .record_count(METRIC_TOKENS_INPUT, input_tokens as i64, &tags);
-                        metrics_service
-                            .record_count(METRIC_TOKENS_OUTPUT, output_tokens as i64, &tags);
-                    },
-                )
-                .await;
-
-                if result.is_err() {
-                    tracing::error!(
-                        "Timeout recording usage on client disconnect ({}s exceeded), inference_id={}",
-                        FINALIZE_TIMEOUT_SECS,
-                        inference_id
-                    );
-                }
-            })
-        });
+        // Always record usage in Drop (async, fire-and-forget)
+        self.record_usage_and_metrics();
     }
 }
 

@@ -91,10 +91,13 @@ impl PgResponseItemsRepository {
         let item_created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
         let created_at_timestamp = item_created_at.timestamp();
 
-        let model = if !item.model().is_empty() {
-            item.model().to_string()
+        let model = if let Some(m) = item.model() {
+            if !m.is_empty() {
+                m.to_string()
+            } else {
+                row.try_get("model")?
+            }
         } else {
-            // Get model from joined responses table
             row.try_get("model")?
         };
 
@@ -156,6 +159,9 @@ impl PgResponseItemsRepository {
                 *ts = created_at_timestamp;
                 *mdl = model;
             }
+            ResponseOutputItem::McpListTools { .. } => {}
+            ResponseOutputItem::McpCall { .. } => {}
+            ResponseOutputItem::McpApprovalRequest { .. } => {}
         }
 
         Ok(item)

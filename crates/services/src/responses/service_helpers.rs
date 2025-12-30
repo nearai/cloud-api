@@ -482,5 +482,19 @@ pub struct ToolCallInfo {
     pub params: Option<serde_json::Value>,
 }
 
+/// Result of processing a completion stream
+///
+/// Contains the accumulated text, detected tool calls, and stream status.
+#[derive(Debug)]
+pub struct ProcessStreamResult {
+    /// The accumulated text content from the stream
+    pub text: String,
+    /// Tool calls detected in the stream
+    pub tool_calls: Vec<ToolCallInfo>,
+    /// Whether the stream terminated with an error (client disconnect, network error, etc.)
+    /// When true, the response may be incomplete and the agent loop should stop.
+    pub stream_error: bool,
+}
+
 /// Accumulator for streaming tool calls
 pub type ToolCallAccumulator = std::collections::HashMap<i64, (Option<String>, String)>;

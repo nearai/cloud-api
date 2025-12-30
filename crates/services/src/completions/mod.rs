@@ -367,6 +367,9 @@ where
                             self.state = StreamState::Finalizing(signature_future);
                         }
                         Poll::Ready(Some(Err(ref err))) => {
+                            // Capture error for stop_reason in usage recording (handled in Drop)
+                            // Note: We intentionally skip Finalizing state (attestation) for errors
+                            // because partial completions cannot be verified by clients
                             self.last_error = Some(err.clone());
                             return Poll::Ready(Some(Err(err.clone())));
                         }

@@ -3,6 +3,7 @@
 // ============================================
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -90,9 +91,56 @@ pub enum ResponseInput {
 
 /// Single input item
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ResponseInputItem {
-    pub role: String,
-    pub content: ResponseContent,
+#[serde(untagged)]
+pub enum ResponseInputItem {
+    McpApprovalResponse {
+        #[serde(rename = "type")]
+        type_: McpApprovalResponseType,
+        approval_request_id: String,
+        approve: bool,
+    },
+    Message {
+        role: String,
+        content: ResponseContent,
+    },
+}
+
+impl ResponseInputItem {
+    pub fn role(&self) -> Option<&str> {
+        match self {
+            ResponseInputItem::Message { role, .. } => Some(role),
+            ResponseInputItem::McpApprovalResponse { .. } => None,
+        }
+    }
+
+    pub fn content(&self) -> Option<&ResponseContent> {
+        match self {
+            ResponseInputItem::Message { content, .. } => Some(content),
+            ResponseInputItem::McpApprovalResponse { .. } => None,
+        }
+    }
+
+    pub fn is_mcp_approval(&self) -> bool {
+        matches!(self, ResponseInputItem::McpApprovalResponse { .. })
+    }
+
+    pub fn as_mcp_approval(&self) -> Option<(&str, bool)> {
+        match self {
+            ResponseInputItem::McpApprovalResponse {
+                approval_request_id,
+                approve,
+                ..
+            } => Some((approval_request_id, *approve)),
+            ResponseInputItem::Message { .. } => None,
+        }
+    }
+}
+
+/// Type marker for MCP approval response input
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub enum McpApprovalResponseType {
+    #[serde(rename = "mcp_approval_response")]
+    McpApprovalResponse,
 }
 
 /// Content can be text or array of content parts
@@ -169,6 +217,22 @@ pub enum ResponseTool {
     CodeInterpreter {},
     #[serde(rename = "computer")]
     Computer {},
+    /// Remote MCP server tool
+    #[serde(rename = "mcp")]
+    Mcp {
+        server_label: String,
+        /// HTTPS endpoint for the remote MCP server
+        server_url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server_description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        authorization: Option<String>,
+        /// Tool approval requirement (default: "always")
+        #[serde(default)]
+        require_approval: McpApprovalRequirement,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allowed_tools: Option<Vec<String>>,
+    },
 }
 
 /// User location for web search
@@ -184,6 +248,57 @@ pub struct UserLocation {
     pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
+}
+
+// ============================================
+// MCP (Model Context Protocol) Types
+// ============================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum McpApprovalRequirement {
+    Simple(McpApprovalMode),
+    Granular { never: McpToolNameFilter },
+}
+
+impl Default for McpApprovalRequirement {
+    fn default() -> Self {
+        McpApprovalRequirement::Simple(McpApprovalMode::Always)
+    }
+}
+
+impl McpApprovalRequirement {
+    /// Check if a specific tool requires approval
+    pub fn requires_approval(&self, tool_name: &str) -> bool {
+        match self {
+            McpApprovalRequirement::Simple(mode) => matches!(mode, McpApprovalMode::Always),
+            McpApprovalRequirement::Granular { never } => !never.tool_names.contains(tool_name),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum McpApprovalMode {
+    #[default]
+    Always,
+    Never,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct McpToolNameFilter {
+    pub tool_names: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct McpDiscoveredTool {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<serde_json::Value>,
 }
 
 /// Tool choice configuration
@@ -370,6 +485,35 @@ pub enum ResponseOutputItem {
         content: String,
         model: String,
     },
+    /// MCP tool list - emitted after connecting to an MCP server
+    #[serde(rename = "mcp_list_tools")]
+    McpListTools {
+        id: String,
+        server_label: String,
+        tools: Vec<McpDiscoveredTool>,
+    },
+    /// MCP tool call - emitted after executing a tool on an MCP server
+    #[serde(rename = "mcp_call")]
+    McpCall {
+        id: String,
+        server_label: String,
+        name: String,
+        arguments: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval_request_id: Option<String>,
+    },
+    /// MCP approval request - emitted when a tool requires approval
+    #[serde(rename = "mcp_approval_request")]
+    McpApprovalRequest {
+        id: String,
+        server_label: String,
+        name: String,
+        arguments: String,
+    },
 }
 
 impl ResponseOutputItem {
@@ -380,57 +524,76 @@ impl ResponseOutputItem {
             ResponseOutputItem::ToolCall { id, .. } => id,
             ResponseOutputItem::WebSearchCall { id, .. } => id,
             ResponseOutputItem::Reasoning { id, .. } => id,
+            ResponseOutputItem::McpListTools { id, .. } => id,
+            ResponseOutputItem::McpCall { id, .. } => id,
+            ResponseOutputItem::McpApprovalRequest { id, .. } => id,
         }
     }
 
     /// Get the status of the output item
-    pub fn status(&self) -> &ResponseItemStatus {
+    pub fn status(&self) -> ResponseItemStatus {
         match self {
-            ResponseOutputItem::Message { status, .. } => status,
-            ResponseOutputItem::ToolCall { status, .. } => status,
-            ResponseOutputItem::WebSearchCall { status, .. } => status,
-            ResponseOutputItem::Reasoning { status, .. } => status,
+            ResponseOutputItem::Message { status, .. } => status.clone(),
+            ResponseOutputItem::ToolCall { status, .. } => status.clone(),
+            ResponseOutputItem::WebSearchCall { status, .. } => status.clone(),
+            ResponseOutputItem::Reasoning { status, .. } => status.clone(),
+            ResponseOutputItem::McpListTools { .. } => ResponseItemStatus::Completed,
+            ResponseOutputItem::McpCall { .. } => ResponseItemStatus::Completed,
+            ResponseOutputItem::McpApprovalRequest { .. } => ResponseItemStatus::InProgress,
         }
     }
 
-    pub fn model(&self) -> &str {
+    /// Get the model of the output item
+    pub fn model(&self) -> Option<&str> {
         match self {
-            ResponseOutputItem::Message { model, .. } => model,
-            ResponseOutputItem::ToolCall { model, .. } => model,
-            ResponseOutputItem::WebSearchCall { model, .. } => model,
-            ResponseOutputItem::Reasoning { model, .. } => model,
+            ResponseOutputItem::Message { model, .. } => Some(model),
+            ResponseOutputItem::ToolCall { model, .. } => Some(model),
+            ResponseOutputItem::WebSearchCall { model, .. } => Some(model),
+            ResponseOutputItem::Reasoning { model, .. } => Some(model),
+            // MCP items are external server interactions, not LLM outputs
+            ResponseOutputItem::McpListTools { .. } => None,
+            ResponseOutputItem::McpCall { .. } => None,
+            ResponseOutputItem::McpApprovalRequest { .. } => None,
         }
     }
 
     /// Get the response_id of the output item
-    pub fn response_id(&self) -> &str {
+    pub fn response_id(&self) -> Option<&str> {
         match self {
-            ResponseOutputItem::Message { response_id, .. } => response_id,
-            ResponseOutputItem::ToolCall { response_id, .. } => response_id,
-            ResponseOutputItem::WebSearchCall { response_id, .. } => response_id,
-            ResponseOutputItem::Reasoning { response_id, .. } => response_id,
+            ResponseOutputItem::Message { response_id, .. } => Some(response_id),
+            ResponseOutputItem::ToolCall { response_id, .. } => Some(response_id),
+            ResponseOutputItem::WebSearchCall { response_id, .. } => Some(response_id),
+            ResponseOutputItem::Reasoning { response_id, .. } => Some(response_id),
+            // MCP items don't track response_id
+            ResponseOutputItem::McpListTools { .. } => None,
+            ResponseOutputItem::McpCall { .. } => None,
+            ResponseOutputItem::McpApprovalRequest { .. } => None,
         }
     }
 
     /// Get the previous_response_id of the output item
-    pub fn previous_response_id(&self) -> &Option<String> {
+    pub fn previous_response_id(&self) -> Option<&str> {
         match self {
             ResponseOutputItem::Message {
                 previous_response_id,
                 ..
-            } => previous_response_id,
+            } => previous_response_id.as_deref(),
             ResponseOutputItem::ToolCall {
                 previous_response_id,
                 ..
-            } => previous_response_id,
+            } => previous_response_id.as_deref(),
             ResponseOutputItem::WebSearchCall {
                 previous_response_id,
                 ..
-            } => previous_response_id,
+            } => previous_response_id.as_deref(),
             ResponseOutputItem::Reasoning {
                 previous_response_id,
                 ..
-            } => previous_response_id,
+            } => previous_response_id.as_deref(),
+            // MCP items don't have previous_response_id
+            ResponseOutputItem::McpListTools { .. } => None,
+            ResponseOutputItem::McpCall { .. } => None,
+            ResponseOutputItem::McpApprovalRequest { .. } => None,
         }
     }
 }

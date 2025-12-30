@@ -1156,20 +1156,19 @@ impl ResponseServiceImpl {
                 break;
             }
 
-            // Check for consecutive error tool calls (indicates model returning malformed tool calls)
-            let all_errors = stream_result
+            let has_errors = stream_result
                 .tool_calls
                 .iter()
-                .all(|tc| tc.tool_type == ERROR_TOOL_TYPE);
-            if all_errors {
+                .any(|tc| tc.tool_type == ERROR_TOOL_TYPE);
+            if has_errors {
                 consecutive_error_count += 1;
                 if consecutive_error_count >= MAX_CONSECUTIVE_TOOL_ERRORS {
                     tracing::error!(
-                        "Agent loop: {} consecutive tool call errors, stopping to prevent infinite retry",
+                        "Agent loop: {} consecutive iterations with tool call errors, stopping to prevent infinite retry",
                         consecutive_error_count
                     );
                     return Err(errors::ResponseError::InternalError(
-                        format!("Tool calls failed {} consecutive times due to malformed arguments from model", MAX_CONSECUTIVE_TOOL_ERRORS),
+                        format!("Tool calls failed {} consecutive iterations due to malformed arguments from model", MAX_CONSECUTIVE_TOOL_ERRORS),
                     ));
                 }
             } else {

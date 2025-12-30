@@ -132,7 +132,18 @@ where
                     usage.completion_tokens,
                     chat_id.clone(),
                 ),
-                _ => return,
+                (None, None) => {
+                    tracing::error!("Stream ended but no usage stats and no chat_id available");
+                    return;
+                }
+                (None, Some(chat_id)) => {
+                    tracing::error!(%chat_id, "Stream ended but no usage stats available");
+                    return;
+                }
+                (Some(usage), None) => {
+                    tracing::error!(?usage, "Stream ended but no chat_id available");
+                    return;
+                }
             };
 
         if input_tokens == 0 && output_tokens == 0 {

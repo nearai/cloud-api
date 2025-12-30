@@ -317,7 +317,7 @@ impl ResponseServiceImpl {
     }
 
     /// Process a completion stream and emit events for text deltas
-    /// Returns the accumulated text and detected tool calls
+    /// Returns the accumulated text, detected tool calls, and whether stream terminated with error
     async fn process_completion_stream(
         completion_stream: &mut Pin<
             Box<
@@ -333,8 +333,14 @@ impl ResponseServiceImpl {
         ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
         process_context: &ProcessStreamContext,
-    ) -> Result<(String, Vec<crate::responses::service_helpers::ToolCallInfo>), errors::ResponseError>
-    {
+    ) -> Result<
+        (
+            String,
+            Vec<crate::responses::service_helpers::ToolCallInfo>,
+            bool,
+        ),
+        errors::ResponseError,
+    > {
         use crate::responses::service_helpers::ToolCallAccumulator;
         use futures::StreamExt;
 
@@ -350,8 +356,8 @@ impl ResponseServiceImpl {
         let mut reasoning_item_emitted = false;
         let reasoning_item_id = format!("rs_{}", uuid::Uuid::new_v4().simple());
 
-        // Client disconnect tracking - when client disconnects, we save partial response and stop
-        let mut client_disconnected = false;
+        // Stream error tracking - when stream errors (client disconnect, network error, etc.), we save partial response and stop
+        let mut stream_error = false;
 
         while let Some(event) = completion_stream.next().await {
             match event {
@@ -494,12 +500,12 @@ impl ResponseServiceImpl {
                         // Handle clean text (message content)
                         if !clean_text.is_empty() {
                             // First time we receive message text, emit the item.added and content_part.added events
-                            if !message_item_emitted && !client_disconnected {
+                            if !message_item_emitted && !stream_error {
                                 if let Err(e) =
                                     Self::emit_message_started(emitter, ctx, &message_item_id).await
                                 {
                                     tracing::debug!("emit_message_started failed: {}", e);
-                                    client_disconnected = true;
+                                    stream_error = true;
                                 } else {
                                     message_item_emitted = true;
                                 }
@@ -508,7 +514,7 @@ impl ResponseServiceImpl {
                             current_text.push_str(&clean_text);
 
                             // Emit delta event for message content
-                            if !client_disconnected {
+                            if !stream_error {
                                 if let Err(e) = emitter
                                     .emit_text_delta(
                                         ctx,
@@ -519,13 +525,13 @@ impl ResponseServiceImpl {
                                 {
                                     tracing::debug!("emit_text_delta failed: {}", e);
                                     // Client disconnected - save partial response and stop consuming stream
-                                    client_disconnected = true;
+                                    stream_error = true;
                                 }
                             }
                         }
 
                         // If client disconnected, break out of loop to save partial response
-                        if client_disconnected {
+                        if stream_error {
                             break;
                         }
 
@@ -567,6 +573,7 @@ impl ResponseServiceImpl {
                         "Error in completion stream (client disconnect or stream error): {}",
                         e
                     );
+                    stream_error = true;
                     // Don't return early - save partial response below
                     break;
                 }
@@ -590,7 +597,7 @@ impl ResponseServiceImpl {
         // Convert accumulated tool calls to detected tool calls
         let tool_calls_detected = Self::convert_tool_calls(tool_call_accumulator);
 
-        Ok((current_text, tool_calls_detected))
+        Ok((current_text, tool_calls_detected, stream_error))
     }
 
     /// Emit events when a message starts streaming
@@ -920,7 +927,7 @@ impl ResponseServiceImpl {
         let tools = Self::prepare_tools(&context.request);
         let tool_choice = Self::prepare_tool_choice(&context.request);
 
-        let max_iterations = 100; // Prevent infinite loops
+        let max_iterations = 10; // Prevent infinite loops
         let mut iteration = 0;
         let mut final_response_text = String::new();
 
@@ -1044,6 +1051,9 @@ impl ResponseServiceImpl {
     ) -> Result<(), errors::ResponseError> {
         use crate::completions::ports::{CompletionMessage, CompletionRequest};
 
+        // Track consecutive error tool calls to detect excessive retry loops
+        let mut consecutive_error_count = 0;
+
         loop {
             *iteration += 1;
             if *iteration > max_iterations {
@@ -1114,14 +1124,21 @@ impl ResponseServiceImpl {
             let mut completion_stream = completion_result;
 
             // Process the completion stream and extract text + tool calls
-            let (current_text, tool_calls_detected) = Self::process_completion_stream(
-                &mut completion_stream,
-                emitter,
-                ctx,
-                &process_context.response_items_repository,
-                process_context,
-            )
-            .await?;
+            let (current_text, tool_calls_detected, stream_error) =
+                Self::process_completion_stream(
+                    &mut completion_stream,
+                    emitter,
+                    ctx,
+                    &process_context.response_items_repository,
+                    process_context,
+                )
+                .await?;
+
+            // If stream errored (client disconnect, network error, etc.), stop the agent loop
+            if stream_error {
+                tracing::info!("Stream error detected, stopping agent loop");
+                break;
+            }
 
             // Update response state
             if !current_text.is_empty() {
@@ -1137,6 +1154,25 @@ impl ResponseServiceImpl {
             if tool_calls_detected.is_empty() {
                 tracing::debug!("No tool calls detected, ending agent loop");
                 break;
+            }
+
+            // Check for consecutive error tool calls (indicates model returning malformed tool calls)
+            let all_errors = tool_calls_detected
+                .iter()
+                .all(|tc| tc.tool_type == "__error__");
+            if all_errors {
+                consecutive_error_count += 1;
+                if consecutive_error_count >= 3 {
+                    tracing::error!(
+                        "Agent loop: {} consecutive tool call errors, stopping to prevent infinite retry",
+                        consecutive_error_count
+                    );
+                    return Err(errors::ResponseError::InternalError(
+                        "Tool calls failed 3 consecutive times due to malformed arguments from model".to_string(),
+                    ));
+                }
+            } else {
+                consecutive_error_count = 0;
             }
 
             tracing::debug!("Executing {} tool calls", tool_calls_detected.len());

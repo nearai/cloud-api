@@ -1061,9 +1061,10 @@ mod tests {
         // Consume the stream
         let _ = intercept_stream.collect::<Vec<_>>().await;
 
-        // Verify metrics
+        // Wait for async usage recording in Drop to complete
         tokio::time::sleep(Duration::from_millis(100)).await;
 
+        // Verify metrics
         let metrics = metrics_service.get_metrics();
 
         // Should have:
@@ -1212,6 +1213,7 @@ mod tests {
         // Consume the stream
         let _ = intercept_stream.collect::<Vec<_>>().await;
 
+        // Wait for async usage recording in Drop to complete
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Verify usage was recorded with latency metrics

@@ -91,14 +91,9 @@ impl PgResponseItemsRepository {
         let item_created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
         let created_at_timestamp = item_created_at.timestamp();
 
-        let model = if let Some(m) = item.model() {
-            if !m.is_empty() {
-                m.to_string()
-            } else {
-                row.try_get("model")?
-            }
-        } else {
-            row.try_get("model")?
+        let model = match item.model().filter(|m| !m.is_empty()) {
+            Some(m) => m.to_string(),
+            None => row.try_get("model")?,
         };
 
         // Enrich the item with response metadata

@@ -202,6 +202,8 @@ impl McpClientFactory for RealMcpClientFactory {
 struct McpServerConnection {
     /// The MCP client
     client: Box<dyn McpClient>,
+    /// Server label for mcp_call output items (used in Phase 2)
+    #[allow(dead_code)]
     server_label: String,
     tools: Vec<McpDiscoveredTool>,
     require_approval: McpApprovalRequirement,
@@ -377,7 +379,9 @@ impl McpToolExecutor {
                         || ipv4.is_broadcast()
                         || ipv4.is_unspecified()
                 }
-                std::net::IpAddr::V6(ipv6) => ipv6.is_loopback() || ipv6.is_unspecified(),
+                std::net::IpAddr::V6(ipv6) => {
+                    ipv6.is_loopback() || ipv6.is_unspecified() || ipv6.is_unique_local()
+                }
             }
         } else {
             false

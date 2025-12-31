@@ -3,9 +3,11 @@ use crate::models::{
     AdminAccessTokenResponse, AdminModelListResponse, AdminModelWithPricing,
     AdminUserOrganizationDetails, AdminUserResponse, BatchUpdateModelApiRequest,
     CreateAdminAccessTokenRequest, DecimalPrice, DeleteAdminAccessTokenRequest, DeleteModelRequest,
-    ErrorResponse, ListUsersResponse, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata,
-    ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage,
-    SpendLimit, UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
+    ErrorResponse, GetOrganizationConcurrentLimitResponse, ListUsersResponse, ModelHistoryEntry,
+    ModelHistoryResponse, ModelMetadata, ModelWithPricing, OrgLimitsHistoryEntry,
+    OrgLimitsHistoryResponse, OrganizationUsage, SpendLimit,
+    UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
+    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
 };
 use crate::routes::common::format_amount;
 use axum::{
@@ -1374,4 +1376,175 @@ pub async fn get_organization_timeseries(
         })?;
 
     Ok(ResponseJson(metrics))
+}
+
+// Default concurrent limit if none is set
+const DEFAULT_CONCURRENT_LIMIT: i32 = 64;
+
+/// Update organization concurrent request limit (Admin only)
+///
+/// Updates the maximum concurrent requests allowed per model for an organization.
+/// Set to null to use the default limit (64).
+/// Changes take effect within 5 minutes due to caching.
+#[utoipa::path(
+    patch,
+    path = "/v1/admin/organizations/{organization_id}/concurrent-limit",
+    tag = "Admin",
+    params(
+        ("organization_id" = String, Path, description = "The organization's ID (as a UUID)")
+    ),
+    request_body = UpdateOrganizationConcurrentLimitRequest,
+    responses(
+        (status = 200, description = "Concurrent limit updated successfully", body = UpdateOrganizationConcurrentLimitResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn update_organization_concurrent_limit(
+    State(app_state): State<AdminAppState>,
+    Path(organization_id): Path<String>,
+    Extension(_admin_user): Extension<AdminUser>,
+    ResponseJson(request): ResponseJson<UpdateOrganizationConcurrentLimitRequest>,
+) -> Result<
+    ResponseJson<UpdateOrganizationConcurrentLimitResponse>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    debug!(
+        "Update organization concurrent limit request for org_id: {}, limit: {:?}",
+        organization_id, request.concurrent_limit
+    );
+
+    // Parse organization ID
+    let org_uuid = uuid::Uuid::parse_str(&organization_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Invalid organization ID format".to_string(),
+                "invalid_id".to_string(),
+            )),
+        )
+    })?;
+
+    // Update concurrent limit via admin service
+    app_state
+        .admin_service
+        .update_organization_concurrent_limit(org_uuid, request.concurrent_limit)
+        .await
+        .map_err(|e| {
+            error!("Failed to update organization concurrent limit");
+            match e {
+                services::admin::AdminError::OrganizationNotFound(msg) => (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        msg,
+                        "organization_not_found".to_string(),
+                    )),
+                ),
+                services::admin::AdminError::InvalidLimits(msg) => (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(msg, "invalid_limits".to_string())),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to update concurrent limit".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+
+    let response = UpdateOrganizationConcurrentLimitResponse {
+        organization_id: organization_id.clone(),
+        concurrent_limit: request.concurrent_limit,
+        updated_at: Utc::now().to_rfc3339(),
+    };
+
+    Ok(ResponseJson(response))
+}
+
+/// Get organization concurrent request limit (Admin only)
+///
+/// Returns the current concurrent request limit for an organization.
+/// If no custom limit is set, returns null for concurrent_limit and the default (64) for effective_limit.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations/{organization_id}/concurrent-limit",
+    tag = "Admin",
+    params(
+        ("organization_id" = String, Path, description = "The organization's ID (as a UUID)")
+    ),
+    responses(
+        (status = 200, description = "Concurrent limit retrieved successfully", body = GetOrganizationConcurrentLimitResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_organization_concurrent_limit(
+    State(app_state): State<AdminAppState>,
+    Path(organization_id): Path<String>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<
+    ResponseJson<GetOrganizationConcurrentLimitResponse>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    debug!(
+        "Get organization concurrent limit request for org_id: {}",
+        organization_id
+    );
+
+    // Parse organization ID
+    let org_uuid = uuid::Uuid::parse_str(&organization_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Invalid organization ID format".to_string(),
+                "invalid_id".to_string(),
+            )),
+        )
+    })?;
+
+    // Get concurrent limit via admin service
+    let concurrent_limit = app_state
+        .admin_service
+        .get_organization_concurrent_limit(org_uuid)
+        .await
+        .map_err(|e| {
+            error!("Failed to get organization concurrent limit");
+            match e {
+                services::admin::AdminError::OrganizationNotFound(msg) => (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        msg,
+                        "organization_not_found".to_string(),
+                    )),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to get concurrent limit".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+
+    let effective_limit = concurrent_limit.unwrap_or(DEFAULT_CONCURRENT_LIMIT);
+
+    let response = GetOrganizationConcurrentLimitResponse {
+        organization_id,
+        concurrent_limit,
+        effective_limit,
+    };
+
+    Ok(ResponseJson(response))
 }

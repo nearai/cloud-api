@@ -340,6 +340,12 @@ pub async fn init_domain_services_with_pool(
         metrics_service.clone(),
     )) as Arc<dyn services::usage::UsageServiceTrait + Send + Sync>;
 
+    // Create organization limit repository for completion service rate limiting
+    let org_limit_repository = Arc::new(database::repositories::PgOrganizationRepository::new(
+        database.pool().clone(),
+    ))
+        as Arc<dyn services::completions::ports::OrganizationConcurrentLimitRepository>;
+
     // Create completion service with usage tracking (needs usage_service)
     let completion_service = Arc::new(services::CompletionServiceImpl::new(
         inference_provider_pool.clone(),
@@ -347,6 +353,7 @@ pub async fn init_domain_services_with_pool(
         usage_service.clone(),
         metrics_service.clone(),
         models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
+        org_limit_repository,
     ));
 
     let web_search_provider =
@@ -1009,9 +1016,10 @@ pub fn build_admin_routes(
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
         batch_upsert_models, create_admin_access_token, delete_admin_access_token, delete_model,
-        get_model_history, get_organization_limits_history, get_organization_metrics,
-        get_organization_timeseries, get_platform_metrics, list_admin_access_tokens,
-        list_models as admin_list_models, list_users, update_organization_limits, AdminAppState,
+        get_model_history, get_organization_concurrent_limit, get_organization_limits_history,
+        get_organization_metrics, get_organization_timeseries, get_platform_metrics,
+        list_admin_access_tokens, list_models as admin_list_models, list_users,
+        update_organization_concurrent_limit, update_organization_limits, AdminAppState,
     };
     use database::repositories::{
         AdminAccessTokenRepository, AdminCompositeRepository, PgAnalyticsRepository,
@@ -1064,6 +1072,11 @@ pub fn build_admin_routes(
         .route(
             "/admin/organizations/{organization_id}/limits/history",
             axum::routing::get(get_organization_limits_history),
+        )
+        .route(
+            "/admin/organizations/{organization_id}/concurrent-limit",
+            axum::routing::patch(update_organization_concurrent_limit)
+                .get(get_organization_concurrent_limit),
         )
         .route(
             "/admin/organizations/{org_id}/metrics",

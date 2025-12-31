@@ -217,6 +217,56 @@ impl AdminService for AdminServiceImpl {
 
         Ok((models, total))
     }
+
+    async fn update_organization_concurrent_limit(
+        &self,
+        organization_id: uuid::Uuid,
+        concurrent_limit: Option<i32>,
+    ) -> Result<(), AdminError> {
+        // Validate limit if provided
+        if let Some(limit) = concurrent_limit {
+            if limit <= 0 {
+                return Err(AdminError::InvalidLimits(
+                    "Concurrent limit must be a positive integer".to_string(),
+                ));
+            }
+        }
+
+        self.repository
+            .update_organization_concurrent_limit(organization_id, concurrent_limit)
+            .await
+            .map_err(|e| {
+                let error_msg = e.to_string();
+                if error_msg.contains("not found") || error_msg.contains("inactive") {
+                    AdminError::OrganizationNotFound(format!(
+                        "Organization '{}' not found",
+                        organization_id
+                    ))
+                } else {
+                    AdminError::InternalError(error_msg)
+                }
+            })
+    }
+
+    async fn get_organization_concurrent_limit(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<Option<i32>, AdminError> {
+        self.repository
+            .get_organization_concurrent_limit(organization_id)
+            .await
+            .map_err(|e| {
+                let error_msg = e.to_string();
+                if error_msg.contains("not found") || error_msg.contains("inactive") {
+                    AdminError::OrganizationNotFound(format!(
+                        "Organization '{}' not found",
+                        organization_id
+                    ))
+                } else {
+                    AdminError::InternalError(error_msg)
+                }
+            })
+    }
 }
 
 impl AdminServiceImpl {

@@ -16,6 +16,7 @@ use uuid::Uuid;
 /// Composite repository that implements AdminRepository for both model and organization operations
 #[derive(Clone)]
 pub struct AdminCompositeRepository {
+    pool: DbPool,
     model_repo: Arc<ModelRepository>,
     alias_repo: Arc<ModelAliasRepository>,
     limits_repo: Arc<OrganizationLimitsRepository>,
@@ -25,6 +26,7 @@ pub struct AdminCompositeRepository {
 impl AdminCompositeRepository {
     pub fn new(pool: DbPool) -> Self {
         Self {
+            pool: pool.clone(),
             model_repo: Arc::new(ModelRepository::new(pool.clone())),
             alias_repo: Arc::new(ModelAliasRepository::new(pool.clone())),
             limits_repo: Arc::new(OrganizationLimitsRepository::new(pool.clone())),
@@ -300,5 +302,45 @@ impl AdminRepository for AdminCompositeRepository {
             .collect();
 
         Ok((admin_models, total))
+    }
+
+    async fn update_organization_concurrent_limit(
+        &self,
+        organization_id: Uuid,
+        concurrent_limit: Option<i32>,
+    ) -> Result<()> {
+        let client = self.pool.get().await?;
+
+        let rows_updated = client
+            .execute(
+                "UPDATE organizations SET rate_limit = $1, updated_at = NOW() WHERE id = $2 AND is_active = true",
+                &[&concurrent_limit, &organization_id],
+            )
+            .await?;
+
+        if rows_updated == 0 {
+            anyhow::bail!("Organization not found or inactive: {}", organization_id);
+        }
+
+        Ok(())
+    }
+
+    async fn get_organization_concurrent_limit(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<Option<i32>> {
+        let client = self.pool.get().await?;
+
+        let row = client
+            .query_opt(
+                "SELECT rate_limit FROM organizations WHERE id = $1 AND is_active = true",
+                &[&organization_id],
+            )
+            .await?;
+
+        match row {
+            Some(r) => Ok(r.get("rate_limit")),
+            None => anyhow::bail!("Organization not found or inactive: {}", organization_id),
+        }
     }
 }

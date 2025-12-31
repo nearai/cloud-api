@@ -1248,6 +1248,7 @@ fn convert_output_item_to_conversation_item(
             id,
             server_label,
             tools,
+            error,
         } => ConversationItem::McpListTools {
             id,
             server_label,
@@ -1259,6 +1260,7 @@ fn convert_output_item_to_conversation_item(
                     input_schema: t.input_schema,
                 })
                 .collect(),
+            error,
         },
         ResponseOutputItem::McpCall {
             id,
@@ -1268,6 +1270,7 @@ fn convert_output_item_to_conversation_item(
             output,
             error,
             approval_request_id,
+            status,
         } => ConversationItem::McpCall {
             id,
             server_label,
@@ -1276,6 +1279,7 @@ fn convert_output_item_to_conversation_item(
             output,
             error,
             approval_request_id,
+            status,
         },
         ResponseOutputItem::McpApprovalRequest {
             id,

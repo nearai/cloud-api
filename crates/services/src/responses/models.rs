@@ -491,6 +491,9 @@ pub enum ResponseOutputItem {
         id: String,
         server_label: String,
         tools: Vec<McpDiscoveredTool>,
+        /// Error message if the server could not list tools
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     /// MCP tool call - emitted after executing a tool on an MCP server
     #[serde(rename = "mcp_call")]
@@ -505,6 +508,9 @@ pub enum ResponseOutputItem {
         error: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         approval_request_id: Option<String>,
+        /// Status of the tool call: in_progress, completed, incomplete, calling, or failed
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
     },
     /// MCP approval request - emitted when a tool requires approval
     #[serde(rename = "mcp_approval_request")]

@@ -950,6 +950,8 @@ pub enum ConversationItem {
         id: String,
         server_label: String,
         tools: Vec<McpDiscoveredTool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     #[serde(rename = "mcp_call")]
     McpCall {
@@ -963,6 +965,8 @@ pub enum ConversationItem {
         error: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         approval_request_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
     },
     #[serde(rename = "mcp_approval_request")]
     McpApprovalRequest {

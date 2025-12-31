@@ -1482,6 +1482,9 @@ impl ResponseServiceImpl {
                         models::ResponseInputItem::McpApprovalResponse { .. } => {
                             continue;
                         }
+                        models::ResponseInputItem::McpListTools { .. } => {
+                            continue;
+                        }
                     };
 
                     let content = match input_content {
@@ -1763,6 +1766,9 @@ impl ResponseServiceImpl {
                             models::ResponseInputItem::McpApprovalResponse { .. } => {
                                 continue;
                             }
+                            models::ResponseInputItem::McpListTools { .. } => {
+                                continue;
+                            }
                         };
 
                         let content = match item_content {
@@ -1785,7 +1791,7 @@ impl ResponseServiceImpl {
 
     /// Initialize MCP connections if any MCP tools are configured in the request.
     /// Connects to remote MCP servers, discovers available tools, emits mcp_list_tools
-    /// output items, and merges MCP tool definitions with the tools list for the LLM.
+    /// items (for client-side caching), and merges MCP tool definitions with the tools list.
     async fn initialize_mcp_connections(
         ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
         emitter: &mut crate::responses::service_helpers::EventEmitter,
@@ -1806,29 +1812,18 @@ impl ResponseServiceImpl {
             return Ok(());
         }
 
+        let cached_tools = Self::extract_cached_mcp_tools(&context.request);
+
         let mut mcp_executor = tools::McpToolExecutor::new();
 
-        let mcp_list_tools_items = mcp_executor.connect_servers(mcp_tools).await?;
+        // Connect to servers, using cached tools where available
+        let mcp_list_tools_items = mcp_executor
+            .connect_servers_with_cache(mcp_tools, &cached_tools)
+            .await?;
 
-        // Emit and store mcp_list_tools output items for each server
         for item in mcp_list_tools_items {
             let item_id = item.id().to_string();
-            emitter.emit_item_added(ctx, item.clone(), item_id).await?;
-
-            context
-                .response_items_repository
-                .create(
-                    ctx.response_id.clone(),
-                    ctx.api_key_id,
-                    ctx.conversation_id,
-                    item,
-                )
-                .await
-                .map_err(|e| {
-                    errors::ResponseError::InternalError(format!(
-                        "Failed to store mcp_list_tools item: {e}"
-                    ))
-                })?;
+            emitter.emit_item_added(ctx, item, item_id).await?;
         }
 
         // Add MCP tool definitions to the tools list for the LLM
@@ -1839,6 +1834,33 @@ impl ResponseServiceImpl {
         context.mcp_executor = Some(mcp_executor);
 
         Ok(())
+    }
+
+    /// Extract cached mcp_list_tools from the request input
+    fn extract_cached_mcp_tools(
+        request: &models::CreateResponseRequest,
+    ) -> std::collections::HashMap<String, Vec<models::McpDiscoveredTool>> {
+        use std::collections::HashMap;
+        let mut cached: HashMap<String, Vec<models::McpDiscoveredTool>> = HashMap::new();
+
+        let items = match &request.input {
+            Some(models::ResponseInput::Items(items)) => items,
+            Some(models::ResponseInput::Text(_)) => return cached,
+            None => return cached,
+        };
+
+        for item in items {
+            if let models::ResponseInputItem::McpListTools {
+                server_label,
+                tools,
+                ..
+            } = item
+            {
+                cached.insert(server_label.clone(), tools.clone());
+            }
+        }
+
+        cached
     }
 
     /// Prepare tools configuration for LLM in OpenAI function calling format

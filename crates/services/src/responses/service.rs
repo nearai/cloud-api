@@ -935,51 +935,7 @@ impl ResponseServiceImpl {
         let tool_choice = Self::prepare_tool_choice(&context.request);
 
         // Initialize MCP connections if any MCP tools are configured
-        if let Some(request_tools) = &context.request.tools {
-            let mcp_tools: Vec<&models::ResponseTool> = request_tools
-                .iter()
-                .filter(|t| matches!(t, models::ResponseTool::Mcp { .. }))
-                .collect();
-
-            if !mcp_tools.is_empty() {
-                let mut mcp_executor = tools::McpToolExecutor::new();
-
-                match mcp_executor.connect_servers(mcp_tools).await {
-                    Ok(mcp_list_tools_items) => {
-                        for item in mcp_list_tools_items {
-                            let item_id = item.id().to_string();
-                            emitter
-                                .emit_item_added(&mut ctx, item.clone(), item_id)
-                                .await?;
-
-                            context
-                                .response_items_repository
-                                .create(
-                                    ctx.response_id.clone(),
-                                    ctx.api_key_id,
-                                    ctx.conversation_id,
-                                    item,
-                                )
-                                .await
-                                .map_err(|e| {
-                                    errors::ResponseError::InternalError(format!(
-                                        "Failed to store mcp_list_tools item: {e}"
-                                    ))
-                                })?;
-                        }
-
-                        let mcp_tool_defs = mcp_executor.get_tool_definitions();
-                        tools.extend(mcp_tool_defs);
-
-                        context.mcp_executor = Some(mcp_executor);
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to connect to MCP servers: {:?}", e);
-                        return Err(e);
-                    }
-                }
-            }
-        }
+        Self::initialize_mcp_connections(&mut ctx, &mut emitter, &mut context, &mut tools).await?;
 
         let max_iterations = 10; // Prevent infinite loops
         let mut iteration = 0;
@@ -1825,6 +1781,64 @@ impl ResponseServiceImpl {
         }
 
         Ok(messages)
+    }
+
+    /// Initialize MCP connections if any MCP tools are configured in the request.
+    /// Connects to remote MCP servers, discovers available tools, emits mcp_list_tools
+    /// output items, and merges MCP tool definitions with the tools list for the LLM.
+    async fn initialize_mcp_connections(
+        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
+        emitter: &mut crate::responses::service_helpers::EventEmitter,
+        context: &mut ProcessStreamContext,
+        tools: &mut Vec<inference_providers::ToolDefinition>,
+    ) -> Result<(), errors::ResponseError> {
+        let request_tools = match &context.request.tools {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+
+        let mcp_tools: Vec<&models::ResponseTool> = request_tools
+            .iter()
+            .filter(|t| matches!(t, models::ResponseTool::Mcp { .. }))
+            .collect();
+
+        if mcp_tools.is_empty() {
+            return Ok(());
+        }
+
+        let mut mcp_executor = tools::McpToolExecutor::new();
+
+        let mcp_list_tools_items = mcp_executor.connect_servers(mcp_tools).await?;
+
+        // Emit and store mcp_list_tools output items for each server
+        for item in mcp_list_tools_items {
+            let item_id = item.id().to_string();
+            emitter.emit_item_added(ctx, item.clone(), item_id).await?;
+
+            context
+                .response_items_repository
+                .create(
+                    ctx.response_id.clone(),
+                    ctx.api_key_id,
+                    ctx.conversation_id,
+                    item,
+                )
+                .await
+                .map_err(|e| {
+                    errors::ResponseError::InternalError(format!(
+                        "Failed to store mcp_list_tools item: {e}"
+                    ))
+                })?;
+        }
+
+        // Add MCP tool definitions to the tools list for the LLM
+        let mcp_tool_defs = mcp_executor.get_tool_definitions();
+        tools.extend(mcp_tool_defs);
+
+        // Store the executor for tool execution
+        context.mcp_executor = Some(mcp_executor);
+
+        Ok(())
     }
 
     /// Prepare tools configuration for LLM in OpenAI function calling format

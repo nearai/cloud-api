@@ -542,7 +542,7 @@ pub enum McpApprovalMode {
 /// Filter for tool names that don't require approval
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct McpToolNameFilter {
-    pub tool_names: Vec<String>,
+    pub tool_names: std::collections::HashSet<String>,
 }
 
 /// Tool choice configuration

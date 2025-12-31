@@ -1242,6 +1242,9 @@ async fn test_conversation_items_pagination() {
             ConversationItem::ToolCall { id, .. } => id.clone(),
             ConversationItem::WebSearchCall { id, .. } => id.clone(),
             ConversationItem::Reasoning { id, .. } => id.clone(),
+            ConversationItem::McpListTools { id, .. } => id.clone(),
+            ConversationItem::McpCall { id, .. } => id.clone(),
+            ConversationItem::McpApprovalRequest { id, .. } => id.clone(),
         })
         .collect();
 
@@ -1883,16 +1886,22 @@ async fn test_conversation_items_include_response_metadata() {
     let mut prev_timestamp = 0i64;
     for item in &items_list.data {
         let current_timestamp = match item {
-            api::models::ConversationItem::Message { created_at, .. } => *created_at,
-            api::models::ConversationItem::ToolCall { created_at, .. } => *created_at,
-            api::models::ConversationItem::WebSearchCall { created_at, .. } => *created_at,
-            api::models::ConversationItem::Reasoning { created_at, .. } => *created_at,
+            api::models::ConversationItem::Message { created_at, .. } => Some(*created_at),
+            api::models::ConversationItem::ToolCall { created_at, .. } => Some(*created_at),
+            api::models::ConversationItem::WebSearchCall { created_at, .. } => Some(*created_at),
+            api::models::ConversationItem::Reasoning { created_at, .. } => Some(*created_at),
+            // MCP items don't have created_at field in the API model
+            api::models::ConversationItem::McpListTools { .. } => None,
+            api::models::ConversationItem::McpCall { .. } => None,
+            api::models::ConversationItem::McpApprovalRequest { .. } => None,
         };
-        assert!(
-            current_timestamp >= prev_timestamp,
-            "Items should be sorted by created_at in ascending order"
-        );
-        prev_timestamp = current_timestamp;
+        if let Some(ts) = current_timestamp {
+            assert!(
+                ts >= prev_timestamp,
+                "Items should be sorted by created_at in ascending order"
+            );
+            prev_timestamp = ts;
+        }
     }
 
     println!("✅ Conversation items include response metadata (response_id, previous_response_id, next_response_ids, created_at)");
@@ -2960,6 +2969,19 @@ async fn test_conversation_items_include_model() {
                     model, model_name,
                     "Model field should match the model used for the response"
                 );
+            }
+            // MCP items don't have model field in the API model
+            api::models::ConversationItem::McpListTools { id, .. } => {
+                println!("  McpListTools item {id}");
+                assert!(!id.is_empty(), "McpListTools id should not be empty");
+            }
+            api::models::ConversationItem::McpCall { id, .. } => {
+                println!("  McpCall item {id}");
+                assert!(!id.is_empty(), "McpCall id should not be empty");
+            }
+            api::models::ConversationItem::McpApprovalRequest { id, .. } => {
+                println!("  McpApprovalRequest item {id}");
+                assert!(!id.is_empty(), "McpApprovalRequest id should not be empty");
             }
         }
     }

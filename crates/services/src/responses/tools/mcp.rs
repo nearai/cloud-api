@@ -268,10 +268,8 @@ impl McpToolExecutor {
             {
                 Self::validate_server_url(server_url)?;
 
-                // Connect to server (don't log authorization)
                 debug!(
                     server_label = %server_label,
-                    server_url = %server_url,
                     "Connecting to MCP server"
                 );
 
@@ -316,6 +314,7 @@ impl McpToolExecutor {
                     id: list_tools_id,
                     server_label: server_label.clone(),
                     tools: tools.clone(),
+                    error: None,
                 });
 
                 // Store connection
@@ -461,16 +460,6 @@ impl McpToolExecutor {
         self.connections
             .get(server_label)
             .map(|c| c.tools.as_slice())
-    }
-
-    /// Cleanup all connections
-    pub async fn cleanup(&mut self) {
-        debug!(
-            server_count = self.connections.len(),
-            "Cleaning up MCP connections"
-        );
-        self.connections.clear();
-        self.tool_to_server.clear();
     }
 }
 

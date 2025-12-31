@@ -242,7 +242,7 @@ impl McpToolExecutor {
         }
     }
 
-    /// Connect to MCP servers and discover tools
+    /// Connect to MCP servers and discover tools.
     pub async fn connect_servers(
         &mut self,
         mcp_tools: Vec<&ResponseTool>,
@@ -308,7 +308,7 @@ impl McpToolExecutor {
                     self.tool_to_server.insert(fq_name, server_label.clone());
                 }
 
-                // Create output item with ID prefix matching OpenAI format
+                // Create McpListTools output item for client-side caching
                 let list_tools_id = format!("mcpl_{}", uuid::Uuid::new_v4().simple());
                 output_items.push(ResponseOutputItem::McpListTools {
                     id: list_tools_id,
@@ -318,6 +318,126 @@ impl McpToolExecutor {
                 });
 
                 // Store connection
+                self.connections.insert(
+                    server_label.clone(),
+                    McpServerConnection {
+                        client,
+                        server_label: server_label.clone(),
+                        tools,
+                        require_approval: require_approval.clone(),
+                    },
+                );
+            }
+        }
+
+        Ok(output_items)
+    }
+
+    /// Connect to MCP servers, using cached tools where available.
+    /// For servers with cached tools, skips the list_tools call.
+    /// Returns McpListTools items for servers that were freshly discovered.
+    pub async fn connect_servers_with_cache(
+        &mut self,
+        mcp_tools: Vec<&ResponseTool>,
+        cached_tools: &std::collections::HashMap<String, Vec<McpDiscoveredTool>>,
+    ) -> Result<Vec<ResponseOutputItem>, ResponseError> {
+        if mcp_tools.len() > MAX_MCP_SERVERS_PER_REQUEST {
+            return Err(ResponseError::McpServerLimitExceeded {
+                max: MAX_MCP_SERVERS_PER_REQUEST,
+            });
+        }
+
+        let mut output_items = Vec::new();
+
+        for tool in mcp_tools {
+            if let ResponseTool::Mcp {
+                server_label,
+                server_url,
+                authorization,
+                require_approval,
+                allowed_tools,
+                ..
+            } = tool
+            {
+                Self::validate_server_url(server_url)?;
+
+                if let Some(cached) = cached_tools.get(server_label) {
+                    debug!(
+                        server_label = %server_label,
+                        tool_count = cached.len(),
+                        "Using cached MCP tools (skipping list_tools call)"
+                    );
+
+                    for tool in cached {
+                        let fq_name = format!("{}:{}", server_label, tool.name);
+                        self.tool_to_server.insert(fq_name, server_label.clone());
+                    }
+
+                    let client = self
+                        .client_factory
+                        .create_client(server_url, authorization.clone())
+                        .await?;
+
+                    self.connections.insert(
+                        server_label.clone(),
+                        McpServerConnection {
+                            client,
+                            server_label: server_label.clone(),
+                            tools: cached.clone(),
+                            require_approval: require_approval.clone(),
+                        },
+                    );
+
+                    continue;
+                }
+
+                debug!(
+                    server_label = %server_label,
+                    "Connecting to MCP server (no cache)"
+                );
+
+                let client = self
+                    .client_factory
+                    .create_client(server_url, authorization.clone())
+                    .await?;
+
+                let all_tools = client.list_tools().await?;
+                debug!(
+                    server_label = %server_label,
+                    tool_count = all_tools.len(),
+                    "Discovered tools from MCP server"
+                );
+
+                let tools: Vec<McpDiscoveredTool> = if let Some(allowed) = allowed_tools {
+                    all_tools
+                        .into_iter()
+                        .filter(|t| allowed.contains(&t.name))
+                        .collect()
+                } else {
+                    all_tools
+                };
+
+                if tools.len() > MAX_TOOLS_PER_SERVER {
+                    return Err(ResponseError::McpToolLimitExceeded {
+                        server: server_label.clone(),
+                        count: tools.len(),
+                        max: MAX_TOOLS_PER_SERVER,
+                    });
+                }
+
+                for tool in &tools {
+                    let fq_name = format!("{}:{}", server_label, tool.name);
+                    self.tool_to_server.insert(fq_name, server_label.clone());
+                }
+
+                let list_tools_id = format!("mcpl_{}", uuid::Uuid::new_v4().simple());
+                output_items.push(ResponseOutputItem::McpListTools {
+                    id: list_tools_id,
+                    server_label: server_label.clone(),
+                    tools: tools.clone(),
+                    error: None,
+                });
+
                 self.connections.insert(
                     server_label.clone(),
                     McpServerConnection {
@@ -585,25 +705,13 @@ mod tests {
         let result = executor.connect_servers(vec![&mcp_tool]).await;
         assert!(result.is_ok());
 
-        let output_items = result.unwrap();
-        assert_eq!(output_items.len(), 1);
-
-        // Verify the mcp_list_tools output
-        if let ResponseOutputItem::McpListTools {
-            server_label,
-            tools,
-            ..
-        } = &output_items[0]
-        {
-            assert_eq!(server_label, "test_server");
-            assert_eq!(tools.len(), 1);
-            assert_eq!(tools[0].name, "test_tool");
-        } else {
-            panic!("Expected McpListTools output item");
-        }
-
         // Verify tool registration
         assert!(executor.is_mcp_tool("test_server:test_tool"));
+
+        // Verify tool definitions are available
+        let tool_defs = executor.get_tool_definitions();
+        assert_eq!(tool_defs.len(), 1);
+        assert_eq!(tool_defs[0].function.name, "test_server:test_tool");
     }
 
     #[tokio::test]

@@ -500,7 +500,6 @@ pub enum ResponseTool {
     CodeInterpreter {},
     #[serde(rename = "computer")]
     Computer {},
-    /// Remote MCP server tool
     #[serde(rename = "mcp")]
     Mcp {
         server_label: String,
@@ -945,6 +944,8 @@ pub enum ConversationItem {
         content: String,
         model: String,
     },
+    /// MCP tool list - emitted for client-side caching, not stored in DB.
+    /// Clients can include this in subsequent requests to skip tool discovery.
     #[serde(rename = "mcp_list_tools")]
     McpListTools {
         id: String,
@@ -956,6 +957,12 @@ pub enum ConversationItem {
     #[serde(rename = "mcp_call")]
     McpCall {
         id: String,
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        created_at: i64,
         server_label: String,
         name: String,
         arguments: String,
@@ -967,13 +974,21 @@ pub enum ConversationItem {
         approval_request_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+        model: String,
     },
     #[serde(rename = "mcp_approval_request")]
     McpApprovalRequest {
         id: String,
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        created_at: i64,
         server_label: String,
         name: String,
         arguments: String,
+        model: String,
     },
 }
 

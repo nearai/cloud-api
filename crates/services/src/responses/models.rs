@@ -99,10 +99,24 @@ pub enum ResponseInputItem {
         approval_request_id: String,
         approve: bool,
     },
+    McpListTools {
+        #[serde(rename = "type")]
+        type_: McpListToolsType,
+        id: String,
+        server_label: String,
+        tools: Vec<McpDiscoveredTool>,
+    },
     Message {
         role: String,
         content: ResponseContent,
     },
+}
+
+/// Type marker for MCP list tools input
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub enum McpListToolsType {
+    #[serde(rename = "mcp_list_tools")]
+    McpListTools,
 }
 
 impl ResponseInputItem {
@@ -110,6 +124,7 @@ impl ResponseInputItem {
         match self {
             ResponseInputItem::Message { role, .. } => Some(role),
             ResponseInputItem::McpApprovalResponse { .. } => None,
+            ResponseInputItem::McpListTools { .. } => None,
         }
     }
 
@@ -117,6 +132,7 @@ impl ResponseInputItem {
         match self {
             ResponseInputItem::Message { content, .. } => Some(content),
             ResponseInputItem::McpApprovalResponse { .. } => None,
+            ResponseInputItem::McpListTools { .. } => None,
         }
     }
 
@@ -132,6 +148,7 @@ impl ResponseInputItem {
                 ..
             } => Some((approval_request_id, *approve)),
             ResponseInputItem::Message { .. } => None,
+            ResponseInputItem::McpListTools { .. } => None,
         }
     }
 }
@@ -485,7 +502,8 @@ pub enum ResponseOutputItem {
         content: String,
         model: String,
     },
-    /// MCP tool list - emitted after connecting to an MCP server
+    /// MCP tool list - emitted after connecting to an MCP server.
+    /// Clients can include this in subsequent requests to skip tool discovery.
     #[serde(rename = "mcp_list_tools")]
     McpListTools {
         id: String,
@@ -499,6 +517,14 @@ pub enum ResponseOutputItem {
     #[serde(rename = "mcp_call")]
     McpCall {
         id: String,
+        #[serde(default)]
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        #[serde(default)]
+        created_at: i64,
         server_label: String,
         name: String,
         arguments: String,
@@ -511,14 +537,24 @@ pub enum ResponseOutputItem {
         /// Status of the tool call: in_progress, completed, incomplete, calling, or failed
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+        model: String,
     },
     /// MCP approval request - emitted when a tool requires approval
     #[serde(rename = "mcp_approval_request")]
     McpApprovalRequest {
         id: String,
+        #[serde(default)]
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        #[serde(default)]
+        created_at: i64,
         server_label: String,
         name: String,
         arguments: String,
+        model: String,
     },
 }
 
@@ -556,10 +592,9 @@ impl ResponseOutputItem {
             ResponseOutputItem::ToolCall { model, .. } => Some(model),
             ResponseOutputItem::WebSearchCall { model, .. } => Some(model),
             ResponseOutputItem::Reasoning { model, .. } => Some(model),
-            // MCP items are external server interactions, not LLM outputs
             ResponseOutputItem::McpListTools { .. } => None,
-            ResponseOutputItem::McpCall { .. } => None,
-            ResponseOutputItem::McpApprovalRequest { .. } => None,
+            ResponseOutputItem::McpCall { model, .. } => Some(model),
+            ResponseOutputItem::McpApprovalRequest { model, .. } => Some(model),
         }
     }
 
@@ -570,10 +605,9 @@ impl ResponseOutputItem {
             ResponseOutputItem::ToolCall { response_id, .. } => Some(response_id),
             ResponseOutputItem::WebSearchCall { response_id, .. } => Some(response_id),
             ResponseOutputItem::Reasoning { response_id, .. } => Some(response_id),
-            // MCP items don't track response_id
             ResponseOutputItem::McpListTools { .. } => None,
-            ResponseOutputItem::McpCall { .. } => None,
-            ResponseOutputItem::McpApprovalRequest { .. } => None,
+            ResponseOutputItem::McpCall { response_id, .. } => Some(response_id),
+            ResponseOutputItem::McpApprovalRequest { response_id, .. } => Some(response_id),
         }
     }
 
@@ -596,10 +630,15 @@ impl ResponseOutputItem {
                 previous_response_id,
                 ..
             } => previous_response_id.as_deref(),
-            // MCP items don't have previous_response_id
             ResponseOutputItem::McpListTools { .. } => None,
-            ResponseOutputItem::McpCall { .. } => None,
-            ResponseOutputItem::McpApprovalRequest { .. } => None,
+            ResponseOutputItem::McpCall {
+                previous_response_id,
+                ..
+            } => previous_response_id.as_deref(),
+            ResponseOutputItem::McpApprovalRequest {
+                previous_response_id,
+                ..
+            } => previous_response_id.as_deref(),
         }
     }
 }

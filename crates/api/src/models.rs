@@ -1919,6 +1919,46 @@ pub struct OrgLimitsHistoryResponse {
 }
 
 // ============================================
+// Organization Concurrent Limit API Models (Admin)
+// ============================================
+
+/// Request to update organization concurrent request limit (Admin only)
+///
+/// The concurrent limit controls how many requests an organization can have
+/// in-flight simultaneously per model. Set to null to use the default (64).
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateOrganizationConcurrentLimitRequest {
+    /// Concurrent request limit per model. Set to null to use default (64).
+    #[serde(rename = "concurrentLimit")]
+    pub concurrent_limit: Option<u32>,
+}
+
+/// Response after updating organization concurrent limit
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UpdateOrganizationConcurrentLimitResponse {
+    #[serde(rename = "organizationId")]
+    pub organization_id: String,
+    /// Current concurrent limit. Null means default (64) is used.
+    #[serde(rename = "concurrentLimit")]
+    pub concurrent_limit: Option<u32>,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: String,
+}
+
+/// Response for getting organization concurrent limit
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct GetOrganizationConcurrentLimitResponse {
+    #[serde(rename = "organizationId")]
+    pub organization_id: String,
+    /// Current concurrent limit. Null means default (64) is used.
+    #[serde(rename = "concurrentLimit")]
+    pub concurrent_limit: Option<u32>,
+    /// The effective limit (either custom or default)
+    #[serde(rename = "effectiveLimit")]
+    pub effective_limit: u32,
+}
+
+// ============================================
 // File Upload Models
 // ============================================
 

@@ -856,6 +856,11 @@ impl services::completions::ports::OrganizationConcurrentLimitRepository
                 .map_err(map_db_error)
         })?;
 
-        Ok(row.and_then(|r| r.get::<_, Option<i32>>("rate_limit").map(|v| v as u32)))
+        // Use try_from for safe i32 -> u32 conversion
+        // Negative values will become None, falling back to default limit
+        Ok(row.and_then(|r| {
+            r.get::<_, Option<i32>>("rate_limit")
+                .and_then(|v| u32::try_from(v).ok())
+        }))
     }
 }

@@ -1930,7 +1930,7 @@ pub struct OrgLimitsHistoryResponse {
 pub struct UpdateOrganizationConcurrentLimitRequest {
     /// Concurrent request limit per model. Set to null to use default (64).
     #[serde(rename = "concurrentLimit")]
-    pub concurrent_limit: Option<i32>,
+    pub concurrent_limit: Option<u32>,
 }
 
 /// Response after updating organization concurrent limit
@@ -1940,7 +1940,7 @@ pub struct UpdateOrganizationConcurrentLimitResponse {
     pub organization_id: String,
     /// Current concurrent limit. Null means default (64) is used.
     #[serde(rename = "concurrentLimit")]
-    pub concurrent_limit: Option<i32>,
+    pub concurrent_limit: Option<u32>,
     #[serde(rename = "updatedAt")]
     pub updated_at: String,
 }
@@ -1952,10 +1952,10 @@ pub struct GetOrganizationConcurrentLimitResponse {
     pub organization_id: String,
     /// Current concurrent limit. Null means default (64) is used.
     #[serde(rename = "concurrentLimit")]
-    pub concurrent_limit: Option<i32>,
+    pub concurrent_limit: Option<u32>,
     /// The effective limit (either custom or default)
     #[serde(rename = "effectiveLimit")]
-    pub effective_limit: i32,
+    pub effective_limit: u32,
 }
 
 // ============================================

@@ -244,7 +244,7 @@ pub trait AdminRepository: Send + Sync {
     async fn update_organization_concurrent_limit(
         &self,
         organization_id: uuid::Uuid,
-        concurrent_limit: Option<i32>,
+        concurrent_limit: Option<u32>,
     ) -> Result<(), anyhow::Error>;
 
     /// Get organization concurrent request limit
@@ -252,7 +252,7 @@ pub trait AdminRepository: Send + Sync {
     async fn get_organization_concurrent_limit(
         &self,
         organization_id: uuid::Uuid,
-    ) -> Result<Option<i32>, anyhow::Error>;
+    ) -> Result<Option<u32>, anyhow::Error>;
 }
 
 /// Admin service trait for managing platform configuration
@@ -321,7 +321,7 @@ pub trait AdminService: Send + Sync {
     async fn update_organization_concurrent_limit(
         &self,
         organization_id: uuid::Uuid,
-        concurrent_limit: Option<i32>,
+        concurrent_limit: Option<u32>,
     ) -> Result<(), AdminError>;
 
     /// Get organization concurrent request limit (admin only)
@@ -329,5 +329,5 @@ pub trait AdminService: Send + Sync {
     async fn get_organization_concurrent_limit(
         &self,
         organization_id: uuid::Uuid,
-    ) -> Result<Option<i32>, AdminError>;
+    ) -> Result<Option<u32>, AdminError>;
 }

@@ -1070,11 +1070,11 @@ pub fn build_admin_routes(
             axum::routing::patch(update_organization_limits),
         )
         .route(
-            "/admin/organizations/{organization_id}/limits/history",
+            "/admin/organizations/{org_id}/limits/history",
             axum::routing::get(get_organization_limits_history),
         )
         .route(
-            "/admin/organizations/{organization_id}/concurrent-limit",
+            "/admin/organizations/{org_id}/concurrent-limit",
             axum::routing::patch(update_organization_concurrent_limit)
                 .get(get_organization_concurrent_limit),
         )

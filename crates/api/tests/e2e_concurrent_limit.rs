@@ -127,7 +127,8 @@ async fn test_reset_concurrent_limit_to_default() {
     );
 }
 
-/// Test that negative concurrent limit is rejected
+/// Test that negative concurrent limit is rejected (deserialization error)
+/// With u32 type, negative values fail at the deserialization layer
 #[tokio::test]
 async fn test_update_concurrent_limit_rejects_negative() {
     let (server, _guard) = setup_test_server().await;
@@ -143,14 +144,12 @@ async fn test_update_concurrent_limit_rejects_negative() {
         }))
         .await;
 
-    assert_eq!(
-        response.status_code(),
-        400,
-        "Negative concurrent limit should be rejected"
+    // Serde rejects negative values for u32 with 422 or 400
+    assert!(
+        response.status_code() == 400 || response.status_code() == 422,
+        "Negative concurrent limit should be rejected with 400 or 422, got: {}",
+        response.status_code()
     );
-
-    let body: serde_json::Value = response.json();
-    assert_eq!(body["error"]["type"], "invalid_limits");
 }
 
 /// Test that zero concurrent limit is rejected

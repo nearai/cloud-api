@@ -480,10 +480,10 @@ pub async fn update_organization_limits(
 /// Returns the complete limits history for a specific organization, showing all limits changes over time.
 #[utoipa::path(
     get,
-    path = "/v1/admin/organizations/{organization_id}/limits/history",
+    path = "/v1/admin/organizations/{org_id}/limits/history",
     tag = "Admin",
     params(
-        ("organization_id" = String, Path, description = "The organization's ID (as a UUID)"),
+        ("org_id" = String, Path, description = "The organization's ID (as a UUID)"),
         ("limit" = Option<i64>, Query, description = "Maximum number of history records to return (default: 50)"),
         ("offset" = Option<i64>, Query, description = "Number of records to skip (default: 0)")
     ),
@@ -499,13 +499,13 @@ pub async fn update_organization_limits(
 )]
 pub async fn get_organization_limits_history(
     State(app_state): State<AdminAppState>,
-    Path(organization_id): Path<String>,
+    Path(org_id): Path<String>,
     Extension(_admin_user): Extension<AdminUser>, // Require admin auth
     axum::extract::Query(params): axum::extract::Query<OrgLimitsHistoryQueryParams>,
 ) -> Result<ResponseJson<OrgLimitsHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
-    let organization_uuid = match uuid::Uuid::parse_str(&organization_id) {
+    let organization_uuid = match uuid::Uuid::parse_str(&org_id) {
         Ok(id) => id,
         Err(_) => {
             return Err((
@@ -520,7 +520,7 @@ pub async fn get_organization_limits_history(
 
     debug!(
         "Get limits history for organization_id={}, limit={}, offset={}",
-        organization_id, params.limit, params.offset
+        org_id, params.limit, params.offset
     );
 
     let (history, total) = app_state
@@ -1378,9 +1378,6 @@ pub async fn get_organization_timeseries(
     Ok(ResponseJson(metrics))
 }
 
-// Default concurrent limit if none is set
-const DEFAULT_CONCURRENT_LIMIT: i32 = 64;
-
 /// Update organization concurrent request limit (Admin only)
 ///
 /// Updates the maximum concurrent requests allowed per model for an organization.
@@ -1388,10 +1385,10 @@ const DEFAULT_CONCURRENT_LIMIT: i32 = 64;
 /// Changes take effect within 5 minutes due to caching.
 #[utoipa::path(
     patch,
-    path = "/v1/admin/organizations/{organization_id}/concurrent-limit",
+    path = "/v1/admin/organizations/{org_id}/concurrent-limit",
     tag = "Admin",
     params(
-        ("organization_id" = String, Path, description = "The organization's ID (as a UUID)")
+        ("org_id" = String, Path, description = "The organization's ID (as a UUID)")
     ),
     request_body = UpdateOrganizationConcurrentLimitRequest,
     responses(
@@ -1407,7 +1404,7 @@ const DEFAULT_CONCURRENT_LIMIT: i32 = 64;
 )]
 pub async fn update_organization_concurrent_limit(
     State(app_state): State<AdminAppState>,
-    Path(organization_id): Path<String>,
+    Path(org_id): Path<String>,
     Extension(_admin_user): Extension<AdminUser>,
     ResponseJson(request): ResponseJson<UpdateOrganizationConcurrentLimitRequest>,
 ) -> Result<
@@ -1416,11 +1413,11 @@ pub async fn update_organization_concurrent_limit(
 > {
     debug!(
         "Update organization concurrent limit request for org_id: {}, limit: {:?}",
-        organization_id, request.concurrent_limit
+        org_id, request.concurrent_limit
     );
 
     // Parse organization ID
-    let org_uuid = uuid::Uuid::parse_str(&organization_id).map_err(|_| {
+    let org_uuid = uuid::Uuid::parse_str(&org_id).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
             ResponseJson(ErrorResponse::new(
@@ -1460,7 +1457,7 @@ pub async fn update_organization_concurrent_limit(
         })?;
 
     let response = UpdateOrganizationConcurrentLimitResponse {
-        organization_id: organization_id.clone(),
+        organization_id: org_id.clone(),
         concurrent_limit: request.concurrent_limit,
         updated_at: Utc::now().to_rfc3339(),
     };
@@ -1474,10 +1471,10 @@ pub async fn update_organization_concurrent_limit(
 /// If no custom limit is set, returns null for concurrent_limit and the default (64) for effective_limit.
 #[utoipa::path(
     get,
-    path = "/v1/admin/organizations/{organization_id}/concurrent-limit",
+    path = "/v1/admin/organizations/{org_id}/concurrent-limit",
     tag = "Admin",
     params(
-        ("organization_id" = String, Path, description = "The organization's ID (as a UUID)")
+        ("org_id" = String, Path, description = "The organization's ID (as a UUID)")
     ),
     responses(
         (status = 200, description = "Concurrent limit retrieved successfully", body = GetOrganizationConcurrentLimitResponse),
@@ -1491,7 +1488,7 @@ pub async fn update_organization_concurrent_limit(
 )]
 pub async fn get_organization_concurrent_limit(
     State(app_state): State<AdminAppState>,
-    Path(organization_id): Path<String>,
+    Path(org_id): Path<String>,
     Extension(_admin_user): Extension<AdminUser>,
 ) -> Result<
     ResponseJson<GetOrganizationConcurrentLimitResponse>,
@@ -1499,11 +1496,11 @@ pub async fn get_organization_concurrent_limit(
 > {
     debug!(
         "Get organization concurrent limit request for org_id: {}",
-        organization_id
+        org_id
     );
 
     // Parse organization ID
-    let org_uuid = uuid::Uuid::parse_str(&organization_id).map_err(|_| {
+    let org_uuid = uuid::Uuid::parse_str(&org_id).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
             ResponseJson(ErrorResponse::new(
@@ -1538,10 +1535,13 @@ pub async fn get_organization_concurrent_limit(
             }
         })?;
 
-    let effective_limit = concurrent_limit.unwrap_or(DEFAULT_CONCURRENT_LIMIT);
+    // Filter out zero values (shouldn't happen due to validation, but defensive)
+    let concurrent_limit = concurrent_limit.filter(|&limit| limit > 0);
+    let effective_limit =
+        concurrent_limit.unwrap_or(services::completions::ports::DEFAULT_CONCURRENT_LIMIT);
 
     let response = GetOrganizationConcurrentLimitResponse {
-        organization_id,
+        organization_id: org_id,
         concurrent_limit,
         effective_limit,
     };

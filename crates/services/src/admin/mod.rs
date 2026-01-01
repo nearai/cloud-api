@@ -221,11 +221,11 @@ impl AdminService for AdminServiceImpl {
     async fn update_organization_concurrent_limit(
         &self,
         organization_id: uuid::Uuid,
-        concurrent_limit: Option<i32>,
+        concurrent_limit: Option<u32>,
     ) -> Result<(), AdminError> {
-        // Validate limit if provided
+        // Validate limit if provided (u32 is already non-negative, just check for zero)
         if let Some(limit) = concurrent_limit {
-            if limit <= 0 {
+            if limit == 0 {
                 return Err(AdminError::InvalidLimits(
                     "Concurrent limit must be a positive integer".to_string(),
                 ));
@@ -251,7 +251,7 @@ impl AdminService for AdminServiceImpl {
     async fn get_organization_concurrent_limit(
         &self,
         organization_id: uuid::Uuid,
-    ) -> Result<Option<i32>, AdminError> {
+    ) -> Result<Option<u32>, AdminError> {
         self.repository
             .get_organization_concurrent_limit(organization_id)
             .await

@@ -18,8 +18,6 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-const DEFAULT_CONCURRENT_LIMIT: u32 = 64;
-
 const FINALIZE_TIMEOUT_SECS: u64 = 5;
 
 type FinalizeFuture = Pin<Box<dyn Future<Output = ()> + Send>>;

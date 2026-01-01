@@ -307,14 +307,17 @@ impl AdminRepository for AdminCompositeRepository {
     async fn update_organization_concurrent_limit(
         &self,
         organization_id: Uuid,
-        concurrent_limit: Option<i32>,
+        concurrent_limit: Option<u32>,
     ) -> Result<()> {
         let client = self.pool.get().await?;
+
+        // Convert u32 to i32 for PostgreSQL INTEGER type
+        let db_limit: Option<i32> = concurrent_limit.map(|v| v as i32);
 
         let rows_updated = client
             .execute(
                 "UPDATE organizations SET rate_limit = $1, updated_at = NOW() WHERE id = $2 AND is_active = true",
-                &[&concurrent_limit, &organization_id],
+                &[&db_limit, &organization_id],
             )
             .await?;
 
@@ -328,7 +331,7 @@ impl AdminRepository for AdminCompositeRepository {
     async fn get_organization_concurrent_limit(
         &self,
         organization_id: Uuid,
-    ) -> Result<Option<i32>> {
+    ) -> Result<Option<u32>> {
         let client = self.pool.get().await?;
 
         let row = client
@@ -339,7 +342,11 @@ impl AdminRepository for AdminCompositeRepository {
             .await?;
 
         match row {
-            Some(r) => Ok(r.get("rate_limit")),
+            Some(r) => {
+                let db_limit: Option<i32> = r.get("rate_limit");
+                // Convert i32 from DB to u32, filtering out non-positive values
+                Ok(db_limit.and_then(|v| u32::try_from(v).ok()))
+            }
             None => anyhow::bail!("Organization not found or inactive: {}", organization_id),
         }
     }

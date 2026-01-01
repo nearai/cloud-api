@@ -1,10 +1,12 @@
 use crate::responses::models::ResponseId;
 use crate::UserId;
-use anyhow;
 use async_trait::async_trait;
 use inference_providers::StreamingResult;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Default concurrent request limit per organization per model
+pub const DEFAULT_CONCURRENT_LIMIT: u32 = 64;
 
 // Domain types defined directly here (following dependency inversion)
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -944,8 +944,6 @@ pub enum ConversationItem {
         content: String,
         model: String,
     },
-    /// MCP tool list - emitted for client-side caching, not stored in DB.
-    /// Clients can include this in subsequent requests to skip tool discovery.
     #[serde(rename = "mcp_list_tools")]
     McpListTools {
         id: String,

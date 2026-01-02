@@ -242,7 +242,8 @@ pub enum ResponseTool {
         server_url: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         server_description: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        /// Authorization header for the MCP server (never serialized in responses for security)
+        #[serde(skip_serializing)]
         authorization: Option<String>,
         /// Tool approval requirement (default: "always")
         #[serde(default)]

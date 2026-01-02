@@ -15,7 +15,8 @@ use rmcp::{
     model::{CallToolRequestParam, CallToolResult},
     service::{RoleClient, RunningService},
     transport::{
-        streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
+        streamable_http_client::StreamableHttpClientTransportConfig,
+        StreamableHttpClientTransport,
     },
     ServiceExt,
 };
@@ -167,10 +168,12 @@ impl McpClientFactory for RealMcpClientFactory {
         server_url: &str,
         authorization: Option<String>,
     ) -> Result<Box<dyn McpClient>, ResponseError> {
+        debug!("Connecting to MCP server via Streamable HTTP: {}", server_url);
+
         let mut config = StreamableHttpClientTransportConfig::with_uri(server_url);
 
-        if let Some(auth) = &authorization {
-            config = config.auth_header(auth);
+        if let Some(auth_header) = &authorization {
+            config = config.auth_header(auth_header);
         }
 
         let transport = StreamableHttpClientTransport::from_config(config);
@@ -182,7 +185,7 @@ impl McpClientFactory for RealMcpClientFactory {
         .await
         .map_err(|_| {
             ResponseError::McpConnectionFailed(format!(
-                "Connection timeout after {}s",
+                "Initialization timeout after {}s",
                 CONNECTION_TIMEOUT_SECS
             ))
         })?

@@ -18,8 +18,6 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-const DEFAULT_CONCURRENT_LIMIT: u32 = 64;
-
 const FINALIZE_TIMEOUT_SECS: u64 = 5;
 
 type FinalizeFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -412,7 +410,14 @@ pub struct CompletionServiceImpl {
     pub models_repository: Arc<dyn ModelsRepository>,
     concurrent_counts: Cache<(Uuid, Uuid), Arc<AtomicU32>>,
     concurrent_limit: u32,
+    /// Cache for per-organization concurrent limits (5-minute TTL)
+    org_concurrent_limits: Cache<Uuid, u32>,
+    /// Repository for fetching organization concurrent limits
+    organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
 }
+
+/// TTL for organization concurrent limit cache (5 minutes)
+const ORG_LIMIT_CACHE_TTL_SECS: u64 = 300;
 
 impl CompletionServiceImpl {
     pub fn new(
@@ -421,8 +426,15 @@ impl CompletionServiceImpl {
         usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
         metrics_service: Arc<dyn MetricsServiceTrait>,
         models_repository: Arc<dyn ModelsRepository>,
+        organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
     ) -> Self {
         let concurrent_counts = Cache::builder().max_capacity(100_000).build();
+
+        // Cache for per-organization concurrent limits with 5-minute TTL
+        let org_concurrent_limits = Cache::builder()
+            .time_to_live(Duration::from_secs(ORG_LIMIT_CACHE_TTL_SECS))
+            .max_capacity(10_000)
+            .build();
 
         Self {
             inference_provider_pool,
@@ -432,7 +444,32 @@ impl CompletionServiceImpl {
             models_repository,
             concurrent_counts,
             concurrent_limit: DEFAULT_CONCURRENT_LIMIT,
+            org_concurrent_limits,
+            organization_limit_repository,
         }
+    }
+
+    /// Get the concurrent request limit for an organization (cached)
+    async fn get_org_concurrent_limit(&self, organization_id: Uuid) -> u32 {
+        let default_limit = self.concurrent_limit;
+        let repo = self.organization_limit_repository.clone();
+
+        self.org_concurrent_limits
+            .get_with(organization_id, async move {
+                match repo.get_concurrent_limit(organization_id).await {
+                    Ok(Some(limit)) if limit > 0 => limit,
+                    Ok(_) => default_limit, // Use default if NULL or 0
+                    Err(e) => {
+                        tracing::warn!(
+                            organization_id = %organization_id,
+                            error = %e,
+                            "Failed to fetch org concurrent limit, using default"
+                        );
+                        default_limit
+                    }
+                }
+            })
+            .await
     }
 
     /// Create low-cardinality metric tags for a request
@@ -535,6 +572,9 @@ impl CompletionServiceImpl {
         model_id: Uuid,
         model_name: &str,
     ) -> Result<Arc<AtomicU32>, ports::CompletionError> {
+        // Get the dynamic limit for this organization (cached with 5-min TTL)
+        let limit = self.get_org_concurrent_limit(organization_id).await;
+
         let counter = self
             .concurrent_counts
             .get_with((organization_id, model_id), async {
@@ -544,13 +584,13 @@ impl CompletionServiceImpl {
 
         loop {
             let current = counter.load(Ordering::Acquire);
-            if current >= self.concurrent_limit {
+            if current >= limit {
                 tracing::warn!(
                     organization_id = %organization_id,
                     model_id = %model_id,
                     model_name = %model_name,
                     current_count = current,
-                    limit = self.concurrent_limit,
+                    limit = limit,
                     "Organization concurrent request limit exceeded for model"
                 );
                 self.record_error(&ports::CompletionError::RateLimitExceeded, Some(model_name));

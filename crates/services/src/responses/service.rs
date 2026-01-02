@@ -17,6 +17,11 @@ use crate::responses::{citation_tracker, errors, models, ports};
 /// Tool name constant for web search to avoid typos and improve maintainability
 const WEB_SEARCH_TOOL_NAME: &str = "web_search";
 
+const ERROR_TOOL_TYPE: &str = "__error__";
+
+/// Maximum consecutive error tool calls before stopping the agent loop
+const MAX_CONSECUTIVE_TOOL_ERRORS: u32 = 3;
+
 /// Result of tool execution including optional citation instruction
 struct ToolExecutionResult {
     /// The tool result content to add as a tool message
@@ -316,8 +321,7 @@ impl ResponseServiceImpl {
         Ok(models::ResponseId(response_uuid))
     }
 
-    /// Process a completion stream and emit events for text deltas
-    /// Returns the accumulated text and detected tool calls
+    /// Process a completion stream and emit events for text deltas.
     async fn process_completion_stream(
         completion_stream: &mut Pin<
             Box<
@@ -333,8 +337,7 @@ impl ResponseServiceImpl {
         ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
         process_context: &ProcessStreamContext,
-    ) -> Result<(String, Vec<crate::responses::service_helpers::ToolCallInfo>), errors::ResponseError>
-    {
+    ) -> Result<crate::responses::service_helpers::ProcessStreamResult, errors::ResponseError> {
         use crate::responses::service_helpers::ToolCallAccumulator;
         use futures::StreamExt;
 
@@ -350,8 +353,8 @@ impl ResponseServiceImpl {
         let mut reasoning_item_emitted = false;
         let reasoning_item_id = format!("rs_{}", uuid::Uuid::new_v4().simple());
 
-        // Client disconnect tracking - when client disconnects, we save partial response and stop
-        let mut client_disconnected = false;
+        // Stream error tracking - when stream errors (client disconnect, network error, etc.), we save partial response and stop
+        let mut stream_error = false;
 
         while let Some(event) = completion_stream.next().await {
             match event {
@@ -494,12 +497,12 @@ impl ResponseServiceImpl {
                         // Handle clean text (message content)
                         if !clean_text.is_empty() {
                             // First time we receive message text, emit the item.added and content_part.added events
-                            if !message_item_emitted && !client_disconnected {
+                            if !message_item_emitted && !stream_error {
                                 if let Err(e) =
                                     Self::emit_message_started(emitter, ctx, &message_item_id).await
                                 {
                                     tracing::debug!("emit_message_started failed: {}", e);
-                                    client_disconnected = true;
+                                    stream_error = true;
                                 } else {
                                     message_item_emitted = true;
                                 }
@@ -508,7 +511,7 @@ impl ResponseServiceImpl {
                             current_text.push_str(&clean_text);
 
                             // Emit delta event for message content
-                            if !client_disconnected {
+                            if !stream_error {
                                 if let Err(e) = emitter
                                     .emit_text_delta(
                                         ctx,
@@ -519,13 +522,13 @@ impl ResponseServiceImpl {
                                 {
                                     tracing::debug!("emit_text_delta failed: {}", e);
                                     // Client disconnected - save partial response and stop consuming stream
-                                    client_disconnected = true;
+                                    stream_error = true;
                                 }
                             }
                         }
 
                         // If client disconnected, break out of loop to save partial response
-                        if client_disconnected {
+                        if stream_error {
                             break;
                         }
 
@@ -567,6 +570,7 @@ impl ResponseServiceImpl {
                         "Error in completion stream (client disconnect or stream error): {}",
                         e
                     );
+                    stream_error = true;
                     // Don't return early - save partial response below
                     break;
                 }
@@ -590,7 +594,11 @@ impl ResponseServiceImpl {
         // Convert accumulated tool calls to detected tool calls
         let tool_calls_detected = Self::convert_tool_calls(tool_call_accumulator);
 
-        Ok((current_text, tool_calls_detected))
+        Ok(crate::responses::service_helpers::ProcessStreamResult {
+            text: current_text,
+            tool_calls: tool_calls_detected,
+            stream_error,
+        })
     }
 
     /// Emit events when a message starts streaming
@@ -743,7 +751,7 @@ impl ResponseServiceImpl {
                     );
                     // Create a special error tool call to inform the LLM
                     tool_calls_detected.push(ToolCallInfo {
-                        tool_type: "__error__".to_string(),
+                        tool_type: ERROR_TOOL_TYPE.to_string(),
                         query: format!(
                             "Tool call at index {idx} is missing a tool name. Please ensure all tool calls include a valid 'name' field. Arguments provided: {args_str}"
                         ),
@@ -780,7 +788,7 @@ impl ResponseServiceImpl {
                     );
                     // Create an error tool call to inform the LLM about missing query
                     tool_calls_detected.push(ToolCallInfo {
-                        tool_type: "__error__".to_string(),
+                        tool_type: ERROR_TOOL_TYPE.to_string(),
                         query: format!(
                             "Tool call for '{name}' (index {idx}) is missing the required 'query' field in its arguments. Please include a 'query' parameter. Arguments provided: {args_str}"
                         ),
@@ -801,7 +809,7 @@ impl ResponseServiceImpl {
                 );
                 // Create an error tool call to inform the LLM about invalid JSON
                 tool_calls_detected.push(ToolCallInfo {
-                    tool_type: "__error__".to_string(),
+                    tool_type: ERROR_TOOL_TYPE.to_string(),
                     query: format!(
                         "Tool call for '{name}' (index {idx}) has invalid JSON arguments. Please ensure arguments are valid JSON. Arguments provided: {args_str}"
                     ),
@@ -920,7 +928,7 @@ impl ResponseServiceImpl {
         let tools = Self::prepare_tools(&context.request);
         let tool_choice = Self::prepare_tool_choice(&context.request);
 
-        let max_iterations = 100; // Prevent infinite loops
+        let max_iterations = 10; // Prevent infinite loops
         let mut iteration = 0;
         let mut final_response_text = String::new();
 
@@ -1044,6 +1052,9 @@ impl ResponseServiceImpl {
     ) -> Result<(), errors::ResponseError> {
         use crate::completions::ports::{CompletionMessage, CompletionRequest};
 
+        // Track consecutive error tool calls to detect excessive retry loops
+        let mut consecutive_error_count = 0;
+
         loop {
             *iteration += 1;
             if *iteration > max_iterations {
@@ -1114,7 +1125,7 @@ impl ResponseServiceImpl {
             let mut completion_stream = completion_result;
 
             // Process the completion stream and extract text + tool calls
-            let (current_text, tool_calls_detected) = Self::process_completion_stream(
+            let stream_result = Self::process_completion_stream(
                 &mut completion_stream,
                 emitter,
                 ctx,
@@ -1123,26 +1134,51 @@ impl ResponseServiceImpl {
             )
             .await?;
 
+            // If stream errored (client disconnect, network error, etc.), stop the agent loop
+            if stream_result.stream_error {
+                tracing::info!("Stream error detected, stopping agent loop");
+                return Err(errors::ResponseError::StreamInterrupted);
+            }
+
             // Update response state
-            if !current_text.is_empty() {
-                final_response_text.push_str(&current_text);
+            if !stream_result.text.is_empty() {
+                final_response_text.push_str(&stream_result.text);
                 messages.push(CompletionMessage {
                     role: "assistant".to_string(),
-                    content: current_text.clone(),
+                    content: stream_result.text.clone(),
                 });
                 ctx.next_output_index();
             }
 
             // Check if we're done
-            if tool_calls_detected.is_empty() {
+            if stream_result.tool_calls.is_empty() {
                 tracing::debug!("No tool calls detected, ending agent loop");
                 break;
             }
 
-            tracing::debug!("Executing {} tool calls", tool_calls_detected.len());
+            let has_errors = stream_result
+                .tool_calls
+                .iter()
+                .any(|tc| tc.tool_type == ERROR_TOOL_TYPE);
+            if has_errors {
+                consecutive_error_count += 1;
+                if consecutive_error_count >= MAX_CONSECUTIVE_TOOL_ERRORS {
+                    tracing::error!(
+                        "Agent loop: {} consecutive iterations with tool call errors, stopping to prevent infinite retry",
+                        consecutive_error_count
+                    );
+                    return Err(errors::ResponseError::InternalError(
+                        format!("Tool calls failed {} consecutive iterations due to malformed arguments from model", MAX_CONSECUTIVE_TOOL_ERRORS),
+                    ));
+                }
+            } else {
+                consecutive_error_count = 0;
+            }
+
+            tracing::debug!("Executing {} tool calls", stream_result.tool_calls.len());
 
             // Execute each tool call
-            for tool_call in tool_calls_detected {
+            for tool_call in stream_result.tool_calls {
                 Self::execute_and_emit_tool_call(
                     ctx,
                     emitter,
@@ -1170,7 +1206,7 @@ impl ResponseServiceImpl {
         let tool_call_id = format!("{}_{}", tool_call.tool_type, uuid::Uuid::new_v4().simple());
 
         // Handle error tool calls (malformed tool calls detected during parsing)
-        if tool_call.tool_type == "__error__" {
+        if tool_call.tool_type == ERROR_TOOL_TYPE {
             // For error tool calls, just return the error message as the tool result
             // This allows the LLM to see what went wrong and retry
             messages.push(CompletionMessage {

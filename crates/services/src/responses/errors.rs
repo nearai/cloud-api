@@ -8,4 +8,6 @@ pub enum ResponseError {
     UnknownTool(String),
     #[error("Tool call is missing a tool name. Please ensure all tool calls include a valid 'name' field. Available tools: web_search, file_search")]
     EmptyToolName,
+    #[error("Stream interrupted")]
+    StreamInterrupted,
 }

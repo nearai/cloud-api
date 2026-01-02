@@ -15,8 +15,7 @@ use rmcp::{
     model::{CallToolRequestParam, CallToolResult},
     service::{RoleClient, RunningService},
     transport::{
-        streamable_http_client::StreamableHttpClientTransportConfig,
-        StreamableHttpClientTransport,
+        streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
     },
     ServiceExt,
 };
@@ -43,7 +42,7 @@ pub const MAX_TOOLS_PER_SERVER: usize = 50;
 pub const CONNECTION_TIMEOUT_SECS: u64 = 30;
 
 /// Timeout for executing a tool on an MCP server (seconds)
-pub const TOOL_EXECUTION_TIMEOUT_SECS: u64 = 60;
+pub const TOOL_EXECUTION_TIMEOUT_SECS: u64 = 5;
 
 // ============================================
 // MCP Client Trait (mockable)
@@ -168,8 +167,6 @@ impl McpClientFactory for RealMcpClientFactory {
         server_url: &str,
         authorization: Option<String>,
     ) -> Result<Box<dyn McpClient>, ResponseError> {
-        debug!("Connecting to MCP server via Streamable HTTP: {}", server_url);
-
         let mut config = StreamableHttpClientTransportConfig::with_uri(server_url);
 
         if let Some(auth_header) = &authorization {
@@ -225,6 +222,20 @@ pub struct McpToolExecutor {
     client_factory: Box<dyn McpClientFactory>,
     connections: HashMap<String, McpServerConnection>,
     tool_to_server: HashMap<String, String>,
+    /// MCP list tools items (emitted but not stored in DB)
+    mcp_list_tools_items: Vec<ResponseOutputItem>,
+}
+
+impl Drop for McpToolExecutor {
+    fn drop(&mut self) {
+        if !self.connections.is_empty() {
+            debug!(
+                connection_count = self.connections.len(),
+                "Cleaning up MCP connections"
+            );
+            self.connections.clear();
+        }
+    }
 }
 
 impl McpToolExecutor {
@@ -234,6 +245,7 @@ impl McpToolExecutor {
             client_factory: Box::new(RealMcpClientFactory),
             connections: HashMap::new(),
             tool_to_server: HashMap::new(),
+            mcp_list_tools_items: Vec::new(),
         }
     }
 
@@ -242,104 +254,14 @@ impl McpToolExecutor {
             client_factory,
             connections: HashMap::new(),
             tool_to_server: HashMap::new(),
+            mcp_list_tools_items: Vec::new(),
         }
     }
 
     /// Connect to MCP servers and discover tools.
-    pub async fn connect_servers(
-        &mut self,
-        mcp_tools: Vec<&ResponseTool>,
-    ) -> Result<Vec<ResponseOutputItem>, ResponseError> {
-        // Validate server count
-        if mcp_tools.len() > MAX_MCP_SERVERS_PER_REQUEST {
-            return Err(ResponseError::McpServerLimitExceeded {
-                max: MAX_MCP_SERVERS_PER_REQUEST,
-            });
-        }
-
-        let mut output_items = Vec::new();
-
-        for tool in mcp_tools {
-            if let ResponseTool::Mcp {
-                server_label,
-                server_url,
-                authorization,
-                require_approval,
-                allowed_tools,
-                ..
-            } = tool
-            {
-                Self::validate_server_url(server_url)?;
-
-                debug!(
-                    server_label = %server_label,
-                    "Connecting to MCP server"
-                );
-
-                let client = self
-                    .client_factory
-                    .create_client(server_url, authorization.clone())
-                    .await?;
-
-                // Discover tools
-                let all_tools = client.list_tools().await?;
-                debug!(
-                    server_label = %server_label,
-                    tool_count = all_tools.len(),
-                    "Discovered tools from MCP server"
-                );
-
-                let tools: Vec<McpDiscoveredTool> = if let Some(allowed) = allowed_tools {
-                    all_tools
-                        .into_iter()
-                        .filter(|t| allowed.contains(&t.name))
-                        .collect()
-                } else {
-                    all_tools
-                };
-
-                if tools.len() > MAX_TOOLS_PER_SERVER {
-                    return Err(ResponseError::McpToolLimitExceeded {
-                        server: server_label.clone(),
-                        count: tools.len(),
-                        max: MAX_TOOLS_PER_SERVER,
-                    });
-                }
-
-                for tool in &tools {
-                    let fq_name = format!("{}:{}", server_label, tool.name);
-                    self.tool_to_server.insert(fq_name, server_label.clone());
-                }
-
-                // Create McpListTools output item for client-side caching
-                let list_tools_id = format!("mcpl_{}", uuid::Uuid::new_v4().simple());
-                output_items.push(ResponseOutputItem::McpListTools {
-                    id: list_tools_id,
-                    server_label: server_label.clone(),
-                    tools: tools.clone(),
-                    error: None,
-                });
-
-                // Store connection
-                self.connections.insert(
-                    server_label.clone(),
-                    McpServerConnection {
-                        client,
-                        server_label: server_label.clone(),
-                        tools,
-                        require_approval: require_approval.clone(),
-                    },
-                );
-            }
-        }
-
-        Ok(output_items)
-    }
-
-    /// Connect to MCP servers, using cached tools where available.
     /// For servers with cached tools, skips the list_tools call.
     /// Returns McpListTools items for servers that were freshly discovered.
-    pub async fn connect_servers_with_cache(
+    pub async fn connect_servers(
         &mut self,
         mcp_tools: Vec<&ResponseTool>,
         cached_tools: &std::collections::HashMap<String, Vec<McpDiscoveredTool>>,
@@ -452,6 +374,8 @@ impl McpToolExecutor {
                 );
             }
         }
+
+        self.mcp_list_tools_items = output_items.clone();
 
         Ok(output_items)
     }
@@ -571,6 +495,11 @@ impl McpToolExecutor {
         }
 
         definitions
+    }
+
+    /// Get MCP list tools items (for inclusion in final response)
+    pub fn get_mcp_list_tools_items(&self) -> &[ResponseOutputItem] {
+        &self.mcp_list_tools_items
     }
 
     /// Get the list of connected server labels
@@ -705,7 +634,9 @@ mod tests {
             allowed_tools: None,
         };
 
-        let result = executor.connect_servers(vec![&mcp_tool]).await;
+        let result = executor
+            .connect_servers(vec![&mcp_tool], &std::collections::HashMap::new())
+            .await;
         assert!(result.is_ok());
 
         // Verify tool registration
@@ -750,7 +681,10 @@ mod tests {
         };
 
         // Connect first
-        executor.connect_servers(vec![&mcp_tool]).await.unwrap();
+        executor
+            .connect_servers(vec![&mcp_tool], &std::collections::HashMap::new())
+            .await
+            .unwrap();
 
         // Execute tool
         let result = executor

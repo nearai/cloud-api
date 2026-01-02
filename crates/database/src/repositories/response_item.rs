@@ -91,9 +91,12 @@ impl PgResponseItemsRepository {
         let item_created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
         let created_at_timestamp = item_created_at.timestamp();
 
-        let model = match item.model().filter(|m| !m.is_empty()) {
-            Some(m) => m.to_string(),
-            None => row.try_get("model")?,
+        // McpListTools is never stored in DB, so all items here have a model field
+        let model = item.model().expect("DB items always have model");
+        let model = if !model.is_empty() {
+            model.to_string()
+        } else {
+            row.try_get("model")?
         };
 
         // Enrich the item with response metadata

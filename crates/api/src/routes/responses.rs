@@ -57,6 +57,7 @@ fn map_response_error_to_status(error: &ServiceResponseError) -> StatusCode {
         ServiceResponseError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         ServiceResponseError::UnknownTool(_) => StatusCode::BAD_REQUEST,
         ServiceResponseError::EmptyToolName => StatusCode::BAD_REQUEST,
+        ServiceResponseError::StreamInterrupted => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -85,6 +86,9 @@ impl From<ServiceResponseError> for ErrorResponse {
                 "Tool call is missing a tool name".to_string(),
                 "invalid_request_error".to_string(),
             ),
+            ServiceResponseError::StreamInterrupted => {
+                ErrorResponse::new("Stream interrupted".to_string(), "stream_error".to_string())
+            }
         }
     }
 }

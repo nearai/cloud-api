@@ -989,13 +989,19 @@ impl ResponseServiceImpl {
             })?;
 
         // Filter to get only assistant output items (excluding user input items)
-        let output_items: Vec<_> = response_items
+        let mut output_items: Vec<_> = response_items
             .into_iter()
             .filter(|item| match item {
                 models::ResponseOutputItem::Message { role, .. } => role == "assistant",
                 _ => true, // Include all non-message items (tool calls, web searches, etc.)
             })
             .collect();
+
+        // Prepend MCP list tools items (emitted but not stored in DB)
+        if let Some(ref mcp_executor) = context.mcp_executor {
+            let mcp_items = mcp_executor.get_mcp_list_tools_items().to_vec();
+            output_items.splice(0..0, mcp_items);
+        }
 
         final_response.output = output_items;
 
@@ -1832,7 +1838,7 @@ impl ResponseServiceImpl {
 
         // Connect to servers, using cached tools where available
         let mcp_list_tools_items = mcp_executor
-            .connect_servers_with_cache(mcp_tools, &cached_tools)
+            .connect_servers(mcp_tools, &cached_tools)
             .await?;
 
         for item in mcp_list_tools_items {

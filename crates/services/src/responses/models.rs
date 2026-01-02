@@ -1204,4 +1204,30 @@ mod tests {
             _ => panic!("Expected Message variant"),
         }
     }
+
+    #[test]
+    fn test_response_input_item_backward_compatibility() {
+        // Test that old format {role, content} still deserializes correctly
+        // This ensures backward compatibility when upgrading from struct to enum
+        let old_format_json = r#"{"role": "user", "content": "Hello world"}"#;
+
+        let result: Result<ResponseInputItem, _> = serde_json::from_str(old_format_json);
+
+        assert!(
+            result.is_ok(),
+            "Old format (struct) should deserialize to Message variant: {:?}",
+            result.err()
+        );
+
+        match result.unwrap() {
+            ResponseInputItem::Message { role, content } => {
+                assert_eq!(role, "user");
+                match content {
+                    ResponseContent::Text(text) => assert_eq!(text, "Hello world"),
+                    _ => panic!("Expected Text content"),
+                }
+            }
+            _ => panic!("Expected Message variant for old format"),
+        }
+    }
 }

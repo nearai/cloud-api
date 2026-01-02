@@ -773,7 +773,21 @@ impl ResponseServiceImpl {
 
             // Try to parse the complete arguments for tools that need parameters
             if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str) {
-                if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
+                // Check if this is an MCP tool (format: "server_label:tool_name")
+                if name.contains(':') {
+                    // MCP tools use the full arguments JSON as params
+                    tracing::debug!(
+                        "MCP tool call detected: {} with arguments: {:?}",
+                        name,
+                        args
+                    );
+                    tool_calls_detected.push(ToolCallInfo {
+                        tool_type: name,
+                        query: String::new(),
+                        params: Some(args),
+                    });
+                } else if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
+                    // Non-MCP tools (web_search, file_search) require a "query" field
                     tracing::debug!(
                         "Tool call detected: {} with query: {} and params: {:?}",
                         name,

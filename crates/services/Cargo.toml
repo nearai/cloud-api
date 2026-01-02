@@ -35,7 +35,6 @@ tokio-stream = "0.1"
 rmcp = { version = "0.10", features = [
     "client",
     "transport-streamable-http-client-reqwest",
-    "transport-sse-client-reqwest",
 ] }
 hex = "0.4"
 # NEAR wallet authentication (NEP-413)

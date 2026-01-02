@@ -1244,6 +1244,74 @@ fn convert_output_item_to_conversation_item(
             content,
             model,
         },
+        ResponseOutputItem::McpListTools {
+            id,
+            server_label,
+            tools,
+            error,
+        } => ConversationItem::McpListTools {
+            id,
+            server_label,
+            tools: tools
+                .into_iter()
+                .map(|t| crate::models::McpDiscoveredTool {
+                    name: t.name,
+                    description: t.description,
+                    input_schema: t.input_schema,
+                })
+                .collect(),
+            error,
+        },
+        ResponseOutputItem::McpCall {
+            id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
+            server_label,
+            name,
+            arguments,
+            output,
+            error,
+            approval_request_id,
+            status,
+            model,
+        } => ConversationItem::McpCall {
+            id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
+            server_label,
+            name,
+            arguments,
+            output,
+            error,
+            approval_request_id,
+            status,
+            model,
+        },
+        ResponseOutputItem::McpApprovalRequest {
+            id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
+            server_label,
+            name,
+            arguments,
+            model,
+        } => ConversationItem::McpApprovalRequest {
+            id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
+            server_label,
+            name,
+            arguments,
+            model,
+        },
     }
 }
 
@@ -1306,6 +1374,9 @@ fn get_item_id(item: &ConversationItem) -> String {
         ConversationItem::ToolCall { id, .. } => id.clone(),
         ConversationItem::WebSearchCall { id, .. } => id.clone(),
         ConversationItem::Reasoning { id, .. } => id.clone(),
+        ConversationItem::McpListTools { id, .. } => id.clone(),
+        ConversationItem::McpCall { id, .. } => id.clone(),
+        ConversationItem::McpApprovalRequest { id, .. } => id.clone(),
     }
 }
 

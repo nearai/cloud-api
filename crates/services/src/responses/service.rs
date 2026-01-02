@@ -49,10 +49,9 @@ struct ProcessStreamContext {
     file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
     file_service: Arc<dyn FileServiceTrait>,
     organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
-    /// Source registry for citation resolution
     source_registry: Option<models::SourceRegistry>,
-    /// Counter for consecutive web search failures (for retry tracking)
     web_search_failure_count: u32,
+    mcp_executor: Option<tools::McpToolExecutor>,
 }
 
 pub struct ResponseServiceImpl {
@@ -159,6 +158,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 organization_service,
                 source_registry: None,
                 web_search_failure_count: 0,
+                mcp_executor: None,
             };
 
             if let Err(e) = Self::process_response_stream(tx.clone(), context).await {
@@ -258,9 +258,11 @@ impl ResponseServiceImpl {
         let mut response_parent_map: std::collections::HashMap<String, Option<String>> =
             std::collections::HashMap::new();
         for item in &items {
-            response_parent_map
-                .entry(item.response_id().to_string())
-                .or_insert_with(|| item.previous_response_id().clone());
+            if let Some(response_id) = item.response_id() {
+                response_parent_map
+                    .entry(response_id.to_string())
+                    .or_insert_with(|| item.previous_response_id().map(|s| s.to_string()));
+            }
         }
 
         // Walk up from target to collect ancestor response IDs
@@ -274,7 +276,11 @@ impl ResponseServiceImpl {
         // Filter items to only those in ancestor chain
         items
             .into_iter()
-            .filter(|item| ancestors.contains(item.response_id()))
+            .filter(|item| {
+                item.response_id()
+                    .map(|r| ancestors.contains(r))
+                    .unwrap_or(false)
+            })
             .collect()
     }
 
@@ -767,7 +773,21 @@ impl ResponseServiceImpl {
 
             // Try to parse the complete arguments for tools that need parameters
             if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str) {
-                if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
+                // Check if this is an MCP tool (format: "server_label:tool_name")
+                if name.contains(':') {
+                    // MCP tools use the full arguments JSON as params
+                    tracing::debug!(
+                        "MCP tool call detected: {} with arguments: {:?}",
+                        name,
+                        args
+                    );
+                    tool_calls_detected.push(ToolCallInfo {
+                        tool_type: name,
+                        query: String::new(),
+                        params: Some(args),
+                    });
+                } else if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
+                    // Non-MCP tools (web_search, file_search) require a "query" field
                     tracing::debug!(
                         "Tool call detected: {} with query: {} and params: {:?}",
                         name,
@@ -925,8 +945,11 @@ impl ResponseServiceImpl {
             context.client_pub_key.clone(),
         );
 
-        let tools = Self::prepare_tools(&context.request);
+        let mut tools = Self::prepare_tools(&context.request);
         let tool_choice = Self::prepare_tool_choice(&context.request);
+
+        // Initialize MCP connections if any MCP tools are configured
+        Self::initialize_mcp_connections(&mut ctx, &mut emitter, &mut context, &mut tools).await?;
 
         let max_iterations = 10; // Prevent infinite loops
         let mut iteration = 0;
@@ -966,13 +989,19 @@ impl ResponseServiceImpl {
             })?;
 
         // Filter to get only assistant output items (excluding user input items)
-        let output_items: Vec<_> = response_items
+        let mut output_items: Vec<_> = response_items
             .into_iter()
             .filter(|item| match item {
                 models::ResponseOutputItem::Message { role, .. } => role == "assistant",
                 _ => true, // Include all non-message items (tool calls, web searches, etc.)
             })
             .collect();
+
+        // Prepend MCP list tools items (emitted but not stored in DB)
+        if let Some(ref mcp_executor) = context.mcp_executor {
+            let mcp_items = mcp_executor.get_mcp_list_tools_items().to_vec();
+            output_items.splice(0..0, mcp_items);
+        }
 
         final_response.output = output_items;
 
@@ -1466,7 +1495,19 @@ impl ResponseServiceImpl {
             models::ResponseInput::Items(items) => {
                 // Store each input item as a response_item
                 for input_item in items {
-                    let content = match &input_item.content {
+                    let (role, input_content) = match &input_item {
+                        models::ResponseInputItem::Message { role, content } => {
+                            (role.clone(), content)
+                        }
+                        models::ResponseInputItem::McpApprovalResponse { .. } => {
+                            continue;
+                        }
+                        models::ResponseInputItem::McpListTools { .. } => {
+                            continue;
+                        }
+                    };
+
+                    let content = match input_content {
                         models::ResponseContent::Text(text) => {
                             // Trim leading and trailing whitespace
                             vec![models::ResponseContentItem::InputText {
@@ -1514,7 +1555,7 @@ impl ResponseServiceImpl {
                         next_response_ids: vec![],
                         created_at: 0,
                         status: models::ResponseItemStatus::Completed,
-                        role: input_item.role.clone(),
+                        role,
                         content,
                         model: model.to_string(),
                     };
@@ -1737,7 +1778,20 @@ impl ResponseServiceImpl {
                 }
                 models::ResponseInput::Items(items) => {
                     for item in items {
-                        let content = match &item.content {
+                        // Only process message input items
+                        let (role, item_content) = match item {
+                            models::ResponseInputItem::Message { role, content } => {
+                                (role.clone(), content)
+                            }
+                            models::ResponseInputItem::McpApprovalResponse { .. } => {
+                                continue;
+                            }
+                            models::ResponseInputItem::McpListTools { .. } => {
+                                continue;
+                            }
+                        };
+
+                        let content = match item_content {
                             models::ResponseContent::Text(text) => text.clone(),
                             models::ResponseContent::Parts(parts) => {
                                 // Extract text from parts and fetch file content if needed
@@ -1746,16 +1800,87 @@ impl ResponseServiceImpl {
                             }
                         };
 
-                        messages.push(CompletionMessage {
-                            role: item.role.clone(),
-                            content,
-                        });
+                        messages.push(CompletionMessage { role, content });
                     }
                 }
             }
         }
 
         Ok(messages)
+    }
+
+    /// Initialize MCP connections if any MCP tools are configured in the request.
+    /// Connects to remote MCP servers, discovers available tools, emits mcp_list_tools
+    /// items (for client-side caching), and merges MCP tool definitions with the tools list.
+    async fn initialize_mcp_connections(
+        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
+        emitter: &mut crate::responses::service_helpers::EventEmitter,
+        context: &mut ProcessStreamContext,
+        tools: &mut Vec<inference_providers::ToolDefinition>,
+    ) -> Result<(), errors::ResponseError> {
+        let request_tools = match &context.request.tools {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+
+        let mcp_tools: Vec<&models::ResponseTool> = request_tools
+            .iter()
+            .filter(|t| matches!(t, models::ResponseTool::Mcp { .. }))
+            .collect();
+
+        if mcp_tools.is_empty() {
+            return Ok(());
+        }
+
+        let cached_tools = Self::extract_cached_mcp_tools(&context.request);
+
+        let mut mcp_executor = tools::McpToolExecutor::new();
+
+        // Connect to servers, using cached tools where available
+        let mcp_list_tools_items = mcp_executor
+            .connect_servers(mcp_tools, &cached_tools)
+            .await?;
+
+        for item in mcp_list_tools_items {
+            let item_id = item.id().to_string();
+            emitter.emit_item_added(ctx, item, item_id).await?;
+        }
+
+        // Add MCP tool definitions to the tools list for the LLM
+        let mcp_tool_defs = mcp_executor.get_tool_definitions();
+        tools.extend(mcp_tool_defs);
+
+        // Store the executor for tool execution
+        context.mcp_executor = Some(mcp_executor);
+
+        Ok(())
+    }
+
+    /// Extract cached mcp_list_tools from the request input
+    fn extract_cached_mcp_tools(
+        request: &models::CreateResponseRequest,
+    ) -> std::collections::HashMap<String, Vec<models::McpDiscoveredTool>> {
+        use std::collections::HashMap;
+        let mut cached: HashMap<String, Vec<models::McpDiscoveredTool>> = HashMap::new();
+
+        let items = match &request.input {
+            Some(models::ResponseInput::Items(items)) => items,
+            Some(models::ResponseInput::Text(_)) => return cached,
+            None => return cached,
+        };
+
+        for item in items {
+            if let models::ResponseInputItem::McpListTools {
+                server_label,
+                tools,
+                ..
+            } = item
+            {
+                cached.insert(server_label.clone(), tools.clone());
+            }
+        }
+
+        cached
     }
 
     /// Prepare tools configuration for LLM in OpenAI function calling format
@@ -1928,6 +2053,11 @@ impl ResponseServiceImpl {
                                 }),
                             },
                         });
+                    }
+                    models::ResponseTool::Mcp { .. } => {
+                        // MCP tools are handled separately via McpToolExecutor
+                        // Tool definitions are dynamically discovered from the MCP server
+                        // and added to the request in process_response_stream
                     }
                 }
             }
@@ -2454,6 +2584,42 @@ DO NOT USE THESE FORMATS:
                     })
                 }
             }
+            tool_name if tool_name.contains(':') => {
+                if let Some(ref mcp_executor) = context.mcp_executor {
+                    if let Some((server_label, mcp_tool_name)) =
+                        tools::McpToolExecutor::parse_tool_name(tool_name)
+                    {
+                        if mcp_executor.requires_approval(server_label, mcp_tool_name) {
+                            // TODO: Implement approval flow in a separate task
+                            // For now, return an error indicating approval is required
+                            return Err(errors::ResponseError::McpApprovalRequired {
+                                server: server_label.to_string(),
+                                tool: mcp_tool_name.to_string(),
+                            });
+                        }
+
+                        // Parse arguments from tool call
+                        let arguments = tool_call
+                            .params
+                            .clone()
+                            .unwrap_or_else(|| serde_json::json!({}));
+
+                        // Execute the MCP tool
+                        let result = mcp_executor
+                            .execute_tool(server_label, mcp_tool_name, arguments)
+                            .await?;
+
+                        Ok(ToolExecutionResult {
+                            content: result,
+                            citation_instruction: None,
+                        })
+                    } else {
+                        Err(errors::ResponseError::UnknownTool(tool_name.to_string()))
+                    }
+                } else {
+                    Err(errors::ResponseError::UnknownTool(tool_name.to_string()))
+                }
+            }
             _ => Err(errors::ResponseError::UnknownTool(
                 tool_call.tool_type.clone(),
             )),
@@ -2492,8 +2658,14 @@ DO NOT USE THESE FORMATS:
                 // Find first user message
                 items
                     .iter()
-                    .find(|item| item.role == "user")
-                    .and_then(|item| match &item.content {
+                    .filter_map(|item| match item {
+                        models::ResponseInputItem::Message { role, content } if role == "user" => {
+                            Some(content)
+                        }
+                        _ => None,
+                    })
+                    .next()
+                    .and_then(|content| match content {
                         models::ResponseContent::Text(text) => Some(text.clone()),
                         models::ResponseContent::Parts(parts) => {
                             // Extract text from parts

@@ -42,7 +42,7 @@ pub const MAX_TOOLS_PER_SERVER: usize = 50;
 pub const CONNECTION_TIMEOUT_SECS: u64 = 30;
 
 /// Timeout for executing a tool on an MCP server (seconds)
-pub const TOOL_EXECUTION_TIMEOUT_SECS: u64 = 5;
+pub const TOOL_EXECUTION_TIMEOUT_SECS: u64 = 15;
 
 // ============================================
 // MCP Client Trait (mockable)

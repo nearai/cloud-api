@@ -272,6 +272,75 @@ pub async fn setup_test_server_with_pool() -> (
     )
 }
 
+/// Setup test server with MCP client factory injection.
+pub async fn setup_test_server_with_mcp_factory(
+    mcp_client_factory: std::sync::Arc<dyn services::responses::tools::McpClientFactory>,
+) -> (
+    axum_test::TestServer,
+    std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
+    std::sync::Arc<inference_providers::mock::MockProvider>,
+    TestDatabaseGuard,
+) {
+    std::env::set_var("BRAVE_SEARCH_PRO_API_KEY", "test_key_for_mcp_tests");
+
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(tracing::level_filters::LevelFilter::DEBUG)
+        .try_init();
+
+    // Generate a unique test ID for this test's database
+    let test_id = uuid::Uuid::new_v4().to_string();
+
+    // Get base config for database connection info
+    let base_db_config = db_config_for_tests();
+
+    // Create a unique database from the template
+    let db_name = db_setup::create_test_database_from_template(&base_db_config, &test_id)
+        .await
+        .expect("Failed to create test database from template");
+
+    // Create config with the new database name
+    let config = test_config_with_db(&db_name);
+    let db_config = config.database.clone();
+
+    // Connect to the new test database
+    let database = init_database_connection(&config.database).await;
+
+    // Create mock user in database for foreign key constraints
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+
+    // Use mock inference providers
+    let (inference_provider_pool, mock_provider) =
+        api::init_inference_providers_with_mocks(&config).await;
+    let metrics_service = Arc::new(services::metrics::MockMetricsService);
+
+    // Initialize domain services with MCP factory
+    let domain_services = api::init_domain_services_with_mcp_factory(
+        database.clone(),
+        &config,
+        auth_components.organization_service.clone(),
+        inference_provider_pool.clone(),
+        metrics_service,
+        mcp_client_factory,
+    )
+    .await;
+
+    let app = build_app_with_config(
+        database.clone(),
+        auth_components,
+        domain_services,
+        Arc::new(config),
+    );
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // Create cleanup guard
+    let guard = TestDatabaseGuard { db_name, db_config };
+
+    (server, inference_provider_pool, mock_provider, guard)
+}
+
 pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, String) {
     let user_id = uuid::Uuid::new_v4();
     let user_id_str = user_id.to_string();

@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 use tracing::debug;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-mocks"))]
 use mockall::automock;
 
 // ============================================
@@ -48,7 +48,7 @@ pub const TOOL_EXECUTION_TIMEOUT_SECS: u64 = 60;
 // MCP Client Trait (mockable)
 // ============================================
 
-#[cfg_attr(test, automock)]
+#[cfg_attr(any(test, feature = "test-mocks"), automock)]
 #[async_trait]
 pub trait McpClient: Send + Sync {
     async fn list_tools(&self) -> Result<Vec<McpDiscoveredTool>, ResponseError>;
@@ -60,7 +60,7 @@ pub trait McpClient: Send + Sync {
     ) -> Result<String, ResponseError>;
 }
 
-#[cfg_attr(test, automock)]
+#[cfg_attr(any(test, feature = "test-mocks"), automock)]
 #[async_trait]
 pub trait McpClientFactory: Send + Sync {
     /// Create a new MCP client connection
@@ -195,6 +195,24 @@ impl McpClientFactory for RealMcpClientFactory {
 }
 
 // ============================================
+// Arc Wrapper for McpClientFactory
+// ============================================
+
+/// Wrapper to use Arc<dyn McpClientFactory> as Box<dyn McpClientFactory>
+struct ArcClientFactoryWrapper(Arc<dyn McpClientFactory>);
+
+#[async_trait]
+impl McpClientFactory for ArcClientFactoryWrapper {
+    async fn create_client(
+        &self,
+        server_url: &str,
+        authorization: Option<String>,
+    ) -> Result<Box<dyn McpClient>, ResponseError> {
+        self.0.create_client(server_url, authorization).await
+    }
+}
+
+// ============================================
 // MCP Server Connection
 // ============================================
 
@@ -252,6 +270,16 @@ impl McpToolExecutor {
     pub fn with_client_factory(client_factory: Box<dyn McpClientFactory>) -> Self {
         Self {
             client_factory,
+            connections: HashMap::new(),
+            tool_to_server: HashMap::new(),
+            mcp_list_tools_items: Vec::new(),
+        }
+    }
+
+    /// Create executor with an Arc-wrapped client factory
+    pub fn with_arc_client_factory(client_factory: Arc<dyn McpClientFactory>) -> Self {
+        Self {
+            client_factory: Box::new(ArcClientFactoryWrapper(client_factory)),
             connections: HashMap::new(),
             tool_to_server: HashMap::new(),
             mcp_list_tools_items: Vec::new(),

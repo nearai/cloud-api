@@ -196,7 +196,6 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
     async fn create_workspace(
         &self,
         name: String,
-        display_name: String,
         description: Option<String>,
         organization_id: OrganizationId,
         requester_id: UserId,
@@ -220,13 +219,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
 
         // Create the workspace
         self.workspace_repository
-            .create(
-                name,
-                display_name,
-                description,
-                organization_id,
-                requester_id,
-            )
+            .create(name, description, organization_id, requester_id)
             .await
             .map_err(Self::map_repository_error)
     }
@@ -431,7 +424,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         &self,
         workspace_id: WorkspaceId,
         requester_id: UserId,
-        display_name: Option<String>,
+        name: Option<String>,
         description: Option<String>,
         settings: Option<serde_json::Value>,
     ) -> Result<Workspace, WorkspaceError> {
@@ -441,7 +434,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
 
         // Update the workspace
         self.workspace_repository
-            .update(workspace_id, display_name, description, settings)
+            .update(workspace_id, name, description, settings)
             .await
             .map_err(Self::map_repository_error)?
             .ok_or(WorkspaceError::NotFound)

@@ -116,7 +116,6 @@ async fn test_duplicate_workspace_name_returns_409() {
     // Create first workspace
     let request = api::routes::workspaces::CreateWorkspaceRequest {
         name: workspace_name.clone(),
-        display_name: Some("First Workspace".to_string()),
         description: Some("First workspace description".to_string()),
     };
 
@@ -139,7 +138,6 @@ async fn test_duplicate_workspace_name_returns_409() {
     // Try to create second workspace with the same name in the same organization
     let duplicate_request = api::routes::workspaces::CreateWorkspaceRequest {
         name: workspace_name.clone(),
-        display_name: Some("Duplicate Workspace".to_string()),
         description: Some("Duplicate workspace description".to_string()),
     };
 
@@ -172,7 +170,6 @@ async fn test_same_workspace_name_different_organizations_allowed() {
     // Create workspace with same name in first organization
     let request1 = api::routes::workspaces::CreateWorkspaceRequest {
         name: workspace_name.clone(),
-        display_name: Some("Workspace in Org 1".to_string()),
         description: Some("First organization's workspace".to_string()),
     };
 
@@ -193,7 +190,6 @@ async fn test_same_workspace_name_different_organizations_allowed() {
     // Create workspace with same name in second organization (should succeed)
     let request2 = api::routes::workspaces::CreateWorkspaceRequest {
         name: workspace_name.clone(),
-        display_name: Some("Workspace in Org 2".to_string()),
         description: Some("Second organization's workspace".to_string()),
     };
 
@@ -230,7 +226,6 @@ async fn test_duplicate_workspace_default_workspace() {
     // Try to create another workspace named "default"
     let duplicate_default_request = api::routes::workspaces::CreateWorkspaceRequest {
         name: "default".to_string(),
-        display_name: Some("Another Default".to_string()),
         description: Some("Attempt to create duplicate default workspace".to_string()),
     };
 
@@ -485,7 +480,6 @@ async fn test_same_api_key_name_different_workspaces_allowed() {
     // Create a second workspace
     let workspace2_request = api::routes::workspaces::CreateWorkspaceRequest {
         name: format!("second-workspace-{}", uuid::Uuid::new_v4()),
-        display_name: Some("Second Workspace".to_string()),
         description: Some("Second workspace for testing".to_string()),
     };
 
@@ -609,7 +603,6 @@ async fn test_workspace_duplicate_check_respects_permissions() {
     // Create workspace
     let request = api::routes::workspaces::CreateWorkspaceRequest {
         name: workspace_name.clone(),
-        display_name: Some("Test Workspace".to_string()),
         description: Some("Test".to_string()),
     };
 

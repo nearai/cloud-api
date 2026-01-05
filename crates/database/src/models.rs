@@ -109,7 +109,6 @@ impl std::fmt::Display for OrganizationRole {
 pub struct Workspace {
     pub id: Uuid,
     pub name: String,
-    pub display_name: String,
     pub description: Option<String>,
     pub organization_id: Uuid,
     pub created_by_user_id: Uuid,
@@ -208,13 +207,12 @@ pub struct ApiKeyResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateWorkspaceRequest {
     pub name: String,
-    pub display_name: String,
     pub description: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateWorkspaceRequest {
-    pub display_name: Option<String>,
+    pub name: Option<String>,
     pub description: Option<String>,
     pub settings: Option<serde_json::Value>,
 }

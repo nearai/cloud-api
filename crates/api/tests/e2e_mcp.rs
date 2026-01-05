@@ -118,28 +118,16 @@ async fn test_mcp_multi_turn_conversation() {
     let mcp_list_tools = resp1_obj
         .output
         .iter()
-        .find(|item| {
-            serde_json::to_value(item)
-                .ok()
-                .and_then(|v| {
-                    v.get("type")
-                        .and_then(|t| t.as_str())
-                        .map(|s| s == "mcp_list_tools")
-                })
-                .unwrap_or(false)
-        })
+        .find(|item| matches!(item, api::models::ResponseOutputItem::McpListTools { .. }))
         .expect("Turn 1 should return mcp_list_tools");
 
-    let list_tools_json = serde_json::to_value(mcp_list_tools).unwrap();
-    let tools = list_tools_json
-        .get("tools")
-        .and_then(|v| v.as_array())
-        .unwrap();
-    assert_eq!(tools.len(), 1);
-    assert_eq!(
-        tools[0].get("name").and_then(|v| v.as_str()),
-        Some("get_weather")
-    );
+    // Verify the discovered tools
+    if let api::models::ResponseOutputItem::McpListTools { tools, .. } = mcp_list_tools {
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "get_weather");
+    } else {
+        panic!("Expected McpListTools variant");
+    }
 
     println!("  ✓ Discovered 1 tool: get_weather");
 
@@ -214,33 +202,28 @@ async fn test_mcp_multi_turn_conversation() {
 
     // Verify the final response contains the weather information
     // The LLM made a tool call, the tool executed, and the LLM produced a final response
-    let final_message = resp2_obj.output.iter().find(|item| {
-        serde_json::to_value(item)
-            .ok()
-            .and_then(|v| {
-                v.get("type")
-                    .and_then(|t| t.as_str())
-                    .map(|s| s == "message")
-            })
-            .unwrap_or(false)
-    });
+    let final_message = resp2_obj
+        .output
+        .iter()
+        .find(|item| matches!(item, api::models::ResponseOutputItem::Message { .. }));
     assert!(
         final_message.is_some(),
         "Turn 2 should have a message output. Got: {:?}",
         resp2_obj.output
     );
 
-    let message_json = serde_json::to_value(final_message.unwrap()).unwrap();
-    let content = message_json
-        .get("content")
-        .and_then(|v| v.as_array())
-        .expect("message should have content array");
-    assert!(!content.is_empty(), "message content should not be empty");
+    // Extract text from the message content
+    let text =
+        if let api::models::ResponseOutputItem::Message { content, .. } = final_message.unwrap() {
+            assert!(!content.is_empty(), "message content should not be empty");
+            match &content[0] {
+                api::models::ResponseOutputContent::OutputText { text, .. } => text.clone(),
+                _ => panic!("Expected OutputText content"),
+            }
+        } else {
+            panic!("Expected Message variant");
+        };
 
-    let text = content[0]
-        .get("text")
-        .and_then(|v| v.as_str())
-        .expect("content should have text");
     assert!(
         text.contains("San Francisco") || text.contains("72°F") || text.contains("sunny"),
         "Final response should reference weather. Got: {}",

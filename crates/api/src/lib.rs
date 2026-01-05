@@ -454,30 +454,6 @@ pub async fn init_domain_services_with_mcp_factory(
     let web_search_provider =
         Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
 
-    // Create S3 storage for file service
-    let s3_storage: Arc<dyn services::files::storage::StorageTrait> = if config.s3.mock {
-        Arc::new(services::files::storage::MockStorage::new(
-            config.s3.encryption_key.clone(),
-        ))
-    } else {
-        let s3_config = aws_config::load_from_env().await;
-        let s3_client = aws_sdk_s3::Client::new(&s3_config);
-        Arc::new(services::files::storage::S3Storage::new(
-            s3_client,
-            config.s3.bucket.clone(),
-            config.s3.encryption_key.clone(),
-        ))
-    };
-
-    let file_repository = Arc::new(database::repositories::FileRepository::new(
-        database.pool().clone(),
-    )) as Arc<dyn services::files::FileRepositoryTrait>;
-
-    let files_service = Arc::new(services::files::FileServiceImpl::new(
-        file_repository,
-        s3_storage,
-    )) as Arc<dyn services::files::FileServiceTrait + Send + Sync>;
-
     let response_service = Arc::new(services::ResponseService::with_mcp_client_factory(
         response_repo,
         response_items_repo,
@@ -486,7 +462,7 @@ pub async fn init_domain_services_with_mcp_factory(
         domain_services.completion_service.clone(),
         Some(web_search_provider),
         None,
-        files_service,
+        domain_services.files_service.clone(), // Reuse files_service from base
         organization_service,
         mcp_client_factory,
     ));

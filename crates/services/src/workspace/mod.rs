@@ -432,6 +432,27 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         self.check_workspace_permission(workspace_id.clone(), requester_id)
             .await?;
 
+        // If name is being updated, check for duplicates in the same organization
+        if let Some(ref new_name) = name {
+            let workspace = self
+                .workspace_repository
+                .get_by_id(workspace_id.clone())
+                .await
+                .map_err(Self::map_repository_error)?
+                .ok_or(WorkspaceError::NotFound)?;
+
+            if let Some(existing) = self
+                .workspace_repository
+                .get_by_name(workspace.organization_id.0, new_name)
+                .await
+                .map_err(Self::map_repository_error)?
+            {
+                if existing.id != workspace_id {
+                    return Err(WorkspaceError::AlreadyExists);
+                }
+            }
+        }
+
         // Update the workspace
         self.workspace_repository
             .update(workspace_id, name, description, settings)

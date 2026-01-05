@@ -59,6 +59,7 @@ pub struct UpdateWorkspaceRequest {
 impl UpdateWorkspaceRequest {
     pub fn validate(&self) -> Result<(), String> {
         if let Some(name) = &self.name {
+            crate::routes::common::validate_non_empty_field(name, "workspace name")?;
             crate::routes::common::validate_max_length(
                 name,
                 "workspace name",
@@ -538,6 +539,13 @@ pub async fn update_workspace(
         Err(services::workspace::WorkspaceError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse::new(msg, "forbidden".to_string())),
+        )),
+        Err(services::workspace::WorkspaceError::AlreadyExists) => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse::new(
+                "Workspace name already exists in organization".to_string(),
+                "conflict".to_string(),
+            )),
         )),
         Err(_) => {
             error!("Failed to update workspace");

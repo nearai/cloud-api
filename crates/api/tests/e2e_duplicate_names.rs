@@ -245,6 +245,152 @@ async fn test_duplicate_workspace_default_workspace() {
     println!("✓ Cannot create duplicate 'default' workspace");
 }
 
+#[tokio::test]
+async fn test_update_workspace_name_to_duplicate_returns_409() {
+    let (server, _guard) = setup_test_server().await;
+    let org = create_org(&server).await;
+
+    // Create two workspaces
+    let ws1_name = format!("workspace-one-{}", uuid::Uuid::new_v4());
+    let ws2_name = format!("workspace-two-{}", uuid::Uuid::new_v4());
+
+    let request1 = api::routes::workspaces::CreateWorkspaceRequest {
+        name: ws1_name.clone(),
+        description: Some("First workspace".to_string()),
+    };
+
+    let response1 = server
+        .post(format!("/v1/organizations/{}/workspaces", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&request1)
+        .await;
+    assert_eq!(response1.status_code(), 201);
+    let workspace1 = response1.json::<api::routes::workspaces::WorkspaceResponse>();
+
+    let request2 = api::routes::workspaces::CreateWorkspaceRequest {
+        name: ws2_name.clone(),
+        description: Some("Second workspace".to_string()),
+    };
+
+    let response2 = server
+        .post(format!("/v1/organizations/{}/workspaces", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&request2)
+        .await;
+    assert_eq!(response2.status_code(), 201);
+
+    // Try to rename workspace1 to workspace2's name (should fail with 409)
+    let update_request = api::routes::workspaces::UpdateWorkspaceRequest {
+        name: Some(ws2_name.clone()),
+        description: None,
+        settings: None,
+    };
+
+    let update_response = server
+        .put(format!("/v1/workspaces/{}", workspace1.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&update_request)
+        .await;
+
+    assert_eq!(
+        update_response.status_code(),
+        409,
+        "Updating workspace name to duplicate should return 409 CONFLICT"
+    );
+
+    println!("✓ Updating workspace name to duplicate correctly returns 409 CONFLICT");
+}
+
+#[tokio::test]
+async fn test_update_workspace_name_to_unique_succeeds() {
+    let (server, _guard) = setup_test_server().await;
+    let org = create_org(&server).await;
+
+    // Create a workspace
+    let original_name = format!("original-name-{}", uuid::Uuid::new_v4());
+    let new_name = format!("new-name-{}", uuid::Uuid::new_v4());
+
+    let create_request = api::routes::workspaces::CreateWorkspaceRequest {
+        name: original_name.clone(),
+        description: Some("Test workspace".to_string()),
+    };
+
+    let create_response = server
+        .post(format!("/v1/organizations/{}/workspaces", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&create_request)
+        .await;
+    assert_eq!(create_response.status_code(), 201);
+    let workspace = create_response.json::<api::routes::workspaces::WorkspaceResponse>();
+
+    // Update workspace name to a unique name (should succeed)
+    let update_request = api::routes::workspaces::UpdateWorkspaceRequest {
+        name: Some(new_name.clone()),
+        description: None,
+        settings: None,
+    };
+
+    let update_response = server
+        .put(format!("/v1/workspaces/{}", workspace.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&update_request)
+        .await;
+
+    assert_eq!(
+        update_response.status_code(),
+        200,
+        "Updating workspace name to unique name should succeed"
+    );
+
+    let updated_workspace = update_response.json::<api::routes::workspaces::WorkspaceResponse>();
+    assert_eq!(updated_workspace.name, new_name);
+
+    println!("✓ Updating workspace name to unique name succeeds");
+}
+
+#[tokio::test]
+async fn test_update_workspace_name_to_same_name_succeeds() {
+    let (server, _guard) = setup_test_server().await;
+    let org = create_org(&server).await;
+
+    // Create a workspace
+    let workspace_name = format!("test-workspace-{}", uuid::Uuid::new_v4());
+
+    let create_request = api::routes::workspaces::CreateWorkspaceRequest {
+        name: workspace_name.clone(),
+        description: Some("Test workspace".to_string()),
+    };
+
+    let create_response = server
+        .post(format!("/v1/organizations/{}/workspaces", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&create_request)
+        .await;
+    assert_eq!(create_response.status_code(), 201);
+    let workspace = create_response.json::<api::routes::workspaces::WorkspaceResponse>();
+
+    // Update workspace name to the same name (should succeed - no-op)
+    let update_request = api::routes::workspaces::UpdateWorkspaceRequest {
+        name: Some(workspace_name.clone()),
+        description: None,
+        settings: None,
+    };
+
+    let update_response = server
+        .put(format!("/v1/workspaces/{}", workspace.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&update_request)
+        .await;
+
+    assert_eq!(
+        update_response.status_code(),
+        200,
+        "Updating workspace name to same name should succeed"
+    );
+
+    println!("✓ Updating workspace name to same name succeeds");
+}
+
 // ============================================
 // API Key Duplicate Name Tests
 // ============================================

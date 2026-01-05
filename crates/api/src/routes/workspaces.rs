@@ -649,7 +649,8 @@ pub async fn delete_workspace(
 
 /// Create API key for workspace
 ///
-/// Creates a new API key for a workspace.
+/// Creates a new API key for a workspace. Note: The key may take up to 10 seconds
+/// to become active for authentication due to internal caching.
 #[utoipa::path(
     post,
     path = "/v1/workspaces/{workspace_id}/api-keys",

@@ -423,6 +423,54 @@ pub async fn init_domain_services_with_pool(
     }
 }
 
+/// Initialize domain services with a custom MCP client factory (for testing)
+/// This is a thin wrapper that creates the response service with an injected factory
+#[allow(clippy::too_many_arguments)]
+pub async fn init_domain_services_with_mcp_factory(
+    database: Arc<Database>,
+    config: &ApiConfig,
+    organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
+    inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+    metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
+    mcp_client_factory: Arc<dyn services::responses::tools::McpClientFactory>,
+) -> DomainServices {
+    // Get the base domain services
+    let mut domain_services = init_domain_services_with_pool(
+        database.clone(),
+        config,
+        organization_service.clone(),
+        inference_provider_pool.clone(),
+        metrics_service.clone(),
+    )
+    .await;
+
+    // Replace the response service with one that has the MCP factory injected
+    let response_repo = Arc::new(database::PgResponseRepository::new(database.pool().clone()));
+    let response_items_repo = Arc::new(database::PgResponseItemsRepository::new(
+        database.pool().clone(),
+    ))
+        as Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>;
+
+    let web_search_provider =
+        Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
+
+    let response_service = Arc::new(services::ResponseService::with_mcp_client_factory(
+        response_repo,
+        response_items_repo,
+        inference_provider_pool,
+        domain_services.conversation_service.clone(),
+        domain_services.completion_service.clone(),
+        Some(web_search_provider),
+        None,
+        domain_services.files_service.clone(), // Reuse files_service from base
+        organization_service,
+        mcp_client_factory,
+    ));
+
+    domain_services.response_service = response_service;
+    domain_services
+}
+
 /// Initialize inference provider pool
 pub async fn init_inference_providers(
     config: &ApiConfig,
@@ -1111,7 +1159,7 @@ pub fn build_admin_routes(
         ))
 }
 
-/// Build OpenAPI documentation routes  
+/// Build OpenAPI documentation routes
 pub fn build_openapi_routes() -> Router {
     Router::new().route("/docs", get(swagger_ui_handler)).route(
         "/api-docs/openapi.json",

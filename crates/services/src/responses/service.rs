@@ -52,6 +52,7 @@ struct ProcessStreamContext {
     source_registry: Option<models::SourceRegistry>,
     web_search_failure_count: u32,
     mcp_executor: Option<tools::McpToolExecutor>,
+    mcp_client_factory: Option<Arc<dyn tools::McpClientFactory>>,
 }
 
 pub struct ResponseServiceImpl {
@@ -64,6 +65,8 @@ pub struct ResponseServiceImpl {
     pub file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
     pub file_service: Arc<dyn FileServiceTrait>,
     pub organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
+    /// Optional MCP client factory for testing (if None, uses RealMcpClientFactory)
+    pub mcp_client_factory: Option<Arc<dyn tools::McpClientFactory>>,
 }
 
 /// Tag transition states for reasoning content
@@ -97,6 +100,35 @@ impl ResponseServiceImpl {
             file_search_provider,
             file_service,
             organization_service,
+            mcp_client_factory: None,
+        }
+    }
+
+    /// Create a new ResponseServiceImpl with a custom MCP client factory (for testing)
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_mcp_client_factory(
+        response_repository: Arc<dyn ports::ResponseRepositoryTrait>,
+        response_items_repository: Arc<dyn ports::ResponseItemRepositoryTrait>,
+        inference_provider_pool: Arc<InferenceProviderPool>,
+        conversation_service: Arc<dyn ConversationServiceTrait>,
+        completion_service: Arc<dyn CompletionServiceTrait>,
+        web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
+        file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
+        file_service: Arc<dyn FileServiceTrait>,
+        organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
+        mcp_client_factory: Arc<dyn tools::McpClientFactory>,
+    ) -> Self {
+        Self {
+            response_repository,
+            response_items_repository,
+            inference_provider_pool,
+            conversation_service,
+            completion_service,
+            web_search_provider,
+            file_search_provider,
+            file_service,
+            organization_service,
+            mcp_client_factory: Some(mcp_client_factory),
         }
     }
 }
@@ -133,6 +165,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let file_search_provider = self.file_search_provider.clone();
         let file_service = self.file_service.clone();
         let organization_service = self.organization_service.clone();
+        let mcp_client_factory = self.mcp_client_factory.clone();
         let signing_algo_clone = signing_algo.clone();
         let client_pub_key_clone = client_pub_key.clone();
         let model_pub_key_clone = model_pub_key.clone();
@@ -159,6 +192,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 source_registry: None,
                 web_search_failure_count: 0,
                 mcp_executor: None,
+                mcp_client_factory,
             };
 
             if let Err(e) = Self::process_response_stream(tx.clone(), context).await {
@@ -1834,7 +1868,11 @@ impl ResponseServiceImpl {
 
         let cached_tools = Self::extract_cached_mcp_tools(&context.request);
 
-        let mut mcp_executor = tools::McpToolExecutor::new();
+        // Use injected factory if provided (for testing), otherwise use default
+        let mut mcp_executor = match &context.mcp_client_factory {
+            Some(factory) => tools::McpToolExecutor::with_arc_client_factory(factory.clone()),
+            None => tools::McpToolExecutor::new(),
+        };
 
         // Connect to servers, using cached tools where available
         let mcp_list_tools_items = mcp_executor

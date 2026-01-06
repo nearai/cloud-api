@@ -56,6 +56,11 @@ hmac = "0.12"
 sha2 = "0.10"
 moka = { version = "0.12.12", features = ["future"] }
 bloomfilter = "3.0.1"
+mockall = { version = "0.13", optional = true }
+
+[features]
+default = []
+test-mocks = ["mockall"]
 
 [dev-dependencies]
 tokio-test = "0.4"

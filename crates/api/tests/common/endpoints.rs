@@ -231,3 +231,27 @@ pub async fn create_response_stream_with_temperature(
     let final_resp = final_response.expect("Expected response.completed event from stream");
     (content, final_resp)
 }
+
+pub async fn upload_file(
+    server: &axum_test::TestServer,
+    api_key: String,
+    filename: &str,
+    body: &[u8],
+    mimetype: &str,
+    purpose: &str,
+) -> axum_test::TestResponse {
+    server
+        .post("/v1/files")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_text("purpose", purpose)
+                .add_part(
+                    "file",
+                    axum_test::multipart::Part::bytes(body.to_vec())
+                        .file_name(filename)
+                        .mime_type(mimetype),
+                ),
+        )
+        .await
+}

@@ -1,6 +1,5 @@
 mod common;
 
-use api::models::FileUploadResponse;
 use common::endpoints::upload_file;
 use common::*;
 use services::id_prefixes::PREFIX_FILE;
@@ -14,7 +13,7 @@ async fn real_test_file_api_upload_and_fetch() {
     let payload = b"Real test file contents";
     let upload_response = upload_file(
         &server,
-        api_key.clone(),
+        &api_key,
         "real-test.txt",
         payload,
         "text/plain",

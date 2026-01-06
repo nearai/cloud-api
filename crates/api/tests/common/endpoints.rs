@@ -234,7 +234,7 @@ pub async fn create_response_stream_with_temperature(
 
 pub async fn upload_file(
     server: &axum_test::TestServer,
-    api_key: String,
+    api_key: &str,
     filename: &str,
     body: &[u8],
     mimetype: &str,

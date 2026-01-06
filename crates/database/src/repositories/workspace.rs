@@ -218,7 +218,7 @@ impl WorkspaceRepository {
 
             client
             .query(
-                &format!("SELECT * FROM workspaces WHERE organization_id = $1 ORDER BY {order_by_column} {order_dir} LIMIT $2 OFFSET $3"),
+                &format!("SELECT * FROM workspaces WHERE organization_id = $1 AND is_active = true ORDER BY {order_by_column} {order_dir} LIMIT $2 OFFSET $3"),
                 &[&organization_id, &limit, &offset],
             )
             .await

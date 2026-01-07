@@ -375,7 +375,6 @@ impl ApiKeyRepository {
             Some(row) => Ok(Some(crate::models::Workspace {
                 id: row.get("id"),
                 name: row.get("name"),
-                display_name: row.get("display_name"),
                 description: row.get("description"),
                 organization_id: row.get("organization_id"),
                 created_by_user_id: row.get("created_by_user_id"),

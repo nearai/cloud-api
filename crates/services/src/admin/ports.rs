@@ -247,6 +247,21 @@ pub trait AdminRepository: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<AdminModelInfo>, i64), anyhow::Error>;
+
+    /// Update organization concurrent request limit
+    /// Set to None to use the default limit
+    async fn update_organization_concurrent_limit(
+        &self,
+        organization_id: uuid::Uuid,
+        concurrent_limit: Option<u32>,
+    ) -> Result<(), anyhow::Error>;
+
+    /// Get organization concurrent request limit
+    /// Returns None if using default
+    async fn get_organization_concurrent_limit(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<Option<u32>, anyhow::Error>;
 }
 
 /// Admin service trait for managing platform configuration
@@ -309,4 +324,19 @@ pub trait AdminService: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<AdminModelInfo>, i64), AdminError>;
+
+    /// Update organization concurrent request limit (admin only)
+    /// Set to None to use the default limit
+    async fn update_organization_concurrent_limit(
+        &self,
+        organization_id: uuid::Uuid,
+        concurrent_limit: Option<u32>,
+    ) -> Result<(), AdminError>;
+
+    /// Get organization concurrent request limit (admin only)
+    /// Returns the custom limit if set, None if using default
+    async fn get_organization_concurrent_limit(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<Option<u32>, AdminError>;
 }

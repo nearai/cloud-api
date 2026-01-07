@@ -24,7 +24,6 @@ use uuid::Uuid;
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateWorkspaceRequest {
     pub name: String,
-    pub display_name: Option<String>,
     pub description: Option<String>,
 }
 
@@ -36,14 +35,6 @@ impl CreateWorkspaceRequest {
             "workspace name",
             crate::consts::MAX_NAME_LENGTH,
         )?;
-
-        if let Some(display_name) = &self.display_name {
-            crate::routes::common::validate_max_length(
-                display_name,
-                "workspace display_name",
-                crate::consts::MAX_NAME_LENGTH,
-            )?;
-        }
 
         if let Some(description) = &self.description {
             crate::routes::common::validate_max_length(
@@ -60,17 +51,18 @@ impl CreateWorkspaceRequest {
 /// Request to update a workspace
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateWorkspaceRequest {
-    pub display_name: Option<String>,
+    pub name: Option<String>,
     pub description: Option<String>,
     pub settings: Option<serde_json::Value>,
 }
 
 impl UpdateWorkspaceRequest {
     pub fn validate(&self) -> Result<(), String> {
-        if let Some(display_name) = &self.display_name {
+        if let Some(name) = &self.name {
+            crate::routes::common::validate_non_empty_field(name, "workspace name")?;
             crate::routes::common::validate_max_length(
-                display_name,
-                "workspace display_name",
+                name,
+                "workspace name",
                 crate::consts::MAX_NAME_LENGTH,
             )?;
         }
@@ -103,7 +95,6 @@ impl UpdateWorkspaceRequest {
 pub struct WorkspaceResponse {
     pub id: String,
     pub name: String,
-    pub display_name: Option<String>,
     pub description: Option<String>,
     pub organization_id: String,
     pub created_by_user_id: String,
@@ -215,13 +206,7 @@ pub async fn create_workspace(
     // Use the workspace service to create the workspace (it handles permission checking and duplicate detection)
     match app_state
         .workspace_service
-        .create_workspace(
-            request.name,
-            request.display_name.unwrap_or_default(),
-            request.description,
-            organization_id,
-            user_id,
-        )
+        .create_workspace(request.name, request.description, organization_id, user_id)
         .await
     {
         Ok(workspace) => {
@@ -232,7 +217,6 @@ pub async fn create_workspace(
             let response = WorkspaceResponse {
                 id: workspace.id.0.to_string(),
                 name: workspace.name,
-                display_name: Some(workspace.display_name),
                 description: workspace.description,
                 organization_id: workspace.organization_id.0.to_string(),
                 created_by_user_id: workspace.created_by_user_id.0.to_string(),
@@ -366,7 +350,6 @@ pub async fn list_organization_workspaces(
                 .map(|w| WorkspaceResponse {
                     id: w.id.0.to_string(),
                     name: w.name,
-                    display_name: Some(w.display_name),
                     description: w.description,
                     organization_id: w.organization_id.0.to_string(),
                     created_by_user_id: w.created_by_user_id.0.to_string(),
@@ -442,7 +425,6 @@ pub async fn get_workspace(
             let response = WorkspaceResponse {
                 id: workspace.id.0.to_string(),
                 name: workspace.name,
-                display_name: Some(workspace.display_name),
                 description: workspace.description,
                 organization_id: workspace.organization_id.0.to_string(),
                 created_by_user_id: workspace.created_by_user_id.0.to_string(),
@@ -527,7 +509,7 @@ pub async fn update_workspace(
         .update_workspace(
             workspace_id_typed,
             user_id,
-            request.display_name,
+            request.name,
             request.description,
             request.settings,
         )
@@ -537,7 +519,6 @@ pub async fn update_workspace(
             let response = WorkspaceResponse {
                 id: updated.id.0.to_string(),
                 name: updated.name,
-                display_name: Some(updated.display_name),
                 description: updated.description,
                 organization_id: updated.organization_id.0.to_string(),
                 created_by_user_id: updated.created_by_user_id.0.to_string(),
@@ -558,6 +539,13 @@ pub async fn update_workspace(
         Err(services::workspace::WorkspaceError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse::new(msg, "forbidden".to_string())),
+        )),
+        Err(services::workspace::WorkspaceError::AlreadyExists) => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse::new(
+                "Workspace name already exists in organization".to_string(),
+                "conflict".to_string(),
+            )),
         )),
         Err(_) => {
             error!("Failed to update workspace");

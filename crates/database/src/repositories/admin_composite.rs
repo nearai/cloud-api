@@ -16,6 +16,7 @@ use uuid::Uuid;
 /// Composite repository that implements AdminRepository for both model and organization operations
 #[derive(Clone)]
 pub struct AdminCompositeRepository {
+    pool: DbPool,
     model_repo: Arc<ModelRepository>,
     alias_repo: Arc<ModelAliasRepository>,
     limits_repo: Arc<OrganizationLimitsRepository>,
@@ -25,6 +26,7 @@ pub struct AdminCompositeRepository {
 impl AdminCompositeRepository {
     pub fn new(pool: DbPool) -> Self {
         Self {
+            pool: pool.clone(),
             model_repo: Arc::new(ModelRepository::new(pool.clone())),
             alias_repo: Arc::new(ModelAliasRepository::new(pool.clone())),
             limits_repo: Arc::new(OrganizationLimitsRepository::new(pool.clone())),
@@ -315,5 +317,52 @@ impl AdminRepository for AdminCompositeRepository {
             .collect();
 
         Ok((admin_models, total))
+    }
+
+    async fn update_organization_concurrent_limit(
+        &self,
+        organization_id: Uuid,
+        concurrent_limit: Option<u32>,
+    ) -> Result<()> {
+        let client = self.pool.get().await?;
+
+        // Convert u32 to i32 for PostgreSQL INTEGER type
+        let db_limit: Option<i32> = concurrent_limit.map(|v| v as i32);
+
+        let rows_updated = client
+            .execute(
+                "UPDATE organizations SET rate_limit = $1, updated_at = NOW() WHERE id = $2 AND is_active = true",
+                &[&db_limit, &organization_id],
+            )
+            .await?;
+
+        if rows_updated == 0 {
+            anyhow::bail!("Organization not found or inactive: {}", organization_id);
+        }
+
+        Ok(())
+    }
+
+    async fn get_organization_concurrent_limit(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<Option<u32>> {
+        let client = self.pool.get().await?;
+
+        let row = client
+            .query_opt(
+                "SELECT rate_limit FROM organizations WHERE id = $1 AND is_active = true",
+                &[&organization_id],
+            )
+            .await?;
+
+        match row {
+            Some(r) => {
+                let db_limit: Option<i32> = r.get("rate_limit");
+                // Convert i32 from DB to u32, filtering out non-positive values
+                Ok(db_limit.and_then(|v| u32::try_from(v).ok()))
+            }
+            None => anyhow::bail!("Organization not found or inactive: {}", organization_id),
+        }
     }
 }

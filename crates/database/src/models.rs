@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use services::responses::models::ResponseId;
 use uuid::Uuid;
 
 /// Organization model - top level entity
@@ -108,7 +109,6 @@ impl std::fmt::Display for OrganizationRole {
 pub struct Workspace {
     pub id: Uuid,
     pub name: String,
-    pub display_name: String,
     pub description: Option<String>,
     pub organization_id: Uuid,
     pub created_by_user_id: Uuid,
@@ -207,13 +207,12 @@ pub struct ApiKeyResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateWorkspaceRequest {
     pub name: String,
-    pub display_name: String,
     pub description: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateWorkspaceRequest {
-    pub display_name: Option<String>,
+    pub name: Option<String>,
     pub description: Option<String>,
     pub settings: Option<serde_json::Value>,
 }
@@ -533,6 +532,9 @@ pub struct UpdateOrganizationLimitsDbRequest {
 // Organization Usage Tracking Models
 // ============================================
 
+// Re-export StopReason from services for convenience
+pub use services::usage::StopReason;
+
 /// Organization usage log entry - records individual API calls with costs
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -555,8 +557,14 @@ pub struct OrganizationUsageLog {
     pub ttft_ms: Option<i32>,
     /// Average inter-token latency in milliseconds
     pub avg_itl_ms: Option<f64>,
-    /// Inference UUID
+    /// Inference UUID (hashed from provider_request_id)
     pub inference_id: Option<Uuid>,
+    /// Raw request ID from the inference provider (e.g., vLLM chat_id)
+    pub provider_request_id: Option<String>,
+    /// Why the inference stream ended
+    pub stop_reason: Option<StopReason>,
+    /// Response ID for Response API calls (FK to responses table)
+    pub response_id: Option<ResponseId>,
 }
 
 /// Organization balance summary - cached aggregate spending
@@ -590,8 +598,14 @@ pub struct RecordUsageRequest {
     pub ttft_ms: Option<i32>,
     /// Average inter-token latency in milliseconds
     pub avg_itl_ms: Option<f64>,
-    /// Inference UUID
+    /// Inference UUID (hashed from provider_request_id)
     pub inference_id: Option<Uuid>,
+    /// Raw request ID from the inference provider (e.g., vLLM chat_id)
+    pub provider_request_id: Option<String>,
+    /// Why the inference stream ended
+    pub stop_reason: Option<StopReason>,
+    /// Response ID for Response API calls (FK to responses table)
+    pub response_id: Option<ResponseId>,
 }
 
 // ============================================

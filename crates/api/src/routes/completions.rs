@@ -89,6 +89,7 @@ fn convert_chat_request_to_service(
         workspace_id,
         metadata: None,
         body_hash: body_hash.hash.clone(),
+        response_id: None, // Direct chat completions API calls don't have a response_id
         extra: request.extra.clone(),
     }
 }
@@ -120,6 +121,7 @@ fn convert_text_request_to_service(
         workspace_id,
         metadata: None,
         body_hash: body_hash.hash.clone(),
+        response_id: None, // Direct text completions API calls don't have a response_id
         extra: request.extra.clone(),
     }
 }

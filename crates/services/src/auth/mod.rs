@@ -318,7 +318,6 @@ impl AuthServiceTrait for AuthService {
                     .workspace_repository
                     .create(
                         "default".to_string(),
-                        "default".to_string(),
                         Some(format!("Default workspace for {org_name}")),
                         OrganizationId(organization.id.0),
                         new_user.id.clone(),

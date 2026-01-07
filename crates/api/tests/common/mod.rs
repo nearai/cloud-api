@@ -234,6 +234,29 @@ pub async fn setup_test_server_with_pool() -> (
     Arc<Database>,
     TestDatabaseGuard,
 ) {
+    let infra = setup_test_infrastructure().await;
+
+    let (server, inference_provider_pool, mock_provider) =
+        build_test_server_components(infra.database.clone(), infra.config).await;
+
+    (
+        server,
+        inference_provider_pool,
+        mock_provider,
+        infra.database,
+        infra.guard,
+    )
+}
+
+/// Common test infrastructure setup (database, config, guard)
+struct TestInfrastructure {
+    database: Arc<Database>,
+    config: config::ApiConfig,
+    guard: TestDatabaseGuard,
+}
+
+/// Initialize common test infrastructure (tracing, database, config)
+async fn setup_test_infrastructure() -> TestInfrastructure {
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_max_level(tracing::level_filters::LevelFilter::DEBUG)
@@ -257,19 +280,56 @@ pub async fn setup_test_server_with_pool() -> (
     // Connect to the new test database
     let database = init_database_connection(&config.database).await;
 
-    let (server, inference_provider_pool, mock_provider) =
-        build_test_server_components(database.clone(), config).await;
-
-    // Create cleanup guard
     let guard = TestDatabaseGuard { db_name, db_config };
 
-    (
-        server,
-        inference_provider_pool,
-        mock_provider,
+    TestInfrastructure {
         database,
+        config,
         guard,
+    }
+}
+
+/// Setup test server with MCP client factory injection.
+pub async fn setup_test_server_with_mcp_factory(
+    mcp_client_factory: std::sync::Arc<dyn services::responses::tools::McpClientFactory>,
+) -> (
+    axum_test::TestServer,
+    std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
+    std::sync::Arc<inference_providers::mock::MockProvider>,
+    TestDatabaseGuard,
+) {
+    let infra = setup_test_infrastructure().await;
+
+    // Create mock user in database for foreign key constraints
+    assert_mock_user_in_db(&infra.database).await;
+
+    let auth_components = init_auth_services(infra.database.clone(), &infra.config);
+
+    // Use mock inference providers
+    let (inference_provider_pool, mock_provider) =
+        api::init_inference_providers_with_mocks(&infra.config).await;
+    let metrics_service = Arc::new(services::metrics::MockMetricsService);
+
+    // Initialize domain services with MCP factory
+    let domain_services = api::init_domain_services_with_mcp_factory(
+        infra.database.clone(),
+        &infra.config,
+        auth_components.organization_service.clone(),
+        inference_provider_pool.clone(),
+        metrics_service,
+        mcp_client_factory,
     )
+    .await;
+
+    let app = build_app_with_config(
+        infra.database.clone(),
+        auth_components,
+        domain_services,
+        Arc::new(infra.config),
+    );
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    (server, inference_provider_pool, mock_provider, infra.guard)
 }
 
 pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, String) {

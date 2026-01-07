@@ -7,8 +7,9 @@
 -- locking the table during index creation on large tables.
 
 -- Drop the existing unique constraint on name
+-- Using IF EXISTS to make migration idempotent and safer for production
 ALTER TABLE organizations
-DROP CONSTRAINT organizations_name_key;
+DROP CONSTRAINT IF EXISTS organizations_name_key;
 
 -- Create a partial unique index that only applies to active organizations
 -- This allows multiple inactive organizations to have the same name,

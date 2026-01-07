@@ -96,9 +96,7 @@ impl ToolExecutor for FileSearchToolExecutor {
             .await
             .map_err(|e| ResponseError::InternalError(format!("File search failed: {e}")))?;
 
-        let formatted = Self::format_results(&results);
-
-        Ok(ToolOutput::FileSearch { formatted, results })
+        Ok(ToolOutput::FileSearch { results })
     }
 }
 
@@ -220,11 +218,10 @@ mod tests {
 
         let result = executor.execute(&tool_call, &context).await.unwrap();
         match result {
-            ToolOutput::FileSearch { formatted, results } => {
-                assert!(formatted.contains("test.txt"));
-                assert!(formatted.contains("Test content"));
+            ToolOutput::FileSearch { results } => {
                 assert_eq!(results.len(), 1);
                 assert_eq!(results[0].file_name, "test.txt");
+                assert_eq!(results[0].content, "Test content");
             }
             _ => panic!("Expected FileSearch output"),
         }

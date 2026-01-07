@@ -1343,19 +1343,15 @@ impl ResponseServiceImpl {
 
         // Handle tool-specific side effects via pattern matching
         let (tool_content, instruction) = match tool_output {
-            tools::ToolOutput::WebSearch { sources, .. } => {
-                // Calculate start index based on current registry size
-                let start_index = process_context
+            tools::ToolOutput::WebSearch { sources } => {
+                let current_source_count = process_context
                     .source_registry
                     .as_ref()
                     .map(|r| r.web_sources.len())
                     .unwrap_or(0);
 
-                // Determine if this is the first search (need citation instruction)
-                let is_first_search = process_context.source_registry.is_none();
-
-                // Format content with correct cumulative indices
-                let formatted = tools::web_search::format_search_results(&sources, start_index);
+                // Format results with proper indexing and get citation instruction
+                let result = tools::web_search::format_results(&sources, current_source_count);
 
                 // Accumulate sources into registry
                 if let Some(ref mut registry) = process_context.source_registry {
@@ -1368,17 +1364,12 @@ impl ResponseServiceImpl {
                 // Reset failure counter on successful web search
                 process_context.web_search_failure_count = 0;
 
-                // Return formatted content and optional citation instruction
-                let instruction = if is_first_search {
-                    Some(tools::CITATION_INSTRUCTION.to_string())
-                } else {
-                    None
-                };
-
-                (formatted, instruction)
+                (result.formatted, result.instruction)
             }
-            tools::ToolOutput::FileSearch { formatted, .. } => {
-                // File search has no side effects, just return content
+            tools::ToolOutput::FileSearch { results } => {
+                // Format file search results
+                let formatted =
+                    tools::file_search::FileSearchToolExecutor::format_results(&results);
                 (formatted, None)
             }
             tools::ToolOutput::Text(content) => {

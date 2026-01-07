@@ -34,8 +34,7 @@ fn create_web_search_item(
 pub const WEB_SEARCH_TOOL_NAME: &str = "web_search";
 
 /// Citation instruction provided on first web search.
-/// Exported for use by the service layer when accumulating sources.
-pub const CITATION_INSTRUCTION: &str = r#"CITATION REQUIREMENT: Use [s:N]text[/s:N] for EVERY fact from web search results.
+const CITATION_INSTRUCTION: &str = r#"CITATION REQUIREMENT: Use [s:N]text[/s:N] for EVERY fact from web search results.
 
 FORMAT: [s:N]fact from source N[/s:N]
 - N = source number (0, 1, 2, 3, etc. - cumulative across all searches)
@@ -54,22 +53,44 @@ DO NOT USE THESE FORMATS:
 ✗ [s:0]Mismatched[/s:1] numbers
 ✗ Statements without any citation tags"#;
 
-/// Format search results with the given start index
-pub fn format_search_results(results: &[WebSearchResult], start_index: usize) -> String {
-    results
+/// Result of formatting web search results
+pub struct FormattedWebSearchResult {
+    /// The formatted content for LLM consumption
+    pub formatted: String,
+    /// Citation instruction (only on first search)
+    pub instruction: Option<String>,
+}
+
+/// Format web search results with proper source indexing
+pub fn format_results(
+    sources: &[WebSearchResult],
+    current_source_count: usize,
+) -> FormattedWebSearchResult {
+    let formatted = sources
         .iter()
         .enumerate()
         .map(|(idx, r)| {
             format!(
                 "Source: {}\nTitle: {}\nURL: {}\nSnippet: {}\n",
-                start_index + idx,
+                current_source_count + idx,
                 r.title,
                 r.url,
                 r.snippet
             )
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+
+    let instruction = if current_source_count == 0 {
+        Some(CITATION_INSTRUCTION.to_string())
+    } else {
+        None
+    };
+
+    FormattedWebSearchResult {
+        formatted,
+        instruction,
+    }
 }
 
 /// Web search tool executor
@@ -157,9 +178,7 @@ impl ToolExecutor for WebSearchToolExecutor {
             .await
             .map_err(|e| ResponseError::InternalError(format!("Web search failed: {e}")))?;
 
-        let formatted = format_search_results(&sources, 0);
-
-        Ok(ToolOutput::WebSearch { formatted, sources })
+        Ok(ToolOutput::WebSearch { sources })
     }
 
     async fn emit_start(
@@ -267,11 +286,10 @@ mod tests {
         let result = executor.execute(&tool_call, &context).await.unwrap();
 
         match result {
-            ToolOutput::WebSearch { formatted, sources } => {
-                assert!(formatted.contains("Source: 0"));
-                assert!(formatted.contains("Test"));
+            ToolOutput::WebSearch { sources } => {
                 assert_eq!(sources.len(), 1);
                 assert_eq!(sources[0].title, "Test");
+                assert_eq!(sources[0].url, "https://example.com");
             }
             _ => panic!("Expected WebSearch output"),
         }
@@ -325,8 +343,25 @@ mod tests {
             },
         ];
 
-        let formatted = format_search_results(&results, 3);
-        assert!(formatted.contains("Source: 3"));
-        assert!(formatted.contains("Source: 4"));
+        let result = format_results(&results, 3);
+        assert!(result.formatted.contains("Source: 3"));
+        assert!(result.formatted.contains("Source: 4"));
+        // Not first search, so no instruction
+        assert!(result.instruction.is_none());
+    }
+
+    #[test]
+    fn test_format_results_first_search_includes_instruction() {
+        let results = vec![WebSearchResult {
+            title: "Test".to_string(),
+            url: "https://test.com".to_string(),
+            snippet: "Test snippet".to_string(),
+        }];
+
+        let result = format_results(&results, 0);
+        assert!(result.formatted.contains("Source: 0"));
+        // First search should include citation instruction
+        assert!(result.instruction.is_some());
+        assert!(result.instruction.unwrap().contains("CITATION REQUIREMENT"));
     }
 }

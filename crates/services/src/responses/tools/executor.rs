@@ -4,7 +4,6 @@
 //! enabling extensible tool handling with a consistent interface.
 
 use async_trait::async_trait;
-use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::responses::errors::ResponseError;
@@ -88,30 +87,14 @@ pub enum ToolOutput {
 
     /// Web search results with structured source data
     WebSearch {
-        /// Formatted content for LLM consumption
-        formatted: String,
-        /// Raw search results for citation tracking
         sources: Vec<super::ports::WebSearchResult>,
     },
 
     /// File search results with structured data
     FileSearch {
-        /// Formatted content for LLM consumption
-        formatted: String,
         /// Raw search results
         results: Vec<super::ports::FileSearchResult>,
     },
-}
-
-impl ToolOutput {
-    /// Get the formatted content string for any output type
-    pub fn content(&self) -> &str {
-        match self {
-            ToolOutput::Text(s) => s,
-            ToolOutput::WebSearch { formatted, .. } => formatted,
-            ToolOutput::FileSearch { formatted, .. } => formatted,
-        }
-    }
 }
 
 /// Context for tool execution
@@ -384,24 +367,33 @@ mod tests {
         let context = ToolExecutionContext { request: &request };
 
         let result = registry.execute(&tool_call, &context).await.unwrap();
-        assert_eq!(result.content(), "Executed by web_search");
+        match result {
+            ToolOutput::Text(content) => assert_eq!(content, "Executed by web_search"),
+            _ => panic!("Expected Text output"),
+        }
     }
 
     #[test]
-    fn test_tool_output_content() {
+    fn test_tool_output_variants() {
+        // Text variant
         let text_output = ToolOutput::Text("hello".to_string());
-        assert_eq!(text_output.content(), "hello");
+        match text_output {
+            ToolOutput::Text(s) => assert_eq!(s, "hello"),
+            _ => panic!("Expected Text"),
+        }
 
-        let web_output = ToolOutput::WebSearch {
-            formatted: "formatted results".to_string(),
-            sources: vec![],
-        };
-        assert_eq!(web_output.content(), "formatted results");
+        // WebSearch variant - just sources, no formatted
+        let web_output = ToolOutput::WebSearch { sources: vec![] };
+        match web_output {
+            ToolOutput::WebSearch { sources } => assert!(sources.is_empty()),
+            _ => panic!("Expected WebSearch"),
+        }
 
-        let file_output = ToolOutput::FileSearch {
-            formatted: "file results".to_string(),
-            results: vec![],
-        };
-        assert_eq!(file_output.content(), "file results");
+        // FileSearch variant - just results, no formatted
+        let file_output = ToolOutput::FileSearch { results: vec![] };
+        match file_output {
+            ToolOutput::FileSearch { results } => assert!(results.is_empty()),
+            _ => panic!("Expected FileSearch"),
+        }
     }
 }

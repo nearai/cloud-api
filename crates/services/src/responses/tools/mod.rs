@@ -12,7 +12,7 @@ pub use executor::{
 
 // Tool executors
 pub use file_search::{FileSearchToolExecutor, FILE_SEARCH_TOOL_NAME};
-pub use web_search::{WebSearchToolExecutor, CITATION_INSTRUCTION, WEB_SEARCH_TOOL_NAME};
+pub use web_search::{FormattedWebSearchResult, WebSearchToolExecutor, WEB_SEARCH_TOOL_NAME};
 
 // MCP
 pub use mcp::{

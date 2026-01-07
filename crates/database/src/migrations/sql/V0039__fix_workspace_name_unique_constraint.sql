@@ -7,8 +7,9 @@
 -- locking the table during index creation on large tables.
 
 -- Drop the existing unique constraint on (organization_id, name)
+-- Using IF EXISTS to make migration idempotent and safer for production
 ALTER TABLE workspaces
-DROP CONSTRAINT workspaces_organization_id_name_key;
+DROP CONSTRAINT IF EXISTS workspaces_organization_id_name_key;
 
 -- Create a partial unique index that only applies to active workspaces
 -- This allows multiple inactive workspaces to have the same name,

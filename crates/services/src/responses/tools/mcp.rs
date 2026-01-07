@@ -9,6 +9,10 @@ use crate::responses::errors::ResponseError;
 use crate::responses::models::{
     McpApprovalRequirement, McpDiscoveredTool, ResponseOutputItem, ResponseTool,
 };
+use crate::responses::service_helpers::ToolCallInfo;
+
+use super::executor::{ToolExecutionContext, ToolExecutor, ToolOutput};
+
 use async_trait::async_trait;
 use inference_providers::{FunctionDefinition, ToolDefinition};
 use rmcp::{
@@ -546,6 +550,54 @@ impl McpToolExecutor {
 impl Default for McpToolExecutor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ============================================
+// ToolExecutor Implementation
+// ============================================
+
+#[async_trait]
+impl ToolExecutor for McpToolExecutor {
+    fn name(&self) -> &str {
+        "mcp"
+    }
+
+    fn can_handle(&self, tool_name: &str) -> bool {
+        // MCP tools have format "server_label:tool_name"
+        self.is_mcp_tool(tool_name)
+    }
+
+    async fn execute(
+        &self,
+        tool_call: &ToolCallInfo,
+        _context: &ToolExecutionContext<'_>,
+    ) -> Result<ToolOutput, ResponseError> {
+        let tool_name = &tool_call.tool_type;
+
+        let (server_label, mcp_tool_name) = Self::parse_tool_name(tool_name)
+            .ok_or_else(|| ResponseError::UnknownTool(tool_name.clone()))?;
+
+        // Check if tool requires approval
+        if self.requires_approval(server_label, mcp_tool_name) {
+            return Err(ResponseError::McpApprovalRequired {
+                server: server_label.to_string(),
+                tool: mcp_tool_name.to_string(),
+            });
+        }
+
+        // Parse arguments from tool call
+        let arguments = tool_call
+            .params
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        // Execute the MCP tool
+        let result = self
+            .execute_tool(server_label, mcp_tool_name, arguments)
+            .await?;
+
+        Ok(ToolOutput::Text(result))
     }
 }
 

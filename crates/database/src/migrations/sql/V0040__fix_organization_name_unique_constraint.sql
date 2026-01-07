@@ -1,4 +1,4 @@
--- refinery:no-transaction
+-- no-transaction
 -- V40: Fix organization name unique constraint to only apply to active organizations
 -- This allows reusing organization names after an organization has been soft-deleted (is_active = false)
 --

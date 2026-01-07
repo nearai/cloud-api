@@ -40,7 +40,7 @@ struct ProcessStreamContext {
     organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
     source_registry: Option<models::SourceRegistry>,
     web_search_failure_count: u32,
-    mcp_executor: Option<tools::McpToolExecutor>,
+    mcp_executor: Option<Arc<tools::McpToolExecutor>>,
     mcp_client_factory: Option<Arc<dyn tools::McpClientFactory>>,
     tool_registry: tools::ToolRegistry,
 }
@@ -1823,7 +1823,9 @@ impl ResponseServiceImpl {
         let mcp_tool_defs = mcp_executor.get_tool_definitions();
         tools.extend(mcp_tool_defs);
 
-        // Store the executor for tool execution
+        // Wrap in Arc, register in tool_registry, and store for other uses
+        let mcp_executor = Arc::new(mcp_executor);
+        context.tool_registry.register(mcp_executor.clone());
         context.mcp_executor = Some(mcp_executor);
 
         Ok(())

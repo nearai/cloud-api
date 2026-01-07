@@ -202,7 +202,6 @@ async fn test_workspaces_duplicate_name_conflict_message() {
 
     let req = api::routes::workspaces::CreateWorkspaceRequest {
         name: ws_name.clone(),
-        display_name: Some("First".to_string()),
         description: Some("desc".to_string()),
     };
 
@@ -269,7 +268,6 @@ async fn test_create_workspace_missing_authorization_message() {
 
     let req = api::routes::workspaces::CreateWorkspaceRequest {
         name: format!("ws-noauth-{}", uuid::Uuid::new_v4()),
-        display_name: Some("No Auth".to_string()),
         description: Some("desc".to_string()),
     };
 

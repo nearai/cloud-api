@@ -1547,7 +1547,6 @@ pub struct UserOrganizationResponse {
 pub struct UserWorkspaceResponse {
     pub id: String,
     pub name: String,
-    pub display_name: Option<String>,
     pub organization_id: String,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,

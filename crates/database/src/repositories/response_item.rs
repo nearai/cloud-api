@@ -91,11 +91,9 @@ impl PgResponseItemsRepository {
         let item_created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
         let created_at_timestamp = item_created_at.timestamp();
 
-        let model = if !item.model().is_empty() {
-            item.model().to_string()
-        } else {
-            // Get model from joined responses table
-            row.try_get("model")?
+        let model = match item.model() {
+            Some(m) if !m.is_empty() => m.to_string(),
+            _ => row.try_get("model")?,
         };
 
         // Enrich the item with response metadata
@@ -143,6 +141,36 @@ impl PgResponseItemsRepository {
                 *mdl = model;
             }
             ResponseOutputItem::Reasoning {
+                response_id: ref mut rid,
+                previous_response_id: ref mut prev,
+                next_response_ids: ref mut next,
+                created_at: ref mut ts,
+                model: ref mut mdl,
+                ..
+            } => {
+                *rid = response_id_str;
+                *prev = previous_response_id_str;
+                *next = next_response_ids;
+                *ts = created_at_timestamp;
+                *mdl = model;
+            }
+            // McpListTools is not stored in DB - it's only emitted for client-side caching
+            ResponseOutputItem::McpListTools { .. } => {}
+            ResponseOutputItem::McpCall {
+                response_id: ref mut rid,
+                previous_response_id: ref mut prev,
+                next_response_ids: ref mut next,
+                created_at: ref mut ts,
+                model: ref mut mdl,
+                ..
+            } => {
+                *rid = response_id_str;
+                *prev = previous_response_id_str;
+                *next = next_response_ids;
+                *ts = created_at_timestamp;
+                *mdl = model;
+            }
+            ResponseOutputItem::McpApprovalRequest {
                 response_id: ref mut rid,
                 previous_response_id: ref mut prev,
                 next_response_ids: ref mut next,

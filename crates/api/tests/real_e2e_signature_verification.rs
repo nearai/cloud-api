@@ -21,7 +21,6 @@ async fn real_test_signature_signing_address_matches_model_attestation_stream() 
         ],
         "stream": true,
         "model": model_name,
-        "nonce": 42
     });
 
     let response = server
@@ -134,7 +133,6 @@ async fn real_test_signature_signing_address_matches_model_attestation_non_strea
         ],
         "stream": false,
         "model": model_name,
-        "nonce": 42
     });
 
     let response = server

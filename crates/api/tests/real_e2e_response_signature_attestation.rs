@@ -11,34 +11,12 @@ async fn real_test_signature_signing_address_matches_gateway_attestation_stream(
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
-    let conversation_response = server
-        .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "name": "Real Signature Gateway Attestation",
-            "description": "Ensure gateway attestation matches response signature"
-        }))
-        .await;
-
-    assert_eq!(
-        conversation_response.status_code(),
-        201,
-        "Failed to create conversation"
-    );
-
-    let conversation = conversation_response.json::<api::models::ConversationObject>();
-
     let request_body = serde_json::json!({
-        "conversation": {
-            "id": conversation.id
-        },
         "input": "Respond with only two words.",
         "temperature": 0.7,
         "max_output_tokens": 50,
         "stream": true,
         "model": model_name,
-        "signing_algo": "ecdsa",
-        "nonce": 42
     });
 
     let response = server
@@ -147,34 +125,12 @@ async fn real_test_signature_signing_address_matches_gateway_attestation_non_str
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
-    let conversation_response = server
-        .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "name": "Real Signature Gateway Attestation (non-stream)",
-            "description": "Ensure gateway attestation matches response signature (non-stream)"
-        }))
-        .await;
-
-    assert_eq!(
-        conversation_response.status_code(),
-        201,
-        "Failed to create conversation"
-    );
-
-    let conversation = conversation_response.json::<api::models::ConversationObject>();
-
     let request_body = serde_json::json!({
-        "conversation": {
-            "id": conversation.id
-        },
         "input": "Respond with only two words.",
         "temperature": 0.7,
         "max_output_tokens": 50,
         "stream": false,
         "model": model_name,
-        "signing_algo": "ecdsa",
-        "nonce": 42
     });
 
     let response = server

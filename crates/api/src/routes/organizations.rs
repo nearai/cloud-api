@@ -198,7 +198,6 @@ pub async fn create_organization(
                 .workspace_service
                 .create_workspace(
                     "default".to_string(),
-                    "Default Workspace".to_string(),
                     Some(format!("Default workspace for {}", request.name)),
                     org.id.clone(),
                     user_id.clone(),

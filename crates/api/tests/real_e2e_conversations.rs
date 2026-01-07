@@ -107,7 +107,7 @@ async fn real_test_conversation_items_populated_by_responses_streaming() {
 }
 
 #[tokio::test]
-async fn real_test_conversation_metadata_update_replaces_all_fields() {
+async fn real_test_update_conversation_metadata() {
     let (server, _pool, _guard) = setup_test_server_with_real_provider().await;
     let _model_name = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -172,7 +172,7 @@ async fn real_test_conversation_metadata_update_replaces_all_fields() {
 }
 
 #[tokio::test]
-async fn real_test_delete_conversation_archives_soft_delete() {
+async fn real_test_delete_conversation() {
     let (server, _pool, _guard) = setup_test_server_with_real_provider().await;
     let _model_name = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;

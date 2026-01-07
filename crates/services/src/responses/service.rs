@@ -14,21 +14,12 @@ use crate::inference_provider_pool::InferenceProviderPool;
 use crate::responses::tools;
 use crate::responses::{citation_tracker, errors, models, ports};
 
-/// Tool name constant for web search to avoid typos and improve maintainability
-const WEB_SEARCH_TOOL_NAME: &str = "web_search";
+use tools::WEB_SEARCH_TOOL_NAME;
 
 const ERROR_TOOL_TYPE: &str = "__error__";
 
 /// Maximum consecutive error tool calls before stopping the agent loop
 const MAX_CONSECUTIVE_TOOL_ERRORS: u32 = 3;
-
-/// Result of tool execution including optional citation instruction
-struct ToolExecutionResult {
-    /// The tool result content to add as a tool message
-    content: String,
-    /// Optional citation instruction to add as a system message (for web_search)
-    citation_instruction: Option<String>,
-}
 
 /// Context for processing a response stream
 struct ProcessStreamContext {
@@ -45,14 +36,13 @@ struct ProcessStreamContext {
     response_items_repository: Arc<dyn ports::ResponseItemRepositoryTrait>,
     completion_service: Arc<dyn CompletionServiceTrait>,
     conversation_service: Arc<dyn ConversationServiceTrait>,
-    web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
-    file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
     file_service: Arc<dyn FileServiceTrait>,
     organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
     source_registry: Option<models::SourceRegistry>,
     web_search_failure_count: u32,
     mcp_executor: Option<tools::McpToolExecutor>,
     mcp_client_factory: Option<Arc<dyn tools::McpClientFactory>>,
+    tool_registry: tools::ToolRegistry,
 }
 
 pub struct ResponseServiceImpl {
@@ -171,6 +161,15 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let model_pub_key_clone = model_pub_key.clone();
 
         tokio::spawn(async move {
+            let mut tool_registry = tools::ToolRegistry::new();
+            if let Some(provider) = web_search_provider {
+                tool_registry.register(Arc::new(tools::WebSearchToolExecutor::new(provider)));
+            }
+            if let Some(provider) = file_search_provider {
+                tool_registry.register(Arc::new(tools::FileSearchToolExecutor::new(provider)));
+            }
+            // Note: MCP executor is added later after connecting to servers
+
             let context = ProcessStreamContext {
                 request,
                 user_id,
@@ -185,14 +184,13 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 response_items_repository,
                 completion_service,
                 conversation_service,
-                web_search_provider,
-                file_search_provider,
                 file_service,
                 organization_service,
                 source_registry: None,
                 web_search_failure_count: 0,
                 mcp_executor: None,
                 mcp_client_factory,
+                tool_registry,
             };
 
             if let Err(e) = Self::process_response_stream(tx.clone(), context).await {
@@ -1282,21 +1280,37 @@ impl ResponseServiceImpl {
             return Ok(());
         }
 
-        // Emit tool-specific start events
-        if tool_call.tool_type == WEB_SEARCH_TOOL_NAME {
-            Self::emit_web_search_start(ctx, emitter, &tool_call_id, tool_call).await?;
+        {
+            let mut event_ctx = tools::ToolEventContext {
+                stream_ctx: ctx,
+                emitter,
+                tool_call_id: &tool_call_id,
+                response_items_repository: Some(&process_context.response_items_repository),
+            };
+            process_context
+                .tool_registry
+                .emit_start(tool_call, &mut event_ctx)
+                .await?;
         }
 
-        // Execute the tool and catch errors to provide feedback to the LLM
-        let tool_result = match Self::execute_tool(tool_call, process_context).await {
-            Ok(result) => result,
+        // Execute the tool using the registry
+        let exec_context = tools::ToolExecutionContext {
+            request: &process_context.request,
+        };
+
+        let tool_output = match process_context
+            .tool_registry
+            .execute(tool_call, &exec_context)
+            .await
+        {
+            Ok(output) => output,
             Err(e) => {
                 // Convert tool execution errors into error messages for the LLM
                 let error_message = format!("ERROR: {e}");
 
                 // Track failures for web_search tool with retry-aware logging
                 // Note: We intentionally do NOT log the error details to avoid leaking user query data
-                // The error is fed back to the LLM via ToolExecutionResult for self-correction
+                // The error is fed back to the LLM via ToolOutput for self-correction
                 if tool_call.tool_type == WEB_SEARCH_TOOL_NAME {
                     process_context.web_search_failure_count += 1;
                     const MAX_RETRIES: u32 = 3;
@@ -1323,164 +1337,85 @@ impl ResponseServiceImpl {
                     );
                 }
 
-                ToolExecutionResult {
-                    content: error_message,
-                    citation_instruction: None,
-                }
+                tools::ToolOutput::Text(error_message)
             }
         };
 
-        // Emit tool-specific completion events
-        if tool_call.tool_type == WEB_SEARCH_TOOL_NAME {
-            Self::emit_web_search_complete(
-                ctx,
+        // Handle tool-specific side effects via pattern matching
+        let (tool_content, instruction) = match tool_output {
+            tools::ToolOutput::WebSearch { sources, .. } => {
+                // Calculate start index based on current registry size
+                let start_index = process_context
+                    .source_registry
+                    .as_ref()
+                    .map(|r| r.web_sources.len())
+                    .unwrap_or(0);
+
+                // Determine if this is the first search (need citation instruction)
+                let is_first_search = process_context.source_registry.is_none();
+
+                // Format content with correct cumulative indices
+                let formatted = tools::web_search::format_search_results(&sources, start_index);
+
+                // Accumulate sources into registry
+                if let Some(ref mut registry) = process_context.source_registry {
+                    registry.web_sources.extend(sources);
+                } else {
+                    process_context.source_registry =
+                        Some(models::SourceRegistry::with_results(sources));
+                }
+
+                // Reset failure counter on successful web search
+                process_context.web_search_failure_count = 0;
+
+                // Return formatted content and optional citation instruction
+                let instruction = if is_first_search {
+                    Some(tools::CITATION_INSTRUCTION.to_string())
+                } else {
+                    None
+                };
+
+                (formatted, instruction)
+            }
+            tools::ToolOutput::FileSearch { formatted, .. } => {
+                // File search has no side effects, just return content
+                (formatted, None)
+            }
+            tools::ToolOutput::Text(content) => {
+                // Plain text has no side effects
+                (content, None)
+            }
+        };
+
+        // Emit tool-specific completion events via registry
+        {
+            let mut event_ctx = tools::ToolEventContext {
+                stream_ctx: ctx,
                 emitter,
-                &tool_call_id,
-                tool_call,
-                &process_context.response_items_repository,
-            )
-            .await?;
+                tool_call_id: &tool_call_id,
+                response_items_repository: Some(&process_context.response_items_repository),
+            };
+            process_context
+                .tool_registry
+                .emit_complete(tool_call, &mut event_ctx)
+                .await?;
         }
 
         // Add tool result to message history
         messages.push(CompletionMessage {
             role: "tool".to_string(),
-            content: tool_result.content,
+            content: tool_content,
         });
 
-        // Add citation instruction if provided by the tool
-        if let Some(citation_instruction) = tool_result.citation_instruction {
+        // Add citation instruction if provided (first web search)
+        if let Some(instruction) = instruction {
             messages.push(CompletionMessage {
                 role: "system".to_string(),
-                content: citation_instruction,
+                content: instruction,
             });
         }
 
         Ok(())
-    }
-
-    /// Emit web search start events
-    async fn emit_web_search_start(
-        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
-        emitter: &mut crate::responses::service_helpers::EventEmitter,
-        tool_call_id: &str,
-        tool_call: &crate::responses::service_helpers::ToolCallInfo,
-    ) -> Result<(), errors::ResponseError> {
-        // Event: response.output_item.added
-        let item = models::ResponseOutputItem::WebSearchCall {
-            id: tool_call_id.to_string(),
-            response_id: ctx.response_id_str.clone(),
-            previous_response_id: ctx.previous_response_id.clone(),
-            next_response_ids: vec![], // next_response_ids will be populated when child responses are created
-            created_at: ctx.created_at,
-            status: models::ResponseItemStatus::InProgress,
-            action: models::WebSearchAction::Search {
-                query: tool_call.query.clone(),
-            },
-            model: ctx.model.clone(),
-        };
-        emitter
-            .emit_item_added(ctx, item, tool_call_id.to_string())
-            .await?;
-
-        // Emit web-search-specific progress events
-        Self::emit_simple_event(
-            emitter,
-            ctx,
-            "response.web_search_call.in_progress",
-            Some(tool_call_id.to_string()),
-        )
-        .await?;
-
-        Self::emit_simple_event(
-            emitter,
-            ctx,
-            "response.web_search_call.searching",
-            Some(tool_call_id.to_string()),
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    /// Emit web search completion events
-    async fn emit_web_search_complete(
-        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
-        emitter: &mut crate::responses::service_helpers::EventEmitter,
-        tool_call_id: &str,
-        tool_call: &crate::responses::service_helpers::ToolCallInfo,
-        response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
-    ) -> Result<(), errors::ResponseError> {
-        // Event: response.web_search_call.completed
-        Self::emit_simple_event(
-            emitter,
-            ctx,
-            "response.web_search_call.completed",
-            Some(tool_call_id.to_string()),
-        )
-        .await?;
-
-        // Event: response.output_item.done
-        let item = models::ResponseOutputItem::WebSearchCall {
-            id: tool_call_id.to_string(),
-            response_id: ctx.response_id_str.clone(),
-            previous_response_id: ctx.previous_response_id.clone(),
-            next_response_ids: vec![], // next_response_ids will be populated when child responses are created
-            created_at: ctx.created_at,
-            status: models::ResponseItemStatus::Completed,
-            action: models::WebSearchAction::Search {
-                query: tool_call.query.clone(),
-            },
-            model: ctx.model.clone(),
-        };
-        emitter
-            .emit_item_done(ctx, item.clone(), tool_call_id.to_string())
-            .await?;
-
-        // Store response item
-        if let Err(e) = response_items_repository
-            .create(
-                ctx.response_id.clone(),
-                ctx.api_key_id,
-                ctx.conversation_id,
-                item,
-            )
-            .await
-        {
-            tracing::warn!("Failed to store response item: {:?}", e);
-        }
-
-        ctx.next_output_index();
-
-        Ok(())
-    }
-
-    /// Emit a simple event with just event_type and optional item_id
-    async fn emit_simple_event(
-        emitter: &mut crate::responses::service_helpers::EventEmitter,
-        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
-        event_type: &str,
-        item_id: Option<String>,
-    ) -> Result<(), errors::ResponseError> {
-        let event = models::ResponseStreamEvent {
-            event_type: event_type.to_string(),
-            sequence_number: Some(ctx.next_sequence()),
-            response: None,
-            output_index: Some(ctx.output_item_index),
-            content_index: None,
-            item: None,
-            item_id,
-            part: None,
-            delta: None,
-            text: None,
-            logprobs: None,
-            obfuscation: None,
-            annotation_index: None,
-            annotation: None,
-            conversation_title: None,
-        };
-
-        emitter.send_raw(event).await
     }
 
     /// Store user input messages as response_items
@@ -2418,249 +2353,6 @@ impl ResponseServiceImpl {
                     }
                 }
             }
-        }
-    }
-
-    /// Execute a tool call
-    async fn execute_tool(
-        tool_call: &crate::responses::service_helpers::ToolCallInfo,
-        context: &mut ProcessStreamContext,
-    ) -> Result<ToolExecutionResult, errors::ResponseError> {
-        // Check for empty tool type
-        if tool_call.tool_type.trim().is_empty() {
-            return Err(errors::ResponseError::EmptyToolName);
-        }
-
-        match tool_call.tool_type.as_str() {
-            WEB_SEARCH_TOOL_NAME => {
-                if let Some(provider) = &context.web_search_provider {
-                    // Build WebSearchParams from tool call parameters
-                    let mut search_params = tools::WebSearchParams::new(tool_call.query.clone());
-
-                    // Parse additional parameters if present
-                    if let Some(params) = &tool_call.params {
-                        // Extract optional parameters from JSON
-                        if let Some(country) = params.get("country").and_then(|v| v.as_str()) {
-                            search_params.country = Some(country.to_string());
-                        }
-                        if let Some(lang) = params.get("search_lang").and_then(|v| v.as_str()) {
-                            search_params.search_lang = Some(lang.to_string());
-                        }
-                        if let Some(ui_lang) = params.get("ui_lang").and_then(|v| v.as_str()) {
-                            search_params.ui_lang = Some(ui_lang.to_string());
-                        }
-                        if let Some(count) = params.get("count").and_then(|v| v.as_u64()) {
-                            search_params.count = Some(count as u32);
-                        }
-                        if let Some(offset) = params.get("offset").and_then(|v| v.as_u64()) {
-                            search_params.offset = Some(offset as u32);
-                        }
-                        if let Some(safesearch) = params.get("safesearch").and_then(|v| v.as_str())
-                        {
-                            search_params.safesearch = Some(safesearch.to_string());
-                        }
-                        if let Some(freshness) = params.get("freshness").and_then(|v| v.as_str()) {
-                            search_params.freshness = Some(freshness.to_string());
-                        }
-                        if let Some(text_decorations) =
-                            params.get("text_decorations").and_then(|v| v.as_bool())
-                        {
-                            search_params.text_decorations = Some(text_decorations);
-                        }
-                        if let Some(spellcheck) = params.get("spellcheck").and_then(|v| v.as_bool())
-                        {
-                            search_params.spellcheck = Some(spellcheck);
-                        }
-                        if let Some(units) = params.get("units").and_then(|v| v.as_str()) {
-                            search_params.units = Some(units.to_string());
-                        }
-                        if let Some(extra_snippets) =
-                            params.get("extra_snippets").and_then(|v| v.as_bool())
-                        {
-                            search_params.extra_snippets = Some(extra_snippets);
-                        }
-                        if let Some(summary) = params.get("summary").and_then(|v| v.as_bool()) {
-                            search_params.summary = Some(summary);
-                        }
-                    }
-
-                    let results = provider.search(search_params).await.map_err(|e| {
-                        errors::ResponseError::InternalError(format!("Web search failed: {e}"))
-                    })?;
-
-                    // Calculate cumulative offset from current registry size
-                    let search_start_index = context
-                        .source_registry
-                        .as_ref()
-                        .map(|r| r.web_sources.len())
-                        .unwrap_or(0);
-
-                    // Accumulate results into registry and generate citation instruction if first search
-                    let citation_instruction = if let Some(ref mut registry) =
-                        context.source_registry
-                    {
-                        registry.web_sources.extend(results.clone());
-                        None
-                    } else {
-                        context.source_registry =
-                            Some(models::SourceRegistry::with_results(results.clone()));
-                        Some(
-                            r#"CITATION REQUIREMENT: Use [s:N]text[/s:N] for EVERY fact from web search results.
-
-FORMAT: [s:N]fact from source N[/s:N]
-- N = source number (0, 1, 2, 3, etc. - cumulative across all searches)
-- ALWAYS use BOTH opening [s:N] and closing [/s:N] tags together
-- The number N MUST match in opening and closing tags
-- Cite specific facts, names, numbers, and statements from sources
-- Every factual claim must be wrapped
-
-CORRECT EXAMPLES:
-[s:0]San Francisco's top restaurant is The French Laundry[/s:0]
-[s:1]The app TikTok has over 2 billion downloads[/s:1]
-[s:2]Instagram was founded in 2010[/s:2]
-
-DO NOT USE THESE FORMATS:
-✗ [s:0]Missing closing tag
-✗ [s:0]Mismatched[/s:1] numbers
-✗ Statements without any citation tags"#
-                                .to_string(),
-                        )
-                    };
-
-                    // Format results with cumulative indices
-                    let formatted = results
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, r)| {
-                            format!(
-                                "Source: {}\nTitle: {}\nURL: {}\nSnippet: {}\n",
-                                search_start_index + idx,
-                                r.title,
-                                r.url,
-                                r.snippet
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-
-                    // Reset failure counter on successful web search
-                    context.web_search_failure_count = 0;
-
-                    Ok(ToolExecutionResult {
-                        content: formatted,
-                        citation_instruction,
-                    })
-                } else {
-                    Err(errors::ResponseError::UnknownTool(
-                        WEB_SEARCH_TOOL_NAME.to_string(),
-                    ))
-                }
-            }
-            "file_search" => {
-                if let Some(provider) = &context.file_search_provider {
-                    // Get conversation ID from request
-                    let conversation_id = match &context.request.conversation {
-                        Some(models::ConversationReference::Id(id)) => {
-                            // Parse conversation ID
-                            let uuid_str = id
-                                .strip_prefix(crate::id_prefixes::PREFIX_CONV)
-                                .unwrap_or(id);
-                            uuid::Uuid::parse_str(uuid_str).map_err(|e| {
-                                errors::ResponseError::InvalidParams(format!(
-                                    "Invalid conversation ID: {e}"
-                                ))
-                            })?
-                        }
-                        Some(models::ConversationReference::Object { id, .. }) => {
-                            let uuid_str = id
-                                .strip_prefix(crate::id_prefixes::PREFIX_CONV)
-                                .unwrap_or(id);
-                            uuid::Uuid::parse_str(uuid_str).map_err(|e| {
-                                errors::ResponseError::InvalidParams(format!(
-                                    "Invalid conversation ID: {e}"
-                                ))
-                            })?
-                        }
-                        None => {
-                            return Ok(ToolExecutionResult {
-                                content: "File search requires a conversation context".to_string(),
-                                citation_instruction: None,
-                            });
-                        }
-                    };
-
-                    let results = provider
-                        .search_conversation_files(
-                            crate::conversations::models::ConversationId::from(conversation_id),
-                            tool_call.query.clone(),
-                        )
-                        .await
-                        .map_err(|e| {
-                            errors::ResponseError::InternalError(format!("File search failed: {e}"))
-                        })?;
-
-                    // Format results as text
-                    let formatted = results
-                        .iter()
-                        .map(|r| {
-                            format!(
-                                "File: {}\nContent: {}\nRelevance: {}\n",
-                                r.file_name, r.content, r.relevance_score
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-
-                    Ok(ToolExecutionResult {
-                        content: formatted,
-                        citation_instruction: None,
-                    })
-                } else {
-                    Ok(ToolExecutionResult {
-                        content: "File search not available (no provider configured)".to_string(),
-                        citation_instruction: None,
-                    })
-                }
-            }
-            tool_name if tool_name.contains(':') => {
-                if let Some(ref mcp_executor) = context.mcp_executor {
-                    if let Some((server_label, mcp_tool_name)) =
-                        tools::McpToolExecutor::parse_tool_name(tool_name)
-                    {
-                        if mcp_executor.requires_approval(server_label, mcp_tool_name) {
-                            // TODO: Implement approval flow in a separate task
-                            // For now, return an error indicating approval is required
-                            return Err(errors::ResponseError::McpApprovalRequired {
-                                server: server_label.to_string(),
-                                tool: mcp_tool_name.to_string(),
-                            });
-                        }
-
-                        // Parse arguments from tool call
-                        let arguments = tool_call
-                            .params
-                            .clone()
-                            .unwrap_or_else(|| serde_json::json!({}));
-
-                        // Execute the MCP tool
-                        let result = mcp_executor
-                            .execute_tool(server_label, mcp_tool_name, arguments)
-                            .await?;
-
-                        Ok(ToolExecutionResult {
-                            content: result,
-                            citation_instruction: None,
-                        })
-                    } else {
-                        Err(errors::ResponseError::UnknownTool(tool_name.to_string()))
-                    }
-                } else {
-                    Err(errors::ResponseError::UnknownTool(tool_name.to_string()))
-                }
-            }
-            _ => Err(errors::ResponseError::UnknownTool(
-                tool_call.tool_type.clone(),
-            )),
         }
     }
 

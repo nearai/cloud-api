@@ -1,4 +1,4 @@
--- refinery:no-transaction
+-- no-transaction
 -- V39: Fix workspace name unique constraint to only apply to active workspaces
 -- This allows reusing workspace names after a workspace has been soft-deleted (is_active = false)
 --

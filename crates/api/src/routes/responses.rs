@@ -57,6 +57,16 @@ fn map_response_error_to_status(error: &ServiceResponseError) -> StatusCode {
         ServiceResponseError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         ServiceResponseError::UnknownTool(_) => StatusCode::BAD_REQUEST,
         ServiceResponseError::EmptyToolName => StatusCode::BAD_REQUEST,
+        ServiceResponseError::StreamInterrupted => StatusCode::INTERNAL_SERVER_ERROR,
+        ServiceResponseError::McpConnectionFailed(_) => StatusCode::BAD_GATEWAY,
+        ServiceResponseError::McpToolDiscoveryFailed(_) => StatusCode::BAD_GATEWAY,
+        ServiceResponseError::McpToolExecutionFailed(_) => StatusCode::BAD_GATEWAY,
+        ServiceResponseError::McpServerLimitExceeded { .. } => StatusCode::BAD_REQUEST,
+        ServiceResponseError::McpToolLimitExceeded { .. } => StatusCode::BAD_REQUEST,
+        ServiceResponseError::McpInsecureUrl => StatusCode::BAD_REQUEST,
+        ServiceResponseError::McpPrivateIpBlocked => StatusCode::BAD_REQUEST,
+        ServiceResponseError::McpApprovalRequired { .. } => StatusCode::BAD_REQUEST,
+        ServiceResponseError::McpApprovalRequestNotFound(_) => StatusCode::NOT_FOUND,
     }
 }
 
@@ -84,6 +94,49 @@ impl From<ServiceResponseError> for ErrorResponse {
             ServiceResponseError::EmptyToolName => ErrorResponse::new(
                 "Tool call is missing a tool name".to_string(),
                 "invalid_request_error".to_string(),
+            ),
+            ServiceResponseError::StreamInterrupted => {
+                ErrorResponse::new("Stream interrupted".to_string(), "stream_error".to_string())
+            }
+            ServiceResponseError::McpConnectionFailed(msg) => ErrorResponse::new(
+                format!("MCP connection failed: {msg}"),
+                "mcp_error".to_string(),
+            ),
+            ServiceResponseError::McpToolDiscoveryFailed(msg) => ErrorResponse::new(
+                format!("MCP tool discovery failed: {msg}"),
+                "mcp_error".to_string(),
+            ),
+            ServiceResponseError::McpToolExecutionFailed(msg) => ErrorResponse::new(
+                format!("MCP tool execution failed: {msg}"),
+                "mcp_error".to_string(),
+            ),
+            ServiceResponseError::McpServerLimitExceeded { max } => ErrorResponse::new(
+                format!("MCP server limit exceeded: max {max} servers per request"),
+                "invalid_request_error".to_string(),
+            ),
+            ServiceResponseError::McpToolLimitExceeded { server, count, max } => {
+                ErrorResponse::new(
+                    format!(
+                        "MCP tool limit exceeded: server '{server}' has {count} tools, max {max}"
+                    ),
+                    "invalid_request_error".to_string(),
+                )
+            }
+            ServiceResponseError::McpInsecureUrl => ErrorResponse::new(
+                "MCP server URL must use HTTPS".to_string(),
+                "invalid_request_error".to_string(),
+            ),
+            ServiceResponseError::McpPrivateIpBlocked => ErrorResponse::new(
+                "MCP private IP addresses not allowed".to_string(),
+                "invalid_request_error".to_string(),
+            ),
+            ServiceResponseError::McpApprovalRequired { server, tool } => ErrorResponse::new(
+                format!("MCP approval required for tool '{tool}' on server '{server}'"),
+                "mcp_approval_required".to_string(),
+            ),
+            ServiceResponseError::McpApprovalRequestNotFound(msg) => ErrorResponse::new(
+                format!("MCP approval request not found: {msg}"),
+                "not_found_error".to_string(),
             ),
         }
     }

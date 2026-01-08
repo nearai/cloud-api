@@ -97,6 +97,9 @@ impl UsageServiceTrait for UsageServiceImpl {
             ttft_ms: request.ttft_ms,
             avg_itl_ms: request.avg_itl_ms,
             inference_id: request.inference_id,
+            provider_request_id: request.provider_request_id,
+            stop_reason: request.stop_reason,
+            response_id: request.response_id,
         };
 
         // Record in database

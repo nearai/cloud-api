@@ -193,29 +193,17 @@ async fn test_mcp_multi_turn_conversation_with_approval() {
     println!("  ✓ list_tools was not called (cache hit)");
 
     // Extract mcp_approval_request from output
-    let approval_request = resp2_obj
+    let (approval_request_id, tool_name, arguments) = resp2_obj
         .output
         .iter()
-        .find(|item| {
-            matches!(
-                item,
-                api::models::ResponseOutputItem::McpApprovalRequest { .. }
-            )
+        .find_map(|item| {
+            if let api::models::ResponseOutputItem::McpApprovalRequest { id, name, arguments, .. } = item {
+                Some((id.clone(), name.clone(), arguments.clone()))
+            } else {
+                None
+            }
         })
         .expect("Turn 2 should return mcp_approval_request");
-
-    let (approval_request_id, tool_name, arguments) =
-        if let api::models::ResponseOutputItem::McpApprovalRequest {
-            id,
-            name,
-            arguments,
-            ..
-        } = approval_request
-        {
-            (id.clone(), name.clone(), arguments.clone())
-        } else {
-            panic!("Expected McpApprovalRequest variant");
-        };
 
     assert_eq!(tool_name, "get_weather");
     assert!(arguments.contains("San Francisco"));

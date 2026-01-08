@@ -1,8 +1,170 @@
 //! Common HTTP-level helpers for API E2E tests.
-//!
-//! Keep these focused on making requests + asserting status codes + parsing responses.
 
 use api::models::{ConversationItemList, ConversationObject, ResponseObject};
+use inference_providers::StreamChunk;
+
+/// POST `/v1/chat/completions` and return the raw response body text.
+///
+/// This is intentionally low-level so tests can compute hashes over the exact body when needed.
+pub async fn post_chat_completions_raw(
+    server: &axum_test::TestServer,
+    api_key: &str,
+    request_body: &serde_json::Value,
+) -> String {
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(request_body)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "POST /v1/chat/completions should return 200, got {} body={}",
+        response.status_code(),
+        response.text()
+    );
+
+    response.text()
+}
+
+/// Extract chat completion id from a `/v1/chat/completions` streaming (SSE) body.
+pub fn extract_chat_id_from_chat_completions_sse(response_text: &str) -> Option<String> {
+    for line in response_text.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+
+        if data.trim() == "[DONE]" {
+            break;
+        }
+
+        if let Ok(StreamChunk::Chat(chat_chunk)) = serde_json::from_str::<StreamChunk>(data) {
+            return Some(chat_chunk.id);
+        }
+    }
+
+    None
+}
+
+/// Run a `/v1/chat/completions` streaming request and return `(chat_id, raw_body)`.
+pub async fn create_chat_completion_stream_and_get_id(
+    server: &axum_test::TestServer,
+    api_key: &str,
+    request_body: &serde_json::Value,
+) -> (String, String) {
+    let response_text = post_chat_completions_raw(server, api_key, request_body).await;
+    let chat_id = extract_chat_id_from_chat_completions_sse(&response_text)
+        .expect("Should extract chat_id from SSE stream");
+    (chat_id, response_text)
+}
+
+/// Run a non-streaming `/v1/chat/completions` request and return `(chat_id, raw_body)`.
+pub async fn create_chat_completion_non_stream_and_get_id(
+    server: &axum_test::TestServer,
+    api_key: &str,
+    request_body: &serde_json::Value,
+) -> (String, String) {
+    let response_text = post_chat_completions_raw(server, api_key, request_body).await;
+    let response_json: serde_json::Value =
+        serde_json::from_str(&response_text).expect("Chat completion response must be valid JSON");
+    let chat_id = response_json
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("Chat completion response must have id field")
+        .to_string();
+    (chat_id, response_text)
+}
+
+/// POST `/v1/responses` (without conversation) and return the raw response body text.
+///
+/// This matches the real-e2e tests that only provide `input`/`model` fields.
+pub async fn post_responses_raw(
+    server: &axum_test::TestServer,
+    api_key: &str,
+    request_body: &serde_json::Value,
+) -> String {
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(request_body)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "POST /v1/responses should return 200, got {} body={}",
+        response.status_code(),
+        response.text()
+    );
+
+    response.text()
+}
+
+/// Extract response id from a `/v1/responses` streaming (SSE) body by looking for `response.created`.
+pub fn extract_response_id_from_responses_sse(response_text: &str) -> Option<String> {
+    for line_chunk in response_text.split("\n\n") {
+        if line_chunk.trim().is_empty() {
+            continue;
+        }
+
+        let mut event_type = "";
+        let mut event_data = "";
+
+        for line in line_chunk.lines() {
+            if let Some(event_name) = line.strip_prefix("event: ") {
+                event_type = event_name;
+            } else if let Some(data) = line.strip_prefix("data: ") {
+                event_data = data;
+            }
+        }
+
+        if event_type != "response.created" || event_data.is_empty() {
+            continue;
+        }
+
+        let Ok(event_json) = serde_json::from_str::<serde_json::Value>(event_data) else {
+            continue;
+        };
+
+        if let Some(response_obj) = event_json.get("response") {
+            if let Some(id) = response_obj.get("id").and_then(|v| v.as_str()) {
+                return Some(id.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Run a `/v1/responses` streaming request (without conversation) and return `(response_id, raw_body)`.
+pub async fn create_response_stream_no_conversation_and_get_id(
+    server: &axum_test::TestServer,
+    api_key: &str,
+    request_body: &serde_json::Value,
+) -> (String, String) {
+    let response_text = post_responses_raw(server, api_key, request_body).await;
+    let response_id = extract_response_id_from_responses_sse(&response_text)
+        .expect("Should have extracted response_id from stream");
+    (response_id, response_text)
+}
+
+/// Run a non-streaming `/v1/responses` request (without conversation) and return `(response_id, raw_body)`.
+pub async fn create_response_non_stream_no_conversation_and_get_id(
+    server: &axum_test::TestServer,
+    api_key: &str,
+    request_body: &serde_json::Value,
+) -> (String, String) {
+    let response_text = post_responses_raw(server, api_key, request_body).await;
+    let response_json: serde_json::Value =
+        serde_json::from_str(&response_text).expect("Response must be valid JSON");
+    let response_id = response_json
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("Response must have id field")
+        .to_string();
+    (response_id, response_text)
+}
 
 pub async fn create_conversation(
     server: &axum_test::TestServer,

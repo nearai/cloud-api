@@ -2,8 +2,7 @@ mod common;
 
 use api::routes::attestation::{AttestationResponse, SignatureResponse};
 use common::*;
-
-use inference_providers::StreamChunk;
+use endpoints::*;
 
 #[tokio::test]
 async fn real_test_signature_signing_address_matches_model_attestation_stream() {
@@ -23,35 +22,8 @@ async fn real_test_signature_signing_address_matches_model_attestation_stream() 
         "model": model_name,
     });
 
-    let response = server
-        .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&request_body)
-        .await;
-
-    assert_eq!(
-        response.status_code(),
-        200,
-        "Streaming request should succeed"
-    );
-
-    let response_text = response.text();
-    let mut chat_id: Option<String> = None;
-
-    for line in response_text.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
-            if data.trim() == "[DONE]" {
-                break;
-            }
-            if let Ok(StreamChunk::Chat(chat_chunk)) = serde_json::from_str::<StreamChunk>(data) {
-                if chat_id.is_none() {
-                    chat_id = Some(chat_chunk.id.clone());
-                }
-            }
-        }
-    }
-
-    let chat_id = chat_id.expect("Should extract chat_id from SSE stream");
+    let (chat_id, _raw_body) =
+        create_chat_completion_stream_and_get_id(&server, &api_key, &request_body).await;
 
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
@@ -135,26 +107,8 @@ async fn real_test_signature_signing_address_matches_model_attestation_non_strea
         "model": model_name,
     });
 
-    let response = server
-        .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&request_body)
-        .await;
-
-    assert_eq!(
-        response.status_code(),
-        200,
-        "Non-streaming request should succeed"
-    );
-
-    let response_text = response.text();
-    let response_json: serde_json::Value =
-        serde_json::from_str(&response_text).expect("Response must be valid JSON");
-    let chat_id = response_json
-        .get("id")
-        .and_then(|v| v.as_str())
-        .expect("Chat completion response must have id field")
-        .to_string();
+    let (chat_id, _raw_body) =
+        create_chat_completion_non_stream_and_get_id(&server, &api_key, &request_body).await;
 
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 

@@ -3,6 +3,7 @@ mod common;
 
 use api::routes::attestation::{AttestationResponse, SignatureResponse};
 use common::*;
+use endpoints::*;
 
 #[tokio::test]
 async fn real_test_signature_signing_address_matches_gateway_attestation_stream() {
@@ -18,52 +19,8 @@ async fn real_test_signature_signing_address_matches_gateway_attestation_stream(
         "stream": true,
         "model": model_name,
     });
-
-    let response = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&request_body)
-        .await;
-
-    assert_eq!(
-        response.status_code(),
-        200,
-        "Real response request should succeed"
-    );
-
-    let response_text = response.text();
-    let mut response_id: Option<String> = None;
-
-    for line_chunk in response_text.split("\n\n") {
-        if line_chunk.trim().is_empty() {
-            continue;
-        }
-
-        let mut event_type = "";
-        let mut event_data = "";
-
-        for line in line_chunk.lines() {
-            if let Some(event_name) = line.strip_prefix("event: ") {
-                event_type = event_name;
-            } else if let Some(data) = line.strip_prefix("data: ") {
-                event_data = data;
-            }
-        }
-
-        if event_type == "response.created" && !event_data.is_empty() {
-            if let Ok(event_json) = serde_json::from_str::<serde_json::Value>(event_data) {
-                if response_id.is_none() {
-                    if let Some(response_obj) = event_json.get("response") {
-                        if let Some(id) = response_obj.get("id").and_then(|v| v.as_str()) {
-                            response_id = Some(id.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let response_id = response_id.expect("Should have extracted response_id");
+    let (response_id, _raw_body) =
+        create_response_stream_no_conversation_and_get_id(&server, &api_key, &request_body).await;
 
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
@@ -132,27 +89,9 @@ async fn real_test_signature_signing_address_matches_gateway_attestation_non_str
         "stream": false,
         "model": model_name,
     });
-
-    let response = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&request_body)
-        .await;
-
-    assert_eq!(
-        response.status_code(),
-        200,
-        "Real non-stream response request should succeed"
-    );
-
-    let response_text = response.text();
-    let response_json: serde_json::Value =
-        serde_json::from_str(&response_text).expect("Response must be valid JSON");
-    let response_id = response_json
-        .get("id")
-        .and_then(|v| v.as_str())
-        .expect("Response must have id field")
-        .to_string();
+    let (response_id, _raw_body) =
+        create_response_non_stream_no_conversation_and_get_id(&server, &api_key, &request_body)
+            .await;
 
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 

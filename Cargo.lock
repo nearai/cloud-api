@@ -5814,6 +5814,7 @@ dependencies = [
  "futures",
  "futures-util",
  "hex",
+ "hkdf",
  "hmac 0.12.1",
  "inference_providers",
  "jsonwebtoken",

@@ -24,6 +24,7 @@ use crate::{
 };
 
 use chrono;
+use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -43,7 +44,7 @@ pub struct AttestationService {
 }
 
 impl AttestationService {
-    pub fn new(
+    pub async fn init(
         repository: Arc<dyn AttestationRepository + Send + Sync>,
         inference_provider_pool: Arc<InferenceProviderPool>,
         models_repository: Arc<dyn ModelsRepository>,
@@ -60,32 +61,26 @@ impl AttestationService {
             );
         }
 
-        let mut csprng = OsRng;
-
-        // Generate ed25519 key pair on startup
-        let ed25519_signing_key = SigningKey::generate(&mut csprng);
-        let ed25519_verifying_key = ed25519_signing_key.verifying_key();
-        let ed25519_signing_key = Arc::new(ed25519_signing_key);
-        let ed25519_verifying_key = Arc::new(ed25519_verifying_key);
-
-        let ed25519_address = hex::encode(ed25519_verifying_key.as_bytes());
-        tracing::info!(
-            "Generated ed25519 key pair for response signing. Public key (signing address): {}",
-            ed25519_address
-        );
-
-        // Generate ECDSA (secp256k1) key pair on startup
-        let ecdsa_signing_key = EcdsaSigningKey::random(&mut csprng);
-        let ecdsa_verifying_key = *ecdsa_signing_key.verifying_key();
-        let ecdsa_signing_key = Arc::new(ecdsa_signing_key);
-        let ecdsa_verifying_key = Arc::new(ecdsa_verifying_key);
-
-        // Convert ECDSA public key to Ethereum address (20 bytes = 40 hex chars)
-        let ecdsa_address_raw = Self::ecdsa_public_key_to_ethereum_address(&ecdsa_verifying_key);
-        tracing::info!(
-            "Generated ECDSA (secp256k1) key pair for response signing. Ethereum address (signing address): 0x{}",
-            hex::encode(ecdsa_address_raw)
-        );
+        // In TEE, use dstack-derived key material based on app_id so the signing address
+        // stays stable across multiple instances of the same app.
+        // In DEV / non-TEE environments, fall back to per-process keys.
+        let (ed25519_signing_key, ed25519_verifying_key, ecdsa_signing_key, ecdsa_verifying_key) =
+            Self::derive_signing_keys_from_dstack().await.unwrap_or_else(|e| {
+                if std::env::var("DEV").is_ok() {
+                    tracing::warn!(
+                            "DEV mode: Unable to derive signing keys from dstack ({}); falling back to ephemeral keys",
+                            e
+                        );
+                } else {
+                    tracing::warn!(
+                            "Failed to derive signing keys from dstack ({}); falling back to ephemeral keys. \
+                             This may cause signing_address mismatch across instances. \
+                             Ensure this service runs in a CVM/TEE with dstack available.",
+                            e
+                        );
+                }
+                Self::generate_ephemeral_signing_keys()
+            });
 
         Self {
             repository,
@@ -94,11 +89,125 @@ impl AttestationService {
             metrics_service,
             vpc_info,
             vpc_shared_secret,
+            ed25519_signing_key: Arc::new(ed25519_signing_key),
+            ed25519_verifying_key: Arc::new(ed25519_verifying_key),
+            ecdsa_signing_key: Arc::new(ecdsa_signing_key),
+            ecdsa_verifying_key: Arc::new(ecdsa_verifying_key),
+        }
+    }
+
+    fn generate_ephemeral_signing_keys(
+    ) -> (SigningKey, VerifyingKey, EcdsaSigningKey, EcdsaVerifyingKey) {
+        let mut csprng = OsRng;
+
+        // ed25519 key pair
+        let ed25519_signing_key = SigningKey::generate(&mut csprng);
+        let ed25519_verifying_key = ed25519_signing_key.verifying_key();
+        let ed25519_address = hex::encode(ed25519_verifying_key.as_bytes());
+        tracing::info!(
+            "Generated ed25519 key pair for response signing (ephemeral). Public key (signing address): {}",
+            ed25519_address
+        );
+
+        // ECDSA key pair
+        let ecdsa_signing_key = EcdsaSigningKey::random(&mut csprng);
+        let ecdsa_verifying_key = *ecdsa_signing_key.verifying_key();
+        let ecdsa_address_raw = Self::ecdsa_public_key_to_ethereum_address(&ecdsa_verifying_key);
+        tracing::info!(
+            "Generated ECDSA (secp256k1) key pair for response signing (ephemeral). Ethereum address (signing address): 0x{}",
+            hex::encode(ecdsa_address_raw)
+        );
+
+        (
             ed25519_signing_key,
             ed25519_verifying_key,
             ecdsa_signing_key,
             ecdsa_verifying_key,
+        )
+    }
+
+    async fn derive_signing_keys_from_dstack(
+    ) -> Result<(SigningKey, VerifyingKey, EcdsaSigningKey, EcdsaVerifyingKey), AttestationError>
+    {
+        let client = dstack_client::DstackClient::new(None);
+        let info = client.info().await.map_err(|e| {
+            AttestationError::InternalError(format!(
+                "failed to get dstack info for key derivation: {e:?}"
+            ))
+        })?;
+        let app_id = info.app_id;
+
+        // Ask dstack for a derived key. The returned key is bound to the app in TEE,
+        let path = format!("gateway-signing-key:{app_id}");
+
+        let key_resp = client.get_key(Some(path), None).await.map_err(|e| {
+            AttestationError::InternalError(format!("failed to get dstack derived key: {e:?}"))
+        })?;
+
+        let key_bytes = key_resp.decode_key().map_err(|e| {
+            AttestationError::InternalError(format!("failed to decode dstack derived key hex: {e}"))
+        })?;
+
+        // Use HKDF-SHA256 for secure key derivation
+        // Salt: app_id ensures different apps get different keys even with same IKM
+        // Info: distinguishes between ed25519 and ecdsa key derivation
+        let hk = Hkdf::<Sha256>::new(Some(app_id.as_bytes()), &key_bytes);
+
+        // Derive ed25519 secret bytes (32 bytes)
+        let mut ed_secret: [u8; 32] = [0u8; 32];
+        hk.expand(b"nearai-cloud-api/ed25519/signing-key", &mut ed_secret)
+            .map_err(|e| {
+                AttestationError::InternalError(format!("HKDF expansion failed for ed25519: {e}"))
+            })?;
+        let ed25519_signing_key = SigningKey::from_bytes(&ed_secret);
+        let ed25519_verifying_key = ed25519_signing_key.verifying_key();
+
+        // Derive an ECDSA secret scalar. If the bytes are not a valid scalar, deterministically
+        // use HKDF with different info (including counter) until we get a valid one.
+        let mut ecdsa_signing_key_opt: Option<EcdsaSigningKey> = None;
+        for ctr in 0u16..=1000u16 {
+            let mut ecdsa_seed: [u8; 32] = [0u8; 32];
+            // Include counter in info to get different output for each retry attempt
+            let mut info = Vec::with_capacity(32 + 2);
+            info.extend_from_slice(b"nearai-cloud-api/ecdsa/signing-key");
+            info.extend_from_slice(&ctr.to_be_bytes());
+
+            hk.expand(&info, &mut ecdsa_seed).map_err(|e| {
+                AttestationError::InternalError(format!("HKDF expansion failed for ecdsa: {e}"))
+            })?;
+
+            let fb: k256::FieldBytes = ecdsa_seed.into();
+            if let Ok(sk) = EcdsaSigningKey::from_bytes(&fb) {
+                ecdsa_signing_key_opt = Some(sk);
+                break;
+            }
         }
+
+        let ecdsa_signing_key = ecdsa_signing_key_opt.ok_or_else(|| {
+            AttestationError::InternalError(
+                "failed to derive a valid secp256k1 signing key from dstack key material"
+                    .to_string(),
+            )
+        })?;
+        let ecdsa_verifying_key = *ecdsa_signing_key.verifying_key();
+
+        let ed25519_address = hex::encode(ed25519_verifying_key.as_bytes());
+        tracing::info!(
+            "Derived ed25519 key pair for response signing from dstack app_id. Public key (signing address): {}",
+            ed25519_address
+        );
+        let ecdsa_address_raw = Self::ecdsa_public_key_to_ethereum_address(&ecdsa_verifying_key);
+        tracing::info!(
+            "Derived ECDSA (secp256k1) key pair for response signing from dstack app_id. Ethereum address (signing address): 0x{}",
+            hex::encode(ecdsa_address_raw)
+        );
+
+        Ok((
+            ed25519_signing_key,
+            ed25519_verifying_key,
+            ecdsa_signing_key,
+            ecdsa_verifying_key,
+        ))
     }
 
     /// Convert ECDSA public key to Ethereum address (20 bytes)
@@ -409,22 +518,19 @@ impl ports::AttestationServiceTrait for AttestationService {
         // Resolve model name (could be an alias) and get model details
         let mut model_attestations = vec![];
         // Create a nonce if none was provided
-        let nonce = match nonce {
-            Some(n) => n,
-            None => {
-                let mut nonce_bytes = [0u8; 32];
-                OsRng.fill_bytes(&mut nonce_bytes);
-                let generated_nonce = nonce_bytes
-                    .into_iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>();
-                tracing::debug!(
-                    "No nonce provided for attestation report, generated nonce: {}",
-                    generated_nonce
-                );
+        let nonce = nonce.unwrap_or_else(|| {
+            let mut nonce_bytes = [0u8; 32];
+            OsRng.fill_bytes(&mut nonce_bytes);
+            let generated_nonce = nonce_bytes
+                .into_iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            tracing::debug!(
+                "No nonce provided for attestation report, generated nonce: {}",
                 generated_nonce
-            }
-        };
+            );
+            generated_nonce
+        });
 
         // Parse nonce: handle hex string or generate if needed
         let nonce_bytes = hex::decode(&nonce).map_err(|e| {

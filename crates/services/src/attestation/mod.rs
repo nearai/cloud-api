@@ -206,7 +206,8 @@ impl AttestationService {
         let ed25519_verifying_key = ed25519_signing_key.verifying_key();
 
         // Derive ECDSA secret scalar
-        // Most attempts should succeed on the first try (probability ~99.6% for SECP256K1)
+        // Most attempts should succeed on the first try (probability ~100% for secp256k1)
+        // The curve order is very close to 2^256, so invalid scalars are extremely rare (~3.7e-37%)
         let mut ecdsa_signing_key_opt: Option<EcdsaSigningKey> = None;
         let mut attempts = 0u16;
 

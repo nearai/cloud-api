@@ -298,7 +298,8 @@ pub async fn init_domain_services_with_pool(
             models_repo.clone(),
             metrics_service.clone(),
         )
-        .await,
+        .await
+        .unwrap(),
     );
 
     // Create models service

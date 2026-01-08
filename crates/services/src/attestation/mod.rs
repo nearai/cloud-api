@@ -56,7 +56,7 @@ impl AttestationService {
         inference_provider_pool: Arc<InferenceProviderPool>,
         models_repository: Arc<dyn ModelsRepository>,
         metrics_service: Arc<dyn MetricsServiceTrait>,
-    ) -> Self {
+    ) -> Result<Self, AttestationError> {
         // Load VPC info once during initialization
         let vpc_info = load_vpc_info();
 
@@ -70,26 +70,33 @@ impl AttestationService {
 
         // In TEE, use dstack-derived key material based on app_id so the signing address
         // stays stable across multiple instances of the same app.
-        // In DEV / non-TEE environments, fall back to per-process keys.
+        // In DEV mode, fall back to per-process keys for local development.
         let (ed25519_signing_key, ed25519_verifying_key, ecdsa_signing_key, ecdsa_verifying_key) =
-            Self::derive_signing_keys_from_dstack().await.unwrap_or_else(|e| {
-                if std::env::var("DEV").is_ok() {
-                    tracing::warn!(
+            match Self::derive_signing_keys_from_dstack().await {
+                Ok(keys) => keys,
+                Err(e) => {
+                    if std::env::var("DEV").is_ok() {
+                        tracing::warn!(
                             "DEV mode: Unable to derive signing keys from dstack ({}); falling back to ephemeral keys",
                             e
                         );
-                } else {
-                    tracing::warn!(
-                            "Failed to derive signing keys from dstack ({}); falling back to ephemeral keys. \
-                             This may cause signing_address mismatch across instances. \
-                             Ensure this service runs in a CVM/TEE with dstack available.",
+                        Self::generate_ephemeral_signing_keys()
+                    } else {
+                        tracing::error!(
+                            "Failed to derive signing keys from dstack ({}). \
+                             This service must run in a CVM/TEE with dstack available.",
                             e
                         );
+                        return Err(AttestationError::InternalError(format!(
+                            "Failed to derive signing keys from dstack: {}. \
+                             Ensure this service runs in a CVM/TEE with dstack available.",
+                            e
+                        )));
+                    }
                 }
-                Self::generate_ephemeral_signing_keys()
-            });
+            };
 
-        Self {
+        Ok(Self {
             repository,
             inference_provider_pool,
             models_repository,
@@ -100,7 +107,7 @@ impl AttestationService {
             ed25519_verifying_key: Arc::new(ed25519_verifying_key),
             ecdsa_signing_key: Arc::new(ecdsa_signing_key),
             ecdsa_verifying_key: Arc::new(ecdsa_verifying_key),
-        }
+        })
     }
 
     fn generate_ephemeral_signing_keys(

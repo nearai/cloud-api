@@ -40,6 +40,8 @@ pub enum FileServiceError {
 pub const ALLOWED_MIME_TYPES: &[(&str, bool)] = &[
     // (MIME type, requires_utf_encoding)
     ("application/octet-stream", false),
+    ("text/csv", true),
+    ("text/tab-separated-values", true),
     ("text/x-c", true),
     ("text/x-c++", true),
     ("text/x-csharp", true),

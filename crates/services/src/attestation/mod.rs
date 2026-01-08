@@ -35,7 +35,7 @@ const GATEWAY_KEY_PATH: &str = "/signing-key";
 const GATEWAY_KEY_INFO_ED25519: &[u8] = b"/ed25519";
 const GATEWAY_KEY_INFO_ECDSA: &[u8] = b"/ecdsa";
 
-const MAX_ECDSA_DERIVATION_ATTEMPTS: u16 = 1000;
+const MAX_DERIVATION_ATTEMPTS: u16 = 1024;
 
 pub struct AttestationService {
     pub repository: Arc<dyn AttestationRepository + Send + Sync>,
@@ -168,13 +168,41 @@ impl AttestationService {
         let hk = Hkdf::<Sha256>::new(Some(app_id.as_bytes()), &key_bytes);
 
         // Derive ed25519 secret bytes (32 bytes)
-        let mut ed_secret: [u8; 32] = [0u8; 32];
-        hk.expand(GATEWAY_KEY_INFO_ED25519, &mut ed_secret)
-            .map_err(|e| {
+        // Use loop to retry if derived key is all zeros
+        let mut ed25519_signing_key_opt: Option<SigningKey> = None;
+        let mut ed25519_attempts = 0u16;
+
+        for ctr in 0u16..=MAX_DERIVATION_ATTEMPTS {
+            ed25519_attempts = ctr + 1;
+
+            // Build normalized_info: always include counter for consistent derivation
+            let mut normalized_info = Vec::with_capacity(GATEWAY_KEY_INFO_ED25519.len() + 2);
+            normalized_info.extend_from_slice(GATEWAY_KEY_INFO_ED25519);
+            normalized_info.extend_from_slice(&ctr.to_be_bytes());
+
+            let mut ed_secret: [u8; 32] = [0u8; 32];
+            hk.expand(&normalized_info, &mut ed_secret).map_err(|e| {
                 AttestationError::InternalError(format!("HKDF expansion failed for ed25519: {e}"))
             })?;
 
-        let ed25519_signing_key = SigningKey::from_bytes(&ed_secret);
+            // Check if the derived key is all zeros
+            if ed_secret.iter().all(|&b| b == 0) {
+                continue;
+            }
+
+            let ed25519_signing_key = SigningKey::from_bytes(&ed_secret);
+            ed25519_signing_key_opt = Some(ed25519_signing_key);
+            break;
+        }
+
+        let ed25519_signing_key = ed25519_signing_key_opt.ok_or_else(|| {
+            AttestationError::InternalError(format!(
+                "Failed to derive a valid ed25519 signing key from dstack key material after {} attempts. \
+                 This indicates a serious issue with key material or derivation process.",
+                ed25519_attempts
+            ))
+        })?;
+
         let ed25519_verifying_key = ed25519_signing_key.verifying_key();
 
         // Derive ECDSA secret scalar
@@ -182,19 +210,13 @@ impl AttestationService {
         let mut ecdsa_signing_key_opt: Option<EcdsaSigningKey> = None;
         let mut attempts = 0u16;
 
-        for ctr in 0u16..=MAX_ECDSA_DERIVATION_ATTEMPTS {
+        for ctr in 0u16..=MAX_DERIVATION_ATTEMPTS {
             attempts = ctr + 1;
 
-            // Build normalized_info: base info for first attempt, base + counter for retries
-            let normalized_info: Vec<u8> = if ctr == 0 {
-                GATEWAY_KEY_INFO_ECDSA.to_vec()
-            } else {
-                // Include counter in info to get different output for each retry attempt
-                let mut info = Vec::with_capacity(GATEWAY_KEY_INFO_ECDSA.len() + 2);
-                info.extend_from_slice(GATEWAY_KEY_INFO_ECDSA);
-                info.extend_from_slice(&ctr.to_be_bytes());
-                info
-            };
+            // Build normalized_info: always include counter for consistent derivation
+            let mut normalized_info = Vec::with_capacity(GATEWAY_KEY_INFO_ECDSA.len() + 2);
+            normalized_info.extend_from_slice(GATEWAY_KEY_INFO_ECDSA);
+            normalized_info.extend_from_slice(&ctr.to_be_bytes());
 
             let mut ecdsa_seed: [u8; 32] = [0u8; 32];
 
@@ -215,14 +237,6 @@ impl AttestationService {
                 attempts
             ))
         })?;
-
-        // Log if multiple attempts were needed (unusual but acceptable)
-        if attempts > 1 {
-            tracing::warn!(
-                "ECDSA key derivation required {} attempts (unusual but acceptable)",
-                attempts
-            );
-        }
 
         let ecdsa_verifying_key = *ecdsa_signing_key.verifying_key();
 

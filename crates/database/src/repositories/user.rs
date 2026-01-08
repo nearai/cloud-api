@@ -259,7 +259,14 @@ impl UserRepository {
         limit: i64,
         offset: i64,
         search_by_name: Option<String>,
-    ) -> Result<Vec<(User, Option<services::admin::UserOrganizationInfo>)>> {
+    ) -> Result<(Vec<(User, Option<services::admin::UserOrganizationInfo>)>, i64)> {
+        // Escape LIKE wildcard characters in user input to prevent injection
+        let escaped_search = search_by_name.as_ref().map(|s| {
+            s.replace('\\', "\\\\")
+             .replace('%', "\\%")
+             .replace('_', "\\_")
+        });
+
         let rows = retry_db!("list_all_users_with_organizations_with_pagination", {
             let client = self
                 .pool
@@ -273,6 +280,7 @@ impl UserRepository {
                     r#"
             SELECT DISTINCT ON (u.id)
                 u.*,
+                COUNT(*) OVER() as total_count,
                 o.id as organization_id,
                 o.name as organization_name,
                 o.description as organization_description,
@@ -293,18 +301,22 @@ impl UserRepository {
             ) olh ON true
             LEFT JOIN organization_balance ob ON o.id = ob.organization_id
             WHERE u.is_active = true
-              AND ($3::TEXT IS NULL OR o.name ILIKE $3 || '%')
+              AND ($3::TEXT IS NULL OR o.name ILIKE ($3 || '%') ESCAPE '\')
             ORDER BY u.id, o.created_at ASC NULLS LAST
             LIMIT $1
             OFFSET $2
             "#,
-                    &[&limit, &offset, &search_by_name],
+                    &[&limit, &offset, &escaped_search],
                 )
                 .await
                 .map_err(map_db_error)
         })?;
 
-        rows.into_iter()
+        // Extract total count from first row, or 0 if no rows
+        let total_count = rows.first().map(|row| row.get::<_, i64>("total_count")).unwrap_or(0);
+
+        let result = rows
+            .into_iter()
             .map(|row| {
                 let user = self.row_to_user(row.clone())?;
                 let org_id: Option<Uuid> = row.get("organization_id");
@@ -327,7 +339,9 @@ impl UserRepository {
 
                 Ok((user, org_data))
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok((result, total_count))
     }
 
     /// Search users by username or email

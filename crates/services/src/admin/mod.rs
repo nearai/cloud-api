@@ -189,15 +189,9 @@ impl AdminService for AdminServiceImpl {
         offset: i64,
         search_by_name: Option<String>,
     ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64), AdminError> {
-        let users_with_orgs = self
+        let (users_with_orgs, total) = self
             .repository
-            .list_users_with_organizations(limit, offset, search_by_name.clone())
-            .await
-            .map_err(|e| AdminError::InternalError(e.to_string()))?;
-
-        let total = self
-            .repository
-            .get_active_user_count()
+            .list_users_with_organizations(limit, offset, search_by_name)
             .await
             .map_err(|e| AdminError::InternalError(e.to_string()))?;
 

@@ -30,6 +30,13 @@ use sha2::Sha256;
 
 pub mod ports;
 
+// Constants for key derivation
+const GATEWAY_KEY_PATH: &str = "/signing-key";
+const GATEWAY_KEY_INFO_ED25519: &[u8] = b"/ed25519";
+const GATEWAY_KEY_INFO_ECDSA: &[u8] = b"/ecdsa";
+
+const MAX_ECDSA_DERIVATION_ATTEMPTS: u16 = 1000;
+
 pub struct AttestationService {
     pub repository: Arc<dyn AttestationRepository + Send + Sync>,
     pub inference_provider_pool: Arc<InferenceProviderPool>,
@@ -138,7 +145,7 @@ impl AttestationService {
         let app_id = info.app_id;
 
         // Ask dstack for a derived key. The returned key is bound to the app in TEE,
-        let path = format!("gateway-signing-key:{app_id}");
+        let path = format!("{app_id}{GATEWAY_KEY_PATH}");
 
         let key_resp = client.get_key(Some(path), None).await.map_err(|e| {
             AttestationError::InternalError(format!("failed to get dstack derived key: {e:?}"))
@@ -155,40 +162,84 @@ impl AttestationService {
 
         // Derive ed25519 secret bytes (32 bytes)
         let mut ed_secret: [u8; 32] = [0u8; 32];
-        hk.expand(b"nearai-cloud-api/ed25519/signing-key", &mut ed_secret)
+        hk.expand(GATEWAY_KEY_INFO_ED25519, &mut ed_secret)
             .map_err(|e| {
                 AttestationError::InternalError(format!("HKDF expansion failed for ed25519: {e}"))
             })?;
         let ed25519_signing_key = SigningKey::from_bytes(&ed_secret);
+
+        // Verify ed25519 key is not all zeros (ed25519_dalek::from_bytes already validates)
+        if ed_secret.iter().all(|&b| b == 0) {
+            return Err(AttestationError::InternalError(
+                "Derived ed25519 key is zero (invalid)".to_string(),
+            ));
+        }
+
         let ed25519_verifying_key = ed25519_signing_key.verifying_key();
 
-        // Derive an ECDSA secret scalar. If the bytes are not a valid scalar, deterministically
-        // use HKDF with different info (including counter) until we get a valid one.
+        // Derive ECDSA secret scalar
+        // EcdsaSigningKey::from_bytes validates that the key is within valid range
+        // Most attempts should succeed on the first try (probability ~99.6% for secp256k1)
         let mut ecdsa_signing_key_opt: Option<EcdsaSigningKey> = None;
-        for ctr in 0u16..=1000u16 {
+        let mut attempts = 0u16;
+
+        for ctr in 0u16..=MAX_ECDSA_DERIVATION_ATTEMPTS {
+            attempts = ctr + 1;
             let mut ecdsa_seed: [u8; 32] = [0u8; 32];
-            // Include counter in info to get different output for each retry attempt
-            let mut info = Vec::with_capacity(32 + 2);
-            info.extend_from_slice(b"nearai-cloud-api/ecdsa/signing-key");
-            info.extend_from_slice(&ctr.to_be_bytes());
 
-            hk.expand(&info, &mut ecdsa_seed).map_err(|e| {
-                AttestationError::InternalError(format!("HKDF expansion failed for ecdsa: {e}"))
-            })?;
+            // For the first attempt, use the base info without counter
+            // For subsequent attempts, include counter to get different output
+            if ctr == 0 {
+                hk.expand(GATEWAY_KEY_INFO_ECDSA, &mut ecdsa_seed)
+                    .map_err(|e| {
+                        AttestationError::InternalError(format!(
+                            "HKDF expansion failed for ecdsa: {e}"
+                        ))
+                    })?;
+            } else {
+                // Include counter in info to get different output for each retry attempt
+                let mut info = Vec::with_capacity(GATEWAY_KEY_INFO_ECDSA.len() + 2);
+                info.extend_from_slice(GATEWAY_KEY_INFO_ECDSA);
+                info.extend_from_slice(&ctr.to_be_bytes());
 
-            let fb: k256::FieldBytes = ecdsa_seed.into();
-            if let Ok(sk) = EcdsaSigningKey::from_bytes(&fb) {
+                hk.expand(&info, &mut ecdsa_seed).map_err(|e| {
+                    AttestationError::InternalError(format!("HKDF expansion failed for ecdsa: {e}"))
+                })?;
+            }
+
+            // Try to create signing key from the derived seed
+            // EcdsaSigningKey::from_bytes validates that the key is within valid range
+            // and not zero, so we can directly use it
+            let field_bytes: k256::FieldBytes = ecdsa_seed.into();
+
+            // Verify the seed is not all zeros before attempting to create the key
+            if ecdsa_seed.iter().all(|&b| b == 0) {
+                // If zero, continue to next attempt
+                continue;
+            }
+
+            if let Ok(sk) = EcdsaSigningKey::from_bytes(&field_bytes) {
                 ecdsa_signing_key_opt = Some(sk);
                 break;
             }
         }
 
         let ecdsa_signing_key = ecdsa_signing_key_opt.ok_or_else(|| {
-            AttestationError::InternalError(
-                "failed to derive a valid secp256k1 signing key from dstack key material"
-                    .to_string(),
-            )
+            AttestationError::InternalError(format!(
+                "Failed to derive a valid secp256k1 signing key from dstack key material after {} attempts. \
+                 This indicates a serious issue with key material or derivation process.",
+                attempts
+            ))
         })?;
+
+        // Log if multiple attempts were needed (unusual but acceptable)
+        if attempts > 1 {
+            tracing::warn!(
+                "ECDSA key derivation required {} attempts (unusual but acceptable)",
+                attempts
+            );
+        }
+
         let ecdsa_verifying_key = *ecdsa_signing_key.verifying_key();
 
         let ed25519_address = hex::encode(ed25519_verifying_key.as_bytes());

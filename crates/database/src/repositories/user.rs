@@ -259,12 +259,15 @@ impl UserRepository {
         limit: i64,
         offset: i64,
         search_by_name: Option<String>,
-    ) -> Result<(Vec<(User, Option<services::admin::UserOrganizationInfo>)>, i64)> {
+    ) -> Result<(
+        Vec<(User, Option<services::admin::UserOrganizationInfo>)>,
+        i64,
+    )> {
         // Escape LIKE wildcard characters in user input to prevent injection
         let escaped_search = search_by_name.as_ref().map(|s| {
             s.replace('\\', "\\\\")
-             .replace('%', "\\%")
-             .replace('_', "\\_")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
         });
 
         let rows = retry_db!("list_all_users_with_organizations_with_pagination", {
@@ -313,7 +316,10 @@ impl UserRepository {
         })?;
 
         // Extract total count from first row, or 0 if no rows
-        let total_count = rows.first().map(|row| row.get::<_, i64>("total_count")).unwrap_or(0);
+        let total_count = rows
+            .first()
+            .map(|row| row.get::<_, i64>("total_count"))
+            .unwrap_or(0);
 
         let result = rows
             .into_iter()

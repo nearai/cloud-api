@@ -553,51 +553,24 @@ impl McpToolExecutor {
 
     /// Process an MCP approval response from the client.
     ///
-    /// Validates that the approval request exists in the previous response,
-    /// then either executes the approved tool or returns a rejection message.
+    /// Executes an approved tool or returns a rejection message.
     ///
     /// Returns `Ok(Some(message))` with the tool result or rejection message,
     /// or `Ok(None)` if no action needed.
     pub async fn process_approval_response(
         &self,
-        approval_request_id: &str,
+        server_label: &str,
+        tool_name: &str,
+        arguments_str: &str,
         approve: bool,
-        previous_response_items: &[ResponseOutputItem],
     ) -> Result<Option<String>, ResponseError> {
-        // Find the matching approval request in the previous response
-        let approval_request = previous_response_items
-            .iter()
-            .find_map(|item| {
-                if let ResponseOutputItem::McpApprovalRequest {
-                    id,
-                    server_label,
-                    name,
-                    arguments,
-                    ..
-                } = item
-                {
-                    if id == approval_request_id {
-                        Some((server_label.clone(), name.clone(), arguments.clone()))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| {
-                ResponseError::McpApprovalRequestNotFound(approval_request_id.to_string())
-            })?;
-
-        let (server_label, tool_name, arguments_str) = approval_request;
-
         if approve {
             // Parse arguments and execute the tool
             let arguments: serde_json::Value =
-                serde_json::from_str(&arguments_str).unwrap_or_else(|_| serde_json::json!({}));
+                serde_json::from_str(arguments_str).unwrap_or_else(|_| serde_json::json!({}));
 
             let result = self
-                .execute_tool(&server_label, &tool_name, arguments)
+                .execute_tool(server_label, tool_name, arguments)
                 .await?;
 
             Ok(Some(result))
@@ -691,7 +664,11 @@ impl ToolExecutor for McpToolExecutor {
                     .unwrap_or_else(|| serde_json::json!({}));
 
                 // Create approval request
-                let approval_id = format!("mcpr_{}", uuid::Uuid::new_v4().simple());
+                let approval_id = format!(
+                    "{}{}",
+                    crate::id_prefixes::PREFIX_MCPR,
+                    uuid::Uuid::new_v4().simple()
+                );
                 let approval_request = ResponseOutputItem::McpApprovalRequest {
                     id: approval_id.clone(),
                     response_id: event_ctx.stream_ctx.response_id_str.clone(),
@@ -877,7 +854,7 @@ pub async fn initialize_mcp_executor(
 /// Process MCP approval responses from the request input.
 ///
 /// For each approval response:
-/// - Validates the approval request exists in the previous response
+/// - Fetches the approval request directly by ID from the database
 /// - If approved: executes the tool and adds result to messages
 /// - If rejected: adds rejection message for LLM context
 ///
@@ -902,33 +879,47 @@ pub async fn process_approval_responses(
         return Ok(messages);
     }
 
-    // Load previous response items to validate approval requests
-    let previous_response_id = request.previous_response_id.as_ref().ok_or_else(|| {
-        ResponseError::InvalidParams(
-            "MCP approval response requires previous_response_id".to_string(),
-        )
-    })?;
-
-    // Parse the previous response ID to get the UUID
-    let prev_response_uuid = previous_response_id
-        .strip_prefix(crate::id_prefixes::PREFIX_RESP)
-        .unwrap_or(previous_response_id);
-    let prev_response_id =
-        models::ResponseId(uuid::Uuid::parse_str(prev_response_uuid).map_err(|e| {
-            ResponseError::InvalidParams(format!("Invalid previous_response_id: {e}"))
-        })?);
-
-    let previous_items = response_items_repository
-        .list_by_response(prev_response_id)
-        .await
-        .map_err(|e| {
-            ResponseError::InternalError(format!("Failed to load previous response items: {e}"))
-        })?;
-
     // Process each approval response
     for (approval_request_id, approve) in approval_responses {
+        // Parse the approval request ID to get the UUID
+        // IDs are in format "mcpr_<uuid>"
+        let uuid_str = approval_request_id
+            .strip_prefix(crate::id_prefixes::PREFIX_MCPR)
+            .unwrap_or(approval_request_id);
+        let item_uuid = uuid::Uuid::parse_str(uuid_str).map_err(|e| {
+            ResponseError::InvalidParams(format!("Invalid approval_request_id: {e}"))
+        })?;
+        let item_id = models::ResponseItemId(item_uuid);
+
+        // Fetch the approval request directly by ID
+        let item = response_items_repository
+            .get_by_id(item_id)
+            .await
+            .map_err(|e| {
+                ResponseError::InternalError(format!("Failed to fetch approval request: {e}"))
+            })?
+            .ok_or_else(|| {
+                ResponseError::McpApprovalRequestNotFound(approval_request_id.to_string())
+            })?;
+
+        // Extract fields from the approval request
+        let (server_label, tool_name, arguments) = match item {
+            ResponseOutputItem::McpApprovalRequest {
+                server_label,
+                name,
+                arguments,
+                ..
+            } => (server_label, name, arguments),
+            _ => {
+                return Err(ResponseError::InvalidParams(format!(
+                    "Item {} is not an MCP approval request",
+                    approval_request_id
+                )));
+            }
+        };
+
         if let Some(result_message) = mcp_executor
-            .process_approval_response(approval_request_id, approve, &previous_items)
+            .process_approval_response(&server_label, &tool_name, &arguments, approve)
             .await?
         {
             messages.push(crate::completions::ports::CompletionMessage {

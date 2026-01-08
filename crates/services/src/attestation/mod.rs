@@ -167,7 +167,7 @@ impl AttestationService {
         // Info: distinguishes between ed25519 and ecdsa key derivation
         let hk = Hkdf::<Sha256>::new(Some(app_id.as_bytes()), &key_bytes);
 
-        // Derive ed25519 secret bytes (32 bytes)
+        // Derive ed25519 secret seed (32 bytes)
         // Use loop to retry if derived key is all zeros
         let mut ed25519_signing_key_opt: Option<SigningKey> = None;
         let mut ed25519_attempts = 0u16;
@@ -205,7 +205,7 @@ impl AttestationService {
 
         let ed25519_verifying_key = ed25519_signing_key.verifying_key();
 
-        // Derive ECDSA secret scalar
+        // Derive ECDSA secret scalar (32 bytes)
         // Most attempts should succeed on the first try (probability ~100% for secp256k1)
         // The curve order is very close to 2^256, so invalid scalars are extremely rare (~3.7e-37%)
         let mut ecdsa_signing_key_opt: Option<EcdsaSigningKey> = None;

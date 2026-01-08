@@ -166,59 +166,36 @@ impl AttestationService {
             .map_err(|e| {
                 AttestationError::InternalError(format!("HKDF expansion failed for ed25519: {e}"))
             })?;
+
         let ed25519_signing_key = SigningKey::from_bytes(&ed_secret);
-
-        // Verify ed25519 key is not all zeros (ed25519_dalek::from_bytes already validates)
-        if ed_secret.iter().all(|&b| b == 0) {
-            return Err(AttestationError::InternalError(
-                "Derived ed25519 key is zero (invalid)".to_string(),
-            ));
-        }
-
         let ed25519_verifying_key = ed25519_signing_key.verifying_key();
 
         // Derive ECDSA secret scalar
-        // EcdsaSigningKey::from_bytes validates that the key is within valid range
-        // Most attempts should succeed on the first try (probability ~99.6% for secp256k1)
+        // Most attempts should succeed on the first try (probability ~99.6% for SECP256K1)
         let mut ecdsa_signing_key_opt: Option<EcdsaSigningKey> = None;
         let mut attempts = 0u16;
 
         for ctr in 0u16..=MAX_ECDSA_DERIVATION_ATTEMPTS {
             attempts = ctr + 1;
-            let mut ecdsa_seed: [u8; 32] = [0u8; 32];
 
-            // For the first attempt, use the base info without counter
-            // For subsequent attempts, include counter to get different output
-            if ctr == 0 {
-                hk.expand(GATEWAY_KEY_INFO_ECDSA, &mut ecdsa_seed)
-                    .map_err(|e| {
-                        AttestationError::InternalError(format!(
-                            "HKDF expansion failed for ecdsa: {e}"
-                        ))
-                    })?;
+            // Build normalized_info: base info for first attempt, base + counter for retries
+            let normalized_info: Vec<u8> = if ctr == 0 {
+                GATEWAY_KEY_INFO_ECDSA.to_vec()
             } else {
                 // Include counter in info to get different output for each retry attempt
                 let mut info = Vec::with_capacity(GATEWAY_KEY_INFO_ECDSA.len() + 2);
                 info.extend_from_slice(GATEWAY_KEY_INFO_ECDSA);
                 info.extend_from_slice(&ctr.to_be_bytes());
+                info
+            };
 
-                hk.expand(&info, &mut ecdsa_seed).map_err(|e| {
-                    AttestationError::InternalError(format!("HKDF expansion failed for ecdsa: {e}"))
-                })?;
-            }
+            let mut ecdsa_seed: [u8; 32] = [0u8; 32];
 
-            // Try to create signing key from the derived seed
-            // EcdsaSigningKey::from_bytes validates that the key is within valid range
-            // and not zero, so we can directly use it
-            let field_bytes: k256::FieldBytes = ecdsa_seed.into();
+            hk.expand(&normalized_info, &mut ecdsa_seed).map_err(|e| {
+                AttestationError::InternalError(format!("HKDF expansion failed for ecdsa: {e}"))
+            })?;
 
-            // Verify the seed is not all zeros before attempting to create the key
-            if ecdsa_seed.iter().all(|&b| b == 0) {
-                // If zero, continue to next attempt
-                continue;
-            }
-
-            if let Ok(sk) = EcdsaSigningKey::from_bytes(&field_bytes) {
+            if let Ok(sk) = EcdsaSigningKey::from_bytes(&ecdsa_seed.into()) {
                 ecdsa_signing_key_opt = Some(sk);
                 break;
             }

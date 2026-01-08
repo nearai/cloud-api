@@ -258,6 +258,7 @@ impl UserRepository {
         &self,
         limit: i64,
         offset: i64,
+        search_by_name: Option<String>,
     ) -> Result<Vec<(User, Option<services::admin::UserOrganizationInfo>)>> {
         let rows = retry_db!("list_all_users_with_organizations_with_pagination", {
             let client = self
@@ -292,11 +293,12 @@ impl UserRepository {
             ) olh ON true
             LEFT JOIN organization_balance ob ON o.id = ob.organization_id
             WHERE u.is_active = true
+              AND ($3::TEXT IS NULL OR o.name ILIKE $3 || '%')
             ORDER BY u.id, o.created_at ASC NULLS LAST
             LIMIT $1
             OFFSET $2
             "#,
-                    &[&limit, &offset],
+                    &[&limit, &offset, &search_by_name],
                 )
                 .await
                 .map_err(map_db_error)

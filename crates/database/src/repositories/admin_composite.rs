@@ -237,10 +237,11 @@ impl AdminRepository for AdminCompositeRepository {
         &self,
         limit: i64,
         offset: i64,
+        search_by_name: Option<String>,
     ) -> Result<Vec<(UserInfo, Option<UserOrganizationInfo>)>> {
         let users_with_orgs = self
             .user_repo
-            .list_with_organizations(limit, offset)
+            .list_with_organizations(limit, offset, search_by_name)
             .await?;
 
         Ok(users_with_orgs

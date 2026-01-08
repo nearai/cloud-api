@@ -669,7 +669,8 @@ pub async fn delete_model(
     params(
         ("limit" = Option<i64>, Query, description = "Maximum number of users to return (default: 100)"),
         ("offset" = Option<i64>, Query, description = "Number of users to skip (default: 0)"),
-        ("include_organizations" = Option<bool>, Query, description = "Whether to include organization information and spend limits for the first organization owned by each user (default: false)")
+        ("include_organizations" = Option<bool>, Query, description = "Whether to include organization information and spend limits for the first organization owned by each user (default: false)"),
+        ("search_by_name" = Option<String>, Query, description = "Filter users by organization name (case-insensitive partial match)")
     ),
     responses(
         (status = 200, description = "Users retrieved successfully", body = ListUsersResponse),
@@ -688,15 +689,15 @@ pub async fn list_users(
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     debug!(
-        "List users request with limit={}, offset={}, include_organizations={}",
-        params.limit, params.offset, params.include_organizations
+        "List users request with limit={}, offset={}, include_organizations={}, search_by_name={:?}",
+        params.limit, params.offset, params.include_organizations, params.search_by_name
     );
 
     let (user_responses, total) = if params.include_organizations {
         // Fetch users with their default organization and spend limit
         let (users_with_orgs, total) = app_state
             .admin_service
-            .list_users_with_organizations(params.limit, params.offset)
+            .list_users_with_organizations(params.limit, params.offset, params.search_by_name)
             .await
             .map_err(|e| {
                 error!("Failed to list users with organizations");
@@ -1065,6 +1066,7 @@ pub struct ListUsersQueryParams {
     pub offset: i64,
     #[serde(default)]
     pub include_organizations: bool,
+    pub search_by_name: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]

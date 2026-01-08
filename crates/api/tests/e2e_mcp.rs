@@ -197,7 +197,13 @@ async fn test_mcp_multi_turn_conversation_with_approval() {
         .output
         .iter()
         .find_map(|item| {
-            if let api::models::ResponseOutputItem::McpApprovalRequest { id, name, arguments, .. } = item {
+            if let api::models::ResponseOutputItem::McpApprovalRequest {
+                id,
+                name,
+                arguments,
+                ..
+            } = item
+            {
                 Some((id.clone(), name.clone(), arguments.clone()))
             } else {
                 None

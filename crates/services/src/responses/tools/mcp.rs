@@ -7,11 +7,12 @@
 
 use crate::responses::errors::ResponseError;
 use crate::responses::models::{
-    McpApprovalRequirement, McpDiscoveredTool, ResponseOutputItem, ResponseTool,
+    self, McpApprovalRequirement, McpDiscoveredTool, ResponseOutputItem, ResponseTool,
 };
-use crate::responses::service_helpers::ToolCallInfo;
+use crate::responses::ports::ResponseItemRepositoryTrait;
+use crate::responses::service_helpers::{EventEmitter, ResponseStreamContext, ToolCallInfo};
 
-use super::executor::{ToolExecutionContext, ToolExecutor, ToolOutput};
+use super::executor::{ToolEventContext, ToolExecutionContext, ToolExecutor, ToolOutput};
 
 use async_trait::async_trait;
 use inference_providers::{FunctionDefinition, ToolDefinition};
@@ -545,6 +546,69 @@ impl McpToolExecutor {
             .get(server_label)
             .map(|c| c.tools.as_slice())
     }
+
+    // ============================================
+    // Approval Response Processing
+    // ============================================
+
+    /// Process an MCP approval response from the client.
+    ///
+    /// Validates that the approval request exists in the previous response,
+    /// then either executes the approved tool or returns a rejection message.
+    ///
+    /// Returns `Ok(Some(message))` with the tool result or rejection message,
+    /// or `Ok(None)` if no action needed.
+    pub async fn process_approval_response(
+        &self,
+        approval_request_id: &str,
+        approve: bool,
+        previous_response_items: &[ResponseOutputItem],
+    ) -> Result<Option<String>, ResponseError> {
+        // Find the matching approval request in the previous response
+        let approval_request = previous_response_items
+            .iter()
+            .find_map(|item| {
+                if let ResponseOutputItem::McpApprovalRequest {
+                    id,
+                    server_label,
+                    name,
+                    arguments,
+                    ..
+                } = item
+                {
+                    if id == approval_request_id {
+                        Some((server_label.clone(), name.clone(), arguments.clone()))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                ResponseError::McpApprovalRequestNotFound(approval_request_id.to_string())
+            })?;
+
+        let (server_label, tool_name, arguments_str) = approval_request;
+
+        if approve {
+            // Parse arguments and execute the tool
+            let arguments: serde_json::Value =
+                serde_json::from_str(&arguments_str).unwrap_or_else(|_| serde_json::json!({}));
+
+            let result = self
+                .execute_tool(&server_label, &tool_name, arguments)
+                .await?;
+
+            Ok(Some(result))
+        } else {
+            // Return rejection message for LLM context
+            Ok(Some(format!(
+                "Tool call '{}' on server '{}' was rejected by the user.",
+                tool_name, server_label
+            )))
+        }
+    }
 }
 
 impl Default for McpToolExecutor {
@@ -578,6 +642,12 @@ impl ToolExecutor for McpToolExecutor {
         let (server_label, mcp_tool_name) = Self::parse_tool_name(tool_name)
             .ok_or_else(|| ResponseError::UnknownTool(tool_name.clone()))?;
 
+        // Parse arguments from tool call
+        let arguments = tool_call
+            .params
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+
         // Check if tool requires approval
         if self.requires_approval(server_label, mcp_tool_name) {
             return Err(ResponseError::McpApprovalRequired {
@@ -586,12 +656,6 @@ impl ToolExecutor for McpToolExecutor {
             });
         }
 
-        // Parse arguments from tool call
-        let arguments = tool_call
-            .params
-            .clone()
-            .unwrap_or_else(|| serde_json::json!({}));
-
         // Execute the MCP tool
         let result = self
             .execute_tool(server_label, mcp_tool_name, arguments)
@@ -599,6 +663,282 @@ impl ToolExecutor for McpToolExecutor {
 
         Ok(ToolOutput::Text(result))
     }
+
+    async fn handle_error(
+        &self,
+        error: ResponseError,
+        tool_call: &ToolCallInfo,
+        event_ctx: &mut ToolEventContext<'_>,
+    ) -> Result<Option<ToolOutput>, ResponseError> {
+        match error {
+            ResponseError::McpApprovalRequired { .. } => {
+                // MCP tool requires approval - emit approval request
+                let tool_name = &tool_call.tool_type;
+
+                let (server_label, mcp_tool_name) = match Self::parse_tool_name(tool_name) {
+                    Some(parsed) => parsed,
+                    None => {
+                        return Ok(Some(ToolOutput::Text(format!(
+                            "ERROR: Invalid MCP tool name: {tool_name}"
+                        ))))
+                    }
+                };
+
+                // Parse arguments from tool call
+                let arguments = tool_call
+                    .params
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({}));
+
+                // Create approval request
+                let approval_id = format!("mcpr_{}", uuid::Uuid::new_v4().simple());
+                let approval_request = ResponseOutputItem::McpApprovalRequest {
+                    id: approval_id.clone(),
+                    response_id: event_ctx.stream_ctx.response_id_str.clone(),
+                    previous_response_id: event_ctx.stream_ctx.previous_response_id.clone(),
+                    next_response_ids: vec![],
+                    created_at: event_ctx.stream_ctx.created_at,
+                    server_label: server_label.to_string(),
+                    name: mcp_tool_name.to_string(),
+                    arguments: serde_json::to_string(&arguments).unwrap_or_default(),
+                    model: event_ctx.stream_ctx.model.clone(),
+                };
+
+                // Store approval request in database
+                if let Some(repo) = &event_ctx.response_items_repository {
+                    if let Err(e) = repo
+                        .create(
+                            event_ctx.stream_ctx.response_id.clone(),
+                            event_ctx.stream_ctx.api_key_id,
+                            event_ctx.stream_ctx.conversation_id,
+                            approval_request.clone(),
+                        )
+                        .await
+                    {
+                        tracing::warn!("Failed to store MCP approval request: {}", e);
+                    }
+                }
+
+                // Emit approval request event
+                if let Err(e) = event_ctx.emit_item_added(approval_request).await {
+                    tracing::debug!("Failed to emit MCP approval request event: {}", e);
+                }
+
+                // Return None to signal approval is required (special control flow)
+                Ok(None)
+            }
+            // For other errors, convert to text output for LLM
+            other => Ok(Some(ToolOutput::Text(format!("ERROR: {other}")))),
+        }
+    }
+}
+
+// ============================================
+// Standalone MCP Helper Functions
+// ============================================
+
+/// Result of MCP setup containing the executor, tool definitions, and any approval messages.
+pub struct McpSetupResult {
+    /// The MCP executor to register with the tool registry
+    pub executor: Arc<McpToolExecutor>,
+    /// Tool definitions to add to the LLM request
+    pub tool_definitions: Vec<ToolDefinition>,
+    /// Messages from processed approval responses (to add to conversation context)
+    pub approval_messages: Vec<crate::completions::ports::CompletionMessage>,
+}
+
+/// Set up MCP for the request: connect to servers, discover tools, and process approvals.
+///
+/// This is the main entry point for MCP setup in service.rs. It:
+/// 1. Extracts cached tools from the request input
+/// 2. Connects to MCP servers and discovers tools
+/// 3. Emits mcp_list_tools items for client-side caching
+/// 4. Processes any approval responses from the input
+///
+/// Returns None if no MCP tools are configured in the request.
+pub async fn setup_mcp(
+    request: &models::CreateResponseRequest,
+    client_factory: Option<&Arc<dyn McpClientFactory>>,
+    response_items_repository: &Arc<dyn ResponseItemRepositoryTrait>,
+    ctx: &mut ResponseStreamContext,
+    emitter: &mut EventEmitter,
+) -> Result<Option<McpSetupResult>, ResponseError> {
+    // Check if there are any MCP tools in the request
+    let request_tools = match &request.tools {
+        Some(tools) => tools,
+        None => return Ok(None),
+    };
+
+    let mcp_tools: Vec<&ResponseTool> = request_tools
+        .iter()
+        .filter(|t| matches!(t, ResponseTool::Mcp { .. }))
+        .collect();
+
+    if mcp_tools.is_empty() {
+        return Ok(None);
+    }
+
+    // Extract cached tools from input
+    let cached_tools = extract_cached_mcp_tools(request);
+
+    // Initialize the MCP executor
+    let (mcp_executor, tool_definitions) =
+        match initialize_mcp_executor(request_tools, &cached_tools, client_factory, ctx, emitter)
+            .await?
+        {
+            Some(result) => result,
+            None => return Ok(None),
+        };
+
+    let executor = Arc::new(mcp_executor);
+
+    // Process any approval responses
+    let approval_messages =
+        process_approval_responses(&executor, request, response_items_repository).await?;
+
+    Ok(Some(McpSetupResult {
+        executor,
+        tool_definitions,
+        approval_messages,
+    }))
+}
+
+/// Extract cached mcp_list_tools from the request input.
+///
+/// Returns a map of server_label -> discovered tools that can be used
+/// to skip tool discovery for servers that have cached tools.
+pub fn extract_cached_mcp_tools(
+    request: &models::CreateResponseRequest,
+) -> HashMap<String, Vec<McpDiscoveredTool>> {
+    let mut cached: HashMap<String, Vec<McpDiscoveredTool>> = HashMap::new();
+
+    let items = match &request.input {
+        Some(models::ResponseInput::Items(items)) => items,
+        Some(models::ResponseInput::Text(_)) => return cached,
+        None => return cached,
+    };
+
+    for item in items {
+        if let models::ResponseInputItem::McpListTools {
+            server_label,
+            tools,
+            ..
+        } = item
+        {
+            cached.insert(server_label.clone(), tools.clone());
+        }
+    }
+
+    cached
+}
+
+/// Initialize MCP connections for the given request tools.
+///
+/// Connects to remote MCP servers, discovers available tools, emits mcp_list_tools
+/// items (for client-side caching), and returns the MCP executor and tool definitions.
+pub async fn initialize_mcp_executor(
+    request_tools: &[ResponseTool],
+    cached_tools: &HashMap<String, Vec<McpDiscoveredTool>>,
+    client_factory: Option<&Arc<dyn McpClientFactory>>,
+    ctx: &mut ResponseStreamContext,
+    emitter: &mut EventEmitter,
+) -> Result<Option<(McpToolExecutor, Vec<ToolDefinition>)>, ResponseError> {
+    let mcp_tools: Vec<&ResponseTool> = request_tools
+        .iter()
+        .filter(|t| matches!(t, ResponseTool::Mcp { .. }))
+        .collect();
+
+    if mcp_tools.is_empty() {
+        return Ok(None);
+    }
+
+    // Use injected factory if provided (for testing), otherwise use default
+    let mut mcp_executor = match client_factory {
+        Some(factory) => McpToolExecutor::with_arc_client_factory(factory.clone()),
+        None => McpToolExecutor::new(),
+    };
+
+    // Connect to servers, using cached tools where available
+    let mcp_list_tools_items = mcp_executor
+        .connect_servers(mcp_tools, cached_tools)
+        .await?;
+
+    for item in mcp_list_tools_items {
+        let item_id = item.id().to_string();
+        emitter.emit_item_added(ctx, item, item_id).await?;
+    }
+
+    // Get MCP tool definitions for the LLM
+    let mcp_tool_defs = mcp_executor.get_tool_definitions();
+
+    Ok(Some((mcp_executor, mcp_tool_defs)))
+}
+
+/// Process MCP approval responses from the request input.
+///
+/// For each approval response:
+/// - Validates the approval request exists in the previous response
+/// - If approved: executes the tool and adds result to messages
+/// - If rejected: adds rejection message for LLM context
+///
+/// Returns the messages to add to the conversation context.
+pub async fn process_approval_responses(
+    mcp_executor: &McpToolExecutor,
+    request: &models::CreateResponseRequest,
+    response_items_repository: &Arc<dyn ResponseItemRepositoryTrait>,
+) -> Result<Vec<crate::completions::ports::CompletionMessage>, ResponseError> {
+    let mut messages = Vec::new();
+
+    // Extract approval responses from input
+    let approval_responses: Vec<_> = match &request.input {
+        Some(models::ResponseInput::Items(items)) => items
+            .iter()
+            .filter_map(|item| item.as_mcp_approval())
+            .collect(),
+        _ => return Ok(messages),
+    };
+
+    if approval_responses.is_empty() {
+        return Ok(messages);
+    }
+
+    // Load previous response items to validate approval requests
+    let previous_response_id = request.previous_response_id.as_ref().ok_or_else(|| {
+        ResponseError::InvalidParams(
+            "MCP approval response requires previous_response_id".to_string(),
+        )
+    })?;
+
+    // Parse the previous response ID to get the UUID
+    let prev_response_uuid = previous_response_id
+        .strip_prefix(crate::id_prefixes::PREFIX_RESP)
+        .unwrap_or(previous_response_id);
+    let prev_response_id =
+        models::ResponseId(uuid::Uuid::parse_str(prev_response_uuid).map_err(|e| {
+            ResponseError::InvalidParams(format!("Invalid previous_response_id: {e}"))
+        })?);
+
+    let previous_items = response_items_repository
+        .list_by_response(prev_response_id)
+        .await
+        .map_err(|e| {
+            ResponseError::InternalError(format!("Failed to load previous response items: {e}"))
+        })?;
+
+    // Process each approval response
+    for (approval_request_id, approve) in approval_responses {
+        if let Some(result_message) = mcp_executor
+            .process_approval_response(approval_request_id, approve, &previous_items)
+            .await?
+        {
+            messages.push(crate::completions::ports::CompletionMessage {
+                role: "tool".to_string(),
+                content: result_message,
+            });
+        }
+    }
+
+    Ok(messages)
 }
 
 // ============================================

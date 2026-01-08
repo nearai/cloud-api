@@ -684,6 +684,13 @@ pub enum ResponseOutputItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    #[serde(rename = "mcp_approval_request")]
+    McpApprovalRequest {
+        id: String,
+        server_label: String,
+        name: String,
+        arguments: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]

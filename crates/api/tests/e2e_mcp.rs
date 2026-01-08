@@ -2,8 +2,8 @@
 //!
 //! This test simulates a realistic multi-turn conversation with MCP tools:
 //! 1. First request: discovers tools, returns mcp_list_tools
-//! 2. Second request: client sends cached tools, LLM requests tool call
-//! 3. Tool executes, LLM produces final response
+//! 2. Second request: client sends cached tools, LLM requests tool call, approval required
+//! 3. Third request: client sends approval, tool executes, LLM produces final response
 
 mod common;
 
@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 #[tokio::test]
-async fn test_mcp_multi_turn_conversation() {
+async fn test_mcp_multi_turn_conversation_with_approval() {
     // Track list_tools calls to verify caching works
     let list_tools_call_count = Arc::new(AtomicUsize::new(0));
     let call_count_clone = list_tools_call_count.clone();
@@ -77,7 +77,7 @@ async fn test_mcp_multi_turn_conversation() {
         "type": "mcp",
         "server_label": "weather_server",
         "server_url": "https://example.com/mcp",
-        "require_approval": "never"
+        "require_approval": "always"
     });
 
     // ========================================
@@ -132,17 +132,16 @@ async fn test_mcp_multi_turn_conversation() {
     println!("  ✓ Discovered 1 tool: get_weather");
 
     // ========================================
-    // Turn 2: Cached tools + tool invocation
+    // Turn 2: Tool call requires approval
     // ========================================
-    println!("Turn 2: Tool invocation with cached tools...");
+    println!("Turn 2: Tool invocation with cached tools (requires approval)...");
 
     // LLM will request a tool call
     let turn1_user = "What can you help me with?";
     let turn1_assistant = "I can check the weather for you using the get_weather tool. What location would you like to know about?";
     let turn2_user = "What's the weather in San Francisco?";
-    let tool_result = "Weather in San Francisco: Sunny, 72°F";
 
-    // First LLM call in Turn 2: LLM requests tool call
+    // LLM requests tool call - but approval is required so tool won't execute yet
     let turn2_prompt = mock_prompts::build_prompt(&format!(
         "{} {} {}",
         turn1_user, turn1_assistant, turn2_user
@@ -158,20 +157,6 @@ async fn test_mcp_multi_turn_conversation() {
             ),
         ]),
     )
-    .await;
-
-    // Second LLM call in Turn 2: After tool executes, LLM produces final response
-    // The tool result is appended as a "tool" role message
-    let turn2_with_tool_result_prompt = mock_prompts::build_prompt(&format!(
-        "{} {} {} {}",
-        turn1_user, turn1_assistant, turn2_user, tool_result
-    ));
-    mock.when(inference_providers::mock::RequestMatcher::ExactPrompt(
-        turn2_with_tool_result_prompt,
-    ))
-    .respond_with(inference_providers::mock::ResponseTemplate::new(
-        "The weather in San Francisco is currently sunny and 72°F. Perfect weather for outdoor activities!",
-    ))
     .await;
 
     let resp2 = server
@@ -192,6 +177,13 @@ async fn test_mcp_multi_turn_conversation() {
     assert_eq!(resp2.status_code(), 200, "Turn 2 failed: {}", resp2.text());
     let resp2_obj = resp2.json::<api::models::ResponseObject>();
 
+    // Response should be incomplete - waiting for approval
+    assert_eq!(
+        resp2_obj.status,
+        api::models::ResponseStatus::Incomplete,
+        "Turn 2 should be incomplete (waiting for approval)"
+    );
+
     // Verify list_tools was NOT called again (caching worked)
     assert_eq!(
         list_tools_call_count.load(Ordering::SeqCst),
@@ -200,16 +192,91 @@ async fn test_mcp_multi_turn_conversation() {
     );
     println!("  ✓ list_tools was not called (cache hit)");
 
+    // Extract mcp_approval_request from output
+    let approval_request = resp2_obj
+        .output
+        .iter()
+        .find(|item| {
+            matches!(
+                item,
+                api::models::ResponseOutputItem::McpApprovalRequest { .. }
+            )
+        })
+        .expect("Turn 2 should return mcp_approval_request");
+
+    let (approval_request_id, tool_name, arguments) =
+        if let api::models::ResponseOutputItem::McpApprovalRequest {
+            id,
+            name,
+            arguments,
+            ..
+        } = approval_request
+        {
+            (id.clone(), name.clone(), arguments.clone())
+        } else {
+            panic!("Expected McpApprovalRequest variant");
+        };
+
+    assert_eq!(tool_name, "get_weather");
+    assert!(arguments.contains("San Francisco"));
+    println!(
+        "  ✓ Received approval request: {} for tool '{}'",
+        approval_request_id, tool_name
+    );
+
+    // ========================================
+    // Turn 3: Approve and execute tool
+    // ========================================
+    println!("Turn 3: Approving tool call and getting result...");
+
+    let tool_result = "Weather in San Francisco: Sunny, 72°F";
+
+    // After approval, tool executes and LLM produces final response
+    // The tool result is appended as a "tool" role message
+    let turn3_with_tool_result_prompt = mock_prompts::build_prompt(&format!(
+        "{} {} {} {}",
+        turn1_user, turn1_assistant, turn2_user, tool_result
+    ));
+    mock.when(inference_providers::mock::RequestMatcher::ExactPrompt(
+        turn3_with_tool_result_prompt,
+    ))
+    .respond_with(inference_providers::mock::ResponseTemplate::new(
+        "The weather in San Francisco is currently sunny and 72°F. Perfect weather for outdoor activities!",
+    ))
+    .await;
+
+    let resp3 = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "conversation": {"id": conversation.id},
+            "previous_response_id": resp2_obj.id,
+            "input": [
+                mcp_list_tools,
+                {
+                    "type": "mcp_approval_response",
+                    "approval_request_id": approval_request_id,
+                    "approve": true
+                }
+            ],
+            "stream": false,
+            "tools": [mcp_tool.clone()]
+        }))
+        .await;
+
+    assert_eq!(resp3.status_code(), 200, "Turn 3 failed: {}", resp3.text());
+    let resp3_obj = resp3.json::<api::models::ResponseObject>();
+
     // Verify the final response contains the weather information
-    // The LLM made a tool call, the tool executed, and the LLM produced a final response
-    let final_message = resp2_obj
+    let final_message = resp3_obj
         .output
         .iter()
         .find(|item| matches!(item, api::models::ResponseOutputItem::Message { .. }));
     assert!(
         final_message.is_some(),
-        "Turn 2 should have a message output. Got: {:?}",
-        resp2_obj.output
+        "Turn 3 should have a message output. Got: {:?}",
+        resp3_obj.output
     );
 
     // Extract text from the message content
@@ -232,8 +299,8 @@ async fn test_mcp_multi_turn_conversation() {
     println!("  ✓ LLM produced final response: {}", text);
 
     // Verify the conversation completed successfully
-    assert_eq!(resp2_obj.status, api::models::ResponseStatus::Completed);
+    assert_eq!(resp3_obj.status, api::models::ResponseStatus::Completed);
 
     println!("  ✓ Response completed successfully");
-    println!("\n✅ MCP multi-turn conversation test passed!");
+    println!("\n✅ MCP multi-turn conversation with approval test passed!");
 }

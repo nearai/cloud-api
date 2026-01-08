@@ -1,8 +1,12 @@
+use crate::responses::models::ResponseId;
 use crate::UserId;
 use async_trait::async_trait;
 use inference_providers::StreamingResult;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Default concurrent request limit per organization per model
+pub const DEFAULT_CONCURRENT_LIMIT: u32 = 64;
 
 // Domain types defined directly here (following dependency inversion)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +63,8 @@ pub struct CompletionRequest {
     pub workspace_id: Uuid,
     pub metadata: Option<serde_json::Value>,
     pub body_hash: String,
+    /// Response ID when called from Responses API (for usage tracking FK)
+    pub response_id: Option<ResponseId>,
 
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -85,6 +91,16 @@ pub struct ModelCapabilities {
 }
 
 // Port/Trait definitions (no implementations!)
+
+/// Repository trait for fetching organization concurrent limits
+/// Used by CompletionService to look up per-org rate limits
+#[async_trait]
+pub trait OrganizationConcurrentLimitRepository: Send + Sync {
+    /// Get the concurrent request limit for an organization
+    /// Returns None if no custom limit is set (use default)
+    async fn get_concurrent_limit(&self, org_id: Uuid) -> Result<Option<u32>, anyhow::Error>;
+}
+
 #[async_trait]
 pub trait CompletionServiceTrait: Send + Sync {
     /// Create a streaming completion

@@ -39,6 +39,12 @@ pub enum RequestMatcher {
     /// Match requests with exact prompt text (checks all text content in messages)
     /// Timestamps are automatically normalized to [TIME] for matching across test runs
     ExactPrompt(String),
+    /// Match requests with exact prompt text and specific tool names
+    /// Checks that all specified tool names are present in the request tools
+    PromptWithTools {
+        prompt: String,
+        tool_names: Vec<String>,
+    },
 }
 
 impl RequestMatcher {
@@ -53,6 +59,26 @@ impl RequestMatcher {
                 let normalized_text = Self::normalize_timestamps(&all_text);
                 let normalized_prompt = Self::normalize_timestamps(prompt);
                 normalized_text == normalized_prompt
+            }
+            Self::PromptWithTools { prompt, tool_names } => {
+                // Check prompt matches
+                let all_text = Self::extract_text_from_messages(&params.messages);
+                let normalized_text = Self::normalize_timestamps(&all_text);
+                let normalized_prompt = Self::normalize_timestamps(prompt);
+                if normalized_text != normalized_prompt {
+                    return false;
+                }
+
+                // Check all expected tools are present
+                let request_tool_names: Vec<&str> = params
+                    .tools
+                    .as_ref()
+                    .map(|tools| tools.iter().map(|t| t.function.name.as_str()).collect())
+                    .unwrap_or_default();
+
+                tool_names
+                    .iter()
+                    .all(|name| request_tool_names.contains(&name.as_str()))
             }
         }
     }
@@ -83,6 +109,25 @@ impl RequestMatcher {
     }
 }
 
+/// A tool call to be included in the response
+#[derive(Clone, Debug)]
+pub struct ToolCall {
+    /// Tool name (e.g., "server:tool_name" for MCP tools)
+    pub name: String,
+    /// JSON arguments for the tool
+    pub arguments: String,
+}
+
+impl ToolCall {
+    /// Create a new tool call
+    pub fn new(name: impl Into<String>, arguments: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            arguments: arguments.into(),
+        }
+    }
+}
+
 /// Template for generating responses
 #[derive(Clone)]
 pub struct ResponseTemplate {
@@ -90,6 +135,8 @@ pub struct ResponseTemplate {
     reasoning_content: Option<String>,
     /// Simulate client disconnect after N chunks (stream ends without final usage chunk)
     disconnect_after_chunks: Option<usize>,
+    /// Tool calls to include in the response
+    tool_calls: Option<Vec<ToolCall>>,
 }
 
 impl ResponseTemplate {
@@ -99,6 +146,7 @@ impl ResponseTemplate {
             content: content.into(),
             reasoning_content: None,
             disconnect_after_chunks: None,
+            tool_calls: None,
         }
     }
 
@@ -115,6 +163,12 @@ impl ResponseTemplate {
         self
     }
 
+    /// Add tool calls to this response
+    pub fn with_tool_calls(mut self, tool_calls: Vec<ToolCall>) -> Self {
+        self.tool_calls = Some(tool_calls);
+        self
+    }
+
     /// Generate a ChatCompletionResponse from this template
     fn generate_response(
         &self,
@@ -125,6 +179,30 @@ impl ResponseTemplate {
     ) -> ChatCompletionResponse {
         // Calculate output tokens as word count of content
         let output_tokens = self.content.split_whitespace().count() as i32;
+
+        // Convert tool calls if present
+        let tool_calls = self.tool_calls.as_ref().map(|calls| {
+            calls
+                .iter()
+                .enumerate()
+                .map(|(i, tc)| crate::ToolCall {
+                    id: Some(format!("call_{}", i)),
+                    type_: Some("function".to_string()),
+                    index: None,
+                    function: crate::FunctionCall {
+                        name: Some(tc.name.clone()),
+                        arguments: Some(tc.arguments.clone()),
+                    },
+                })
+                .collect()
+        });
+
+        let finish_reason = if tool_calls.is_some() {
+            "tool_calls"
+        } else {
+            "stop"
+        };
+
         ChatCompletionResponse {
             id,
             object: "chat.completion".to_string(),
@@ -134,17 +212,21 @@ impl ResponseTemplate {
                 index: 0,
                 message: ChatResponseMessage {
                     role: MessageRole::Assistant,
-                    content: Some(self.content.clone()),
+                    content: if self.content.is_empty() {
+                        None
+                    } else {
+                        Some(self.content.clone())
+                    },
                     refusal: None,
                     annotations: None,
                     audio: None,
                     function_call: None,
-                    tool_calls: None,
+                    tool_calls,
                     reasoning_content: self.reasoning_content.clone(),
                     reasoning: self.reasoning_content.clone(),
                 },
                 logprobs: None,
-                finish_reason: Some("stop".to_string()),
+                finish_reason: Some(finish_reason.to_string()),
                 token_ids: None,
             }],
             service_tier: None,
@@ -206,43 +288,139 @@ impl ResponseTemplate {
             }
         }
 
-        // Stream the content word by word (split by spaces)
-        let words: Vec<&str> = self.content.split(' ').collect();
-        for (i, word) in words.iter().enumerate() {
-            output_token_count += 1;
-            let word_with_space = if i == 0 {
-                word.to_string()
-            } else {
-                format!(" {}", word)
-            };
-            chunks.push(ChatCompletionChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk".to_string(),
-                created,
-                model: model.clone(),
-                system_fingerprint: None,
-                choices: vec![ChatChoice {
-                    index: 0,
-                    delta: Some(ChatDelta {
-                        role: None,
-                        content: Some(word_with_space),
-                        name: None,
-                        tool_call_id: None,
-                        tool_calls: None,
-                        reasoning_content: None,
-                        reasoning: None,
-                    }),
-                    logprobs: None,
-                    finish_reason: if i == words.len() - 1 {
-                        Some(FinishReason::Stop)
+        // Stream content if present (not empty)
+        if !self.content.is_empty() {
+            let words: Vec<&str> = self.content.split(' ').collect();
+            for (i, word) in words.iter().enumerate() {
+                output_token_count += 1;
+                let word_with_space = if i == 0 {
+                    word.to_string()
+                } else {
+                    format!(" {}", word)
+                };
+                let is_last_content = i == words.len() - 1;
+                let finish_reason = if is_last_content && self.tool_calls.is_none() {
+                    Some(FinishReason::Stop)
+                } else {
+                    None
+                };
+                chunks.push(ChatCompletionChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk".to_string(),
+                    created,
+                    model: model.clone(),
+                    system_fingerprint: None,
+                    choices: vec![ChatChoice {
+                        index: 0,
+                        delta: Some(ChatDelta {
+                            role: None,
+                            content: Some(word_with_space),
+                            name: None,
+                            tool_call_id: None,
+                            tool_calls: None,
+                            reasoning_content: None,
+                            reasoning: None,
+                        }),
+                        logprobs: None,
+                        finish_reason,
+                        token_ids: None,
+                    }],
+                    usage: Some(TokenUsage::new(input_tokens, output_token_count)),
+                    prompt_token_ids: None,
+                });
+            }
+        }
+
+        // Stream tool calls if present
+        if let Some(tool_calls) = &self.tool_calls {
+            for (idx, tc) in tool_calls.iter().enumerate() {
+                let tool_call_id = format!("call_{}", idx);
+                let is_last_tool = idx == tool_calls.len() - 1;
+
+                // First chunk: tool call start with name
+                output_token_count += 1;
+                chunks.push(ChatCompletionChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk".to_string(),
+                    created,
+                    model: model.clone(),
+                    system_fingerprint: None,
+                    choices: vec![ChatChoice {
+                        index: 0,
+                        delta: Some(ChatDelta {
+                            role: None,
+                            content: None,
+                            name: None,
+                            tool_call_id: None,
+                            tool_calls: Some(vec![ToolCallDelta {
+                                id: Some(tool_call_id),
+                                type_: Some("function".to_string()),
+                                index: Some(idx as i64),
+                                function: Some(FunctionCallDelta {
+                                    name: Some(tc.name.clone()),
+                                    arguments: None,
+                                }),
+                            }]),
+                            reasoning_content: None,
+                            reasoning: None,
+                        }),
+                        logprobs: None,
+                        finish_reason: None,
+                        token_ids: None,
+                    }],
+                    usage: Some(TokenUsage::new(input_tokens, output_token_count)),
+                    prompt_token_ids: None,
+                });
+
+                // Stream arguments split by spaces (like content)
+                let arg_parts: Vec<&str> = tc.arguments.split(' ').collect();
+                for (i, part) in arg_parts.iter().enumerate() {
+                    output_token_count += 1;
+                    let part_with_space = if i == 0 {
+                        part.to_string()
+                    } else {
+                        format!(" {}", part)
+                    };
+                    let is_last_part = i == arg_parts.len() - 1;
+                    let finish_reason = if is_last_part && is_last_tool {
+                        Some(FinishReason::ToolCalls)
                     } else {
                         None
-                    },
-                    token_ids: None,
-                }],
-                usage: Some(TokenUsage::new(input_tokens, output_token_count)),
-                prompt_token_ids: None,
-            });
+                    };
+                    chunks.push(ChatCompletionChunk {
+                        id: id.clone(),
+                        object: "chat.completion.chunk".to_string(),
+                        created,
+                        model: model.clone(),
+                        system_fingerprint: None,
+                        choices: vec![ChatChoice {
+                            index: 0,
+                            delta: Some(ChatDelta {
+                                role: None,
+                                content: None,
+                                name: None,
+                                tool_call_id: None,
+                                tool_calls: Some(vec![ToolCallDelta {
+                                    id: None,
+                                    type_: None,
+                                    index: Some(idx as i64),
+                                    function: Some(FunctionCallDelta {
+                                        name: None,
+                                        arguments: Some(part_with_space),
+                                    }),
+                                }]),
+                                reasoning_content: None,
+                                reasoning: None,
+                            }),
+                            logprobs: None,
+                            finish_reason,
+                            token_ids: None,
+                        }],
+                        usage: Some(TokenUsage::new(input_tokens, output_token_count)),
+                        prompt_token_ids: None,
+                    });
+                }
+            }
         }
 
         // Final chunk with final usage
@@ -412,165 +590,6 @@ impl MockProvider {
         self.models.iter().any(|m| m.id == model)
     }
 
-    /// Generate streaming chat completion chunks
-    fn generate_chat_chunks(
-        &self,
-        params: &ChatCompletionParams,
-        has_tools: bool,
-    ) -> Vec<ChatCompletionChunk> {
-        let id = self.generate_chat_id();
-        let created = self.current_timestamp();
-        let model = params.model.clone();
-
-        let mut chunks = Vec::new();
-
-        // Check if this is a tool call request
-        if has_tools && params.tools.is_some() {
-            // Generate tool call chunks
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            std::time::SystemTime::now().hash(&mut hasher);
-            let tool_call_id = format!("chatcmpl-tool-{:x}", hasher.finish());
-            let tool_name = "get_weather";
-            let tool_args = r#"{"location": "New York"}"#;
-
-            // First chunk: tool call start
-            chunks.push(ChatCompletionChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk".to_string(),
-                created,
-                model: model.clone(),
-                system_fingerprint: None,
-                choices: vec![ChatChoice {
-                    index: 0,
-                    delta: Some(ChatDelta {
-                        role: None,
-                        content: Some(
-                            "I'll check the weather in New York for you right away.".to_string(),
-                        ),
-                        name: None,
-                        tool_call_id: None,
-                        tool_calls: Some(vec![ToolCallDelta {
-                            id: Some(tool_call_id.clone()),
-                            type_: Some("function".to_string()),
-                            index: Some(0),
-                            function: Some(FunctionCallDelta {
-                                name: Some(tool_name.to_string()),
-                                arguments: None,
-                            }),
-                        }]),
-                        reasoning_content: None,
-                        reasoning: None,
-                    }),
-                    logprobs: None,
-                    finish_reason: None,
-                    token_ids: None,
-                }],
-                usage: None,
-                prompt_token_ids: None,
-            });
-
-            // Generate argument chunks
-            for char in tool_args.chars() {
-                chunks.push(ChatCompletionChunk {
-                    id: id.clone(),
-                    object: "chat.completion.chunk".to_string(),
-                    created,
-                    model: model.clone(),
-                    system_fingerprint: None,
-                    choices: vec![ChatChoice {
-                        index: 0,
-                        delta: Some(ChatDelta {
-                            role: None,
-                            content: None,
-                            name: None,
-                            tool_call_id: None,
-                            tool_calls: Some(vec![ToolCallDelta {
-                                id: None,
-                                type_: None,
-                                index: Some(0),
-                                function: Some(FunctionCallDelta {
-                                    name: None,
-                                    arguments: Some(char.to_string()),
-                                }),
-                            }]),
-                            reasoning_content: None,
-                            reasoning: None,
-                        }),
-                        logprobs: None,
-                        finish_reason: None,
-                        token_ids: None,
-                    }],
-                    usage: None,
-                    prompt_token_ids: None,
-                });
-            }
-
-            // Final chunk with usage
-            chunks.push(ChatCompletionChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk".to_string(),
-                created,
-                model: model.clone(),
-                system_fingerprint: None,
-                choices: vec![],
-                usage: Some(TokenUsage::new(6, 20)),
-                prompt_token_ids: None,
-            });
-        } else {
-            // Regular chat completion
-            let content_parts = ["1", ".", " ", "2", ".", " ", "3", "."];
-            let mut full_content = String::new();
-
-            for (i, part) in content_parts.iter().enumerate() {
-                full_content.push_str(part);
-                chunks.push(ChatCompletionChunk {
-                    id: id.clone(),
-                    object: "chat.completion.chunk".to_string(),
-                    created,
-                    model: model.clone(),
-                    system_fingerprint: None,
-                    choices: vec![ChatChoice {
-                        index: 0,
-                        delta: Some(ChatDelta {
-                            role: None,
-                            content: Some(part.to_string()),
-                            name: None,
-                            tool_call_id: None,
-                            tool_calls: None,
-                            reasoning_content: None,
-                            reasoning: None,
-                        }),
-                        logprobs: None,
-                        finish_reason: if i == content_parts.len() - 1 {
-                            Some(FinishReason::Stop)
-                        } else {
-                            None
-                        },
-                        token_ids: None,
-                    }],
-                    usage: None,
-                    prompt_token_ids: None,
-                });
-            }
-
-            // Final chunk with usage
-            chunks.push(ChatCompletionChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk".to_string(),
-                created,
-                model: model.clone(),
-                system_fingerprint: None,
-                choices: vec![],
-                usage: Some(TokenUsage::new(6, 8)),
-                prompt_token_ids: None,
-            });
-        }
-
-        chunks
-    }
-
     /// Generate streaming text completion chunks
     fn generate_text_chunks(&self, params: &CompletionParams) -> Vec<CompletionChunk> {
         let id = self.generate_id();
@@ -670,16 +689,12 @@ impl crate::InferenceProvider for MockProvider {
         // Ensure at least some input tokens for very short messages
         let input_tokens = input_tokens.max(6);
 
-        // Generate chunks from the matched response or default
-        let has_tools = params.tools.is_some();
-        let mut chunks = if has_tools && params.tools.is_some() {
-            self.generate_chat_chunks(&params, true)
-        } else {
-            let id = self.generate_chat_id();
-            let created = self.current_timestamp();
-            let model = params.model.clone();
-            response_template.generate_chunks(id, created, model, input_tokens)
-        };
+        // Generate chunks from the matched response template
+        // Always use the template - it now supports tool calls
+        let id = self.generate_chat_id();
+        let created = self.current_timestamp();
+        let model = params.model.clone();
+        let mut chunks = response_template.generate_chunks(id, created, model, input_tokens);
 
         // If disconnect simulation is enabled, truncate chunks (simulates client disconnect)
         // The stream will end abruptly without the final usage chunk

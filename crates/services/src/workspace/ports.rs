@@ -31,7 +31,6 @@ pub struct ApiKeyId(pub String);
 pub struct Workspace {
     pub id: WorkspaceId,
     pub name: String,
-    pub display_name: String,
     pub description: Option<String>,
     pub organization_id: OrganizationId,
     pub created_by_user_id: UserId,
@@ -145,7 +144,6 @@ pub trait WorkspaceRepository: Send + Sync {
     async fn create(
         &self,
         name: String,
-        display_name: String,
         description: Option<String>,
         organization_id: OrganizationId,
         created_by_user_id: UserId,
@@ -155,7 +153,7 @@ pub trait WorkspaceRepository: Send + Sync {
     async fn update(
         &self,
         workspace_id: WorkspaceId,
-        display_name: Option<String>,
+        name: Option<String>,
         description: Option<String>,
         settings: Option<serde_json::Value>,
     ) -> Result<Option<Workspace>, RepositoryError>;
@@ -268,7 +266,6 @@ pub trait WorkspaceServiceTrait: Send + Sync {
     async fn create_workspace(
         &self,
         name: String,
-        display_name: String,
         description: Option<String>,
         organization_id: OrganizationId,
         requester_id: UserId,
@@ -335,7 +332,7 @@ pub trait WorkspaceServiceTrait: Send + Sync {
         &self,
         workspace_id: WorkspaceId,
         requester_id: UserId,
-        display_name: Option<String>,
+        name: Option<String>,
         description: Option<String>,
         settings: Option<serde_json::Value>,
     ) -> Result<Workspace, WorkspaceError>;

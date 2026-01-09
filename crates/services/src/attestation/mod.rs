@@ -209,12 +209,12 @@ impl AttestationService {
         let key_resp = client
             .get_key(Some(GATEWAY_KEY_PATH.into()), None)
             .await
-            .map_err(|e| {
-                AttestationError::InternalError(format!("failed to get dstack derived key: {e:?}"))
+            .map_err(|_| {
+                AttestationError::InternalError("failed to get dstack derived key".into())
             })?;
 
-        let key_bytes = key_resp.decode_key().map_err(|e| {
-            AttestationError::InternalError(format!("failed to decode dstack derived key hex: {e}"))
+        let key_bytes = key_resp.decode_key().map_err(|_| {
+            AttestationError::InternalError("failed to decode dstack derived key hex".into())
         })?;
 
         // Derive ed25519 secret seed (32 bytes)

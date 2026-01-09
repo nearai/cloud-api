@@ -1,33 +1,9 @@
 // Import common test utilities
 mod common;
 
+use common::endpoints::upload_file;
 use common::*;
 use services::id_prefixes::PREFIX_FILE;
-
-/// Helper function to upload a file
-async fn upload_file(
-    server: &axum_test::TestServer,
-    api_key: &str,
-    filename: &str,
-    content: &[u8],
-    content_type: &str,
-    purpose: &str,
-) -> axum_test::TestResponse {
-    server
-        .post("/v1/files")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .multipart(
-            axum_test::multipart::MultipartForm::new()
-                .add_text("purpose", purpose)
-                .add_part(
-                    "file",
-                    axum_test::multipart::Part::bytes(content.to_vec())
-                        .file_name(filename)
-                        .mime_type(content_type),
-                ),
-        )
-        .await
-}
 
 /// Helper function to upload a file with expiration
 async fn upload_file_with_expiration(

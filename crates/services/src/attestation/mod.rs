@@ -32,6 +32,7 @@ pub mod ports;
 
 // Constants for key derivation
 const GATEWAY_KEY_PATH: &str = "/signing-key";
+const GATEWAY_KEY_SALT: &[u8] = b"signing-key";
 const GATEWAY_KEY_INFO_ED25519: &[u8] = b"/ed25519";
 const GATEWAY_KEY_INFO_ECDSA: &[u8] = b"/ecdsa";
 
@@ -144,17 +145,8 @@ impl AttestationService {
     ) -> Result<(SigningKey, VerifyingKey, EcdsaSigningKey, EcdsaVerifyingKey), AttestationError>
     {
         let client = dstack_client::DstackClient::new(None);
-        let info = client.info().await.map_err(|e| {
-            AttestationError::InternalError(format!(
-                "failed to get dstack info for key derivation: {e:?}"
-            ))
-        })?;
-        let app_id = info.app_id;
 
-        // Ask dstack for a derived key. The returned key is bound to the app in TEE,
-        let path = format!("{app_id}{GATEWAY_KEY_PATH}");
-
-        let key_resp = client.get_key(Some(path), None).await.map_err(|e| {
+        let key_resp = client.get_key(Some(GATEWAY_KEY_PATH.into()), None).await.map_err(|e| {
             AttestationError::InternalError(format!("failed to get dstack derived key: {e:?}"))
         })?;
 
@@ -163,9 +155,7 @@ impl AttestationService {
         })?;
 
         // Use HKDF-SHA256 for secure key derivation
-        // Salt: app_id ensures different apps get different keys even with same IKM
-        // Info: distinguishes between ed25519 and ecdsa key derivation
-        let hk = Hkdf::<Sha256>::new(Some(app_id.as_bytes()), &key_bytes);
+        let hk = Hkdf::<Sha256>::new(Some(GATEWAY_KEY_SALT), &key_bytes);
 
         // Derive ed25519 secret seed (32 bytes)
         // Use loop to retry if derived key is all zeros

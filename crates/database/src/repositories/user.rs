@@ -270,6 +270,36 @@ impl UserRepository {
                 .replace('_', "\\_")
         });
 
+        // Get total count of matching users (independent of pagination)
+        let total_count = retry_db!("count_users_with_organizations", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            let count_row = client
+                .query_one(
+                    r#"
+            SELECT COUNT(DISTINCT u.id) as total_count
+            FROM users u
+            LEFT JOIN organization_members om ON u.id = om.user_id AND om.role = 'owner'
+            LEFT JOIN organizations o ON om.organization_id = o.id AND o.is_active = true
+            WHERE u.is_active = true
+              AND ($1::TEXT IS NULL
+                   OR o.name ILIKE ('%' || $1 || '%') ESCAPE '\'
+                   OR o.id IS NULL)
+            "#,
+                    &[&escaped_search],
+                )
+                .await
+                .map_err(map_db_error)?;
+
+            Ok(count_row.get::<_, i64>("total_count"))
+        })?;
+
+        // Get paginated results with organization info
         let rows = retry_db!("list_all_users_with_organizations_with_pagination", {
             let client = self
                 .pool
@@ -283,7 +313,6 @@ impl UserRepository {
                     r#"
             SELECT DISTINCT ON (u.id)
                 u.*,
-                COUNT(*) OVER() as total_count,
                 o.id as organization_id,
                 o.name as organization_name,
                 o.description as organization_description,
@@ -316,12 +345,6 @@ impl UserRepository {
                 .await
                 .map_err(map_db_error)
         })?;
-
-        // Extract total count from first row, or 0 if no rows
-        let total_count = rows
-            .first()
-            .map(|row| row.get::<_, i64>("total_count"))
-            .unwrap_or(0);
 
         let result = rows
             .into_iter()

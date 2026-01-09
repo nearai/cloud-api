@@ -671,7 +671,7 @@ pub async fn delete_model(
         ("limit" = Option<i64>, Query, description = "Maximum number of users to return (default: 100)"),
         ("offset" = Option<i64>, Query, description = "Number of users to skip (default: 0)"),
         ("include_organizations" = Option<bool>, Query, description = "Whether to include organization information and spend limits for the first organization owned by each user (default: false)"),
-        ("search_by_name" = Option<String>, Query, description = "Filter users by organization name (case-insensitive partial match)")
+        ("search_by_name" = Option<String>, Query, description = "Filter users by organization name (case-insensitive match). Only effective when include_organizations=true; ignored otherwise.")
     ),
     responses(
         (status = 200, description = "Users retrieved successfully", body = ListUsersResponse),

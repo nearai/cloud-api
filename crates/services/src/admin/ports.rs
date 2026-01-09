@@ -147,6 +147,19 @@ pub struct AdminModelInfo {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Organization information for admin listing (includes spend limit and usage)
+#[derive(Debug, Clone)]
+pub struct AdminOrganizationInfo {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub spend_limit: Option<i64>, // Amount in nano-dollars (scale 9)
+    pub total_spent: Option<i64>, // Amount in nano-dollars (scale 9)
+    pub total_requests: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
     #[error("Model not found: {0}")]
@@ -253,6 +266,20 @@ pub trait AdminRepository: Send + Sync {
         &self,
         organization_id: uuid::Uuid,
     ) -> Result<Option<u32>, anyhow::Error>;
+
+    /// List all organizations with pagination (admin only)
+    async fn list_all_organizations(
+        &self,
+        limit: i64,
+        offset: i64,
+        search_by_name: Option<String>,
+    ) -> Result<Vec<AdminOrganizationInfo>, anyhow::Error>;
+
+    /// Count all active organizations (admin only)
+    async fn count_all_organizations(
+        &self,
+        search_by_name: Option<String>,
+    ) -> Result<i64, anyhow::Error>;
 }
 
 /// Admin service trait for managing platform configuration
@@ -330,4 +357,12 @@ pub trait AdminService: Send + Sync {
         &self,
         organization_id: uuid::Uuid,
     ) -> Result<Option<u32>, AdminError>;
+
+    /// List all organizations with pagination (admin only)
+    async fn list_organizations(
+        &self,
+        limit: i64,
+        offset: i64,
+        search_by_name: Option<String>,
+    ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError>;
 }

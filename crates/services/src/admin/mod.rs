@@ -267,6 +267,27 @@ impl AdminService for AdminServiceImpl {
                 }
             })
     }
+
+    async fn list_organizations(
+        &self,
+        limit: i64,
+        offset: i64,
+        search_by_name: Option<String>,
+    ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError> {
+        let organizations = self
+            .repository
+            .list_all_organizations(limit, offset, search_by_name.clone())
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+
+        let total = self
+            .repository
+            .count_all_organizations(search_by_name)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+
+        Ok((organizations, total))
+    }
 }
 
 impl AdminServiceImpl {

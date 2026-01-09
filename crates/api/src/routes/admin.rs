@@ -1,11 +1,12 @@
 use crate::middleware::AdminUser;
 use crate::models::{
     AdminAccessTokenResponse, AdminModelListResponse, AdminModelWithPricing,
-    AdminUserOrganizationDetails, AdminUserResponse, BatchUpdateModelApiRequest,
-    CreateAdminAccessTokenRequest, DecimalPrice, DeleteAdminAccessTokenRequest, DeleteModelRequest,
-    ErrorResponse, GetOrganizationConcurrentLimitResponse, ListUsersResponse, ModelHistoryEntry,
-    ModelHistoryResponse, ModelMetadata, ModelWithPricing, OrgLimitsHistoryEntry,
-    OrgLimitsHistoryResponse, OrganizationUsage, SpendLimit,
+    AdminOrganizationResponse, AdminUserOrganizationDetails, AdminUserResponse,
+    BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, DecimalPrice,
+    DeleteAdminAccessTokenRequest, DeleteModelRequest, ErrorResponse,
+    GetOrganizationConcurrentLimitResponse, ListOrganizationsAdminResponse, ListUsersResponse,
+    ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
+    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, SpendLimit,
     UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
     UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
 };
@@ -805,6 +806,97 @@ pub async fn list_users(
     Ok(ResponseJson(response))
 }
 
+/// List all organizations with pagination (Admin only)
+///
+/// Returns a paginated list of all organizations in the system with their spend limits and usage.
+/// Only authenticated admins can perform this operation.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations",
+    tag = "Admin",
+    params(
+        ("limit" = Option<i64>, Query, description = "Maximum number of organizations to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Number of organizations to skip (default: 0)"),
+        ("search_by_name" = Option<String>, Query, description = "Filter organizations by name (case-insensitive partial match)")
+    ),
+    responses(
+        (status = 200, description = "Organizations retrieved successfully", body = ListOrganizationsAdminResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_organizations(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    axum::extract::Query(params): axum::extract::Query<ListOrganizationsQueryParams>,
+) -> Result<ResponseJson<ListOrganizationsAdminResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
+{
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+
+    debug!(
+        "List organizations request with limit={}, offset={}, search_by_name={:?}",
+        params.limit, params.offset, params.search_by_name
+    );
+
+    let (organizations, total) = app_state
+        .admin_service
+        .list_organizations(params.limit, params.offset, params.search_by_name)
+        .await
+        .map_err(|e| {
+            error!("Failed to list organizations: {:?}", e);
+            match e {
+                services::admin::AdminError::Unauthorized(msg) => (
+                    StatusCode::UNAUTHORIZED,
+                    ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve organizations".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+
+    let org_responses: Vec<AdminOrganizationResponse> = organizations
+        .into_iter()
+        .map(|org| {
+            let current_usage = org.total_spent.map(|total_spent| OrganizationUsage {
+                total_spent,
+                total_spent_display: format_amount(total_spent),
+                total_requests: org.total_requests.unwrap_or(0),
+                total_tokens: org.total_tokens.unwrap_or(0),
+            });
+
+            AdminOrganizationResponse {
+                id: org.id.to_string(),
+                name: org.name,
+                description: org.description,
+                spend_limit: org.spend_limit.map(|amount| SpendLimit {
+                    amount,
+                    scale: 9,
+                    currency: "USD".to_string(),
+                }),
+                current_usage,
+                created_at: org.created_at,
+            }
+        })
+        .collect();
+
+    let response = ListOrganizationsAdminResponse {
+        organizations: org_responses,
+        total,
+        limit: params.limit,
+        offset: params.offset,
+    };
+
+    Ok(ResponseJson(response))
+}
+
 /// Create admin access token (Admin only)
 ///
 /// Creates an access token for admin users with customizable expiration time, IP address, and user agent.
@@ -1065,6 +1157,15 @@ pub struct ListUsersQueryParams {
     pub offset: i64,
     #[serde(default)]
     pub include_organizations: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ListOrganizationsQueryParams {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    pub search_by_name: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]

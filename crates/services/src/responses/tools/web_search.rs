@@ -34,7 +34,7 @@ fn create_web_search_item(
 pub const WEB_SEARCH_TOOL_NAME: &str = "web_search";
 
 /// Citation instruction provided on first web search.
-const CITATION_INSTRUCTION: &str = r#"CITATION REQUIREMENT: Use [s:N]text[/s:N] for EVERY fact from web search results.
+pub const CITATION_INSTRUCTION: &str = r#"CITATION REQUIREMENT: Use [s:N]text[/s:N] for EVERY fact from web search results.
 
 FORMAT: [s:N]fact from source N[/s:N]
 - N = source number (0, 1, 2, 3, etc. - cumulative across all searches)

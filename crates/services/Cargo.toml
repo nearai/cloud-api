@@ -54,8 +54,6 @@ aes-gcm = "0.10"
 # HMAC for VPC signature verification
 hmac = "0.12"
 sha2 = "0.10"
-# HKDF for secure key derivation
-hkdf = "0.12"
 moka = { version = "0.12.12", features = ["future"] }
 bloomfilter = "3.0.1"
 mockall = { version = "0.14", optional = true }

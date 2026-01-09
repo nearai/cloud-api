@@ -142,6 +142,8 @@ impl AttestationService {
         let client = dstack_client::DstackClient::new(None);
 
         // Get ed25519 signing key directly from dstack
+        // Because the secp256k1 private key returned by `get_key` has been processed with HKDF,
+        // it can be directly treated as a valid ed25519 private key
         let ed25519_key_resp = client
             .get_key(Some(GATEWAY_KEY_PATH_ED25519.into()), None)
             .await

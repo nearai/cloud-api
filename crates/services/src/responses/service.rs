@@ -14,12 +14,15 @@ use crate::inference_provider_pool::InferenceProviderPool;
 use crate::responses::tools;
 use crate::responses::{citation_tracker, errors, models, ports};
 
-use tools::WEB_SEARCH_TOOL_NAME;
+use tools::{ERROR_TOOL_TYPE, MAX_CONSECUTIVE_TOOL_FAILURES};
 
-const ERROR_TOOL_TYPE: &str = "__error__";
-
-/// Maximum consecutive error tool calls before stopping the agent loop
-const MAX_CONSECUTIVE_TOOL_ERRORS: u32 = 3;
+/// Result of the agent loop execution
+enum AgentLoopResult {
+    /// Agent loop completed normally
+    Completed,
+    /// Agent loop paused due to MCP approval required
+    ApprovalRequired,
+}
 
 /// Context for processing a response stream
 struct ProcessStreamContext {
@@ -630,7 +633,7 @@ impl ResponseServiceImpl {
         }
 
         // Convert accumulated tool calls to detected tool calls
-        let tool_calls_detected = Self::convert_tool_calls(tool_call_accumulator);
+        let tool_calls_detected = tools::convert_tool_calls(tool_call_accumulator);
 
         Ok(crate::responses::service_helpers::ProcessStreamResult {
             text: current_text,
@@ -769,115 +772,6 @@ impl ResponseServiceImpl {
         Ok(())
     }
 
-    /// Convert accumulated tool calls to ToolCallInfo
-    fn convert_tool_calls(
-        tool_call_accumulator: std::collections::HashMap<i64, (Option<String>, String)>,
-    ) -> Vec<crate::responses::service_helpers::ToolCallInfo> {
-        use crate::responses::service_helpers::ToolCallInfo;
-
-        let mut tool_calls_detected = Vec::new();
-
-        for (idx, (name_opt, args_str)) in tool_call_accumulator {
-            // Check if name is None or empty string
-            let name = match name_opt {
-                Some(n) if !n.trim().is_empty() => n,
-                _ => {
-                    tracing::warn!(
-                        "Tool call at index {} has no name or empty name. Args: {}",
-                        idx,
-                        args_str
-                    );
-                    // Create a special error tool call to inform the LLM
-                    tool_calls_detected.push(ToolCallInfo {
-                        tool_type: ERROR_TOOL_TYPE.to_string(),
-                        query: format!(
-                            "Tool call at index {idx} is missing a tool name. Please ensure all tool calls include a valid 'name' field. Arguments provided: {args_str}"
-                        ),
-                        params: Some(serde_json::json!({
-                            "error_type": "missing_tool_name",
-                            "index": idx,
-                            "arguments": args_str
-                        })),
-                    });
-                    continue;
-                }
-            };
-
-            // Try to parse the complete arguments for tools that need parameters
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str) {
-                // Check if this is an MCP tool (format: "server_label:tool_name")
-                if name.contains(':') {
-                    // MCP tools use the full arguments JSON as params
-                    tracing::debug!(
-                        "MCP tool call detected: {} with arguments: {:?}",
-                        name,
-                        args
-                    );
-                    tool_calls_detected.push(ToolCallInfo {
-                        tool_type: name,
-                        query: String::new(),
-                        params: Some(args),
-                    });
-                } else if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
-                    // Non-MCP tools (web_search, file_search) require a "query" field
-                    tracing::debug!(
-                        "Tool call detected: {} with query: {} and params: {:?}",
-                        name,
-                        query,
-                        args
-                    );
-                    tool_calls_detected.push(ToolCallInfo {
-                        tool_type: name,
-                        query: query.to_string(),
-                        params: Some(args),
-                    });
-                } else {
-                    tracing::warn!(
-                        "Tool call {} (index {}) has no 'query' field in arguments: {}",
-                        name,
-                        idx,
-                        args_str
-                    );
-                    // Create an error tool call to inform the LLM about missing query
-                    tool_calls_detected.push(ToolCallInfo {
-                        tool_type: ERROR_TOOL_TYPE.to_string(),
-                        query: format!(
-                            "Tool call for '{name}' (index {idx}) is missing the required 'query' field in its arguments. Please include a 'query' parameter. Arguments provided: {args_str}"
-                        ),
-                        params: Some(serde_json::json!({
-                            "error_type": "missing_query_field",
-                            "tool_name": name,
-                            "index": idx,
-                            "arguments": args_str
-                        })),
-                    });
-                }
-            } else {
-                tracing::warn!(
-                    "Failed to parse tool call {} (index {}) arguments: {}",
-                    name,
-                    idx,
-                    args_str
-                );
-                // Create an error tool call to inform the LLM about invalid JSON
-                tool_calls_detected.push(ToolCallInfo {
-                    tool_type: ERROR_TOOL_TYPE.to_string(),
-                    query: format!(
-                        "Tool call for '{name}' (index {idx}) has invalid JSON arguments. Please ensure arguments are valid JSON. Arguments provided: {args_str}"
-                    ),
-                    params: Some(serde_json::json!({
-                        "error_type": "invalid_json",
-                        "tool_name": name,
-                        "index": idx,
-                        "arguments": args_str
-                    })),
-                });
-            }
-        }
-
-        tool_calls_detected
-    }
-
     /// Process the response stream - main logic
     async fn process_response_stream(
         tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
@@ -977,11 +871,24 @@ impl ResponseServiceImpl {
             context.client_pub_key.clone(),
         );
 
-        let mut tools = Self::prepare_tools(&context.request);
-        let tool_choice = Self::prepare_tool_choice(&context.request);
+        let mut tools = tools::prepare_tools(&context.request);
+        let tool_choice = tools::prepare_tool_choice(&context.request);
 
-        // Initialize MCP connections if any MCP tools are configured
-        Self::initialize_mcp_connections(&mut ctx, &mut emitter, &mut context, &mut tools).await?;
+        // Set up MCP: connect to servers, discover tools, and process approvals
+        if let Some(mcp_setup) = tools::setup_mcp(
+            &context.request,
+            context.mcp_client_factory.as_ref(),
+            &context.response_items_repository,
+            &mut ctx,
+            &mut emitter,
+        )
+        .await?
+        {
+            tools.extend(mcp_setup.tool_definitions);
+            context.tool_registry.register(mcp_setup.executor.clone());
+            context.mcp_executor = Some(mcp_setup.executor);
+            messages.extend(mcp_setup.approval_messages);
+        }
 
         let max_iterations = 10; // Prevent infinite loops
         let mut iteration = 0;
@@ -1002,14 +909,26 @@ impl ResponseServiceImpl {
         )
         .await;
 
-        // Log error but continue - we want to save partial response even on disconnect
-        if let Err(ref e) = agent_loop_result {
-            tracing::warn!("Agent loop error (may be client disconnect): {:?}", e);
-        }
+        // Determine final response status based on agent loop result
+        let (final_status, incomplete_details) = match &agent_loop_result {
+            Ok(AgentLoopResult::Completed) => (models::ResponseStatus::Completed, None),
+            Ok(AgentLoopResult::ApprovalRequired) => (
+                models::ResponseStatus::Incomplete,
+                Some(models::ResponseIncompleteDetails {
+                    reason: "mcp_approval_required".to_string(),
+                }),
+            ),
+            Err(ref e) => {
+                // Log error but continue - we want to save partial response even on disconnect
+                tracing::warn!("Agent loop error (may be client disconnect): {:?}", e);
+                (models::ResponseStatus::Completed, None)
+            }
+        };
 
         // Build final response
         let mut final_response = initial_response;
-        final_response.status = models::ResponseStatus::Completed;
+        final_response.status = final_status;
+        final_response.incomplete_details = incomplete_details;
 
         // Load all response items from the database for this response
         let response_items = context
@@ -1110,7 +1029,7 @@ impl ResponseServiceImpl {
         tool_choice: &Option<inference_providers::ToolChoice>,
         max_iterations: usize,
         iteration: &mut usize,
-    ) -> Result<(), errors::ResponseError> {
+    ) -> Result<AgentLoopResult, errors::ResponseError> {
         use crate::completions::ports::{CompletionMessage, CompletionRequest};
 
         // Track consecutive error tool calls to detect excessive retry loops
@@ -1223,13 +1142,13 @@ impl ResponseServiceImpl {
                 .any(|tc| tc.tool_type == ERROR_TOOL_TYPE);
             if has_errors {
                 consecutive_error_count += 1;
-                if consecutive_error_count >= MAX_CONSECUTIVE_TOOL_ERRORS {
+                if consecutive_error_count >= MAX_CONSECUTIVE_TOOL_FAILURES {
                     tracing::error!(
                         "Agent loop: {} consecutive iterations with tool call errors, stopping to prevent infinite retry",
                         consecutive_error_count
                     );
                     return Err(errors::ResponseError::InternalError(
-                        format!("Tool calls failed {} consecutive iterations due to malformed arguments from model", MAX_CONSECUTIVE_TOOL_ERRORS),
+                        format!("Tool calls failed {} consecutive iterations due to malformed arguments from model", MAX_CONSECUTIVE_TOOL_FAILURES),
                     ));
                 }
             } else {
@@ -1240,28 +1159,41 @@ impl ResponseServiceImpl {
 
             // Execute each tool call
             for tool_call in stream_result.tool_calls {
-                Self::execute_and_emit_tool_call(
+                match Self::execute_and_emit_tool_call(
                     ctx,
                     emitter,
                     &tool_call,
                     messages,
                     process_context,
                 )
-                .await?;
+                .await?
+                {
+                    tools::ToolExecutionResult::Success => {
+                        // Continue processing tool calls
+                    }
+                    tools::ToolExecutionResult::ApprovalRequired => {
+                        // MCP tool requires approval - pause the agent loop
+                        return Ok(AgentLoopResult::ApprovalRequired);
+                    }
+                }
             }
         }
 
-        Ok(())
+        Ok(AgentLoopResult::Completed)
     }
 
     /// Execute a tool call and emit appropriate events
+    /// Execute a tool call and emit appropriate events.
+    ///
+    /// Returns `Ok(ToolExecutionResult::Success)` if the tool executed normally,
+    /// or `Ok(ToolExecutionResult::ApprovalRequired)` if the tool requires user approval.
     async fn execute_and_emit_tool_call(
         ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
         emitter: &mut crate::responses::service_helpers::EventEmitter,
         tool_call: &crate::responses::service_helpers::ToolCallInfo,
         messages: &mut Vec<crate::completions::ports::CompletionMessage>,
         process_context: &mut ProcessStreamContext,
-    ) -> Result<(), errors::ResponseError> {
+    ) -> Result<tools::ToolExecutionResult, errors::ResponseError> {
         use crate::completions::ports::CompletionMessage;
 
         let tool_call_id = format!("{}_{}", tool_call.tool_type, uuid::Uuid::new_v4().simple());
@@ -1277,7 +1209,7 @@ impl ResponseServiceImpl {
                     tool_call.query
                 ),
             });
-            return Ok(());
+            return Ok(tools::ToolExecutionResult::Success);
         }
 
         {
@@ -1303,55 +1235,51 @@ impl ResponseServiceImpl {
             .execute(tool_call, &exec_context)
             .await
         {
-            Ok(output) => output,
+            Ok(output) => Some(output),
+
             Err(e) => {
-                // Convert tool execution errors into error messages for the LLM
-                let error_message = format!("ERROR: {e}");
+                // Delegate error handling to the executor (e.g., MCP approval flow)
+                let mut event_ctx = tools::ToolEventContext {
+                    stream_ctx: ctx,
+                    emitter,
+                    tool_call_id: &tool_call_id,
+                    response_items_repository: Some(&process_context.response_items_repository),
+                };
 
-                // Track failures for web_search tool with retry-aware logging
-                // Note: We intentionally do NOT log the error details to avoid leaking user query data
-                // The error is fed back to the LLM via ToolOutput for self-correction
-                if tool_call.tool_type == WEB_SEARCH_TOOL_NAME {
-                    process_context.web_search_failure_count += 1;
-                    const MAX_RETRIES: u32 = 3;
-
-                    if process_context.web_search_failure_count > MAX_RETRIES {
-                        tracing::error!(
-                            tool = %tool_call.tool_type,
-                            failures = %process_context.web_search_failure_count,
-                            "Web search failed after {} attempts. Error fed back to LLM for correction.",
-                            MAX_RETRIES,
-                        );
-                    } else {
-                        tracing::warn!(
-                            tool = %tool_call.tool_type,
-                            attempt = %process_context.web_search_failure_count,
-                            max_retries = MAX_RETRIES,
-                            "Web search failed, feeding error back to LLM for retry",
-                        );
+                match process_context
+                    .tool_registry
+                    .handle_error(e, tool_call, &mut event_ctx)
+                    .await?
+                {
+                    Some(output) => Some(output),
+                    None => {
+                        // None means special control flow (e.g., approval required)
+                        // The executor has already emitted appropriate events
+                        return Ok(tools::ToolExecutionResult::ApprovalRequired);
                     }
-                } else {
-                    tracing::warn!(
-                        tool = %tool_call.tool_type,
-                        "Tool execution failed. Error fed back to LLM for correction.",
-                    );
                 }
-
-                tools::ToolOutput::Text(error_message)
             }
+        };
+
+        // If we got here with None, something went wrong
+        let tool_output = match tool_output {
+            Some(output) => output,
+            None => return Ok(tools::ToolExecutionResult::ApprovalRequired),
         };
 
         // Handle tool-specific side effects via pattern matching
         let (tool_content, instruction) = match tool_output {
-            tools::ToolOutput::WebSearch { sources } => {
-                let current_source_count = process_context
+            tools::ToolOutput::WebSearch { sources, .. } => {
+                // Calculate start index based on current registry size
+                let start_index = process_context
                     .source_registry
                     .as_ref()
                     .map(|r| r.web_sources.len())
                     .unwrap_or(0);
 
-                // Format results with proper indexing and get citation instruction
-                let result = tools::web_search::format_results(&sources, current_source_count);
+                // Format content with correct cumulative indices
+                // format_results returns FormattedWebSearchResult with formatted text and optional instruction
+                let result = tools::web_search::format_results(&sources, start_index);
 
                 // Accumulate sources into registry
                 if let Some(ref mut registry) = process_context.source_registry {
@@ -1406,7 +1334,7 @@ impl ResponseServiceImpl {
             });
         }
 
-        Ok(())
+        Ok(tools::ToolExecutionResult::Success)
     }
 
     /// Store user input messages as response_items
@@ -1767,288 +1695,6 @@ impl ResponseServiceImpl {
         }
 
         Ok(messages)
-    }
-
-    /// Initialize MCP connections if any MCP tools are configured in the request.
-    /// Connects to remote MCP servers, discovers available tools, emits mcp_list_tools
-    /// items (for client-side caching), and merges MCP tool definitions with the tools list.
-    async fn initialize_mcp_connections(
-        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
-        emitter: &mut crate::responses::service_helpers::EventEmitter,
-        context: &mut ProcessStreamContext,
-        tools: &mut Vec<inference_providers::ToolDefinition>,
-    ) -> Result<(), errors::ResponseError> {
-        let request_tools = match &context.request.tools {
-            Some(t) => t,
-            None => return Ok(()),
-        };
-
-        let mcp_tools: Vec<&models::ResponseTool> = request_tools
-            .iter()
-            .filter(|t| matches!(t, models::ResponseTool::Mcp { .. }))
-            .collect();
-
-        if mcp_tools.is_empty() {
-            return Ok(());
-        }
-
-        let cached_tools = Self::extract_cached_mcp_tools(&context.request);
-
-        // Use injected factory if provided (for testing), otherwise use default
-        let mut mcp_executor = match &context.mcp_client_factory {
-            Some(factory) => tools::McpToolExecutor::with_arc_client_factory(factory.clone()),
-            None => tools::McpToolExecutor::new(),
-        };
-
-        // Connect to servers, using cached tools where available
-        let mcp_list_tools_items = mcp_executor
-            .connect_servers(mcp_tools, &cached_tools)
-            .await?;
-
-        for item in mcp_list_tools_items {
-            let item_id = item.id().to_string();
-            emitter.emit_item_added(ctx, item, item_id).await?;
-        }
-
-        // Add MCP tool definitions to the tools list for the LLM
-        let mcp_tool_defs = mcp_executor.get_tool_definitions();
-        tools.extend(mcp_tool_defs);
-
-        // Wrap in Arc, register in tool_registry, and store for other uses
-        let mcp_executor = Arc::new(mcp_executor);
-        context.tool_registry.register(mcp_executor.clone());
-        context.mcp_executor = Some(mcp_executor);
-
-        Ok(())
-    }
-
-    /// Extract cached mcp_list_tools from the request input
-    fn extract_cached_mcp_tools(
-        request: &models::CreateResponseRequest,
-    ) -> std::collections::HashMap<String, Vec<models::McpDiscoveredTool>> {
-        use std::collections::HashMap;
-        let mut cached: HashMap<String, Vec<models::McpDiscoveredTool>> = HashMap::new();
-
-        let items = match &request.input {
-            Some(models::ResponseInput::Items(items)) => items,
-            Some(models::ResponseInput::Text(_)) => return cached,
-            None => return cached,
-        };
-
-        for item in items {
-            if let models::ResponseInputItem::McpListTools {
-                server_label,
-                tools,
-                ..
-            } = item
-            {
-                cached.insert(server_label.clone(), tools.clone());
-            }
-        }
-
-        cached
-    }
-
-    /// Prepare tools configuration for LLM in OpenAI function calling format
-    fn prepare_tools(
-        request: &models::CreateResponseRequest,
-    ) -> Vec<inference_providers::ToolDefinition> {
-        let mut tool_definitions = Vec::new();
-
-        if let Some(tools) = &request.tools {
-            for tool in tools {
-                match tool {
-                    models::ResponseTool::WebSearch { .. } => {
-                        tool_definitions.push(inference_providers::ToolDefinition {
-                            type_: "function".to_string(),
-                            function: inference_providers::FunctionDefinition {
-                                name: WEB_SEARCH_TOOL_NAME.to_string(),
-                                description: Some(
-                                    "Search the web for current information. Use this when you need up-to-date information or facts that you don't have. \
-                                    \n\nIMPORTANT PARAMETERS TO CONSIDER:\
-                                    \n- Use 'freshness' for time-sensitive queries (news, recent events, current trends)\
-                                    \n- Use 'country' for location-specific information\
-                                    \n- Use 'count' to limit results when user asks for specific number\
-                                    \n- Use 'safesearch' when dealing with sensitive topics".to_string()
-                                ),
-                                parameters: serde_json::json!({
-                                    "type": "object",
-                                    "properties": {
-                                        "query": {
-                                            "type": "string",
-                                            "description": "The search query to look up (required, max 400 characters)"
-                                        },
-                                        "country": {
-                                            "type": "string",
-                                            "description": "2-character country code where results come from (e.g., 'US', 'GB', 'DE'). Use when user asks about location-specific information or mentions a country."
-                                        },
-                                        "search_lang": {
-                                            "type": "string",
-                                            "description": "2+ character language code for search results (e.g., 'en', 'es', 'de'). Use when user's query or language preference suggests non-English results."
-                                        },
-                                        "ui_lang": {
-                                            "type": "string",
-                                            "description": "User interface language (e.g., 'en-US', 'es-ES')"
-                                        },
-                                        "count": {
-                                            "type": "integer",
-                                            "description": "Number of search results to return (1-20, default: 20). Use lower values (5-10) for focused queries, higher values (15-20) for comprehensive research.",
-                                            "minimum": 1,
-                                            "maximum": 20
-                                        },
-                                        "offset": {
-                                            "type": "integer",
-                                            "description": "Zero-based offset for pagination (0-9)",
-                                            "minimum": 0,
-                                            "maximum": 9
-                                        },
-                                        "safesearch": {
-                                            "type": "string",
-                                            "description": "Safe search filter: 'strict' for educational/family content, 'moderate' (default) for general use, 'off' only when explicitly needed",
-                                            "enum": ["off", "moderate", "strict"]
-                                        },
-                                        "freshness": {
-                                            "type": "string",
-                                            "description": "Filter by freshness: 'pd' (24h) for breaking news, 'pw' (7d) for recent events, 'pm' (31d) for current trends, 'py' (365d) for recent developments. Always use for: news, current events, latest updates, recent changes, today's info."
-                                        },
-                                        "text_decorations": {
-                                            "type": "boolean",
-                                            "description": "Include text highlighting markers (default: true)"
-                                        },
-                                        "spellcheck": {
-                                            "type": "boolean",
-                                            "description": "Enable spellcheck on query (default: true)"
-                                        },
-                                        "units": {
-                                            "type": "string",
-                                            "description": "Measurement units: 'metric' or 'imperial'",
-                                            "enum": ["metric", "imperial"]
-                                        },
-                                        "extra_snippets": {
-                                            "type": "boolean",
-                                            "description": "Get up to 5 additional alternative excerpts (requires AI/Data plan)"
-                                        },
-                                        "summary": {
-                                            "type": "boolean",
-                                            "description": "Enable summary key generation (requires AI/Data plan)"
-                                        }
-                                    },
-                                    "required": ["query"]
-                                }),
-                            },
-                        });
-                    }
-                    models::ResponseTool::FileSearch {} => {
-                        tool_definitions.push(inference_providers::ToolDefinition {
-                            type_: "function".to_string(),
-                            function: inference_providers::FunctionDefinition {
-                                name: "file_search".to_string(),
-                                description: Some(
-                                    "Search through files in the current conversation. Use this to find information from uploaded documents or previous file content.".to_string()
-                                ),
-                                parameters: serde_json::json!({
-                                    "type": "object",
-                                    "properties": {
-                                        "query": {
-                                            "type": "string",
-                                            "description": "The search query to look up in files"
-                                        }
-                                    },
-                                    "required": ["query"]
-                                }),
-                            },
-                        });
-                    }
-                    models::ResponseTool::Function {
-                        name,
-                        description,
-                        parameters,
-                    } => {
-                        tool_definitions.push(inference_providers::ToolDefinition {
-                            type_: "function".to_string(),
-                            function: inference_providers::FunctionDefinition {
-                                name: name.clone(),
-                                description: description.clone(),
-                                parameters: parameters.clone().unwrap_or_else(|| {
-                                    serde_json::json!({
-                                        "type": "object",
-                                        "properties": {}
-                                    })
-                                }),
-                            },
-                        });
-                    }
-                    models::ResponseTool::CodeInterpreter {} => {
-                        tool_definitions.push(inference_providers::ToolDefinition {
-                            type_: "function".to_string(),
-                            function: inference_providers::FunctionDefinition {
-                                name: "code_interpreter".to_string(),
-                                description: Some(
-                                    "Execute Python code in a sandboxed environment.".to_string(),
-                                ),
-                                parameters: serde_json::json!({
-                                    "type": "object",
-                                    "properties": {
-                                        "code": {
-                                            "type": "string",
-                                            "description": "Python code to execute"
-                                        }
-                                    },
-                                    "required": ["code"]
-                                }),
-                            },
-                        });
-                    }
-                    models::ResponseTool::Computer {} => {
-                        tool_definitions.push(inference_providers::ToolDefinition {
-                            type_: "function".to_string(),
-                            function: inference_providers::FunctionDefinition {
-                                name: "computer".to_string(),
-                                description: Some(
-                                    "Control computer actions like mouse clicks and keyboard input.".to_string()
-                                ),
-                                parameters: serde_json::json!({
-                                    "type": "object",
-                                    "properties": {
-                                        "action": {
-                                            "type": "string",
-                                            "description": "The action to perform"
-                                        }
-                                    },
-                                    "required": ["action"]
-                                }),
-                            },
-                        });
-                    }
-                    models::ResponseTool::Mcp { .. } => {
-                        // MCP tools are handled separately via McpToolExecutor
-                        // Tool definitions are dynamically discovered from the MCP server
-                        // and added to the request in process_response_stream
-                    }
-                }
-            }
-        }
-
-        tool_definitions
-    }
-
-    /// Prepare tool choice configuration
-    fn prepare_tool_choice(
-        request: &models::CreateResponseRequest,
-    ) -> Option<inference_providers::ToolChoice> {
-        request.tool_choice.as_ref().map(|choice| match choice {
-            models::ResponseToolChoice::Auto(s) => {
-                inference_providers::ToolChoice::String(s.clone())
-            }
-            models::ResponseToolChoice::Specific { type_, function } => {
-                inference_providers::ToolChoice::Function {
-                    type_: type_.clone(),
-                    function: inference_providers::FunctionChoice {
-                        name: function.name.clone(),
-                    },
-                }
-            }
-        })
     }
 
     /// Extract text and reasoning deltas from SSE event
@@ -2609,6 +2255,7 @@ impl ResponseServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::responses::tools::WEB_SEARCH_TOOL_NAME;
 
     #[test]
     fn test_process_reasoning_tags_simple_think() {

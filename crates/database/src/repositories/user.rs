@@ -304,7 +304,9 @@ impl UserRepository {
             ) olh ON true
             LEFT JOIN organization_balance ob ON o.id = ob.organization_id
             WHERE u.is_active = true
-              AND ($3::TEXT IS NULL OR o.name ILIKE ($3 || '%') ESCAPE '\')
+              AND ($3::TEXT IS NULL 
+                   OR o.name ILIKE ('%' || $3 || '%') ESCAPE '\'
+                   OR o.id IS NULL)
             ORDER BY u.id, o.created_at ASC NULLS LAST
             LIMIT $1
             OFFSET $2

@@ -6,9 +6,9 @@ use crate::repositories::{
 use anyhow::Result;
 use async_trait::async_trait;
 use services::admin::{
-    AdminModelInfo, AdminRepository, ModelHistoryEntry, ModelPricing, OrganizationLimits,
-    OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate, UpdateModelAdminRequest, UserInfo,
-    UserOrganizationInfo,
+    AdminModelInfo, AdminOrganizationInfo, AdminRepository, ModelHistoryEntry, ModelPricing,
+    OrganizationLimits, OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate,
+    UpdateModelAdminRequest, UserInfo, UserOrganizationInfo,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -349,5 +349,76 @@ impl AdminRepository for AdminCompositeRepository {
             }
             None => anyhow::bail!("Organization not found or inactive: {}", organization_id),
         }
+    }
+
+    async fn list_all_organizations(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AdminOrganizationInfo>> {
+        let client = self.pool.get().await?;
+
+        let rows = client
+            .query(
+                r#"
+                SELECT
+                    o.id,
+                    o.name,
+                    o.description,
+                    o.created_at,
+                    olh.spend_limit,
+                    ob.total_spent,
+                    ob.total_requests,
+                    ob.total_tokens
+                FROM organizations o
+                LEFT JOIN LATERAL (
+                    SELECT spend_limit
+                    FROM organization_limits_history
+                    WHERE organization_id = o.id
+                      AND effective_until IS NULL
+                    ORDER BY effective_from DESC
+                    LIMIT 1
+                ) olh ON true
+                LEFT JOIN organization_balance ob ON o.id = ob.organization_id
+                WHERE o.is_active = true
+                ORDER BY o.created_at DESC
+                LIMIT $1 OFFSET $2
+                "#,
+                &[&limit, &offset],
+            )
+            .await?;
+
+        let organizations = rows
+            .into_iter()
+            .map(|row| AdminOrganizationInfo {
+                id: row.get("id"),
+                name: row.get("name"),
+                description: row.get("description"),
+                spend_limit: row.get("spend_limit"),
+                total_spent: row.get("total_spent"),
+                total_requests: row.get("total_requests"),
+                total_tokens: row.get("total_tokens"),
+                created_at: row.get("created_at"),
+            })
+            .collect();
+
+        Ok(organizations)
+    }
+
+    async fn count_all_organizations(&self) -> Result<i64> {
+        let client = self.pool.get().await?;
+
+        let row = client
+            .query_one(
+                r#"
+                SELECT COUNT(*) as count
+                FROM organizations
+                WHERE is_active = true
+                "#,
+                &[],
+            )
+            .await?;
+
+        Ok(row.get::<_, i64>("count"))
     }
 }

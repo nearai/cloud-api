@@ -36,8 +36,6 @@ const GATEWAY_KEY_SALT: &[u8] = b"signing-key";
 const GATEWAY_KEY_INFO_ED25519: &[u8] = b"/ed25519";
 const GATEWAY_KEY_INFO_ECDSA: &[u8] = b"/ecdsa";
 
-const MAX_DERIVATION_ATTEMPTS: u16 = 1024;
-
 pub struct AttestationService {
     pub repository: Arc<dyn AttestationRepository + Send + Sync>,
     pub inference_provider_pool: Arc<InferenceProviderPool>,
@@ -141,93 +139,93 @@ impl AttestationService {
         )
     }
 
+    fn derive_ed25519_key(
+        input: &[u8],
+        info: &[u8],
+        salt: &[u8],
+    ) -> Result<SigningKey, AttestationError> {
+        const MAX_DERIVATION_ATTEMPTS: u8 = u8::MAX;
+
+        let hk = Hkdf::<Sha256>::new(Some(salt), input);
+
+        for ctr in 0..=MAX_DERIVATION_ATTEMPTS {
+            let mut normalized_info = Vec::with_capacity(info.len() + 1);
+            normalized_info.extend_from_slice(info);
+            normalized_info.extend_from_slice(&ctr.to_be_bytes());
+
+            let mut okm: [u8; 32] = [0u8; 32];
+
+            hk.expand(&normalized_info, &mut okm)
+                .map_err(|_| AttestationError::InternalError("HKDF expansion failed".into()))?;
+
+            // Validate the derived key material
+            if !okm.iter().all(|&b| b == 0) {
+                return Ok(SigningKey::from_bytes(&okm));
+            }
+        }
+
+        Err(AttestationError::InternalError(format!(
+            "failed to derive a valid ed25519 key from dstack key material after {} attempts",
+            MAX_DERIVATION_ATTEMPTS + 1
+        )))
+    }
+
+    fn derive_ecdsa_key(
+        input: &[u8],
+        info: &[u8],
+        salt: &[u8],
+    ) -> Result<EcdsaSigningKey, AttestationError> {
+        const MAX_DERIVATION_ATTEMPTS: u8 = u8::MAX;
+
+        let hk = Hkdf::<Sha256>::new(Some(salt), input);
+
+        for ctr in 0..=MAX_DERIVATION_ATTEMPTS {
+            let mut normalized_info = Vec::with_capacity(info.len() + 1);
+            normalized_info.extend_from_slice(info);
+            normalized_info.extend_from_slice(&ctr.to_be_bytes());
+
+            let mut key_material: [u8; 32] = [0u8; 32];
+
+            hk.expand(&normalized_info, &mut key_material)
+                .map_err(|_| AttestationError::InternalError("HKDF expansion failed".into()))?;
+
+            // Validate the derived key material
+            if let Ok(key) = EcdsaSigningKey::from_bytes(&key_material.into()) {
+                return Ok(key);
+            }
+        }
+
+        Err(AttestationError::InternalError(format!(
+            "failed to derive a valid ecdsa key from dstack key material after {} attempts",
+            MAX_DERIVATION_ATTEMPTS + 1
+        )))
+    }
+
     async fn derive_signing_keys_from_dstack(
     ) -> Result<(SigningKey, VerifyingKey, EcdsaSigningKey, EcdsaVerifyingKey), AttestationError>
     {
         let client = dstack_client::DstackClient::new(None);
 
-        let key_resp = client.get_key(Some(GATEWAY_KEY_PATH.into()), None).await.map_err(|e| {
-            AttestationError::InternalError(format!("failed to get dstack derived key: {e:?}"))
-        })?;
+        let key_resp = client
+            .get_key(Some(GATEWAY_KEY_PATH.into()), None)
+            .await
+            .map_err(|e| {
+                AttestationError::InternalError(format!("failed to get dstack derived key: {e:?}"))
+            })?;
 
         let key_bytes = key_resp.decode_key().map_err(|e| {
             AttestationError::InternalError(format!("failed to decode dstack derived key hex: {e}"))
         })?;
 
-        // Use HKDF-SHA256 for secure key derivation
-        let hk = Hkdf::<Sha256>::new(Some(GATEWAY_KEY_SALT), &key_bytes);
-
         // Derive ed25519 secret seed (32 bytes)
-        // Use loop to retry if derived key is all zeros
-        let mut ed25519_signing_key_opt: Option<SigningKey> = None;
-        let mut ed25519_attempts = 0u16;
-
-        for ctr in 0u16..=MAX_DERIVATION_ATTEMPTS {
-            ed25519_attempts = ctr + 1;
-
-            // Build normalized_info: always include counter for consistent derivation
-            let mut normalized_info = Vec::with_capacity(GATEWAY_KEY_INFO_ED25519.len() + 2);
-            normalized_info.extend_from_slice(GATEWAY_KEY_INFO_ED25519);
-            normalized_info.extend_from_slice(&ctr.to_be_bytes());
-
-            let mut ed_secret: [u8; 32] = [0u8; 32];
-            hk.expand(&normalized_info, &mut ed_secret).map_err(|e| {
-                AttestationError::InternalError(format!("HKDF expansion failed for ed25519: {e}"))
-            })?;
-
-            // Check if the derived key is all zeros
-            if ed_secret.iter().all(|&b| b == 0) {
-                continue;
-            }
-
-            let ed25519_signing_key = SigningKey::from_bytes(&ed_secret);
-            ed25519_signing_key_opt = Some(ed25519_signing_key);
-            break;
-        }
-
-        let ed25519_signing_key = ed25519_signing_key_opt.ok_or_else(|| {
-            AttestationError::InternalError(format!(
-                "Failed to derive a valid ed25519 signing key from dstack key material after {} attempts. \
-                 This indicates a serious issue with key material or derivation process.",
-                ed25519_attempts
-            ))
-        })?;
+        let ed25519_signing_key =
+            Self::derive_ed25519_key(&key_bytes, GATEWAY_KEY_INFO_ED25519, GATEWAY_KEY_SALT)?;
 
         let ed25519_verifying_key = ed25519_signing_key.verifying_key();
 
         // Derive ECDSA secret scalar (32 bytes)
-        // Most attempts should succeed on the first try (probability ~100% for secp256k1)
-        // The curve order is very close to 2^256, so invalid scalars are extremely rare (~3.7e-37%)
-        let mut ecdsa_signing_key_opt: Option<EcdsaSigningKey> = None;
-        let mut attempts = 0u16;
-
-        for ctr in 0u16..=MAX_DERIVATION_ATTEMPTS {
-            attempts = ctr + 1;
-
-            // Build normalized_info: always include counter for consistent derivation
-            let mut normalized_info = Vec::with_capacity(GATEWAY_KEY_INFO_ECDSA.len() + 2);
-            normalized_info.extend_from_slice(GATEWAY_KEY_INFO_ECDSA);
-            normalized_info.extend_from_slice(&ctr.to_be_bytes());
-
-            let mut ecdsa_seed: [u8; 32] = [0u8; 32];
-
-            hk.expand(&normalized_info, &mut ecdsa_seed).map_err(|e| {
-                AttestationError::InternalError(format!("HKDF expansion failed for ecdsa: {e}"))
-            })?;
-
-            if let Ok(sk) = EcdsaSigningKey::from_bytes(&ecdsa_seed.into()) {
-                ecdsa_signing_key_opt = Some(sk);
-                break;
-            }
-        }
-
-        let ecdsa_signing_key = ecdsa_signing_key_opt.ok_or_else(|| {
-            AttestationError::InternalError(format!(
-                "Failed to derive a valid secp256k1 signing key from dstack key material after {} attempts. \
-                 This indicates a serious issue with key material or derivation process.",
-                attempts
-            ))
-        })?;
+        let ecdsa_signing_key =
+            Self::derive_ecdsa_key(&key_bytes, GATEWAY_KEY_INFO_ECDSA, GATEWAY_KEY_SALT)?;
 
         let ecdsa_verifying_key = *ecdsa_signing_key.verifying_key();
 

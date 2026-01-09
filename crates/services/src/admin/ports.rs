@@ -272,14 +272,10 @@ pub trait AdminRepository: Send + Sync {
         &self,
         limit: i64,
         offset: i64,
-        search_by_name: Option<String>,
     ) -> Result<Vec<AdminOrganizationInfo>, anyhow::Error>;
 
     /// Count all active organizations (admin only)
-    async fn count_all_organizations(
-        &self,
-        search_by_name: Option<String>,
-    ) -> Result<i64, anyhow::Error>;
+    async fn count_all_organizations(&self) -> Result<i64, anyhow::Error>;
 }
 
 /// Admin service trait for managing platform configuration
@@ -363,6 +359,5 @@ pub trait AdminService: Send + Sync {
         &self,
         limit: i64,
         offset: i64,
-        search_by_name: Option<String>,
     ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError>;
 }

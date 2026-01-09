@@ -355,73 +355,38 @@ impl AdminRepository for AdminCompositeRepository {
         &self,
         limit: i64,
         offset: i64,
-        search_by_name: Option<String>,
     ) -> Result<Vec<AdminOrganizationInfo>> {
         let client = self.pool.get().await?;
 
-        let rows = if let Some(ref name_filter) = search_by_name {
-            let pattern = format!("%{}%", name_filter.to_lowercase());
-            client
-                .query(
-                    r#"
-                    SELECT
-                        o.id,
-                        o.name,
-                        o.description,
-                        o.created_at,
-                        olh.spend_limit,
-                        ob.total_spent,
-                        ob.total_requests,
-                        ob.total_tokens
-                    FROM organizations o
-                    LEFT JOIN LATERAL (
-                        SELECT spend_limit
-                        FROM organization_limits_history
-                        WHERE organization_id = o.id
-                          AND effective_until IS NULL
-                        ORDER BY effective_from DESC
-                        LIMIT 1
-                    ) olh ON true
-                    LEFT JOIN organization_balance ob ON o.id = ob.organization_id
-                    WHERE o.is_active = true
-                      AND LOWER(o.name) LIKE $1
-                    ORDER BY o.created_at DESC
-                    LIMIT $2 OFFSET $3
-                    "#,
-                    &[&pattern, &limit, &offset],
-                )
-                .await?
-        } else {
-            client
-                .query(
-                    r#"
-                    SELECT
-                        o.id,
-                        o.name,
-                        o.description,
-                        o.created_at,
-                        olh.spend_limit,
-                        ob.total_spent,
-                        ob.total_requests,
-                        ob.total_tokens
-                    FROM organizations o
-                    LEFT JOIN LATERAL (
-                        SELECT spend_limit
-                        FROM organization_limits_history
-                        WHERE organization_id = o.id
-                          AND effective_until IS NULL
-                        ORDER BY effective_from DESC
-                        LIMIT 1
-                    ) olh ON true
-                    LEFT JOIN organization_balance ob ON o.id = ob.organization_id
-                    WHERE o.is_active = true
-                    ORDER BY o.created_at DESC
-                    LIMIT $1 OFFSET $2
-                    "#,
-                    &[&limit, &offset],
-                )
-                .await?
-        };
+        let rows = client
+            .query(
+                r#"
+                SELECT
+                    o.id,
+                    o.name,
+                    o.description,
+                    o.created_at,
+                    olh.spend_limit,
+                    ob.total_spent,
+                    ob.total_requests,
+                    ob.total_tokens
+                FROM organizations o
+                LEFT JOIN LATERAL (
+                    SELECT spend_limit
+                    FROM organization_limits_history
+                    WHERE organization_id = o.id
+                      AND effective_until IS NULL
+                    ORDER BY effective_from DESC
+                    LIMIT 1
+                ) olh ON true
+                LEFT JOIN organization_balance ob ON o.id = ob.organization_id
+                WHERE o.is_active = true
+                ORDER BY o.created_at DESC
+                LIMIT $1 OFFSET $2
+                "#,
+                &[&limit, &offset],
+            )
+            .await?;
 
         let organizations = rows
             .into_iter()
@@ -440,34 +405,19 @@ impl AdminRepository for AdminCompositeRepository {
         Ok(organizations)
     }
 
-    async fn count_all_organizations(&self, search_by_name: Option<String>) -> Result<i64> {
+    async fn count_all_organizations(&self) -> Result<i64> {
         let client = self.pool.get().await?;
 
-        let row = if let Some(ref name_filter) = search_by_name {
-            let pattern = format!("%{}%", name_filter.to_lowercase());
-            client
-                .query_one(
-                    r#"
-                    SELECT COUNT(*) as count
-                    FROM organizations
-                    WHERE is_active = true
-                      AND LOWER(name) LIKE $1
-                    "#,
-                    &[&pattern],
-                )
-                .await?
-        } else {
-            client
-                .query_one(
-                    r#"
-                    SELECT COUNT(*) as count
-                    FROM organizations
-                    WHERE is_active = true
-                    "#,
-                    &[],
-                )
-                .await?
-        };
+        let row = client
+            .query_one(
+                r#"
+                SELECT COUNT(*) as count
+                FROM organizations
+                WHERE is_active = true
+                "#,
+                &[],
+            )
+            .await?;
 
         Ok(row.get::<_, i64>("count"))
     }

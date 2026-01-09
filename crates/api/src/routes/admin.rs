@@ -816,8 +816,7 @@ pub async fn list_users(
     tag = "Admin",
     params(
         ("limit" = Option<i64>, Query, description = "Maximum number of organizations to return (default: 100)"),
-        ("offset" = Option<i64>, Query, description = "Number of organizations to skip (default: 0)"),
-        ("search_by_name" = Option<String>, Query, description = "Filter organizations by name (case-insensitive partial match)")
+        ("offset" = Option<i64>, Query, description = "Number of organizations to skip (default: 0)")
     ),
     responses(
         (status = 200, description = "Organizations retrieved successfully", body = ListOrganizationsAdminResponse),
@@ -837,13 +836,13 @@ pub async fn list_organizations(
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     debug!(
-        "List organizations request with limit={}, offset={}, search_by_name={:?}",
-        params.limit, params.offset, params.search_by_name
+        "List organizations request with limit={}, offset={}",
+        params.limit, params.offset
     );
 
     let (organizations, total) = app_state
         .admin_service
-        .list_organizations(params.limit, params.offset, params.search_by_name)
+        .list_organizations(params.limit, params.offset)
         .await
         .map_err(|e| {
             error!("Failed to list organizations: {:?}", e);
@@ -1165,7 +1164,6 @@ pub struct ListOrganizationsQueryParams {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
-    pub search_by_name: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]

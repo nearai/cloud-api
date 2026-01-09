@@ -43,16 +43,15 @@ impl WorkspaceRepository {
                 .query_one(
                     r#"
                 INSERT INTO workspaces (
-                    id, name, display_name, description, organization_id, 
+                    id, name, description, organization_id,
                     created_by_user_id, created_at, updated_at, is_active
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, true)
                 RETURNING *
                 "#,
                     &[
                         &id,
                         &request.name,
-                        &request.display_name,
                         &request.description,
                         &organization_id,
                         &created_by_user_id,
@@ -219,7 +218,7 @@ impl WorkspaceRepository {
 
             client
             .query(
-                &format!("SELECT * FROM workspaces WHERE organization_id = $1 ORDER BY {order_by_column} {order_dir} LIMIT $2 OFFSET $3"),
+                &format!("SELECT * FROM workspaces WHERE organization_id = $1 AND is_active = true ORDER BY {order_by_column} {order_dir} LIMIT $2 OFFSET $3"),
                 &[&organization_id, &limit, &offset],
             )
             .await
@@ -269,9 +268,9 @@ impl WorkspaceRepository {
         let mut param_index = 2; // Start from $2, $1 is the ID
         let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&id];
 
-        if let Some(ref display_name) = request.display_name {
-            query.push_str(&format!(", display_name = ${param_index}"));
-            params.push(display_name);
+        if let Some(ref name) = request.name {
+            query.push_str(&format!(", name = ${param_index}"));
+            params.push(name);
             param_index += 1;
         }
 
@@ -338,7 +337,6 @@ impl WorkspaceRepository {
         Ok(Workspace {
             id: row.get("id"),
             name: row.get("name"),
-            display_name: row.get("display_name"),
             description: row.get("description"),
             organization_id: row.get("organization_id"),
             created_by_user_id: row.get("created_by_user_id"),
@@ -387,7 +385,6 @@ impl WorkspaceRepository {
                 let workspace = Workspace {
                     id: row.get("id"),
                     name: row.get("name"),
-                    display_name: row.get("display_name"),
                     description: row.get("description"),
                     organization_id: row.get("organization_id"),
                     created_by_user_id: row.get("created_by_user_id"),
@@ -515,16 +512,11 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
     async fn create(
         &self,
         name: String,
-        display_name: String,
         description: Option<String>,
         organization_id: services::organization::OrganizationId,
         created_by_user_id: services::auth::ports::UserId,
     ) -> Result<services::workspace::Workspace, RepositoryError> {
-        let request = crate::models::CreateWorkspaceRequest {
-            name,
-            display_name,
-            description,
-        };
+        let request = crate::models::CreateWorkspaceRequest { name, description };
         let db_workspace = self
             .create(request, organization_id.0, created_by_user_id.0)
             .await?;
@@ -534,12 +526,12 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
     async fn update(
         &self,
         workspace_id: services::workspace::WorkspaceId,
-        display_name: Option<String>,
+        name: Option<String>,
         description: Option<String>,
         settings: Option<serde_json::Value>,
     ) -> Result<Option<services::workspace::Workspace>, RepositoryError> {
         let request = crate::models::UpdateWorkspaceRequest {
-            display_name,
+            name,
             description,
             settings,
         };
@@ -571,7 +563,6 @@ fn db_workspace_to_workspace_service(
     services::workspace::Workspace {
         id: services::workspace::WorkspaceId(db_workspace.id),
         name: db_workspace.name,
-        display_name: db_workspace.display_name,
         description: db_workspace.description,
         organization_id: services::organization::ports::OrganizationId(
             db_workspace.organization_id,

@@ -162,7 +162,6 @@ pub async fn get_current_user(
                 workspaces.push(crate::models::UserWorkspaceResponse {
                     id: workspace.id.0.to_string(),
                     name: workspace.name,
-                    display_name: Some(workspace.display_name),
                     organization_id: workspace.organization_id.0.to_string(),
                     is_active: workspace.is_active,
                     created_at: workspace.created_at,

@@ -267,6 +267,24 @@ impl AdminService for AdminServiceImpl {
                 }
             })
     }
+
+    async fn list_organizations(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError> {
+        // Execute both queries in parallel for better performance
+        let (organizations_result, total_result) = tokio::join!(
+            self.repository.list_all_organizations(limit, offset),
+            self.repository.count_all_organizations()
+        );
+
+        let organizations =
+            organizations_result.map_err(|e| AdminError::InternalError(e.to_string()))?;
+        let total = total_result.map_err(|e| AdminError::InternalError(e.to_string()))?;
+
+        Ok((organizations, total))
+    }
 }
 
 impl AdminServiceImpl {

@@ -1607,6 +1607,28 @@ pub struct ListUsersResponse {
     pub offset: i64,
 }
 
+/// Organization details for admin organization listing
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminOrganizationResponse {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(rename = "spendLimit", skip_serializing_if = "Option::is_none")]
+    pub spend_limit: Option<SpendLimit>,
+    #[serde(rename = "currentUsage", skip_serializing_if = "Option::is_none")]
+    pub current_usage: Option<OrganizationUsage>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// List organizations response model (admin only)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListOrganizationsAdminResponse {
+    pub organizations: Vec<AdminOrganizationResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 /// Admin access token request model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateAdminAccessTokenRequest {

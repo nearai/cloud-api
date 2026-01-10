@@ -1066,7 +1066,7 @@ pub fn build_admin_routes(
         batch_upsert_models, create_admin_access_token, delete_admin_access_token, delete_model,
         get_model_history, get_organization_concurrent_limit, get_organization_limits_history,
         get_organization_metrics, get_organization_timeseries, get_platform_metrics,
-        list_admin_access_tokens, list_models as admin_list_models, list_users,
+        list_admin_access_tokens, list_models as admin_list_models, list_organizations, list_users,
         update_organization_concurrent_limit, update_organization_limits, AdminAppState,
     };
     use database::repositories::{
@@ -1139,6 +1139,10 @@ pub fn build_admin_routes(
             axum::routing::get(get_platform_metrics),
         )
         .route("/admin/users", axum::routing::get(list_users))
+        .route(
+            "/admin/organizations",
+            axum::routing::get(list_organizations),
+        )
         .route(
             "/admin/access-tokens",
             axum::routing::post(create_admin_access_token),

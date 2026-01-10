@@ -684,6 +684,22 @@ pub enum ResponseOutputItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    #[serde(rename = "mcp_approval_request")]
+    McpApprovalRequest {
+        id: String,
+        #[serde(default)]
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        #[serde(default)]
+        created_at: i64,
+        server_label: String,
+        name: String,
+        arguments: String,
+        model: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -1586,6 +1602,28 @@ pub struct OrganizationMemberResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ListUsersResponse {
     pub users: Vec<AdminUserResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// Organization details for admin organization listing
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminOrganizationResponse {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(rename = "spendLimit", skip_serializing_if = "Option::is_none")]
+    pub spend_limit: Option<SpendLimit>,
+    #[serde(rename = "currentUsage", skip_serializing_if = "Option::is_none")]
+    pub current_usage: Option<OrganizationUsage>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// List organizations response model (admin only)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListOrganizationsAdminResponse {
+    pub organizations: Vec<AdminOrganizationResponse>,
     pub total: i64,
     pub limit: i64,
     pub offset: i64,

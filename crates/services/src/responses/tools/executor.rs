@@ -4,7 +4,8 @@
 //! enabling extensible tool handling with a consistent interface.
 
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use crate::responses::errors::ResponseError;
 use crate::responses::models::{CreateResponseRequest, ResponseOutputItem, ResponseStreamEvent};
@@ -97,6 +98,15 @@ pub enum ToolOutput {
     },
 }
 
+/// Result of tool execution indicating how the agent loop should proceed
+#[derive(Debug, Clone)]
+pub enum ToolExecutionResult {
+    /// Tool executed successfully, continue agent loop
+    Success,
+    /// Tool requires approval, pause agent loop
+    ApprovalRequired,
+}
+
 /// Context for tool execution
 ///
 /// Provides read-only access to request data. Tool executors should be
@@ -162,14 +172,41 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Result<(), ResponseError> {
         Ok(())
     }
+
+    /// Handle an error from tool execution.
+    ///
+    /// This allows each executor to handle its own errors in a custom way.
+    /// For example, MCP executor handles `McpApprovalRequired` by emitting
+    /// an approval request.
+    ///
+    /// Returns:
+    /// - `Ok(Some(ToolOutput))` to convert error to output (e.g., error message for LLM)
+    /// - `Ok(None)` to signal the error was handled but requires special control flow (e.g., approval required)
+    /// - `Err(ResponseError)` to propagate the error up
+    ///
+    /// Default implementation converts the error to a text message for the LLM.
+    async fn handle_error(
+        &self,
+        error: ResponseError,
+        _tool_call: &ToolCallInfo,
+        _event_ctx: &mut ToolEventContext<'_>,
+    ) -> Result<Option<ToolOutput>, ResponseError> {
+        // Default: convert error to text output for LLM
+        Ok(Some(ToolOutput::Text(format!("ERROR: {error}"))))
+    }
 }
 
 /// Registry for tool executors
 ///
 /// Holds a collection of tool executors and dispatches tool calls
 /// to the appropriate executor based on the tool name.
+/// Maximum consecutive failures before logging error instead of warning
+pub const MAX_CONSECUTIVE_TOOL_FAILURES: u32 = 3;
+
 pub struct ToolRegistry {
     executors: Vec<Arc<dyn ToolExecutor>>,
+    /// Track consecutive failures per tool type for retry-aware logging
+    failure_counts: RwLock<HashMap<String, u32>>,
 }
 
 impl ToolRegistry {
@@ -177,6 +214,44 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             executors: Vec::new(),
+            failure_counts: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Reset the failure counter for a tool type (called on success)
+    fn reset_failure_count(&self, tool_type: &str) {
+        if let Ok(mut counts) = self.failure_counts.write() {
+            counts.remove(tool_type);
+        }
+    }
+
+    /// Increment failure counter for a tool type and return the new count
+    fn increment_failure_count(&self, tool_type: &str) -> u32 {
+        if let Ok(mut counts) = self.failure_counts.write() {
+            let count = counts.entry(tool_type.to_string()).or_insert(0);
+            *count += 1;
+            *count
+        } else {
+            1
+        }
+    }
+
+    /// Log a tool error with retry-aware messaging
+    fn log_tool_error(&self, tool_type: &str, failure_count: u32) {
+        if failure_count > MAX_CONSECUTIVE_TOOL_FAILURES {
+            tracing::error!(
+                tool = %tool_type,
+                failures = %failure_count,
+                "Tool failed after {} attempts. Error fed back to LLM for correction.",
+                MAX_CONSECUTIVE_TOOL_FAILURES,
+            );
+        } else {
+            tracing::warn!(
+                tool = %tool_type,
+                attempt = %failure_count,
+                max_retries = MAX_CONSECUTIVE_TOOL_FAILURES,
+                "Tool failed, feeding error back to LLM for retry",
+            );
         }
     }
 
@@ -201,7 +276,12 @@ impl ToolRegistry {
 
         for executor in &self.executors {
             if executor.can_handle(&tool_call.tool_type) {
-                return executor.execute(tool_call, context).await;
+                let result = executor.execute(tool_call, context).await;
+                // Reset failure count on success
+                if result.is_ok() {
+                    self.reset_failure_count(&tool_call.tool_type);
+                }
+                return result;
             }
         }
 
@@ -243,6 +323,30 @@ impl ToolRegistry {
             }
         }
         Ok(()) // No-op if no executor found
+    }
+
+    /// Handle an error from tool execution
+    ///
+    /// Finds the appropriate executor and calls its handle_error method.
+    /// If no executor is found, converts the error to a text message.
+    pub async fn handle_error(
+        &self,
+        error: ResponseError,
+        tool_call: &ToolCallInfo,
+        event_ctx: &mut ToolEventContext<'_>,
+    ) -> Result<Option<ToolOutput>, ResponseError> {
+        // Track and log failure
+        let failure_count = self.increment_failure_count(&tool_call.tool_type);
+        self.log_tool_error(&tool_call.tool_type, failure_count);
+
+        // Delegate to executor for custom handling (e.g., MCP approval)
+        for executor in &self.executors {
+            if executor.can_handle(&tool_call.tool_type) {
+                return executor.handle_error(error, tool_call, event_ctx).await;
+            }
+        }
+        // No executor found, use default behavior
+        Ok(Some(ToolOutput::Text(format!("ERROR: {error}"))))
     }
 }
 

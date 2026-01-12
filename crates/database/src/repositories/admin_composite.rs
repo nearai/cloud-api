@@ -237,13 +237,14 @@ impl AdminRepository for AdminCompositeRepository {
         &self,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<(UserInfo, Option<UserOrganizationInfo>)>> {
-        let users_with_orgs = self
+        search_by_name: Option<String>,
+    ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64)> {
+        let (users_with_orgs, total_count) = self
             .user_repo
-            .list_with_organizations(limit, offset)
+            .list_with_organizations(limit, offset, search_by_name)
             .await?;
 
-        Ok(users_with_orgs
+        let result = users_with_orgs
             .into_iter()
             .map(|(u, org_data)| {
                 let user_info = UserInfo {
@@ -258,7 +259,9 @@ impl AdminRepository for AdminCompositeRepository {
                 };
                 (user_info, org_data)
             })
-            .collect())
+            .collect();
+
+        Ok((result, total_count))
     }
 
     async fn get_active_user_count(&self) -> Result<i64> {

@@ -291,12 +291,16 @@ pub async fn init_domain_services_with_pool(
     ));
 
     // Create attestation service
-    let attestation_service = Arc::new(services::attestation::AttestationService::new(
-        attestation_repo,
-        inference_provider_pool.clone(),
-        models_repo.clone(),
-        metrics_service.clone(),
-    ));
+    let attestation_service = Arc::new(
+        services::attestation::AttestationService::init(
+            attestation_repo,
+            inference_provider_pool.clone(),
+            models_repo.clone(),
+            metrics_service.clone(),
+        )
+        .await
+        .unwrap(),
+    );
 
     // Create models service
     let models_service = Arc::new(services::models::ModelsServiceImpl::new(

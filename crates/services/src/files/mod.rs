@@ -72,9 +72,12 @@ pub const ALLOWED_MIME_TYPES: &[(&str, bool)] = &[
     ("text/plain", true),
     // Markup / documentation
     ("application/xml", true),      // .xml, .xhtml
+    ("text/xml", true),             // .xml (alternative MIME type)
     ("application/x-bibtex", true), // .bib
     // YAML
-    ("application/yaml", true), // .yaml, .yml
+    ("application/yaml", true), // .yaml, .yml (RFC 9512 standard)
+    ("text/yaml", true),        // .yaml, .yml (deprecated but still used)
+    ("text/x-yaml", true),      // .yaml, .yml (deprecated but still used)
     // Web manifests
     ("application/manifest+json", true), // .webmanifest
     // PHP alternative

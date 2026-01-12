@@ -1,4 +1,4 @@
-use crate::{models::StreamOptions, sse_parser::SSEParser, *};
+use crate::{models::StreamOptions, sse_parser::SSEParser, ImageGenerationError, *};
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
@@ -394,5 +394,50 @@ impl InferenceProvider for VLlmProvider {
         // Use the SSE parser to handle the stream properly
         let sse_stream = SSEParser::new(response.bytes_stream(), false);
         Ok(Box::pin(sse_stream))
+    }
+
+    /// Performs an image generation request
+    async fn image_generation(
+        &self,
+        params: ImageGenerationParams,
+        request_hash: String,
+    ) -> Result<ImageGenerationResponse, ImageGenerationError> {
+        let url = format!("{}/v1/images/generations", self.config.base_url);
+
+        let mut headers = self
+            .build_headers()
+            .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
+
+        headers.insert(
+            "X-Request-Hash",
+            HeaderValue::from_str(&request_hash)
+                .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?,
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&params)
+            .send()
+            .await
+            .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(ImageGenerationError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        response
+            .json()
+            .await
+            .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))
     }
 }

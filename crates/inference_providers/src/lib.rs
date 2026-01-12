@@ -68,10 +68,11 @@ use tokio_stream::StreamExt;
 // Re-export commonly used types for convenience
 pub use mock::MockProvider;
 pub use models::{
-    ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
+    AudioOutput, ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionResponseWithBytes, ChatDelta, ChatMessage, ChatResponseMessage, ChatSignature,
-    CompletionError, CompletionParams, FinishReason, FunctionChoice, FunctionDefinition,
-    MessageRole, ModelInfo, StreamChunk, StreamOptions, TokenUsage, ToolChoice, ToolDefinition,
+    CompletionError, CompletionParams, FinishReason, FunctionChoice, FunctionDefinition, ImageData,
+    ImageGenerationError, ImageGenerationParams, ImageGenerationResponse, MessageRole, ModelInfo,
+    StreamChunk, StreamOptions, TokenUsage, ToolChoice, ToolDefinition,
 };
 pub use sse_parser::SSEEvent;
 pub use vllm::{VLlmConfig, VLlmProvider};
@@ -131,6 +132,15 @@ pub trait InferenceProvider {
         &self,
         params: CompletionParams,
     ) -> Result<StreamingResult, CompletionError>;
+
+    /// Performs an image generation request
+    ///
+    /// Returns generated images based on the provided text prompt.
+    async fn image_generation(
+        &self,
+        params: ImageGenerationParams,
+        request_hash: String,
+    ) -> Result<ImageGenerationResponse, ImageGenerationError>;
 
     async fn get_signature(
         &self,

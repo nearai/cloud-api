@@ -152,6 +152,57 @@ pub struct CompletionResponse {
     pub usage: Usage,
 }
 
+/// Request for image generation
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ImageGenerationRequest {
+    /// Model ID to use for generation
+    pub model: String,
+    /// Text prompt describing the image to generate
+    pub prompt: String,
+    /// Number of images to generate (default: 1)
+    #[serde(default = "default_n_images")]
+    pub n: Option<i32>,
+    /// Size of the generated images (e.g., "1024x1024", "512x512")
+    #[serde(default)]
+    pub size: Option<String>,
+    /// Response format: "url" or "b64_json"
+    #[serde(default)]
+    pub response_format: Option<String>,
+    /// Quality of the generated image: "standard" or "hd"
+    #[serde(default)]
+    pub quality: Option<String>,
+    /// Style of the generated image: "vivid" or "natural"
+    #[serde(default)]
+    pub style: Option<String>,
+}
+
+fn default_n_images() -> Option<i32> {
+    Some(1)
+}
+
+/// Response from image generation
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ImageGenerationResponse {
+    /// Unix timestamp of when the generation was created
+    pub created: i64,
+    /// Generated images
+    pub data: Vec<ImageData>,
+}
+
+/// Individual generated image
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ImageData {
+    /// Base64-encoded image data (when response_format is "b64_json")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub b64_json: Option<String>,
+    /// URL to the generated image (when response_format is "url")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Revised prompt used for generation (if model modified it)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revised_prompt: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelsResponse {
     pub object: String,
@@ -265,24 +316,7 @@ impl ChatCompletionRequest {
             if !["system", "user", "assistant", "tool"].contains(&message.role.as_str()) {
                 return Err(format!("invalid message role: {}", message.role));
             }
-
-            // Validate content: if it's an array, check that all parts are text-only
-            if let Some(MessageContent::Parts(parts)) = &message.content {
-                for part in parts {
-                    match part {
-                        MessageContentPart::Text { .. } => {
-                            // Text parts are allowed
-                        }
-                        MessageContentPart::ImageUrl { .. }
-                        | MessageContentPart::Audio { .. }
-                        | MessageContentPart::File { .. } => {
-                            return Err(
-                                "Content array contains non-text parts (image, audio, or file). Only text content is currently supported.".to_string()
-                            );
-                        }
-                    }
-                }
-            }
+            // Multimodal content (text, image, audio, file) is now supported via passthrough
         }
 
         if let Some(temp) = self.temperature {
@@ -298,6 +332,28 @@ impl ChatCompletionRequest {
         }
 
         Ok(())
+    }
+
+    /// Check if request contains image content (for size limit selection)
+    pub fn has_image_content(&self) -> bool {
+        self.messages.iter().any(|m| {
+            matches!(
+                &m.content,
+                Some(MessageContent::Parts(parts))
+                    if parts.iter().any(|p| matches!(p, MessageContentPart::ImageUrl { .. }))
+            )
+        })
+    }
+
+    /// Check if request contains audio content (for size limit selection)
+    pub fn has_audio_content(&self) -> bool {
+        self.messages.iter().any(|m| {
+            matches!(
+                &m.content,
+                Some(MessageContent::Parts(parts))
+                    if parts.iter().any(|p| matches!(p, MessageContentPart::Audio { .. }))
+            )
+        })
     }
 }
 
@@ -2391,17 +2447,16 @@ mod tests {
             extra: std::collections::HashMap::new(),
         };
 
-        // Image content should be rejected
+        // Image content is now allowed for multimodal passthrough
         let result = request.validate();
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err(),
-            "Content array contains non-text parts (image, audio, or file). Only text content is currently supported."
-        );
+        assert!(result.is_ok());
+        // Test helper method
+        assert!(request.has_image_content());
+        assert!(!request.has_audio_content());
     }
 
     #[test]
-    fn test_chat_completion_request_with_audio_content_rejected() {
+    fn test_chat_completion_request_with_audio_content_allowed() {
         let request = ChatCompletionRequest {
             model: "gpt-4".to_string(),
             messages: vec![Message {
@@ -2425,17 +2480,16 @@ mod tests {
             extra: std::collections::HashMap::new(),
         };
 
-        // Audio content should be rejected
+        // Audio content is now allowed for multimodal passthrough
         let result = request.validate();
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err(),
-            "Content array contains non-text parts (image, audio, or file). Only text content is currently supported."
-        );
+        assert!(result.is_ok());
+        // Test helper method
+        assert!(!request.has_image_content());
+        assert!(request.has_audio_content());
     }
 
     #[test]
-    fn test_chat_completion_request_with_file_content_rejected() {
+    fn test_chat_completion_request_with_file_content_allowed() {
         let request = ChatCompletionRequest {
             model: "gpt-4".to_string(),
             messages: vec![Message {
@@ -2456,13 +2510,12 @@ mod tests {
             extra: std::collections::HashMap::new(),
         };
 
-        // File content should be rejected
+        // File content is now allowed for multimodal passthrough
         let result = request.validate();
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err(),
-            "Content array contains non-text parts (image, audio, or file). Only text content is currently supported."
-        );
+        assert!(result.is_ok());
+        // File content doesn't count as image or audio
+        assert!(!request.has_image_content());
+        assert!(!request.has_audio_content());
     }
 
     #[test]

@@ -82,14 +82,18 @@ async fn test_chat_completion_streaming() {
         messages: vec![
             ChatMessage {
                 role: MessageRole::System,
-                content: Some("You are a helpful assistant. Please respond briefly.".to_string()),
+                content: Some(serde_json::Value::String(
+                    "You are a helpful assistant. Please respond briefly.".to_string(),
+                )),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
             },
             ChatMessage {
                 role: MessageRole::User,
-                content: Some("Hello! Can you count to 3?".to_string()),
+                content: Some(serde_json::Value::String(
+                    "Hello! Can you count to 3?".to_string(),
+                )),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
@@ -115,6 +119,7 @@ async fn test_chat_completion_streaming() {
         metadata: None,
         store: None,
         stream_options: None,
+        modalities: None,
         extra: std::collections::HashMap::new(),
     };
 
@@ -320,7 +325,7 @@ async fn test_error_handling() {
         model: "nonexistent-model-12345".to_string(),
         messages: vec![ChatMessage {
             role: MessageRole::User,
-            content: Some("Hello".to_string()),
+            content: Some(serde_json::Value::String("Hello".to_string())),
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -345,6 +350,7 @@ async fn test_error_handling() {
         metadata: None,
         store: None,
         stream_options: None,
+        modalities: None,
         extra: std::collections::HashMap::new(),
     };
 
@@ -407,7 +413,9 @@ async fn test_chat_completion_streaming_with_tool_calls() {
         model: model_id.clone(),
         messages: vec![ChatMessage {
             role: MessageRole::User,
-            content: Some("What's the weather in New York today?".to_string()),
+            content: Some(serde_json::Value::String(
+                "What's the weather in New York today?".to_string(),
+            )),
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -432,6 +440,7 @@ async fn test_chat_completion_streaming_with_tool_calls() {
         metadata: None,
         store: None,
         stream_options: None,
+        modalities: None,
         extra: std::collections::HashMap::new(),
     };
 
@@ -597,7 +606,9 @@ async fn test_reasoning_content() {
         model: "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
         messages: vec![ChatMessage {
             role: MessageRole::User,
-            content: Some("Why is the sky blue?".to_string()),
+            content: Some(serde_json::Value::String(
+                "Why is the sky blue?".to_string(),
+            )),
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -622,6 +633,7 @@ async fn test_reasoning_content() {
         metadata: None,
         store: None,
         stream_options: None,
+        modalities: None,
         extra: std::collections::HashMap::new(),
     };
 
@@ -661,4 +673,104 @@ async fn test_reasoning_content() {
         content_received,
         "The sky is blue due to Rayleigh scattering."
     );
+}
+
+/// Test image generation with real vLLM provider
+/// Run with: VLLM_BASE_URL=<your-url> VLLM_API_KEY=<your-key> VLLM_IMAGE_MODEL=<model-id> cargo test test_image_generation_real -- --nocapture --ignored
+#[tokio::test]
+#[ignore] // Only run when explicitly requested (requires real vLLM server)
+async fn test_image_generation_real() {
+    use inference_providers::{ImageGenerationParams, VLlmConfig, VLlmProvider};
+
+    let _ = dotenvy::dotenv();
+
+    let base_url = std::env::var("VLLM_BASE_URL").expect("VLLM_BASE_URL must be set for this test");
+    let model =
+        std::env::var("VLLM_IMAGE_MODEL").unwrap_or_else(|_| "test-image-model".to_string());
+
+    let config = VLlmConfig {
+        base_url,
+        api_key: std::env::var("VLLM_API_KEY").ok(),
+        timeout_seconds: 120, // Image generation can take longer
+    };
+    let provider = VLlmProvider::new(config);
+
+    let params = ImageGenerationParams {
+        model,
+        prompt: "A cute baby sea otter swimming in blue water".to_string(),
+        n: Some(1),
+        size: Some("1024x1024".to_string()),
+        response_format: Some("b64_json".to_string()),
+        quality: None,
+        style: None,
+    };
+
+    println!("Starting image generation request...");
+    let result = provider
+        .image_generation(params, "test-request-hash".to_string())
+        .await;
+
+    match result {
+        Ok(response) => {
+            println!("Image generation successful!");
+            println!("Response ID: {}", response.id);
+            println!("Created at: {}", response.created);
+            println!("Number of images: {}", response.data.len());
+
+            for (i, img) in response.data.iter().enumerate() {
+                if let Some(b64) = &img.b64_json {
+                    println!("Image {}: base64 data length = {} bytes", i, b64.len());
+                    assert!(!b64.is_empty(), "Base64 data should not be empty");
+                }
+                if let Some(url) = &img.url {
+                    println!("Image {}: URL = {}", i, url);
+                }
+                if let Some(revised) = &img.revised_prompt {
+                    println!("Image {}: Revised prompt = {}", i, revised);
+                }
+            }
+
+            assert!(!response.data.is_empty(), "Should have at least one image");
+        }
+        Err(e) => {
+            panic!("Image generation failed: {}", e);
+        }
+    }
+}
+
+/// Test image generation with mock provider
+#[tokio::test]
+async fn test_image_generation_mock() {
+    use inference_providers::{ImageGenerationParams, MockProvider};
+
+    // Use new_accept_all() to accept any model name
+    let provider = MockProvider::new_accept_all();
+
+    let params = ImageGenerationParams {
+        model: "mock-image-model".to_string(),
+        prompt: "A beautiful sunset over mountains".to_string(),
+        n: Some(1),
+        size: Some("512x512".to_string()),
+        response_format: Some("b64_json".to_string()),
+        quality: None,
+        style: None,
+    };
+
+    let result = provider
+        .image_generation(params, "test-request-hash".to_string())
+        .await;
+
+    match result {
+        Ok(response) => {
+            println!("Mock image generation successful!");
+            assert!(!response.data.is_empty(), "Should have at least one image");
+            assert!(
+                response.data[0].b64_json.is_some(),
+                "Should have base64 data"
+            );
+        }
+        Err(e) => {
+            panic!("Mock image generation failed: {}", e);
+        }
+    }
 }

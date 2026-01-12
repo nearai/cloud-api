@@ -558,7 +558,7 @@ impl CompletionServiceImpl {
                     "tool" => MessageRole::Tool,
                     _ => MessageRole::User,
                 },
-                content: Some(msg.content.clone()),
+                content: Some(serde_json::Value::String(msg.content.clone())),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
@@ -710,6 +710,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             metadata: request.metadata,
             store: None,
             stream_options: None,
+            modalities: None,
             extra: request.extra.clone(),
         };
 
@@ -829,6 +830,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             metadata: request.metadata,
             store: None,
             stream_options: None,
+            modalities: None,
             extra: request.extra.clone(),
         };
 
@@ -1038,6 +1040,7 @@ mod tests {
                 usage: None,
                 prompt_token_ids: None,
                 system_fingerprint: None,
+                modality: None,
             }),
         };
 
@@ -1063,6 +1066,7 @@ mod tests {
                 }),
                 prompt_token_ids: None,
                 system_fingerprint: None,
+                modality: None,
             }),
         };
 
@@ -1172,6 +1176,7 @@ mod tests {
                 usage: None,
                 prompt_token_ids: None,
                 system_fingerprint: None,
+                modality: None,
             }),
         };
 
@@ -1186,6 +1191,7 @@ mod tests {
                 usage: None,
                 prompt_token_ids: None,
                 system_fingerprint: None,
+                modality: None,
             }),
         };
 
@@ -1210,6 +1216,7 @@ mod tests {
                     prompt_tokens_details: None,
                 }),
                 prompt_token_ids: None,
+                modality: None,
                 system_fingerprint: None,
             }),
         };
@@ -1330,6 +1337,7 @@ mod tests {
                     prompt_tokens_details: None,
                 }),
                 prompt_token_ids: None,
+                modality: None,
                 system_fingerprint: None,
             }),
         };

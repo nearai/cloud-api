@@ -615,3 +615,86 @@ mod tests {
         assert!(result.is_some());
     }
 }
+
+/// Generate images from text prompt
+///
+/// Generate images using an AI model from a text description. OpenAI-compatible endpoint.
+#[utoipa::path(
+    post,
+    path = "/v1/images/generations",
+    tag = "Images",
+    request_body = ImageGenerationRequest,
+    responses(
+        (status = 200, description = "Image generated successfully", body = ImageGenerationResponse),
+        (status = 400, description = "Invalid request parameters", body = ErrorResponse),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn image_generations(
+    State(app_state): State<AppState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(body_hash): Extension<RequestBodyHash>,
+    Json(request): Json<crate::models::ImageGenerationRequest>,
+) -> axum::response::Response {
+    debug!(
+        "Image generation request from api key: {:?}",
+        api_key.api_key.id
+    );
+    debug!(
+        "Request model: {}, prompt length: {}, org: {}, workspace: {}",
+        request.model,
+        request.prompt.len(),
+        api_key.organization.id,
+        api_key.workspace.id.0
+    );
+
+    // Convert API request to provider params
+    let params = inference_providers::ImageGenerationParams {
+        model: request.model.clone(),
+        prompt: request.prompt.clone(),
+        n: request.n,
+        size: request.size.clone(),
+        response_format: request.response_format.clone(),
+        quality: request.quality.clone(),
+        style: request.style.clone(),
+    };
+
+    // Call the inference provider pool
+    match app_state
+        .inference_provider_pool
+        .image_generation(params, body_hash.hash.clone())
+        .await
+    {
+        Ok(response) => {
+            // Convert provider response to API response
+            let api_response = crate::models::ImageGenerationResponse {
+                created: response.created,
+                data: response
+                    .data
+                    .into_iter()
+                    .map(|img| crate::models::ImageData {
+                        b64_json: img.b64_json,
+                        url: img.url,
+                        revised_prompt: img.revised_prompt,
+                    })
+                    .collect(),
+            };
+            (StatusCode::OK, ResponseJson(api_response)).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Image generation failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    e.to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+                .into_response()
+        }
+    }
+}

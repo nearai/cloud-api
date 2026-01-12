@@ -40,6 +40,8 @@ pub enum FileServiceError {
 pub const ALLOWED_MIME_TYPES: &[(&str, bool)] = &[
     // (MIME type, requires_utf_encoding)
     ("application/octet-stream", false),
+    ("text/csv", true),
+    ("text/tab-separated-values", true),
     ("text/x-c", true),
     ("text/x-c++", true),
     ("text/x-csharp", true),
@@ -68,6 +70,41 @@ pub const ALLOWED_MIME_TYPES: &[(&str, bool)] = &[
     ("text/x-tex", true),
     ("application/typescript", true),
     ("text/plain", true),
+    // Markup / documentation
+    ("application/xml", true),      // .xml, .xhtml
+    ("application/x-bibtex", true), // .bib
+    // YAML
+    ("application/yaml", true), // .yaml, .yml
+    // Web manifests
+    ("application/manifest+json", true), // .webmanifest
+    // PHP alternative
+    ("application/x-httpd-php", true), // .php, .phtml
+    // Shell variants
+    ("text/x-shellscript", true), // .bash, .zsh, .fish, .ksh
+    // PowerShell
+    ("text/x-powershell", true), // .ps1, .psm1, .psd1
+    // SQL
+    ("application/sql", true), // .sql, .mysql, .psql, .sqlite
+    // GraphQL
+    ("application/graphql", true), // .graphql, .gql
+    // Jupyter notebooks
+    ("application/x-ipynb+json", true), // .ipynb
+    // LaTeX alternative
+    ("application/x-tex", true), // .tex, .latex
+    // Ruby alternative
+    ("application/x-ruby", true), // .rb
+    // Perl
+    ("text/x-perl", true), // .pl, .pm, .t
+    // Assembly / low-level
+    ("text/x-asm", true), // .asm, .s, .S
+    // Objective-C (distinct from C/C++)
+    ("text/x-objective-c", true), // .m, .mm
+    // CMake
+    ("text/x-cmake", true), // .cmake
+    // Docker
+    ("text/x-dockerfile", true), // Dockerfile
+    // INI / desktop / service files (common on Linux)
+    ("text/x-ini", true), // .ini, .cfg, .conf
 ];
 
 pub fn validate_mime_type(content_type: &str) -> Result<(), FileServiceError> {

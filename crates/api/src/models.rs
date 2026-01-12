@@ -180,6 +180,69 @@ fn default_n_images() -> Option<i32> {
     Some(1)
 }
 
+impl ImageGenerationRequest {
+    /// Validate the image generation request
+    pub fn validate(&self) -> Result<(), String> {
+        // Model is required and must not be empty
+        if self.model.trim().is_empty() {
+            return Err("model is required".to_string());
+        }
+
+        // Prompt is required and must not be empty
+        if self.prompt.trim().is_empty() {
+            return Err("prompt is required".to_string());
+        }
+
+        // Validate n if provided
+        if let Some(n) = self.n {
+            if n < 1 {
+                return Err("n must be at least 1".to_string());
+            }
+            if n > 10 {
+                return Err("n must be at most 10".to_string());
+            }
+        }
+
+        // Validate size format if provided (should be "WxH")
+        if let Some(ref size) = self.size {
+            let parts: Vec<&str> = size.split('x').collect();
+            if parts.len() != 2 {
+                return Err("size must be in format 'WIDTHxHEIGHT' (e.g., '1024x1024')".to_string());
+            }
+            for part in parts {
+                if part.parse::<u32>().is_err() {
+                    return Err(
+                        "size must be in format 'WIDTHxHEIGHT' with numeric values".to_string()
+                    );
+                }
+            }
+        }
+
+        // Validate response_format if provided
+        if let Some(ref format) = self.response_format {
+            if format != "url" && format != "b64_json" {
+                return Err("response_format must be 'url' or 'b64_json'".to_string());
+            }
+        }
+
+        // Validate quality if provided
+        if let Some(ref quality) = self.quality {
+            if quality != "standard" && quality != "hd" {
+                return Err("quality must be 'standard' or 'hd'".to_string());
+            }
+        }
+
+        // Validate style if provided
+        if let Some(ref style) = self.style {
+            if style != "vivid" && style != "natural" {
+                return Err("style must be 'vivid' or 'natural'".to_string());
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Response from image generation
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ImageGenerationResponse {

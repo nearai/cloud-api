@@ -8,9 +8,14 @@ impl From<crate::models::Message> for ChatMessage {
     fn from(msg: crate::models::Message) -> Self {
         // Serialize content as-is for passthrough to vLLM proxy
         // This preserves the original structure (text string or array of content parts)
-        let content = msg
-            .content
-            .map(|c| serde_json::to_value(c).unwrap_or_default());
+        // Note: MessageContent serialization should never fail as it only contains
+        // String and simple enum variants that are guaranteed to serialize
+        let content = msg.content.map(|c| {
+            serde_json::to_value(&c).unwrap_or_else(|e| {
+                tracing::error!(error = %e, "Failed to serialize message content, using empty object");
+                serde_json::Value::Object(serde_json::Map::new())
+            })
+        });
 
         Self {
             role: match msg.role.as_str() {

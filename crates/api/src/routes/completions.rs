@@ -652,6 +652,18 @@ pub async fn image_generations(
         api_key.workspace.id.0
     );
 
+    // Validate the request
+    if let Err(error) = request.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                error,
+                "invalid_request_error".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
     // Convert API request to provider params
     let params = inference_providers::ImageGenerationParams {
         model: request.model.clone(),
@@ -686,13 +698,39 @@ pub async fn image_generations(
             (StatusCode::OK, ResponseJson(api_response)).into_response()
         }
         Err(e) => {
+            // Log the full error internally but return a sanitized message to the client
             tracing::error!(error = %e, "Image generation failed");
+
+            // Map error to appropriate status code and sanitized message
+            let (status_code, message) = match &e {
+                inference_providers::ImageGenerationError::GenerationError(msg) => {
+                    // Check if it's a model not found error
+                    if msg.contains("not found") || msg.contains("does not exist") {
+                        (StatusCode::NOT_FOUND, "Model not found".to_string())
+                    } else {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Image generation failed".to_string(),
+                        )
+                    }
+                }
+                inference_providers::ImageGenerationError::HttpError { status_code, .. } => {
+                    // Map HTTP status codes appropriately
+                    let code = StatusCode::from_u16(*status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let msg = match code {
+                        StatusCode::NOT_FOUND => "Model not found".to_string(),
+                        StatusCode::BAD_REQUEST => "Invalid request".to_string(),
+                        StatusCode::TOO_MANY_REQUESTS => "Rate limit exceeded".to_string(),
+                        _ => "Image generation failed".to_string(),
+                    };
+                    (code, msg)
+                }
+            };
+
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    e.to_string(),
-                    "server_error".to_string(),
-                )),
+                status_code,
+                ResponseJson(ErrorResponse::new(message, "server_error".to_string())),
             )
                 .into_response()
         }

@@ -7,3 +7,9 @@ test-threads = "num-cpus"
 
 # Longer timeout for e2e tests
 slow-timeout = { period = "60s", terminate-after = 2 }
+
+# Override timeout for real e2e tests (5 minutes)
+# Matches tests whose function names start with real_test_ (all tests in real_e2e_* files)
+[[profile.default.overrides]]
+filter = 'test(/^real_test_/)'
+slow-timeout = { period = "300s", terminate-after = 1 }

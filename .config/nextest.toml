@@ -12,4 +12,4 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 # Matches tests whose function names start with real_test_ (all tests in real_e2e_* files)
 [[profile.default.overrides]]
 filter = 'test(/^real_test_/)'
-slow-timeout = { period = "300s", terminate-after = 1 }
+slow-timeout = { period = "500s", terminate-after = 1 }

@@ -65,19 +65,22 @@ pub const ALLOWED_MIME_TYPES: &[(&str, bool)] = &[
     ),
     ("text/x-python", true),
     ("text/x-script.python", true),
+    ("text/x-python-script", true),
     ("text/x-ruby", true),
     ("application/x-sh", true),
     ("text/x-tex", true),
     ("application/typescript", true),
+    ("text/x-typescript", true), // .ts (more commonly used)
     ("text/plain", true),
     // Markup / documentation
     ("application/xml", true),      // .xml, .xhtml
     ("text/xml", true),             // .xml (alternative MIME type)
     ("application/x-bibtex", true), // .bib
     // YAML
-    ("application/yaml", true), // .yaml, .yml (RFC 9512 standard)
-    ("text/yaml", true),        // .yaml, .yml (deprecated but still used)
-    ("text/x-yaml", true),      // .yaml, .yml (deprecated but still used)
+    ("application/yaml", true),   // .yaml, .yml (RFC 9512 standard)
+    ("application/x-yaml", true), // .yaml, .yml (alternative)
+    ("text/yaml", true),          // .yaml, .yml (deprecated but still used)
+    ("text/x-yaml", true),        // .yaml, .yml (deprecated but still used)
     // Web manifests
     ("application/manifest+json", true), // .webmanifest
     // PHP alternative
@@ -87,7 +90,8 @@ pub const ALLOWED_MIME_TYPES: &[(&str, bool)] = &[
     // PowerShell
     ("text/x-powershell", true), // .ps1, .psm1, .psd1
     // SQL
-    ("application/sql", true), // .sql, .mysql, .psql, .sqlite
+    ("application/sql", true), // .sql, .mysql, .psql, .sqlite (RFC 6922 standard)
+    ("text/x-sql", true),      // .sql (commonly used alternative)
     // GraphQL
     ("application/graphql", true), // .graphql, .gql
     // Jupyter notebooks

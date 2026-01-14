@@ -61,6 +61,7 @@ impl ModelRepository {
                         m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
                         m.input_cost_per_token, m.output_cost_per_token,
                         m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
+                        m.provider_type, m.provider_config, m.attestation_supported,
                         COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                     FROM models m
                     LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -140,6 +141,7 @@ impl ModelRepository {
                             m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
                             m.input_cost_per_token, m.output_cost_per_token,
                             m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
+                            m.provider_type, m.provider_config, m.attestation_supported,
                             COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                         FROM models m
                         LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -159,6 +161,7 @@ impl ModelRepository {
                             m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
                             m.input_cost_per_token, m.output_cost_per_token,
                             m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
+                            m.provider_type, m.provider_config, m.attestation_supported,
                             COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                         FROM models m
                         LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -198,7 +201,8 @@ impl ModelRepository {
                     SELECT
                         id, model_name, model_display_name, model_description, model_icon,
                         input_cost_per_token, output_cost_per_token,
-                        context_length, verifiable, is_active, owned_by, created_at, updated_at
+                        context_length, verifiable, is_active, owned_by, created_at, updated_at,
+                        provider_type, provider_config, attestation_supported
                     FROM models
                     WHERE model_name = $1
                     "#,
@@ -231,7 +235,8 @@ impl ModelRepository {
                     SELECT
                         id, model_name, model_display_name, model_description, model_icon,
                         input_cost_per_token, output_cost_per_token,
-                        context_length, verifiable, is_active, owned_by, created_at, updated_at
+                        context_length, verifiable, is_active, owned_by, created_at, updated_at,
+                        provider_type, provider_config, attestation_supported
                     FROM models
                     WHERE id = $1
                     "#,
@@ -276,6 +281,9 @@ impl ModelRepository {
                         m.owned_by,
                         m.created_at,
                         m.updated_at,
+                        m.provider_type,
+                        m.provider_config,
+                        m.attestation_supported,
                         COALESCE(
                             array_agg(ma.alias_name)
                             FILTER (WHERE ma.alias_name IS NOT NULL),
@@ -362,11 +370,15 @@ impl ModelRepository {
                             verifiable = COALESCE($8, verifiable),
                             is_active = COALESCE($9, is_active),
                             owned_by = COALESCE($10, owned_by),
+                            provider_type = COALESCE($11, provider_type),
+                            provider_config = COALESCE($12, provider_config),
+                            attestation_supported = COALESCE($13, attestation_supported),
                             updated_at = NOW()
                         WHERE model_name = $1
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token,
-                                  context_length, verifiable, is_active, owned_by, created_at, updated_at
+                                  context_length, verifiable, is_active, owned_by, created_at, updated_at,
+                                  provider_type, provider_config, attestation_supported
                         "#,
                         &[
                             &model_name,
@@ -379,6 +391,9 @@ impl ModelRepository {
                             &update_request.verifiable,
                             &update_request.is_active,
                             &update_request.owned_by,
+                            &update_request.provider_type,
+                            &update_request.provider_config,
+                            &update_request.attestation_supported,
                         ],
                     )
                     .await
@@ -409,8 +424,9 @@ impl ModelRepository {
                             model_name,
                             input_cost_per_token, output_cost_per_token,
                             model_display_name, model_description, model_icon,
-                            context_length, verifiable, is_active, owned_by
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, $11))
+                            context_length, verifiable, is_active, owned_by,
+                            provider_type, provider_config, attestation_supported
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, $11), COALESCE($12, 'vllm'), $13, COALESCE($14, true))
                         ON CONFLICT (model_name) DO UPDATE SET
                             input_cost_per_token = EXCLUDED.input_cost_per_token,
                             output_cost_per_token = EXCLUDED.output_cost_per_token,
@@ -421,10 +437,14 @@ impl ModelRepository {
                             verifiable = EXCLUDED.verifiable,
                             is_active = EXCLUDED.is_active,
                             owned_by = CASE WHEN $10 IS NULL THEN models.owned_by ELSE EXCLUDED.owned_by END,
+                            provider_type = EXCLUDED.provider_type,
+                            provider_config = EXCLUDED.provider_config,
+                            attestation_supported = EXCLUDED.attestation_supported,
                             updated_at = NOW()
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token,
-                                  context_length, verifiable, is_active, owned_by, created_at, updated_at
+                                  context_length, verifiable, is_active, owned_by, created_at, updated_at,
+                                  provider_type, provider_config, attestation_supported
                         "#,
                         &[
                             &model_name,
@@ -438,6 +458,9 @@ impl ModelRepository {
                             &update_request.is_active.unwrap_or(true),
                             &owned_by,
                             &DEFAULT_MODEL_OWNED_BY,
+                            &update_request.provider_type,
+                            &update_request.provider_config,
+                            &update_request.attestation_supported,
                         ],
                     )
                     .await
@@ -481,11 +504,13 @@ impl ModelRepository {
                     INSERT INTO models (
                         model_name, model_display_name, model_description, model_icon,
                         input_cost_per_token, output_cost_per_token,
-                        context_length, verifiable, is_active, owned_by
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                        context_length, verifiable, is_active, owned_by,
+                        provider_type, provider_config, attestation_supported
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token,
-                              context_length, verifiable, is_active, owned_by, created_at, updated_at
+                              context_length, verifiable, is_active, owned_by, created_at, updated_at,
+                              provider_type, provider_config, attestation_supported
                     "#,
                     &[
                         &model.model_name,
@@ -498,6 +523,9 @@ impl ModelRepository {
                         &model.verifiable,
                         &model.is_active,
                         &model.owned_by,
+                        &model.provider_type,
+                        &model.provider_config,
+                        &model.attestation_supported,
                     ],
                 )
                 .await
@@ -524,6 +552,7 @@ impl ModelRepository {
                         id, model_id, input_cost_per_token, output_cost_per_token,
                         context_length, model_name, model_display_name, model_description,
                         model_icon, verifiable, is_active, owned_by,
+                        provider_type, provider_config, attestation_supported,
                         effective_from, effective_until, changed_by_user_id, changed_by_user_email,
                         change_reason, created_at
                     FROM model_history
@@ -564,6 +593,7 @@ impl ModelRepository {
                         id, model_id, input_cost_per_token, output_cost_per_token,
                         context_length, model_name, model_display_name, model_description,
                         model_icon, verifiable, is_active, owned_by,
+                        provider_type, provider_config, attestation_supported,
                         effective_from, effective_until, changed_by_user_id, changed_by_user_email,
                         change_reason, created_at
                     FROM model_history
@@ -634,6 +664,7 @@ impl ModelRepository {
                         h.id, h.model_id, h.input_cost_per_token, h.output_cost_per_token,
                         h.context_length, h.model_name, h.model_display_name, h.model_description,
                         h.model_icon, h.verifiable, h.is_active, h.owned_by,
+                        h.provider_type, h.provider_config, h.attestation_supported,
                         h.effective_from, h.effective_until, h.changed_by_user_id, h.changed_by_user_email,
                         h.change_reason, h.created_at
                     FROM model_history h
@@ -679,7 +710,8 @@ impl ModelRepository {
                     WHERE model_name = $1 AND is_active = true
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token,
-                              context_length, verifiable, is_active, owned_by, created_at, updated_at
+                              context_length, verifiable, is_active, owned_by, created_at, updated_at,
+                              provider_type, provider_config, attestation_supported
                     "#,
                     &[&model_name],
                 )
@@ -752,6 +784,9 @@ impl ModelRepository {
                     verifiable,
                     is_active,
                     owned_by,
+                    provider_type,
+                    provider_config,
+                    attestation_supported,
                     effective_from,
                     effective_until,
                     changed_by_user_id,
@@ -759,8 +794,8 @@ impl ModelRepository {
                     change_reason,
                     created_at
                 ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                    NOW(), NULL, $12, $13, $14, NOW()
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                    NOW(), NULL, $15, $16, $17, NOW()
                 )
                 "#,
                 &[
@@ -775,6 +810,9 @@ impl ModelRepository {
                     &model_row.get::<_, bool>("verifiable"),
                     &model_row.get::<_, bool>("is_active"),
                     &model_row.get::<_, String>("owned_by"),
+                    &model_row.try_get::<_, String>("provider_type").ok(),
+                    &model_row.try_get::<_, serde_json::Value>("provider_config").ok(),
+                    &model_row.try_get::<_, bool>("attestation_supported").ok(),
                     &changed_by_user_id,
                     &changed_by_user_email,
                     change_reason,
@@ -847,6 +885,9 @@ impl ModelRepository {
                         m.owned_by,
                         m.created_at,
                         m.updated_at,
+                        m.provider_type,
+                        m.provider_config,
+                        m.attestation_supported,
                         COALESCE(
                             array_agg(ma_all.alias_name)
                             FILTER (WHERE ma_all.alias_name IS NOT NULL),
@@ -896,6 +937,9 @@ impl ModelRepository {
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
             aliases: row.try_get("aliases").unwrap_or_default(),
+            provider_type: row.try_get("provider_type").unwrap_or_else(|_| "vllm".to_string()),
+            provider_config: row.try_get("provider_config").ok().flatten(),
+            attestation_supported: row.try_get("attestation_supported").unwrap_or(true),
         }
     }
 
@@ -914,6 +958,9 @@ impl ModelRepository {
             verifiable: row.get("verifiable"),
             is_active: row.get("is_active"),
             owned_by: row.get("owned_by"),
+            provider_type: row.try_get("provider_type").ok().flatten(),
+            provider_config: row.try_get("provider_config").ok().flatten(),
+            attestation_supported: row.try_get("attestation_supported").ok().flatten(),
             effective_from: row.get("effective_from"),
             effective_until: row.get("effective_until"),
             changed_by_user_id: row.get("changed_by_user_id"),
@@ -921,6 +968,44 @@ impl ModelRepository {
             change_reason: row.get("change_reason"),
             created_at: row.get("created_at"),
         }
+    }
+
+    /// Get all active external provider models
+    pub async fn get_external_models(&self) -> Result<Vec<Model>> {
+        let rows = retry_db!("get_external_models", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query(
+                    r#"
+                    SELECT
+                        m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
+                        m.input_cost_per_token, m.output_cost_per_token,
+                        m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
+                        m.provider_type, m.provider_config, m.attestation_supported,
+                        COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
+                    FROM models m
+                    LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
+                    WHERE m.is_active = true AND m.provider_type = 'external'
+                    GROUP BY m.id
+                    ORDER BY m.model_name ASC
+                    "#,
+                    &[],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        let models = rows
+            .into_iter()
+            .map(|row| self.row_to_model(&row))
+            .collect();
+        Ok(models)
     }
 }
 
@@ -951,6 +1036,9 @@ impl services::models::ModelsRepository for ModelRepository {
                 verifiable: m.verifiable,
                 aliases: m.aliases,
                 owned_by: m.owned_by,
+                provider_type: m.provider_type,
+                provider_config: m.provider_config,
+                attestation_supported: m.attestation_supported,
             })
             .collect())
     }
@@ -972,6 +1060,9 @@ impl services::models::ModelsRepository for ModelRepository {
             verifiable: m.verifiable,
             aliases: m.aliases,
             owned_by: m.owned_by,
+            provider_type: m.provider_type,
+            provider_config: m.provider_config,
+            attestation_supported: m.attestation_supported,
         }))
     }
 
@@ -992,6 +1083,9 @@ impl services::models::ModelsRepository for ModelRepository {
             verifiable: m.verifiable,
             aliases: m.aliases,
             owned_by: m.owned_by,
+            provider_type: m.provider_type,
+            provider_config: m.provider_config,
+            attestation_supported: m.attestation_supported,
         }))
     }
 

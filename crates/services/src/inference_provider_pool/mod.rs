@@ -1,14 +1,15 @@
 use crate::common::encryption_headers;
+use config::ExternalProvidersConfig;
 use inference_providers::{
     models::{AttestationError, CompletionError, ListModelsError, ModelsResponse},
-    ChatCompletionParams, InferenceProvider, StreamingResult, StreamingResultExt, VLlmConfig,
-    VLlmProvider,
+    ChatCompletionParams, ExternalProvider, ExternalProviderConfig, InferenceProvider,
+    ProviderConfig, StreamingResult, StreamingResultExt, VLlmConfig, VLlmProvider,
 };
 use regex::Regex;
 use serde::Deserialize;
 use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
 
@@ -53,6 +54,10 @@ pub struct InferenceProviderPool {
     inference_timeout_secs: i64,
     /// Combined provider mappings (updated atomically to prevent race conditions)
     provider_mappings: Arc<RwLock<ProviderMappings>>,
+    /// External providers (keyed by model name, created from database config)
+    external_providers: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
+    /// API keys configuration for external providers
+    external_api_keys: ExternalProvidersConfig,
     /// Round-robin index for each model
     load_balancer_index: Arc<RwLock<HashMap<String, usize>>>,
     /// Map of chat_id -> provider for sticky routing
@@ -68,6 +73,7 @@ impl InferenceProviderPool {
         api_key: Option<String>,
         discovery_timeout_secs: i64,
         inference_timeout_secs: i64,
+        external_api_keys: ExternalProvidersConfig,
     ) -> Self {
         Self {
             discovery_url,
@@ -75,10 +81,131 @@ impl InferenceProviderPool {
             discovery_timeout: Duration::from_secs(discovery_timeout_secs as u64),
             inference_timeout_secs,
             provider_mappings: Arc::new(RwLock::new(ProviderMappings::new())),
+            external_providers: Arc::new(RwLock::new(HashMap::new())),
+            external_api_keys,
             load_balancer_index: Arc::new(RwLock::new(HashMap::new())),
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
             refresh_task_handle: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Register an external provider for a model
+    ///
+    /// External providers are third-party AI providers (OpenAI, Anthropic, Gemini)
+    /// that don't support TEE attestation.
+    ///
+    /// # Arguments
+    /// * `model_name` - The model name to register (e.g., "gpt-4o", "claude-3-opus")
+    /// * `provider_config` - The provider configuration from database
+    pub async fn register_external_provider(
+        &self,
+        model_name: String,
+        provider_config: serde_json::Value,
+    ) -> Result<(), String> {
+        // Parse the provider config
+        let config: ProviderConfig = serde_json::from_value(provider_config)
+            .map_err(|e| format!("Failed to parse provider config: {e}"))?;
+
+        // Get the backend type to look up the API key
+        let backend_type = match &config {
+            ProviderConfig::OpenAiCompatible { .. } => "openai_compatible",
+            ProviderConfig::Anthropic { .. } => "anthropic",
+            ProviderConfig::Gemini { .. } => "gemini",
+        };
+
+        // Get the API key for this backend
+        let api_key = self
+            .external_api_keys
+            .get_api_key(backend_type)
+            .ok_or_else(|| {
+                format!(
+                    "No API key configured for backend type '{}'. \
+                     Set the appropriate environment variable (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY)",
+                    backend_type
+                )
+            })?
+            .to_string();
+
+        // Create the external provider
+        let external_config = ExternalProviderConfig {
+            model_name: model_name.clone(),
+            provider_config: config,
+            api_key,
+            timeout_seconds: self.external_api_keys.timeout_seconds,
+        };
+
+        let provider = Arc::new(ExternalProvider::new(external_config)) as Arc<InferenceProviderTrait>;
+
+        // Register the provider
+        let mut external = self.external_providers.write().await;
+        external.insert(model_name.clone(), provider);
+
+        info!(
+            model = %model_name,
+            backend = %backend_type,
+            "Registered external provider"
+        );
+
+        Ok(())
+    }
+
+    /// Load and register external providers from a list of model configurations
+    ///
+    /// This should be called during application startup after fetching external
+    /// models from the database.
+    ///
+    /// # Arguments
+    /// * `models` - List of (model_name, provider_config) tuples
+    pub async fn load_external_providers(
+        &self,
+        models: Vec<(String, serde_json::Value)>,
+    ) -> Result<(), String> {
+        let mut success_count = 0;
+        let mut error_count = 0;
+
+        for (model_name, provider_config) in models {
+            match self
+                .register_external_provider(model_name.clone(), provider_config)
+                .await
+            {
+                Ok(()) => success_count += 1,
+                Err(e) => {
+                    warn!(
+                        model = %model_name,
+                        error = %e,
+                        "Failed to register external provider"
+                    );
+                    error_count += 1;
+                }
+            }
+        }
+
+        info!(
+            success = success_count,
+            errors = error_count,
+            "Loaded external providers"
+        );
+
+        if error_count > 0 && success_count == 0 {
+            Err(format!(
+                "All {} external provider(s) failed to load",
+                error_count
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Get an external provider by model name
+    async fn get_external_provider(&self, model_name: &str) -> Option<Arc<InferenceProviderTrait>> {
+        let external = self.external_providers.read().await;
+        external.get(model_name).cloned()
+    }
+
+    /// Check if a model is an external provider
+    pub async fn is_external_provider(&self, model_name: &str) -> bool {
+        let external = self.external_providers.read().await;
+        external.contains_key(model_name)
     }
 
     /// Register a provider for a model manually (useful for testing with mock providers)
@@ -645,6 +772,10 @@ impl InferenceProviderPool {
     /// Generic retry helper that tries each provider in order with automatic fallback
     /// Returns both the result and the provider that succeeded (for chat_id mapping)
     /// If model_pub_key is provided, routes to the specific provider by signing public key first
+    ///
+    /// Provider resolution order:
+    /// 1. External providers (exact match by model name)
+    /// 2. vLLM providers (with model_pub_key routing if specified)
     async fn retry_with_fallback<T, F, Fut>(
         &self,
         model_id: &str,
@@ -656,10 +787,47 @@ impl InferenceProviderPool {
         F: Fn(Arc<InferenceProviderTrait>) -> Fut,
         Fut: std::future::Future<Output = Result<T, CompletionError>>,
     {
-        // Ensure models are discovered first
+        // Check external providers first (exact match)
+        if let Some(external_provider) = self.get_external_provider(model_id).await {
+            tracing::info!(
+                model_id = %model_id,
+                operation = operation_name,
+                "Using external provider"
+            );
+
+            // External providers don't support model_pub_key routing
+            if model_pub_key.is_some() {
+                return Err(CompletionError::CompletionError(format!(
+                    "Model '{}' is an external provider and does not support encryption. \
+                     External providers run outside of our Trusted Execution Environment.",
+                    model_id
+                )));
+            }
+
+            match provider_fn(external_provider.clone()).await {
+                Ok(result) => {
+                    tracing::info!(
+                        model_id = %model_id,
+                        operation = operation_name,
+                        "Successfully completed request with external provider"
+                    );
+                    return Ok((result, external_provider));
+                }
+                Err(e) => {
+                    // External providers have no fallback
+                    let sanitized = Self::sanitize_error_message(&e.to_string());
+                    return Err(CompletionError::CompletionError(format!(
+                        "External provider failed for model '{}': {}",
+                        model_id, sanitized
+                    )));
+                }
+            }
+        }
+
+        // Ensure vLLM models are discovered
         self.ensure_models_discovered().await?;
 
-        // Get providers with load balancing (handles both model_id and model_pub_key cases)
+        // Get vLLM providers with load balancing (handles both model_id and model_pub_key cases)
         let providers = match self
             .get_providers_with_fallback(model_id, model_pub_key)
             .await
@@ -682,10 +850,13 @@ impl InferenceProviderPool {
                 } else {
                     let mappings = self.provider_mappings.read().await;
                     let available_models: Vec<_> = mappings.model_to_providers.keys().collect();
+                    let external = self.external_providers.read().await;
+                    let external_models: Vec<_> = external.keys().collect();
 
                     tracing::error!(
                         model_id = %model_id,
-                        available_models = ?available_models,
+                        available_vllm_models = ?available_models,
+                        available_external_models = ?external_models,
                         operation = operation_name,
                         "Model not found in provider pool"
                     );
@@ -986,6 +1157,14 @@ impl InferenceProviderPool {
         );
         drop(mappings);
 
+        // Step 2.5: Clear external providers
+        debug!("Step 2.5: Clearing external providers");
+        let mut external = self.external_providers.write().await;
+        let external_count = external.len();
+        external.clear();
+        debug!("Cleared {} external providers", external_count);
+        drop(external);
+
         // Step 3: Clear load balancer indices
         debug!("Step 3: Clearing load balancer indices");
         let mut lb_index = self.load_balancer_index.write().await;
@@ -1003,8 +1182,8 @@ impl InferenceProviderPool {
         drop(chat_mapping);
 
         info!(
-            "Inference provider pool shutdown completed. Cleaned up: {} models, {} pubkeys, {} load balancer indices, {} chat mappings",
-            model_count, pubkey_count, index_count, chat_count
+            "Inference provider pool shutdown completed. Cleaned up: {} models, {} pubkeys, {} external providers, {} load balancer indices, {} chat mappings",
+            model_count, pubkey_count, external_count, index_count, chat_count
         );
     }
 }
@@ -1093,8 +1272,13 @@ mod tests {
         use futures_util::StreamExt;
         use inference_providers::mock::MockProvider;
 
-        let pool =
-            InferenceProviderPool::new("http://localhost:8080/models".to_string(), None, 5, 30);
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig::default(),
+        );
 
         let mock_provider = Arc::new(MockProvider::new());
         let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();

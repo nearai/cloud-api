@@ -14,6 +14,10 @@ pub struct UpdateModelAdminRequest {
     pub is_active: Option<bool>,
     pub aliases: Option<Vec<String>>,
     pub owned_by: Option<String>,
+    // Provider configuration
+    pub provider_type: Option<String>,
+    pub provider_config: Option<serde_json::Value>,
+    pub attestation_supported: Option<bool>,
     // User audit tracking for history
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<uuid::Uuid>,

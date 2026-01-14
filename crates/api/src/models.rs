@@ -1909,6 +1909,15 @@ pub struct UpdateModelApiRequest {
     pub aliases: Option<Vec<String>>,
     #[serde(rename = "ownedBy")]
     pub owned_by: Option<String>,
+    /// Provider type: "vllm" (default, TEE-enabled) or "external" (3rd party)
+    #[serde(rename = "providerType", skip_serializing_if = "Option::is_none")]
+    pub provider_type: Option<String>,
+    /// JSON config for external providers (backend, base_url, etc.)
+    #[serde(rename = "providerConfig", skip_serializing_if = "Option::is_none")]
+    pub provider_config: Option<serde_json::Value>,
+    /// Whether this model supports TEE attestation
+    #[serde(rename = "attestationSupported", skip_serializing_if = "Option::is_none")]
+    pub attestation_supported: Option<bool>,
     #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
     pub change_reason: Option<String>,
 }

@@ -633,7 +633,8 @@ impl ResponseServiceImpl {
         }
 
         // Convert accumulated tool calls to detected tool calls
-        let tool_calls_detected = tools::convert_tool_calls(tool_call_accumulator);
+        let tool_calls_detected =
+            tools::convert_tool_calls(tool_call_accumulator, &process_context.request.model);
 
         Ok(crate::responses::service_helpers::ProcessStreamResult {
             text: current_text,
@@ -1981,9 +1982,9 @@ impl ResponseServiceImpl {
                                 // Accumulate arguments (streamed across multiple chunks)
                                 if let Some(args_fragment) = &function.arguments {
                                     tracing::debug!(
-                                        "Accumulated tool call {} args fragment: {}",
+                                        "Accumulated tool call {} args fragment (len={})",
                                         index,
-                                        args_fragment
+                                        args_fragment.len()
                                     );
                                     entry.1.push_str(args_fragment);
                                 }

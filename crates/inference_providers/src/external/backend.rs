@@ -4,7 +4,9 @@
 //! Each backend handles the API-specific translation between our internal format
 //! and the provider's native format.
 
-use crate::{ChatCompletionParams, ChatCompletionResponseWithBytes, CompletionError, StreamingResult};
+use crate::{
+    ChatCompletionParams, ChatCompletionResponseWithBytes, CompletionError, StreamingResult,
+};
 use async_trait::async_trait;
 use std::collections::HashMap;
 

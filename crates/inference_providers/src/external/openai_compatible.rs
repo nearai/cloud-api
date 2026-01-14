@@ -11,8 +11,8 @@
 
 use super::backend::{BackendConfig, ExternalBackend};
 use crate::{
-    models::StreamOptions, sse_parser::SSEParser, ChatCompletionParams,
-    ChatCompletionResponse, ChatCompletionResponseWithBytes, CompletionError, StreamingResult,
+    models::StreamOptions, sse_parser::SSEParser, ChatCompletionParams, ChatCompletionResponse,
+    ChatCompletionResponseWithBytes, CompletionError, StreamingResult,
 };
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
@@ -170,8 +170,10 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             .to_vec();
 
         // Parse the response
-        let chat_response: ChatCompletionResponse = serde_json::from_slice(&raw_bytes)
-            .map_err(|e| CompletionError::CompletionError(format!("Failed to parse response: {e}")))?;
+        let chat_response: ChatCompletionResponse =
+            serde_json::from_slice(&raw_bytes).map_err(|e| {
+                CompletionError::CompletionError(format!("Failed to parse response: {e}"))
+            })?;
 
         Ok(ChatCompletionResponseWithBytes {
             response: chat_response,
@@ -225,7 +227,11 @@ mod tests {
         let headers = backend.build_headers(&config).unwrap();
 
         assert_eq!(
-            headers.get("OpenAI-Organization").unwrap().to_str().unwrap(),
+            headers
+                .get("OpenAI-Organization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "org-abc123"
         );
     }
@@ -258,10 +264,22 @@ mod tests {
     #[test]
     fn test_chat_completion_url_different_providers() {
         let providers = vec![
-            ("https://api.openai.com/v1", "https://api.openai.com/v1/chat/completions"),
-            ("https://api.together.xyz/v1", "https://api.together.xyz/v1/chat/completions"),
-            ("https://api.groq.com/openai/v1", "https://api.groq.com/openai/v1/chat/completions"),
-            ("https://api.fireworks.ai/inference/v1", "https://api.fireworks.ai/inference/v1/chat/completions"),
+            (
+                "https://api.openai.com/v1",
+                "https://api.openai.com/v1/chat/completions",
+            ),
+            (
+                "https://api.together.xyz/v1",
+                "https://api.together.xyz/v1/chat/completions",
+            ),
+            (
+                "https://api.groq.com/openai/v1",
+                "https://api.groq.com/openai/v1/chat/completions",
+            ),
+            (
+                "https://api.fireworks.ai/inference/v1",
+                "https://api.fireworks.ai/inference/v1/chat/completions",
+            ),
         ];
 
         for (base_url, expected) in providers {

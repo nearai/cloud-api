@@ -202,8 +202,9 @@ where
     }
 
     fn parse_response(&mut self, data: &str) -> Result<Option<StreamChunk>, CompletionError> {
-        let response: GeminiResponse = serde_json::from_str(data)
-            .map_err(|e| CompletionError::InvalidResponse(format!("Failed to parse Gemini response: {e}")))?;
+        let response: GeminiResponse = serde_json::from_str(data).map_err(|e| {
+            CompletionError::InvalidResponse(format!("Failed to parse Gemini response: {e}"))
+        })?;
 
         if response.candidates.is_empty() {
             return Ok(None);
@@ -503,8 +504,9 @@ impl ExternalBackend for GeminiBackend {
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?
             .to_vec();
 
-        let gemini_response: GeminiResponse = serde_json::from_slice(&raw_bytes)
-            .map_err(|e| CompletionError::CompletionError(format!("Failed to parse response: {e}")))?;
+        let gemini_response: GeminiResponse = serde_json::from_slice(&raw_bytes).map_err(|e| {
+            CompletionError::CompletionError(format!("Failed to parse response: {e}"))
+        })?;
 
         if gemini_response.candidates.is_empty() {
             return Err(CompletionError::CompletionError(
@@ -557,8 +559,9 @@ impl ExternalBackend for GeminiBackend {
         };
 
         // Re-serialize for consistent raw bytes
-        let serialized_bytes = serde_json::to_vec(&openai_response)
-            .map_err(|e| CompletionError::CompletionError(format!("Failed to serialize response: {e}")))?;
+        let serialized_bytes = serde_json::to_vec(&openai_response).map_err(|e| {
+            CompletionError::CompletionError(format!("Failed to serialize response: {e}"))
+        })?;
 
         Ok(ChatCompletionResponseWithBytes {
             response: openai_response,

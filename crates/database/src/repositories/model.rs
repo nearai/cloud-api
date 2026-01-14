@@ -811,7 +811,9 @@ impl ModelRepository {
                     &model_row.get::<_, bool>("is_active"),
                     &model_row.get::<_, String>("owned_by"),
                     &model_row.try_get::<_, String>("provider_type").ok(),
-                    &model_row.try_get::<_, serde_json::Value>("provider_config").ok(),
+                    &model_row
+                        .try_get::<_, serde_json::Value>("provider_config")
+                        .ok(),
                     &model_row.try_get::<_, bool>("attestation_supported").ok(),
                     &changed_by_user_id,
                     &changed_by_user_email,
@@ -937,7 +939,9 @@ impl ModelRepository {
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
             aliases: row.try_get("aliases").unwrap_or_default(),
-            provider_type: row.try_get("provider_type").unwrap_or_else(|_| "vllm".to_string()),
+            provider_type: row
+                .try_get("provider_type")
+                .unwrap_or_else(|_| "vllm".to_string()),
             provider_config: row.try_get("provider_config").ok().flatten(),
             attestation_supported: row.try_get("attestation_supported").unwrap_or(true),
         }

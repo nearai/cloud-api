@@ -144,10 +144,7 @@ enum AnthropicStreamEvent {
         content_block: AnthropicContentBlock,
     },
     #[serde(rename = "content_block_delta")]
-    ContentBlockDelta {
-        index: i64,
-        delta: AnthropicDelta,
-    },
+    ContentBlockDelta { index: i64, delta: AnthropicDelta },
     #[serde(rename = "content_block_stop")]
     ContentBlockStop { index: i64 },
     #[serde(rename = "message_delta")]
@@ -254,8 +251,9 @@ where
     }
 
     fn parse_event(&mut self, data: &str) -> Result<Option<StreamChunk>, CompletionError> {
-        let event: AnthropicStreamEvent = serde_json::from_str(data)
-            .map_err(|e| CompletionError::InvalidResponse(format!("Failed to parse Anthropic event: {e}")))?;
+        let event: AnthropicStreamEvent = serde_json::from_str(data).map_err(|e| {
+            CompletionError::InvalidResponse(format!("Failed to parse Anthropic event: {e}"))
+        })?;
 
         match event {
             AnthropicStreamEvent::MessageStart { message } => {
@@ -353,19 +351,17 @@ where
                     usage: Some(TokenUsage {
                         prompt_tokens: self.accumulated_input_tokens,
                         completion_tokens: self.accumulated_output_tokens,
-                        total_tokens: self.accumulated_input_tokens + self.accumulated_output_tokens,
+                        total_tokens: self.accumulated_input_tokens
+                            + self.accumulated_output_tokens,
                         prompt_tokens_details: None,
                     }),
                     prompt_token_ids: None,
                 };
                 Ok(Some(StreamChunk::Chat(chunk)))
             }
-            AnthropicStreamEvent::Error { error } => {
-                Err(CompletionError::CompletionError(format!(
-                    "Anthropic error: {} - {}",
-                    error.type_, error.message
-                )))
-            }
+            AnthropicStreamEvent::Error { error } => Err(CompletionError::CompletionError(
+                format!("Anthropic error: {} - {}", error.type_, error.message),
+            )),
             // Ignore other events
             _ => Ok(None),
         }
@@ -564,8 +560,10 @@ impl ExternalBackend for AnthropicBackend {
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?
             .to_vec();
 
-        let anthropic_response: AnthropicResponse = serde_json::from_slice(&raw_bytes)
-            .map_err(|e| CompletionError::CompletionError(format!("Failed to parse response: {e}")))?;
+        let anthropic_response: AnthropicResponse =
+            serde_json::from_slice(&raw_bytes).map_err(|e| {
+                CompletionError::CompletionError(format!("Failed to parse response: {e}"))
+            })?;
 
         // Convert Anthropic response to OpenAI format
         let content = anthropic_response
@@ -612,8 +610,9 @@ impl ExternalBackend for AnthropicBackend {
         };
 
         // Re-serialize for consistent raw bytes
-        let serialized_bytes = serde_json::to_vec(&openai_response)
-            .map_err(|e| CompletionError::CompletionError(format!("Failed to serialize response: {e}")))?;
+        let serialized_bytes = serde_json::to_vec(&openai_response).map_err(|e| {
+            CompletionError::CompletionError(format!("Failed to serialize response: {e}"))
+        })?;
 
         Ok(ChatCompletionResponseWithBytes {
             response: openai_response,
@@ -867,7 +866,8 @@ mod tests {
 
     #[test]
     fn test_parse_content_block_start_event() {
-        let data = r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#;
+        let data =
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#;
 
         let event: AnthropicStreamEvent = serde_json::from_str(data).unwrap();
 

@@ -79,8 +79,8 @@ pub use vllm::{VLlmConfig, VLlmProvider};
 
 // External provider exports
 pub use external::{
-    ExternalProvider, ExternalProviderConfig, ProviderConfig,
-    AnthropicBackend, GeminiBackend, OpenAiCompatibleBackend,
+    AnthropicBackend, ExternalProvider, ExternalProviderConfig, GeminiBackend,
+    OpenAiCompatibleBackend, ProviderConfig,
 };
 
 /// Type alias for streaming completion results

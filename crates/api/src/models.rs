@@ -1916,7 +1916,10 @@ pub struct UpdateModelApiRequest {
     #[serde(rename = "providerConfig", skip_serializing_if = "Option::is_none")]
     pub provider_config: Option<serde_json::Value>,
     /// Whether this model supports TEE attestation
-    #[serde(rename = "attestationSupported", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "attestationSupported",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub attestation_supported: Option<bool>,
     #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
     pub change_reason: Option<String>,

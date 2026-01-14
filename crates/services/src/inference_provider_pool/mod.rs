@@ -134,7 +134,8 @@ impl InferenceProviderPool {
             timeout_seconds: self.external_configs.timeout_seconds,
         };
 
-        let provider = Arc::new(ExternalProvider::new(external_config)) as Arc<InferenceProviderTrait>;
+        let provider =
+            Arc::new(ExternalProvider::new(external_config)) as Arc<InferenceProviderTrait>;
 
         // Register the provider
         let mut external = self.external_providers.write().await;

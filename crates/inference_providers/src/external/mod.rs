@@ -334,16 +334,12 @@ mod tests {
 
     #[test]
     fn test_provider_config_deserialization_gemini() {
-        let json =
-            r#"{"backend": "gemini", "base_url": "https://generativelanguage.googleapis.com/v1beta"}"#;
+        let json = r#"{"backend": "gemini", "base_url": "https://generativelanguage.googleapis.com/v1beta"}"#;
         let config: ProviderConfig = serde_json::from_str(json).unwrap();
 
         match config {
             ProviderConfig::Gemini { base_url } => {
-                assert_eq!(
-                    base_url,
-                    "https://generativelanguage.googleapis.com/v1beta"
-                );
+                assert_eq!(base_url, "https://generativelanguage.googleapis.com/v1beta");
             }
             _ => panic!("Expected Gemini variant"),
         }

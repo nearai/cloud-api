@@ -211,13 +211,248 @@ pub fn prepare_tool_choice(
     })
 }
 
+/// Maximum recursion depth for JSON repair to prevent stack overflow
+const MAX_REPAIR_DEPTH: u8 = 2;
+
+/// Attempt to repair malformed JSON from LLM tool calls
+///
+/// Handles common failure modes:
+/// - Truncated JSON: `{"query": "test", "count` -> `{"query": "test"}`
+/// - Missing opening brace: `": "value"...` -> attempt to extract query
+/// - Duplicated/nested JSON: `{"query": "a", "x":{"query": "a"}` -> use first complete object
+/// - Unclosed strings: `{"query": "test` -> `{"query": "test"}`
+///
+/// Returns the repaired JSON string if successful, or None if repair failed.
+///
+/// # Performance
+///
+/// The progressive truncation loop has O(N²) time complexity where N is the input length,
+/// as each iteration may call try_close_json (O(N)) and serde_json::from_str (O(N)).
+/// This is acceptable for typical tool call arguments which are small (< 1KB).
+fn try_repair_json(json_str: &str) -> Option<String> {
+    try_repair_json_inner(json_str, 0)
+}
+
+/// Inner implementation with depth tracking to prevent unbounded recursion
+fn try_repair_json_inner(json_str: &str, depth: u8) -> Option<String> {
+    if depth > MAX_REPAIR_DEPTH {
+        return None;
+    }
+
+    let trimmed = json_str.trim();
+
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Already valid JSON - no repair needed
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return Some(trimmed.to_string());
+    }
+
+    // Handle missing opening brace (stream started mid-JSON)
+    if !trimmed.starts_with('{') {
+        // Try to find if this looks like a partial JSON value
+        // Common pattern: `": "some value", "key": ...`
+        if trimmed.starts_with("\":") || trimmed.starts_with("\": ") {
+            let with_prefix = format!("{{\"query{}", trimmed);
+            if let Some(repaired) = try_repair_json_inner(&with_prefix, depth + 1) {
+                return Some(repaired);
+            }
+        }
+        // Can't repair without opening brace
+        return None;
+    }
+
+    // Handle duplicated/nested JSON objects
+    // e.g., `{"query": "a", "search_lang":{"query": "a", ...}`
+    // Find the first complete JSON object by tracking brace depth
+    if let Some(first_obj_end) = find_first_complete_object(trimmed) {
+        // Bounds check before slicing
+        if first_obj_end < trimmed.len() {
+            let first_obj = &trimmed[..=first_obj_end];
+            if serde_json::from_str::<serde_json::Value>(first_obj).is_ok() {
+                return Some(first_obj.to_string());
+            }
+        }
+    }
+
+    // Progressive truncation loop: O(N²) complexity - see Performance note above.
+    // Try progressively removing characters from the end and closing the JSON.
+    // This handles truncated JSON like: `{"query": "test", "freshness":`
+    let mut working = trimmed.to_string();
+
+    for _ in 0..working.len() {
+        // Try closing the JSON at current position
+        if let Some(closed) = try_close_json(&working) {
+            if serde_json::from_str::<serde_json::Value>(&closed).is_ok() {
+                return Some(closed);
+            }
+        }
+
+        // Remove last character and try again
+        working.pop();
+
+        // Stop if we've removed too much
+        if working.len() < 2 {
+            break;
+        }
+    }
+
+    None
+}
+
+/// Find the end index of the first complete JSON object in a string
+fn find_first_complete_object(s: &str) -> Option<usize> {
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for (i, ch) in s.char_indices() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+
+        match ch {
+            '\\' if in_string => escape_next = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+/// Attempt to close incomplete JSON by adding missing quotes, brackets, and braces
+fn try_close_json(s: &str) -> Option<String> {
+    let mut result = s.to_string();
+
+    // Count unclosed structures
+    let mut brace_count = 0i32;
+    let mut bracket_count = 0i32;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for ch in s.chars() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escape_next = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => brace_count += 1,
+            '}' if !in_string => brace_count -= 1,
+            '[' if !in_string => bracket_count += 1,
+            ']' if !in_string => bracket_count -= 1,
+            _ => {}
+        }
+    }
+
+    // If we're inside a string, close it
+    if in_string {
+        result.push('"');
+    }
+
+    // Add missing closing brackets
+    for _ in 0..bracket_count {
+        result.push(']');
+    }
+
+    // Add missing closing braces
+    for _ in 0..brace_count {
+        result.push('}');
+    }
+
+    Some(result)
+}
+
+/// Result of parsing tool call arguments
+enum ParseArgsResult {
+    /// Successfully parsed (or repaired) JSON
+    Ok(serde_json::Value),
+    /// Successfully repaired malformed JSON
+    Repaired(serde_json::Value),
+    /// Failed to parse or repair
+    Failed,
+}
+
+/// Parse tool call arguments JSON, with optional repair for web_search
+///
+/// For web_search tools, attempts to repair malformed JSON from truncated streams.
+/// For other tools, returns Failed if JSON is invalid.
+fn parse_tool_args(tool_name: &str, args_str: &str) -> ParseArgsResult {
+    // Try direct parsing first
+    if let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str) {
+        return ParseArgsResult::Ok(args);
+    }
+
+    // Only attempt repair for web_search
+    if tool_name != super::WEB_SEARCH_TOOL_NAME {
+        return ParseArgsResult::Failed;
+    }
+
+    // Attempt to repair malformed JSON
+    match try_repair_json(args_str) {
+        Some(repaired) => match serde_json::from_str::<serde_json::Value>(&repaired) {
+            Ok(args) => ParseArgsResult::Repaired(args),
+            Err(_) => ParseArgsResult::Failed,
+        },
+        None => ParseArgsResult::Failed,
+    }
+}
+
+/// Create an error ToolCallInfo for invalid JSON arguments
+fn create_invalid_json_error(name: &str, idx: i64) -> ToolCallInfo {
+    ToolCallInfo {
+        tool_type: ERROR_TOOL_TYPE.to_string(),
+        query: format!(
+            "Tool call for '{name}' (index {idx}) has invalid JSON arguments. \
+             Please ensure arguments are valid JSON."
+        ),
+        params: Some(serde_json::json!({
+            "error_type": "invalid_json",
+            "tool_name": name,
+            "index": idx
+        })),
+    }
+}
+
+/// Create an error ToolCallInfo for missing query field
+fn create_missing_query_error(name: &str, idx: i64) -> ToolCallInfo {
+    ToolCallInfo {
+        tool_type: ERROR_TOOL_TYPE.to_string(),
+        query: format!(
+            "Tool call for '{name}' (index {idx}) is missing the required 'query' field \
+             in its arguments. Please include a 'query' parameter."
+        ),
+        params: Some(serde_json::json!({
+            "error_type": "missing_query_field",
+            "tool_name": name,
+            "index": idx
+        })),
+    }
+}
+
 /// Convert accumulated tool calls from LLM response to ToolCallInfo
 ///
 /// Takes a map of tool call index -> (name, arguments_json) and converts
 /// them to structured ToolCallInfo. Invalid or malformed tool calls are
 /// converted to error tool calls that inform the LLM of the issue.
+///
+/// The `model` parameter is used for logging to help identify which models
+/// produce malformed tool calls.
 pub fn convert_tool_calls(
     tool_call_accumulator: HashMap<i64, (Option<String>, String)>,
+    model: &str,
 ) -> Vec<ToolCallInfo> {
     let mut tool_calls_detected = Vec::new();
 
@@ -227,15 +462,23 @@ pub fn convert_tool_calls(
             Some(n) if !n.trim().is_empty() => n,
             _ => {
                 tracing::warn!(
-                    "Tool call at index {} has no name or empty name. Args: {}",
-                    idx,
-                    args_str
+                    model = model,
+                    index = idx,
+                    "Tool call has no name or empty name"
                 );
-                // Create a special error tool call to inform the LLM
+                // Log args at debug level for staging troubleshooting (not in prod)
+                tracing::debug!(
+                    model = model,
+                    index = idx,
+                    args = args_str,
+                    "Tool call missing name - arguments for debugging"
+                );
                 tool_calls_detected.push(ToolCallInfo {
                     tool_type: ERROR_TOOL_TYPE.to_string(),
                     query: format!(
-                        "Tool call at index {idx} is missing a tool name. Please ensure all tool calls include a valid 'name' field. Arguments provided: {args_str}"
+                        "Tool call at index {idx} is missing a tool name. \
+                         Please ensure all tool calls include a valid 'name' field. \
+                         Arguments provided: {args_str}"
                     ),
                     params: Some(serde_json::json!({
                         "error_type": "missing_tool_name",
@@ -247,77 +490,279 @@ pub fn convert_tool_calls(
             }
         };
 
-        // Try to parse the complete arguments for tools that need parameters
-        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str) {
-            // Check if this is an MCP tool (format: "server_label:tool_name")
-            if name.contains(':') {
-                // MCP tools use the full arguments JSON as params
-                tracing::debug!(
-                    "MCP tool call detected: {} with arguments: {:?}",
-                    name,
-                    args
+        // Parse arguments, with repair for web_search if needed
+        let args = match parse_tool_args(&name, &args_str) {
+            ParseArgsResult::Ok(args) => args,
+            ParseArgsResult::Repaired(args) => {
+                tracing::info!(
+                    model = model,
+                    tool_name = name,
+                    index = idx,
+                    "Repaired malformed web_search tool call JSON"
                 );
-                tool_calls_detected.push(ToolCallInfo {
-                    tool_type: name,
-                    query: String::new(),
-                    params: Some(args),
-                });
-            } else if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
-                // Non-MCP tools (web_search, file_search) require a "query" field
-                tracing::debug!(
-                    "Tool call detected: {} with query: {} and params: {:?}",
-                    name,
-                    query,
-                    args
-                );
-                tool_calls_detected.push(ToolCallInfo {
-                    tool_type: name,
-                    query: query.to_string(),
-                    params: Some(args),
-                });
-            } else {
-                tracing::warn!(
-                    "Tool call {} (index {}) has no 'query' field in arguments: {}",
-                    name,
-                    idx,
-                    args_str
-                );
-                // Create an error tool call to inform the LLM about missing query
-                tool_calls_detected.push(ToolCallInfo {
-                    tool_type: ERROR_TOOL_TYPE.to_string(),
-                    query: format!(
-                        "Tool call for '{name}' (index {idx}) is missing the required 'query' field in its arguments. Please include a 'query' parameter. Arguments provided: {args_str}"
-                    ),
-                    params: Some(serde_json::json!({
-                        "error_type": "missing_query_field",
-                        "tool_name": name,
-                        "index": idx,
-                        "arguments": args_str
-                    })),
-                });
+                args
             }
+            ParseArgsResult::Failed => {
+                tracing::warn!(
+                    model = model,
+                    tool_name = name,
+                    index = idx,
+                    "Failed to parse tool call arguments"
+                );
+                // Log args at debug level for staging troubleshooting (not in prod)
+                tracing::debug!(
+                    model = model,
+                    tool_name = name,
+                    index = idx,
+                    args = args_str,
+                    "Failed to parse tool call - arguments for debugging"
+                );
+                tool_calls_detected.push(create_invalid_json_error(&name, idx));
+                continue;
+            }
+        };
+
+        // Check if this is an MCP tool (format: "server_label:tool_name")
+        if name.contains(':') {
+            tracing::debug!("MCP tool call detected: {}", name);
+            tool_calls_detected.push(ToolCallInfo {
+                tool_type: name,
+                query: String::new(),
+                params: Some(args),
+            });
+        } else if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
+            tracing::debug!("Tool call detected: {}", name);
+            tool_calls_detected.push(ToolCallInfo {
+                tool_type: name,
+                query: query.to_string(),
+                params: Some(args),
+            });
         } else {
             tracing::warn!(
-                "Failed to parse tool call {} (index {}) arguments: {}",
-                name,
-                idx,
-                args_str
+                model = model,
+                tool_name = name,
+                index = idx,
+                "Tool call has no 'query' field in arguments"
             );
-            // Create an error tool call to inform the LLM about invalid JSON
-            tool_calls_detected.push(ToolCallInfo {
-                tool_type: ERROR_TOOL_TYPE.to_string(),
-                query: format!(
-                    "Tool call for '{name}' (index {idx}) has invalid JSON arguments. Please ensure arguments are valid JSON. Arguments provided: {args_str}"
-                ),
-                params: Some(serde_json::json!({
-                    "error_type": "invalid_json",
-                    "tool_name": name,
-                    "index": idx,
-                    "arguments": args_str
-                })),
-            });
+            tool_calls_detected.push(create_missing_query_error(&name, idx));
         }
     }
 
     tool_calls_detected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_try_repair_json_valid_json() {
+        let input = r#"{"query": "test", "count": 10}"#;
+        let result = try_repair_json(input);
+        assert_eq!(result, Some(input.to_string()));
+    }
+
+    #[test]
+    fn test_try_repair_json_truncated_at_end() {
+        // Truncated JSON missing closing brace after key
+        let input = r#"{"query": "test search query", "freshness":"#;
+        let result = try_repair_json(input);
+        assert!(result.is_some());
+        let repaired = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(
+            parsed.get("query").and_then(|v| v.as_str()),
+            Some("test search query")
+        );
+    }
+
+    #[test]
+    fn test_try_repair_json_truncated_string_value() {
+        // Truncated in the middle of a key name
+        let input =
+            r#"{"query": "test query with multiple words", "freshness": "pm", "country": "US", ""#;
+        let result = try_repair_json(input);
+        assert!(result.is_some());
+        let repaired = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert!(parsed.get("query").is_some());
+        assert_eq!(parsed.get("country").and_then(|v| v.as_str()), Some("US"));
+    }
+
+    #[test]
+    fn test_try_repair_json_truncated_key() {
+        // Truncated after a key name
+        let input = r#"{"query": "example search", "freshness": "pd", "count"#;
+        let result = try_repair_json(input);
+        assert!(result.is_some());
+        let repaired = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert!(parsed.get("query").is_some());
+        assert_eq!(parsed.get("freshness").and_then(|v| v.as_str()), Some("pd"));
+    }
+
+    #[test]
+    fn test_try_repair_json_duplicated_nested() {
+        // Duplicated/nested JSON where the LLM repeated itself
+        let input = r#"{"query": "test query", "freshness": "pw", "country": "US", "count": 10, "search_lang":{"query": "test query", "freshness": "pw", "country": "US", "count": 10}"#;
+        let result = try_repair_json(input);
+        assert!(result.is_some());
+        let repaired = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(
+            parsed.get("query").and_then(|v| v.as_str()),
+            Some("test query")
+        );
+    }
+
+    #[test]
+    fn test_try_repair_json_missing_opening_brace() {
+        // Stream started mid-JSON (missing opening brace)
+        let input = r#"": "test search value", "count": 10, "freshness": "pw", "safesearch"#;
+        let result = try_repair_json(input);
+        // This case prepends {"query and attempts repair
+        assert!(result.is_some());
+        let repaired = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert!(parsed.get("query").is_some());
+    }
+
+    #[test]
+    fn test_try_repair_json_empty_string() {
+        let result = try_repair_json("");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_try_repair_json_whitespace_only() {
+        let result = try_repair_json("   ");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_try_repair_json_not_json() {
+        // Completely invalid - not JSON at all
+        let result = try_repair_json("this is not json at all");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_first_complete_object() {
+        let input = r#"{"a": 1}{"b": 2}"#;
+        let end = find_first_complete_object(input);
+        assert_eq!(end, Some(7)); // Index of first closing brace
+        assert_eq!(&input[..=7], r#"{"a": 1}"#);
+    }
+
+    #[test]
+    fn test_find_first_complete_object_nested() {
+        let input = r#"{"a": {"b": 1}, "c": 2}extra"#;
+        let end = find_first_complete_object(input);
+        assert_eq!(end, Some(22));
+        assert_eq!(&input[..=22], r#"{"a": {"b": 1}, "c": 2}"#);
+    }
+
+    #[test]
+    fn test_find_first_complete_object_with_escaped_quotes() {
+        let input = r#"{"a": "test \"quoted\" value"}"#;
+        let end = find_first_complete_object(input);
+        assert_eq!(end, Some(29));
+    }
+
+    #[test]
+    fn test_try_close_json_unclosed_string() {
+        let input = r#"{"query": "test"#;
+        let result = try_close_json(input);
+        assert!(result.is_some());
+        let closed = result.unwrap();
+        assert!(closed.ends_with("\"}"));
+    }
+
+    #[test]
+    fn test_try_close_json_unclosed_brace() {
+        let input = r#"{"query": "test""#;
+        let result = try_close_json(input);
+        assert!(result.is_some());
+        let closed = result.unwrap();
+        assert!(closed.ends_with("}"));
+    }
+
+    #[test]
+    fn test_convert_tool_calls_with_valid_json() {
+        let mut accumulator = HashMap::new();
+        accumulator.insert(
+            0,
+            (
+                Some("web_search".to_string()),
+                r#"{"query": "test search"}"#.to_string(),
+            ),
+        );
+
+        let result = convert_tool_calls(accumulator, "test-model");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].tool_type, "web_search");
+        assert_eq!(result[0].query, "test search");
+    }
+
+    #[test]
+    fn test_convert_tool_calls_repairs_truncated_json() {
+        let mut accumulator = HashMap::new();
+        accumulator.insert(
+            0,
+            (
+                Some("web_search".to_string()),
+                r#"{"query": "Bitcoin price", "freshness":"#.to_string(),
+            ),
+        );
+
+        let result = convert_tool_calls(accumulator, "test-model");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].tool_type, "web_search");
+        assert_eq!(result[0].query, "Bitcoin price");
+    }
+
+    #[test]
+    fn test_convert_tool_calls_missing_name() {
+        let mut accumulator = HashMap::new();
+        accumulator.insert(0, (None, r#"{"query": "test"}"#.to_string()));
+
+        let result = convert_tool_calls(accumulator, "test-model");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].tool_type, ERROR_TOOL_TYPE);
+    }
+
+    #[test]
+    fn test_convert_tool_calls_mcp_tool() {
+        let mut accumulator = HashMap::new();
+        accumulator.insert(
+            0,
+            (
+                Some("server:tool_name".to_string()),
+                r#"{"param1": "value1"}"#.to_string(),
+            ),
+        );
+
+        let result = convert_tool_calls(accumulator, "test-model");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].tool_type, "server:tool_name");
+        assert!(result[0].query.is_empty()); // MCP tools don't require query
+    }
+
+    #[test]
+    fn test_convert_tool_calls_no_repair_for_non_web_search() {
+        // Verify that JSON repair is NOT attempted for non-web_search tools
+        let mut accumulator = HashMap::new();
+        accumulator.insert(
+            0,
+            (
+                Some("file_search".to_string()),
+                r#"{"query": "test", "truncated":"#.to_string(), // Invalid JSON
+            ),
+        );
+
+        let result = convert_tool_calls(accumulator, "test-model");
+        assert_eq!(result.len(), 1);
+        // Should return an error, not attempt repair
+        assert_eq!(result[0].tool_type, ERROR_TOOL_TYPE);
+    }
 }

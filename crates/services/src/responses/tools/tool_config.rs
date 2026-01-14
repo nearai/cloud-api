@@ -211,6 +211,9 @@ pub fn prepare_tool_choice(
     })
 }
 
+/// Maximum recursion depth for JSON repair to prevent stack overflow
+const MAX_REPAIR_DEPTH: u8 = 2;
+
 /// Attempt to repair malformed JSON from LLM tool calls
 ///
 /// Handles common failure modes:
@@ -227,6 +230,15 @@ pub fn prepare_tool_choice(
 /// as each iteration may call try_close_json (O(N)) and serde_json::from_str (O(N)).
 /// This is acceptable for typical tool call arguments which are small (< 1KB).
 fn try_repair_json(json_str: &str) -> Option<String> {
+    try_repair_json_inner(json_str, 0)
+}
+
+/// Inner implementation with depth tracking to prevent unbounded recursion
+fn try_repair_json_inner(json_str: &str, depth: u8) -> Option<String> {
+    if depth > MAX_REPAIR_DEPTH {
+        return None;
+    }
+
     let trimmed = json_str.trim();
 
     if trimmed.is_empty() {
@@ -244,7 +256,7 @@ fn try_repair_json(json_str: &str) -> Option<String> {
         // Common pattern: `": "some value", "key": ...`
         if trimmed.starts_with("\":") || trimmed.starts_with("\": ") {
             let with_prefix = format!("{{\"query{}", trimmed);
-            if let Some(repaired) = try_repair_json(&with_prefix) {
+            if let Some(repaired) = try_repair_json_inner(&with_prefix, depth + 1) {
                 return Some(repaired);
             }
         }
@@ -256,9 +268,12 @@ fn try_repair_json(json_str: &str) -> Option<String> {
     // e.g., `{"query": "a", "search_lang":{"query": "a", ...}`
     // Find the first complete JSON object by tracking brace depth
     if let Some(first_obj_end) = find_first_complete_object(trimmed) {
-        let first_obj = &trimmed[..=first_obj_end];
-        if serde_json::from_str::<serde_json::Value>(first_obj).is_ok() {
-            return Some(first_obj.to_string());
+        // Bounds check before slicing
+        if first_obj_end < trimmed.len() {
+            let first_obj = &trimmed[..=first_obj_end];
+            if serde_json::from_str::<serde_json::Value>(first_obj).is_ok() {
+                return Some(first_obj.to_string());
+            }
         }
     }
 

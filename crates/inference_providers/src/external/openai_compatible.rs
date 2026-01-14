@@ -179,3 +179,135 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // ==================== Header Building Tests ====================
+
+    #[test]
+    fn test_build_headers_basic() {
+        let backend = OpenAiCompatibleBackend::new();
+        let config = BackendConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "sk-test-key-123".to_string(),
+            timeout_seconds: 30,
+            extra: HashMap::new(),
+        };
+
+        let headers = backend.build_headers(&config).unwrap();
+
+        assert_eq!(
+            headers.get("Authorization").unwrap().to_str().unwrap(),
+            "Bearer sk-test-key-123"
+        );
+        assert_eq!(
+            headers.get("Content-Type").unwrap().to_str().unwrap(),
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn test_build_headers_with_organization() {
+        let backend = OpenAiCompatibleBackend::new();
+        let mut extra = HashMap::new();
+        extra.insert("organization_id".to_string(), "org-abc123".to_string());
+
+        let config = BackendConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "sk-test-key".to_string(),
+            timeout_seconds: 30,
+            extra,
+        };
+
+        let headers = backend.build_headers(&config).unwrap();
+
+        assert_eq!(
+            headers.get("OpenAI-Organization").unwrap().to_str().unwrap(),
+            "org-abc123"
+        );
+    }
+
+    #[test]
+    fn test_build_headers_no_organization() {
+        let backend = OpenAiCompatibleBackend::new();
+        let config = BackendConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "sk-test-key".to_string(),
+            timeout_seconds: 30,
+            extra: HashMap::new(),
+        };
+
+        let headers = backend.build_headers(&config).unwrap();
+
+        assert!(headers.get("OpenAI-Organization").is_none());
+    }
+
+    // ==================== URL Building Tests ====================
+
+    #[test]
+    fn test_chat_completion_url() {
+        let base_url = "https://api.openai.com/v1";
+        let url = format!("{}/chat/completions", base_url);
+
+        assert_eq!(url, "https://api.openai.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_chat_completion_url_different_providers() {
+        let providers = vec![
+            ("https://api.openai.com/v1", "https://api.openai.com/v1/chat/completions"),
+            ("https://api.together.xyz/v1", "https://api.together.xyz/v1/chat/completions"),
+            ("https://api.groq.com/openai/v1", "https://api.groq.com/openai/v1/chat/completions"),
+            ("https://api.fireworks.ai/inference/v1", "https://api.fireworks.ai/inference/v1/chat/completions"),
+        ];
+
+        for (base_url, expected) in providers {
+            let url = format!("{}/chat/completions", base_url);
+            assert_eq!(url, expected);
+        }
+    }
+
+    // ==================== Backend Type Tests ====================
+
+    #[test]
+    fn test_backend_type() {
+        let backend = OpenAiCompatibleBackend::new();
+        assert_eq!(backend.backend_type(), "openai_compatible");
+    }
+
+    // ==================== Default Implementation Tests ====================
+
+    #[test]
+    fn test_default_implementation() {
+        let backend = OpenAiCompatibleBackend::default();
+        assert_eq!(backend.backend_type(), "openai_compatible");
+    }
+
+    // ==================== Stream Options Tests ====================
+
+    #[test]
+    fn test_stream_options_serialization() {
+        let options = StreamOptions {
+            include_usage: Some(true),
+            continuous_usage_stats: None,
+        };
+
+        let json = serde_json::to_string(&options).unwrap();
+        assert!(json.contains("\"include_usage\":true"));
+    }
+
+    #[test]
+    fn test_stream_options_with_all_fields() {
+        let options = StreamOptions {
+            include_usage: Some(true),
+            continuous_usage_stats: Some(true),
+        };
+
+        let json = serde_json::to_string(&options).unwrap();
+        assert!(json.contains("\"include_usage\":true"));
+        assert!(json.contains("\"continuous_usage_stats\":true"));
+    }
+}

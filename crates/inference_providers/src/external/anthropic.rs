@@ -621,3 +621,433 @@ impl ExternalBackend for AnthropicBackend {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ChatMessage;
+
+    // ==================== Message Translation Tests ====================
+
+    #[test]
+    fn test_convert_messages_extracts_system() {
+        let messages = vec![
+            ChatMessage {
+                role: MessageRole::System,
+                content: Some("You are a helpful assistant.".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::User,
+                content: Some("Hello".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
+        let (system, anthropic_messages) = AnthropicBackend::convert_messages(&messages);
+
+        assert_eq!(system, Some("You are a helpful assistant.".to_string()));
+        assert_eq!(anthropic_messages.len(), 1);
+        assert_eq!(anthropic_messages[0].role, "user");
+        assert_eq!(anthropic_messages[0].content, "Hello");
+    }
+
+    #[test]
+    fn test_convert_messages_no_system() {
+        let messages = vec![
+            ChatMessage {
+                role: MessageRole::User,
+                content: Some("Hello".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::Assistant,
+                content: Some("Hi there!".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
+        let (system, anthropic_messages) = AnthropicBackend::convert_messages(&messages);
+
+        assert!(system.is_none());
+        assert_eq!(anthropic_messages.len(), 2);
+        assert_eq!(anthropic_messages[0].role, "user");
+        assert_eq!(anthropic_messages[1].role, "assistant");
+    }
+
+    #[test]
+    fn test_convert_messages_empty() {
+        let messages: Vec<ChatMessage> = vec![];
+        let (system, anthropic_messages) = AnthropicBackend::convert_messages(&messages);
+
+        assert!(system.is_none());
+        assert!(anthropic_messages.is_empty());
+    }
+
+    #[test]
+    fn test_convert_messages_only_system() {
+        let messages = vec![ChatMessage {
+            role: MessageRole::System,
+            content: Some("You are a bot.".to_string()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let (system, anthropic_messages) = AnthropicBackend::convert_messages(&messages);
+
+        assert_eq!(system, Some("You are a bot.".to_string()));
+        assert!(anthropic_messages.is_empty());
+    }
+
+    #[test]
+    fn test_convert_messages_tool_becomes_user() {
+        let messages = vec![ChatMessage {
+            role: MessageRole::Tool,
+            content: Some("Tool result here".to_string()),
+            name: None,
+            tool_call_id: Some("call_123".to_string()),
+            tool_calls: None,
+        }];
+
+        let (system, anthropic_messages) = AnthropicBackend::convert_messages(&messages);
+
+        assert!(system.is_none());
+        assert_eq!(anthropic_messages.len(), 1);
+        assert_eq!(anthropic_messages[0].role, "user");
+        assert_eq!(anthropic_messages[0].content, "Tool result here");
+    }
+
+    #[test]
+    fn test_convert_messages_none_content() {
+        let messages = vec![ChatMessage {
+            role: MessageRole::User,
+            content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let (system, anthropic_messages) = AnthropicBackend::convert_messages(&messages);
+
+        assert!(system.is_none());
+        assert_eq!(anthropic_messages.len(), 1);
+        assert_eq!(anthropic_messages[0].content, ""); // Empty string for None
+    }
+
+    #[test]
+    fn test_convert_messages_multiple_system_uses_last() {
+        // If there are multiple system messages, the last one wins
+        let messages = vec![
+            ChatMessage {
+                role: MessageRole::System,
+                content: Some("First system".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::User,
+                content: Some("Hello".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::System,
+                content: Some("Second system".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
+        let (system, anthropic_messages) = AnthropicBackend::convert_messages(&messages);
+
+        // Last system message should be used
+        assert_eq!(system, Some("Second system".to_string()));
+        assert_eq!(anthropic_messages.len(), 1);
+    }
+
+    // ==================== SSE Event Parsing Tests ====================
+
+    #[test]
+    fn test_parse_message_start_event() {
+        let data = r#"{"type":"message_start","message":{"id":"msg_123","type":"message","role":"assistant","model":"claude-3-opus-20240229","usage":{"input_tokens":25,"output_tokens":0}}}"#;
+
+        let event: AnthropicStreamEvent = serde_json::from_str(data).unwrap();
+
+        match event {
+            AnthropicStreamEvent::MessageStart { message } => {
+                assert_eq!(message.id, "msg_123");
+                assert_eq!(message.role, "assistant");
+                assert_eq!(message.usage.input_tokens, 25);
+            }
+            _ => panic!("Expected MessageStart event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_content_block_delta_event() {
+        let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
+
+        let event: AnthropicStreamEvent = serde_json::from_str(data).unwrap();
+
+        match event {
+            AnthropicStreamEvent::ContentBlockDelta { index, delta } => {
+                assert_eq!(index, 0);
+                assert_eq!(delta.type_, "text_delta");
+                assert_eq!(delta.text, Some("Hello".to_string()));
+            }
+            _ => panic!("Expected ContentBlockDelta event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_message_delta_event() {
+        let data = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":15}}"#;
+
+        let event: AnthropicStreamEvent = serde_json::from_str(data).unwrap();
+
+        match event {
+            AnthropicStreamEvent::MessageDelta { delta, usage } => {
+                assert_eq!(delta.stop_reason, Some("end_turn".to_string()));
+                assert_eq!(usage.output_tokens, 15);
+            }
+            _ => panic!("Expected MessageDelta event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_error_event() {
+        let data = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Invalid API key"}}"#;
+
+        let event: AnthropicStreamEvent = serde_json::from_str(data).unwrap();
+
+        match event {
+            AnthropicStreamEvent::Error { error } => {
+                assert_eq!(error.type_, "invalid_request_error");
+                assert_eq!(error.message, "Invalid API key");
+            }
+            _ => panic!("Expected Error event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ping_event() {
+        let data = r#"{"type":"ping"}"#;
+
+        let event: AnthropicStreamEvent = serde_json::from_str(data).unwrap();
+
+        match event {
+            AnthropicStreamEvent::Ping => {}
+            _ => panic!("Expected Ping event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_message_stop_event() {
+        let data = r#"{"type":"message_stop"}"#;
+
+        let event: AnthropicStreamEvent = serde_json::from_str(data).unwrap();
+
+        match event {
+            AnthropicStreamEvent::MessageStop => {}
+            _ => panic!("Expected MessageStop event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_content_block_start_event() {
+        let data = r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#;
+
+        let event: AnthropicStreamEvent = serde_json::from_str(data).unwrap();
+
+        match event {
+            AnthropicStreamEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => {
+                assert_eq!(index, 0);
+                assert_eq!(content_block.type_, "text");
+            }
+            _ => panic!("Expected ContentBlockStart event"),
+        }
+    }
+
+    // ==================== Response Parsing Tests ====================
+
+    #[test]
+    fn test_parse_anthropic_response() {
+        let json = r#"{
+            "id": "msg_abc123",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Hello! How can I help you?"}],
+            "model": "claude-3-opus-20240229",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 8}
+        }"#;
+
+        let response: AnthropicResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(response.id, "msg_abc123");
+        assert_eq!(response.role, "assistant");
+        assert_eq!(response.content.len(), 1);
+        assert_eq!(
+            response.content[0].text,
+            Some("Hello! How can I help you?".to_string())
+        );
+        assert_eq!(response.stop_reason, Some("end_turn".to_string()));
+        assert_eq!(response.usage.input_tokens, 10);
+        assert_eq!(response.usage.output_tokens, 8);
+    }
+
+    #[test]
+    fn test_parse_anthropic_response_multiple_content_blocks() {
+        let json = r#"{
+            "id": "msg_abc123",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "First part. "},
+                {"type": "text", "text": "Second part."}
+            ],
+            "model": "claude-3-opus-20240229",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 8}
+        }"#;
+
+        let response: AnthropicResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(response.content.len(), 2);
+    }
+
+    // ==================== Finish Reason Mapping Tests ====================
+
+    #[test]
+    fn test_finish_reason_mapping() {
+        // Test the finish reason mapping logic
+        let test_cases = vec![
+            ("end_turn", crate::FinishReason::Stop),
+            ("stop_sequence", crate::FinishReason::Stop),
+            ("max_tokens", crate::FinishReason::Length),
+            ("unknown_reason", crate::FinishReason::Stop), // Default
+        ];
+
+        for (anthropic_reason, expected) in test_cases {
+            let mapped = match anthropic_reason {
+                "end_turn" | "stop_sequence" => crate::FinishReason::Stop,
+                "max_tokens" => crate::FinishReason::Length,
+                _ => crate::FinishReason::Stop,
+            };
+            assert_eq!(mapped, expected, "Failed for reason: {}", anthropic_reason);
+        }
+    }
+
+    // ==================== Request Building Tests ====================
+
+    #[test]
+    fn test_anthropic_request_serialization() {
+        let request = AnthropicRequest {
+            model: "claude-3-opus-20240229".to_string(),
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            }],
+            max_tokens: 1024,
+            system: Some("You are helpful.".to_string()),
+            temperature: Some(0.7),
+            top_p: None,
+            stop_sequences: Some(vec!["STOP".to_string()]),
+            stream: true,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+
+        assert!(json.contains("\"model\":\"claude-3-opus-20240229\""));
+        assert!(json.contains("\"max_tokens\":1024"));
+        assert!(json.contains("\"system\":\"You are helpful.\""));
+        assert!(json.contains("\"temperature\":0.7"));
+        assert!(json.contains("\"stream\":true"));
+        assert!(!json.contains("\"top_p\"")); // Should be skipped (None)
+    }
+
+    #[test]
+    fn test_anthropic_request_skips_none_fields() {
+        let request = AnthropicRequest {
+            model: "claude-3-opus-20240229".to_string(),
+            messages: vec![],
+            max_tokens: 1024,
+            system: None,
+            temperature: None,
+            top_p: None,
+            stop_sequences: None,
+            stream: false,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+
+        assert!(!json.contains("\"system\""));
+        assert!(!json.contains("\"temperature\""));
+        assert!(!json.contains("\"top_p\""));
+        assert!(!json.contains("\"stop_sequences\""));
+    }
+
+    // ==================== Header Building Tests ====================
+
+    #[test]
+    fn test_build_headers_default_version() {
+        let backend = AnthropicBackend::new();
+        let config = BackendConfig {
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key: "test-key".to_string(),
+            timeout_seconds: 30,
+            extra: std::collections::HashMap::new(),
+        };
+
+        let headers = backend.build_headers(&config).unwrap();
+
+        assert_eq!(
+            headers.get("x-api-key").unwrap().to_str().unwrap(),
+            "test-key"
+        );
+        assert_eq!(
+            headers.get("anthropic-version").unwrap().to_str().unwrap(),
+            DEFAULT_ANTHROPIC_VERSION
+        );
+        assert_eq!(
+            headers.get("Content-Type").unwrap().to_str().unwrap(),
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn test_build_headers_custom_version() {
+        let backend = AnthropicBackend::new();
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("version".to_string(), "2024-01-01".to_string());
+
+        let config = BackendConfig {
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key: "test-key".to_string(),
+            timeout_seconds: 30,
+            extra,
+        };
+
+        let headers = backend.build_headers(&config).unwrap();
+
+        assert_eq!(
+            headers.get("anthropic-version").unwrap().to_str().unwrap(),
+            "2024-01-01"
+        );
+    }
+}

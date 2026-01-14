@@ -56,8 +56,8 @@ pub struct InferenceProviderPool {
     provider_mappings: Arc<RwLock<ProviderMappings>>,
     /// External providers (keyed by model name, created from database config)
     external_providers: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
-    /// API keys configuration for external providers
-    external_api_keys: ExternalProvidersConfig,
+    /// Configuration for external providers (API keys, timeouts, etc.)
+    external_configs: ExternalProvidersConfig,
     /// Round-robin index for each model
     load_balancer_index: Arc<RwLock<HashMap<String, usize>>>,
     /// Map of chat_id -> provider for sticky routing
@@ -73,7 +73,7 @@ impl InferenceProviderPool {
         api_key: Option<String>,
         discovery_timeout_secs: i64,
         inference_timeout_secs: i64,
-        external_api_keys: ExternalProvidersConfig,
+        external_configs: ExternalProvidersConfig,
     ) -> Self {
         Self {
             discovery_url,
@@ -82,7 +82,7 @@ impl InferenceProviderPool {
             inference_timeout_secs,
             provider_mappings: Arc::new(RwLock::new(ProviderMappings::new())),
             external_providers: Arc::new(RwLock::new(HashMap::new())),
-            external_api_keys,
+            external_configs,
             load_balancer_index: Arc::new(RwLock::new(HashMap::new())),
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
             refresh_task_handle: Arc::new(Mutex::new(None)),
@@ -115,7 +115,7 @@ impl InferenceProviderPool {
 
         // Get the API key for this backend
         let api_key = self
-            .external_api_keys
+            .external_configs
             .get_api_key(backend_type)
             .ok_or_else(|| {
                 format!(
@@ -131,7 +131,7 @@ impl InferenceProviderPool {
             model_name: model_name.clone(),
             provider_config: config,
             api_key,
-            timeout_seconds: self.external_api_keys.timeout_seconds,
+            timeout_seconds: self.external_configs.timeout_seconds,
         };
 
         let provider = Arc::new(ExternalProvider::new(external_config)) as Arc<InferenceProviderTrait>;
@@ -1333,5 +1333,324 @@ mod tests {
 
         while stream.next().await.is_some() {}
         assert!(pool.get_provider_by_chat_id(&chat_id).await.is_some());
+    }
+
+    // ==================== External Provider Tests ====================
+
+    #[tokio::test]
+    async fn test_register_external_provider_openai() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test-key".to_string()),
+                anthropic_api_key: None,
+                gemini_api_key: None,
+                timeout_seconds: 60,
+            },
+        );
+
+        let config = serde_json::json!({
+            "backend": "openai_compatible",
+            "base_url": "https://api.openai.com/v1"
+        });
+
+        let result = pool
+            .register_external_provider("gpt-4".to_string(), config)
+            .await;
+
+        assert!(result.is_ok());
+        assert!(pool.is_external_provider("gpt-4").await);
+    }
+
+    #[tokio::test]
+    async fn test_register_external_provider_anthropic() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: None,
+                anthropic_api_key: Some("sk-ant-test".to_string()),
+                gemini_api_key: None,
+                timeout_seconds: 60,
+            },
+        );
+
+        let config = serde_json::json!({
+            "backend": "anthropic",
+            "base_url": "https://api.anthropic.com/v1"
+        });
+
+        let result = pool
+            .register_external_provider("claude-3-opus".to_string(), config)
+            .await;
+
+        assert!(result.is_ok());
+        assert!(pool.is_external_provider("claude-3-opus").await);
+    }
+
+    #[tokio::test]
+    async fn test_register_external_provider_gemini() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: None,
+                anthropic_api_key: None,
+                gemini_api_key: Some("AIza-test".to_string()),
+                timeout_seconds: 60,
+            },
+        );
+
+        let config = serde_json::json!({
+            "backend": "gemini",
+            "base_url": "https://generativelanguage.googleapis.com/v1beta"
+        });
+
+        let result = pool
+            .register_external_provider("gemini-1.5-pro".to_string(), config)
+            .await;
+
+        assert!(result.is_ok());
+        assert!(pool.is_external_provider("gemini-1.5-pro").await);
+    }
+
+    #[tokio::test]
+    async fn test_register_external_provider_missing_api_key() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig::default(), // No API keys configured
+        );
+
+        let config = serde_json::json!({
+            "backend": "openai_compatible",
+            "base_url": "https://api.openai.com/v1"
+        });
+
+        let result = pool
+            .register_external_provider("gpt-4".to_string(), config)
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("API key"));
+    }
+
+    #[tokio::test]
+    async fn test_register_external_provider_invalid_config() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test".to_string()),
+                anthropic_api_key: None,
+                gemini_api_key: None,
+                timeout_seconds: 60,
+            },
+        );
+
+        let config = serde_json::json!({
+            "backend": "unknown_backend",
+            "base_url": "https://example.com"
+        });
+
+        let result = pool
+            .register_external_provider("test-model".to_string(), config)
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_is_external_provider_false_for_vllm() {
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig::default(),
+        );
+
+        // Register a vLLM-style provider (via mock)
+        let mock_provider = Arc::new(MockProvider::new());
+        pool.register_provider("vllm-model".to_string(), mock_provider)
+            .await;
+
+        // vLLM providers should not be external
+        assert!(!pool.is_external_provider("vllm-model").await);
+    }
+
+    #[tokio::test]
+    async fn test_is_external_provider_false_for_unknown() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig::default(),
+        );
+
+        // Unknown model should not be external
+        assert!(!pool.is_external_provider("unknown-model").await);
+    }
+
+    #[tokio::test]
+    async fn test_load_external_providers_batch() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test".to_string()),
+                anthropic_api_key: Some("sk-ant-test".to_string()),
+                gemini_api_key: Some("AIza-test".to_string()),
+                timeout_seconds: 60,
+            },
+        );
+
+        let models = vec![
+            (
+                "gpt-4".to_string(),
+                serde_json::json!({
+                    "backend": "openai_compatible",
+                    "base_url": "https://api.openai.com/v1"
+                }),
+            ),
+            (
+                "claude-3".to_string(),
+                serde_json::json!({
+                    "backend": "anthropic",
+                    "base_url": "https://api.anthropic.com/v1"
+                }),
+            ),
+            (
+                "gemini-pro".to_string(),
+                serde_json::json!({
+                    "backend": "gemini",
+                    "base_url": "https://generativelanguage.googleapis.com/v1beta"
+                }),
+            ),
+        ];
+
+        let result = pool.load_external_providers(models).await;
+
+        assert!(result.is_ok());
+        assert!(pool.is_external_provider("gpt-4").await);
+        assert!(pool.is_external_provider("claude-3").await);
+        assert!(pool.is_external_provider("gemini-pro").await);
+    }
+
+    #[tokio::test]
+    async fn test_load_external_providers_partial_failure() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test".to_string()),
+                anthropic_api_key: None, // Missing Anthropic key
+                gemini_api_key: None,
+                timeout_seconds: 60,
+            },
+        );
+
+        let models = vec![
+            (
+                "gpt-4".to_string(),
+                serde_json::json!({
+                    "backend": "openai_compatible",
+                    "base_url": "https://api.openai.com/v1"
+                }),
+            ),
+            (
+                "claude-3".to_string(),
+                serde_json::json!({
+                    "backend": "anthropic",
+                    "base_url": "https://api.anthropic.com/v1"
+                }),
+            ),
+        ];
+
+        // Should still succeed (continues on individual failures)
+        let result = pool.load_external_providers(models).await;
+        assert!(result.is_ok());
+
+        // OpenAI should be registered
+        assert!(pool.is_external_provider("gpt-4").await);
+
+        // Anthropic should fail to register (missing API key)
+        assert!(!pool.is_external_provider("claude-3").await);
+    }
+
+    #[tokio::test]
+    async fn test_external_provider_config_from_env() {
+        // Test the ExternalProvidersConfig::from_env() behavior
+        let config = ExternalProvidersConfig::default();
+
+        // Default should have no API keys
+        assert!(config.openai_api_key.is_none());
+        assert!(config.anthropic_api_key.is_none());
+        assert!(config.gemini_api_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_external_provider_config_get_api_key() {
+        let config = ExternalProvidersConfig {
+            openai_api_key: Some("openai-key".to_string()),
+            anthropic_api_key: Some("anthropic-key".to_string()),
+            gemini_api_key: Some("gemini-key".to_string()),
+            timeout_seconds: 60,
+        };
+
+        assert_eq!(config.get_api_key("openai_compatible"), Some("openai-key"));
+        assert_eq!(config.get_api_key("anthropic"), Some("anthropic-key"));
+        assert_eq!(config.get_api_key("gemini"), Some("gemini-key"));
+        assert_eq!(config.get_api_key("unknown"), None);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_clears_external_providers() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test".to_string()),
+                anthropic_api_key: None,
+                gemini_api_key: None,
+                timeout_seconds: 60,
+            },
+        );
+
+        let config = serde_json::json!({
+            "backend": "openai_compatible",
+            "base_url": "https://api.openai.com/v1"
+        });
+
+        pool.register_external_provider("gpt-4".to_string(), config)
+            .await
+            .unwrap();
+
+        assert!(pool.is_external_provider("gpt-4").await);
+
+        pool.shutdown().await;
+
+        assert!(!pool.is_external_provider("gpt-4").await);
     }
 }

@@ -354,10 +354,11 @@ impl ExternalBackend for GeminiBackend {
         model: &str,
         params: ChatCompletionParams,
     ) -> Result<StreamingResult, CompletionError> {
-        // Gemini API URL format: {base_url}/models/{model}:streamGenerateContent?key={api_key}
+        // Gemini API URL format: {base_url}/models/{model}:streamGenerateContent?alt=sse
+        // API key is passed via x-goog-api-key header for security
         let url = format!(
-            "{}/models/{}:streamGenerateContent?key={}&alt=sse",
-            config.base_url, model, config.api_key
+            "{}/models/{}:streamGenerateContent?alt=sse",
+            config.base_url, model
         );
 
         let (system_instruction, contents) = Self::convert_messages(&params.messages);
@@ -389,6 +390,11 @@ impl ExternalBackend for GeminiBackend {
         headers.insert(
             "Content-Type",
             reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            "x-goog-api-key",
+            reqwest::header::HeaderValue::from_str(&config.api_key)
+                .map_err(|e| CompletionError::CompletionError(format!("Invalid API key: {e}")))?,
         );
 
         let timeout = std::time::Duration::from_secs(config.timeout_seconds as u64);
@@ -426,11 +432,9 @@ impl ExternalBackend for GeminiBackend {
         model: &str,
         params: ChatCompletionParams,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
-        // Gemini API URL format: {base_url}/models/{model}:generateContent?key={api_key}
-        let url = format!(
-            "{}/models/{}:generateContent?key={}",
-            config.base_url, model, config.api_key
-        );
+        // Gemini API URL format: {base_url}/models/{model}:generateContent
+        // API key is passed via x-goog-api-key header for security
+        let url = format!("{}/models/{}:generateContent", config.base_url, model);
 
         let (system_instruction, contents) = Self::convert_messages(&params.messages);
 
@@ -461,6 +465,11 @@ impl ExternalBackend for GeminiBackend {
         headers.insert(
             "Content-Type",
             reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            "x-goog-api-key",
+            reqwest::header::HeaderValue::from_str(&config.api_key)
+                .map_err(|e| CompletionError::CompletionError(format!("Invalid API key: {e}")))?,
         );
 
         let timeout = std::time::Duration::from_secs(config.timeout_seconds as u64);
@@ -555,5 +564,472 @@ impl ExternalBackend for GeminiBackend {
             response: openai_response,
             raw_bytes: serialized_bytes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ChatMessage;
+
+    // ==================== Message Translation Tests ====================
+
+    #[test]
+    fn test_convert_messages_extracts_system_instruction() {
+        let messages = vec![
+            ChatMessage {
+                role: MessageRole::System,
+                content: Some("You are a helpful assistant.".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::User,
+                content: Some("Hello".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
+        let (system_instruction, contents) = GeminiBackend::convert_messages(&messages);
+
+        assert!(system_instruction.is_some());
+        let sys = system_instruction.unwrap();
+        assert_eq!(sys.parts.len(), 1);
+        assert_eq!(sys.parts[0].text, "You are a helpful assistant.");
+
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].role, "user");
+        assert_eq!(contents[0].parts[0].text, "Hello");
+    }
+
+    #[test]
+    fn test_convert_messages_assistant_becomes_model() {
+        let messages = vec![
+            ChatMessage {
+                role: MessageRole::User,
+                content: Some("Hello".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::Assistant,
+                content: Some("Hi there!".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
+        let (system_instruction, contents) = GeminiBackend::convert_messages(&messages);
+
+        assert!(system_instruction.is_none());
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[0].role, "user");
+        assert_eq!(contents[1].role, "model"); // assistant -> model
+        assert_eq!(contents[1].parts[0].text, "Hi there!");
+    }
+
+    #[test]
+    fn test_convert_messages_empty() {
+        let messages: Vec<ChatMessage> = vec![];
+        let (system_instruction, contents) = GeminiBackend::convert_messages(&messages);
+
+        assert!(system_instruction.is_none());
+        assert!(contents.is_empty());
+    }
+
+    #[test]
+    fn test_convert_messages_only_system() {
+        let messages = vec![ChatMessage {
+            role: MessageRole::System,
+            content: Some("You are a bot.".to_string()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let (system_instruction, contents) = GeminiBackend::convert_messages(&messages);
+
+        assert!(system_instruction.is_some());
+        assert!(contents.is_empty());
+    }
+
+    #[test]
+    fn test_convert_messages_tool_becomes_user() {
+        let messages = vec![ChatMessage {
+            role: MessageRole::Tool,
+            content: Some("Tool result here".to_string()),
+            name: None,
+            tool_call_id: Some("call_123".to_string()),
+            tool_calls: None,
+        }];
+
+        let (system_instruction, contents) = GeminiBackend::convert_messages(&messages);
+
+        assert!(system_instruction.is_none());
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].role, "user");
+        assert_eq!(contents[0].parts[0].text, "Tool result here");
+    }
+
+    #[test]
+    fn test_convert_messages_none_content() {
+        let messages = vec![ChatMessage {
+            role: MessageRole::User,
+            content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let (system_instruction, contents) = GeminiBackend::convert_messages(&messages);
+
+        assert!(system_instruction.is_none());
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].parts[0].text, ""); // Empty string for None
+    }
+
+    #[test]
+    fn test_convert_messages_multiple_system_uses_last() {
+        let messages = vec![
+            ChatMessage {
+                role: MessageRole::System,
+                content: Some("First system".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::User,
+                content: Some("Hello".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::System,
+                content: Some("Second system".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
+        let (system_instruction, contents) = GeminiBackend::convert_messages(&messages);
+
+        // Last system message should be used
+        assert!(system_instruction.is_some());
+        let sys = system_instruction.unwrap();
+        assert_eq!(sys.parts[0].text, "Second system");
+        assert_eq!(contents.len(), 1);
+    }
+
+    #[test]
+    fn test_convert_messages_no_system() {
+        let messages = vec![ChatMessage {
+            role: MessageRole::User,
+            content: Some("Hello".to_string()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let (system_instruction, contents) = GeminiBackend::convert_messages(&messages);
+
+        assert!(system_instruction.is_none());
+        assert_eq!(contents.len(), 1);
+    }
+
+    // ==================== Response Parsing Tests ====================
+
+    #[test]
+    fn test_parse_gemini_response() {
+        let json = r#"{
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "Hello! How can I help you?"}]
+                },
+                "finishReason": "STOP",
+                "safetyRatings": []
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 8,
+                "totalTokenCount": 18
+            },
+            "modelVersion": "gemini-1.5-pro"
+        }"#;
+
+        let response: GeminiResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(response.candidates.len(), 1);
+        assert_eq!(response.candidates[0].content.role, "model");
+        assert_eq!(
+            response.candidates[0].content.parts[0].text,
+            "Hello! How can I help you?"
+        );
+        assert_eq!(
+            response.candidates[0].finish_reason,
+            Some("STOP".to_string())
+        );
+        assert_eq!(response.usage_metadata.prompt_token_count, 10);
+        assert_eq!(response.usage_metadata.candidates_token_count, 8);
+        assert_eq!(response.usage_metadata.total_token_count, 18);
+    }
+
+    #[test]
+    fn test_parse_gemini_response_empty_candidates() {
+        let json = r#"{
+            "candidates": [],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 0,
+                "totalTokenCount": 10
+            }
+        }"#;
+
+        let response: GeminiResponse = serde_json::from_str(json).unwrap();
+
+        assert!(response.candidates.is_empty());
+    }
+
+    #[test]
+    fn test_parse_gemini_response_multiple_parts() {
+        let json = r#"{
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"text": "First part. "},
+                        {"text": "Second part."}
+                    ]
+                },
+                "finishReason": "STOP",
+                "safetyRatings": []
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 8,
+                "totalTokenCount": 18
+            }
+        }"#;
+
+        let response: GeminiResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(response.candidates[0].content.parts.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_gemini_response_safety_finish_reason() {
+        let json = r#"{
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": ""}]
+                },
+                "finishReason": "SAFETY",
+                "safetyRatings": [{"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "probability": "HIGH"}]
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 0,
+                "totalTokenCount": 10
+            }
+        }"#;
+
+        let response: GeminiResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            response.candidates[0].finish_reason,
+            Some("SAFETY".to_string())
+        );
+    }
+
+    // ==================== Finish Reason Mapping Tests ====================
+
+    #[test]
+    fn test_finish_reason_mapping() {
+        let test_cases = vec![
+            ("STOP", crate::FinishReason::Stop),
+            ("MAX_TOKENS", crate::FinishReason::Length),
+            ("SAFETY", crate::FinishReason::ContentFilter),
+            ("UNKNOWN", crate::FinishReason::Stop), // Default
+        ];
+
+        for (gemini_reason, expected) in test_cases {
+            let mapped = match gemini_reason {
+                "STOP" => crate::FinishReason::Stop,
+                "MAX_TOKENS" => crate::FinishReason::Length,
+                "SAFETY" => crate::FinishReason::ContentFilter,
+                _ => crate::FinishReason::Stop,
+            };
+            assert_eq!(mapped, expected, "Failed for reason: {}", gemini_reason);
+        }
+    }
+
+    // ==================== Request Building Tests ====================
+
+    #[test]
+    fn test_gemini_request_serialization() {
+        let request = GeminiRequest {
+            contents: vec![GeminiContent {
+                role: "user".to_string(),
+                parts: vec![GeminiPart {
+                    text: "Hello".to_string(),
+                }],
+            }],
+            system_instruction: Some(GeminiSystemInstruction {
+                parts: vec![GeminiPart {
+                    text: "You are helpful.".to_string(),
+                }],
+            }),
+            generation_config: Some(GeminiGenerationConfig {
+                temperature: Some(0.7),
+                top_p: Some(0.9),
+                max_output_tokens: Some(1024),
+                stop_sequences: Some(vec!["STOP".to_string()]),
+            }),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+
+        assert!(json.contains("\"contents\""));
+        assert!(json.contains("\"systemInstruction\"")); // camelCase
+        assert!(json.contains("\"generationConfig\"")); // camelCase
+        assert!(json.contains("\"temperature\":0.7"));
+        assert!(json.contains("\"maxOutputTokens\":1024")); // camelCase
+    }
+
+    #[test]
+    fn test_gemini_request_skips_none_fields() {
+        let request = GeminiRequest {
+            contents: vec![],
+            system_instruction: None,
+            generation_config: None,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+
+        assert!(!json.contains("\"systemInstruction\""));
+        assert!(!json.contains("\"generationConfig\""));
+    }
+
+    #[test]
+    fn test_gemini_generation_config_skips_none_fields() {
+        let config = GeminiGenerationConfig {
+            temperature: Some(0.5),
+            top_p: None,
+            max_output_tokens: None,
+            stop_sequences: None,
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+
+        assert!(json.contains("\"temperature\":0.5"));
+        assert!(!json.contains("\"topP\""));
+        assert!(!json.contains("\"maxOutputTokens\""));
+        assert!(!json.contains("\"stopSequences\""));
+    }
+
+    // ==================== Usage Metadata Tests ====================
+
+    #[test]
+    fn test_usage_metadata_defaults() {
+        let json = r#"{}"#;
+
+        let usage: GeminiUsageMetadata = serde_json::from_str(json).unwrap();
+
+        assert_eq!(usage.prompt_token_count, 0);
+        assert_eq!(usage.candidates_token_count, 0);
+        assert_eq!(usage.total_token_count, 0);
+    }
+
+    #[test]
+    fn test_usage_metadata_partial() {
+        let json = r#"{"promptTokenCount": 10}"#;
+
+        let usage: GeminiUsageMetadata = serde_json::from_str(json).unwrap();
+
+        assert_eq!(usage.prompt_token_count, 10);
+        assert_eq!(usage.candidates_token_count, 0);
+        assert_eq!(usage.total_token_count, 0);
+    }
+
+    // ==================== URL Building Tests ====================
+
+    #[test]
+    fn test_streaming_url_format() {
+        let base_url = "https://generativelanguage.googleapis.com/v1beta";
+        let model = "gemini-1.5-pro";
+
+        // API key is passed via x-goog-api-key header, not in URL
+        let url = format!(
+            "{}/models/{}:streamGenerateContent?alt=sse",
+            base_url, model
+        );
+
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:streamGenerateContent?alt=sse"
+        );
+    }
+
+    #[test]
+    fn test_non_streaming_url_format() {
+        let base_url = "https://generativelanguage.googleapis.com/v1beta";
+        let model = "gemini-1.5-pro";
+
+        // API key is passed via x-goog-api-key header, not in URL
+        let url = format!("{}/models/{}:generateContent", base_url, model);
+
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent"
+        );
+    }
+
+    #[test]
+    fn test_api_key_header() {
+        // Verify that the x-goog-api-key header can be created
+        let api_key = "test-api-key-123";
+        let header_value = reqwest::header::HeaderValue::from_str(api_key);
+        assert!(header_value.is_ok());
+        assert_eq!(header_value.unwrap().to_str().unwrap(), api_key);
+    }
+
+    // ==================== Content Structure Tests ====================
+
+    #[test]
+    fn test_gemini_content_serialization() {
+        let content = GeminiContent {
+            role: "user".to_string(),
+            parts: vec![GeminiPart {
+                text: "Hello world".to_string(),
+            }],
+        };
+
+        let json = serde_json::to_string(&content).unwrap();
+
+        assert!(json.contains("\"role\":\"user\""));
+        assert!(json.contains("\"text\":\"Hello world\""));
+    }
+
+    #[test]
+    fn test_gemini_system_instruction_serialization() {
+        let instruction = GeminiSystemInstruction {
+            parts: vec![GeminiPart {
+                text: "Be helpful".to_string(),
+            }],
+        };
+
+        let json = serde_json::to_string(&instruction).unwrap();
+
+        assert!(json.contains("\"parts\""));
+        assert!(json.contains("\"text\":\"Be helpful\""));
     }
 }

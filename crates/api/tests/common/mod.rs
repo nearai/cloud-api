@@ -116,6 +116,7 @@ pub fn test_config_with_db(db_name: &str) -> ApiConfig {
             protocol: std::env::var("TELEMETRY_OTLP_PROTOCOL").unwrap_or("grpc".to_string()),
         },
         cors: config::CorsConfig::default(),
+        external_providers: config::ExternalProvidersConfig::default(),
     }
 }
 

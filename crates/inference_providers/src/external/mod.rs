@@ -260,6 +260,8 @@ impl InferenceProvider for ExternalProvider {
 mod tests {
     use super::*;
 
+    // ==================== ProviderConfig Deserialization Tests ====================
+
     #[test]
     fn test_provider_config_deserialization_openai() {
         let json = r#"{"backend": "openai_compatible", "base_url": "https://api.openai.com/v1"}"#;
@@ -344,6 +346,263 @@ mod tests {
                 );
             }
             _ => panic!("Expected Gemini variant"),
+        }
+    }
+
+    #[test]
+    fn test_provider_config_invalid_backend() {
+        let json = r#"{"backend": "unknown_provider", "base_url": "https://example.com"}"#;
+        let result: Result<ProviderConfig, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_provider_config_missing_base_url() {
+        let json = r#"{"backend": "openai_compatible"}"#;
+        let result: Result<ProviderConfig, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    // ==================== ExternalProvider Creation Tests ====================
+
+    #[test]
+    fn test_create_external_provider_openai() {
+        let config = ExternalProviderConfig {
+            model_name: "gpt-4".to_string(),
+            provider_config: ProviderConfig::OpenAiCompatible {
+                base_url: "https://api.openai.com/v1".to_string(),
+                organization_id: Some("org-123".to_string()),
+            },
+            api_key: "sk-test-key".to_string(),
+            timeout_seconds: 60,
+        };
+
+        let provider = ExternalProvider::new(config);
+
+        assert_eq!(provider.model_name(), "gpt-4");
+        assert_eq!(provider.backend_type(), "openai_compatible");
+    }
+
+    #[test]
+    fn test_create_external_provider_anthropic() {
+        let config = ExternalProviderConfig {
+            model_name: "claude-3-opus-20240229".to_string(),
+            provider_config: ProviderConfig::Anthropic {
+                base_url: "https://api.anthropic.com/v1".to_string(),
+                version: "2024-01-01".to_string(),
+            },
+            api_key: "sk-ant-test".to_string(),
+            timeout_seconds: 120,
+        };
+
+        let provider = ExternalProvider::new(config);
+
+        assert_eq!(provider.model_name(), "claude-3-opus-20240229");
+        assert_eq!(provider.backend_type(), "anthropic");
+    }
+
+    #[test]
+    fn test_create_external_provider_gemini() {
+        let config = ExternalProviderConfig {
+            model_name: "gemini-1.5-pro".to_string(),
+            provider_config: ProviderConfig::Gemini {
+                base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+            },
+            api_key: "AIza-test".to_string(),
+            timeout_seconds: 90,
+        };
+
+        let provider = ExternalProvider::new(config);
+
+        assert_eq!(provider.model_name(), "gemini-1.5-pro");
+        assert_eq!(provider.backend_type(), "gemini");
+    }
+
+    // ==================== InferenceProvider Trait Tests ====================
+
+    #[tokio::test]
+    async fn test_models_returns_empty_list() {
+        let config = ExternalProviderConfig {
+            model_name: "gpt-4".to_string(),
+            provider_config: ProviderConfig::OpenAiCompatible {
+                base_url: "https://api.openai.com/v1".to_string(),
+                organization_id: None,
+            },
+            api_key: "test-key".to_string(),
+            timeout_seconds: 30,
+        };
+
+        let provider = ExternalProvider::new(config);
+        let result = provider.models().await;
+
+        assert!(result.is_ok());
+        let models = result.unwrap();
+        assert_eq!(models.object, "list");
+        assert!(models.data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_text_completion_returns_error() {
+        let config = ExternalProviderConfig {
+            model_name: "gpt-4".to_string(),
+            provider_config: ProviderConfig::OpenAiCompatible {
+                base_url: "https://api.openai.com/v1".to_string(),
+                organization_id: None,
+            },
+            api_key: "test-key".to_string(),
+            timeout_seconds: 30,
+        };
+
+        let provider = ExternalProvider::new(config);
+        let params = CompletionParams {
+            model: "gpt-4".to_string(),
+            prompt: "Hello".to_string(),
+            max_tokens: Some(100),
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: None,
+            stop: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            logit_bias: None,
+            logprobs: None,
+            echo: None,
+            best_of: None,
+            seed: None,
+            user: None,
+            suffix: None,
+            stream_options: None,
+        };
+
+        let result = provider.text_completion_stream(params).await;
+
+        assert!(result.is_err());
+        match result {
+            Err(CompletionError::CompletionError(msg)) => {
+                assert!(msg.contains("Text completion is not supported"));
+            }
+            _ => panic!("Expected CompletionError"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_signature_returns_error() {
+        let config = ExternalProviderConfig {
+            model_name: "gpt-4".to_string(),
+            provider_config: ProviderConfig::OpenAiCompatible {
+                base_url: "https://api.openai.com/v1".to_string(),
+                organization_id: None,
+            },
+            api_key: "test-key".to_string(),
+            timeout_seconds: 30,
+        };
+
+        let provider = ExternalProvider::new(config);
+        let result = provider.get_signature("chat-123", None).await;
+
+        assert!(result.is_err());
+        match result {
+            Err(CompletionError::CompletionError(msg)) => {
+                assert!(msg.contains("Cryptographic signatures are not supported"));
+                assert!(msg.contains("TEE"));
+            }
+            _ => panic!("Expected CompletionError"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_attestation_report_returns_error() {
+        let config = ExternalProviderConfig {
+            model_name: "gpt-4".to_string(),
+            provider_config: ProviderConfig::OpenAiCompatible {
+                base_url: "https://api.openai.com/v1".to_string(),
+                organization_id: None,
+            },
+            api_key: "test-key".to_string(),
+            timeout_seconds: 30,
+        };
+
+        let provider = ExternalProvider::new(config);
+        let result = provider
+            .get_attestation_report("gpt-4".to_string(), None, None, None)
+            .await;
+
+        assert!(result.is_err());
+        match result {
+            Err(AttestationError::FetchError(msg)) => {
+                assert!(msg.contains("TEE attestation is not supported"));
+                assert!(msg.contains("external providers"));
+            }
+            _ => panic!("Expected AttestationError::FetchError"),
+        }
+    }
+
+    // ==================== ExternalProviderConfig Tests ====================
+
+    #[test]
+    fn test_external_provider_config_struct() {
+        let config = ExternalProviderConfig {
+            model_name: "test-model".to_string(),
+            provider_config: ProviderConfig::OpenAiCompatible {
+                base_url: "https://example.com".to_string(),
+                organization_id: None,
+            },
+            api_key: "key".to_string(),
+            timeout_seconds: 30,
+        };
+
+        assert_eq!(config.model_name, "test-model");
+        assert_eq!(config.api_key, "key");
+        assert_eq!(config.timeout_seconds, 30);
+    }
+
+    // ==================== Default Anthropic Version Tests ====================
+
+    #[test]
+    fn test_default_anthropic_version() {
+        assert_eq!(default_anthropic_version(), "2023-06-01");
+    }
+
+    // ==================== Various Provider Configs ====================
+
+    #[test]
+    fn test_provider_config_together_ai() {
+        let json = r#"{"backend": "openai_compatible", "base_url": "https://api.together.xyz/v1"}"#;
+        let config: ProviderConfig = serde_json::from_str(json).unwrap();
+
+        match config {
+            ProviderConfig::OpenAiCompatible { base_url, .. } => {
+                assert_eq!(base_url, "https://api.together.xyz/v1");
+            }
+            _ => panic!("Expected OpenAiCompatible variant"),
+        }
+    }
+
+    #[test]
+    fn test_provider_config_groq() {
+        let json =
+            r#"{"backend": "openai_compatible", "base_url": "https://api.groq.com/openai/v1"}"#;
+        let config: ProviderConfig = serde_json::from_str(json).unwrap();
+
+        match config {
+            ProviderConfig::OpenAiCompatible { base_url, .. } => {
+                assert_eq!(base_url, "https://api.groq.com/openai/v1");
+            }
+            _ => panic!("Expected OpenAiCompatible variant"),
+        }
+    }
+
+    #[test]
+    fn test_provider_config_fireworks() {
+        let json = r#"{"backend": "openai_compatible", "base_url": "https://api.fireworks.ai/inference/v1"}"#;
+        let config: ProviderConfig = serde_json::from_str(json).unwrap();
+
+        match config {
+            ProviderConfig::OpenAiCompatible { base_url, .. } => {
+                assert_eq!(base_url, "https://api.fireworks.ai/inference/v1");
+            }
+            _ => panic!("Expected OpenAiCompatible variant"),
         }
     }
 }

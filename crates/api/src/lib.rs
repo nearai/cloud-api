@@ -283,6 +283,38 @@ pub async fn init_domain_services_with_pool(
         database.pool().clone(),
     ));
 
+    // Load external providers from database
+    match models_repo.get_external_models().await {
+        Ok(external_models) => {
+            if !external_models.is_empty() {
+                let models_for_pool: Vec<(String, serde_json::Value)> = external_models
+                    .into_iter()
+                    .filter_map(|model| {
+                        model
+                            .provider_config
+                            .map(|config| (model.model_name, config))
+                    })
+                    .collect();
+
+                if !models_for_pool.is_empty() {
+                    tracing::info!(
+                        count = models_for_pool.len(),
+                        "Loading external providers from database"
+                    );
+                    if let Err(e) = inference_provider_pool
+                        .load_external_providers(models_for_pool)
+                        .await
+                    {
+                        tracing::warn!(error = %e, "Failed to load some external providers");
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to fetch external models from database");
+        }
+    }
+
     // Create conversation service
     let conversation_service = Arc::new(services::ConversationService::new(
         conversation_repo.clone(),

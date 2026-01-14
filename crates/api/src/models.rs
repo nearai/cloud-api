@@ -63,7 +63,8 @@ pub enum MessageContent {
     Parts(Vec<MessageContentPart>),
 }
 
-/// Content part (text, image, audio, file)
+/// Content part (text, image, audio, video, file)
+/// Supports both OpenAI format (input_audio) and vLLM format (audio_url, video_url)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
 pub enum MessageContentPart {
@@ -75,8 +76,15 @@ pub enum MessageContentPart {
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
-    #[serde(rename = "audio")]
-    Audio { audio: MessageAudio },
+    // OpenAI format: input_audio with data + format
+    #[serde(rename = "input_audio")]
+    InputAudio { input_audio: MessageInputAudio },
+    // vLLM format: audio_url with url field
+    #[serde(rename = "audio_url")]
+    AudioUrl { audio_url: MessageAudioUrl },
+    // vLLM format: video_url with url field
+    #[serde(rename = "video_url")]
+    VideoUrl { video_url: MessageVideoUrl },
     #[serde(rename = "file")]
     File { file_id: String },
 }
@@ -88,11 +96,28 @@ pub enum MessageImageUrl {
     Object { url: String },
 }
 
+/// OpenAI format: input_audio with data + format
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct MessageAudio {
+pub struct MessageInputAudio {
     pub data: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
+}
+
+/// vLLM format: audio_url with url field
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum MessageAudioUrl {
+    String(String),
+    Object { url: String },
+}
+
+/// vLLM format: video_url with url field
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum MessageVideoUrl {
+    String(String),
+    Object { url: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -409,12 +434,13 @@ impl ChatCompletionRequest {
     }
 
     /// Check if request contains audio content (for size limit selection)
+    /// Checks for both OpenAI format (input_audio) and vLLM format (audio_url)
     pub fn has_audio_content(&self) -> bool {
         self.messages.iter().any(|m| {
             matches!(
                 &m.content,
                 Some(MessageContent::Parts(parts))
-                    if parts.iter().any(|p| matches!(p, MessageContentPart::Audio { .. }))
+                    if parts.iter().any(|p| matches!(p, MessageContentPart::InputAudio { .. } | MessageContentPart::AudioUrl { .. }))
             )
         })
     }
@@ -2524,12 +2550,14 @@ mod tests {
             model: "gpt-4".to_string(),
             messages: vec![Message {
                 role: "user".to_string(),
-                content: Some(MessageContent::Parts(vec![MessageContentPart::Audio {
-                    audio: MessageAudio {
-                        data: "base64_audio_data".to_string(),
-                        format: Some("mp3".to_string()),
+                content: Some(MessageContent::Parts(vec![
+                    MessageContentPart::InputAudio {
+                        input_audio: MessageInputAudio {
+                            data: "base64_audio_data".to_string(),
+                            format: Some("mp3".to_string()),
+                        },
                     },
-                }])),
+                ])),
                 name: None,
             }],
             max_tokens: Some(100),

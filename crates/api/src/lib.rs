@@ -539,6 +539,8 @@ pub async fn init_inference_providers_with_mocks(
         "nearai/gpt-oss-120b".to_string(),
         "dphn/Dolphin-Mistral-24B-Venice-Edition".to_string(),
         "deepseek-ai/DeepSeek-V3.1".to_string(),
+        "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string(),
+        "Qwen/Qwen-Image-2512".to_string(),
     ];
 
     let providers: Vec<(

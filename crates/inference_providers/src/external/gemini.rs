@@ -215,7 +215,7 @@ where
             .content
             .parts
             .iter()
-            .filter_map(|p| Some(p.text.clone()))
+            .map(|p| p.text.clone())
             .collect::<Vec<_>>()
             .join("");
 
@@ -519,7 +519,7 @@ impl ExternalBackend for GeminiBackend {
             .content
             .parts
             .iter()
-            .filter_map(|p| Some(p.text.clone()))
+            .map(|p| p.text.clone())
             .collect::<Vec<_>>()
             .join("");
 

@@ -702,6 +702,7 @@ pub fn build_app_with_config(
         database.clone(),
         &auth_components.auth_state_middleware,
         config.clone(),
+        app_state.inference_provider_pool.clone(),
     );
 
     let invitation_routes =
@@ -1098,6 +1099,7 @@ pub fn build_admin_routes(
     database: Arc<Database>,
     auth_state_middleware: &AuthState,
     config: Arc<ApiConfig>,
+    inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
 ) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
@@ -1136,6 +1138,7 @@ pub fn build_admin_routes(
         auth_service: auth_state_middleware.auth_service.clone(),
         config,
         admin_access_token_repository,
+        inference_provider_pool,
     };
 
     Router::new()

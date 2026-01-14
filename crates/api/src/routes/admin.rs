@@ -32,6 +32,7 @@ pub struct AdminAppState {
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub config: Arc<ApiConfig>,
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
+    pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
 }
 
 /// Batch upsert models metadata (Admin only)
@@ -136,6 +137,75 @@ pub async fn batch_upsert_models(
                 ),
             }
         })?;
+
+    // Update external providers at runtime
+    // This allows newly added/updated external models to be used without server restart
+
+    // Collect models to register (active external providers with valid config)
+    let models_to_register: Vec<(String, serde_json::Value)> = batch_request
+        .iter()
+        .filter_map(|(model_name, request)| {
+            // Only register models that are:
+            // 1. External providers with valid config
+            // 2. Active (is_active != Some(false))
+            let is_external = request.provider_type.as_deref() == Some("external");
+            let is_active = request.is_active != Some(false);
+
+            if is_external && is_active {
+                request
+                    .provider_config
+                    .clone()
+                    .map(|config| (model_name.clone(), config))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Collect models to unregister:
+    // - Models explicitly set to non-external provider_type
+    // - Models explicitly set to is_active = false
+    let models_to_unregister: Vec<String> = batch_request
+        .iter()
+        .filter_map(|(model_name, request)| {
+            let is_non_external = request
+                .provider_type
+                .as_ref()
+                .is_some_and(|t| t != "external");
+            let is_inactive = request.is_active == Some(false);
+
+            if is_non_external || is_inactive {
+                Some(model_name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Unregister models that are no longer external or are inactive
+    for model_name in &models_to_unregister {
+        app_state
+            .inference_provider_pool
+            .unregister_external_provider(model_name)
+            .await;
+    }
+
+    // Register/update external providers
+    if !models_to_register.is_empty() {
+        tracing::info!(
+            count = models_to_register.len(),
+            "Registering external providers at runtime"
+        );
+        if let Err(e) = app_state
+            .inference_provider_pool
+            .load_external_providers(models_to_register)
+            .await
+        {
+            // Log but don't fail the request - the models are saved to DB
+            // They will be loaded on next server restart if runtime registration fails
+            tracing::warn!(error = %e, "Failed to register some external providers at runtime");
+        }
+    }
 
     // Convert to API response - map from HashMap to Vec
     // The key in the HashMap is the canonical model_name
@@ -659,6 +729,13 @@ pub async fn delete_model(
                 ),
             }
         })?;
+
+    // Unregister external provider if it was registered
+    // This is a no-op for vLLM models (they are discovered, not registered)
+    app_state
+        .inference_provider_pool
+        .unregister_external_provider(&model_name)
+        .await;
 
     Ok(StatusCode::NO_CONTENT)
 }

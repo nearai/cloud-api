@@ -209,6 +209,28 @@ impl InferenceProviderPool {
         external.contains_key(model_name)
     }
 
+    /// Unregister an external provider by model name
+    ///
+    /// This removes the provider from the pool, preventing future requests to this model.
+    /// Should be called when a model is deleted or deactivated.
+    ///
+    /// # Arguments
+    /// * `model_name` - The model name to unregister
+    ///
+    /// # Returns
+    /// * `true` if the provider was found and removed
+    /// * `false` if the provider was not found (may have already been removed)
+    pub async fn unregister_external_provider(&self, model_name: &str) -> bool {
+        let mut external = self.external_providers.write().await;
+        let removed = external.remove(model_name).is_some();
+        if removed {
+            info!(model = %model_name, "Unregistered external provider");
+        } else {
+            debug!(model = %model_name, "External provider not found for unregistration (may be vLLM model)");
+        }
+        removed
+    }
+
     /// Register a provider for a model manually (useful for testing with mock providers)
     /// Also populates model_pub_key_mapping by fetching the attestation report
     /// Fetches attestation reports for both ECDSA and Ed25519 to support both signing algorithms
@@ -1653,5 +1675,98 @@ mod tests {
         pool.shutdown().await;
 
         assert!(!pool.is_external_provider("gpt-4").await);
+    }
+
+    #[tokio::test]
+    async fn test_unregister_external_provider() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test".to_string()),
+                anthropic_api_key: None,
+                gemini_api_key: None,
+                timeout_seconds: 60,
+            },
+        );
+
+        let config = serde_json::json!({
+            "backend": "openai_compatible",
+            "base_url": "https://api.openai.com/v1"
+        });
+
+        // Register a provider
+        pool.register_external_provider("gpt-4".to_string(), config)
+            .await
+            .unwrap();
+        assert!(pool.is_external_provider("gpt-4").await);
+
+        // Unregister it
+        let removed = pool.unregister_external_provider("gpt-4").await;
+        assert!(removed);
+        assert!(!pool.is_external_provider("gpt-4").await);
+
+        // Unregistering again should return false
+        let removed_again = pool.unregister_external_provider("gpt-4").await;
+        assert!(!removed_again);
+    }
+
+    #[tokio::test]
+    async fn test_unregister_nonexistent_provider() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig::default(),
+        );
+
+        // Unregistering a provider that was never registered should return false
+        let removed = pool.unregister_external_provider("nonexistent-model").await;
+        assert!(!removed);
+    }
+
+    #[tokio::test]
+    async fn test_register_update_external_provider() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test".to_string()),
+                anthropic_api_key: None,
+                gemini_api_key: None,
+                timeout_seconds: 60,
+            },
+        );
+
+        let config1 = serde_json::json!({
+            "backend": "openai_compatible",
+            "base_url": "https://api.openai.com/v1"
+        });
+
+        let config2 = serde_json::json!({
+            "backend": "openai_compatible",
+            "base_url": "https://api.together.xyz/v1"
+        });
+
+        // Register initial config
+        pool.register_external_provider("my-model".to_string(), config1)
+            .await
+            .unwrap();
+        assert!(pool.is_external_provider("my-model").await);
+
+        // Re-register with updated config (should overwrite)
+        pool.register_external_provider("my-model".to_string(), config2)
+            .await
+            .unwrap();
+        assert!(pool.is_external_provider("my-model").await);
+
+        // Should still only have one entry (not duplicated)
+        let external = pool.external_providers.read().await;
+        assert_eq!(external.len(), 1);
     }
 }

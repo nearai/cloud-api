@@ -1,6 +1,8 @@
-name: Tests
+name: Real E2E Tests
 
 on:
+  issue_comment:
+    types: [ created ]  # Listen for @claude in PR comments (non-review tasks)
   push:
     branches: [ main, develop ]
   pull_request:
@@ -12,8 +14,8 @@ env:
   CARGO_INCREMENTAL: 0  # Faster CI builds
 
 jobs:
-  test:
-    name: Test Suite
+  test_real:
+    name: Real E2E Test Suite
     runs-on: ubuntu_large_x64
     environment: Cloud API test env
     
@@ -48,35 +50,9 @@ jobs:
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
 
-    - name: Run cargo fmt
-      run: cargo fmt --all -- --check
-
-    - name: Run cargo clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
-
-    - name: Run unit tests
-      run: cargo nextest run --lib --bins
-      env:
-        POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
-        DATABASE_HOST: localhost
-        DATABASE_PORT: 5432
-        DATABASE_NAME: platform_api
-        DATABASE_USERNAME: postgres
-        DATABASE_PASSWORD: postgres
-        DATABASE_MAX_CONNECTIONS: 5
-        DATABASE_TLS_ENABLED: "false"
-        MODEL_DISCOVERY_SERVER_URL: ${{ secrets.MODEL_DISCOVERY_SERVER_URL }}
-        MODEL_DISCOVERY_API_KEY: ${{ secrets.MODEL_DISCOVERY_API_KEY }}
-        AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
-        AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
-        BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
-        DEV: "true"
-
-    # Integration tests use isolated databases per test (created from a template)
-    # Template DB is created automatically on first test run with all migrations applied
-    # Each test gets its own database copy for complete isolation
-    - name: Run integration tests
-      run: cargo nextest run -p api --tests --filter 'not test(/^real_test_/)'
+    # Run only real_e2e tests (tests with function names starting with real_test_)
+    - name: Run real E2E tests
+      run: cargo nextest run -p api --tests --filter 'test(/^real_test_/)'
       env:
         POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
         DATABASE_HOST: localhost
@@ -105,23 +81,3 @@ jobs:
         DATABASE_USERNAME: postgres
         DATABASE_PASSWORD: postgres
         TEST_TEMPLATE_DATABASE_NAME: platform_api_test_template
-
-    - name: Run vLLM integration tests
-      run: cargo test --test integration_tests -- --nocapture
-      env:
-        VLLM_BASE_URL: ${{ secrets.VLLM_BASE_URL }}
-        VLLM_API_KEY: ${{ secrets.VLLM_API_KEY }}
-        
-    # Only build release on main branch, not on PRs
-    - name: Build release
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-      run: cargo build --release
-      env:
-        POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
-        DATABASE_HOST: localhost
-        DATABASE_PORT: 5432
-        DATABASE_NAME: platform_api
-        DATABASE_USERNAME: postgres
-        DATABASE_PASSWORD: postgres
-        MODEL_DISCOVERY_SERVER_URL: ${{ secrets.MODEL_DISCOVERY_SERVER_URL }}
-        AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}

@@ -220,6 +220,12 @@ pub fn prepare_tool_choice(
 /// - Unclosed strings: `{"query": "test` -> `{"query": "test"}`
 ///
 /// Returns the repaired JSON string if successful, or None if repair failed.
+///
+/// # Performance
+///
+/// The progressive truncation loop has O(N²) time complexity where N is the input length,
+/// as each iteration may call try_close_json (O(N)) and serde_json::from_str (O(N)).
+/// This is acceptable for typical tool call arguments which are small (< 1KB).
 fn try_repair_json(json_str: &str) -> Option<String> {
     let trimmed = json_str.trim();
 
@@ -256,7 +262,8 @@ fn try_repair_json(json_str: &str) -> Option<String> {
         }
     }
 
-    // Try progressively removing characters from the end and closing the JSON
+    // Progressive truncation loop: O(N²) complexity - see Performance note above.
+    // Try progressively removing characters from the end and closing the JSON.
     // This handles truncated JSON like: `{"query": "test", "freshness":`
     let mut working = trimmed.to_string();
 
@@ -353,6 +360,73 @@ fn try_close_json(s: &str) -> Option<String> {
     Some(result)
 }
 
+/// Result of parsing tool call arguments
+enum ParseArgsResult {
+    /// Successfully parsed (or repaired) JSON
+    Ok(serde_json::Value),
+    /// Successfully repaired malformed JSON
+    Repaired(serde_json::Value),
+    /// Failed to parse or repair
+    Failed,
+}
+
+/// Parse tool call arguments JSON, with optional repair for web_search
+///
+/// For web_search tools, attempts to repair malformed JSON from truncated streams.
+/// For other tools, returns Failed if JSON is invalid.
+fn parse_tool_args(tool_name: &str, args_str: &str) -> ParseArgsResult {
+    // Try direct parsing first
+    if let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str) {
+        return ParseArgsResult::Ok(args);
+    }
+
+    // Only attempt repair for web_search
+    if tool_name != super::WEB_SEARCH_TOOL_NAME {
+        return ParseArgsResult::Failed;
+    }
+
+    // Attempt to repair malformed JSON
+    match try_repair_json(args_str) {
+        Some(repaired) => match serde_json::from_str::<serde_json::Value>(&repaired) {
+            Ok(args) => ParseArgsResult::Repaired(args),
+            Err(_) => ParseArgsResult::Failed,
+        },
+        None => ParseArgsResult::Failed,
+    }
+}
+
+/// Create an error ToolCallInfo for invalid JSON arguments
+fn create_invalid_json_error(name: &str, idx: i64) -> ToolCallInfo {
+    ToolCallInfo {
+        tool_type: ERROR_TOOL_TYPE.to_string(),
+        query: format!(
+            "Tool call for '{name}' (index {idx}) has invalid JSON arguments. \
+             Please ensure arguments are valid JSON."
+        ),
+        params: Some(serde_json::json!({
+            "error_type": "invalid_json",
+            "tool_name": name,
+            "index": idx
+        })),
+    }
+}
+
+/// Create an error ToolCallInfo for missing query field
+fn create_missing_query_error(name: &str, idx: i64) -> ToolCallInfo {
+    ToolCallInfo {
+        tool_type: ERROR_TOOL_TYPE.to_string(),
+        query: format!(
+            "Tool call for '{name}' (index {idx}) is missing the required 'query' field \
+             in its arguments. Please include a 'query' parameter."
+        ),
+        params: Some(serde_json::json!({
+            "error_type": "missing_query_field",
+            "tool_name": name,
+            "index": idx
+        })),
+    }
+}
+
 /// Convert accumulated tool calls from LLM response to ToolCallInfo
 ///
 /// Takes a map of tool call index -> (name, arguments_json) and converts
@@ -377,11 +451,19 @@ pub fn convert_tool_calls(
                     index = idx,
                     "Tool call has no name or empty name"
                 );
-                // Create a special error tool call to inform the LLM
+                // Log args at debug level for staging troubleshooting (not in prod)
+                tracing::debug!(
+                    model = model,
+                    index = idx,
+                    args = args_str,
+                    "Tool call missing name - arguments for debugging"
+                );
                 tool_calls_detected.push(ToolCallInfo {
                     tool_type: ERROR_TOOL_TYPE.to_string(),
                     query: format!(
-                        "Tool call at index {idx} is missing a tool name. Please ensure all tool calls include a valid 'name' field. Arguments provided: {args_str}"
+                        "Tool call at index {idx} is missing a tool name. \
+                         Please ensure all tool calls include a valid 'name' field. \
+                         Arguments provided: {args_str}"
                     ),
                     params: Some(serde_json::json!({
                         "error_type": "missing_tool_name",
@@ -393,94 +475,40 @@ pub fn convert_tool_calls(
             }
         };
 
-        // Try to parse the arguments JSON
-        // For web_search, attempt repair if JSON is malformed (truncated streams, etc.)
-        let args_result = serde_json::from_str::<serde_json::Value>(&args_str);
-        let args = match args_result {
-            Ok(a) => a,
-            Err(_) if name == super::WEB_SEARCH_TOOL_NAME => {
-                // Only attempt repair for web_search tool calls
-                match try_repair_json(&args_str) {
-                    Some(repaired) => {
-                        tracing::info!(
-                            model = model,
-                            tool_name = name,
-                            index = idx,
-                            "Repaired malformed web_search tool call JSON"
-                        );
-                        match serde_json::from_str::<serde_json::Value>(&repaired) {
-                            Ok(a) => a,
-                            Err(_) => {
-                                // Repair produced invalid JSON (shouldn't happen)
-                                tracing::warn!(
-                                    model = model,
-                                    tool_name = name,
-                                    index = idx,
-                                    "JSON repair produced invalid result"
-                                );
-                                tool_calls_detected.push(ToolCallInfo {
-                                    tool_type: ERROR_TOOL_TYPE.to_string(),
-                                    query: format!(
-                                        "Tool call for '{name}' (index {idx}) has invalid JSON arguments. Please ensure arguments are valid JSON."
-                                    ),
-                                    params: Some(serde_json::json!({
-                                        "error_type": "invalid_json",
-                                        "tool_name": name,
-                                        "index": idx
-                                    })),
-                                });
-                                continue;
-                            }
-                        }
-                    }
-                    None => {
-                        tracing::warn!(
-                            model = model,
-                            tool_name = name,
-                            index = idx,
-                            "Failed to parse or repair tool call arguments"
-                        );
-                        tool_calls_detected.push(ToolCallInfo {
-                            tool_type: ERROR_TOOL_TYPE.to_string(),
-                            query: format!(
-                                "Tool call for '{name}' (index {idx}) has invalid JSON arguments. Please ensure arguments are valid JSON."
-                            ),
-                            params: Some(serde_json::json!({
-                                "error_type": "invalid_json",
-                                "tool_name": name,
-                                "index": idx
-                            })),
-                        });
-                        continue;
-                    }
-                }
+        // Parse arguments, with repair for web_search if needed
+        let args = match parse_tool_args(&name, &args_str) {
+            ParseArgsResult::Ok(args) => args,
+            ParseArgsResult::Repaired(args) => {
+                tracing::info!(
+                    model = model,
+                    tool_name = name,
+                    index = idx,
+                    "Repaired malformed web_search tool call JSON"
+                );
+                args
             }
-            Err(_) => {
-                // For non-web_search tools, don't attempt repair
+            ParseArgsResult::Failed => {
                 tracing::warn!(
                     model = model,
                     tool_name = name,
                     index = idx,
                     "Failed to parse tool call arguments"
                 );
-                tool_calls_detected.push(ToolCallInfo {
-                    tool_type: ERROR_TOOL_TYPE.to_string(),
-                    query: format!(
-                        "Tool call for '{name}' (index {idx}) has invalid JSON arguments. Please ensure arguments are valid JSON."
-                    ),
-                    params: Some(serde_json::json!({
-                        "error_type": "invalid_json",
-                        "tool_name": name,
-                        "index": idx
-                    })),
-                });
+                // Log args at debug level for staging troubleshooting (not in prod)
+                tracing::debug!(
+                    model = model,
+                    tool_name = name,
+                    index = idx,
+                    args = args_str,
+                    "Failed to parse tool call - arguments for debugging"
+                );
+                tool_calls_detected.push(create_invalid_json_error(&name, idx));
                 continue;
             }
         };
 
         // Check if this is an MCP tool (format: "server_label:tool_name")
         if name.contains(':') {
-            // MCP tools use the full arguments JSON as params
             tracing::debug!("MCP tool call detected: {}", name);
             tool_calls_detected.push(ToolCallInfo {
                 tool_type: name,
@@ -488,7 +516,6 @@ pub fn convert_tool_calls(
                 params: Some(args),
             });
         } else if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
-            // Non-MCP tools (web_search, file_search) require a "query" field
             tracing::debug!("Tool call detected: {}", name);
             tool_calls_detected.push(ToolCallInfo {
                 tool_type: name,
@@ -502,18 +529,7 @@ pub fn convert_tool_calls(
                 index = idx,
                 "Tool call has no 'query' field in arguments"
             );
-            // Create an error tool call to inform the LLM about missing query
-            tool_calls_detected.push(ToolCallInfo {
-                tool_type: ERROR_TOOL_TYPE.to_string(),
-                query: format!(
-                    "Tool call for '{name}' (index {idx}) is missing the required 'query' field in its arguments. Please include a 'query' parameter."
-                ),
-                params: Some(serde_json::json!({
-                    "error_type": "missing_query_field",
-                    "tool_name": name,
-                    "index": idx
-                })),
-            });
+            tool_calls_detected.push(create_missing_query_error(&name, idx));
         }
     }
 

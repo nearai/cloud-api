@@ -6,7 +6,8 @@ use crate::repositories::{
 use anyhow::Result;
 use async_trait::async_trait;
 use services::admin::{
-    AdminModelInfo, AdminOrganizationInfo, AdminRepository, ModelHistoryEntry, ModelPricing,
+    AdminModelInfo, AdminOrganizationInfo, AdminOrganizationOrderBy,
+    AdminOrganizationOrderDirection, AdminRepository, ModelHistoryEntry, ModelPricing,
     OrganizationLimits, OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate,
     UpdateModelAdminRequest, UserInfo, UserOrganizationInfo,
 };
@@ -358,38 +359,96 @@ impl AdminRepository for AdminCompositeRepository {
         &self,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<AdminOrganizationInfo>> {
+        order_by: Option<AdminOrganizationOrderBy>,
+        order_direction: Option<AdminOrganizationOrderDirection>,
+        search: Option<&str>,
+    ) -> Result<(Vec<AdminOrganizationInfo>, i64)> {
         let client = self.pool.get().await?;
 
-        let rows = client
-            .query(
-                r#"
-                SELECT
-                    o.id,
-                    o.name,
-                    o.description,
-                    o.created_at,
-                    olh.spend_limit,
-                    ob.total_spent,
-                    ob.total_requests,
-                    ob.total_tokens
-                FROM organizations o
-                LEFT JOIN LATERAL (
-                    SELECT spend_limit
-                    FROM organization_limits_history
-                    WHERE organization_id = o.id
-                      AND effective_until IS NULL
-                    ORDER BY effective_from DESC
-                    LIMIT 1
-                ) olh ON true
-                LEFT JOIN organization_balance ob ON o.id = ob.organization_id
-                WHERE o.is_active = true
-                ORDER BY o.created_at DESC
-                LIMIT $1 OFFSET $2
-                "#,
-                &[&limit, &offset],
+        // Build ORDER BY clause
+        let order_column = match order_by.unwrap_or_default() {
+            AdminOrganizationOrderBy::CreatedAt => "o.created_at",
+            AdminOrganizationOrderBy::Name => "o.name",
+            AdminOrganizationOrderBy::SpendLimit => "olh.spend_limit",
+            AdminOrganizationOrderBy::CurrentUsage => "ob.total_spent",
+        };
+
+        let order_dir = match order_direction.unwrap_or_default() {
+            AdminOrganizationOrderDirection::Asc => "ASC",
+            AdminOrganizationOrderDirection::Desc => "DESC",
+        };
+
+        // NULLS LAST for columns that can be null
+        let nulls_clause = match order_by.unwrap_or_default() {
+            AdminOrganizationOrderBy::SpendLimit | AdminOrganizationOrderBy::CurrentUsage => {
+                " NULLS LAST"
+            }
+            _ => "",
+        };
+
+        // Build WHERE clause with optional search
+        let (main_where_clause, count_where_clause, search_pattern) = if let Some(query) = search {
+            let pattern = format!("%{}%", query);
+            (
+                "WHERE o.is_active = true AND (o.name ILIKE $3 OR o.id::text ILIKE $3)",
+                "WHERE o.is_active = true AND (o.name ILIKE $1 OR o.id::text ILIKE $1)",
+                Some(pattern),
             )
-            .await?;
+        } else {
+            ("WHERE o.is_active = true", "WHERE o.is_active = true", None)
+        };
+
+        // Build the main query
+        let query = format!(
+            r#"
+            SELECT
+                o.id,
+                o.name,
+                o.description,
+                o.created_at,
+                olh.spend_limit,
+                ob.total_spent,
+                ob.total_requests,
+                ob.total_tokens
+            FROM organizations o
+            LEFT JOIN LATERAL (
+                SELECT spend_limit
+                FROM organization_limits_history
+                WHERE organization_id = o.id
+                  AND effective_until IS NULL
+                ORDER BY effective_from DESC
+                LIMIT 1
+            ) olh ON true
+            LEFT JOIN organization_balance ob ON o.id = ob.organization_id
+            {}
+            ORDER BY {} {}{}
+            LIMIT $1 OFFSET $2
+            "#,
+            main_where_clause, order_column, order_dir, nulls_clause
+        );
+
+        // Build the count query
+        let count_query = format!(
+            r#"
+            SELECT COUNT(*) as count
+            FROM organizations o
+            {}
+            "#,
+            count_where_clause
+        );
+
+        // Execute queries
+        let (rows, count_row) = if let Some(ref pattern) = search_pattern {
+            let rows = client.query(&query, &[&limit, &offset, pattern]).await?;
+            let count_row = client.query_one(&count_query, &[pattern]).await?;
+            (rows, count_row)
+        } else {
+            let rows = client.query(&query, &[&limit, &offset]).await?;
+            let count_row = client.query_one(&count_query, &[]).await?;
+            (rows, count_row)
+        };
+
+        let total: i64 = count_row.get("count");
 
         let organizations = rows
             .into_iter()
@@ -405,23 +464,6 @@ impl AdminRepository for AdminCompositeRepository {
             })
             .collect();
 
-        Ok(organizations)
-    }
-
-    async fn count_all_organizations(&self) -> Result<i64> {
-        let client = self.pool.get().await?;
-
-        let row = client
-            .query_one(
-                r#"
-                SELECT COUNT(*) as count
-                FROM organizations
-                WHERE is_active = true
-                "#,
-                &[],
-            )
-            .await?;
-
-        Ok(row.get::<_, i64>("count"))
+        Ok((organizations, total))
     }
 }

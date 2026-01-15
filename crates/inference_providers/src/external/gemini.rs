@@ -200,6 +200,9 @@ struct GeminiSSEParser<S> {
     inner: S,
     buffer: String,
     bytes_buffer: Vec<u8>,
+    /// Pending results from previous process_buffer() calls
+    /// Multiple SSE events can arrive in a single network packet
+    pending_results: std::collections::VecDeque<Result<SSEEvent, CompletionError>>,
     model: String,
     created: i64,
     chunk_index: i64,
@@ -216,6 +219,7 @@ where
             inner: stream,
             buffer: String::new(),
             bytes_buffer: Vec::new(),
+            pending_results: std::collections::VecDeque::new(),
             model,
             created: chrono::Utc::now().timestamp(),
             chunk_index: 0,
@@ -331,13 +335,22 @@ where
     type Item = Result<SSEEvent, CompletionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // First, return any pending results from previous process_buffer() calls
+        if let Some(result) = self.pending_results.pop_front() {
+            return Poll::Ready(Some(result));
+        }
+
+        // Try to get more results from the current buffer
         let buffered_results = self.process_buffer();
         if !buffered_results.is_empty() {
-            if let Some(result) = buffered_results.into_iter().next() {
+            // Store all results in pending queue
+            self.pending_results.extend(buffered_results);
+            if let Some(result) = self.pending_results.pop_front() {
                 return Poll::Ready(Some(result));
             }
         }
 
+        // Poll for more data from the underlying stream
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => {
                 self.bytes_buffer.extend_from_slice(&bytes);
@@ -345,12 +358,16 @@ where
                 self.buffer.push_str(&text);
 
                 let results = self.process_buffer();
-                if let Some(result) = results.into_iter().next() {
-                    Poll::Ready(Some(result))
-                } else {
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+                if !results.is_empty() {
+                    // Store all results in pending queue
+                    self.pending_results.extend(results);
+                    if let Some(result) = self.pending_results.pop_front() {
+                        return Poll::Ready(Some(result));
+                    }
                 }
+                // No complete events yet, wake and try again
+                cx.waker().wake_by_ref();
+                Poll::Pending
             }
             Poll::Ready(Some(Err(e))) => {
                 Poll::Ready(Some(Err(CompletionError::CompletionError(e.to_string()))))
@@ -1051,5 +1068,58 @@ mod tests {
 
         assert!(json.contains("\"parts\""));
         assert!(json.contains("\"text\":\"Be helpful\""));
+    }
+
+    // ==================== SSE Parser Tests ====================
+
+    #[tokio::test]
+    async fn test_sse_parser_multiple_events_in_single_packet() {
+        use futures_util::StreamExt;
+
+        // Simulate multiple SSE events arriving in a single network packet
+        // This tests that the parser doesn't lose events when process_buffer() returns multiple results
+        let multi_event_packet = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}],\"role\":\"model\"},\"finishReason\":null,\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":1,\"totalTokenCount\":11}}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" World\"}],\"role\":\"model\"},\"finishReason\":null,\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":2,\"totalTokenCount\":12}}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"!\"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":3,\"totalTokenCount\":13}}\n\n",
+        );
+
+        // Create a mock stream that returns all events in one packet
+        let bytes = bytes::Bytes::from(multi_event_packet);
+        let mock_stream = futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes)]);
+
+        let parser = GeminiSSEParser::new(mock_stream, "gemini-1.5-pro".to_string());
+        let events: Vec<_> = parser.collect().await;
+
+        // Should have received all 3 events
+        assert_eq!(events.len(), 3, "Expected 3 events, got {}", events.len());
+
+        // Verify each event is Ok
+        for (i, event) in events.iter().enumerate() {
+            assert!(event.is_ok(), "Event {} should be Ok", i);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sse_parser_events_split_across_packets() {
+        use futures_util::StreamExt;
+
+        // Test events split across multiple network packets
+        let packet1 = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}],\"role\":\"model\"},\"finishReason\":null,\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":1,\"totalTokenCount\":11}}\n\n";
+        let packet2 = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" World\"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":2,\"totalTokenCount\":12}}\n\n";
+
+        let mock_stream = futures_util::stream::iter(vec![
+            Ok::<_, reqwest::Error>(bytes::Bytes::from(packet1)),
+            Ok(bytes::Bytes::from(packet2)),
+        ]);
+
+        let parser = GeminiSSEParser::new(mock_stream, "gemini-1.5-pro".to_string());
+        let events: Vec<_> = parser.collect().await;
+
+        assert_eq!(events.len(), 2, "Expected 2 events, got {}", events.len());
+
+        for event in &events {
+            assert!(event.is_ok());
+        }
     }
 }

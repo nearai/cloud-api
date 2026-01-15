@@ -837,13 +837,19 @@ pub async fn list_organizations(
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     debug!(
-        "List organizations request with limit={}, offset={}",
-        params.limit, params.offset
+        "List organizations request with limit={}, offset={}, sort_by={:?}, sort_order={:?}, search={}",
+        params.limit, params.offset, params.sort_by, params.sort_order, params.search.is_some()
     );
 
     let (organizations, total) = app_state
         .admin_service
-        .list_organizations(params.limit, params.offset)
+        .list_organizations(
+            params.limit,
+            params.offset,
+            params.sort_by,
+            params.sort_order,
+            params.search,
+        )
         .await
         .map_err(|e| {
             error!("Failed to list organizations: {:?}", e);
@@ -1166,6 +1172,9 @@ pub struct ListOrganizationsQueryParams {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+    pub sort_by: Option<services::admin::ports::AdminOrganizationOrderBy>,
+    pub sort_order: Option<services::admin::ports::AdminOrganizationOrderDirection>,
+    pub search: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]

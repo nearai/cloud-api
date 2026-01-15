@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde::Deserialize;
 
 /// Request to update model pricing and metadata
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
@@ -160,6 +161,26 @@ pub struct AdminOrganizationInfo {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Sort field for admin organization listing
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminOrganizationOrderBy {
+    #[default]
+    CreatedAt,
+    Name,
+    SpendLimit,
+    CurrentUsage,
+}
+
+/// Sort direction for admin organization listing
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminOrganizationOrderDirection {
+    Asc,
+    #[default]
+    Desc,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
     #[error("Model not found: {0}")]
@@ -270,15 +291,15 @@ pub trait AdminRepository: Send + Sync {
         organization_id: uuid::Uuid,
     ) -> Result<Option<u32>, anyhow::Error>;
 
-    /// List all organizations with pagination (admin only)
+    /// List all organizations with pagination, sorting, and search (admin only)
     async fn list_all_organizations(
         &self,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<AdminOrganizationInfo>, anyhow::Error>;
-
-    /// Count all active organizations (admin only)
-    async fn count_all_organizations(&self) -> Result<i64, anyhow::Error>;
+        order_by: Option<AdminOrganizationOrderBy>,
+        order_direction: Option<AdminOrganizationOrderDirection>,
+        search: Option<&str>,
+    ) -> Result<(Vec<AdminOrganizationInfo>, i64), anyhow::Error>;
 }
 
 /// Admin service trait for managing platform configuration
@@ -359,10 +380,13 @@ pub trait AdminService: Send + Sync {
         organization_id: uuid::Uuid,
     ) -> Result<Option<u32>, AdminError>;
 
-    /// List all organizations with pagination (admin only)
+    /// List all organizations with pagination, sorting, and search (admin only)
     async fn list_organizations(
         &self,
         limit: i64,
         offset: i64,
+        order_by: Option<AdminOrganizationOrderBy>,
+        order_direction: Option<AdminOrganizationOrderDirection>,
+        search: Option<String>,
     ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError>;
 }

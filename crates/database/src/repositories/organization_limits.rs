@@ -18,7 +18,7 @@ impl OrganizationLimitsRepository {
         Self { pool }
     }
 
-    /// Update organization limits - closes previous active limit and creates new one
+    /// Update organization limits - closes previous active limit of the same type and creates new one
     pub async fn update_limits(
         &self,
         organization_id: Uuid,
@@ -51,15 +51,15 @@ impl OrganizationLimitsRepository {
 
             let now = Utc::now();
 
-            // Close any existing active limits (set effective_until to now)
+            // Close any existing active limits of the same credit_type (set effective_until to now)
             transaction
                 .execute(
                     r#"
                     UPDATE organization_limits_history
                     SET effective_until = $1
-                    WHERE organization_id = $2 AND effective_until IS NULL
+                    WHERE organization_id = $2 AND credit_type = $3 AND effective_until IS NULL
                     "#,
-                    &[&now, &organization_id],
+                    &[&now, &organization_id, &request.credit_type],
                 )
                 .await
                 .map_err(map_db_error)?;
@@ -71,19 +71,25 @@ impl OrganizationLimitsRepository {
                     INSERT INTO organization_limits_history (
                         organization_id,
                         spend_limit,
+                        credit_type,
+                        source,
+                        currency,
                         effective_from,
                         changed_by,
                         change_reason,
                         changed_by_user_id,
                         changed_by_user_email
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-                    RETURNING id, organization_id, spend_limit,
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    RETURNING id, organization_id, spend_limit, credit_type, source, currency,
                               effective_from, effective_until,
                               changed_by, change_reason, changed_by_user_id, changed_by_user_email, created_at
                     "#,
                     &[
                         &organization_id,
                         &request.spend_limit,
+                        &request.credit_type,
+                        &request.source,
+                        &request.currency,
                         &now,
                         &request.changed_by,
                         &request.change_reason,
@@ -102,11 +108,11 @@ impl OrganizationLimitsRepository {
         Ok(self.row_to_limits_history(&row))
     }
 
-    /// Get current active limits for an organization
+    /// Get all current active limits for an organization (one per credit type)
     pub async fn get_current_limits(
         &self,
         organization_id: Uuid,
-    ) -> Result<Option<OrganizationLimitsHistory>> {
+    ) -> Result<Vec<OrganizationLimitsHistory>> {
         let rows = retry_db!("get_current_organization_limits", {
             let client = self
                 .pool
@@ -118,13 +124,12 @@ impl OrganizationLimitsRepository {
             client
                 .query(
                     r#"
-                    SELECT id, organization_id, spend_limit,
+                    SELECT id, organization_id, spend_limit, credit_type, source, currency,
                            effective_from, effective_until,
                            changed_by, change_reason, changed_by_user_id, changed_by_user_email, created_at
                     FROM organization_limits_history
                     WHERE organization_id = $1 AND effective_until IS NULL
-                    ORDER BY effective_from DESC
-                    LIMIT 1
+                    ORDER BY credit_type, effective_from DESC
                     "#,
                     &[&organization_id],
                 )
@@ -132,11 +137,11 @@ impl OrganizationLimitsRepository {
                 .map_err(map_db_error)
         })?;
 
-        if let Some(row) = rows.first() {
-            Ok(Some(self.row_to_limits_history(row)))
-        } else {
-            Ok(None)
-        }
+        let limits = rows
+            .iter()
+            .map(|row| self.row_to_limits_history(row))
+            .collect();
+        Ok(limits)
     }
 
     /// Count limits history for an organization
@@ -179,7 +184,7 @@ impl OrganizationLimitsRepository {
             client
                 .query(
                     r#"
-                    SELECT id, organization_id, spend_limit,
+                    SELECT id, organization_id, spend_limit, credit_type, source, currency,
                            effective_from, effective_until,
                            changed_by, change_reason, changed_by_user_id, changed_by_user_email, created_at
                     FROM organization_limits_history
@@ -206,6 +211,9 @@ impl OrganizationLimitsRepository {
             id: row.get("id"),
             organization_id: row.get("organization_id"),
             spend_limit: row.get("spend_limit"),
+            credit_type: row.get("credit_type"),
+            source: row.get("source"),
+            currency: row.get("currency"),
             effective_from: row.get("effective_from"),
             effective_until: row.get("effective_until"),
             changed_by: row.get("changed_by"),

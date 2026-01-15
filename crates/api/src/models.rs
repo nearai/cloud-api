@@ -1980,6 +1980,10 @@ pub struct ModelHistoryResponse {
 /// Request to update organization limits (Admin only)
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateOrganizationLimitsRequest {
+    #[serde(rename = "type")]
+    pub credit_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(rename = "spendLimit")]
     pub spend_limit: SpendLimitRequest,
     #[serde(rename = "changedBy", skip_serializing_if = "Option::is_none")]
@@ -2023,6 +2027,10 @@ pub struct SpendLimit {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateOrganizationLimitsResponse {
     pub organization_id: String,
+    #[serde(rename = "type")]
+    pub credit_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(rename = "spendLimit")]
     pub spend_limit: SpendLimit,
     pub updated_at: String,
@@ -2034,6 +2042,10 @@ pub struct OrgLimitsHistoryEntry {
     pub id: String,
     #[serde(rename = "organizationId")]
     pub organization_id: String,
+    #[serde(rename = "type")]
+    pub credit_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(rename = "spendLimit")]
     pub spend_limit: SpendLimit,
     #[serde(rename = "effectiveFrom")]

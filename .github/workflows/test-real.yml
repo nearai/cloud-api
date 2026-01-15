@@ -26,6 +26,10 @@ jobs:
        contains(github.event.comment.body, '@claude'))
     runs-on: ubuntu_large_x64
     environment: Cloud API test env
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
     
     services:
       postgres:
@@ -43,7 +47,28 @@ jobs:
           - 5432:5432
 
     steps:
-    - uses: actions/checkout@v6
+    - name: Get PR head SHA (for issue_comment events)
+      if: github.event_name == 'issue_comment'
+      id: pr-head
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.issue.number }}
+        REPO: ${{ github.repository }}
+      run: |
+        PR_HEAD_SHA=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+          "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER" \
+          | jq -r '.head.sha')
+        if [ -z "$PR_HEAD_SHA" ] || [ "$PR_HEAD_SHA" = "null" ]; then
+          echo "Error: Failed to get PR head SHA"
+          exit 1
+        fi
+        echo "sha=$PR_HEAD_SHA" >> $GITHUB_OUTPUT
+        echo "PR head SHA: $PR_HEAD_SHA"
+
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event_name == 'issue_comment' && steps.pr-head.outputs.sha || github.ref }}
     
     - name: Install Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1

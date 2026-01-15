@@ -76,7 +76,7 @@ jobs:
     # Template DB is created automatically on first test run with all migrations applied
     # Each test gets its own database copy for complete isolation
     - name: Run integration tests
-      run: cargo nextest run -p api --tests
+      run: cargo nextest run -p api --tests -E 'not test(/^real_test_/)'
       env:
         POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
         DATABASE_HOST: localhost

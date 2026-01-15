@@ -5,6 +5,7 @@
 //! each test clones from template for isolation and speed.
 
 pub mod db_setup;
+pub mod endpoints;
 
 use api::{build_app_with_config, init_auth_services, models::BatchUpdateModelApiRequest};
 use base64::Engine;
@@ -15,6 +16,7 @@ pub use services::auth::ports::MOCK_USER_AGENT;
 use services::auth::AccessTokenClaims;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use tokio::sync::OnceCell;
 
 #[cfg(test)]
 use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
@@ -24,6 +26,32 @@ use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey};
 use sha3::Keccak256;
 
 pub const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+/// Shared inference provider pool for real e2e tests (initialized once)
+static SHARED_REAL_PROVIDER_POOL: OnceCell<
+    Arc<services::inference_provider_pool::InferenceProviderPool>,
+> = OnceCell::const_new();
+
+/// Get or initialize the shared real provider pool
+async fn get_shared_real_provider_pool(
+) -> Arc<services::inference_provider_pool::InferenceProviderPool> {
+    SHARED_REAL_PROVIDER_POOL
+        .get_or_init(|| async {
+            let _ = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::level_filters::LevelFilter::DEBUG)
+                .try_init();
+
+            // Use a dummy database name for config (provider pool doesn't need actual DB)
+            let dummy_db_name = "real_e2e_shared_pool";
+            let config = test_config_with_db(dummy_db_name);
+
+            // Initialize the provider pool (this is the expensive part)
+            api::init_inference_providers(&config).await
+        })
+        .await
+        .clone()
+}
 
 /// RAII guard for test database cleanup.
 pub struct TestDatabaseGuard {
@@ -213,6 +241,38 @@ async fn build_test_server_components(
     (server, inference_provider_pool, mock_provider)
 }
 
+async fn build_test_server_components_with_real_provider(
+    database: Arc<Database>,
+    config: ApiConfig,
+    shared_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+) -> axum_test::TestServer {
+    // Ensure the mock user exists even when using a real inference provider
+    assert_mock_user_in_db(&database).await;
+
+    // Initialize auth components based on the provided config
+    let auth_components = init_auth_services(database.clone(), &config);
+
+    // Use the shared inference provider pool instead of creating a new one
+    let metrics_service = Arc::new(services::metrics::MockMetricsService);
+    let domain_services = api::init_domain_services_with_pool(
+        database.clone(),
+        &config,
+        auth_components.organization_service.clone(),
+        shared_provider_pool.clone(),
+        metrics_service,
+    )
+    .await;
+
+    let config_arc = Arc::new(config);
+    let app = build_app_with_config(
+        database.clone(),
+        auth_components,
+        domain_services,
+        config_arc.clone(),
+    );
+    axum_test::TestServer::new(app).unwrap()
+}
+
 /// Setup test server. Returns guard that must be held to ensure database cleanup.
 pub async fn setup_test_server() -> (axum_test::TestServer, TestDatabaseGuard) {
     let (server, _, _, _, guard) = setup_test_server_with_pool().await;
@@ -330,6 +390,41 @@ pub async fn setup_test_server_with_mcp_factory(
     let server = axum_test::TestServer::new(app).unwrap();
 
     (server, inference_provider_pool, mock_provider, infra.guard)
+}
+
+/// Setup test server backed by the real inference provider pool
+/// The provider pool is shared across all tests (initialized once) to avoid repeated expensive initialization
+pub async fn setup_test_server_with_real_provider() -> (
+    axum_test::TestServer,
+    std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
+    TestDatabaseGuard,
+) {
+    // Get or initialize the shared provider pool (only initialized once)
+    let shared_provider_pool = get_shared_real_provider_pool().await;
+
+    // Each test still gets its own database for isolation
+    let test_id = uuid::Uuid::new_v4().to_string();
+    let base_db_config = db_config_for_tests();
+    let db_name = db_setup::create_test_database_from_template(&base_db_config, &test_id)
+        .await
+        .expect("Failed to create test database from template");
+
+    let config = test_config_with_db(&db_name);
+    let db_config = config.database.clone();
+
+    let database = init_database_connection(&config.database).await;
+
+    // Build server using the shared provider pool
+    let server = build_test_server_components_with_real_provider(
+        database.clone(),
+        config,
+        shared_provider_pool.clone(),
+    )
+    .await;
+
+    let guard = TestDatabaseGuard { db_name, db_config };
+
+    (server, shared_provider_pool, guard)
 }
 
 pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, String) {

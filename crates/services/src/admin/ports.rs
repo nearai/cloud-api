@@ -147,6 +147,19 @@ pub struct AdminModelInfo {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Organization information for admin listing (includes spend limit and usage)
+#[derive(Debug, Clone)]
+pub struct AdminOrganizationInfo {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub spend_limit: Option<i64>, // Amount in nano-dollars (scale 9)
+    pub total_spent: Option<i64>, // Amount in nano-dollars (scale 9)
+    pub total_requests: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
     #[error("Model not found: {0}")]
@@ -221,11 +234,14 @@ pub trait AdminRepository: Send + Sync {
     async fn list_users(&self, limit: i64, offset: i64) -> Result<Vec<UserInfo>, anyhow::Error>;
 
     /// List all users with their earliest organization and spend limit (admin only)
+    /// If search_by_name is provided, filters users by organization name (case-insensitive partial match)
+    /// Returns a tuple of (users, total_count) where total_count is the count of filtered users
     async fn list_users_with_organizations(
         &self,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<(UserInfo, Option<UserOrganizationInfo>)>, anyhow::Error>;
+        search_by_name: Option<String>,
+    ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64), anyhow::Error>;
 
     /// Get the count of active users (admin only)
     async fn get_active_user_count(&self) -> Result<i64, anyhow::Error>;
@@ -238,6 +254,31 @@ pub trait AdminRepository: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<AdminModelInfo>, i64), anyhow::Error>;
+
+    /// Update organization concurrent request limit
+    /// Set to None to use the default limit
+    async fn update_organization_concurrent_limit(
+        &self,
+        organization_id: uuid::Uuid,
+        concurrent_limit: Option<u32>,
+    ) -> Result<(), anyhow::Error>;
+
+    /// Get organization concurrent request limit
+    /// Returns None if using default
+    async fn get_organization_concurrent_limit(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<Option<u32>, anyhow::Error>;
+
+    /// List all organizations with pagination (admin only)
+    async fn list_all_organizations(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AdminOrganizationInfo>, anyhow::Error>;
+
+    /// Count all active organizations (admin only)
+    async fn count_all_organizations(&self) -> Result<i64, anyhow::Error>;
 }
 
 /// Admin service trait for managing platform configuration
@@ -286,10 +327,12 @@ pub trait AdminService: Send + Sync {
         -> Result<(Vec<UserInfo>, i64), AdminError>;
 
     /// List all users with their earliest organization and spend limit (admin only)
+    /// If search_by_name is provided, filters users by organization name (case-insensitive partial match)
     async fn list_users_with_organizations(
         &self,
         limit: i64,
         offset: i64,
+        search_by_name: Option<String>,
     ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64), AdminError>;
 
     /// List all models with pagination (admin only)
@@ -300,4 +343,26 @@ pub trait AdminService: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<AdminModelInfo>, i64), AdminError>;
+
+    /// Update organization concurrent request limit (admin only)
+    /// Set to None to use the default limit
+    async fn update_organization_concurrent_limit(
+        &self,
+        organization_id: uuid::Uuid,
+        concurrent_limit: Option<u32>,
+    ) -> Result<(), AdminError>;
+
+    /// Get organization concurrent request limit (admin only)
+    /// Returns the custom limit if set, None if using default
+    async fn get_organization_concurrent_limit(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<Option<u32>, AdminError>;
+
+    /// List all organizations with pagination (admin only)
+    async fn list_organizations(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError>;
 }

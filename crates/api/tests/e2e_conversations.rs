@@ -1084,6 +1084,9 @@ async fn test_conversation_items_pagination() {
             ConversationItem::ToolCall { id, .. } => id.clone(),
             ConversationItem::WebSearchCall { id, .. } => id.clone(),
             ConversationItem::Reasoning { id, .. } => id.clone(),
+            ConversationItem::McpListTools { id, .. } => id.clone(),
+            ConversationItem::McpCall { id, .. } => id.clone(),
+            ConversationItem::McpApprovalRequest { id, .. } => id.clone(),
         })
         .collect();
 
@@ -1725,16 +1728,22 @@ async fn test_conversation_items_include_response_metadata() {
     let mut prev_timestamp = 0i64;
     for item in &items_list.data {
         let current_timestamp = match item {
-            api::models::ConversationItem::Message { created_at, .. } => *created_at,
-            api::models::ConversationItem::ToolCall { created_at, .. } => *created_at,
-            api::models::ConversationItem::WebSearchCall { created_at, .. } => *created_at,
-            api::models::ConversationItem::Reasoning { created_at, .. } => *created_at,
+            api::models::ConversationItem::Message { created_at, .. } => Some(*created_at),
+            api::models::ConversationItem::ToolCall { created_at, .. } => Some(*created_at),
+            api::models::ConversationItem::WebSearchCall { created_at, .. } => Some(*created_at),
+            api::models::ConversationItem::Reasoning { created_at, .. } => Some(*created_at),
+            // MCP items don't have created_at field in the API model
+            api::models::ConversationItem::McpListTools { .. } => None,
+            api::models::ConversationItem::McpCall { .. } => None,
+            api::models::ConversationItem::McpApprovalRequest { .. } => None,
         };
-        assert!(
-            current_timestamp >= prev_timestamp,
-            "Items should be sorted by created_at in ascending order"
-        );
-        prev_timestamp = current_timestamp;
+        if let Some(ts) = current_timestamp {
+            assert!(
+                ts >= prev_timestamp,
+                "Items should be sorted by created_at in ascending order"
+            );
+            prev_timestamp = ts;
+        }
     }
 
     println!("✅ Conversation items include response metadata (response_id, previous_response_id, next_response_ids, created_at)");
@@ -1974,6 +1983,87 @@ async fn test_rename_conversation_via_metadata() {
         Some("Updated Title")
     );
     println!("✅ Metadata changes persisted");
+}
+
+#[tokio::test]
+async fn test_pin_rename_unpin_conversation() {
+    // Test the bug: pin -> rename -> unpin should remove pinned_at from metadata
+    let (server, _guard) = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    // Create a conversation
+    let create_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "metadata": {
+                "title": "Test Conversation"
+            }
+        }))
+        .await;
+    assert_eq!(create_response.status_code(), 201);
+    let conversation = create_response.json::<api::models::ConversationObject>();
+    println!("Created conversation: {}", conversation.id);
+
+    // Step 1: Pin the conversation
+    let pin_response = server
+        .post(format!("/v1/conversations/{}/pin", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(pin_response.status_code(), 200);
+    let pinned_conv = pin_response.json::<api::models::ConversationObject>();
+
+    // Verify pinned_at is present
+    assert!(
+        pinned_conv.metadata.get("pinned_at").is_some(),
+        "pinned_at should be present after pinning"
+    );
+    println!("✅ Conversation pinned successfully");
+
+    // Step 2: Rename the conversation (update metadata)
+    let rename_response = server
+        .post(format!("/v1/conversations/{}", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "metadata": {
+                "title": "Renamed Conversation"
+            }
+        }))
+        .await;
+    assert_eq!(rename_response.status_code(), 200);
+    let renamed_conv = rename_response.json::<api::models::ConversationObject>();
+
+    // Verify title was updated
+    assert_eq!(
+        renamed_conv.metadata.get("title").and_then(|v| v.as_str()),
+        Some("Renamed Conversation")
+    );
+    // Verify pinned_at is still present after rename
+    assert!(
+        renamed_conv.metadata.get("pinned_at").is_some(),
+        "pinned_at should still be present after rename"
+    );
+    println!("✅ Conversation renamed successfully, pinned_at preserved");
+
+    // Step 3: Unpin the conversation
+    let unpin_response = server
+        .delete(format!("/v1/conversations/{}/pin", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(unpin_response.status_code(), 200);
+    let unpinned_conv = unpin_response.json::<api::models::ConversationObject>();
+
+    // Verify pinned_at is removed after unpinning (this was the bug)
+    assert!(
+        unpinned_conv.metadata.get("pinned_at").is_none(),
+        "pinned_at should be removed from metadata after unpinning, even after rename"
+    );
+    // Verify title is still preserved
+    assert_eq!(
+        unpinned_conv.metadata.get("title").and_then(|v| v.as_str()),
+        Some("Renamed Conversation")
+    );
+    println!("✅ Conversation unpinned successfully, pinned_at removed from metadata");
 }
 
 #[tokio::test]
@@ -2802,6 +2892,19 @@ async fn test_conversation_items_include_model() {
                     model, model_name,
                     "Model field should match the model used for the response"
                 );
+            }
+            // MCP items don't have model field in the API model
+            api::models::ConversationItem::McpListTools { id, .. } => {
+                println!("  McpListTools item {id}");
+                assert!(!id.is_empty(), "McpListTools id should not be empty");
+            }
+            api::models::ConversationItem::McpCall { id, .. } => {
+                println!("  McpCall item {id}");
+                assert!(!id.is_empty(), "McpCall id should not be empty");
+            }
+            api::models::ConversationItem::McpApprovalRequest { id, .. } => {
+                println!("  McpApprovalRequest item {id}");
+                assert!(!id.is_empty(), "McpApprovalRequest id should not be empty");
             }
         }
     }

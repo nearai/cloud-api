@@ -187,16 +187,11 @@ impl AdminService for AdminServiceImpl {
         &self,
         limit: i64,
         offset: i64,
+        search_by_name: Option<String>,
     ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64), AdminError> {
-        let users_with_orgs = self
+        let (users_with_orgs, total) = self
             .repository
-            .list_users_with_organizations(limit, offset)
-            .await
-            .map_err(|e| AdminError::InternalError(e.to_string()))?;
-
-        let total = self
-            .repository
-            .get_active_user_count()
+            .list_users_with_organizations(limit, offset, search_by_name)
             .await
             .map_err(|e| AdminError::InternalError(e.to_string()))?;
 
@@ -216,6 +211,74 @@ impl AdminService for AdminServiceImpl {
             .map_err(|e| AdminError::InternalError(e.to_string()))?;
 
         Ok((models, total))
+    }
+
+    async fn update_organization_concurrent_limit(
+        &self,
+        organization_id: uuid::Uuid,
+        concurrent_limit: Option<u32>,
+    ) -> Result<(), AdminError> {
+        // Validate limit if provided (u32 is already non-negative, just check for zero)
+        if let Some(limit) = concurrent_limit {
+            if limit == 0 {
+                return Err(AdminError::InvalidLimits(
+                    "Concurrent limit must be a positive integer".to_string(),
+                ));
+            }
+        }
+
+        self.repository
+            .update_organization_concurrent_limit(organization_id, concurrent_limit)
+            .await
+            .map_err(|e| {
+                let error_msg = e.to_string();
+                if error_msg.contains("not found") || error_msg.contains("inactive") {
+                    AdminError::OrganizationNotFound(format!(
+                        "Organization '{}' not found",
+                        organization_id
+                    ))
+                } else {
+                    AdminError::InternalError(error_msg)
+                }
+            })
+    }
+
+    async fn get_organization_concurrent_limit(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<Option<u32>, AdminError> {
+        self.repository
+            .get_organization_concurrent_limit(organization_id)
+            .await
+            .map_err(|e| {
+                let error_msg = e.to_string();
+                if error_msg.contains("not found") || error_msg.contains("inactive") {
+                    AdminError::OrganizationNotFound(format!(
+                        "Organization '{}' not found",
+                        organization_id
+                    ))
+                } else {
+                    AdminError::InternalError(error_msg)
+                }
+            })
+    }
+
+    async fn list_organizations(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError> {
+        // Execute both queries in parallel for better performance
+        let (organizations_result, total_result) = tokio::join!(
+            self.repository.list_all_organizations(limit, offset),
+            self.repository.count_all_organizations()
+        );
+
+        let organizations =
+            organizations_result.map_err(|e| AdminError::InternalError(e.to_string()))?;
+        let total = total_result.map_err(|e| AdminError::InternalError(e.to_string()))?;
+
+        Ok((organizations, total))
     }
 }
 

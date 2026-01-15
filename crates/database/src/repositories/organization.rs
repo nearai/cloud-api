@@ -832,3 +832,35 @@ impl OrganizationRepository for PgOrganizationRepository {
         Ok(organizations)
     }
 }
+
+// Implementation of OrganizationConcurrentLimitRepository for completions service
+#[async_trait]
+impl services::completions::ports::OrganizationConcurrentLimitRepository
+    for PgOrganizationRepository
+{
+    async fn get_concurrent_limit(&self, org_id: Uuid) -> Result<Option<u32>> {
+        let row = retry_db!("get_organization_concurrent_limit", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_opt(
+                    "SELECT rate_limit FROM organizations WHERE id = $1 AND is_active = true",
+                    &[&org_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        // Use try_from for safe i32 -> u32 conversion
+        // Negative values will become None, falling back to default limit
+        Ok(row.and_then(|r| {
+            r.get::<_, Option<i32>>("rate_limit")
+                .and_then(|v| u32::try_from(v).ok())
+        }))
+    }
+}

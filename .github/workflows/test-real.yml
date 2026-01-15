@@ -52,7 +52,7 @@ jobs:
 
     # Run only real_e2e tests (tests with function names starting with real_test_)
     - name: Run real E2E tests
-      run: cargo nextest run -p api --tests --filter 'test(/^real_test_/)'
+      run: cargo nextest run -p api --tests -E 'test(/^real_test_/)'
       env:
         POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
         DATABASE_HOST: localhost

@@ -258,6 +258,7 @@ where
                             provider_request_id: Some(chat_id),
                             stop_reason,
                             response_id,
+                            image_count: None,
                         })
                         .await
                         .is_err()
@@ -985,6 +986,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     provider_request_id: Some(provider_request_id),
                     stop_reason: Some(stop_reason),
                     response_id,
+                    image_count: None,
                 })
                 .await
                 .is_err()

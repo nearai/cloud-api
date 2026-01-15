@@ -29,6 +29,7 @@ pub struct ModelWithPricing {
     // Pricing (fixed scale 9 = nano-dollars, USD only)
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
+    pub cost_per_image: i64,
 
     // Model metadata
     pub context_length: i32,

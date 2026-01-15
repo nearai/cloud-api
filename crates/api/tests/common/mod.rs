@@ -755,11 +755,15 @@ pub async fn setup_qwen_image_model(server: &axum_test::TestServer) -> String {
         "Qwen/Qwen-Image-2512".to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
-                "amount": 2000000,
+                "amount": 0,
                 "currency": "USD"
             },
             "outputCostPerToken": {
-                "amount": 4000000,
+                "amount": 0,
+                "currency": "USD"
+            },
+            "costPerImage": {
+                "amount": 40000000,
                 "currency": "USD"
             },
             "modelDisplayName": "Qwen-Image",

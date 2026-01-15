@@ -755,9 +755,8 @@ pub async fn image_generations(
                     api_key_id,
                     model_id,
                     // Image generation doesn't have traditional token counts
-                    // We use output_tokens to track number of images generated
                     input_tokens: 0,
-                    output_tokens: image_count,
+                    output_tokens: 0,
                     inference_type: "image_generation".to_string(),
                     ttft_ms: None,
                     avg_itl_ms: None,
@@ -765,6 +764,7 @@ pub async fn image_generations(
                     provider_request_id: Some(provider_request_id),
                     stop_reason: Some(services::usage::StopReason::Completed),
                     response_id: None,
+                    image_count: Some(image_count),
                 };
 
                 if let Err(e) = usage_service.record_usage(usage_request).await {

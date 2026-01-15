@@ -74,8 +74,8 @@ impl OrganizationUsageRepository {
                         model_id, model_name, input_tokens, output_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
                         inference_type, created_at, ttft_ms, avg_itl_ms, inference_id,
-                        provider_request_id, stop_reason, response_id
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+                        provider_request_id, stop_reason, response_id, image_count
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
                     RETURNING *
                     "#,
                     &[
@@ -99,6 +99,7 @@ impl OrganizationUsageRepository {
                         &request.provider_request_id,
                         &stop_reason_str,
                         &response_id_uuid,
+                        &request.image_count,
                     ],
                 )
                 .await
@@ -221,7 +222,7 @@ impl OrganizationUsageRepository {
                         model_id, model_name, input_tokens, output_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
                         inference_type, created_at, ttft_ms, avg_itl_ms, inference_id,
-                        provider_request_id, stop_reason, response_id
+                        provider_request_id, stop_reason, response_id, image_count
                     FROM organization_usage_log
                     WHERE organization_id = $1
                     ORDER BY created_at DESC
@@ -288,7 +289,7 @@ impl OrganizationUsageRepository {
                         model_id, model_name, input_tokens, output_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
                         inference_type, created_at, ttft_ms, avg_itl_ms, inference_id,
-                        provider_request_id, stop_reason, response_id
+                        provider_request_id, stop_reason, response_id, image_count
                     FROM organization_usage_log
                     WHERE api_key_id = $1
                     ORDER BY created_at DESC
@@ -373,6 +374,7 @@ impl OrganizationUsageRepository {
             provider_request_id: row.get("provider_request_id"),
             stop_reason,
             response_id,
+            image_count: row.get("image_count"),
         })
     }
 

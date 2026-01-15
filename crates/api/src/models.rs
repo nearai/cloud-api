@@ -1954,6 +1954,8 @@ pub struct AdminModelWithPricing {
     pub input_cost_per_token: DecimalPrice,
     #[serde(rename = "outputCostPerToken")]
     pub output_cost_per_token: DecimalPrice,
+    #[serde(rename = "costPerImage")]
+    pub cost_per_image: DecimalPrice,
     pub metadata: ModelMetadata,
     #[serde(rename = "isActive")]
     pub is_active: bool,
@@ -1972,6 +1974,8 @@ pub struct ModelWithPricing {
     pub input_cost_per_token: DecimalPrice,
     #[serde(rename = "outputCostPerToken")]
     pub output_cost_per_token: DecimalPrice,
+    #[serde(rename = "costPerImage")]
+    pub cost_per_image: DecimalPrice,
     pub metadata: ModelMetadata,
 }
 
@@ -2040,6 +2044,8 @@ pub struct UpdateModelApiRequest {
     pub input_cost_per_token: Option<DecimalPriceRequest>,
     #[serde(rename = "outputCostPerToken")]
     pub output_cost_per_token: Option<DecimalPriceRequest>,
+    #[serde(rename = "costPerImage")]
+    pub cost_per_image: Option<DecimalPriceRequest>,
     #[serde(rename = "modelDisplayName")]
     pub model_display_name: Option<String>,
     #[serde(rename = "modelDescription")]
@@ -2078,6 +2084,8 @@ pub struct ModelHistoryEntry {
     pub input_cost_per_token: DecimalPrice,
     #[serde(rename = "outputCostPerToken")]
     pub output_cost_per_token: DecimalPrice,
+    #[serde(rename = "costPerImage")]
+    pub cost_per_image: DecimalPrice,
     #[serde(rename = "contextLength")]
     pub context_length: i32,
     #[serde(rename = "modelName")]

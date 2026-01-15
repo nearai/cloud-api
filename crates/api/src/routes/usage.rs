@@ -61,6 +61,9 @@ pub struct UsageHistoryEntryResponse {
     /// Inference UUID (hashed from provider_request_id)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inference_id: Option<String>,
+    /// Number of images generated (for image generation requests)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_count: Option<i32>,
 }
 
 /// Usage history response
@@ -355,6 +358,7 @@ pub async fn get_organization_usage_history(
             response_id: entry.response_id.map(|id| id.to_string()),
             provider_request_id: entry.provider_request_id,
             inference_id: entry.inference_id.map(|id| id.to_string()),
+            image_count: entry.image_count,
         })
         .collect();
 
@@ -484,6 +488,7 @@ pub async fn get_api_key_usage_history(
             response_id: entry.response_id.map(|id| id.to_string()),
             provider_request_id: entry.provider_request_id,
             inference_id: entry.inference_id.map(|id| id.to_string()),
+            image_count: entry.image_count,
         })
         .collect();
 

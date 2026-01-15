@@ -664,6 +664,36 @@ pub async fn image_generations(
             .into_response();
     }
 
+    // Resolve model to get UUID for usage tracking
+    let model = match app_state
+        .models_service
+        .get_model_by_name(&request.model)
+        .await
+    {
+        Ok(model) => model,
+        Err(services::models::ModelsError::NotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    format!("Model '{}' not found", request.model),
+                    "invalid_request_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to resolve model for image generation");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to resolve model".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+
     // Convert API request to provider params
     let params = inference_providers::ImageGenerationParams {
         model: request.model.clone(),
@@ -682,6 +712,57 @@ pub async fn image_generations(
         .await
     {
         Ok(response) => {
+            // Record usage for image generation
+            let organization_id = api_key.organization.id.0;
+            let workspace_id = api_key.workspace.id.0;
+            let api_key_id_str = api_key.api_key.id.0.clone();
+            let model_id = model.id;
+            let image_count = response.data.len() as i32;
+            let provider_request_id = response.id.clone();
+            let usage_service = app_state.usage_service.clone();
+
+            // Spawn async task to record usage (fire-and-forget like chat completions)
+            tokio::spawn(async move {
+                // Parse API key ID to UUID
+                let api_key_id = match Uuid::parse_str(&api_key_id_str) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Invalid API key ID for usage tracking");
+                        return;
+                    }
+                };
+
+                // Hash the provider request ID to UUID for storage
+                let inference_id = Some(hash_inference_id_to_uuid(&provider_request_id));
+
+                let usage_request = services::usage::RecordUsageServiceRequest {
+                    organization_id,
+                    workspace_id,
+                    api_key_id,
+                    model_id,
+                    // Image generation doesn't have traditional token counts
+                    // We use output_tokens to track number of images generated
+                    input_tokens: 0,
+                    output_tokens: image_count,
+                    inference_type: "image_generation".to_string(),
+                    ttft_ms: None,
+                    avg_itl_ms: None,
+                    inference_id,
+                    provider_request_id: Some(provider_request_id),
+                    stop_reason: Some(services::usage::StopReason::Completed),
+                    response_id: None,
+                };
+
+                if let Err(e) = usage_service.record_usage(usage_request).await {
+                    tracing::error!(
+                        error = %e,
+                        %organization_id,
+                        %workspace_id,
+                        "Failed to record image generation usage"
+                    );
+                }
+            });
+
             // Convert provider response to API response
             let api_response = crate::models::ImageGenerationResponse {
                 created: response.created,

@@ -8,8 +8,9 @@ impl From<crate::models::Message> for ChatMessage {
     fn from(msg: crate::models::Message) -> Self {
         let content = msg.content.map(|c| {
             let converted = convert_content_to_vllm(c);
-            serde_json::to_value(&converted).unwrap_or_else(|e| {
-                tracing::error!(error = %e, "Failed to serialize message content");
+            serde_json::to_value(&converted).unwrap_or_else(|_| {
+                // Log without error details for privacy (avoid any potential content leakage)
+                tracing::error!("Failed to serialize message content");
                 serde_json::Value::Object(serde_json::Map::new())
             })
         });
@@ -118,7 +119,14 @@ impl From<CompletionRequest> for CompletionParams {
 
 impl From<ChatMessage> for crate::models::Message {
     fn from(msg: ChatMessage) -> Self {
-        let content = msg.content.and_then(|v| serde_json::from_value(v).ok());
+        let content = msg.content.and_then(|v| {
+            serde_json::from_value(v.clone()).unwrap_or_else(|_| {
+                // Log warning for debugging but gracefully degrade to None
+                // Don't log the value itself to avoid potential content exposure
+                tracing::warn!("Failed to deserialize message content from provider response");
+                None
+            })
+        });
 
         Self {
             role: match msg.role {

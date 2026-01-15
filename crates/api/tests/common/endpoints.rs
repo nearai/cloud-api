@@ -1,6 +1,7 @@
 //! Common HTTP-level helpers for API E2E tests.
 
 use api::models::{ConversationItemList, ConversationObject, ResponseObject};
+use api::routes::attestation::SignatureResponse;
 use inference_providers::StreamChunk;
 
 /// POST `/v1/chat/completions` and return the raw response body text.
@@ -416,4 +417,36 @@ pub async fn upload_file(
                 ),
         )
         .await
+}
+
+/// GET `/v1/signature/{id}` for a given model and signing algorithm.
+///
+/// This helper is used by real_e2e signature tests. It ensures that the `model`
+/// query parameter is URL-encoded before sending the request.
+pub async fn get_signature_for_id(
+    server: &axum_test::TestServer,
+    api_key: &str,
+    id: &str,
+    model_name: &str,
+    signing_algo: &str,
+) -> SignatureResponse {
+    let encoded_model =
+        url::form_urlencoded::byte_serialize(model_name.as_bytes()).collect::<String>();
+    let signature_url =
+        format!("/v1/signature/{id}?model={encoded_model}&signing_algo={signing_algo}");
+
+    let response = server
+        .get(&signature_url)
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Signature endpoint should return success, got {} body={}",
+        response.status_code(),
+        response.text()
+    );
+
+    response.json::<SignatureResponse>()
 }

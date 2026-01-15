@@ -1,6 +1,6 @@
 mod common;
 
-use api::routes::attestation::{AttestationResponse, SignatureResponse};
+use api::routes::attestation::AttestationResponse;
 use common::*;
 use endpoints::*;
 
@@ -27,18 +27,7 @@ async fn real_test_signature_signing_address_matches_model_attestation_stream() 
 
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
-    let signature_response = server
-        .get(format!("/v1/signature/{chat_id}?model={model_name}&signing_algo=ecdsa").as_str())
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(
-        signature_response.status_code(),
-        200,
-        "Signature endpoint should return success"
-    );
-
-    let signature = signature_response.json::<SignatureResponse>();
+    let signature = get_signature_for_id(&server, &api_key, &chat_id, &model_name, "ecdsa").await;
     let signing_address = signature.signing_address;
     assert!(
         !signing_address.is_empty(),
@@ -112,18 +101,7 @@ async fn real_test_signature_signing_address_matches_model_attestation_non_strea
 
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
-    let signature_response = server
-        .get(format!("/v1/signature/{chat_id}?model={model_name}&signing_algo=ecdsa").as_str())
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(
-        signature_response.status_code(),
-        200,
-        "Signature endpoint should return success"
-    );
-
-    let signature = signature_response.json::<SignatureResponse>();
+    let signature = get_signature_for_id(&server, &api_key, &chat_id, &model_name, "ecdsa").await;
     let signing_address = signature.signing_address;
     assert!(
         !signing_address.is_empty(),

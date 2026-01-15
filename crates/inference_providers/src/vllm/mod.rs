@@ -406,7 +406,7 @@ impl InferenceProvider for VLlmProvider {
         &self,
         params: ImageGenerationParams,
         request_hash: String,
-    ) -> Result<ImageGenerationResponse, ImageGenerationError> {
+    ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
         let url = format!("{}/v1/images/generations", self.config.base_url);
 
         let mut headers = self.build_headers().map_err(to_image_gen_error)?;
@@ -437,6 +437,16 @@ impl InferenceProvider for VLlmProvider {
             });
         }
 
-        response.json().await.map_err(to_image_gen_error)
+        // Get raw bytes first for exact hash verification (same pattern as chat_completion)
+        let raw_bytes = response.bytes().await.map_err(to_image_gen_error)?.to_vec();
+
+        // Parse the response from the raw bytes
+        let image_response: ImageGenerationResponse =
+            serde_json::from_slice(&raw_bytes).map_err(to_image_gen_error)?;
+
+        Ok(ImageGenerationResponseWithBytes {
+            response: image_response,
+            raw_bytes,
+        })
     }
 }

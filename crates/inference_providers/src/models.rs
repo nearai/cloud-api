@@ -723,6 +723,15 @@ pub struct ImageData {
     pub revised_prompt: Option<String>,
 }
 
+/// Image generation response with raw bytes for TEE verification
+#[derive(Debug, Clone)]
+pub struct ImageGenerationResponseWithBytes {
+    /// The parsed response
+    pub response: ImageGenerationResponse,
+    /// The raw bytes from the provider response (for hash verification)
+    pub raw_bytes: Vec<u8>,
+}
+
 /// Image generation errors
 #[derive(Debug, Error, Clone, Serialize, Deserialize)]
 pub enum ImageGenerationError {

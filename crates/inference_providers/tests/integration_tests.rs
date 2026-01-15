@@ -711,13 +711,17 @@ async fn test_image_generation_real() {
         .await;
 
     match result {
-        Ok(response) => {
+        Ok(response_with_bytes) => {
             println!("Image generation successful!");
-            println!("Response ID: {}", response.id);
-            println!("Created at: {}", response.created);
-            println!("Number of images: {}", response.data.len());
+            println!("Response ID: {}", response_with_bytes.response.id);
+            println!("Created at: {}", response_with_bytes.response.created);
+            println!(
+                "Number of images: {}",
+                response_with_bytes.response.data.len()
+            );
+            println!("Raw bytes length: {}", response_with_bytes.raw_bytes.len());
 
-            for (i, img) in response.data.iter().enumerate() {
+            for (i, img) in response_with_bytes.response.data.iter().enumerate() {
                 if let Some(b64) = &img.b64_json {
                     println!("Image {}: base64 data length = {} bytes", i, b64.len());
                     assert!(!b64.is_empty(), "Base64 data should not be empty");
@@ -730,7 +734,14 @@ async fn test_image_generation_real() {
                 }
             }
 
-            assert!(!response.data.is_empty(), "Should have at least one image");
+            assert!(
+                !response_with_bytes.response.data.is_empty(),
+                "Should have at least one image"
+            );
+            assert!(
+                !response_with_bytes.raw_bytes.is_empty(),
+                "Raw bytes should not be empty"
+            );
         }
         Err(e) => {
             panic!("Image generation failed: {}", e);
@@ -761,12 +772,19 @@ async fn test_image_generation_mock() {
         .await;
 
     match result {
-        Ok(response) => {
+        Ok(response_with_bytes) => {
             println!("Mock image generation successful!");
-            assert!(!response.data.is_empty(), "Should have at least one image");
             assert!(
-                response.data[0].b64_json.is_some(),
+                !response_with_bytes.response.data.is_empty(),
+                "Should have at least one image"
+            );
+            assert!(
+                response_with_bytes.response.data[0].b64_json.is_some(),
                 "Should have base64 data"
+            );
+            assert!(
+                !response_with_bytes.raw_bytes.is_empty(),
+                "Raw bytes should not be empty"
             );
         }
         Err(e) => {

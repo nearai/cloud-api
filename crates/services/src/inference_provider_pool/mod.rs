@@ -1,8 +1,9 @@
 use crate::common::encryption_headers;
 use inference_providers::{
     models::{AttestationError, CompletionError, ListModelsError, ModelsResponse},
-    ChatCompletionParams, ImageGenerationError, ImageGenerationParams, ImageGenerationResponse,
-    InferenceProvider, StreamingResult, StreamingResultExt, VLlmConfig, VLlmProvider,
+    ChatCompletionParams, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponseWithBytes, InferenceProvider, StreamingResult, StreamingResultExt,
+    VLlmConfig, VLlmProvider,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -937,7 +938,7 @@ impl InferenceProviderPool {
         &self,
         params: ImageGenerationParams,
         request_hash: String,
-    ) -> Result<ImageGenerationResponse, ImageGenerationError> {
+    ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
         let model_id = params.model.clone();
 
         tracing::debug!(
@@ -947,7 +948,7 @@ impl InferenceProviderPool {
 
         let params_for_provider = params.clone();
 
-        let (response, _provider) = self
+        let (response, provider) = self
             .retry_with_fallback(&model_id, "image_generation", None, |provider| {
                 let params = params_for_provider.clone();
                 let request_hash = request_hash.clone();
@@ -960,6 +961,15 @@ impl InferenceProviderPool {
             })
             .await
             .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
+
+        // Store the chat_id mapping so attestation service can find the provider
+        // (same pattern as chat_completion)
+        let image_id = response.response.id.clone();
+        tracing::info!(
+            image_id = %image_id,
+            "Storing chat_id mapping for image generation"
+        );
+        self.store_chat_id_mapping(image_id, provider).await;
 
         Ok(response)
     }

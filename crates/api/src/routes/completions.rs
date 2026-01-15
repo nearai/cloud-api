@@ -711,14 +711,28 @@ pub async fn image_generations(
         .image_generation(params, body_hash.hash.clone())
         .await
     {
-        Ok(response) => {
+        Ok(response_with_bytes) => {
+            // Store attestation signature for image generation (same pattern as chat completions)
+            let attestation_service = app_state.attestation_service.clone();
+            let image_id_for_sig = response_with_bytes.response.id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = attestation_service
+                    .store_chat_signature_from_provider(&image_id_for_sig)
+                    .await
+                {
+                    tracing::error!(error = %e, "Failed to store image generation signature");
+                } else {
+                    tracing::debug!(image_id = %image_id_for_sig, "Stored signature for image generation");
+                }
+            });
+
             // Record usage for image generation
             let organization_id = api_key.organization.id.0;
             let workspace_id = api_key.workspace.id.0;
             let api_key_id_str = api_key.api_key.id.0.clone();
             let model_id = model.id;
-            let image_count = response.data.len() as i32;
-            let provider_request_id = response.id.clone();
+            let image_count = response_with_bytes.response.data.len() as i32;
+            let provider_request_id = response_with_bytes.response.id.clone();
             let usage_service = app_state.usage_service.clone();
 
             // Spawn async task to record usage (fire-and-forget like chat completions)
@@ -763,20 +777,13 @@ pub async fn image_generations(
                 }
             });
 
-            // Convert provider response to API response
-            let api_response = crate::models::ImageGenerationResponse {
-                created: response.created,
-                data: response
-                    .data
-                    .into_iter()
-                    .map(|img| crate::models::ImageData {
-                        b64_json: img.b64_json,
-                        url: img.url,
-                        revised_prompt: img.revised_prompt,
-                    })
-                    .collect(),
-            };
-            (StatusCode::OK, ResponseJson(api_response)).into_response()
+            // Return the exact bytes from the provider for hash verification
+            // This ensures clients can hash the response and compare with attestation endpoints
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(response_with_bytes.raw_bytes))
+                .unwrap()
         }
         Err(e) => {
             // Log the full error internally but return a sanitized message to the client

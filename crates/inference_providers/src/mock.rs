@@ -8,8 +8,9 @@ use crate::{
     ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseWithBytes,
     ChatDelta, ChatResponseMessage, ChatSignature, CompletionChunk, CompletionError,
     CompletionParams, FinishReason, FunctionCallDelta, ImageData, ImageGenerationError,
-    ImageGenerationParams, ImageGenerationResponse, ListModelsError, MessageRole, ModelInfo,
-    ModelsResponse, SSEEvent, StreamChunk, StreamingResult, TokenUsage, ToolCallDelta,
+    ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes,
+    ListModelsError, MessageRole, ModelInfo, ModelsResponse, SSEEvent, StreamChunk,
+    StreamingResult, TokenUsage, ToolCallDelta,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -848,7 +849,7 @@ impl crate::InferenceProvider for MockProvider {
         &self,
         params: ImageGenerationParams,
         _request_hash: String,
-    ) -> Result<ImageGenerationResponse, ImageGenerationError> {
+    ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
         // Check for invalid model
         if !self.is_valid_model(&params.model) {
             return Err(ImageGenerationError::GenerationError(format!(
@@ -869,10 +870,19 @@ impl crate::InferenceProvider for MockProvider {
             })
             .collect();
 
-        Ok(ImageGenerationResponse {
+        let response = ImageGenerationResponse {
             id: format!("img-{}", self.generate_id()),
             created,
             data,
+        };
+
+        // Serialize to raw bytes for TEE verification consistency
+        let raw_bytes = serde_json::to_vec(&response)
+            .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
+
+        Ok(ImageGenerationResponseWithBytes {
+            response,
+            raw_bytes,
         })
     }
 

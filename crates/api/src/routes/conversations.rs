@@ -1244,6 +1244,74 @@ fn convert_output_item_to_conversation_item(
             content,
             model,
         },
+        ResponseOutputItem::McpListTools {
+            id,
+            server_label,
+            tools,
+            error,
+        } => ConversationItem::McpListTools {
+            id,
+            server_label,
+            tools: tools
+                .into_iter()
+                .map(|t| crate::models::McpDiscoveredTool {
+                    name: t.name,
+                    description: t.description,
+                    input_schema: t.input_schema,
+                })
+                .collect(),
+            error,
+        },
+        ResponseOutputItem::McpCall {
+            id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
+            server_label,
+            name,
+            arguments,
+            output,
+            error,
+            approval_request_id,
+            status,
+            model,
+        } => ConversationItem::McpCall {
+            id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
+            server_label,
+            name,
+            arguments,
+            output,
+            error,
+            approval_request_id,
+            status,
+            model,
+        },
+        ResponseOutputItem::McpApprovalRequest {
+            id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
+            server_label,
+            name,
+            arguments,
+            model,
+        } => ConversationItem::McpApprovalRequest {
+            id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
+            server_label,
+            name,
+            arguments,
+            model,
+        },
     }
 }
 
@@ -1279,17 +1347,26 @@ fn convert_domain_conversation_to_http(
         .cloned()
         .unwrap_or_default();
 
+    // Update pinned_at in metadata based on database field
     if let Some(pinned_at) = domain_conversation.pinned_at {
         metadata.insert(
             "pinned_at".to_string(),
             serde_json::json!(pinned_at.timestamp()),
         );
+    } else {
+        // Remove pinned_at from metadata if it's not pinned
+        metadata.remove("pinned_at");
     }
+
+    // Update archived_at in metadata based on database field
     if let Some(archived_at) = domain_conversation.archived_at {
         metadata.insert(
             "archived_at".to_string(),
             serde_json::json!(archived_at.timestamp()),
         );
+    } else {
+        // Remove archived_at from metadata if it's not archived
+        metadata.remove("archived_at");
     }
 
     ConversationObject {
@@ -1306,6 +1383,9 @@ fn get_item_id(item: &ConversationItem) -> String {
         ConversationItem::ToolCall { id, .. } => id.clone(),
         ConversationItem::WebSearchCall { id, .. } => id.clone(),
         ConversationItem::Reasoning { id, .. } => id.clone(),
+        ConversationItem::McpListTools { id, .. } => id.clone(),
+        ConversationItem::McpCall { id, .. } => id.clone(),
+        ConversationItem::McpApprovalRequest { id, .. } => id.clone(),
     }
 }
 

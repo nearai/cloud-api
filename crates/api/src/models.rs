@@ -500,6 +500,48 @@ pub enum ResponseTool {
     CodeInterpreter {},
     #[serde(rename = "computer")]
     Computer {},
+    #[serde(rename = "mcp")]
+    Mcp {
+        server_label: String,
+        server_url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server_description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        authorization: Option<String>,
+        #[serde(default)]
+        require_approval: McpApprovalRequirement,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allowed_tools: Option<Vec<String>>,
+    },
+}
+
+/// Approval requirement for MCP tool calls
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum McpApprovalRequirement {
+    Simple(McpApprovalMode),
+    Granular { never: McpToolNameFilter },
+}
+
+impl Default for McpApprovalRequirement {
+    fn default() -> Self {
+        Self::Simple(McpApprovalMode::Always)
+    }
+}
+
+/// Simple MCP approval mode
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum McpApprovalMode {
+    #[default]
+    Always,
+    Never,
+}
+
+/// Filter for tool names that don't require approval
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct McpToolNameFilter {
+    pub tool_names: std::collections::HashSet<String>,
 }
 
 /// Tool choice configuration
@@ -633,6 +675,30 @@ pub enum ResponseOutputItem {
         status: ResponseItemStatus,
         summary: String,
         content: String,
+    },
+    #[serde(rename = "mcp_list_tools")]
+    McpListTools {
+        id: String,
+        server_label: String,
+        tools: Vec<McpDiscoveredTool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    #[serde(rename = "mcp_approval_request")]
+    McpApprovalRequest {
+        id: String,
+        #[serde(default)]
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        #[serde(default)]
+        created_at: i64,
+        server_label: String,
+        name: String,
+        arguments: String,
+        model: String,
     },
 }
 
@@ -832,6 +898,15 @@ pub enum ConversationContentPart {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct McpDiscoveredTool {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<serde_json::Value>,
+}
+
 /// Conversation item (for responses)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
@@ -893,6 +968,50 @@ pub enum ConversationItem {
         content: String,
         model: String,
     },
+    #[serde(rename = "mcp_list_tools")]
+    McpListTools {
+        id: String,
+        server_label: String,
+        tools: Vec<McpDiscoveredTool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    #[serde(rename = "mcp_call")]
+    McpCall {
+        id: String,
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        created_at: i64,
+        server_label: String,
+        name: String,
+        arguments: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval_request_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        model: String,
+    },
+    #[serde(rename = "mcp_approval_request")]
+    McpApprovalRequest {
+        id: String,
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        created_at: i64,
+        server_label: String,
+        name: String,
+        arguments: String,
+        model: String,
+    },
 }
 
 impl ConversationItem {
@@ -903,6 +1022,9 @@ impl ConversationItem {
             ConversationItem::ToolCall { id, .. } => id,
             ConversationItem::WebSearchCall { id, .. } => id,
             ConversationItem::Reasoning { id, .. } => id,
+            ConversationItem::McpListTools { id, .. } => id,
+            ConversationItem::McpCall { id, .. } => id,
+            ConversationItem::McpApprovalRequest { id, .. } => id,
         }
     }
 
@@ -1441,7 +1563,6 @@ pub struct UserOrganizationResponse {
 pub struct UserWorkspaceResponse {
     pub id: String,
     pub name: String,
-    pub display_name: Option<String>,
     pub organization_id: String,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
@@ -1481,6 +1602,28 @@ pub struct OrganizationMemberResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ListUsersResponse {
     pub users: Vec<AdminUserResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// Organization details for admin organization listing
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminOrganizationResponse {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(rename = "spendLimit", skip_serializing_if = "Option::is_none")]
+    pub spend_limit: Option<SpendLimit>,
+    #[serde(rename = "currentUsage", skip_serializing_if = "Option::is_none")]
+    pub current_usage: Option<OrganizationUsage>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// List organizations response model (admin only)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListOrganizationsAdminResponse {
+    pub organizations: Vec<AdminOrganizationResponse>,
     pub total: i64,
     pub limit: i64,
     pub offset: i64,
@@ -1916,6 +2059,46 @@ pub struct OrgLimitsHistoryResponse {
     pub total: i64,
     pub limit: i64,
     pub offset: i64,
+}
+
+// ============================================
+// Organization Concurrent Limit API Models (Admin)
+// ============================================
+
+/// Request to update organization concurrent request limit (Admin only)
+///
+/// The concurrent limit controls how many requests an organization can have
+/// in-flight simultaneously per model. Set to null to use the default (64).
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateOrganizationConcurrentLimitRequest {
+    /// Concurrent request limit per model. Set to null to use default (64).
+    #[serde(rename = "concurrentLimit")]
+    pub concurrent_limit: Option<u32>,
+}
+
+/// Response after updating organization concurrent limit
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UpdateOrganizationConcurrentLimitResponse {
+    #[serde(rename = "organizationId")]
+    pub organization_id: String,
+    /// Current concurrent limit. Null means default (64) is used.
+    #[serde(rename = "concurrentLimit")]
+    pub concurrent_limit: Option<u32>,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: String,
+}
+
+/// Response for getting organization concurrent limit
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct GetOrganizationConcurrentLimitResponse {
+    #[serde(rename = "organizationId")]
+    pub organization_id: String,
+    /// Current concurrent limit. Null means default (64) is used.
+    #[serde(rename = "concurrentLimit")]
+    pub concurrent_limit: Option<u32>,
+    /// The effective limit (either custom or default)
+    #[serde(rename = "effectiveLimit")]
+    pub effective_limit: u32,
 }
 
 // ============================================

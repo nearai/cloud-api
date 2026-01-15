@@ -32,10 +32,9 @@ url = "2.5"
 bytes = "1.11"
 tokio-stream = "0.1"
 # MCP protocol
-rmcp = { version = "0.10", features = [
+rmcp = { version = "0.12", features = [
     "client",
     "transport-streamable-http-client-reqwest",
-    "transport-sse-client-reqwest",
 ] }
 hex = "0.4"
 # NEAR wallet authentication (NEP-413)
@@ -57,8 +56,14 @@ hmac = "0.12"
 sha2 = "0.10"
 moka = { version = "0.12.12", features = ["future"] }
 bloomfilter = "3.0.1"
+mockall = { version = "0.14", optional = true }
+
+[features]
+default = []
+test-mocks = ["mockall"]
 
 [dev-dependencies]
 tokio-test = "0.4"
 async-trait = "0.1"
 futures = "0.3"
+mockall = "0.14"

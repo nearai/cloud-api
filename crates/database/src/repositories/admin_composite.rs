@@ -6,9 +6,9 @@ use crate::repositories::{
 use anyhow::Result;
 use async_trait::async_trait;
 use services::admin::{
-    AdminModelInfo, AdminRepository, ModelHistoryEntry, ModelPricing, OrganizationLimits,
-    OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate, UpdateModelAdminRequest, UserInfo,
-    UserOrganizationInfo,
+    AdminModelInfo, AdminOrganizationInfo, AdminRepository, ModelHistoryEntry, ModelPricing,
+    OrganizationLimits, OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate,
+    UpdateModelAdminRequest, UserInfo, UserOrganizationInfo,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -16,6 +16,7 @@ use uuid::Uuid;
 /// Composite repository that implements AdminRepository for both model and organization operations
 #[derive(Clone)]
 pub struct AdminCompositeRepository {
+    pool: DbPool,
     model_repo: Arc<ModelRepository>,
     alias_repo: Arc<ModelAliasRepository>,
     limits_repo: Arc<OrganizationLimitsRepository>,
@@ -25,6 +26,7 @@ pub struct AdminCompositeRepository {
 impl AdminCompositeRepository {
     pub fn new(pool: DbPool) -> Self {
         Self {
+            pool: pool.clone(),
             model_repo: Arc::new(ModelRepository::new(pool.clone())),
             alias_repo: Arc::new(ModelAliasRepository::new(pool.clone())),
             limits_repo: Arc::new(OrganizationLimitsRepository::new(pool.clone())),
@@ -235,13 +237,14 @@ impl AdminRepository for AdminCompositeRepository {
         &self,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<(UserInfo, Option<UserOrganizationInfo>)>> {
-        let users_with_orgs = self
+        search_by_name: Option<String>,
+    ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64)> {
+        let (users_with_orgs, total_count) = self
             .user_repo
-            .list_with_organizations(limit, offset)
+            .list_with_organizations(limit, offset, search_by_name)
             .await?;
 
-        Ok(users_with_orgs
+        let result = users_with_orgs
             .into_iter()
             .map(|(u, org_data)| {
                 let user_info = UserInfo {
@@ -256,7 +259,9 @@ impl AdminRepository for AdminCompositeRepository {
                 };
                 (user_info, org_data)
             })
-            .collect())
+            .collect();
+
+        Ok((result, total_count))
     }
 
     async fn get_active_user_count(&self) -> Result<i64> {
@@ -300,5 +305,123 @@ impl AdminRepository for AdminCompositeRepository {
             .collect();
 
         Ok((admin_models, total))
+    }
+
+    async fn update_organization_concurrent_limit(
+        &self,
+        organization_id: Uuid,
+        concurrent_limit: Option<u32>,
+    ) -> Result<()> {
+        let client = self.pool.get().await?;
+
+        // Convert u32 to i32 for PostgreSQL INTEGER type
+        let db_limit: Option<i32> = concurrent_limit.map(|v| v as i32);
+
+        let rows_updated = client
+            .execute(
+                "UPDATE organizations SET rate_limit = $1, updated_at = NOW() WHERE id = $2 AND is_active = true",
+                &[&db_limit, &organization_id],
+            )
+            .await?;
+
+        if rows_updated == 0 {
+            anyhow::bail!("Organization not found or inactive: {}", organization_id);
+        }
+
+        Ok(())
+    }
+
+    async fn get_organization_concurrent_limit(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<Option<u32>> {
+        let client = self.pool.get().await?;
+
+        let row = client
+            .query_opt(
+                "SELECT rate_limit FROM organizations WHERE id = $1 AND is_active = true",
+                &[&organization_id],
+            )
+            .await?;
+
+        match row {
+            Some(r) => {
+                let db_limit: Option<i32> = r.get("rate_limit");
+                // Convert i32 from DB to u32, filtering out non-positive values
+                Ok(db_limit.and_then(|v| u32::try_from(v).ok()))
+            }
+            None => anyhow::bail!("Organization not found or inactive: {}", organization_id),
+        }
+    }
+
+    async fn list_all_organizations(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AdminOrganizationInfo>> {
+        let client = self.pool.get().await?;
+
+        let rows = client
+            .query(
+                r#"
+                SELECT
+                    o.id,
+                    o.name,
+                    o.description,
+                    o.created_at,
+                    olh.spend_limit,
+                    ob.total_spent,
+                    ob.total_requests,
+                    ob.total_tokens
+                FROM organizations o
+                LEFT JOIN LATERAL (
+                    SELECT spend_limit
+                    FROM organization_limits_history
+                    WHERE organization_id = o.id
+                      AND effective_until IS NULL
+                    ORDER BY effective_from DESC
+                    LIMIT 1
+                ) olh ON true
+                LEFT JOIN organization_balance ob ON o.id = ob.organization_id
+                WHERE o.is_active = true
+                ORDER BY o.created_at DESC
+                LIMIT $1 OFFSET $2
+                "#,
+                &[&limit, &offset],
+            )
+            .await?;
+
+        let organizations = rows
+            .into_iter()
+            .map(|row| AdminOrganizationInfo {
+                id: row.get("id"),
+                name: row.get("name"),
+                description: row.get("description"),
+                spend_limit: row.get("spend_limit"),
+                total_spent: row.get("total_spent"),
+                total_requests: row.get("total_requests"),
+                total_tokens: row.get("total_tokens"),
+                created_at: row.get("created_at"),
+            })
+            .collect();
+
+        Ok(organizations)
+    }
+
+    async fn count_all_organizations(&self) -> Result<i64> {
+        let client = self.pool.get().await?;
+
+        let row = client
+            .query_one(
+                r#"
+                SELECT COUNT(*) as count
+                FROM organizations
+                WHERE is_active = true
+                "#,
+                &[],
+            )
+            .await?;
+
+        Ok(row.get::<_, i64>("count"))
     }
 }

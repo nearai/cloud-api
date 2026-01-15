@@ -1,10 +1,11 @@
-use crate::models::{OrganizationBalance, OrganizationUsageLog, RecordUsageRequest};
+use crate::models::{OrganizationBalance, OrganizationUsageLog, RecordUsageRequest, StopReason};
 use crate::pool::DbPool;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use services::common::RepositoryError;
+use services::responses::models::ResponseId;
 use std::collections::HashMap;
 use tokio_postgres::Row;
 use uuid::Uuid;
@@ -63,6 +64,8 @@ impl OrganizationUsageRepository {
             let total_tokens = request.input_tokens + request.output_tokens;
 
             // Insert usage log entry (model_name is denormalized for performance)
+            let stop_reason_str = request.stop_reason.as_ref().map(|r| r.as_str());
+            let response_id_uuid = request.response_id.as_ref().map(|r| r.as_uuid());
             let row = transaction
                 .query_one(
                     r#"
@@ -70,8 +73,9 @@ impl OrganizationUsageRepository {
                         id, organization_id, workspace_id, api_key_id,
                         model_id, model_name, input_tokens, output_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
-                        request_type, inference_type, created_at, ttft_ms, avg_itl_ms, inference_id
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                        inference_type, created_at, ttft_ms, avg_itl_ms, inference_id,
+                        provider_request_id, stop_reason, response_id
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
                     RETURNING *
                     "#,
                     &[
@@ -88,11 +92,13 @@ impl OrganizationUsageRepository {
                         &request.output_cost,
                         &request.total_cost,
                         &request.inference_type,
-                        &request.inference_type,
                         &now,
                         &request.ttft_ms,
                         &request.avg_itl_ms,
                         &request.inference_id,
+                        &request.provider_request_id,
+                        &stop_reason_str,
+                        &response_id_uuid,
                     ],
                 )
                 .await
@@ -214,7 +220,8 @@ impl OrganizationUsageRepository {
                         id, organization_id, workspace_id, api_key_id,
                         model_id, model_name, input_tokens, output_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
-                        inference_type, request_type, created_at, ttft_ms, avg_itl_ms, inference_id
+                        inference_type, created_at, ttft_ms, avg_itl_ms, inference_id,
+                        provider_request_id, stop_reason, response_id
                     FROM organization_usage_log
                     WHERE organization_id = $1
                     ORDER BY created_at DESC
@@ -280,7 +287,8 @@ impl OrganizationUsageRepository {
                         id, organization_id, workspace_id, api_key_id,
                         model_id, model_name, input_tokens, output_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
-                        inference_type, request_type, created_at, ttft_ms, avg_itl_ms, inference_id
+                        inference_type, created_at, ttft_ms, avg_itl_ms, inference_id,
+                        provider_request_id, stop_reason, response_id
                     FROM organization_usage_log
                     WHERE api_key_id = $1
                     ORDER BY created_at DESC
@@ -336,15 +344,13 @@ impl OrganizationUsageRepository {
     }
 
     fn row_to_usage_log(&self, row: &Row) -> Result<OrganizationUsageLog> {
-        // Try to get inference_type, fallback to request_type, error if neither exists
-        let inference_type = row
-            .try_get("inference_type")
-            .or_else(|_| row.try_get("request_type"))
-            .map_err(|_| {
-                RepositoryError::RequiredFieldMissing(
-                    "Neither inference_type nor request_type column found".to_string(),
-                )
-            })?;
+        // Parse stop_reason from string to enum
+        let stop_reason_str: Option<String> = row.get("stop_reason");
+        let stop_reason = stop_reason_str.as_deref().map(StopReason::parse);
+
+        // Convert response_id from UUID to ResponseId
+        let response_id_uuid: Option<Uuid> = row.get("response_id");
+        let response_id = response_id_uuid.map(ResponseId::from);
 
         Ok(OrganizationUsageLog {
             id: row.get("id"),
@@ -359,11 +365,14 @@ impl OrganizationUsageRepository {
             input_cost: row.get("input_cost"),
             output_cost: row.get("output_cost"),
             total_cost: row.get("total_cost"),
-            inference_type,
+            inference_type: row.get("inference_type"),
             created_at: row.get("created_at"),
             ttft_ms: row.get("ttft_ms"),
             avg_itl_ms: row.get("avg_itl_ms"),
             inference_id: row.get("inference_id"),
+            provider_request_id: row.get("provider_request_id"),
+            stop_reason,
+            response_id,
         })
     }
 

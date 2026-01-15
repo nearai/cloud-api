@@ -1,11 +1,14 @@
 use crate::middleware::AdminUser;
 use crate::models::{
     AdminAccessTokenResponse, AdminModelListResponse, AdminModelWithPricing,
-    AdminUserOrganizationDetails, AdminUserResponse, BatchUpdateModelApiRequest,
-    CreateAdminAccessTokenRequest, DecimalPrice, DeleteAdminAccessTokenRequest, DeleteModelRequest,
-    ErrorResponse, ListUsersResponse, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata,
-    ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage,
-    SpendLimit, UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
+    AdminOrganizationResponse, AdminUserOrganizationDetails, AdminUserResponse,
+    BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, DecimalPrice,
+    DeleteAdminAccessTokenRequest, DeleteModelRequest, ErrorResponse,
+    GetOrganizationConcurrentLimitResponse, ListOrganizationsAdminResponse, ListUsersResponse,
+    ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
+    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, SpendLimit,
+    UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
+    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
 };
 use crate::routes::common::format_amount;
 use axum::{
@@ -478,10 +481,10 @@ pub async fn update_organization_limits(
 /// Returns the complete limits history for a specific organization, showing all limits changes over time.
 #[utoipa::path(
     get,
-    path = "/v1/admin/organizations/{organization_id}/limits/history",
+    path = "/v1/admin/organizations/{org_id}/limits/history",
     tag = "Admin",
     params(
-        ("organization_id" = String, Path, description = "The organization's ID (as a UUID)"),
+        ("org_id" = String, Path, description = "The organization's ID (as a UUID)"),
         ("limit" = Option<i64>, Query, description = "Maximum number of history records to return (default: 50)"),
         ("offset" = Option<i64>, Query, description = "Number of records to skip (default: 0)")
     ),
@@ -497,13 +500,13 @@ pub async fn update_organization_limits(
 )]
 pub async fn get_organization_limits_history(
     State(app_state): State<AdminAppState>,
-    Path(organization_id): Path<String>,
+    Path(org_id): Path<String>,
     Extension(_admin_user): Extension<AdminUser>, // Require admin auth
     axum::extract::Query(params): axum::extract::Query<OrgLimitsHistoryQueryParams>,
 ) -> Result<ResponseJson<OrgLimitsHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
-    let organization_uuid = match uuid::Uuid::parse_str(&organization_id) {
+    let organization_uuid = match uuid::Uuid::parse_str(&org_id) {
         Ok(id) => id,
         Err(_) => {
             return Err((
@@ -518,7 +521,7 @@ pub async fn get_organization_limits_history(
 
     debug!(
         "Get limits history for organization_id={}, limit={}, offset={}",
-        organization_id, params.limit, params.offset
+        org_id, params.limit, params.offset
     );
 
     let (history, total) = app_state
@@ -667,7 +670,8 @@ pub async fn delete_model(
     params(
         ("limit" = Option<i64>, Query, description = "Maximum number of users to return (default: 100)"),
         ("offset" = Option<i64>, Query, description = "Number of users to skip (default: 0)"),
-        ("include_organizations" = Option<bool>, Query, description = "Whether to include organization information and spend limits for the first organization owned by each user (default: false)")
+        ("include_organizations" = Option<bool>, Query, description = "Whether to include organization information and spend limits for the first organization owned by each user (default: false)"),
+        ("search_by_name" = Option<String>, Query, description = "Filter users by organization name (case-insensitive match). Only effective when include_organizations=true; ignored otherwise.")
     ),
     responses(
         (status = 200, description = "Users retrieved successfully", body = ListUsersResponse),
@@ -686,15 +690,15 @@ pub async fn list_users(
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     debug!(
-        "List users request with limit={}, offset={}, include_organizations={}",
-        params.limit, params.offset, params.include_organizations
+        "List users request with limit={}, offset={}, include_organizations={}, search_by_name={:?}",
+        params.limit, params.offset, params.include_organizations, params.search_by_name
     );
 
     let (user_responses, total) = if params.include_organizations {
         // Fetch users with their default organization and spend limit
         let (users_with_orgs, total) = app_state
             .admin_service
-            .list_users_with_organizations(params.limit, params.offset)
+            .list_users_with_organizations(params.limit, params.offset, params.search_by_name)
             .await
             .map_err(|e| {
                 error!("Failed to list users with organizations");
@@ -795,6 +799,96 @@ pub async fn list_users(
 
     let response = ListUsersResponse {
         users: user_responses,
+        total,
+        limit: params.limit,
+        offset: params.offset,
+    };
+
+    Ok(ResponseJson(response))
+}
+
+/// List all organizations with pagination (Admin only)
+///
+/// Returns a paginated list of all organizations in the system with their spend limits and usage.
+/// Only authenticated admins can perform this operation.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations",
+    tag = "Admin",
+    params(
+        ("limit" = Option<i64>, Query, description = "Maximum number of organizations to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Number of organizations to skip (default: 0)")
+    ),
+    responses(
+        (status = 200, description = "Organizations retrieved successfully", body = ListOrganizationsAdminResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_organizations(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    axum::extract::Query(params): axum::extract::Query<ListOrganizationsQueryParams>,
+) -> Result<ResponseJson<ListOrganizationsAdminResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
+{
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+
+    debug!(
+        "List organizations request with limit={}, offset={}",
+        params.limit, params.offset
+    );
+
+    let (organizations, total) = app_state
+        .admin_service
+        .list_organizations(params.limit, params.offset)
+        .await
+        .map_err(|e| {
+            error!("Failed to list organizations: {:?}", e);
+            match e {
+                services::admin::AdminError::Unauthorized(msg) => (
+                    StatusCode::UNAUTHORIZED,
+                    ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve organizations".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+
+    let org_responses: Vec<AdminOrganizationResponse> = organizations
+        .into_iter()
+        .map(|org| {
+            let current_usage = org.total_spent.map(|total_spent| OrganizationUsage {
+                total_spent,
+                total_spent_display: format_amount(total_spent),
+                total_requests: org.total_requests.unwrap_or(0),
+                total_tokens: org.total_tokens.unwrap_or(0),
+            });
+
+            AdminOrganizationResponse {
+                id: org.id.to_string(),
+                name: org.name,
+                description: org.description,
+                spend_limit: org.spend_limit.map(|amount| SpendLimit {
+                    amount,
+                    scale: 9,
+                    currency: "USD".to_string(),
+                }),
+                current_usage,
+                created_at: org.created_at,
+            }
+        })
+        .collect();
+
+    let response = ListOrganizationsAdminResponse {
+        organizations: org_responses,
         total,
         limit: params.limit,
         offset: params.offset,
@@ -1063,6 +1157,15 @@ pub struct ListUsersQueryParams {
     pub offset: i64,
     #[serde(default)]
     pub include_organizations: bool,
+    pub search_by_name: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ListOrganizationsQueryParams {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1374,4 +1477,175 @@ pub async fn get_organization_timeseries(
         })?;
 
     Ok(ResponseJson(metrics))
+}
+
+/// Update organization concurrent request limit (Admin only)
+///
+/// Updates the maximum concurrent requests allowed per model for an organization.
+/// Set to null to use the default limit (64).
+/// Changes take effect within 5 minutes due to caching.
+#[utoipa::path(
+    patch,
+    path = "/v1/admin/organizations/{org_id}/concurrent-limit",
+    tag = "Admin",
+    params(
+        ("org_id" = String, Path, description = "The organization's ID (as a UUID)")
+    ),
+    request_body = UpdateOrganizationConcurrentLimitRequest,
+    responses(
+        (status = 200, description = "Concurrent limit updated successfully", body = UpdateOrganizationConcurrentLimitResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn update_organization_concurrent_limit(
+    State(app_state): State<AdminAppState>,
+    Path(org_id): Path<String>,
+    Extension(_admin_user): Extension<AdminUser>,
+    ResponseJson(request): ResponseJson<UpdateOrganizationConcurrentLimitRequest>,
+) -> Result<
+    ResponseJson<UpdateOrganizationConcurrentLimitResponse>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    debug!(
+        "Update organization concurrent limit request for org_id: {}, limit: {:?}",
+        org_id, request.concurrent_limit
+    );
+
+    // Parse organization ID
+    let org_uuid = uuid::Uuid::parse_str(&org_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Invalid organization ID format".to_string(),
+                "invalid_id".to_string(),
+            )),
+        )
+    })?;
+
+    // Update concurrent limit via admin service
+    app_state
+        .admin_service
+        .update_organization_concurrent_limit(org_uuid, request.concurrent_limit)
+        .await
+        .map_err(|e| {
+            error!("Failed to update organization concurrent limit");
+            match e {
+                services::admin::AdminError::OrganizationNotFound(msg) => (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        msg,
+                        "organization_not_found".to_string(),
+                    )),
+                ),
+                services::admin::AdminError::InvalidLimits(msg) => (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(msg, "invalid_limits".to_string())),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to update concurrent limit".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+
+    let response = UpdateOrganizationConcurrentLimitResponse {
+        organization_id: org_id.clone(),
+        concurrent_limit: request.concurrent_limit,
+        updated_at: Utc::now().to_rfc3339(),
+    };
+
+    Ok(ResponseJson(response))
+}
+
+/// Get organization concurrent request limit (Admin only)
+///
+/// Returns the current concurrent request limit for an organization.
+/// If no custom limit is set, returns null for concurrent_limit and the default (64) for effective_limit.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations/{org_id}/concurrent-limit",
+    tag = "Admin",
+    params(
+        ("org_id" = String, Path, description = "The organization's ID (as a UUID)")
+    ),
+    responses(
+        (status = 200, description = "Concurrent limit retrieved successfully", body = GetOrganizationConcurrentLimitResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_organization_concurrent_limit(
+    State(app_state): State<AdminAppState>,
+    Path(org_id): Path<String>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<
+    ResponseJson<GetOrganizationConcurrentLimitResponse>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    debug!(
+        "Get organization concurrent limit request for org_id: {}",
+        org_id
+    );
+
+    // Parse organization ID
+    let org_uuid = uuid::Uuid::parse_str(&org_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Invalid organization ID format".to_string(),
+                "invalid_id".to_string(),
+            )),
+        )
+    })?;
+
+    // Get concurrent limit via admin service
+    let concurrent_limit = app_state
+        .admin_service
+        .get_organization_concurrent_limit(org_uuid)
+        .await
+        .map_err(|e| {
+            error!("Failed to get organization concurrent limit");
+            match e {
+                services::admin::AdminError::OrganizationNotFound(msg) => (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        msg,
+                        "organization_not_found".to_string(),
+                    )),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to get concurrent limit".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+
+    // Filter out zero values (shouldn't happen due to validation, but defensive)
+    let concurrent_limit = concurrent_limit.filter(|&limit| limit > 0);
+    let effective_limit =
+        concurrent_limit.unwrap_or(services::completions::ports::DEFAULT_CONCURRENT_LIMIT);
+
+    let response = GetOrganizationConcurrentLimitResponse {
+        organization_id: org_id,
+        concurrent_limit,
+        effective_limit,
+    };
+
+    Ok(ResponseJson(response))
 }

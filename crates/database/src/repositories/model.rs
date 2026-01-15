@@ -426,7 +426,16 @@ impl ModelRepository {
                             model_display_name, model_description, model_icon,
                             context_length, verifiable, is_active, owned_by,
                             provider_type, provider_config, attestation_supported
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, $11), COALESCE($12, 'vllm'), $13, COALESCE($14, true))
+                        ) VALUES (
+                            $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                            COALESCE($10, $11),
+                            COALESCE($12, 'vllm'),
+                            $13,
+                            -- Default attestation_supported based on provider_type:
+                            -- External providers cannot support attestation, so default to false
+                            -- vLLM providers support attestation, so default to true
+                            COALESCE($14, CASE WHEN COALESCE($12, 'vllm') = 'external' THEN false ELSE true END)
+                        )
                         ON CONFLICT (model_name) DO UPDATE SET
                             input_cost_per_token = EXCLUDED.input_cost_per_token,
                             output_cost_per_token = EXCLUDED.output_cost_per_token,

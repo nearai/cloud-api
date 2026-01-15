@@ -93,6 +93,29 @@ impl Default for GeminiBackend {
     }
 }
 
+/// Map Gemini's finishReason to OpenAI-compatible finish_reason (enum for streaming)
+///
+/// Gemini uses: "STOP", "MAX_TOKENS", "SAFETY", "RECITATION", "OTHER"
+/// OpenAI uses: "stop", "length", "content_filter", "tool_calls"
+fn map_finish_reason(finish_reason: Option<&String>) -> Option<crate::FinishReason> {
+    finish_reason.map(|r| match r.as_str() {
+        "STOP" => crate::FinishReason::Stop,
+        "MAX_TOKENS" => crate::FinishReason::Length,
+        "SAFETY" => crate::FinishReason::ContentFilter,
+        _ => crate::FinishReason::Stop,
+    })
+}
+
+/// Map Gemini's finishReason to OpenAI-compatible finish_reason (string for non-streaming)
+fn map_finish_reason_string(finish_reason: Option<&String>) -> Option<String> {
+    finish_reason.map(|r| match r.as_str() {
+        "STOP" => "stop".to_string(),
+        "MAX_TOKENS" => "length".to_string(),
+        "SAFETY" => "content_filter".to_string(),
+        _ => "stop".to_string(),
+    })
+}
+
 /// Gemini part format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GeminiPart {
@@ -223,12 +246,7 @@ where
         self.accumulated_prompt_tokens = response.usage_metadata.prompt_token_count;
         self.accumulated_completion_tokens = response.usage_metadata.candidates_token_count;
 
-        let finish_reason = candidate.finish_reason.as_ref().map(|r| match r.as_str() {
-            "STOP" => crate::FinishReason::Stop,
-            "MAX_TOKENS" => crate::FinishReason::Length,
-            "SAFETY" => crate::FinishReason::ContentFilter,
-            _ => crate::FinishReason::Stop,
-        });
+        let finish_reason = map_finish_reason(candidate.finish_reason.as_ref());
 
         let is_first = self.chunk_index == 0;
         self.chunk_index += 1;
@@ -542,7 +560,7 @@ impl ExternalBackend for GeminiBackend {
                     reasoning: None,
                 },
                 logprobs: None,
-                finish_reason: candidate.finish_reason.clone(),
+                finish_reason: map_finish_reason_string(candidate.finish_reason.as_ref()),
                 token_ids: None,
             }],
             service_tier: None,
@@ -865,14 +883,13 @@ mod tests {
         ];
 
         for (gemini_reason, expected) in test_cases {
-            let mapped = match gemini_reason {
-                "STOP" => crate::FinishReason::Stop,
-                "MAX_TOKENS" => crate::FinishReason::Length,
-                "SAFETY" => crate::FinishReason::ContentFilter,
-                _ => crate::FinishReason::Stop,
-            };
+            let reason_string = gemini_reason.to_string();
+            let mapped = map_finish_reason(Some(&reason_string)).unwrap();
             assert_eq!(mapped, expected, "Failed for reason: {}", gemini_reason);
         }
+
+        // Test None case
+        assert_eq!(map_finish_reason(None), None);
     }
 
     // ==================== Request Building Tests ====================

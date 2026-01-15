@@ -107,6 +107,27 @@ impl Default for AnthropicBackend {
     }
 }
 
+/// Map Anthropic's stop_reason to OpenAI-compatible finish_reason (enum for streaming)
+///
+/// Anthropic uses: "end_turn", "stop_sequence", "max_tokens"
+/// OpenAI uses: "stop", "length", "content_filter", "tool_calls"
+fn map_finish_reason(stop_reason: Option<String>) -> Option<crate::FinishReason> {
+    stop_reason.map(|r| match r.as_str() {
+        "end_turn" | "stop_sequence" => crate::FinishReason::Stop,
+        "max_tokens" => crate::FinishReason::Length,
+        _ => crate::FinishReason::Stop,
+    })
+}
+
+/// Map Anthropic's stop_reason to OpenAI-compatible finish_reason (string for non-streaming)
+fn map_finish_reason_string(stop_reason: Option<String>) -> Option<String> {
+    stop_reason.map(|r| match r.as_str() {
+        "end_turn" | "stop_sequence" => "stop".to_string(),
+        "max_tokens" => "length".to_string(),
+        _ => "stop".to_string(),
+    })
+}
+
 /// Anthropic message format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AnthropicMessage {
@@ -321,11 +342,7 @@ where
             AnthropicStreamEvent::MessageDelta { delta, usage } => {
                 self.accumulated_output_tokens = usage.output_tokens;
 
-                let finish_reason = delta.stop_reason.map(|r| match r.as_str() {
-                    "end_turn" | "stop_sequence" => crate::FinishReason::Stop,
-                    "max_tokens" => crate::FinishReason::Length,
-                    _ => crate::FinishReason::Stop,
-                });
+                let finish_reason = map_finish_reason(delta.stop_reason);
 
                 let chunk = ChatCompletionChunk {
                     id: self.message_id.clone().unwrap_or_default(),
@@ -592,7 +609,7 @@ impl ExternalBackend for AnthropicBackend {
                     reasoning: None,
                 },
                 logprobs: None,
-                finish_reason: anthropic_response.stop_reason,
+                finish_reason: map_finish_reason_string(anthropic_response.stop_reason),
                 token_ids: None,
             }],
             service_tier: None,
@@ -935,7 +952,7 @@ mod tests {
 
     #[test]
     fn test_finish_reason_mapping() {
-        // Test the finish reason mapping logic
+        // Test the finish reason mapping logic using the helper function
         let test_cases = vec![
             ("end_turn", crate::FinishReason::Stop),
             ("stop_sequence", crate::FinishReason::Stop),
@@ -944,13 +961,12 @@ mod tests {
         ];
 
         for (anthropic_reason, expected) in test_cases {
-            let mapped = match anthropic_reason {
-                "end_turn" | "stop_sequence" => crate::FinishReason::Stop,
-                "max_tokens" => crate::FinishReason::Length,
-                _ => crate::FinishReason::Stop,
-            };
+            let mapped = map_finish_reason(Some(anthropic_reason.to_string())).unwrap();
             assert_eq!(mapped, expected, "Failed for reason: {}", anthropic_reason);
         }
+
+        // Test None case
+        assert_eq!(map_finish_reason(None), None);
     }
 
     // ==================== Request Building Tests ====================

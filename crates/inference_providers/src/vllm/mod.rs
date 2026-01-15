@@ -3,6 +3,11 @@ use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
 
+/// Convert any displayable error to ImageGenerationError::GenerationError
+fn to_image_gen_error<E: std::fmt::Display>(e: E) -> ImageGenerationError {
+    ImageGenerationError::GenerationError(e.to_string())
+}
+
 /// Encryption header keys used in params.extra for passing encryption information
 mod encryption_headers {
     /// Key for signing algorithm (x-signing-algo header)
@@ -404,14 +409,11 @@ impl InferenceProvider for VLlmProvider {
     ) -> Result<ImageGenerationResponse, ImageGenerationError> {
         let url = format!("{}/v1/images/generations", self.config.base_url);
 
-        let mut headers = self
-            .build_headers()
-            .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
+        let mut headers = self.build_headers().map_err(to_image_gen_error)?;
 
         headers.insert(
             "X-Request-Hash",
-            HeaderValue::from_str(&request_hash)
-                .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?,
+            HeaderValue::from_str(&request_hash).map_err(to_image_gen_error)?,
         );
 
         let response = self
@@ -421,7 +423,7 @@ impl InferenceProvider for VLlmProvider {
             .json(&params)
             .send()
             .await
-            .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
+            .map_err(to_image_gen_error)?;
 
         if !response.status().is_success() {
             let status_code = response.status().as_u16();
@@ -435,9 +437,6 @@ impl InferenceProvider for VLlmProvider {
             });
         }
 
-        response
-            .json()
-            .await
-            .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))
+        response.json().await.map_err(to_image_gen_error)
     }
 }

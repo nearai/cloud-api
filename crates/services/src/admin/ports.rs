@@ -234,11 +234,14 @@ pub trait AdminRepository: Send + Sync {
     async fn list_users(&self, limit: i64, offset: i64) -> Result<Vec<UserInfo>, anyhow::Error>;
 
     /// List all users with their earliest organization and spend limit (admin only)
+    /// If search_by_name is provided, filters users by organization name (case-insensitive partial match)
+    /// Returns a tuple of (users, total_count) where total_count is the count of filtered users
     async fn list_users_with_organizations(
         &self,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<(UserInfo, Option<UserOrganizationInfo>)>, anyhow::Error>;
+        search_by_name: Option<String>,
+    ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64), anyhow::Error>;
 
     /// Get the count of active users (admin only)
     async fn get_active_user_count(&self) -> Result<i64, anyhow::Error>;
@@ -324,10 +327,12 @@ pub trait AdminService: Send + Sync {
         -> Result<(Vec<UserInfo>, i64), AdminError>;
 
     /// List all users with their earliest organization and spend limit (admin only)
+    /// If search_by_name is provided, filters users by organization name (case-insensitive partial match)
     async fn list_users_with_organizations(
         &self,
         limit: i64,
         offset: i64,
+        search_by_name: Option<String>,
     ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64), AdminError>;
 
     /// List all models with pagination (admin only)

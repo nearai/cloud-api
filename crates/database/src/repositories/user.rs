@@ -258,7 +258,48 @@ impl UserRepository {
         &self,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<(User, Option<services::admin::UserOrganizationInfo>)>> {
+        search_by_name: Option<String>,
+    ) -> Result<(
+        Vec<(User, Option<services::admin::UserOrganizationInfo>)>,
+        i64,
+    )> {
+        // Escape LIKE wildcard characters in user input to prevent injection
+        let escaped_search = search_by_name.as_ref().map(|s| {
+            s.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        });
+
+        // Get total count of matching users (independent of pagination)
+        let total_count = retry_db!("count_users_with_organizations", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            let count_row = client
+                .query_one(
+                    r#"
+            SELECT COUNT(DISTINCT u.id) as total_count
+            FROM users u
+            LEFT JOIN organization_members om ON u.id = om.user_id AND om.role = 'owner'
+            LEFT JOIN organizations o ON om.organization_id = o.id AND o.is_active = true
+            WHERE u.is_active = true
+              AND ($1::TEXT IS NULL
+                   OR o.name ILIKE ('%' || $1 || '%') ESCAPE '\'
+                   OR o.id IS NULL)
+            "#,
+                    &[&escaped_search],
+                )
+                .await
+                .map_err(map_db_error)?;
+
+            Ok(count_row.get::<_, i64>("total_count"))
+        })?;
+
+        // Get paginated results with organization info
         let rows = retry_db!("list_all_users_with_organizations_with_pagination", {
             let client = self
                 .pool
@@ -292,17 +333,21 @@ impl UserRepository {
             ) olh ON true
             LEFT JOIN organization_balance ob ON o.id = ob.organization_id
             WHERE u.is_active = true
+              AND ($3::TEXT IS NULL 
+                   OR o.name ILIKE ('%' || $3 || '%') ESCAPE '\'
+                   OR o.id IS NULL)
             ORDER BY u.id, o.created_at ASC NULLS LAST
             LIMIT $1
             OFFSET $2
             "#,
-                    &[&limit, &offset],
+                    &[&limit, &offset, &escaped_search],
                 )
                 .await
                 .map_err(map_db_error)
         })?;
 
-        rows.into_iter()
+        let result = rows
+            .into_iter()
             .map(|row| {
                 let user = self.row_to_user(row.clone())?;
                 let org_id: Option<Uuid> = row.get("organization_id");
@@ -325,7 +370,9 @@ impl UserRepository {
 
                 Ok((user, org_data))
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok((result, total_count))
     }
 
     /// Search users by username or email

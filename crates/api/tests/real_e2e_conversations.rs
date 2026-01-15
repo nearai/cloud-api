@@ -124,24 +124,16 @@ async fn real_test_update_conversation_metadata() {
     )
     .await;
 
-    let update_response = server
-        .post(format!("/v1/conversations/{}", conversation.id).as_str())
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "metadata": {
-                "title": "Updated Title",
-                "context": "full replacement test"
-            }
-        }))
-        .await;
-
-    assert_eq!(
-        update_response.status_code(),
-        200,
-        "Update conversation metadata should return 200"
-    );
-
-    let updated_conv = update_response.json::<api::models::ConversationObject>();
+    let updated_conv = endpoints::update_conversation_metadata(
+        &server,
+        conversation.id.clone(),
+        api_key.clone(),
+        serde_json::json!({
+            "title": "Updated Title",
+            "context": "full replacement test"
+        }),
+    )
+    .await;
     let metadata_obj = updated_conv
         .metadata
         .as_object()
@@ -185,27 +177,10 @@ async fn real_test_delete_conversation() {
     )
     .await;
 
-    let pre_delete = server
-        .get(format!("/v1/conversations/{}", conversation.id).as_str())
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
+    let _pre_delete =
+        endpoints::get_conversation(&server, conversation.id.clone(), api_key.clone()).await;
 
-    assert_eq!(
-        pre_delete.status_code(),
-        200,
-        "Conversation should exist before delete"
-    );
-
-    let delete_response = server
-        .delete(format!("/v1/conversations/{}", conversation.id).as_str())
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(
-        delete_response.status_code(),
-        200,
-        "Delete conversation should succeed"
-    );
+    endpoints::delete_conversation(&server, conversation.id.clone(), api_key.clone()).await;
 
     let get_after_delete = server
         .get(format!("/v1/conversations/{}", conversation.id).as_str())

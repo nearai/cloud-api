@@ -1,7 +1,7 @@
 //! Common HTTP-level helpers for API E2E tests.
 
 use api::models::{ConversationItemList, ConversationObject, ResponseObject};
-use api::routes::attestation::SignatureResponse;
+use api::routes::attestation::{AttestationResponse, SignatureResponse};
 use inference_providers::StreamChunk;
 
 /// POST `/v1/chat/completions` and return the raw response body text.
@@ -237,6 +237,53 @@ pub async fn list_conversation_items(
     response.json::<ConversationItemList>()
 }
 
+/// Update conversation metadata by POST to `/v1/conversations/{id}`.
+///
+/// This replaces the entire metadata object with the provided one.
+pub async fn update_conversation_metadata(
+    server: &axum_test::TestServer,
+    conversation_id: String,
+    api_key: String,
+    metadata: serde_json::Value,
+) -> ConversationObject {
+    let response = server
+        .post(format!("/v1/conversations/{conversation_id}").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "metadata": metadata
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Update conversation metadata should return 200, got {} body={}",
+        response.status_code(),
+        response.text()
+    );
+    response.json::<ConversationObject>()
+}
+
+/// Delete a conversation by DELETE to `/v1/conversations/{id}`.
+pub async fn delete_conversation(
+    server: &axum_test::TestServer,
+    conversation_id: String,
+    api_key: String,
+) {
+    let response = server
+        .delete(format!("/v1/conversations/{conversation_id}").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Delete conversation should return 200, got {} body={}",
+        response.status_code(),
+        response.text()
+    );
+}
+
 pub async fn create_response(
     server: &axum_test::TestServer,
     conversation_id: String,
@@ -449,4 +496,35 @@ pub async fn get_signature_for_id(
     );
 
     response.json::<SignatureResponse>()
+}
+
+/// GET `/v1/attestation/report` for a given model and signing algorithm.
+///
+/// This helper is used by real_e2e signature tests. It ensures that the `model`
+/// query parameter is URL-encoded before sending the request.
+pub async fn get_attestation_report(
+    server: &axum_test::TestServer,
+    api_key: &str,
+    model_name: &str,
+    signing_algo: &str,
+) -> AttestationResponse {
+    let encoded_model =
+        url::form_urlencoded::byte_serialize(model_name.as_bytes()).collect::<String>();
+    let attestation_url =
+        format!("/v1/attestation/report?model={encoded_model}&signing_algo={signing_algo}");
+
+    let response = server
+        .get(&attestation_url)
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Attestation report should return successfully, got {} body={}",
+        response.status_code(),
+        response.text()
+    );
+
+    response.json::<AttestationResponse>()
 }

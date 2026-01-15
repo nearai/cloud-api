@@ -1,6 +1,5 @@
 mod common;
 
-use api::routes::attestation::AttestationResponse;
 use common::*;
 use endpoints::*;
 
@@ -34,20 +33,7 @@ async fn real_test_signature_signing_address_matches_model_attestation_stream() 
         "Signing address should not be empty"
     );
 
-    let encoded_model =
-        url::form_urlencoded::byte_serialize(model_name.as_bytes()).collect::<String>();
-    let attestation_response = server
-        .get(format!("/v1/attestation/report?model={encoded_model}&signing_algo=ecdsa").as_str())
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(
-        attestation_response.status_code(),
-        200,
-        "Attestation report should return successfully"
-    );
-
-    let attestation = attestation_response.json::<AttestationResponse>();
+    let attestation = get_attestation_report(&server, &api_key, &model_name, "ecdsa").await;
     let attestation_addresses: Vec<String> = attestation
         .model_attestations
         .iter()
@@ -108,20 +94,7 @@ async fn real_test_signature_signing_address_matches_model_attestation_non_strea
         "Signing address should not be empty"
     );
 
-    let encoded_model =
-        url::form_urlencoded::byte_serialize(model_name.as_bytes()).collect::<String>();
-    let attestation_response = server
-        .get(format!("/v1/attestation/report?model={encoded_model}&signing_algo=ecdsa").as_str())
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(
-        attestation_response.status_code(),
-        200,
-        "Attestation report should return successfully"
-    );
-
-    let attestation = attestation_response.json::<AttestationResponse>();
+    let attestation = get_attestation_report(&server, &api_key, &model_name, "ecdsa").await;
     let attestation_addresses: Vec<String> = attestation
         .model_attestations
         .iter()

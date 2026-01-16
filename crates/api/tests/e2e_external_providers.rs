@@ -255,7 +255,7 @@ async fn test_external_model_appears_in_models_list() {
     );
 
     let model = external_model.unwrap();
-    assert_eq!(model.owned_by, "openai"); // Derived from model name prefix
+    assert_eq!(model.owned_by, "nearai"); // Default owned_by for models created via admin API
 
     // Verify pricing is set
     let pricing = model.pricing.as_ref().expect("Should have pricing");
@@ -616,10 +616,12 @@ async fn test_external_model_completion_tracks_usage() {
     // Wait for async usage recording
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
-    // Check organization usage was updated
+    // Check organization usage was updated (requires session auth, not API key auth)
+    let session_id = get_session_id();
     let usage_response = server
-        .get("/v1/usage")
-        .add_header("Authorization", format!("Bearer {api_key}"))
+        .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {session_id}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
 
     assert_eq!(usage_response.status_code(), 200);
@@ -627,7 +629,7 @@ async fn test_external_model_completion_tracks_usage() {
     let usage: serde_json::Value = usage_response.json();
 
     // Verify usage was tracked
-    let total_tokens = usage["totalTokens"].as_i64().unwrap_or(0);
+    let total_tokens = usage["total_tokens"].as_i64().unwrap_or(0);
     assert!(
         total_tokens > 0,
         "Should have recorded token usage after completions"
@@ -954,11 +956,11 @@ async fn test_external_model_history_records_provider_config() {
         .await;
 
     assert_eq!(response.status_code(), 200);
-    let history: Vec<api::models::ModelHistoryEntry> = response.json();
+    let history_response: api::models::ModelHistoryResponse = response.json();
 
     // Should have at least 2 entries (creation + update)
     assert!(
-        history.len() >= 2,
+        history_response.history.len() >= 2,
         "Should have history entries for creation and update"
     );
 }

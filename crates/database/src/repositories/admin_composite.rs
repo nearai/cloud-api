@@ -85,6 +85,9 @@ impl AdminRepository for AdminCompositeRepository {
             is_active: model.is_active,
             aliases: model.aliases,
             owned_by: model.owned_by,
+            provider_type: model.provider_type,
+            provider_config: model.provider_config,
+            attestation_supported: model.attestation_supported,
         })
     }
 
@@ -304,6 +307,9 @@ impl AdminRepository for AdminCompositeRepository {
                 aliases: m.aliases,
                 created_at: m.created_at,
                 updated_at: m.updated_at,
+                provider_type: m.provider_type,
+                provider_config: m.provider_config,
+                attestation_supported: m.attestation_supported,
             })
             .collect();
 

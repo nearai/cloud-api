@@ -1178,4 +1178,40 @@ mod tests {
             assert!(event.is_ok());
         }
     }
+
+    // ==================== Image Generation Not Supported Tests ====================
+
+    #[tokio::test]
+    async fn test_image_generation_returns_error() {
+        let backend = AnthropicBackend::new();
+        let config = BackendConfig {
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key: "test-key".to_string(),
+            timeout_seconds: 30,
+            extra: std::collections::HashMap::new(),
+        };
+
+        let params = crate::ImageGenerationParams {
+            model: "claude-3-opus".to_string(),
+            prompt: "A cat".to_string(),
+            n: None,
+            size: None,
+            response_format: None,
+            quality: None,
+            style: None,
+        };
+
+        let result = backend
+            .image_generation(&config, "claude-3-opus", params)
+            .await;
+
+        assert!(result.is_err());
+        match result {
+            Err(crate::ImageGenerationError::GenerationError(msg)) => {
+                assert!(msg.contains("not supported"));
+                assert!(msg.contains("anthropic"));
+            }
+            _ => panic!("Expected GenerationError"),
+        }
+    }
 }

@@ -7,7 +7,9 @@ use super::backend::{BackendConfig, ExternalBackend};
 use crate::{
     ChatChoice, ChatCompletionChunk, ChatCompletionParams, ChatCompletionResponse,
     ChatCompletionResponseChoice, ChatCompletionResponseWithBytes, ChatDelta, ChatResponseMessage,
-    CompletionError, MessageRole, SSEEvent, StreamChunk, StreamingResult, TokenUsage,
+    CompletionError, ImageData, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponse, ImageGenerationResponseWithBytes, MessageRole, SSEEvent, StreamChunk,
+    StreamingResult, TokenUsage,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -214,6 +216,71 @@ struct GeminiResponse {
     #[serde(default)]
     usage_metadata: GeminiUsageMetadata,
     model_version: Option<String>,
+}
+
+// ==================== Gemini Image Generation (Imagen) Structures ====================
+
+/// Gemini/Imagen image generation request
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiImageGenerationRequest {
+    prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    number_of_images: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aspect_ratio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    safety_filter_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    person_generation: Option<String>,
+}
+
+/// Gemini/Imagen image generation response
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiImageGenerationResponse {
+    #[serde(default)]
+    generated_images: Vec<GeminiGeneratedImage>,
+}
+
+/// Generated image from Imagen
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiGeneratedImage {
+    image: GeminiImageData,
+}
+
+/// Image data from Imagen
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiImageData {
+    /// Base64-encoded image bytes
+    image_bytes: String,
+}
+
+/// Convert size string (e.g., "1024x1024") to Gemini aspect ratio
+fn size_to_aspect_ratio(size: Option<&String>) -> Option<String> {
+    size.and_then(|s| {
+        let parts: Vec<&str> = s.split('x').collect();
+        if parts.len() == 2 {
+            if let (Ok(w), Ok(h)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                // Calculate closest aspect ratio
+                let ratio = w as f32 / h as f32;
+                if (ratio - 1.0).abs() < 0.1 {
+                    return Some("1:1".to_string());
+                } else if (ratio - 16.0 / 9.0).abs() < 0.1 {
+                    return Some("16:9".to_string());
+                } else if (ratio - 9.0 / 16.0).abs() < 0.1 {
+                    return Some("9:16".to_string());
+                } else if (ratio - 4.0 / 3.0).abs() < 0.1 {
+                    return Some("4:3".to_string());
+                } else if (ratio - 3.0 / 4.0).abs() < 0.1 {
+                    return Some("3:4".to_string());
+                }
+            }
+        }
+        None
+    })
 }
 
 /// SSE parser for Gemini's streaming format
@@ -624,6 +691,100 @@ impl ExternalBackend for GeminiBackend {
         })?;
 
         Ok(ChatCompletionResponseWithBytes {
+            response: openai_response,
+            raw_bytes: serialized_bytes,
+        })
+    }
+
+    async fn image_generation(
+        &self,
+        config: &BackendConfig,
+        model: &str,
+        params: ImageGenerationParams,
+    ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
+        // Gemini uses the generateImage endpoint for Imagen models
+        // URL format: {base_url}/models/{model}:generateImages
+        let url = format!("{}/models/{}:generateImages", config.base_url, model);
+
+        // Convert OpenAI-style params to Gemini format
+        let gemini_request = GeminiImageGenerationRequest {
+            prompt: params.prompt,
+            number_of_images: params.n,
+            aspect_ratio: size_to_aspect_ratio(params.size.as_ref()),
+            safety_filter_level: None,
+            person_generation: None,
+        };
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "Content-Type",
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            "x-goog-api-key",
+            reqwest::header::HeaderValue::from_str(&config.api_key).map_err(|e| {
+                ImageGenerationError::GenerationError(format!("Invalid API key: {e}"))
+            })?,
+        );
+
+        let timeout = std::time::Duration::from_secs(config.timeout_seconds as u64);
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .timeout(timeout)
+            .json(&gemini_request)
+            .send()
+            .await
+            .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(ImageGenerationError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        // Get raw bytes first
+        let raw_bytes = response
+            .bytes()
+            .await
+            .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?
+            .to_vec();
+
+        // Parse Gemini response
+        let gemini_response: GeminiImageGenerationResponse = serde_json::from_slice(&raw_bytes)
+            .map_err(|e| {
+                ImageGenerationError::GenerationError(format!("Failed to parse response: {e}"))
+            })?;
+
+        // Convert to OpenAI-compatible format
+        let openai_response = ImageGenerationResponse {
+            id: format!("gemini-img-{}", Uuid::new_v4()),
+            created: chrono::Utc::now().timestamp(),
+            data: gemini_response
+                .generated_images
+                .into_iter()
+                .map(|img| ImageData {
+                    b64_json: Some(img.image.image_bytes),
+                    url: None,
+                    revised_prompt: None,
+                })
+                .collect(),
+        };
+
+        // Re-serialize for consistent raw bytes
+        let serialized_bytes = serde_json::to_vec(&openai_response).map_err(|e| {
+            ImageGenerationError::GenerationError(format!("Failed to serialize response: {e}"))
+        })?;
+
+        Ok(ImageGenerationResponseWithBytes {
             response: openai_response,
             raw_bytes: serialized_bytes,
         })
@@ -1243,5 +1404,113 @@ mod tests {
             first_id.starts_with("gemini-"),
             "ID should start with 'gemini-'"
         );
+    }
+
+    // ==================== Image Generation Tests ====================
+
+    #[test]
+    fn test_image_generation_url() {
+        let base_url = "https://generativelanguage.googleapis.com/v1beta";
+        let model = "imagen-3.0-generate-001";
+        let url = format!("{}/models/{}:generateImages", base_url, model);
+
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-001:generateImages"
+        );
+    }
+
+    #[test]
+    fn test_size_to_aspect_ratio_square() {
+        assert_eq!(
+            size_to_aspect_ratio(Some(&"1024x1024".to_string())),
+            Some("1:1".to_string())
+        );
+        assert_eq!(
+            size_to_aspect_ratio(Some(&"512x512".to_string())),
+            Some("1:1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_size_to_aspect_ratio_wide() {
+        assert_eq!(
+            size_to_aspect_ratio(Some(&"1920x1080".to_string())),
+            Some("16:9".to_string())
+        );
+    }
+
+    #[test]
+    fn test_size_to_aspect_ratio_tall() {
+        assert_eq!(
+            size_to_aspect_ratio(Some(&"1080x1920".to_string())),
+            Some("9:16".to_string())
+        );
+    }
+
+    #[test]
+    fn test_size_to_aspect_ratio_none() {
+        assert_eq!(size_to_aspect_ratio(None), None);
+    }
+
+    #[test]
+    fn test_size_to_aspect_ratio_invalid() {
+        assert_eq!(size_to_aspect_ratio(Some(&"invalid".to_string())), None);
+        assert_eq!(size_to_aspect_ratio(Some(&"abc".to_string())), None);
+    }
+
+    #[test]
+    fn test_size_to_aspect_ratio_unusual_size() {
+        // Sizes that don't match any standard aspect ratio
+        // Using a ratio far from any standard (e.g., 2:1 = 2.0)
+        assert_eq!(size_to_aspect_ratio(Some(&"2000x1000".to_string())), None);
+    }
+
+    #[test]
+    fn test_gemini_image_generation_request_serialization() {
+        let request = GeminiImageGenerationRequest {
+            prompt: "A cat wearing a hat".to_string(),
+            number_of_images: Some(2),
+            aspect_ratio: Some("1:1".to_string()),
+            safety_filter_level: None,
+            person_generation: None,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"prompt\":\"A cat wearing a hat\""));
+        assert!(json.contains("\"numberOfImages\":2"));
+        assert!(json.contains("\"aspectRatio\":\"1:1\""));
+        // These should not be serialized when None
+        assert!(!json.contains("safetyFilterLevel"));
+        assert!(!json.contains("personGeneration"));
+    }
+
+    #[test]
+    fn test_gemini_image_generation_response_deserialization() {
+        let json = r#"{
+            "generatedImages": [
+                {"image": {"imageBytes": "base64encodedimage1"}},
+                {"image": {"imageBytes": "base64encodedimage2"}}
+            ]
+        }"#;
+
+        let response: GeminiImageGenerationResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.generated_images.len(), 2);
+        assert_eq!(
+            response.generated_images[0].image.image_bytes,
+            "base64encodedimage1"
+        );
+        assert_eq!(
+            response.generated_images[1].image.image_bytes,
+            "base64encodedimage2"
+        );
+    }
+
+    #[test]
+    fn test_gemini_image_generation_response_empty() {
+        let json = r#"{"generatedImages": []}"#;
+
+        let response: GeminiImageGenerationResponse = serde_json::from_str(json).unwrap();
+        assert!(response.generated_images.is_empty());
     }
 }

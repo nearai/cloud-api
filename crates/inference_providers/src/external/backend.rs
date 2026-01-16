@@ -5,7 +5,8 @@
 //! and the provider's native format.
 
 use crate::{
-    ChatCompletionParams, ChatCompletionResponseWithBytes, CompletionError, StreamingResult,
+    ChatCompletionParams, ChatCompletionResponseWithBytes, CompletionError, ImageGenerationError,
+    ImageGenerationParams, ImageGenerationResponseWithBytes, StreamingResult,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -68,4 +69,24 @@ pub trait ExternalBackend: Send + Sync {
         model: &str,
         params: ChatCompletionParams,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError>;
+
+    /// Performs an image generation request
+    ///
+    /// The backend is responsible for:
+    /// - Translating ImageGenerationParams to provider-specific format
+    /// - Making the HTTP request
+    /// - Parsing the response and translating it back to our ImageGenerationResponse format
+    ///
+    /// Default implementation returns an error indicating image generation is not supported.
+    async fn image_generation(
+        &self,
+        _config: &BackendConfig,
+        _model: &str,
+        _params: ImageGenerationParams,
+    ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
+        Err(ImageGenerationError::GenerationError(format!(
+            "Image generation is not supported by the {} backend.",
+            self.backend_type()
+        )))
+    }
 }

@@ -30,7 +30,8 @@ pub mod openai_compatible;
 
 use crate::{
     AttestationError, ChatCompletionParams, ChatCompletionResponseWithBytes, ChatSignature,
-    CompletionError, CompletionParams, InferenceProvider, ListModelsError, ModelsResponse,
+    CompletionError, CompletionParams, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponseWithBytes, InferenceProvider, ListModelsError, ModelsResponse,
     StreamingResult,
 };
 use async_trait::async_trait;
@@ -255,15 +256,20 @@ impl InferenceProvider for ExternalProvider {
         ))
     }
 
-    /// Image generation - not supported for external providers
+    /// Image generation via external provider
+    ///
+    /// Delegates to the backend implementation. Supported by:
+    /// - OpenAI-compatible backends (DALL-E, etc.)
+    /// - Gemini backend (Imagen)
+    /// - Not supported by Anthropic (will return error)
     async fn image_generation(
         &self,
-        _params: crate::ImageGenerationParams,
+        params: ImageGenerationParams,
         _request_hash: String,
-    ) -> Result<crate::ImageGenerationResponseWithBytes, crate::ImageGenerationError> {
-        Err(crate::ImageGenerationError::GenerationError(
-            "Image generation is not supported for external providers.".to_string(),
-        ))
+    ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
+        self.backend
+            .image_generation(&self.config, &self.model_name, params)
+            .await
     }
 }
 

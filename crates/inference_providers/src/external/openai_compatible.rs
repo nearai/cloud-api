@@ -12,7 +12,8 @@
 use super::backend::{BackendConfig, ExternalBackend};
 use crate::{
     models::StreamOptions, sse_parser::SSEParser, ChatCompletionParams, ChatCompletionResponse,
-    ChatCompletionResponseWithBytes, CompletionError, StreamingResult,
+    ChatCompletionResponseWithBytes, CompletionError, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponse, ImageGenerationResponseWithBytes, StreamingResult,
 };
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
@@ -180,6 +181,65 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             raw_bytes,
         })
     }
+
+    async fn image_generation(
+        &self,
+        config: &BackendConfig,
+        model: &str,
+        params: ImageGenerationParams,
+    ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
+        let url = format!("{}/images/generations", config.base_url);
+
+        // Override model in params
+        let mut generation_params = params;
+        generation_params.model = model.to_string();
+
+        let headers = self
+            .build_headers(config)
+            .map_err(ImageGenerationError::GenerationError)?;
+
+        let timeout = std::time::Duration::from_secs(config.timeout_seconds as u64);
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .timeout(timeout)
+            .json(&generation_params)
+            .send()
+            .await
+            .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(ImageGenerationError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        // Get raw bytes first for exact hash verification
+        let raw_bytes = response
+            .bytes()
+            .await
+            .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?
+            .to_vec();
+
+        // Parse the response from the raw bytes
+        let image_response: ImageGenerationResponse =
+            serde_json::from_slice(&raw_bytes).map_err(|e| {
+                ImageGenerationError::GenerationError(format!("Failed to parse response: {e}"))
+            })?;
+
+        Ok(ImageGenerationResponseWithBytes {
+            response: image_response,
+            raw_bytes,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -327,5 +387,58 @@ mod tests {
         let json = serde_json::to_string(&options).unwrap();
         assert!(json.contains("\"include_usage\":true"));
         assert!(json.contains("\"continuous_usage_stats\":true"));
+    }
+
+    // ==================== Image Generation URL Tests ====================
+
+    #[test]
+    fn test_image_generation_url() {
+        let base_url = "https://api.openai.com/v1";
+        let url = format!("{}/images/generations", base_url);
+
+        assert_eq!(url, "https://api.openai.com/v1/images/generations");
+    }
+
+    #[test]
+    fn test_image_generation_url_different_providers() {
+        let providers = vec![
+            (
+                "https://api.openai.com/v1",
+                "https://api.openai.com/v1/images/generations",
+            ),
+            (
+                "https://api.together.xyz/v1",
+                "https://api.together.xyz/v1/images/generations",
+            ),
+            (
+                "https://api.fireworks.ai/inference/v1",
+                "https://api.fireworks.ai/inference/v1/images/generations",
+            ),
+        ];
+
+        for (base_url, expected) in providers {
+            let url = format!("{}/images/generations", base_url);
+            assert_eq!(url, expected);
+        }
+    }
+
+    #[test]
+    fn test_image_generation_params_serialization() {
+        let params = ImageGenerationParams {
+            model: "dall-e-3".to_string(),
+            prompt: "A beautiful sunset".to_string(),
+            n: Some(1),
+            size: Some("1024x1024".to_string()),
+            response_format: Some("b64_json".to_string()),
+            quality: Some("hd".to_string()),
+            style: Some("vivid".to_string()),
+        };
+
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.contains("\"model\":\"dall-e-3\""));
+        assert!(json.contains("\"prompt\":\"A beautiful sunset\""));
+        assert!(json.contains("\"n\":1"));
+        assert!(json.contains("\"size\":\"1024x1024\""));
+        assert!(json.contains("\"quality\":\"hd\""));
     }
 }

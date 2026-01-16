@@ -1404,11 +1404,9 @@ mod tests {
 
         // Extract IDs from all chunks
         let mut ids: Vec<String> = Vec::new();
-        for event in events {
-            if let Ok(sse_event) = event {
-                if let StreamChunk::Chat(chat_chunk) = sse_event.chunk {
-                    ids.push(chat_chunk.id.clone());
-                }
+        for sse_event in events.into_iter().flatten() {
+            if let StreamChunk::Chat(chat_chunk) = sse_event.chunk {
+                ids.push(chat_chunk.id.clone());
             }
         }
 

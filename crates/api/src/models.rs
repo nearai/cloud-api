@@ -397,14 +397,22 @@ impl ChatCompletionRequest {
             return Err("messages cannot be empty".to_string());
         }
 
-        for message in &self.messages {
+        for (idx, message) in self.messages.iter().enumerate() {
             if message.role.is_empty() {
                 return Err("message role is required".to_string());
             }
             if !["system", "user", "assistant", "tool"].contains(&message.role.as_str()) {
                 return Err(format!("invalid message role: {}", message.role));
             }
-            // Multimodal content (text, image, audio, file) is now supported via passthrough
+            // Validate message content can be serialized (catches malformed multimodal content)
+            if let Some(ref content) = message.content {
+                if serde_json::to_value(content).is_err() {
+                    return Err(format!(
+                        "message at index {} has invalid content that cannot be processed",
+                        idx
+                    ));
+                }
+            }
         }
 
         if let Some(temp) = self.temperature {

@@ -8,10 +8,14 @@ impl From<crate::models::Message> for ChatMessage {
     fn from(msg: crate::models::Message) -> Self {
         let content = msg.content.map(|c| {
             let converted = convert_content_to_vllm(c);
-            serde_json::to_value(&converted).unwrap_or_else(|_| {
-                // Log without error details for privacy (avoid any potential content leakage)
-                tracing::error!("Failed to serialize message content");
-                serde_json::Value::Object(serde_json::Map::new())
+            // Content should be validated before conversion via ChatCompletionRequest::validate()
+            // This fallback is defensive - if reached, it indicates a validation gap
+            serde_json::to_value(&converted).unwrap_or_else(|e| {
+                tracing::error!(
+                    error_type = %e,
+                    "Failed to serialize message content - this should have been caught by validation"
+                );
+                serde_json::Value::Null
             })
         });
 

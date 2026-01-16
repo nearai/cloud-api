@@ -408,12 +408,8 @@ pub async fn completions(
         api_key.api_key.id
     );
     debug!(
-        "Request model: {}, stream: {:?}, prompt length: {} chars, org: {}, workspace: {}",
-        request.model,
-        request.stream,
-        request.prompt.len(),
-        api_key.organization.id,
-        api_key.workspace.id.0
+        "Request model: {}, stream: {:?}, org: {}, workspace: {}",
+        request.model, request.stream, api_key.organization.id, api_key.workspace.id.0
     );
 
     return (
@@ -645,11 +641,8 @@ pub async fn image_generations(
         api_key.api_key.id
     );
     debug!(
-        "Request model: {}, prompt length: {}, org: {}, workspace: {}",
-        request.model,
-        request.prompt.len(),
-        api_key.organization.id,
-        api_key.workspace.id.0
+        "Image generation request: model={}, org={}, workspace={}",
+        request.model, api_key.organization.id, api_key.workspace.id.0
     );
 
     // Validate the request

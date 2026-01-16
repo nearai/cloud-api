@@ -158,9 +158,7 @@ where
                     continue;
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Some(Err(CompletionError::CompletionError(
-                        e.to_string(),
-                    ))));
+                    return Poll::Ready(Some(Err(CompletionError::CompletionError(e.to_string()))));
                 }
                 Poll::Ready(None) => {
                     // Stream ended - process any remaining buffer content

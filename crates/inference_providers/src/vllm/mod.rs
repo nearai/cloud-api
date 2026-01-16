@@ -1,4 +1,4 @@
-use crate::{models::StreamOptions, sse_parser::SSEParser, ImageGenerationError, *};
+use crate::{models::StreamOptions, sse_parser::new_sse_parser, ImageGenerationError, *};
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
@@ -291,7 +291,7 @@ impl InferenceProvider for VLlmProvider {
         }
 
         // Use the SSE parser to handle the stream properly
-        let sse_stream = SSEParser::new(response.bytes_stream(), true);
+        let sse_stream = new_sse_parser(response.bytes_stream(), true);
         Ok(Box::pin(sse_stream))
     }
 
@@ -397,7 +397,7 @@ impl InferenceProvider for VLlmProvider {
         }
 
         // Use the SSE parser to handle the stream properly
-        let sse_stream = SSEParser::new(response.bytes_stream(), false);
+        let sse_stream = new_sse_parser(response.bytes_stream(), false);
         Ok(Box::pin(sse_stream))
     }
 

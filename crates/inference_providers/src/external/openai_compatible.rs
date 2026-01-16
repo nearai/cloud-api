@@ -11,9 +11,10 @@
 
 use super::backend::{BackendConfig, ExternalBackend};
 use crate::{
-    models::StreamOptions, sse_parser::SSEParser, ChatCompletionParams, ChatCompletionResponse,
-    ChatCompletionResponseWithBytes, CompletionError, ImageGenerationError, ImageGenerationParams,
-    ImageGenerationResponse, ImageGenerationResponseWithBytes, StreamingResult,
+    models::StreamOptions, sse_parser::new_sse_parser, ChatCompletionParams,
+    ChatCompletionResponse, ChatCompletionResponseWithBytes, CompletionError, ImageGenerationError,
+    ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes,
+    StreamingResult,
 };
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
@@ -117,7 +118,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         }
 
         // Use the SSE parser to handle the stream
-        let sse_stream = SSEParser::new(response.bytes_stream(), true);
+        let sse_stream = new_sse_parser(response.bytes_stream(), true);
         Ok(Box::pin(sse_stream))
     }
 

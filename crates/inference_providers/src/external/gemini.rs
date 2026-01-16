@@ -5,19 +5,17 @@
 
 use super::backend::{BackendConfig, ExternalBackend};
 use crate::{
-    ChatChoice, ChatCompletionChunk, ChatCompletionParams, ChatCompletionResponse,
-    ChatCompletionResponseChoice, ChatCompletionResponseWithBytes, ChatDelta, ChatResponseMessage,
-    CompletionError, ImageData, ImageGenerationError, ImageGenerationParams,
-    ImageGenerationResponse, ImageGenerationResponseWithBytes, MessageRole, SSEEvent, StreamChunk,
-    StreamingResult, TokenUsage,
+    BufferedSSEParser, ChatChoice, ChatCompletionChunk, ChatCompletionParams,
+    ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseWithBytes,
+    ChatDelta, ChatResponseMessage, CompletionError, ImageData, ImageGenerationError,
+    ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes, MessageRole,
+    SSEEventParser, StreamChunk, StreamingResult, TokenUsage,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::Stream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use uuid::Uuid;
 
 /// Gemini backend
@@ -299,33 +297,20 @@ fn size_to_aspect_ratio(size: Option<&String>) -> Option<String> {
     })
 }
 
-/// SSE parser for Gemini's streaming format
-struct GeminiSSEParser<S> {
-    inner: S,
-    buffer: String,
-    bytes_buffer: Vec<u8>,
-    /// Pending results from previous process_buffer() calls
-    /// Multiple SSE events can arrive in a single network packet
-    pending_results: std::collections::VecDeque<Result<SSEEvent, CompletionError>>,
-    model: String,
+/// State for Gemini SSE parsing
+pub struct GeminiParserState {
+    pub(crate) model: String,
     /// Unique request ID (UUID-based to ensure uniqueness across concurrent requests)
-    request_id: String,
-    created: i64,
-    chunk_index: i64,
-    accumulated_prompt_tokens: i32,
-    accumulated_completion_tokens: i32,
+    pub(crate) request_id: String,
+    pub(crate) created: i64,
+    pub(crate) chunk_index: i64,
+    pub(crate) accumulated_prompt_tokens: i32,
+    pub(crate) accumulated_completion_tokens: i32,
 }
 
-impl<S> GeminiSSEParser<S>
-where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
-{
-    fn new(stream: S, model: String) -> Self {
+impl GeminiParserState {
+    pub fn new(model: String) -> Self {
         Self {
-            inner: stream,
-            buffer: String::new(),
-            bytes_buffer: Vec::new(),
-            pending_results: std::collections::VecDeque::new(),
             model,
             request_id: format!("gemini-{}", Uuid::new_v4()),
             created: chrono::Utc::now().timestamp(),
@@ -334,8 +319,20 @@ where
             accumulated_completion_tokens: 0,
         }
     }
+}
 
-    fn parse_response(&mut self, data: &str) -> Result<Option<StreamChunk>, CompletionError> {
+/// Gemini event parser
+///
+/// Handles Gemini's SSE/JSON streaming format and converts to OpenAI-compatible chunks.
+pub struct GeminiEventParser;
+
+impl SSEEventParser for GeminiEventParser {
+    type State = GeminiParserState;
+
+    fn parse_event(
+        state: &mut Self::State,
+        data: &str,
+    ) -> Result<Option<StreamChunk>, CompletionError> {
         let response: GeminiResponse = serde_json::from_str(data).map_err(|e| {
             CompletionError::InvalidResponse(format!("Failed to parse Gemini response: {e}"))
         })?;
@@ -354,19 +351,19 @@ where
             .join("");
 
         // Update token counts
-        self.accumulated_prompt_tokens = response.usage_metadata.prompt_token_count;
-        self.accumulated_completion_tokens = response.usage_metadata.candidates_token_count;
+        state.accumulated_prompt_tokens = response.usage_metadata.prompt_token_count;
+        state.accumulated_completion_tokens = response.usage_metadata.candidates_token_count;
 
         let finish_reason = map_finish_reason(candidate.finish_reason.as_ref());
 
-        let is_first = self.chunk_index == 0;
-        self.chunk_index += 1;
+        let is_first = state.chunk_index == 0;
+        state.chunk_index += 1;
 
         let chunk = ChatCompletionChunk {
-            id: self.request_id.clone(),
+            id: state.request_id.clone(),
             object: "chat.completion.chunk".to_string(),
-            created: self.created,
-            model: self.model.clone(),
+            created: state.created,
+            model: state.model.clone(),
             system_fingerprint: None,
             modality: None,
             choices: vec![ChatChoice {
@@ -389,9 +386,9 @@ where
                 token_ids: None,
             }],
             usage: Some(TokenUsage {
-                prompt_tokens: self.accumulated_prompt_tokens,
-                completion_tokens: self.accumulated_completion_tokens,
-                total_tokens: self.accumulated_prompt_tokens + self.accumulated_completion_tokens,
+                prompt_tokens: state.accumulated_prompt_tokens,
+                completion_tokens: state.accumulated_completion_tokens,
+                total_tokens: state.accumulated_prompt_tokens + state.accumulated_completion_tokens,
                 prompt_tokens_details: None,
             }),
             prompt_token_ids: None,
@@ -400,90 +397,23 @@ where
         Ok(Some(StreamChunk::Chat(chunk)))
     }
 
-    fn process_buffer(&mut self) -> Vec<Result<SSEEvent, CompletionError>> {
-        let mut results = Vec::new();
-
-        // Gemini streaming returns JSON lines, not SSE format
-        while let Some(newline_pos) = self.buffer.find('\n') {
-            let line_len = newline_pos + 1;
-            let raw_bytes = Bytes::copy_from_slice(&self.bytes_buffer[..line_len]);
-            self.bytes_buffer.drain(..line_len);
-
-            let line = self.buffer.drain(..=newline_pos).collect::<String>();
-            let line = line.trim();
-
-            if line.is_empty() {
-                continue;
-            }
-
-            // Handle SSE format (data: prefix) or raw JSON
-            let data = if let Some(d) = line.strip_prefix("data: ") {
-                d
-            } else {
-                line
-            };
-
-            match self.parse_response(data) {
-                Ok(Some(chunk)) => {
-                    results.push(Ok(SSEEvent { raw_bytes, chunk }));
-                }
-                Ok(None) => {}
-                Err(e) => results.push(Err(e)),
-            }
-        }
-
-        results
+    /// Gemini can return raw JSON lines (not just SSE format)
+    fn handles_raw_json() -> bool {
+        true
     }
 }
 
-impl<S> Stream for GeminiSSEParser<S>
+/// SSE parser for Gemini's streaming format
+///
+/// Type alias using the generic BufferedSSEParser with Gemini-specific event parsing.
+pub type GeminiSSEParser<S> = BufferedSSEParser<S, GeminiEventParser>;
+
+/// Create a new Gemini SSE parser
+pub fn new_gemini_sse_parser<S>(stream: S, model: String) -> GeminiSSEParser<S>
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
 {
-    type Item = Result<SSEEvent, CompletionError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // First, return any pending results from previous process_buffer() calls
-        if let Some(result) = self.pending_results.pop_front() {
-            return Poll::Ready(Some(result));
-        }
-
-        // Try to get more results from the current buffer
-        let buffered_results = self.process_buffer();
-        if !buffered_results.is_empty() {
-            // Store all results in pending queue
-            self.pending_results.extend(buffered_results);
-            if let Some(result) = self.pending_results.pop_front() {
-                return Poll::Ready(Some(result));
-            }
-        }
-
-        // Poll for more data from the underlying stream
-        match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(bytes))) => {
-                self.bytes_buffer.extend_from_slice(&bytes);
-                let text = String::from_utf8_lossy(&bytes);
-                self.buffer.push_str(&text);
-
-                let results = self.process_buffer();
-                if !results.is_empty() {
-                    // Store all results in pending queue
-                    self.pending_results.extend(results);
-                    if let Some(result) = self.pending_results.pop_front() {
-                        return Poll::Ready(Some(result));
-                    }
-                }
-                // No complete events yet, wake and try again
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Poll::Ready(Some(Err(e))) => {
-                Poll::Ready(Some(Err(CompletionError::CompletionError(e.to_string()))))
-            }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
+    BufferedSSEParser::new(stream, GeminiParserState::new(model))
 }
 
 #[async_trait]
@@ -569,7 +499,7 @@ impl ExternalBackend for GeminiBackend {
             });
         }
 
-        let sse_stream = GeminiSSEParser::new(response.bytes_stream(), model.to_string());
+        let sse_stream = new_gemini_sse_parser(response.bytes_stream(), model.to_string());
         Ok(Box::pin(sse_stream))
     }
 
@@ -1304,7 +1234,7 @@ mod tests {
         let bytes = bytes::Bytes::from(multi_event_packet);
         let mock_stream = futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes)]);
 
-        let parser = GeminiSSEParser::new(mock_stream, "gemini-1.5-pro".to_string());
+        let parser = new_gemini_sse_parser(mock_stream, "gemini-1.5-pro".to_string());
         let events: Vec<_> = parser.collect().await;
 
         // Should have received all 3 events
@@ -1329,7 +1259,7 @@ mod tests {
             Ok(bytes::Bytes::from(packet2)),
         ]);
 
-        let parser = GeminiSSEParser::new(mock_stream, "gemini-1.5-pro".to_string());
+        let parser = new_gemini_sse_parser(mock_stream, "gemini-1.5-pro".to_string());
         let events: Vec<_> = parser.collect().await;
 
         assert_eq!(events.len(), 2, "Expected 2 events, got {}", events.len());
@@ -1343,6 +1273,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gemini_ids_are_unique_across_concurrent_requests() {
+        use futures_util::StreamExt;
         use std::collections::HashSet;
 
         // Create multiple parsers simultaneously (simulating concurrent requests)
@@ -1350,13 +1281,31 @@ mod tests {
         let mut ids = HashSet::new();
         let num_requests = 100;
 
-        for _ in 0..num_requests {
-            let mock_stream =
-                futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::new())]);
-            let parser = GeminiSSEParser::new(mock_stream, "gemini-1.5-pro".to_string());
+        let sample_response = r#"{"candidates":[{"content":{"parts":[{"text":"Hi"}],"role":"model"},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":1,"totalTokenCount":11}}"#;
 
-            // Access the request_id field
-            let request_id = parser.request_id.clone();
+        for _ in 0..num_requests {
+            let packet = format!("data: {}\n\n", sample_response);
+            let mock_stream = futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(
+                bytes::Bytes::from(packet),
+            )]);
+            let parser = new_gemini_sse_parser(mock_stream, "gemini-1.5-pro".to_string());
+
+            // Get the first event to extract the request ID
+            let events: Vec<_> = parser.collect().await;
+            assert!(!events.is_empty(), "Should get at least one event");
+
+            let request_id = events
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    if let StreamChunk::Chat(chunk) = e.chunk {
+                        Some(chunk.id)
+                    } else {
+                        None
+                    }
+                })
+                .next()
+                .expect("Should have a chunk with ID");
 
             // Verify ID has correct format (gemini-<uuid>)
             assert!(
@@ -1399,7 +1348,7 @@ mod tests {
         let bytes = bytes::Bytes::from(multi_event_packet);
         let mock_stream = futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes)]);
 
-        let parser = GeminiSSEParser::new(mock_stream, "gemini-1.5-pro".to_string());
+        let parser = new_gemini_sse_parser(mock_stream, "gemini-1.5-pro".to_string());
         let events: Vec<_> = parser.collect().await;
 
         // Extract IDs from all chunks

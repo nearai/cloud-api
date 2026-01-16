@@ -76,7 +76,7 @@ pub use models::{
     ImageGenerationResponseWithBytes, MessageRole, ModelInfo, StreamChunk, StreamOptions,
     TokenUsage, ToolChoice, ToolDefinition,
 };
-pub use sse_parser::SSEEvent;
+pub use sse_parser::{new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser};
 pub use vllm::{VLlmConfig, VLlmProvider};
 
 // External provider exports

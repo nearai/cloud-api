@@ -16,6 +16,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use uuid::Uuid;
 
 /// Gemini backend
 ///
@@ -204,6 +205,8 @@ struct GeminiSSEParser<S> {
     /// Multiple SSE events can arrive in a single network packet
     pending_results: std::collections::VecDeque<Result<SSEEvent, CompletionError>>,
     model: String,
+    /// Unique request ID (UUID-based to ensure uniqueness across concurrent requests)
+    request_id: String,
     created: i64,
     chunk_index: i64,
     accumulated_prompt_tokens: i32,
@@ -221,6 +224,7 @@ where
             bytes_buffer: Vec::new(),
             pending_results: std::collections::VecDeque::new(),
             model,
+            request_id: format!("gemini-{}", Uuid::new_v4()),
             created: chrono::Utc::now().timestamp(),
             chunk_index: 0,
             accumulated_prompt_tokens: 0,
@@ -256,7 +260,7 @@ where
         self.chunk_index += 1;
 
         let chunk = ChatCompletionChunk {
-            id: format!("gemini-{}", self.created),
+            id: self.request_id.clone(),
             object: "chat.completion.chunk".to_string(),
             created: self.created,
             model: self.model.clone(),
@@ -559,7 +563,7 @@ impl ExternalBackend for GeminiBackend {
             .join("");
 
         let openai_response = ChatCompletionResponse {
-            id: format!("gemini-{}", chrono::Utc::now().timestamp()),
+            id: format!("gemini-{}", Uuid::new_v4()),
             object: "chat.completion".to_string(),
             created: chrono::Utc::now().timestamp(),
             model: model.to_string(),
@@ -1121,5 +1125,97 @@ mod tests {
         for event in &events {
             assert!(event.is_ok());
         }
+    }
+
+    // ==================== ID Uniqueness Tests ====================
+
+    #[tokio::test]
+    async fn test_gemini_ids_are_unique_across_concurrent_requests() {
+        use std::collections::HashSet;
+
+        // Create multiple parsers simultaneously (simulating concurrent requests)
+        // All should have unique IDs even if created within the same second
+        let mut ids = HashSet::new();
+        let num_requests = 100;
+
+        for _ in 0..num_requests {
+            let mock_stream =
+                futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::new())]);
+            let parser = GeminiSSEParser::new(mock_stream, "gemini-1.5-pro".to_string());
+
+            // Access the request_id field
+            let request_id = parser.request_id.clone();
+
+            // Verify ID has correct format (gemini-<uuid>)
+            assert!(
+                request_id.starts_with("gemini-"),
+                "ID should start with 'gemini-'"
+            );
+            assert!(
+                request_id.len() > 7,
+                "ID should have UUID component after prefix"
+            );
+
+            // Check for uniqueness
+            let is_unique = ids.insert(request_id.clone());
+            assert!(
+                is_unique,
+                "ID should be unique, but got duplicate: {}",
+                request_id
+            );
+        }
+
+        assert_eq!(
+            ids.len(),
+            num_requests,
+            "All {} IDs should be unique",
+            num_requests
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gemini_streaming_response_has_consistent_id() {
+        use futures_util::StreamExt;
+
+        // Test that all chunks in a streaming response have the same ID
+        let multi_event_packet = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}],\"role\":\"model\"},\"finishReason\":null,\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":1,\"totalTokenCount\":11}}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" World\"}],\"role\":\"model\"},\"finishReason\":null,\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":2,\"totalTokenCount\":12}}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"!\"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":3,\"totalTokenCount\":13}}\n\n",
+        );
+
+        let bytes = bytes::Bytes::from(multi_event_packet);
+        let mock_stream = futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes)]);
+
+        let parser = GeminiSSEParser::new(mock_stream, "gemini-1.5-pro".to_string());
+        let events: Vec<_> = parser.collect().await;
+
+        // Extract IDs from all chunks
+        let mut ids: Vec<String> = Vec::new();
+        for event in events {
+            if let Ok(sse_event) = event {
+                if let StreamChunk::Chat(chat_chunk) = sse_event.chunk {
+                    ids.push(chat_chunk.id.clone());
+                }
+            }
+        }
+
+        assert!(!ids.is_empty(), "Should have collected chunk IDs");
+
+        // All IDs should be the same within a single request
+        let first_id = &ids[0];
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(
+                id, first_id,
+                "Chunk {} has different ID. Expected: {}, Got: {}",
+                i, first_id, id
+            );
+        }
+
+        // ID should have the correct format
+        assert!(
+            first_id.starts_with("gemini-"),
+            "ID should start with 'gemini-'"
+        );
     }
 }

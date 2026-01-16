@@ -378,17 +378,31 @@ async fn test_external_model_non_streaming_completion() {
 
     // Verify response has expected OpenAI-compatible structure
     assert!(body["id"].is_string(), "Response should have id");
-    assert_eq!(body["object"], "chat.completion", "Object should be chat.completion");
-    assert!(body["created"].is_number(), "Response should have created timestamp");
-    assert_eq!(body["model"], model_name, "Model should match requested model");
+    assert_eq!(
+        body["object"], "chat.completion",
+        "Object should be chat.completion"
+    );
+    assert!(
+        body["created"].is_number(),
+        "Response should have created timestamp"
+    );
+    assert_eq!(
+        body["model"], model_name,
+        "Model should match requested model"
+    );
 
     // Verify choices
-    let choices = body["choices"].as_array().expect("Should have choices array");
+    let choices = body["choices"]
+        .as_array()
+        .expect("Should have choices array");
     assert!(!choices.is_empty(), "Should have at least one choice");
 
     let choice = &choices[0];
     assert_eq!(choice["index"], 0, "First choice should have index 0");
-    assert!(choice["message"]["content"].is_string(), "Choice should have message content");
+    assert!(
+        choice["message"]["content"].is_string(),
+        "Choice should have message content"
+    );
     assert!(
         choice["finish_reason"].is_string() || choice["finish_reason"].is_null(),
         "Should have finish_reason"
@@ -396,10 +410,14 @@ async fn test_external_model_non_streaming_completion() {
 
     // Verify usage
     let usage = &body["usage"];
-    assert!(usage["input_tokens"].is_number() || usage["prompt_tokens"].is_number(),
-        "Should have input/prompt tokens");
-    assert!(usage["output_tokens"].is_number() || usage["completion_tokens"].is_number(),
-        "Should have output/completion tokens");
+    assert!(
+        usage["input_tokens"].is_number() || usage["prompt_tokens"].is_number(),
+        "Should have input/prompt tokens"
+    );
+    assert!(
+        usage["output_tokens"].is_number() || usage["completion_tokens"].is_number(),
+        "Should have output/completion tokens"
+    );
 }
 
 #[tokio::test]
@@ -433,7 +451,11 @@ async fn test_external_model_streaming_completion() {
         }))
         .await;
 
-    assert_eq!(response.status_code(), 200, "Streaming completion should succeed");
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Streaming completion should succeed"
+    );
 
     // Verify content-type is SSE
     let content_type = response
@@ -583,7 +605,12 @@ async fn test_external_model_completion_tracks_usage() {
             }))
             .await;
 
-        assert_eq!(response.status_code(), 200, "Completion {} should succeed", i);
+        assert_eq!(
+            response.status_code(),
+            200,
+            "Completion {} should succeed",
+            i
+        );
     }
 
     // Wait for async usage recording

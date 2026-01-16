@@ -5,17 +5,16 @@
 
 use super::backend::{BackendConfig, ExternalBackend};
 use crate::{
-    ChatChoice, ChatCompletionChunk, ChatCompletionParams, ChatCompletionResponse,
-    ChatCompletionResponseChoice, ChatCompletionResponseWithBytes, ChatDelta, ChatResponseMessage,
-    CompletionError, MessageRole, SSEEvent, StreamChunk, StreamingResult, TokenUsage,
+    BufferedSSEParser, ChatChoice, ChatCompletionChunk, ChatCompletionParams,
+    ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseWithBytes,
+    ChatDelta, ChatResponseMessage, CompletionError, MessageRole, SSEEventParser, StreamChunk,
+    StreamingResult, TokenUsage,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::Stream;
 use reqwest::{header::HeaderValue, Client};
 use serde::{Deserialize, Serialize};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
 /// Default Anthropic API version
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -265,31 +264,18 @@ struct AnthropicResponse {
     usage: AnthropicUsage,
 }
 
-/// SSE parser for Anthropic's streaming format
-struct AnthropicSSEParser<S> {
-    inner: S,
-    buffer: String,
-    bytes_buffer: Vec<u8>,
-    /// Pending results from previous process_buffer() calls
-    /// Multiple SSE events can arrive in a single network packet
-    pending_results: std::collections::VecDeque<Result<SSEEvent, CompletionError>>,
-    message_id: Option<String>,
-    model: String,
-    created: i64,
-    accumulated_input_tokens: i32,
-    accumulated_output_tokens: i32,
+/// State for Anthropic SSE parsing
+pub struct AnthropicParserState {
+    pub(crate) message_id: Option<String>,
+    pub(crate) model: String,
+    pub(crate) created: i64,
+    pub(crate) accumulated_input_tokens: i32,
+    pub(crate) accumulated_output_tokens: i32,
 }
 
-impl<S> AnthropicSSEParser<S>
-where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
-{
-    fn new(stream: S, model: String) -> Self {
+impl AnthropicParserState {
+    pub fn new(model: String) -> Self {
         Self {
-            inner: stream,
-            buffer: String::new(),
-            bytes_buffer: Vec::new(),
-            pending_results: std::collections::VecDeque::new(),
             message_id: None,
             model,
             created: chrono::Utc::now().timestamp(),
@@ -297,23 +283,35 @@ where
             accumulated_output_tokens: 0,
         }
     }
+}
 
-    fn parse_event(&mut self, data: &str) -> Result<Option<StreamChunk>, CompletionError> {
-        let event: AnthropicStreamEvent = serde_json::from_str(data).map_err(|e| {
-            CompletionError::InvalidResponse(format!("Failed to parse Anthropic event: {e}"))
-        })?;
+/// Anthropic event parser
+///
+/// Handles Anthropic's SSE streaming format and converts to OpenAI-compatible chunks.
+pub struct AnthropicEventParser;
+
+impl SSEEventParser for AnthropicEventParser {
+    type State = AnthropicParserState;
+
+    fn parse_event(
+        state: &mut Self::State,
+        data: &str,
+    ) -> Result<Option<StreamChunk>, CompletionError> {
+        // Don't include parse error details - may contain customer data
+        let event: AnthropicStreamEvent = serde_json::from_str(data)
+            .map_err(|_| CompletionError::InvalidResponse("Failed to parse event".to_string()))?;
 
         match event {
             AnthropicStreamEvent::MessageStart { message } => {
-                self.message_id = Some(message.id.clone());
-                self.accumulated_input_tokens = message.usage.input_tokens;
+                state.message_id = Some(message.id.clone());
+                state.accumulated_input_tokens = message.usage.input_tokens;
 
                 // Emit initial chunk with role
                 let chunk = ChatCompletionChunk {
                     id: message.id,
                     object: "chat.completion.chunk".to_string(),
-                    created: self.created,
-                    model: self.model.clone(),
+                    created: state.created,
+                    model: state.model.clone(),
                     system_fingerprint: None,
                     choices: vec![ChatChoice {
                         index: 0,
@@ -339,10 +337,10 @@ where
             AnthropicStreamEvent::ContentBlockDelta { delta, .. } => {
                 if let Some(text) = delta.text {
                     let chunk = ChatCompletionChunk {
-                        id: self.message_id.clone().unwrap_or_default(),
+                        id: state.message_id.clone().unwrap_or_default(),
                         object: "chat.completion.chunk".to_string(),
-                        created: self.created,
-                        model: self.model.clone(),
+                        created: state.created,
+                        model: state.model.clone(),
                         system_fingerprint: None,
                         choices: vec![ChatChoice {
                             index: 0,
@@ -369,15 +367,15 @@ where
                 }
             }
             AnthropicStreamEvent::MessageDelta { delta, usage } => {
-                self.accumulated_output_tokens = usage.output_tokens;
+                state.accumulated_output_tokens = usage.output_tokens;
 
                 let finish_reason = map_finish_reason(delta.stop_reason);
 
                 let chunk = ChatCompletionChunk {
-                    id: self.message_id.clone().unwrap_or_default(),
+                    id: state.message_id.clone().unwrap_or_default(),
                     object: "chat.completion.chunk".to_string(),
-                    created: self.created,
-                    model: self.model.clone(),
+                    created: state.created,
+                    model: state.model.clone(),
                     system_fingerprint: None,
                     choices: vec![ChatChoice {
                         index: 0,
@@ -395,10 +393,10 @@ where
                         token_ids: None,
                     }],
                     usage: Some(TokenUsage {
-                        prompt_tokens: self.accumulated_input_tokens,
-                        completion_tokens: self.accumulated_output_tokens,
-                        total_tokens: self.accumulated_input_tokens
-                            + self.accumulated_output_tokens,
+                        prompt_tokens: state.accumulated_input_tokens,
+                        completion_tokens: state.accumulated_output_tokens,
+                        total_tokens: state.accumulated_input_tokens
+                            + state.accumulated_output_tokens,
                         prompt_tokens_details: None,
                     }),
                     prompt_token_ids: None,
@@ -413,85 +411,19 @@ where
             _ => Ok(None),
         }
     }
-
-    fn process_buffer(&mut self) -> Vec<Result<SSEEvent, CompletionError>> {
-        let mut results = Vec::new();
-
-        while let Some(newline_pos) = self.buffer.find('\n') {
-            let line_len = newline_pos + 1;
-            let raw_bytes = Bytes::copy_from_slice(&self.bytes_buffer[..line_len]);
-            self.bytes_buffer.drain(..line_len);
-
-            let line = self.buffer.drain(..=newline_pos).collect::<String>();
-            let line = line.trim();
-
-            if line.is_empty() || line.starts_with(':') {
-                continue;
-            }
-
-            if let Some(data) = line.strip_prefix("data: ") {
-                match self.parse_event(data) {
-                    Ok(Some(chunk)) => {
-                        results.push(Ok(SSEEvent { raw_bytes, chunk }));
-                    }
-                    Ok(None) => {}
-                    Err(e) => results.push(Err(e)),
-                }
-            }
-        }
-
-        results
-    }
 }
 
-impl<S> Stream for AnthropicSSEParser<S>
+/// SSE parser for Anthropic's streaming format
+///
+/// Type alias using the generic BufferedSSEParser with Anthropic-specific event parsing.
+pub type AnthropicSSEParser<S> = BufferedSSEParser<S, AnthropicEventParser>;
+
+/// Create a new Anthropic SSE parser
+pub fn new_anthropic_sse_parser<S>(stream: S, model: String) -> AnthropicSSEParser<S>
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
 {
-    type Item = Result<SSEEvent, CompletionError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // First, return any pending results from previous process_buffer() calls
-        if let Some(result) = self.pending_results.pop_front() {
-            return Poll::Ready(Some(result));
-        }
-
-        // Try to get more results from the current buffer
-        let buffered_results = self.process_buffer();
-        if !buffered_results.is_empty() {
-            // Store all results in pending queue
-            self.pending_results.extend(buffered_results);
-            if let Some(result) = self.pending_results.pop_front() {
-                return Poll::Ready(Some(result));
-            }
-        }
-
-        // Poll for more data from the underlying stream
-        match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(bytes))) => {
-                self.bytes_buffer.extend_from_slice(&bytes);
-                let text = String::from_utf8_lossy(&bytes);
-                self.buffer.push_str(&text);
-
-                let results = self.process_buffer();
-                if !results.is_empty() {
-                    // Store all results in pending queue
-                    self.pending_results.extend(results);
-                    if let Some(result) = self.pending_results.pop_front() {
-                        return Poll::Ready(Some(result));
-                    }
-                }
-                // No complete events yet, wake and try again
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Poll::Ready(Some(Err(e))) => {
-                Poll::Ready(Some(Err(CompletionError::CompletionError(e.to_string()))))
-            }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
+    BufferedSSEParser::new(stream, AnthropicParserState::new(model))
 }
 
 #[async_trait]
@@ -555,7 +487,7 @@ impl ExternalBackend for AnthropicBackend {
             });
         }
 
-        let sse_stream = AnthropicSSEParser::new(response.bytes_stream(), model.to_string());
+        let sse_stream = new_anthropic_sse_parser(response.bytes_stream(), model.to_string());
         Ok(Box::pin(sse_stream))
     }
 
@@ -1138,7 +1070,7 @@ mod tests {
         let bytes = bytes::Bytes::from(multi_event_packet);
         let mock_stream = futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes)]);
 
-        let parser = AnthropicSSEParser::new(mock_stream, "claude-3-opus-20240229".to_string());
+        let parser = new_anthropic_sse_parser(mock_stream, "claude-3-opus-20240229".to_string());
         let events: Vec<_> = parser.collect().await;
 
         // Should have received all 4 events (message_start, content_block_start, 2x content_block_delta)
@@ -1169,7 +1101,7 @@ mod tests {
             Ok(bytes::Bytes::from(packet2)),
         ]);
 
-        let parser = AnthropicSSEParser::new(mock_stream, "claude-3-opus-20240229".to_string());
+        let parser = new_anthropic_sse_parser(mock_stream, "claude-3-opus-20240229".to_string());
         let events: Vec<_> = parser.collect().await;
 
         assert_eq!(events.len(), 2, "Expected 2 events, got {}", events.len());

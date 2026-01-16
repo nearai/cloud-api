@@ -258,6 +258,22 @@ struct GeminiImageData {
     image_bytes: String,
 }
 
+/// Strip vendor prefix from model name (e.g., "google/gemini-2.0-flash" -> "gemini-2.0-flash")
+///
+/// Gemini API expects model names without vendor prefixes in the URL path.
+/// Model names in our system may include prefixes like "google/" for routing purposes.
+fn strip_vendor_prefix(model: &str) -> &str {
+    // Handle common vendor prefixes
+    if let Some(stripped) = model.strip_prefix("google/") {
+        return stripped;
+    }
+    if let Some(stripped) = model.strip_prefix("vertex/") {
+        return stripped;
+    }
+    // Return as-is if no known prefix
+    model
+}
+
 /// Convert size string (e.g., "1024x1024") to Gemini aspect ratio
 fn size_to_aspect_ratio(size: Option<&String>) -> Option<String> {
     size.and_then(|s| {
@@ -482,11 +498,14 @@ impl ExternalBackend for GeminiBackend {
         model: &str,
         params: ChatCompletionParams,
     ) -> Result<StreamingResult, CompletionError> {
+        // Strip vendor prefix from model name (e.g., "google/gemini-2.0-flash" -> "gemini-2.0-flash")
+        let model_name = strip_vendor_prefix(model);
+
         // Gemini API URL format: {base_url}/models/{model}:streamGenerateContent?alt=sse
         // API key is passed via x-goog-api-key header for security
         let url = format!(
             "{}/models/{}:streamGenerateContent?alt=sse",
-            config.base_url, model
+            config.base_url, model_name
         );
 
         let (system_instruction, contents) = Self::convert_messages(&params.messages);
@@ -560,9 +579,12 @@ impl ExternalBackend for GeminiBackend {
         model: &str,
         params: ChatCompletionParams,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
+        // Strip vendor prefix from model name (e.g., "google/gemini-2.0-flash" -> "gemini-2.0-flash")
+        let model_name = strip_vendor_prefix(model);
+
         // Gemini API URL format: {base_url}/models/{model}:generateContent
         // API key is passed via x-goog-api-key header for security
-        let url = format!("{}/models/{}:generateContent", config.base_url, model);
+        let url = format!("{}/models/{}:generateContent", config.base_url, model_name);
 
         let (system_instruction, contents) = Self::convert_messages(&params.messages);
 
@@ -702,9 +724,12 @@ impl ExternalBackend for GeminiBackend {
         model: &str,
         params: ImageGenerationParams,
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
+        // Strip vendor prefix from model name (e.g., "google/imagen-3.0" -> "imagen-3.0")
+        let model_name = strip_vendor_prefix(model);
+
         // Gemini uses the generateImage endpoint for Imagen models
         // URL format: {base_url}/models/{model}:generateImages
-        let url = format!("{}/models/{}:generateImages", config.base_url, model);
+        let url = format!("{}/models/{}:generateImages", config.base_url, model_name);
 
         // Convert OpenAI-style params to Gemini format
         let gemini_request = GeminiImageGenerationRequest {
@@ -1403,6 +1428,59 @@ mod tests {
         assert!(
             first_id.starts_with("gemini-"),
             "ID should start with 'gemini-'"
+        );
+    }
+
+    // ==================== Vendor Prefix Stripping Tests ====================
+
+    #[test]
+    fn test_strip_vendor_prefix_google() {
+        assert_eq!(
+            strip_vendor_prefix("google/gemini-2.0-flash"),
+            "gemini-2.0-flash"
+        );
+        assert_eq!(
+            strip_vendor_prefix("google/gemini-1.5-pro"),
+            "gemini-1.5-pro"
+        );
+    }
+
+    #[test]
+    fn test_strip_vendor_prefix_vertex() {
+        assert_eq!(
+            strip_vendor_prefix("vertex/gemini-2.0-flash"),
+            "gemini-2.0-flash"
+        );
+    }
+
+    #[test]
+    fn test_strip_vendor_prefix_no_prefix() {
+        assert_eq!(strip_vendor_prefix("gemini-2.0-flash"), "gemini-2.0-flash");
+        assert_eq!(
+            strip_vendor_prefix("imagen-3.0-generate-001"),
+            "imagen-3.0-generate-001"
+        );
+    }
+
+    #[test]
+    fn test_strip_vendor_prefix_unknown_prefix() {
+        // Unknown prefixes should be left as-is
+        assert_eq!(
+            strip_vendor_prefix("unknown/gemini-2.0-flash"),
+            "unknown/gemini-2.0-flash"
+        );
+    }
+
+    #[test]
+    fn test_url_construction_with_prefixed_model() {
+        let base_url = "https://generativelanguage.googleapis.com/v1beta";
+        let model = "google/gemini-2.0-flash";
+        let model_name = strip_vendor_prefix(model);
+        let url = format!("{}/models/{}:generateContent", base_url, model_name);
+
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
         );
     }
 

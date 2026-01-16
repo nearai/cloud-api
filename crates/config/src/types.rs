@@ -11,6 +11,7 @@ pub struct ApiConfig {
     pub s3: S3Config,
     pub otlp: OtlpConfig,
     pub cors: CorsConfig,
+    pub external_providers: ExternalProvidersConfig,
 }
 
 impl ApiConfig {
@@ -26,6 +27,7 @@ impl ApiConfig {
             s3: S3Config::from_env()?,
             otlp: OtlpConfig::from_env()?,
             cors: CorsConfig::default(),
+            external_providers: ExternalProvidersConfig::from_env(),
         })
     }
 }
@@ -240,6 +242,7 @@ pub struct DomainConfig {
     pub model_discovery: ModelDiscoveryConfig,
     pub dstack_client: DstackClientConfig,
     pub auth: AuthConfig,
+    pub external_providers: ExternalProvidersConfig,
 }
 
 // Simplified Authentication Configuration
@@ -407,6 +410,7 @@ impl From<ApiConfig> for DomainConfig {
             model_discovery: api_config.model_discovery,
             dstack_client: api_config.dstack_client,
             auth: api_config.auth,
+            external_providers: api_config.external_providers,
         }
     }
 }
@@ -584,6 +588,76 @@ mod tests {
         assert_eq!(config.exact_matches.len(), 1);
         assert_eq!(config.wildcard_suffixes.len(), 1);
         std::env::remove_var("CORS_ALLOWED_ORIGINS");
+    }
+}
+
+/// External providers configuration for third-party AI providers
+/// API keys are loaded from environment variables or secret files
+#[derive(Debug, Clone, Default)]
+pub struct ExternalProvidersConfig {
+    /// OpenAI API key (for OpenAI-compatible providers)
+    pub openai_api_key: Option<String>,
+    /// Anthropic API key
+    pub anthropic_api_key: Option<String>,
+    /// Google Gemini API key
+    pub gemini_api_key: Option<String>,
+    /// Default timeout for external provider requests (seconds)
+    pub timeout_seconds: i64,
+}
+
+impl ExternalProvidersConfig {
+    /// Load from environment variables
+    /// Keys can be provided directly via env vars or through file paths
+    pub fn from_env() -> Self {
+        // OpenAI API key
+        let openai_api_key = if let Ok(path) = env::var("OPENAI_API_KEY_FILE") {
+            std::fs::read_to_string(path)
+                .ok()
+                .map(|s| s.trim().to_string())
+        } else {
+            env::var("OPENAI_API_KEY").ok()
+        };
+
+        // Anthropic API key
+        let anthropic_api_key = if let Ok(path) = env::var("ANTHROPIC_API_KEY_FILE") {
+            std::fs::read_to_string(path)
+                .ok()
+                .map(|s| s.trim().to_string())
+        } else {
+            env::var("ANTHROPIC_API_KEY").ok()
+        };
+
+        // Gemini API key
+        let gemini_api_key = if let Ok(path) = env::var("GEMINI_API_KEY_FILE") {
+            std::fs::read_to_string(path)
+                .ok()
+                .map(|s| s.trim().to_string())
+        } else {
+            env::var("GEMINI_API_KEY").ok()
+        };
+
+        // Timeout (default 5 minutes)
+        let timeout_seconds = env::var("EXTERNAL_PROVIDER_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
+
+        Self {
+            openai_api_key,
+            anthropic_api_key,
+            gemini_api_key,
+            timeout_seconds,
+        }
+    }
+
+    /// Get API key for a specific backend type
+    pub fn get_api_key(&self, backend_type: &str) -> Option<&str> {
+        match backend_type {
+            "openai_compatible" => self.openai_api_key.as_deref(),
+            "anthropic" => self.anthropic_api_key.as_deref(),
+            "gemini" => self.gemini_api_key.as_deref(),
+            _ => None,
+        }
     }
 }
 

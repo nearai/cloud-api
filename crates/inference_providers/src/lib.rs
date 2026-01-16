@@ -53,6 +53,7 @@
 //! }
 //! ```
 
+pub mod external;
 pub mod mock;
 pub mod models;
 pub mod sse_parser;
@@ -77,6 +78,12 @@ pub use models::{
 };
 pub use sse_parser::SSEEvent;
 pub use vllm::{VLlmConfig, VLlmProvider};
+
+// External provider exports
+pub use external::{
+    AnthropicBackend, ExternalProvider, ExternalProviderConfig, GeminiBackend,
+    OpenAiCompatibleBackend, ProviderConfig,
+};
 
 /// Type alias for streaming completion results
 ///

@@ -36,6 +36,14 @@ pub struct ModelWithPricing {
     pub verifiable: bool,
     pub aliases: Vec<String>,
     pub owned_by: String,
+
+    // Provider configuration
+    /// Provider type: "vllm" (TEE-enabled) or "external" (3rd party)
+    pub provider_type: String,
+    /// JSON config for external providers (backend, base_url, etc.)
+    pub provider_config: Option<serde_json::Value>,
+    /// Whether this model supports TEE attestation
+    pub attestation_supported: bool,
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -96,6 +96,9 @@ pub async fn list_models(
                 model_icon: model.model_icon.clone(),
                 owned_by: model.owned_by.clone(),
                 aliases: model.aliases.clone(),
+                provider_type: model.provider_type.clone(),
+                provider_config: model.provider_config.clone(),
+                attestation_supported: model.attestation_supported,
             },
         })
         .collect();
@@ -186,6 +189,9 @@ pub async fn get_model_by_name(
             model_icon: model.model_icon,
             owned_by: model.owned_by,
             aliases: model.aliases,
+            provider_type: model.provider_type,
+            provider_config: model.provider_config,
+            attestation_supported: model.attestation_supported,
         },
     };
 

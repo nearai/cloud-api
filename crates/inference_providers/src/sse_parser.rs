@@ -48,9 +48,12 @@ where
                 let chunk = if is_chat {
                     match serde_json::from_value::<ChatCompletionChunk>(json.clone()) {
                         Ok(chunk) => StreamChunk::Chat(chunk),
-                        Err(_) => {
+                        Err(e) => {
                             // Log but don't fail - might be a partial chunk
-                            eprintln!("Warning: Failed to parse chat chunk for json");
+                            eprintln!(
+                                "Warning: Failed to parse chat chunk: {} for json: {}",
+                                e, json
+                            );
                             return Err(CompletionError::InvalidResponse(
                                 "Invalid response format".to_string(),
                             ));

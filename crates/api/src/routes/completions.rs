@@ -408,12 +408,8 @@ pub async fn completions(
         api_key.api_key.id
     );
     debug!(
-        "Request model: {}, stream: {:?}, prompt length: {} chars, org: {}, workspace: {}",
-        request.model,
-        request.stream,
-        request.prompt.len(),
-        api_key.organization.id,
-        api_key.workspace.id.0
+        "Request model: {}, stream: {:?}, org: {}, workspace: {}",
+        request.model, request.stream, api_key.organization.id, api_key.workspace.id.0
     );
 
     return (
@@ -613,5 +609,211 @@ mod tests {
         let result = extract_inference_id_from_sse(empty_id);
         // Empty string should still produce a valid UUID
         assert!(result.is_some());
+    }
+}
+
+/// Generate images from text prompt
+///
+/// Generate images using an AI model from a text description. OpenAI-compatible endpoint.
+#[utoipa::path(
+    post,
+    path = "/v1/images/generations",
+    tag = "Images",
+    request_body = ImageGenerationRequest,
+    responses(
+        (status = 200, description = "Image generated successfully", body = ImageGenerationResponse),
+        (status = 400, description = "Invalid request parameters", body = ErrorResponse),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn image_generations(
+    State(app_state): State<AppState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(body_hash): Extension<RequestBodyHash>,
+    Json(request): Json<crate::models::ImageGenerationRequest>,
+) -> axum::response::Response {
+    debug!(
+        "Image generation request from api key: {:?}",
+        api_key.api_key.id
+    );
+    debug!(
+        "Image generation request: model={}, org={}, workspace={}",
+        request.model, api_key.organization.id, api_key.workspace.id.0
+    );
+
+    // Validate the request
+    if let Err(error) = request.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                error,
+                "invalid_request_error".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
+    // Resolve model to get UUID for usage tracking
+    let model = match app_state
+        .models_service
+        .get_model_by_name(&request.model)
+        .await
+    {
+        Ok(model) => model,
+        Err(services::models::ModelsError::NotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    format!("Model '{}' not found", request.model),
+                    "invalid_request_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to resolve model for image generation");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to resolve model".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    // Convert API request to provider params
+    let params = inference_providers::ImageGenerationParams {
+        model: request.model.clone(),
+        prompt: request.prompt.clone(),
+        n: request.n,
+        size: request.size.clone(),
+        response_format: request.response_format.clone(),
+        quality: request.quality.clone(),
+        style: request.style.clone(),
+    };
+
+    // Call the inference provider pool
+    match app_state
+        .inference_provider_pool
+        .image_generation(params, body_hash.hash.clone())
+        .await
+    {
+        Ok(response_with_bytes) => {
+            // Store attestation signature for image generation (same pattern as chat completions)
+            let attestation_service = app_state.attestation_service.clone();
+            let image_id_for_sig = response_with_bytes.response.id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = attestation_service
+                    .store_chat_signature_from_provider(&image_id_for_sig)
+                    .await
+                {
+                    tracing::error!(error = %e, "Failed to store image generation signature");
+                } else {
+                    tracing::debug!(image_id = %image_id_for_sig, "Stored signature for image generation");
+                }
+            });
+
+            // Record usage for image generation
+            let organization_id = api_key.organization.id.0;
+            let workspace_id = api_key.workspace.id.0;
+            let api_key_id_str = api_key.api_key.id.0.clone();
+            let model_id = model.id;
+            let image_count = response_with_bytes.response.data.len() as i32;
+            let provider_request_id = response_with_bytes.response.id.clone();
+            let usage_service = app_state.usage_service.clone();
+
+            // Spawn async task to record usage (fire-and-forget like chat completions)
+            tokio::spawn(async move {
+                // Parse API key ID to UUID
+                let api_key_id = match Uuid::parse_str(&api_key_id_str) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Invalid API key ID for usage tracking");
+                        return;
+                    }
+                };
+
+                // Hash the provider request ID to UUID for storage
+                let inference_id = Some(hash_inference_id_to_uuid(&provider_request_id));
+
+                let usage_request = services::usage::RecordUsageServiceRequest {
+                    organization_id,
+                    workspace_id,
+                    api_key_id,
+                    model_id,
+                    // Image generation doesn't have traditional token counts
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    inference_type: "image_generation".to_string(),
+                    ttft_ms: None,
+                    avg_itl_ms: None,
+                    inference_id,
+                    provider_request_id: Some(provider_request_id),
+                    stop_reason: Some(services::usage::StopReason::Completed),
+                    response_id: None,
+                    image_count: Some(image_count),
+                };
+
+                if let Err(e) = usage_service.record_usage(usage_request).await {
+                    tracing::error!(
+                        error = %e,
+                        %organization_id,
+                        %workspace_id,
+                        "Failed to record image generation usage"
+                    );
+                }
+            });
+
+            // Return the exact bytes from the provider for hash verification
+            // This ensures clients can hash the response and compare with attestation endpoints
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(response_with_bytes.raw_bytes))
+                .unwrap()
+        }
+        Err(e) => {
+            // Log the full error internally but return a sanitized message to the client
+            tracing::error!(error = %e, "Image generation failed");
+
+            // Map error to appropriate status code and sanitized message
+            let (status_code, message) = match &e {
+                inference_providers::ImageGenerationError::GenerationError(msg) => {
+                    // Check if it's a model not found error
+                    if msg.contains("not found") || msg.contains("does not exist") {
+                        (StatusCode::NOT_FOUND, "Model not found".to_string())
+                    } else {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Image generation failed".to_string(),
+                        )
+                    }
+                }
+                inference_providers::ImageGenerationError::HttpError { status_code, .. } => {
+                    // Map HTTP status codes appropriately
+                    let code = StatusCode::from_u16(*status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let msg = match code {
+                        StatusCode::NOT_FOUND => "Model not found".to_string(),
+                        StatusCode::BAD_REQUEST => "Invalid request".to_string(),
+                        StatusCode::TOO_MANY_REQUESTS => "Rate limit exceeded".to_string(),
+                        _ => "Image generation failed".to_string(),
+                    };
+                    (code, msg)
+                }
+            };
+
+            (
+                status_code,
+                ResponseJson(ErrorResponse::new(message, "server_error".to_string())),
+            )
+                .into_response()
+        }
     }
 }

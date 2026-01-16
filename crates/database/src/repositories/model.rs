@@ -59,7 +59,7 @@ impl ModelRepository {
                     r#"
                     SELECT
                         m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
-                        m.input_cost_per_token, m.output_cost_per_token,
+                        m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image,
                         m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
                         m.provider_type, m.provider_config, m.attestation_supported,
                         COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
@@ -139,7 +139,7 @@ impl ModelRepository {
                         r#"
                         SELECT
                             m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
-                            m.input_cost_per_token, m.output_cost_per_token,
+                            m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image,
                             m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
                             m.provider_type, m.provider_config, m.attestation_supported,
                             COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
@@ -159,7 +159,7 @@ impl ModelRepository {
                         r#"
                         SELECT
                             m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
-                            m.input_cost_per_token, m.output_cost_per_token,
+                            m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image,
                             m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
                             m.provider_type, m.provider_config, m.attestation_supported,
                             COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
@@ -200,7 +200,7 @@ impl ModelRepository {
                     r#"
                     SELECT
                         id, model_name, model_display_name, model_description, model_icon,
-                        input_cost_per_token, output_cost_per_token,
+                        input_cost_per_token, output_cost_per_token, cost_per_image,
                         context_length, verifiable, is_active, owned_by, created_at, updated_at,
                         provider_type, provider_config, attestation_supported
                     FROM models
@@ -234,7 +234,7 @@ impl ModelRepository {
                     r#"
                     SELECT
                         id, model_name, model_display_name, model_description, model_icon,
-                        input_cost_per_token, output_cost_per_token,
+                        input_cost_per_token, output_cost_per_token, cost_per_image,
                         context_length, verifiable, is_active, owned_by, created_at, updated_at,
                         provider_type, provider_config, attestation_supported
                     FROM models
@@ -275,6 +275,7 @@ impl ModelRepository {
                         m.model_icon,
                         m.input_cost_per_token,
                         m.output_cost_per_token,
+                        m.cost_per_image,
                         m.context_length,
                         m.verifiable,
                         m.is_active,
@@ -363,20 +364,21 @@ impl ModelRepository {
                         UPDATE models SET
                             input_cost_per_token = COALESCE($2, input_cost_per_token),
                             output_cost_per_token = COALESCE($3, output_cost_per_token),
-                            model_display_name = COALESCE($4, model_display_name),
-                            model_description = COALESCE($5, model_description),
-                            model_icon = COALESCE($6, model_icon),
-                            context_length = COALESCE($7, context_length),
-                            verifiable = COALESCE($8, verifiable),
-                            is_active = COALESCE($9, is_active),
-                            owned_by = COALESCE($10, owned_by),
-                            provider_type = COALESCE($11, provider_type),
-                            provider_config = COALESCE($12, provider_config),
-                            attestation_supported = COALESCE($13, attestation_supported),
+                            cost_per_image = COALESCE($4, cost_per_image),
+                            model_display_name = COALESCE($5, model_display_name),
+                            model_description = COALESCE($6, model_description),
+                            model_icon = COALESCE($7, model_icon),
+                            context_length = COALESCE($8, context_length),
+                            verifiable = COALESCE($9, verifiable),
+                            is_active = COALESCE($10, is_active),
+                            owned_by = COALESCE($11, owned_by),
+                            provider_type = COALESCE($12, provider_type),
+                            provider_config = COALESCE($13, provider_config),
+                            attestation_supported = COALESCE($14, attestation_supported),
                             updated_at = NOW()
                         WHERE model_name = $1
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
-                                  input_cost_per_token, output_cost_per_token,
+                                  input_cost_per_token, output_cost_per_token, cost_per_image,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
                                   provider_type, provider_config, attestation_supported
                         "#,
@@ -384,6 +386,7 @@ impl ModelRepository {
                             &model_name,
                             &update_request.input_cost_per_token,
                             &update_request.output_cost_per_token,
+                            &update_request.cost_per_image,
                             &update_request.model_display_name,
                             &update_request.model_description,
                             &update_request.model_icon,
@@ -422,36 +425,37 @@ impl ModelRepository {
                         r#"
                         INSERT INTO models (
                             model_name,
-                            input_cost_per_token, output_cost_per_token,
+                            input_cost_per_token, output_cost_per_token, cost_per_image,
                             model_display_name, model_description, model_icon,
                             context_length, verifiable, is_active, owned_by,
                             provider_type, provider_config, attestation_supported
                         ) VALUES (
-                            $1, $2, $3, $4, $5, $6, $7, $8, $9,
-                            COALESCE($10, $11),
-                            COALESCE($12, 'vllm'),
-                            $13,
+                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                            COALESCE($11, $12),
+                            COALESCE($13, 'vllm'),
+                            $14,
                             -- Default attestation_supported based on provider_type:
                             -- External providers cannot support attestation, so default to false
                             -- vLLM providers support attestation, so default to true
-                            COALESCE($14, CASE WHEN COALESCE($12, 'vllm') = 'external' THEN false ELSE true END)
+                            COALESCE($15, CASE WHEN COALESCE($13, 'vllm') = 'external' THEN false ELSE true END)
                         )
                         ON CONFLICT (model_name) DO UPDATE SET
                             input_cost_per_token = EXCLUDED.input_cost_per_token,
                             output_cost_per_token = EXCLUDED.output_cost_per_token,
+                            cost_per_image = EXCLUDED.cost_per_image,
                             model_display_name = EXCLUDED.model_display_name,
                             model_description = EXCLUDED.model_description,
                             model_icon = EXCLUDED.model_icon,
                             context_length = EXCLUDED.context_length,
                             verifiable = EXCLUDED.verifiable,
                             is_active = EXCLUDED.is_active,
-                            owned_by = CASE WHEN $10 IS NULL THEN models.owned_by ELSE EXCLUDED.owned_by END,
+                            owned_by = CASE WHEN $11 IS NULL THEN models.owned_by ELSE EXCLUDED.owned_by END,
                             provider_type = EXCLUDED.provider_type,
                             provider_config = EXCLUDED.provider_config,
                             attestation_supported = EXCLUDED.attestation_supported,
                             updated_at = NOW()
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
-                                  input_cost_per_token, output_cost_per_token,
+                                  input_cost_per_token, output_cost_per_token, cost_per_image,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
                                   provider_type, provider_config, attestation_supported
                         "#,
@@ -459,6 +463,7 @@ impl ModelRepository {
                             &model_name,
                             &update_request.input_cost_per_token.unwrap_or(0),
                             &update_request.output_cost_per_token.unwrap_or(0),
+                            &update_request.cost_per_image.unwrap_or(0),
                             &display_name.as_ref().unwrap(),
                             &description.as_ref().unwrap(),
                             &update_request.model_icon,
@@ -512,12 +517,12 @@ impl ModelRepository {
                     r#"
                     INSERT INTO models (
                         model_name, model_display_name, model_description, model_icon,
-                        input_cost_per_token, output_cost_per_token,
+                        input_cost_per_token, output_cost_per_token, cost_per_image,
                         context_length, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
-                              input_cost_per_token, output_cost_per_token,
+                              input_cost_per_token, output_cost_per_token, cost_per_image,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported
                     "#,
@@ -528,6 +533,7 @@ impl ModelRepository {
                         &model.model_icon,
                         &model.input_cost_per_token,
                         &model.output_cost_per_token,
+                        &model.cost_per_image,
                         &model.context_length,
                         &model.verifiable,
                         &model.is_active,
@@ -558,7 +564,7 @@ impl ModelRepository {
                 .query(
                     r#"
                     SELECT
-                        id, model_id, input_cost_per_token, output_cost_per_token,
+                        id, model_id, input_cost_per_token, output_cost_per_token, cost_per_image,
                         context_length, model_name, model_display_name, model_description,
                         model_icon, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
@@ -599,7 +605,7 @@ impl ModelRepository {
                 .query(
                     r#"
                     SELECT
-                        id, model_id, input_cost_per_token, output_cost_per_token,
+                        id, model_id, input_cost_per_token, output_cost_per_token, cost_per_image,
                         context_length, model_name, model_display_name, model_description,
                         model_icon, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
@@ -670,7 +676,7 @@ impl ModelRepository {
                 .query(
                     r#"
                     SELECT
-                        h.id, h.model_id, h.input_cost_per_token, h.output_cost_per_token,
+                        h.id, h.model_id, h.input_cost_per_token, h.output_cost_per_token, h.cost_per_image,
                         h.context_length, h.model_name, h.model_display_name, h.model_description,
                         h.model_icon, h.verifiable, h.is_active, h.owned_by,
                         h.provider_type, h.provider_config, h.attestation_supported,
@@ -718,7 +724,7 @@ impl ModelRepository {
                     SET is_active = false, updated_at = NOW()
                     WHERE model_name = $1 AND is_active = true
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
-                              input_cost_per_token, output_cost_per_token,
+                              input_cost_per_token, output_cost_per_token, cost_per_image,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported
                     "#,
@@ -785,6 +791,7 @@ impl ModelRepository {
                     model_id,
                     input_cost_per_token,
                     output_cost_per_token,
+                    cost_per_image,
                     context_length,
                     model_name,
                     model_display_name,
@@ -803,14 +810,15 @@ impl ModelRepository {
                     change_reason,
                     created_at
                 ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                    NOW(), NULL, $15, $16, $17, NOW()
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+                    NOW(), NULL, $16, $17, $18, NOW()
                 )
                 "#,
                 &[
                     &model_id,
                     &model_row.get::<_, i64>("input_cost_per_token"),
                     &model_row.get::<_, i64>("output_cost_per_token"),
+                    &model_row.get::<_, i64>("cost_per_image"),
                     &model_row.get::<_, i32>("context_length"),
                     &model_row.get::<_, String>("model_name"),
                     &model_row.get::<_, String>("model_display_name"),
@@ -890,6 +898,7 @@ impl ModelRepository {
                         m.model_icon,
                         m.input_cost_per_token,
                         m.output_cost_per_token,
+                        m.cost_per_image,
                         m.context_length,
                         m.verifiable,
                         m.is_active,
@@ -941,6 +950,7 @@ impl ModelRepository {
             model_icon: row.get("model_icon"),
             input_cost_per_token: row.get("input_cost_per_token"),
             output_cost_per_token: row.get("output_cost_per_token"),
+            cost_per_image: row.get("cost_per_image"),
             context_length: row.get("context_length"),
             verifiable: row.get("verifiable"),
             is_active: row.get("is_active"),
@@ -963,6 +973,7 @@ impl ModelRepository {
             model_id: row.get("model_id"),
             input_cost_per_token: row.get("input_cost_per_token"),
             output_cost_per_token: row.get("output_cost_per_token"),
+            cost_per_image: row.get("cost_per_image"),
             context_length: row.get("context_length"),
             model_name: row.get("model_name"),
             model_display_name: row.get("model_display_name"),
@@ -1045,6 +1056,7 @@ impl services::models::ModelsRepository for ModelRepository {
                 model_icon: m.model_icon,
                 input_cost_per_token: m.input_cost_per_token,
                 output_cost_per_token: m.output_cost_per_token,
+                cost_per_image: m.cost_per_image,
                 context_length: m.context_length,
                 verifiable: m.verifiable,
                 aliases: m.aliases,
@@ -1069,6 +1081,7 @@ impl services::models::ModelsRepository for ModelRepository {
             model_icon: m.model_icon,
             input_cost_per_token: m.input_cost_per_token,
             output_cost_per_token: m.output_cost_per_token,
+            cost_per_image: m.cost_per_image,
             context_length: m.context_length,
             verifiable: m.verifiable,
             aliases: m.aliases,
@@ -1092,6 +1105,7 @@ impl services::models::ModelsRepository for ModelRepository {
             model_icon: m.model_icon,
             input_cost_per_token: m.input_cost_per_token,
             output_cost_per_token: m.output_cost_per_token,
+            cost_per_image: m.cost_per_image,
             context_length: m.context_length,
             verifiable: m.verifiable,
             aliases: m.aliases,

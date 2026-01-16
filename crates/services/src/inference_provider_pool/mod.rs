@@ -2,8 +2,9 @@ use crate::common::encryption_headers;
 use config::ExternalProvidersConfig;
 use inference_providers::{
     models::{AttestationError, CompletionError, ListModelsError, ModelsResponse},
-    ChatCompletionParams, ExternalProvider, ExternalProviderConfig, InferenceProvider,
-    ProviderConfig, StreamingResult, StreamingResultExt, VLlmConfig, VLlmProvider,
+    ChatCompletionParams, ExternalProvider, ExternalProviderConfig, ImageGenerationError,
+    ImageGenerationParams, ImageGenerationResponseWithBytes, InferenceProvider, ProviderConfig,
+    StreamingResult, StreamingResultExt, VLlmConfig, VLlmProvider,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -1126,6 +1127,47 @@ impl InferenceProviderPool {
         Ok(response)
     }
 
+    /// Generate images using the specified model
+    pub async fn image_generation(
+        &self,
+        params: ImageGenerationParams,
+        request_hash: String,
+    ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
+        let model_id = params.model.clone();
+
+        tracing::debug!(
+            model = %model_id,
+            "Starting image generation request"
+        );
+
+        let params_for_provider = params.clone();
+
+        let (response, provider) = self
+            .retry_with_fallback(&model_id, "image_generation", None, |provider| {
+                let params = params_for_provider.clone();
+                let request_hash = request_hash.clone();
+                async move {
+                    provider
+                        .image_generation(params, request_hash)
+                        .await
+                        .map_err(|e| CompletionError::CompletionError(e.to_string()))
+                }
+            })
+            .await
+            .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
+
+        // Store the chat_id mapping so attestation service can find the provider
+        // (same pattern as chat_completion)
+        let image_id = response.response.id.clone();
+        tracing::info!(
+            image_id = %image_id,
+            "Storing chat_id mapping for image generation"
+        );
+        self.store_chat_id_mapping(image_id, provider).await;
+
+        Ok(response)
+    }
+
     /// Start the periodic model discovery refresh task and store the handle
     pub async fn start_refresh_task(self: Arc<Self>, refresh_interval_secs: u64) {
         let handle = tokio::spawn({
@@ -1312,7 +1354,7 @@ mod tests {
             model: model_id,
             messages: vec![inference_providers::ChatMessage {
                 role: inference_providers::MessageRole::User,
-                content: Some("Hello".to_string()),
+                content: Some(serde_json::Value::String("Hello".to_string())),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
@@ -1337,6 +1379,7 @@ mod tests {
             metadata: None,
             store: None,
             stream_options: None,
+            modalities: None,
             extra: std::collections::HashMap::new(),
         };
 

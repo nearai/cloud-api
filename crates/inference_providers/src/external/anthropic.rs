@@ -67,31 +67,54 @@ impl AnthropicBackend {
         let mut system_message = None;
         let mut anthropic_messages = Vec::new();
 
+        // Helper to extract string content from serde_json::Value
+        let extract_content = |value: &serde_json::Value| -> String {
+            match value {
+                serde_json::Value::String(s) => s.clone(),
+                _ => value.to_string(),
+            }
+        };
+
         for msg in messages {
             match msg.role {
                 MessageRole::System => {
                     // Anthropic has a separate system parameter
                     if let Some(content) = &msg.content {
-                        system_message = Some(content.clone());
+                        system_message = Some(extract_content(content));
                     }
                 }
                 MessageRole::User => {
+                    let content = msg
+                        .content
+                        .as_ref()
+                        .map(&extract_content)
+                        .unwrap_or_default();
                     anthropic_messages.push(AnthropicMessage {
                         role: "user".to_string(),
-                        content: msg.content.clone().unwrap_or_default(),
+                        content,
                     });
                 }
                 MessageRole::Assistant => {
+                    let content = msg
+                        .content
+                        .as_ref()
+                        .map(&extract_content)
+                        .unwrap_or_default();
                     anthropic_messages.push(AnthropicMessage {
                         role: "assistant".to_string(),
-                        content: msg.content.clone().unwrap_or_default(),
+                        content,
                     });
                 }
                 MessageRole::Tool => {
                     // Tool results in Anthropic format
+                    let content = msg
+                        .content
+                        .as_ref()
+                        .map(&extract_content)
+                        .unwrap_or_default();
                     anthropic_messages.push(AnthropicMessage {
                         role: "user".to_string(),
-                        content: msg.content.clone().unwrap_or_default(),
+                        content,
                     });
                 }
             }
@@ -309,6 +332,7 @@ where
                     }],
                     usage: None,
                     prompt_token_ids: None,
+                    modality: None,
                 };
                 Ok(Some(StreamChunk::Chat(chunk)))
             }
@@ -337,6 +361,7 @@ where
                         }],
                         usage: None,
                         prompt_token_ids: None,
+                        modality: None,
                     };
                     Ok(Some(StreamChunk::Chat(chunk)))
                 } else {
@@ -377,6 +402,7 @@ where
                         prompt_tokens_details: None,
                     }),
                     prompt_token_ids: None,
+                    modality: None,
                 };
                 Ok(Some(StreamChunk::Chat(chunk)))
             }
@@ -660,6 +686,11 @@ mod tests {
     use super::*;
     use crate::ChatMessage;
 
+    /// Helper to create a string content value for tests
+    fn str_content(s: &str) -> serde_json::Value {
+        serde_json::Value::String(s.to_string())
+    }
+
     // ==================== Message Translation Tests ====================
 
     #[test]
@@ -667,14 +698,14 @@ mod tests {
         let messages = vec![
             ChatMessage {
                 role: MessageRole::System,
-                content: Some("You are a helpful assistant.".to_string()),
+                content: Some(str_content("You are a helpful assistant.")),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
             },
             ChatMessage {
                 role: MessageRole::User,
-                content: Some("Hello".to_string()),
+                content: Some(str_content("Hello")),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
@@ -694,14 +725,14 @@ mod tests {
         let messages = vec![
             ChatMessage {
                 role: MessageRole::User,
-                content: Some("Hello".to_string()),
+                content: Some(str_content("Hello")),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
             },
             ChatMessage {
                 role: MessageRole::Assistant,
-                content: Some("Hi there!".to_string()),
+                content: Some(str_content("Hi there!")),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
@@ -729,7 +760,7 @@ mod tests {
     fn test_convert_messages_only_system() {
         let messages = vec![ChatMessage {
             role: MessageRole::System,
-            content: Some("You are a bot.".to_string()),
+            content: Some(str_content("You are a bot.")),
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -745,7 +776,7 @@ mod tests {
     fn test_convert_messages_tool_becomes_user() {
         let messages = vec![ChatMessage {
             role: MessageRole::Tool,
-            content: Some("Tool result here".to_string()),
+            content: Some(str_content("Tool result here")),
             name: None,
             tool_call_id: Some("call_123".to_string()),
             tool_calls: None,
@@ -782,21 +813,21 @@ mod tests {
         let messages = vec![
             ChatMessage {
                 role: MessageRole::System,
-                content: Some("First system".to_string()),
+                content: Some(str_content("First system")),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
             },
             ChatMessage {
                 role: MessageRole::User,
-                content: Some("Hello".to_string()),
+                content: Some(str_content("Hello")),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
             },
             ChatMessage {
                 role: MessageRole::System,
-                content: Some("Second system".to_string()),
+                content: Some(str_content("Second system")),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,

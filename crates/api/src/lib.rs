@@ -16,7 +16,7 @@ use crate::{
             StateStore,
         },
         billing::{get_billing_costs, BillingRouteState},
-        completions::{chat_completions, models},
+        completions::{chat_completions, image_generations, models},
         conversations,
         health::health_check,
         models::{get_model_by_name, list_models, ModelsAppState},
@@ -573,6 +573,8 @@ pub async fn init_inference_providers_with_mocks(
         "nearai/gpt-oss-120b".to_string(),
         "dphn/Dolphin-Mistral-24B-Venice-Edition".to_string(),
         "deepseek-ai/DeepSeek-V3.1".to_string(),
+        "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string(),
+        "Qwen/Qwen-Image-2512".to_string(),
     ];
 
     let providers: Vec<(
@@ -853,6 +855,7 @@ pub fn build_completion_routes(
 ) -> Router {
     let inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
+        .route("/images/generations", post(image_generations))
         .with_state(app_state.clone())
         .layer(from_fn_with_state(
             usage_state,

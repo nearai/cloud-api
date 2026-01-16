@@ -254,6 +254,17 @@ impl InferenceProvider for ExternalProvider {
                 .to_string(),
         ))
     }
+
+    /// Image generation - not supported for external providers
+    async fn image_generation(
+        &self,
+        _params: crate::ImageGenerationParams,
+        _request_hash: String,
+    ) -> Result<crate::ImageGenerationResponseWithBytes, crate::ImageGenerationError> {
+        Err(crate::ImageGenerationError::GenerationError(
+            "Image generation is not supported for external providers.".to_string(),
+        ))
+    }
 }
 
 #[cfg(test)]

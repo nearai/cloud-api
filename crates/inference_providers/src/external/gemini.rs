@@ -40,6 +40,14 @@ impl GeminiBackend {
     fn convert_messages(
         messages: &[crate::ChatMessage],
     ) -> (Option<GeminiSystemInstruction>, Vec<GeminiContent>) {
+        // Helper to extract string content from serde_json::Value
+        let extract_content = |value: &serde_json::Value| -> String {
+            match value {
+                serde_json::Value::String(s) => s.clone(),
+                _ => value.to_string(),
+            }
+        };
+
         let mut system_instruction = None;
         let mut contents = Vec::new();
 
@@ -50,7 +58,7 @@ impl GeminiBackend {
                     if let Some(content) = &msg.content {
                         system_instruction = Some(GeminiSystemInstruction {
                             parts: vec![GeminiPart {
-                                text: content.clone(),
+                                text: extract_content(content),
                             }],
                         });
                     }
@@ -59,7 +67,11 @@ impl GeminiBackend {
                     contents.push(GeminiContent {
                         role: "user".to_string(),
                         parts: vec![GeminiPart {
-                            text: msg.content.clone().unwrap_or_default(),
+                            text: msg
+                                .content
+                                .as_ref()
+                                .map(&extract_content)
+                                .unwrap_or_default(),
                         }],
                     });
                 }
@@ -68,7 +80,11 @@ impl GeminiBackend {
                     contents.push(GeminiContent {
                         role: "model".to_string(),
                         parts: vec![GeminiPart {
-                            text: msg.content.clone().unwrap_or_default(),
+                            text: msg
+                                .content
+                                .as_ref()
+                                .map(&extract_content)
+                                .unwrap_or_default(),
                         }],
                     });
                 }
@@ -77,7 +93,11 @@ impl GeminiBackend {
                     contents.push(GeminiContent {
                         role: "user".to_string(),
                         parts: vec![GeminiPart {
-                            text: msg.content.clone().unwrap_or_default(),
+                            text: msg
+                                .content
+                                .as_ref()
+                                .map(&extract_content)
+                                .unwrap_or_default(),
                         }],
                     });
                 }
@@ -265,6 +285,7 @@ where
             created: self.created,
             model: self.model.clone(),
             system_fingerprint: None,
+            modality: None,
             choices: vec![ChatChoice {
                 index: 0,
                 delta: Some(ChatDelta {
@@ -614,6 +635,11 @@ mod tests {
     use super::*;
     use crate::ChatMessage;
 
+    /// Helper to create a string content value for tests
+    fn str_content(s: &str) -> serde_json::Value {
+        serde_json::Value::String(s.to_string())
+    }
+
     // ==================== Message Translation Tests ====================
 
     #[test]
@@ -621,14 +647,14 @@ mod tests {
         let messages = vec![
             ChatMessage {
                 role: MessageRole::System,
-                content: Some("You are a helpful assistant.".to_string()),
+                content: Some(str_content("You are a helpful assistant.")),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
             },
             ChatMessage {
                 role: MessageRole::User,
-                content: Some("Hello".to_string()),
+                content: Some(str_content("Hello")),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
@@ -652,14 +678,14 @@ mod tests {
         let messages = vec![
             ChatMessage {
                 role: MessageRole::User,
-                content: Some("Hello".to_string()),
+                content: Some(str_content("Hello")),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
             },
             ChatMessage {
                 role: MessageRole::Assistant,
-                content: Some("Hi there!".to_string()),
+                content: Some(str_content("Hi there!")),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
@@ -688,7 +714,7 @@ mod tests {
     fn test_convert_messages_only_system() {
         let messages = vec![ChatMessage {
             role: MessageRole::System,
-            content: Some("You are a bot.".to_string()),
+            content: Some(str_content("You are a bot.")),
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -704,7 +730,7 @@ mod tests {
     fn test_convert_messages_tool_becomes_user() {
         let messages = vec![ChatMessage {
             role: MessageRole::Tool,
-            content: Some("Tool result here".to_string()),
+            content: Some(str_content("Tool result here")),
             name: None,
             tool_call_id: Some("call_123".to_string()),
             tool_calls: None,
@@ -740,21 +766,21 @@ mod tests {
         let messages = vec![
             ChatMessage {
                 role: MessageRole::System,
-                content: Some("First system".to_string()),
+                content: Some(str_content("First system")),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
             },
             ChatMessage {
                 role: MessageRole::User,
-                content: Some("Hello".to_string()),
+                content: Some(str_content("Hello")),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
             },
             ChatMessage {
                 role: MessageRole::System,
-                content: Some("Second system".to_string()),
+                content: Some(str_content("Second system")),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
@@ -774,7 +800,7 @@ mod tests {
     fn test_convert_messages_no_system() {
         let messages = vec![ChatMessage {
             role: MessageRole::User,
-            content: Some("Hello".to_string()),
+            content: Some(str_content("Hello")),
             name: None,
             tool_call_id: None,
             tool_calls: None,

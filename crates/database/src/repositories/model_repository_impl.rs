@@ -13,6 +13,7 @@ impl services::usage::ports::ModelRepository for ModelRepository {
             model_name: m.model_name,
             input_cost_per_token: m.input_cost_per_token,
             output_cost_per_token: m.output_cost_per_token,
+            cost_per_image: m.cost_per_image,
         }))
     }
 
@@ -24,6 +25,7 @@ impl services::usage::ports::ModelRepository for ModelRepository {
             model_name: m.model_name,
             input_cost_per_token: m.input_cost_per_token,
             output_cost_per_token: m.output_cost_per_token,
+            cost_per_image: m.cost_per_image,
         }))
     }
 }

@@ -28,6 +28,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             provider_request_id: request.provider_request_id,
             stop_reason: request.stop_reason,
             response_id: request.response_id,
+            image_count: request.image_count,
         };
 
         let log = self.record_usage(db_request).await?;
@@ -53,6 +54,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             provider_request_id: log.provider_request_id,
             stop_reason: log.stop_reason,
             response_id: log.response_id,
+            image_count: log.image_count,
         })
     }
 
@@ -107,6 +109,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 provider_request_id: log.provider_request_id,
                 stop_reason: log.stop_reason,
                 response_id: log.response_id,
+                image_count: log.image_count,
             })
             .collect();
 
@@ -148,6 +151,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 provider_request_id: log.provider_request_id,
                 stop_reason: log.stop_reason,
                 response_id: log.response_id,
+                image_count: log.image_count,
             })
             .collect();
 

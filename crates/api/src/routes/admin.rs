@@ -89,6 +89,7 @@ pub async fn batch_upsert_models(
                 UpdateModelAdminRequest {
                     input_cost_per_token: request.input_cost_per_token.as_ref().map(|p| p.amount),
                     output_cost_per_token: request.output_cost_per_token.as_ref().map(|p| p.amount),
+                    cost_per_image: request.cost_per_image.as_ref().map(|p| p.amount),
                     model_display_name: request.model_display_name.clone(),
                     model_description: request.model_description.clone(),
                     model_icon: request.model_icon.clone(),
@@ -147,6 +148,11 @@ pub async fn batch_upsert_models(
             },
             output_cost_per_token: DecimalPrice {
                 amount: updated_model.output_cost_per_token,
+                scale: 9,
+                currency: "USD".to_string(),
+            },
+            cost_per_image: DecimalPrice {
+                amount: updated_model.cost_per_image,
                 scale: 9,
                 currency: "USD".to_string(),
             },
@@ -225,6 +231,11 @@ pub async fn list_models(
             },
             output_cost_per_token: DecimalPrice {
                 amount: model.output_cost_per_token,
+                scale: 9,
+                currency: "USD".to_string(),
+            },
+            cost_per_image: DecimalPrice {
+                amount: model.cost_per_image,
                 scale: 9,
                 currency: "USD".to_string(),
             },
@@ -336,6 +347,11 @@ pub async fn get_model_history(
             },
             output_cost_per_token: DecimalPrice {
                 amount: h.output_cost_per_token,
+                scale: 9,
+                currency: "USD".to_string(),
+            },
+            cost_per_image: DecimalPrice {
+                amount: h.cost_per_image,
                 scale: 9,
                 currency: "USD".to_string(),
             },

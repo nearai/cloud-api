@@ -406,6 +406,7 @@ pub struct Model {
     // Pricing (fixed scale 9 = nano-dollars, USD only)
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
+    pub cost_per_image: i64,
 
     // Model metadata
     pub context_length: i32,
@@ -425,6 +426,7 @@ pub struct Model {
 pub struct UpdateModelPricingRequest {
     pub input_cost_per_token: Option<i64>,
     pub output_cost_per_token: Option<i64>,
+    pub cost_per_image: Option<i64>,
     pub model_display_name: Option<String>,
     pub model_description: Option<String>,
     pub model_icon: Option<String>,
@@ -449,6 +451,7 @@ pub struct ModelHistory {
     // Pricing snapshot (fixed scale 9 = nano-dollars, USD only)
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
+    pub cost_per_image: i64,
 
     // Model metadata snapshot
     pub context_length: i32,
@@ -558,6 +561,8 @@ pub struct OrganizationUsageLog {
     pub stop_reason: Option<StopReason>,
     /// Response ID for Response API calls (FK to responses table)
     pub response_id: Option<ResponseId>,
+    /// Number of images generated (for image generation requests)
+    pub image_count: Option<i32>,
 }
 
 /// Organization balance summary - cached aggregate spending
@@ -599,6 +604,8 @@ pub struct RecordUsageRequest {
     pub stop_reason: Option<StopReason>,
     /// Response ID for Response API calls (FK to responses table)
     pub response_id: Option<ResponseId>,
+    /// Number of images generated (for image generation requests)
+    pub image_count: Option<i32>,
 }
 
 // ============================================

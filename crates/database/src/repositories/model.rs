@@ -1009,7 +1009,7 @@ impl ModelRepository {
                     r#"
                     SELECT
                         m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
-                        m.input_cost_per_token, m.output_cost_per_token,
+                        m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image,
                         m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
                         m.provider_type, m.provider_config, m.attestation_supported,
                         COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases

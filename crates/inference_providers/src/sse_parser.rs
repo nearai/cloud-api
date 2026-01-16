@@ -133,56 +133,44 @@ where
     type Item = Result<SSEEvent, CompletionError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Get mutable reference to self - safe because all fields are Unpin
         let this = self.get_mut();
 
-        // First, return any pending results from previous process_buffer() calls
-        if let Some(result) = this.pending_results.pop_front() {
-            return Poll::Ready(Some(result));
-        }
-
-        // Try to get more results from the current buffer
-        let buffered_results = this.process_buffer();
-        if !buffered_results.is_empty() {
-            // Store all results in pending queue
-            this.pending_results.extend(buffered_results);
+        loop {
+            // First, return any pending results from previous process_buffer() calls
             if let Some(result) = this.pending_results.pop_front() {
                 return Poll::Ready(Some(result));
             }
-        }
 
-        // Poll for more data from the underlying stream
-        match Pin::new(&mut this.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(bytes))) => {
-                // Add new data to buffer
-                this.bytes_buffer.extend_from_slice(&bytes);
-                let text = String::from_utf8_lossy(&bytes);
-                this.buffer.push_str(&text);
+            // Try to get more results from the current buffer
+            let buffered_results = this.process_buffer();
+            if !buffered_results.is_empty() {
+                this.pending_results.extend(buffered_results);
+                continue;
+            }
 
-                // Process any complete events
-                let results = this.process_buffer();
-                if !results.is_empty() {
-                    // Store all results in pending queue
-                    this.pending_results.extend(results);
-                    if let Some(result) = this.pending_results.pop_front() {
-                        return Poll::Ready(Some(result));
+            // Poll for more data from the underlying stream
+            match Pin::new(&mut this.inner).poll_next(cx) {
+                Poll::Ready(Some(Ok(bytes))) => {
+                    // Add new data to buffer and loop back to process it
+                    this.bytes_buffer.extend_from_slice(&bytes);
+                    let text = String::from_utf8_lossy(&bytes);
+                    this.buffer.push_str(&text);
+                    continue;
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Some(Err(CompletionError::CompletionError(
+                        e.to_string(),
+                    ))));
+                }
+                Poll::Ready(None) => {
+                    // Stream ended - process any remaining buffer content
+                    if !this.buffer.trim().is_empty() {
+                        warn!("Incomplete SSE data in buffer at stream end");
                     }
+                    return Poll::Ready(None);
                 }
-                // No complete events yet, wake and try again
-                cx.waker().wake_by_ref();
-                Poll::Pending
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(Some(Err(e))) => {
-                Poll::Ready(Some(Err(CompletionError::CompletionError(e.to_string()))))
-            }
-            Poll::Ready(None) => {
-                // Stream ended - process any remaining buffer content
-                if !this.buffer.trim().is_empty() {
-                    warn!("Incomplete SSE data in buffer at stream end");
-                }
-                Poll::Ready(None)
-            }
-            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -226,33 +214,33 @@ impl SSEEventParser for OpenAIEventParser {
                 let chunk = if state.is_chat {
                     match serde_json::from_value::<ChatCompletionChunk>(json) {
                         Ok(chunk) => StreamChunk::Chat(chunk),
-                        Err(e) => {
-                            // Log error type only - don't log content to protect customer data
-                            warn!(error = %e, "Failed to parse chat completion chunk");
+                        Err(_) => {
+                            // Don't log error details - may contain customer data
+                            warn!("Failed to parse event");
                             return Err(CompletionError::InvalidResponse(
-                                "Invalid response format".to_string(),
+                                "Failed to parse event".to_string(),
                             ));
                         }
                     }
                 } else {
                     match serde_json::from_value::<CompletionChunk>(json) {
                         Ok(chunk) => StreamChunk::Text(chunk),
-                        Err(e) => {
-                            // Log error type only - don't log content to protect customer data
-                            warn!(error = %e, "Failed to parse text completion chunk");
+                        Err(_) => {
+                            // Don't log error details - may contain customer data
+                            warn!("Failed to parse event");
                             return Err(CompletionError::InvalidResponse(
-                                "Invalid response format".to_string(),
+                                "Failed to parse event".to_string(),
                             ));
                         }
                     }
                 };
                 Ok(Some(chunk))
             }
-            Err(e) => {
-                // Log error type only - don't log content to protect customer data
-                warn!(error = %e, "Failed to parse SSE JSON");
+            Err(_) => {
+                // Don't log error details - may contain customer data
+                warn!("Failed to parse event");
                 Err(CompletionError::InvalidResponse(
-                    "Invalid JSON in SSE event".to_string(),
+                    "Failed to parse event".to_string(),
                 ))
             }
         }

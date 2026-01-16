@@ -297,9 +297,9 @@ impl SSEEventParser for AnthropicEventParser {
         state: &mut Self::State,
         data: &str,
     ) -> Result<Option<StreamChunk>, CompletionError> {
-        let event: AnthropicStreamEvent = serde_json::from_str(data).map_err(|e| {
-            CompletionError::InvalidResponse(format!("Failed to parse Anthropic event: {e}"))
-        })?;
+        // Don't include parse error details - may contain customer data
+        let event: AnthropicStreamEvent = serde_json::from_str(data)
+            .map_err(|_| CompletionError::InvalidResponse("Failed to parse event".to_string()))?;
 
         match event {
             AnthropicStreamEvent::MessageStart { message } => {

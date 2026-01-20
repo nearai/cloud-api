@@ -6,26 +6,18 @@ use services::completions::CompletionError;
 
 impl From<crate::models::Message> for ChatMessage {
     fn from(msg: crate::models::Message) -> Self {
-        // Extract text from MessageContent
-        let content = match msg.content {
-            None => None,
-            Some(crate::models::MessageContent::Text(text)) => Some(text),
-            Some(crate::models::MessageContent::Parts(parts)) => {
-                // Extract text from all text parts and join with newlines
-                let text_parts: Vec<String> = parts
-                    .into_iter()
-                    .filter_map(|part| match part {
-                        crate::models::MessageContentPart::Text { text } => Some(text),
-                        _ => None, // Non-text parts should be filtered out by validation
-                    })
-                    .collect();
-                if text_parts.is_empty() {
-                    None
-                } else {
-                    Some(text_parts.join("\n"))
-                }
-            }
-        };
+        let content = msg.content.map(|c| {
+            let converted = convert_content_to_vllm(c);
+            // Content should be validated before conversion via ChatCompletionRequest::validate()
+            // This fallback is defensive - if reached, it indicates a validation gap
+            serde_json::to_value(&converted).unwrap_or_else(|e| {
+                tracing::error!(
+                    error_type = %e,
+                    "Failed to serialize message content - this should have been caught by validation"
+                );
+                serde_json::Value::Null
+            })
+        });
 
         Self {
             role: match msg.role.as_str() {
@@ -43,8 +35,38 @@ impl From<crate::models::Message> for ChatMessage {
     }
 }
 
+fn convert_content_to_vllm(content: MessageContent) -> MessageContent {
+    match content {
+        MessageContent::Text(text) => MessageContent::Text(text),
+        MessageContent::Parts(parts) => {
+            MessageContent::Parts(parts.into_iter().map(convert_part_to_vllm).collect())
+        }
+    }
+}
+
+fn convert_part_to_vllm(part: MessageContentPart) -> MessageContentPart {
+    match part {
+        MessageContentPart::InputAudio { input_audio } => {
+            let format = input_audio.format.unwrap_or_else(|| "wav".to_string());
+            let data_url = format!("data:audio/{};base64,{}", format, input_audio.data);
+            MessageContentPart::AudioUrl {
+                audio_url: MessageAudioUrl::Object { url: data_url },
+            }
+        }
+        other => other,
+    }
+}
+
 impl From<ChatCompletionRequest> for ChatCompletionParams {
     fn from(req: ChatCompletionRequest) -> Self {
+        let modalities = req
+            .extra
+            .get("modalities")
+            .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok());
+
+        let mut extra = req.extra;
+        extra.remove("modalities");
+
         Self {
             model: req.model,
             messages: req.messages.into_iter().map(|m| m.into()).collect(),
@@ -68,7 +90,8 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
             metadata: None,
             store: None,
             stream_options: None,
-            extra: req.extra,
+            modalities,
+            extra,
         }
     }
 }
@@ -100,8 +123,14 @@ impl From<CompletionRequest> for CompletionParams {
 
 impl From<ChatMessage> for crate::models::Message {
     fn from(msg: ChatMessage) -> Self {
-        // Convert Option<String> to Option<MessageContent>
-        let content = msg.content.map(crate::models::MessageContent::Text);
+        let content = msg.content.and_then(|v| {
+            serde_json::from_value(v.clone()).unwrap_or_else(|_| {
+                // Log warning for debugging but gracefully degrade to None
+                // Don't log the value itself to avoid potential content exposure
+                tracing::warn!("Failed to deserialize message content from provider response");
+                None
+            })
+        });
 
         Self {
             role: match msg.role {
@@ -588,7 +617,10 @@ mod tests {
 
         let domain_msg: ChatMessage = http_msg.into();
         assert!(matches!(domain_msg.role, MessageRole::User));
-        assert_eq!(domain_msg.content, Some("Hello".to_string()));
+        assert_eq!(
+            domain_msg.content,
+            Some(serde_json::Value::String("Hello".to_string()))
+        );
 
         let back_to_http: crate::models::Message = domain_msg.into();
         assert_eq!(back_to_http.role, "user");

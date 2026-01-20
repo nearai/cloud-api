@@ -93,6 +93,8 @@ where
     /// Last error from provider (for determining stop_reason)
     last_error: Option<inference_providers::CompletionError>,
     state: StreamState,
+    /// Whether the model supports TEE attestation (false for external providers)
+    attestation_supported: bool,
 }
 
 impl<S> InterceptStream<S>
@@ -101,7 +103,13 @@ where
 {
     /// Store attestation signature before sending [DONE] to client.
     /// This runs in the hot path to ensure signature is available when client receives [DONE].
+    /// Skipped for external providers that don't support TEE attestation.
     fn create_signature_future(&self) -> FinalizeFuture {
+        // Skip attestation for external providers (OpenAI, Anthropic, Gemini, etc.)
+        if !self.attestation_supported {
+            return Box::pin(async {});
+        }
+
         let chat_id = match &self.last_chat_id {
             Some(id) => id.clone(),
             None => {
@@ -258,6 +266,7 @@ where
                             provider_request_id: Some(chat_id),
                             stop_reason,
                             response_id,
+                            image_count: None,
                         })
                         .await
                         .is_err()
@@ -558,7 +567,7 @@ impl CompletionServiceImpl {
                     "tool" => MessageRole::Tool,
                     _ => MessageRole::User,
                 },
-                content: Some(msg.content.clone()),
+                content: Some(serde_json::Value::String(msg.content.clone())),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
@@ -619,6 +628,7 @@ impl CompletionServiceImpl {
         provider_start_time: Instant,
         concurrent_counter: Option<Arc<AtomicU32>>,
         response_id: Option<ResponseId>,
+        attestation_supported: bool,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
         let metric_tags = Self::create_metric_tags(&model_name);
@@ -659,6 +669,7 @@ impl CompletionServiceImpl {
             last_finish_reason: None,
             last_error: None,
             state: StreamState::Streaming,
+            attestation_supported,
         };
         Box::pin(intercepted_stream)
     }
@@ -710,6 +721,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             metadata: request.metadata,
             store: None,
             stream_options: None,
+            modalities: None,
             extra: request.extra.clone(),
         };
 
@@ -793,6 +805,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 provider_start_time,
                 Some(counter),
                 request.response_id,
+                model.attestation_supported,
             )
             .await;
 
@@ -829,6 +842,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             metadata: request.metadata,
             store: None,
             stream_options: None,
+            modalities: None,
             extra: request.extra.clone(),
         };
 
@@ -904,20 +918,22 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let backend_latency = provider_start_time.elapsed();
         let queue_time = provider_start_time.duration_since(service_start_time);
 
-        // Store attestation signature
-        let attestation_service = self.attestation_service.clone();
-        let chat_id = response_with_bytes.response.id.clone();
-        tokio::spawn(async move {
-            if attestation_service
-                .store_chat_signature_from_provider(chat_id.as_str())
-                .await
-                .is_err()
-            {
-                tracing::error!("Failed to store chat signature");
-            } else {
-                tracing::debug!("Stored signature for chat_id: {}", chat_id);
-            }
-        });
+        // Store attestation signature (only for models that support TEE attestation)
+        if model.attestation_supported {
+            let attestation_service = self.attestation_service.clone();
+            let chat_id = response_with_bytes.response.id.clone();
+            tokio::spawn(async move {
+                if attestation_service
+                    .store_chat_signature_from_provider(chat_id.as_str())
+                    .await
+                    .is_err()
+                {
+                    tracing::error!("Failed to store chat signature");
+                } else {
+                    tracing::debug!("Stored signature for chat_id: {}", chat_id);
+                }
+            });
+        }
 
         // Record metrics with low-cardinality tags only
         let metrics_service = self.metrics_service.clone();
@@ -983,6 +999,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     provider_request_id: Some(provider_request_id),
                     stop_reason: Some(stop_reason),
                     response_id,
+                    image_count: None,
                 })
                 .await
                 .is_err()
@@ -1038,6 +1055,7 @@ mod tests {
                 usage: None,
                 prompt_token_ids: None,
                 system_fingerprint: None,
+                modality: None,
             }),
         };
 
@@ -1063,6 +1081,7 @@ mod tests {
                 }),
                 prompt_token_ids: None,
                 system_fingerprint: None,
+                modality: None,
             }),
         };
 
@@ -1099,6 +1118,7 @@ mod tests {
             last_finish_reason: None,
             last_error: None,
             state: StreamState::Streaming,
+            attestation_supported: true,
         };
 
         // Consume the stream
@@ -1172,6 +1192,7 @@ mod tests {
                 usage: None,
                 prompt_token_ids: None,
                 system_fingerprint: None,
+                modality: None,
             }),
         };
 
@@ -1186,6 +1207,7 @@ mod tests {
                 usage: None,
                 prompt_token_ids: None,
                 system_fingerprint: None,
+                modality: None,
             }),
         };
 
@@ -1210,6 +1232,7 @@ mod tests {
                     prompt_tokens_details: None,
                 }),
                 prompt_token_ids: None,
+                modality: None,
                 system_fingerprint: None,
             }),
         };
@@ -1251,6 +1274,7 @@ mod tests {
             last_finish_reason: None,
             last_error: None,
             state: StreamState::Streaming,
+            attestation_supported: true,
         };
 
         // Consume the stream
@@ -1330,6 +1354,7 @@ mod tests {
                     prompt_tokens_details: None,
                 }),
                 prompt_token_ids: None,
+                modality: None,
                 system_fingerprint: None,
             }),
         };
@@ -1366,6 +1391,7 @@ mod tests {
             last_finish_reason: None,
             last_error: None,
             state: StreamState::Streaming,
+            attestation_supported: true,
         };
 
         let _ = intercept_stream.collect::<Vec<_>>().await;
@@ -1529,6 +1555,7 @@ mod tests {
                 last_finish_reason: None,
                 last_error: None,
                 state: StreamState::Streaming,
+                attestation_supported: true,
             };
             // InterceptStream goes out of scope here and Drop is called
         }

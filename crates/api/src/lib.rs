@@ -16,7 +16,7 @@ use crate::{
             StateStore,
         },
         billing::{get_billing_costs, BillingRouteState},
-        completions::{chat_completions, models},
+        completions::{chat_completions, image_generations, models},
         conversations,
         health::health_check,
         models::{get_model_by_name, list_models, ModelsAppState},
@@ -283,6 +283,38 @@ pub async fn init_domain_services_with_pool(
         database.pool().clone(),
     ));
 
+    // Load external providers from database
+    match models_repo.get_external_models().await {
+        Ok(external_models) => {
+            if !external_models.is_empty() {
+                let models_for_pool: Vec<(String, serde_json::Value)> = external_models
+                    .into_iter()
+                    .filter_map(|model| {
+                        model
+                            .provider_config
+                            .map(|config| (model.model_name, config))
+                    })
+                    .collect();
+
+                if !models_for_pool.is_empty() {
+                    tracing::info!(
+                        count = models_for_pool.len(),
+                        "Loading external providers from database"
+                    );
+                    if let Err(e) = inference_provider_pool
+                        .load_external_providers(models_for_pool)
+                        .await
+                    {
+                        tracing::warn!(error = %e, "Failed to load some external providers");
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to fetch external models from database");
+        }
+    }
+
     // Create conversation service
     let conversation_service = Arc::new(services::ConversationService::new(
         conversation_repo.clone(),
@@ -489,6 +521,7 @@ pub async fn init_inference_providers(
             api_key,
             config.model_discovery.timeout,
             config.model_discovery.inference_timeout,
+            config.external_providers.clone(),
         ),
     );
 
@@ -524,6 +557,7 @@ pub async fn init_inference_providers_with_mocks(
             None,
             5,
             30 * 60,
+            config::ExternalProvidersConfig::default(),
         ),
     );
 
@@ -539,6 +573,8 @@ pub async fn init_inference_providers_with_mocks(
         "nearai/gpt-oss-120b".to_string(),
         "dphn/Dolphin-Mistral-24B-Venice-Edition".to_string(),
         "deepseek-ai/DeepSeek-V3.1".to_string(),
+        "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string(),
+        "Qwen/Qwen-Image-2512".to_string(),
     ];
 
     let providers: Vec<(
@@ -668,6 +704,7 @@ pub fn build_app_with_config(
         database.clone(),
         &auth_components.auth_state_middleware,
         config.clone(),
+        app_state.inference_provider_pool.clone(),
     );
 
     let invitation_routes =
@@ -818,6 +855,7 @@ pub fn build_completion_routes(
 ) -> Router {
     let inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
+        .route("/images/generations", post(image_generations))
         .with_state(app_state.clone())
         .layer(from_fn_with_state(
             usage_state,
@@ -1064,6 +1102,7 @@ pub fn build_admin_routes(
     database: Arc<Database>,
     auth_state_middleware: &AuthState,
     config: Arc<ApiConfig>,
+    inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
 ) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
@@ -1102,6 +1141,7 @@ pub fn build_admin_routes(
         auth_service: auth_state_middleware.auth_service.clone(),
         config,
         admin_access_token_repository,
+        inference_provider_pool,
     };
 
     Router::new()
@@ -1313,6 +1353,7 @@ mod tests {
                 protocol: "grpc".to_string(),
             },
             cors: config::CorsConfig::default(),
+            external_providers: config::ExternalProvidersConfig::default(),
         };
 
         // Initialize services
@@ -1416,6 +1457,7 @@ mod tests {
                 protocol: "grpc".to_string(),
             },
             cors: config::CorsConfig::default(),
+            external_providers: config::ExternalProvidersConfig::default(),
         };
 
         let auth_components = init_auth_services(database.clone(), &config);

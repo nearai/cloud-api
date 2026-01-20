@@ -406,11 +406,20 @@ pub struct Model {
     // Pricing (fixed scale 9 = nano-dollars, USD only)
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
+    pub cost_per_image: i64,
 
     // Model metadata
     pub context_length: i32,
     pub verifiable: bool,
     pub aliases: Vec<String>,
+
+    // Provider configuration
+    /// Provider type: "vllm" (TEE-enabled) or "external" (3rd party)
+    pub provider_type: String,
+    /// JSON config for external providers (backend, base_url, etc.)
+    pub provider_config: Option<serde_json::Value>,
+    /// Whether this model supports TEE attestation
+    pub attestation_supported: bool,
 
     // Tracking fields
     pub is_active: bool,
@@ -425,6 +434,7 @@ pub struct Model {
 pub struct UpdateModelPricingRequest {
     pub input_cost_per_token: Option<i64>,
     pub output_cost_per_token: Option<i64>,
+    pub cost_per_image: Option<i64>,
     pub model_display_name: Option<String>,
     pub model_description: Option<String>,
     pub model_icon: Option<String>,
@@ -433,6 +443,10 @@ pub struct UpdateModelPricingRequest {
     pub is_active: Option<bool>,
     pub aliases: Option<Vec<String>>,
     pub owned_by: Option<String>,
+    // Provider configuration
+    pub provider_type: Option<String>,
+    pub provider_config: Option<serde_json::Value>,
+    pub attestation_supported: Option<bool>,
     // User audit tracking for history
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<Uuid>,
@@ -449,6 +463,7 @@ pub struct ModelHistory {
     // Pricing snapshot (fixed scale 9 = nano-dollars, USD only)
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
+    pub cost_per_image: i64,
 
     // Model metadata snapshot
     pub context_length: i32,
@@ -459,6 +474,11 @@ pub struct ModelHistory {
     pub verifiable: bool,
     pub is_active: bool,
     pub owned_by: String,
+
+    // Provider configuration snapshot
+    pub provider_type: Option<String>,
+    pub provider_config: Option<serde_json::Value>,
+    pub attestation_supported: Option<bool>,
 
     // Temporal fields
     pub effective_from: DateTime<Utc>,
@@ -558,6 +578,8 @@ pub struct OrganizationUsageLog {
     pub stop_reason: Option<StopReason>,
     /// Response ID for Response API calls (FK to responses table)
     pub response_id: Option<ResponseId>,
+    /// Number of images generated (for image generation requests)
+    pub image_count: Option<i32>,
 }
 
 /// Organization balance summary - cached aggregate spending
@@ -599,6 +621,8 @@ pub struct RecordUsageRequest {
     pub stop_reason: Option<StopReason>,
     /// Response ID for Response API calls (FK to responses table)
     pub response_id: Option<ResponseId>,
+    /// Number of images generated (for image generation requests)
+    pub image_count: Option<i32>,
 }
 
 // ============================================

@@ -1,7 +1,12 @@
-use crate::{models::StreamOptions, sse_parser::SSEParser, *};
+use crate::{models::StreamOptions, sse_parser::new_sse_parser, ImageGenerationError, *};
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
+
+/// Convert any displayable error to ImageGenerationError::GenerationError
+fn to_image_gen_error<E: std::fmt::Display>(e: E) -> ImageGenerationError {
+    ImageGenerationError::GenerationError(e.to_string())
+}
 
 /// Encryption header keys used in params.extra for passing encryption information
 mod encryption_headers {
@@ -286,7 +291,7 @@ impl InferenceProvider for VLlmProvider {
         }
 
         // Use the SSE parser to handle the stream properly
-        let sse_stream = SSEParser::new(response.bytes_stream(), true);
+        let sse_stream = new_sse_parser(response.bytes_stream(), true);
         Ok(Box::pin(sse_stream))
     }
 
@@ -392,7 +397,56 @@ impl InferenceProvider for VLlmProvider {
         }
 
         // Use the SSE parser to handle the stream properly
-        let sse_stream = SSEParser::new(response.bytes_stream(), false);
+        let sse_stream = new_sse_parser(response.bytes_stream(), false);
         Ok(Box::pin(sse_stream))
+    }
+
+    /// Performs an image generation request
+    async fn image_generation(
+        &self,
+        params: ImageGenerationParams,
+        request_hash: String,
+    ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
+        let url = format!("{}/v1/images/generations", self.config.base_url);
+
+        let mut headers = self.build_headers().map_err(to_image_gen_error)?;
+
+        headers.insert(
+            "X-Request-Hash",
+            HeaderValue::from_str(&request_hash).map_err(to_image_gen_error)?,
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&params)
+            .send()
+            .await
+            .map_err(to_image_gen_error)?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(ImageGenerationError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        // Get raw bytes first for exact hash verification (same pattern as chat_completion)
+        let raw_bytes = response.bytes().await.map_err(to_image_gen_error)?.to_vec();
+
+        // Parse the response from the raw bytes
+        let image_response: ImageGenerationResponse =
+            serde_json::from_slice(&raw_bytes).map_err(to_image_gen_error)?;
+
+        Ok(ImageGenerationResponseWithBytes {
+            response: image_response,
+            raw_bytes,
+        })
     }
 }

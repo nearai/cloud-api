@@ -7,8 +7,10 @@ use crate::{
     AttestationError, ChatChoice, ChatCompletionChunk, ChatCompletionParams,
     ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseWithBytes,
     ChatDelta, ChatResponseMessage, ChatSignature, CompletionChunk, CompletionError,
-    CompletionParams, FinishReason, FunctionCallDelta, ListModelsError, MessageRole, ModelInfo,
-    ModelsResponse, SSEEvent, StreamChunk, StreamingResult, TokenUsage, ToolCallDelta,
+    CompletionParams, FinishReason, FunctionCallDelta, ImageData, ImageGenerationError,
+    ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes,
+    ListModelsError, MessageRole, ModelInfo, ModelsResponse, SSEEvent, StreamChunk,
+    StreamingResult, TokenUsage, ToolCallDelta,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -83,11 +85,28 @@ impl RequestMatcher {
         }
     }
 
-    /// Extract all text content from messages
+    /// Extract all text content from messages (handles serde_json::Value content)
     fn extract_text_from_messages(messages: &[crate::ChatMessage]) -> String {
         messages
             .iter()
-            .filter_map(|msg| msg.content.as_deref())
+            .filter_map(|msg| msg.content.as_ref())
+            .filter_map(|c| match c {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Array(parts) => {
+                    // Extract text from content parts array
+                    let text: String = parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if text.is_empty() {
+                        None
+                    } else {
+                        Some(text)
+                    }
+                }
+                _ => None,
+            })
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -284,6 +303,7 @@ impl ResponseTemplate {
                     }],
                     usage: Some(TokenUsage::new(input_tokens, output_token_count)),
                     prompt_token_ids: None,
+                    modality: None,
                 });
             }
         }
@@ -327,6 +347,7 @@ impl ResponseTemplate {
                     }],
                     usage: Some(TokenUsage::new(input_tokens, output_token_count)),
                     prompt_token_ids: None,
+                    modality: None,
                 });
             }
         }
@@ -370,6 +391,7 @@ impl ResponseTemplate {
                     }],
                     usage: Some(TokenUsage::new(input_tokens, output_token_count)),
                     prompt_token_ids: None,
+                    modality: None,
                 });
 
                 // Stream arguments split by spaces (like content)
@@ -418,6 +440,7 @@ impl ResponseTemplate {
                         }],
                         usage: Some(TokenUsage::new(input_tokens, output_token_count)),
                         prompt_token_ids: None,
+                        modality: None,
                     });
                 }
             }
@@ -433,6 +456,7 @@ impl ResponseTemplate {
             choices: vec![],
             usage: Some(TokenUsage::new(input_tokens, output_token_count)),
             prompt_token_ids: None,
+            modality: None,
         });
 
         chunks
@@ -684,7 +708,7 @@ impl crate::InferenceProvider for MockProvider {
             .messages
             .iter()
             .filter_map(|m| m.content.as_ref())
-            .map(|c| c.split_whitespace().count() as i32)
+            .map(Self::count_tokens_in_content)
             .sum();
         // Ensure at least some input tokens for very short messages
         let input_tokens = input_tokens.max(6);
@@ -771,7 +795,7 @@ impl crate::InferenceProvider for MockProvider {
             .messages
             .iter()
             .filter_map(|m| m.content.as_ref())
-            .map(|c| c.split_whitespace().count() as i32)
+            .map(Self::count_tokens_in_content)
             .sum();
         // Ensure at least some input tokens for very short messages
         let input_tokens = input_tokens.max(6);
@@ -819,6 +843,47 @@ impl crate::InferenceProvider for MockProvider {
         }));
 
         Ok(Box::pin(stream))
+    }
+
+    async fn image_generation(
+        &self,
+        params: ImageGenerationParams,
+        _request_hash: String,
+    ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
+        // Check for invalid model
+        if !self.is_valid_model(&params.model) {
+            return Err(ImageGenerationError::GenerationError(format!(
+                "The model `{}` does not exist.",
+                params.model
+            )));
+        }
+
+        let n = params.n.unwrap_or(1);
+        let created = self.current_timestamp();
+
+        // Generate mock image data
+        let data: Vec<ImageData> = (0..n)
+            .map(|i| ImageData {
+                b64_json: Some(format!("mock_base64_image_data_{}", i)),
+                url: None,
+                revised_prompt: Some(params.prompt.clone()),
+            })
+            .collect();
+
+        let response = ImageGenerationResponse {
+            id: format!("img-{}", self.generate_id()),
+            created,
+            data,
+        };
+
+        // Serialize to raw bytes for TEE verification consistency
+        let raw_bytes = serde_json::to_vec(&response)
+            .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
+
+        Ok(ImageGenerationResponseWithBytes {
+            response,
+            raw_bytes,
+        })
     }
 
     async fn get_signature(
@@ -896,5 +961,21 @@ impl MockProvider {
         let json_str = json.to_string();
         let sse_line = format!("data: {json_str}\n\n");
         Bytes::from(sse_line)
+    }
+
+    /// Count tokens in content (handles serde_json::Value)
+    fn count_tokens_in_content(content: &serde_json::Value) -> i32 {
+        match content {
+            serde_json::Value::String(s) => s.split_whitespace().count() as i32,
+            serde_json::Value::Array(parts) => {
+                // Sum token counts from text parts
+                parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .map(|t| t.split_whitespace().count() as i32)
+                    .sum()
+            }
+            _ => 0,
+        }
     }
 }

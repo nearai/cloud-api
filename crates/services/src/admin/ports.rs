@@ -6,6 +6,7 @@ use async_trait::async_trait;
 pub struct UpdateModelAdminRequest {
     pub input_cost_per_token: Option<i64>,
     pub output_cost_per_token: Option<i64>,
+    pub cost_per_image: Option<i64>,
     pub model_display_name: Option<String>,
     pub model_description: Option<String>,
     pub model_icon: Option<String>,
@@ -14,6 +15,10 @@ pub struct UpdateModelAdminRequest {
     pub is_active: Option<bool>,
     pub aliases: Option<Vec<String>>,
     pub owned_by: Option<String>,
+    // Provider configuration
+    pub provider_type: Option<String>,
+    pub provider_config: Option<serde_json::Value>,
+    pub attestation_supported: Option<bool>,
     // User audit tracking for history
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<uuid::Uuid>,
@@ -35,11 +40,19 @@ pub struct ModelPricing {
     pub model_icon: Option<String>,
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
+    pub cost_per_image: i64,
     pub context_length: i32,
     pub verifiable: bool,
     pub is_active: bool,
     pub aliases: Vec<String>,
     pub owned_by: String,
+    // Provider configuration
+    /// Provider type: "vllm" (TEE-enabled) or "external" (3rd party)
+    pub provider_type: String,
+    /// JSON config for external providers (backend, base_url, etc.)
+    pub provider_config: Option<serde_json::Value>,
+    /// Whether this model supports TEE attestation
+    pub attestation_supported: bool,
 }
 
 /// Model history entry - includes pricing, context length, and other model attributes
@@ -50,6 +63,7 @@ pub struct ModelHistoryEntry {
     pub model_id: uuid::Uuid,
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
+    pub cost_per_image: i64,
     pub context_length: i32,
     pub model_name: String,
     pub model_display_name: String,
@@ -138,6 +152,7 @@ pub struct AdminModelInfo {
     pub model_icon: Option<String>,
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
+    pub cost_per_image: i64,
     pub context_length: i32,
     pub verifiable: bool,
     pub is_active: bool,
@@ -145,6 +160,13 @@ pub struct AdminModelInfo {
     pub aliases: Vec<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    // Provider configuration
+    /// Provider type: "vllm" (TEE-enabled) or "external" (3rd party)
+    pub provider_type: String,
+    /// JSON config for external providers (backend, base_url, etc.)
+    pub provider_config: Option<serde_json::Value>,
+    /// Whether this model supports TEE attestation
+    pub attestation_supported: bool,
 }
 
 /// Organization information for admin listing (includes spend limit and usage)

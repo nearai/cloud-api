@@ -144,6 +144,7 @@ pub fn test_config_with_db(db_name: &str) -> ApiConfig {
             protocol: std::env::var("TELEMETRY_OTLP_PROTOCOL").unwrap_or("grpc".to_string()),
         },
         cors: config::CorsConfig::default(),
+        external_providers: config::ExternalProvidersConfig::default(),
     }
 }
 
@@ -204,6 +205,17 @@ async fn init_database_connection(config: &config::DatabaseConfig) -> Arc<Databa
     )
 }
 
+pub fn use_real_providers() -> bool {
+    std::env::var("USE_REAL_PROVIDERS")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
+pub fn get_real_discovery_server_url() -> String {
+    std::env::var("MODEL_DISCOVERY_SERVER_URL")
+        .unwrap_or_else(|_| "http://localhost:8080/models".to_string())
+}
+
 async fn build_test_server_components(
     database: Arc<Database>,
     config: ApiConfig,
@@ -241,36 +253,39 @@ async fn build_test_server_components(
     (server, inference_provider_pool, mock_provider)
 }
 
-async fn build_test_server_components_with_real_provider(
+async fn build_test_server_components_with_real_providers(
     database: Arc<Database>,
     config: ApiConfig,
-    shared_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
-) -> axum_test::TestServer {
-    // Ensure the mock user exists even when using a real inference provider
+) -> (
+    axum_test::TestServer,
+    Arc<services::inference_provider_pool::InferenceProviderPool>,
+) {
+    // Create mock user in database for foreign key constraints
     assert_mock_user_in_db(&database).await;
 
-    // Initialize auth components based on the provided config
     let auth_components = init_auth_services(database.clone(), &config);
 
-    // Use the shared inference provider pool instead of creating a new one
+    // Use real inference providers from discovery server
+    let inference_provider_pool = api::init_inference_providers(&config).await;
     let metrics_service = Arc::new(services::metrics::MockMetricsService);
     let domain_services = api::init_domain_services_with_pool(
         database.clone(),
         &config,
         auth_components.organization_service.clone(),
-        shared_provider_pool.clone(),
+        inference_provider_pool.clone(),
         metrics_service,
     )
     .await;
 
-    let config_arc = Arc::new(config);
     let app = build_app_with_config(
         database.clone(),
         auth_components,
         domain_services,
-        config_arc.clone(),
+        Arc::new(config),
     );
-    axum_test::TestServer::new(app).unwrap()
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    (server, inference_provider_pool)
 }
 
 /// Setup test server. Returns guard that must be held to ensure database cleanup.
@@ -308,6 +323,22 @@ pub async fn setup_test_server_with_pool() -> (
     )
 }
 
+/// Setup test server with real providers. Returns guard that must be held to ensure database cleanup.
+pub async fn setup_test_server_real_providers() -> (
+    axum_test::TestServer,
+    Arc<services::inference_provider_pool::InferenceProviderPool>,
+    Arc<Database>,
+    TestDatabaseGuard,
+) {
+    let infra = setup_test_infrastructure_for_real_providers().await;
+
+    let (server, inference_provider_pool) =
+        build_test_server_components_with_real_providers(infra.database.clone(), infra.config)
+            .await;
+
+    (server, inference_provider_pool, infra.database, infra.guard)
+}
+
 /// Common test infrastructure setup (database, config, guard)
 struct TestInfrastructure {
     database: Arc<Database>,
@@ -335,6 +366,42 @@ async fn setup_test_infrastructure() -> TestInfrastructure {
 
     // Create config with the new database name
     let config = test_config_with_db(&db_name);
+    let db_config = config.database.clone();
+
+    // Connect to the new test database
+    let database = init_database_connection(&config.database).await;
+
+    let guard = TestDatabaseGuard { db_name, db_config };
+
+    TestInfrastructure {
+        database,
+        config,
+        guard,
+    }
+}
+
+async fn setup_test_infrastructure_for_real_providers() -> TestInfrastructure {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(tracing::level_filters::LevelFilter::DEBUG)
+        .try_init();
+
+    // Generate a unique test ID for this test's database
+    let test_id = uuid::Uuid::new_v4().to_string();
+
+    // Get base config for database connection info
+    let base_db_config = db_config_for_tests();
+
+    // Create a unique database from the template
+    let db_name = db_setup::create_test_database_from_template(&base_db_config, &test_id)
+        .await
+        .expect("Failed to create test database from template");
+
+    let mut config = test_config_with_db(&db_name);
+    config.model_discovery.discovery_server_url = get_real_discovery_server_url();
+    config.model_discovery.timeout = 30;
+    config.model_discovery.inference_timeout = 5 * 60;
+
     let db_config = config.database.clone();
 
     // Connect to the new test database
@@ -717,6 +784,105 @@ pub async fn setup_deepseek_model(server: &axum_test::TestServer) -> String {
     // Ensure mock provider registers model before test proceeds
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     "deepseek-ai/DeepSeek-V3.1".to_string()
+}
+
+pub async fn setup_qwen_omni_model(server: &axum_test::TestServer) -> String {
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 1500000,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 3000000,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Qwen3-Omni 30B",
+            "modelDescription": "Qwen3-Omni model with audio input/output support",
+            "contextLength": 128000,
+            "verifiable": true,
+            "isActive": true
+        }))
+        .unwrap(),
+    );
+    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    assert_eq!(updated.len(), 1, "Should have updated 1 model");
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string()
+}
+
+pub async fn setup_qwen_image_model(server: &axum_test::TestServer) -> String {
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        "Qwen/Qwen-Image-2512".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 0,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 0,
+                "currency": "USD"
+            },
+            "costPerImage": {
+                "amount": 40000000,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Qwen-Image",
+            "modelDescription": "Qwen Image generation model",
+            "contextLength": 4096,
+            "verifiable": true,
+            "isActive": true
+        }))
+        .unwrap(),
+    );
+    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    assert_eq!(updated.len(), 1, "Should have updated 1 model");
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    "Qwen/Qwen-Image-2512".to_string()
+}
+
+/// Generate a minimal valid WAV audio file as base64
+pub fn create_test_audio_base64() -> String {
+    use base64::Engine;
+
+    // WAV header for 0.1 second of silence at 8kHz mono 16-bit
+    let sample_rate: u32 = 8000;
+    let bits_per_sample: u16 = 16;
+    let num_channels: u16 = 1;
+    let duration_samples: u32 = 800; // 0.1 second at 8kHz
+    let data_size: u32 = duration_samples * (bits_per_sample as u32 / 8) * num_channels as u32;
+    let file_size: u32 = 36 + data_size;
+
+    let mut wav_data = Vec::new();
+
+    // RIFF header
+    wav_data.extend_from_slice(b"RIFF");
+    wav_data.extend_from_slice(&file_size.to_le_bytes());
+    wav_data.extend_from_slice(b"WAVE");
+
+    // fmt chunk
+    wav_data.extend_from_slice(b"fmt ");
+    wav_data.extend_from_slice(&16u32.to_le_bytes()); // chunk size
+    wav_data.extend_from_slice(&1u16.to_le_bytes()); // audio format (PCM)
+    wav_data.extend_from_slice(&num_channels.to_le_bytes());
+    wav_data.extend_from_slice(&sample_rate.to_le_bytes());
+    let byte_rate = sample_rate * num_channels as u32 * bits_per_sample as u32 / 8;
+    wav_data.extend_from_slice(&byte_rate.to_le_bytes());
+    let block_align = num_channels * bits_per_sample / 8;
+    wav_data.extend_from_slice(&block_align.to_le_bytes());
+    wav_data.extend_from_slice(&bits_per_sample.to_le_bytes());
+
+    // data chunk
+    wav_data.extend_from_slice(b"data");
+    wav_data.extend_from_slice(&data_size.to_le_bytes());
+
+    // Silence (zeros)
+    wav_data.extend(vec![0u8; data_size as usize]);
+
+    base64::engine::general_purpose::STANDARD.encode(&wav_data)
 }
 
 pub async fn admin_batch_upsert_models(

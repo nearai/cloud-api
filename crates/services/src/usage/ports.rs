@@ -276,6 +276,8 @@ pub struct RecordUsageServiceRequest {
     pub stop_reason: Option<StopReason>,
     /// Response ID for Response API calls (FK to responses table)
     pub response_id: Option<ResponseId>,
+    /// Number of images generated (for image generation requests)
+    pub image_count: Option<i32>,
 }
 
 /// Request to record usage (database layer)
@@ -305,6 +307,8 @@ pub struct RecordUsageDbRequest {
     pub stop_reason: Option<StopReason>,
     /// Response ID for Response API calls (FK to responses table)
     pub response_id: Option<ResponseId>,
+    /// Number of images generated (for image generation requests)
+    pub image_count: Option<i32>,
 }
 
 /// Model pricing information
@@ -315,6 +319,7 @@ pub struct ModelPricing {
     pub model_name: String, // Canonical model name
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
+    pub cost_per_image: i64,
 }
 
 /// Organization spending limit
@@ -393,6 +398,8 @@ pub struct UsageLogEntry {
     pub stop_reason: Option<StopReason>,
     /// Response ID for Response API calls (FK to responses table)
     pub response_id: Option<ResponseId>,
+    /// Number of images generated (for image generation requests)
+    pub image_count: Option<i32>,
 }
 
 // ============================================

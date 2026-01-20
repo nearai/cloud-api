@@ -46,6 +46,7 @@ impl AdminRepository for AdminCompositeRepository {
         let db_request = UpdateModelPricingRequest {
             input_cost_per_token: request.input_cost_per_token,
             output_cost_per_token: request.output_cost_per_token,
+            cost_per_image: request.cost_per_image,
             model_display_name: request.model_display_name,
             model_description: request.model_description,
             model_icon: request.model_icon,
@@ -54,6 +55,9 @@ impl AdminRepository for AdminCompositeRepository {
             is_active: request.is_active,
             aliases: request.aliases.clone(),
             owned_by: request.owned_by,
+            provider_type: request.provider_type,
+            provider_config: request.provider_config,
+            attestation_supported: request.attestation_supported,
             change_reason: request.change_reason,
             changed_by_user_id: request.changed_by_user_id,
             changed_by_user_email: request.changed_by_user_email,
@@ -77,11 +81,15 @@ impl AdminRepository for AdminCompositeRepository {
             model_icon: model.model_icon,
             input_cost_per_token: model.input_cost_per_token,
             output_cost_per_token: model.output_cost_per_token,
+            cost_per_image: model.cost_per_image,
             context_length: model.context_length,
             verifiable: model.verifiable,
             is_active: model.is_active,
             aliases: model.aliases,
             owned_by: model.owned_by,
+            provider_type: model.provider_type,
+            provider_config: model.provider_config,
+            attestation_supported: model.attestation_supported,
         })
     }
 
@@ -108,6 +116,7 @@ impl AdminRepository for AdminCompositeRepository {
                 model_id: h.model_id,
                 input_cost_per_token: h.input_cost_per_token,
                 output_cost_per_token: h.output_cost_per_token,
+                cost_per_image: h.cost_per_image,
                 context_length: h.context_length,
                 model_name: h.model_name,
                 model_display_name: h.model_display_name,
@@ -294,6 +303,7 @@ impl AdminRepository for AdminCompositeRepository {
                 model_icon: m.model_icon,
                 input_cost_per_token: m.input_cost_per_token,
                 output_cost_per_token: m.output_cost_per_token,
+                cost_per_image: m.cost_per_image,
                 context_length: m.context_length,
                 verifiable: m.verifiable,
                 is_active: m.is_active,
@@ -301,6 +311,9 @@ impl AdminRepository for AdminCompositeRepository {
                 aliases: m.aliases,
                 created_at: m.created_at,
                 updated_at: m.updated_at,
+                provider_type: m.provider_type,
+                provider_config: m.provider_config,
+                attestation_supported: m.attestation_supported,
             })
             .collect();
 

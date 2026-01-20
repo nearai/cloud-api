@@ -526,6 +526,7 @@ pub async fn create_response(
                                 logprobs: vec![],
                             }],
                             model: request.model,
+                            metadata: None,
                         }],
                         parallel_tool_calls: request.parallel_tool_calls.unwrap_or(false),
                         previous_response_id: request.previous_response_id.clone(),

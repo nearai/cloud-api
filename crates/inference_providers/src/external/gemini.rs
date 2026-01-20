@@ -5,13 +5,16 @@
 
 use super::backend::{BackendConfig, ExternalBackend};
 use crate::{
-    BufferedSSEParser, ChatChoice, ChatCompletionChunk, ChatCompletionParams,
-    ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseWithBytes,
-    ChatDelta, ChatResponseMessage, CompletionError, ImageData, ImageGenerationError,
-    ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes, MessageRole,
-    SSEEventParser, StreamChunk, StreamingResult, TokenUsage,
+    AudioError, AudioSpeechParams, AudioSpeechResponseWithBytes, AudioTranscriptionParams,
+    AudioTranscriptionResponse, AudioTranscriptionResponseWithBytes, BufferedSSEParser, ChatChoice,
+    ChatCompletionChunk, ChatCompletionParams, ChatCompletionResponse,
+    ChatCompletionResponseChoice, ChatCompletionResponseWithBytes, ChatDelta, ChatResponseMessage,
+    CompletionError, ImageData, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponse, ImageGenerationResponseWithBytes, MessageRole, SSEEventParser,
+    StreamChunk, StreamingResult, TokenUsage,
 };
 use async_trait::async_trait;
+use base64::Engine;
 use bytes::Bytes;
 use futures_util::Stream;
 use reqwest::Client;
@@ -254,6 +257,164 @@ struct GeminiGeneratedImage {
 struct GeminiImageData {
     /// Base64-encoded image bytes
     image_bytes: String,
+}
+
+// ==================== Google Cloud Text-to-Speech Structures ====================
+
+/// Google Cloud TTS synthesis request
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleTtsRequest {
+    input: GoogleTtsInput,
+    voice: GoogleTtsVoice,
+    audio_config: GoogleTtsAudioConfig,
+}
+
+/// Input for TTS synthesis
+#[derive(Debug, Clone, Serialize)]
+struct GoogleTtsInput {
+    text: String,
+}
+
+/// Voice selection for TTS
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleTtsVoice {
+    language_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssml_gender: Option<String>,
+}
+
+/// Audio configuration for TTS output
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleTtsAudioConfig {
+    audio_encoding: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speaking_rate: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pitch: Option<f32>,
+}
+
+/// Google Cloud TTS synthesis response
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleTtsResponse {
+    audio_content: String,
+}
+
+// ==================== Google Cloud Speech-to-Text Structures ====================
+
+/// Google Cloud STT recognition request
+#[derive(Debug, Clone, Serialize)]
+struct GoogleSttRequest {
+    config: GoogleSttConfig,
+    audio: GoogleSttAudio,
+}
+
+/// STT recognition configuration
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleSttConfig {
+    encoding: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sample_rate_hertz: Option<i32>,
+    language_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_automatic_punctuation: Option<bool>,
+}
+
+/// Audio data for STT
+#[derive(Debug, Clone, Serialize)]
+struct GoogleSttAudio {
+    content: String,
+}
+
+/// Google Cloud STT recognition response
+#[derive(Debug, Clone, Deserialize)]
+struct GoogleSttResponse {
+    #[serde(default)]
+    results: Vec<GoogleSttResult>,
+}
+
+/// STT recognition result
+#[derive(Debug, Clone, Deserialize)]
+struct GoogleSttResult {
+    #[serde(default)]
+    alternatives: Vec<GoogleSttAlternative>,
+}
+
+/// STT recognition alternative
+#[derive(Debug, Clone, Deserialize)]
+struct GoogleSttAlternative {
+    transcript: String,
+    #[serde(default)]
+    confidence: f32,
+}
+
+/// Map voice name to Google Cloud TTS voice parameters
+fn map_voice_to_google_tts(voice: &str) -> (String, Option<String>, Option<String>) {
+    // Map OpenAI-style voices to Google Cloud TTS voices
+    // Format: (language_code, voice_name, ssml_gender)
+    match voice.to_lowercase().as_str() {
+        "alloy" => ("en-US".to_string(), Some("en-US-Neural2-D".to_string()), None),
+        "echo" => ("en-US".to_string(), Some("en-US-Neural2-A".to_string()), None),
+        "fable" => ("en-GB".to_string(), Some("en-GB-Neural2-B".to_string()), None),
+        "onyx" => ("en-US".to_string(), Some("en-US-Neural2-J".to_string()), None),
+        "nova" => ("en-US".to_string(), Some("en-US-Neural2-F".to_string()), None),
+        "shimmer" => ("en-US".to_string(), Some("en-US-Neural2-C".to_string()), None),
+        // If it looks like a Google voice name (contains language code), use it directly
+        v if v.contains("-") && (v.contains("en-") || v.contains("es-") || v.contains("fr-")) => {
+            let parts: Vec<&str> = v.split('-').collect();
+            if parts.len() >= 2 {
+                let lang = format!("{}-{}", parts[0], parts[1].to_uppercase());
+                (lang, Some(v.to_string()), None)
+            } else {
+                ("en-US".to_string(), Some(v.to_string()), None)
+            }
+        }
+        _ => ("en-US".to_string(), None, Some("NEUTRAL".to_string())),
+    }
+}
+
+/// Map OpenAI audio format to Google Cloud encoding
+fn map_audio_format_to_google(format: Option<&String>) -> String {
+    match format.map(|s| s.to_lowercase()).as_deref() {
+        Some("mp3") => "MP3".to_string(),
+        Some("opus") => "OGG_OPUS".to_string(),
+        Some("aac") => "MP3".to_string(), // Google doesn't support AAC, fallback to MP3
+        Some("flac") => "FLAC".to_string(),
+        Some("wav") => "LINEAR16".to_string(),
+        Some("pcm") => "LINEAR16".to_string(),
+        _ => "MP3".to_string(), // Default to MP3
+    }
+}
+
+/// Get content type from Google encoding
+fn google_encoding_to_content_type(encoding: &str) -> &'static str {
+    match encoding {
+        "MP3" => "audio/mpeg",
+        "OGG_OPUS" => "audio/ogg",
+        "FLAC" => "audio/flac",
+        "LINEAR16" => "audio/wav",
+        _ => "audio/mpeg",
+    }
+}
+
+/// Map audio file extension to Google STT encoding
+fn map_file_extension_to_google_stt_encoding(filename: &str) -> String {
+    let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
+    match ext.as_str() {
+        "mp3" => "MP3".to_string(),
+        "wav" => "LINEAR16".to_string(),
+        "flac" => "FLAC".to_string(),
+        "ogg" => "OGG_OPUS".to_string(),
+        "webm" => "WEBM_OPUS".to_string(),
+        "m4a" => "MP3".to_string(), // Fallback
+        _ => "LINEAR16".to_string(), // Default
+    }
 }
 
 /// Strip vendor prefix from model name (e.g., "google/gemini-2.0-flash" -> "gemini-2.0-flash")
@@ -742,6 +903,220 @@ impl ExternalBackend for GeminiBackend {
         Ok(ImageGenerationResponseWithBytes {
             response: openai_response,
             raw_bytes: serialized_bytes,
+        })
+    }
+
+    async fn audio_transcription(
+        &self,
+        config: &BackendConfig,
+        _model: &str,
+        params: AudioTranscriptionParams,
+    ) -> Result<AudioTranscriptionResponseWithBytes, AudioError> {
+        // Google Cloud Speech-to-Text API endpoint
+        let url = "https://speech.googleapis.com/v1/speech:recognize";
+
+        // Encode audio data to base64
+        let audio_content =
+            base64::engine::general_purpose::STANDARD.encode(&params.audio_data);
+
+        // Determine encoding from filename
+        let encoding = map_file_extension_to_google_stt_encoding(&params.filename);
+
+        // Build request
+        let stt_config = GoogleSttConfig {
+            encoding,
+            sample_rate_hertz: Some(16000), // Default sample rate
+            language_code: params.language.clone().unwrap_or_else(|| "en-US".to_string()),
+            enable_automatic_punctuation: Some(true),
+        };
+
+        let request = GoogleSttRequest {
+            config: stt_config,
+            audio: GoogleSttAudio {
+                content: audio_content,
+            },
+        };
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "Content-Type",
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            "x-goog-api-key",
+            reqwest::header::HeaderValue::from_str(&config.api_key)
+                .map_err(|e| AudioError::HttpError {
+                    status_code: 0,
+                    message: format!("Invalid API key: {e}"),
+                })?,
+        );
+
+        let timeout = std::time::Duration::from_secs(config.timeout_seconds as u64);
+
+        let response = self
+            .client
+            .post(url)
+            .headers(headers)
+            .timeout(timeout)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e: reqwest::Error| AudioError::HttpError {
+                status_code: 0,
+                message: e.to_string(),
+            })?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AudioError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        let raw_bytes = response
+            .bytes()
+            .await
+            .map_err(|e: reqwest::Error| AudioError::HttpError {
+                status_code: 0,
+                message: e.to_string(),
+            })?
+            .to_vec();
+
+        let stt_response: GoogleSttResponse =
+            serde_json::from_slice(&raw_bytes).map_err(|e| {
+                AudioError::TranscriptionFailed(format!("Failed to parse STT response: {e}"))
+            })?;
+
+        // Extract transcript from results
+        let transcript = stt_response
+            .results
+            .iter()
+            .filter_map(|r| r.alternatives.first())
+            .map(|a| a.transcript.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let response = AudioTranscriptionResponse {
+            text: transcript,
+            task: Some("transcribe".to_string()),
+            language: params.language,
+            duration: None,
+            words: None,
+            segments: None,
+        };
+
+        // Re-serialize for consistent raw bytes
+        let serialized_bytes = serde_json::to_vec(&response).map_err(|e| {
+            AudioError::TranscriptionFailed(format!("Failed to serialize response: {e}"))
+        })?;
+
+        Ok(AudioTranscriptionResponseWithBytes {
+            response,
+            raw_bytes: serialized_bytes,
+            audio_duration_seconds: None,
+        })
+    }
+
+    async fn audio_speech(
+        &self,
+        config: &BackendConfig,
+        _model: &str,
+        params: AudioSpeechParams,
+    ) -> Result<AudioSpeechResponseWithBytes, AudioError> {
+        // Google Cloud Text-to-Speech API endpoint
+        let url = "https://texttospeech.googleapis.com/v1/text:synthesize";
+
+        // Map voice to Google TTS parameters
+        let (language_code, voice_name, ssml_gender) = map_voice_to_google_tts(&params.voice);
+
+        // Map audio format
+        let audio_encoding = map_audio_format_to_google(params.response_format.as_ref());
+        let content_type = google_encoding_to_content_type(&audio_encoding);
+
+        let request = GoogleTtsRequest {
+            input: GoogleTtsInput {
+                text: params.input.clone(),
+            },
+            voice: GoogleTtsVoice {
+                language_code,
+                name: voice_name,
+                ssml_gender,
+            },
+            audio_config: GoogleTtsAudioConfig {
+                audio_encoding: audio_encoding.clone(),
+                speaking_rate: params.speed,
+                pitch: None,
+            },
+        };
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "Content-Type",
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            "x-goog-api-key",
+            reqwest::header::HeaderValue::from_str(&config.api_key)
+                .map_err(|e| AudioError::HttpError {
+                    status_code: 0,
+                    message: format!("Invalid API key: {e}"),
+                })?,
+        );
+
+        let timeout = std::time::Duration::from_secs(config.timeout_seconds as u64);
+
+        let response = self
+            .client
+            .post(url)
+            .headers(headers)
+            .timeout(timeout)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e: reqwest::Error| AudioError::HttpError {
+                status_code: 0,
+                message: e.to_string(),
+            })?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AudioError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        let raw_bytes = response
+            .bytes()
+            .await
+            .map_err(|e: reqwest::Error| AudioError::HttpError {
+                status_code: 0,
+                message: e.to_string(),
+            })?
+            .to_vec();
+
+        let tts_response: GoogleTtsResponse = serde_json::from_slice(&raw_bytes)
+            .map_err(|e| AudioError::SynthesisFailed(format!("Failed to parse TTS response: {e}")))?;
+
+        // Decode base64 audio content
+        let audio_data = base64::engine::general_purpose::STANDARD
+            .decode(&tts_response.audio_content)
+            .map_err(|e| AudioError::SynthesisFailed(format!("Failed to decode audio: {e}")))?;
+
+        Ok(AudioSpeechResponseWithBytes {
+            audio_data,
+            content_type: content_type.to_string(),
+            raw_bytes,
+            character_count: params.input.len() as i32,
         })
     }
 }

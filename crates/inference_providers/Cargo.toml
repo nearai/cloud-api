@@ -8,6 +8,7 @@ description.workspace = true
 
 [dependencies]
 async-trait = "0.1"
+base64 = "0.22"
 bytes = "1.11"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }

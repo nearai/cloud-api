@@ -664,6 +664,7 @@ impl ResponseServiceImpl {
             role: "assistant".to_string(),
             content: vec![],
             model: ctx.model.clone(),
+            metadata: None,
         };
         emitter
             .emit_item_added(ctx, item, message_item_id.to_string())
@@ -728,6 +729,7 @@ impl ResponseServiceImpl {
                 logprobs: vec![],
             }],
             model: ctx.model.clone(),
+            metadata: None,
         };
 
         // CRITICAL: Store to database FIRST before emitting events
@@ -1450,6 +1452,7 @@ impl ResponseServiceImpl {
                         text: trimmed_text.to_string(),
                     }],
                     model: model.to_string(),
+                    metadata: None,
                 };
 
                 response_items_repository
@@ -1532,6 +1535,7 @@ impl ResponseServiceImpl {
                         role,
                         content,
                         model: model.to_string(),
+                        metadata: None,
                     };
 
                     response_items_repository
@@ -3086,6 +3090,7 @@ mod tests {
                 content: vec![],
                 status: models::ResponseItemStatus::Completed,
                 model: "test-model".to_string(),
+                metadata: None,
             },
             models::ResponseOutputItem::Message {
                 id: "msg_2".to_string(),
@@ -3097,6 +3102,7 @@ mod tests {
                 content: vec![],
                 status: models::ResponseItemStatus::Completed,
                 model: "test-model".to_string(),
+                metadata: None,
             },
         ];
 
@@ -3127,6 +3133,7 @@ mod tests {
                 content: vec![],
                 status: models::ResponseItemStatus::Completed,
                 model: "test-model".to_string(),
+                metadata: None,
             },
             // resp_b has a message
             models::ResponseOutputItem::Message {
@@ -3139,6 +3146,7 @@ mod tests {
                 content: vec![],
                 status: models::ResponseItemStatus::Completed,
                 model: "test-model".to_string(),
+                metadata: None,
             },
             // resp_b also has a tool call (same response_id, multiple items)
             models::ResponseOutputItem::ToolCall {
@@ -3165,6 +3173,7 @@ mod tests {
                 content: vec![],
                 status: models::ResponseItemStatus::Completed,
                 model: "test-model".to_string(),
+                metadata: None,
             },
             models::ResponseOutputItem::Message {
                 id: "msg_d".to_string(),
@@ -3176,6 +3185,7 @@ mod tests {
                 content: vec![],
                 status: models::ResponseItemStatus::Completed,
                 model: "test-model".to_string(),
+                metadata: None,
             },
         ];
 
@@ -3223,6 +3233,7 @@ mod tests {
             content: vec![],
             status: models::ResponseItemStatus::Completed,
             model: "test-model".to_string(),
+            metadata: None,
         }];
 
         let result = ResponseServiceImpl::filter_to_ancestor_branch(
@@ -3245,6 +3256,7 @@ mod tests {
             content: vec![],
             status: models::ResponseItemStatus::Completed,
             model: "test-model".to_string(),
+            metadata: None,
         }];
 
         // Target "resp_z" doesn't exist - should return only items for "resp_z" (none)

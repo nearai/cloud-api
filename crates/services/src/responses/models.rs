@@ -455,6 +455,8 @@ pub enum ResponseOutputItem {
         role: String,
         content: Vec<ResponseContentItem>,
         model: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
     },
     #[serde(rename = "tool_call")]
     ToolCall {

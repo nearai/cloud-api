@@ -19,6 +19,7 @@ use utoipa::{Modify, OpenApi};
     ),
     tags(
         (name = "Chat", description = "Chat completion endpoints for AI model inference"),
+        (name = "Images", description = "Image generation endpoints"),
         (name = "Models", description = "Public model catalog and information"),
         (name = "Conversations", description = "Conversation management"),
         (name = "Responses", description = "Response handling and streaming"),
@@ -37,6 +38,7 @@ use utoipa::{Modify, OpenApi};
     paths(
         // Chat completion endpoints (most important for users)
         crate::routes::completions::chat_completions,
+        crate::routes::completions::image_generations,
         // crate::routes::completions::completions,
         crate::routes::completions::models,
         // Model endpoints (public model catalog)

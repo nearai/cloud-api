@@ -145,10 +145,8 @@ pub trait AudioServiceTrait: Send + Sync {
     ///
     /// Converts text to audio using the specified model and voice.
     /// Returns the complete audio data.
-    async fn synthesize(
-        &self,
-        request: SpeechRequest,
-    ) -> Result<SpeechResponse, AudioServiceError>;
+    async fn synthesize(&self, request: SpeechRequest)
+        -> Result<SpeechResponse, AudioServiceError>;
 
     /// Synthesize text to speech (streaming)
     ///

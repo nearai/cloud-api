@@ -201,7 +201,10 @@ pub enum ServerEvent {
     InputAudioBufferCleared,
     /// Speech detected in audio
     #[serde(rename = "input_audio_buffer.speech_started")]
-    InputAudioBufferSpeechStarted { audio_start_ms: i32, item_id: String },
+    InputAudioBufferSpeechStarted {
+        audio_start_ms: i32,
+        item_id: String,
+    },
     /// Speech ended in audio
     #[serde(rename = "input_audio_buffer.speech_stopped")]
     InputAudioBufferSpeechStopped { audio_end_ms: i32, item_id: String },
@@ -210,10 +213,7 @@ pub enum ServerEvent {
     ConversationItemCreated { item: ConversationItem },
     /// Audio transcription completed
     #[serde(rename = "conversation.item.input_audio_transcription.completed")]
-    ConversationItemInputAudioTranscriptionCompleted {
-        item_id: String,
-        transcript: String,
-    },
+    ConversationItemInputAudioTranscriptionCompleted { item_id: String, transcript: String },
     /// Response created
     #[serde(rename = "response.created")]
     ResponseCreated { response: ResponseInfo },

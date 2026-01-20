@@ -8,9 +8,11 @@ pub mod ports;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures::stream;
-use inference_providers::{AudioSpeechParams, AudioTranscriptionParams, ChatCompletionParams, ChatMessage, MessageRole};
+use inference_providers::{
+    AudioSpeechParams, AudioTranscriptionParams, ChatCompletionParams, ChatMessage, MessageRole,
+};
 use ports::{
-    ConversationItem, ConversationMessage, ContentPart, RealtimeError, RealtimeServiceTrait,
+    ContentPart, ConversationItem, ConversationMessage, RealtimeError, RealtimeServiceTrait,
     RealtimeSession, ResponseInfo, ServerEvent, ServerEventStream, SessionConfig,
     TranscriptionResult, WorkspaceContext,
 };
@@ -32,7 +34,11 @@ impl RealtimeServiceImpl {
 
     /// Generate a unique ID for items
     fn generate_id(prefix: &str) -> String {
-        format!("{}_{}", prefix, Uuid::new_v4().to_string().replace("-", "")[..24].to_string())
+        format!(
+            "{}_{}",
+            prefix,
+            Uuid::new_v4().to_string().replace("-", "")[..24].to_string()
+        )
     }
 
     /// Convert conversation context to chat messages

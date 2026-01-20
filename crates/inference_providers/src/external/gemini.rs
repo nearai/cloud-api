@@ -351,6 +351,7 @@ struct GoogleSttResult {
 struct GoogleSttAlternative {
     transcript: String,
     #[serde(default)]
+    #[allow(dead_code)]
     confidence: f32,
 }
 
@@ -359,12 +360,36 @@ fn map_voice_to_google_tts(voice: &str) -> (String, Option<String>, Option<Strin
     // Map OpenAI-style voices to Google Cloud TTS voices
     // Format: (language_code, voice_name, ssml_gender)
     match voice.to_lowercase().as_str() {
-        "alloy" => ("en-US".to_string(), Some("en-US-Neural2-D".to_string()), None),
-        "echo" => ("en-US".to_string(), Some("en-US-Neural2-A".to_string()), None),
-        "fable" => ("en-GB".to_string(), Some("en-GB-Neural2-B".to_string()), None),
-        "onyx" => ("en-US".to_string(), Some("en-US-Neural2-J".to_string()), None),
-        "nova" => ("en-US".to_string(), Some("en-US-Neural2-F".to_string()), None),
-        "shimmer" => ("en-US".to_string(), Some("en-US-Neural2-C".to_string()), None),
+        "alloy" => (
+            "en-US".to_string(),
+            Some("en-US-Neural2-D".to_string()),
+            None,
+        ),
+        "echo" => (
+            "en-US".to_string(),
+            Some("en-US-Neural2-A".to_string()),
+            None,
+        ),
+        "fable" => (
+            "en-GB".to_string(),
+            Some("en-GB-Neural2-B".to_string()),
+            None,
+        ),
+        "onyx" => (
+            "en-US".to_string(),
+            Some("en-US-Neural2-J".to_string()),
+            None,
+        ),
+        "nova" => (
+            "en-US".to_string(),
+            Some("en-US-Neural2-F".to_string()),
+            None,
+        ),
+        "shimmer" => (
+            "en-US".to_string(),
+            Some("en-US-Neural2-C".to_string()),
+            None,
+        ),
         // If it looks like a Google voice name (contains language code), use it directly
         v if v.contains("-") && (v.contains("en-") || v.contains("es-") || v.contains("fr-")) => {
             let parts: Vec<&str> = v.split('-').collect();
@@ -412,7 +437,7 @@ fn map_file_extension_to_google_stt_encoding(filename: &str) -> String {
         "flac" => "FLAC".to_string(),
         "ogg" => "OGG_OPUS".to_string(),
         "webm" => "WEBM_OPUS".to_string(),
-        "m4a" => "MP3".to_string(), // Fallback
+        "m4a" => "MP3".to_string(),  // Fallback
         _ => "LINEAR16".to_string(), // Default
     }
 }
@@ -916,8 +941,7 @@ impl ExternalBackend for GeminiBackend {
         let url = "https://speech.googleapis.com/v1/speech:recognize";
 
         // Encode audio data to base64
-        let audio_content =
-            base64::engine::general_purpose::STANDARD.encode(&params.audio_data);
+        let audio_content = base64::engine::general_purpose::STANDARD.encode(&params.audio_data);
 
         // Determine encoding from filename
         let encoding = map_file_extension_to_google_stt_encoding(&params.filename);
@@ -926,7 +950,10 @@ impl ExternalBackend for GeminiBackend {
         let stt_config = GoogleSttConfig {
             encoding,
             sample_rate_hertz: Some(16000), // Default sample rate
-            language_code: params.language.clone().unwrap_or_else(|| "en-US".to_string()),
+            language_code: params
+                .language
+                .clone()
+                .unwrap_or_else(|| "en-US".to_string()),
             enable_automatic_punctuation: Some(true),
         };
 
@@ -944,11 +971,12 @@ impl ExternalBackend for GeminiBackend {
         );
         headers.insert(
             "x-goog-api-key",
-            reqwest::header::HeaderValue::from_str(&config.api_key)
-                .map_err(|e| AudioError::HttpError {
+            reqwest::header::HeaderValue::from_str(&config.api_key).map_err(|e| {
+                AudioError::HttpError {
                     status_code: 0,
                     message: format!("Invalid API key: {e}"),
-                })?,
+                }
+            })?,
         );
 
         let timeout = std::time::Duration::from_secs(config.timeout_seconds as u64);
@@ -987,10 +1015,9 @@ impl ExternalBackend for GeminiBackend {
             })?
             .to_vec();
 
-        let stt_response: GoogleSttResponse =
-            serde_json::from_slice(&raw_bytes).map_err(|e| {
-                AudioError::TranscriptionFailed(format!("Failed to parse STT response: {e}"))
-            })?;
+        let stt_response: GoogleSttResponse = serde_json::from_slice(&raw_bytes).map_err(|e| {
+            AudioError::TranscriptionFailed(format!("Failed to parse STT response: {e}"))
+        })?;
 
         // Extract transcript from results
         let transcript = stt_response
@@ -1061,11 +1088,12 @@ impl ExternalBackend for GeminiBackend {
         );
         headers.insert(
             "x-goog-api-key",
-            reqwest::header::HeaderValue::from_str(&config.api_key)
-                .map_err(|e| AudioError::HttpError {
+            reqwest::header::HeaderValue::from_str(&config.api_key).map_err(|e| {
+                AudioError::HttpError {
                     status_code: 0,
                     message: format!("Invalid API key: {e}"),
-                })?,
+                }
+            })?,
         );
 
         let timeout = std::time::Duration::from_secs(config.timeout_seconds as u64);
@@ -1104,8 +1132,9 @@ impl ExternalBackend for GeminiBackend {
             })?
             .to_vec();
 
-        let tts_response: GoogleTtsResponse = serde_json::from_slice(&raw_bytes)
-            .map_err(|e| AudioError::SynthesisFailed(format!("Failed to parse TTS response: {e}")))?;
+        let tts_response: GoogleTtsResponse = serde_json::from_slice(&raw_bytes).map_err(|e| {
+            AudioError::SynthesisFailed(format!("Failed to parse TTS response: {e}"))
+        })?;
 
         // Decode base64 audio content
         let audio_data = base64::engine::general_purpose::STANDARD

@@ -465,15 +465,16 @@ impl InferenceProvider for VLlmProvider {
 
         let mut headers = self
             .build_headers()
-            .map_err(|e| AudioError::TranscriptionFailed(e))?;
+            .map_err(AudioError::TranscriptionFailed)?;
 
         // Remove Content-Type header as reqwest will set it for multipart
         headers.remove("Content-Type");
 
         headers.insert(
             "X-Request-Hash",
-            HeaderValue::from_str(&request_hash)
-                .map_err(|e| AudioError::TranscriptionFailed(format!("Invalid request hash: {e}")))?,
+            HeaderValue::from_str(&request_hash).map_err(|e| {
+                AudioError::TranscriptionFailed(format!("Invalid request hash: {e}"))
+            })?,
         );
 
         // Build multipart form
@@ -531,9 +532,8 @@ impl InferenceProvider for VLlmProvider {
             .map_err(|e: reqwest::Error| AudioError::TranscriptionFailed(e.to_string()))?
             .to_vec();
 
-        let transcription_response: AudioTranscriptionResponse =
-            serde_json::from_slice(&raw_bytes)
-                .map_err(|e| AudioError::TranscriptionFailed(format!("Invalid response: {e}")))?;
+        let transcription_response: AudioTranscriptionResponse = serde_json::from_slice(&raw_bytes)
+            .map_err(|e| AudioError::TranscriptionFailed(format!("Invalid response: {e}")))?;
 
         let audio_duration_seconds = transcription_response.duration;
 
@@ -552,9 +552,7 @@ impl InferenceProvider for VLlmProvider {
     ) -> Result<AudioSpeechResponseWithBytes, AudioError> {
         let url = format!("{}/v1/audio/speech", self.config.base_url);
 
-        let mut headers = self
-            .build_headers()
-            .map_err(|e| AudioError::SynthesisFailed(e))?;
+        let mut headers = self.build_headers().map_err(AudioError::SynthesisFailed)?;
 
         headers.insert(
             "X-Request-Hash",
@@ -615,9 +613,7 @@ impl InferenceProvider for VLlmProvider {
     ) -> Result<AudioStreamingResult, AudioError> {
         let url = format!("{}/v1/audio/speech", self.config.base_url);
 
-        let mut headers = self
-            .build_headers()
-            .map_err(|e| AudioError::SynthesisFailed(e))?;
+        let mut headers = self.build_headers().map_err(AudioError::SynthesisFailed)?;
 
         headers.insert(
             "X-Request-Hash",

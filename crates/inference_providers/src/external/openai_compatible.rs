@@ -259,7 +259,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
 
         let mut headers = self
             .build_headers(config)
-            .map_err(|e| AudioError::TranscriptionFailed(e))?;
+            .map_err(AudioError::TranscriptionFailed)?;
 
         // Remove Content-Type as it will be set by multipart
         headers.remove("Content-Type");
@@ -316,15 +316,23 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             });
         }
 
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|value| value.to_string());
+
         let raw_bytes = response
             .bytes()
             .await
             .map_err(|e: reqwest::Error| AudioError::TranscriptionFailed(e.to_string()))?
             .to_vec();
 
-        let transcription_response: AudioTranscriptionResponse =
-            serde_json::from_slice(&raw_bytes)
-                .map_err(|e| AudioError::TranscriptionFailed(format!("Invalid response: {e}")))?;
+        let transcription_response = Self::parse_transcription_response(
+            &raw_bytes,
+            params.response_format.as_deref(),
+            content_type.as_deref(),
+        )?;
 
         let audio_duration_seconds = transcription_response.duration;
 
@@ -345,7 +353,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
 
         let headers = self
             .build_headers(config)
-            .map_err(|e| AudioError::SynthesisFailed(e))?;
+            .map_err(AudioError::SynthesisFailed)?;
 
         let character_count = params.input.chars().count() as i32;
 
@@ -360,7 +368,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             .post(&url)
             .headers(headers)
             .timeout(timeout)
-            .json(&speech_params)
+            .json(&Self::build_speech_stream_payload(&speech_params)?)
             .send()
             .await
             .map_err(|e| AudioError::SynthesisFailed(e.to_string()))?;
@@ -408,7 +416,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
 
         let headers = self
             .build_headers(config)
-            .map_err(|e| AudioError::SynthesisFailed(e))?;
+            .map_err(AudioError::SynthesisFailed)?;
 
         // Override model in params
         let mut speech_params = params;
@@ -467,6 +475,52 @@ impl OpenAiCompatibleBackend {
             "mpeg" => "audio/mpeg",
             _ => "application/octet-stream",
         }
+    }
+
+    fn parse_transcription_response(
+        raw_bytes: &[u8],
+        response_format: Option<&str>,
+        content_type: Option<&str>,
+    ) -> Result<AudioTranscriptionResponse, AudioError> {
+        let response_format = response_format.map(|value| value.to_ascii_lowercase());
+        let content_type = content_type.map(|value| value.to_ascii_lowercase());
+
+        let wants_text = matches!(
+            response_format.as_deref(),
+            Some("text") | Some("srt") | Some("vtt")
+        );
+        let is_text_response = content_type
+            .as_deref()
+            .is_some_and(|ct| ct.starts_with("text/") || ct.contains("text/plain"));
+
+        if wants_text || is_text_response {
+            let text = String::from_utf8(raw_bytes.to_vec()).map_err(|e| {
+                AudioError::TranscriptionFailed(format!("Invalid text response: {e}"))
+            })?;
+            Ok(AudioTranscriptionResponse {
+                text,
+                task: None,
+                language: None,
+                duration: None,
+                words: None,
+                segments: None,
+            })
+        } else {
+            serde_json::from_slice(raw_bytes)
+                .map_err(|e| AudioError::TranscriptionFailed(format!("Invalid response: {e}")))
+        }
+    }
+
+    fn build_speech_stream_payload(
+        params: &AudioSpeechParams,
+    ) -> Result<serde_json::Value, AudioError> {
+        let mut payload =
+            serde_json::to_value(params).map_err(|e| AudioError::SynthesisFailed(e.to_string()))?;
+        let payload_map = payload
+            .as_object_mut()
+            .ok_or_else(|| AudioError::SynthesisFailed("Invalid speech params".to_string()))?;
+        payload_map.insert("stream".to_string(), serde_json::Value::Bool(true));
+        Ok(payload)
     }
 }
 
@@ -668,5 +722,65 @@ mod tests {
         assert!(json.contains("\"n\":1"));
         assert!(json.contains("\"size\":\"1024x1024\""));
         assert!(json.contains("\"quality\":\"hd\""));
+    }
+
+    // ==================== Audio Tests ====================
+
+    #[test]
+    fn test_parse_transcription_response_text_format() {
+        let raw_bytes = b"hello world";
+        let response =
+            OpenAiCompatibleBackend::parse_transcription_response(raw_bytes, Some("text"), None)
+                .unwrap();
+
+        assert_eq!(response.text, "hello world");
+        assert!(response.duration.is_none());
+    }
+
+    #[test]
+    fn test_parse_transcription_response_text_content_type() {
+        let raw_bytes = b"1\n00:00:00,000 --> 00:00:01,000\nhello";
+        let response = OpenAiCompatibleBackend::parse_transcription_response(
+            raw_bytes,
+            None,
+            Some("text/vtt"),
+        )
+        .unwrap();
+
+        assert!(response.text.contains("hello"));
+        assert!(response.words.is_none());
+    }
+
+    #[test]
+    fn test_parse_transcription_response_json() {
+        let raw_bytes = br#"{"text":"hi","duration":1.25}"#;
+        let response =
+            OpenAiCompatibleBackend::parse_transcription_response(raw_bytes, None, None).unwrap();
+
+        assert_eq!(response.text, "hi");
+        assert_eq!(response.duration, Some(1.25));
+    }
+
+    #[test]
+    fn test_build_speech_stream_payload_sets_stream() {
+        let params = AudioSpeechParams {
+            model: "tts-1".to_string(),
+            input: "hello".to_string(),
+            voice: "alloy".to_string(),
+            response_format: Some("mp3".to_string()),
+            speed: Some(1.0),
+        };
+
+        let payload = OpenAiCompatibleBackend::build_speech_stream_payload(&params).unwrap();
+        let payload_map = payload.as_object().unwrap();
+
+        assert_eq!(
+            payload_map.get("stream"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            payload_map.get("model"),
+            Some(&serde_json::Value::String("tts-1".to_string()))
+        );
     }
 }

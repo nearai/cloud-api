@@ -19,9 +19,9 @@ use crate::{
         billing::{get_billing_costs, BillingRouteState},
         completions::{chat_completions, image_generations, models},
         conversations,
-        realtime::{realtime_handler, RealtimeRouteState},
         health::health_check,
         models::{get_model_by_name, list_models, ModelsAppState},
+        realtime::{realtime_handler, RealtimeRouteState},
         responses,
     },
 };

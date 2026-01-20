@@ -20,9 +20,9 @@ pub mod workspace;
 
 pub use audio::AudioServiceImpl;
 pub use auth::UserId;
-pub use realtime::RealtimeServiceImpl;
 pub use completions::CompletionServiceImpl;
 pub use conversations::service::ConversationServiceImpl as ConversationService;
+pub use realtime::RealtimeServiceImpl;
 pub use responses::service::ResponseServiceImpl as ResponseService;
 
 #[cfg(test)]

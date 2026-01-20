@@ -2,7 +2,10 @@
 
 use crate::{
     middleware::{auth::AuthenticatedApiKey, RequestBodyHash},
-    models::{AudioSpeechRequest, AudioTranscriptionResponse, AudioTranscriptionSegment, AudioTranscriptionWord, ErrorResponse},
+    models::{
+        AudioSpeechRequest, AudioTranscriptionResponse, AudioTranscriptionSegment,
+        AudioTranscriptionWord, ErrorResponse,
+    },
 };
 use axum::{
     body::Body,
@@ -77,15 +80,21 @@ pub async fn transcribe_audio(
         match name.as_str() {
             "file" => {
                 filename = field.file_name().map(|s| s.to_string());
-                audio_data = Some(field.bytes().await.map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        ResponseJson(ErrorResponse::new(
-                            format!("Failed to read audio file: {e}"),
-                            "invalid_request_error".to_string(),
-                        )),
-                    )
-                })?.to_vec());
+                audio_data = Some(
+                    field
+                        .bytes()
+                        .await
+                        .map_err(|e| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                ResponseJson(ErrorResponse::new(
+                                    format!("Failed to read audio file: {e}"),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                        })?
+                        .to_vec(),
+                );
             }
             "model" => {
                 model = Some(field.text().await.map_err(|e| {

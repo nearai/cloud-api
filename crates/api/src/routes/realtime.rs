@@ -10,8 +10,8 @@ use axum::extract::{
     Extension, State,
 };
 use axum::response::IntoResponse;
-use futures::SinkExt;
 use futures::stream::StreamExt;
+use futures::SinkExt;
 use services::realtime::ports::{
     ClientEvent, ErrorInfo, RealtimeServiceTrait, ServerEvent, SessionConfig, WorkspaceContext,
 };
@@ -171,10 +171,8 @@ async fn handle_realtime_socket(
             }
             Message::Binary(audio) => {
                 // Direct binary audio input (alternative to base64)
-                let audio_base64 = base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    &audio,
-                );
+                let audio_base64 =
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &audio);
                 if let Err(e) = state
                     .realtime_service
                     .handle_audio_chunk(&mut session, &audio_base64)
@@ -193,10 +191,7 @@ async fn handle_realtime_socket(
             }
             Message::Ping(data) => {
                 // Respond with pong
-                if let Err(e) = sender
-                    .send(Message::Pong(data))
-                    .await
-                {
+                if let Err(e) = sender.send(Message::Pong(data)).await {
                     debug!(error = %e, "Failed to send pong");
                 }
             }
@@ -318,10 +313,12 @@ async fn handle_client_event(
                         .collect::<Vec<_>>()
                         .join("");
 
-                    session.context.push(services::realtime::ports::ConversationMessage {
-                        role: role.clone(),
-                        content: text,
-                    });
+                    session
+                        .context
+                        .push(services::realtime::ports::ConversationMessage {
+                            role: role.clone(),
+                            content: text,
+                        });
                 }
             }
 

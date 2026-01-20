@@ -32,8 +32,9 @@ use crate::{
     AttestationError, AudioError, AudioSpeechParams, AudioSpeechResponseWithBytes,
     AudioStreamingResult, AudioTranscriptionParams, AudioTranscriptionResponseWithBytes,
     ChatCompletionParams, ChatCompletionResponseWithBytes, ChatSignature, CompletionError,
-    CompletionParams, ImageGenerationError, ImageGenerationParams, ImageGenerationResponseWithBytes,
-    InferenceProvider, ListModelsError, ModelsResponse, StreamingResult,
+    CompletionParams, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponseWithBytes, InferenceProvider, ListModelsError, ModelsResponse,
+    StreamingResult,
 };
 use async_trait::async_trait;
 use backend::{BackendConfig, ExternalBackend};

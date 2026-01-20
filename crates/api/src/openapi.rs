@@ -139,6 +139,8 @@ use utoipa::{Modify, OpenApi};
             // Core API models
             ChatCompletionRequest, ChatCompletionResponse, Message,
             CompletionRequest, ModelsResponse, ModelInfo, ModelPricing, ErrorResponse,
+            // Image generation models
+            ImageGenerationRequest, ImageGenerationResponse, ImageData,
             // Organization models
             CreateOrganizationRequest, OrganizationResponse,
             UpdateOrganizationRequest, CreateApiKeyRequest, ApiKeyResponse,

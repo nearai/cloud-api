@@ -125,7 +125,11 @@ impl ExternalProvider {
             timeout_seconds,
         } = external_config;
 
-        let (backend, config, remote_model_name): (Arc<dyn ExternalBackend>, BackendConfig, Option<String>) = match provider_config {
+        let (backend, config, remote_model_name): (
+            Arc<dyn ExternalBackend>,
+            BackendConfig,
+            Option<String>,
+        ) = match provider_config {
             ProviderConfig::OpenAiCompatible {
                 base_url,
                 organization_id,
@@ -147,7 +151,11 @@ impl ExternalProvider {
                     config_model_name,
                 )
             }
-            ProviderConfig::Anthropic { base_url, version, model_name: config_model_name } => {
+            ProviderConfig::Anthropic {
+                base_url,
+                version,
+                model_name: config_model_name,
+            } => {
                 let mut extra = std::collections::HashMap::new();
                 extra.insert("version".to_string(), version);
 
@@ -162,7 +170,10 @@ impl ExternalProvider {
                     config_model_name,
                 )
             }
-            ProviderConfig::Gemini { base_url, model_name: config_model_name } => (
+            ProviderConfig::Gemini {
+                base_url,
+                model_name: config_model_name,
+            } => (
                 Arc::new(GeminiBackend::new()),
                 BackendConfig {
                     base_url,
@@ -366,7 +377,11 @@ mod tests {
         let config: ProviderConfig = serde_json::from_str(json).unwrap();
 
         match config {
-            ProviderConfig::Anthropic { base_url, version, model_name } => {
+            ProviderConfig::Anthropic {
+                base_url,
+                version,
+                model_name,
+            } => {
                 assert_eq!(base_url, "https://api.anthropic.com/v1");
                 assert_eq!(version, "2023-06-01"); // Default version
                 assert!(model_name.is_none());
@@ -385,7 +400,11 @@ mod tests {
         let config: ProviderConfig = serde_json::from_str(json).unwrap();
 
         match config {
-            ProviderConfig::Anthropic { base_url, version, model_name } => {
+            ProviderConfig::Anthropic {
+                base_url,
+                version,
+                model_name,
+            } => {
                 assert_eq!(base_url, "https://api.anthropic.com/v1");
                 assert_eq!(version, "2024-01-01");
                 assert!(model_name.is_none());
@@ -400,7 +419,10 @@ mod tests {
         let config: ProviderConfig = serde_json::from_str(json).unwrap();
 
         match config {
-            ProviderConfig::Gemini { base_url, model_name } => {
+            ProviderConfig::Gemini {
+                base_url,
+                model_name,
+            } => {
                 assert_eq!(base_url, "https://generativelanguage.googleapis.com/v1beta");
                 assert!(model_name.is_none());
             }
@@ -484,6 +506,27 @@ mod tests {
     }
 
     #[test]
+    fn test_create_external_provider_anthropic_with_model_name_override() {
+        // Test that model_name in provider config overrides the database model name
+        let config = ExternalProviderConfig {
+            model_name: "anthropic/claude-3-opus".to_string(), // Our internal model ID
+            provider_config: ProviderConfig::Anthropic {
+                base_url: "https://api.anthropic.com/v1".to_string(),
+                version: "2024-01-01".to_string(),
+                model_name: Some("claude-3-opus-20240229".to_string()), // What Anthropic expects
+            },
+            api_key: "sk-ant-test".to_string(),
+            timeout_seconds: 120,
+        };
+
+        let provider = ExternalProvider::new(config);
+
+        // The provider should use the config model_name, not the database model name
+        assert_eq!(provider.model_name(), "claude-3-opus-20240229");
+        assert_eq!(provider.backend_type(), "anthropic");
+    }
+
+    #[test]
     fn test_create_external_provider_gemini() {
         let config = ExternalProviderConfig {
             model_name: "gemini-1.5-pro".to_string(),
@@ -497,6 +540,26 @@ mod tests {
 
         let provider = ExternalProvider::new(config);
 
+        assert_eq!(provider.model_name(), "gemini-1.5-pro");
+        assert_eq!(provider.backend_type(), "gemini");
+    }
+
+    #[test]
+    fn test_create_external_provider_gemini_with_model_name_override() {
+        // Test that model_name in provider config overrides the database model name
+        let config = ExternalProviderConfig {
+            model_name: "google/gemini-1.5-pro".to_string(), // Our internal model ID
+            provider_config: ProviderConfig::Gemini {
+                base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+                model_name: Some("gemini-1.5-pro".to_string()), // What Google expects
+            },
+            api_key: "AIza-test".to_string(),
+            timeout_seconds: 90,
+        };
+
+        let provider = ExternalProvider::new(config);
+
+        // The provider should use the config model_name, not the database model name
         assert_eq!(provider.model_name(), "gemini-1.5-pro");
         assert_eq!(provider.backend_type(), "gemini");
     }

@@ -2,11 +2,7 @@ name: Real E2E Tests
 
 on:
   issue_comment:
-    types: [ created ]  # Listen for @claude in PR comments (non-review tasks)
-  push:
-    branches: [ main, develop ]
-  pull_request:
-    branches: [ main, develop ]
+    types: [ created ]  # Only trigger on PR comments with @tester test
 
 env:
   CARGO_TERM_COLOR: always
@@ -47,21 +43,13 @@ jobs:
           - 5432:5432
 
     steps:
-    - name: Get PR head SHA (for issue_comment events)
+    - name: Get PR head SHA
       if: github.event_name == 'issue_comment'
       id: pr-head
       env:
-        GITHUB_TOKEN: ${{ github.token }}
-        PR_NUMBER: ${{ github.event.issue.number }}
-        REPO: ${{ github.repository }}
+        GH_TOKEN: ${{ github.token }}
       run: |
-        PR_HEAD_SHA=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-          "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER" \
-          | jq -r '.head.sha')
-        if [ -z "$PR_HEAD_SHA" ] || [ "$PR_HEAD_SHA" = "null" ]; then
-          echo "Error: Failed to get PR head SHA"
-          exit 1
-        fi
+        PR_HEAD_SHA=$(gh pr view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json headRefOid --jq '.headRefOid')
         echo "sha=$PR_HEAD_SHA" >> $GITHUB_OUTPUT
         echo "PR head SHA: $PR_HEAD_SHA"
 

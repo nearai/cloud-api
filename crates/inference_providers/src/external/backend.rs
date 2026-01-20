@@ -5,8 +5,10 @@
 //! and the provider's native format.
 
 use crate::{
-    ChatCompletionParams, ChatCompletionResponseWithBytes, CompletionError, ImageGenerationError,
-    ImageGenerationParams, ImageGenerationResponseWithBytes, StreamingResult,
+    AudioError, AudioSpeechParams, AudioSpeechResponseWithBytes, AudioStreamingResult,
+    AudioTranscriptionParams, AudioTranscriptionResponseWithBytes, ChatCompletionParams,
+    ChatCompletionResponseWithBytes, CompletionError, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponseWithBytes, StreamingResult,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -86,6 +88,63 @@ pub trait ExternalBackend: Send + Sync {
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
         Err(ImageGenerationError::GenerationError(format!(
             "Image generation is not supported by the {} backend.",
+            self.backend_type()
+        )))
+    }
+
+    /// Performs an audio transcription (speech-to-text) request
+    ///
+    /// The backend is responsible for:
+    /// - Sending audio data to the provider
+    /// - Parsing the response and translating it back to our format
+    ///
+    /// Default implementation returns an error indicating audio transcription is not supported.
+    async fn audio_transcription(
+        &self,
+        _config: &BackendConfig,
+        _model: &str,
+        _params: AudioTranscriptionParams,
+    ) -> Result<AudioTranscriptionResponseWithBytes, AudioError> {
+        Err(AudioError::ModelNotSupported(format!(
+            "Audio transcription is not supported by the {} backend.",
+            self.backend_type()
+        )))
+    }
+
+    /// Performs a text-to-speech request (non-streaming)
+    ///
+    /// The backend is responsible for:
+    /// - Sending text to the provider
+    /// - Returning the audio data
+    ///
+    /// Default implementation returns an error indicating TTS is not supported.
+    async fn audio_speech(
+        &self,
+        _config: &BackendConfig,
+        _model: &str,
+        _params: AudioSpeechParams,
+    ) -> Result<AudioSpeechResponseWithBytes, AudioError> {
+        Err(AudioError::ModelNotSupported(format!(
+            "Text-to-speech is not supported by the {} backend.",
+            self.backend_type()
+        )))
+    }
+
+    /// Performs a streaming text-to-speech request
+    ///
+    /// The backend is responsible for:
+    /// - Sending text to the provider
+    /// - Streaming audio chunks back
+    ///
+    /// Default implementation returns an error indicating streaming TTS is not supported.
+    async fn audio_speech_stream(
+        &self,
+        _config: &BackendConfig,
+        _model: &str,
+        _params: AudioSpeechParams,
+    ) -> Result<AudioStreamingResult, AudioError> {
+        Err(AudioError::ModelNotSupported(format!(
+            "Streaming text-to-speech is not supported by the {} backend.",
             self.backend_type()
         )))
     }

@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod api;
 pub mod attestation;
+pub mod audio;
 pub mod auth;
 pub mod auth_vpc;
 pub mod billing;
@@ -12,6 +13,7 @@ pub mod health;
 pub mod models;
 pub mod organization_members;
 pub mod organizations;
+pub mod realtime;
 pub mod responses;
 pub mod usage;
 pub mod users;

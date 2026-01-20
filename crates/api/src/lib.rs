@@ -11,6 +11,7 @@ use crate::{
     routes::{
         api::{build_management_router, AppState},
         attestation::{get_attestation_report, get_signature},
+        audio::{generate_speech, transcribe_audio, AudioRouteState},
         auth::{
             current_user, github_login, google_login, login_page, logout, oauth_callback,
             StateStore,
@@ -18,6 +19,7 @@ use crate::{
         billing::{get_billing_costs, BillingRouteState},
         completions::{chat_completions, image_generations, models},
         conversations,
+        realtime::{realtime_handler, RealtimeRouteState},
         health::health_check,
         models::{get_model_by_name, list_models, ModelsAppState},
         responses,
@@ -75,6 +77,8 @@ pub struct DomainServices {
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
+    pub audio_service: Arc<dyn services::audio::ports::AudioServiceTrait>,
+    pub realtime_service: Arc<dyn services::realtime::ports::RealtimeServiceTrait>,
 }
 
 /// Initialize database connection and run migrations
@@ -442,6 +446,17 @@ pub async fn init_domain_services_with_pool(
         organization_service.clone(),
     ));
 
+    // Create audio service
+    let audio_service = Arc::new(services::audio::AudioServiceImpl::new(
+        inference_provider_pool.clone(),
+        usage_service.clone(),
+    )) as Arc<dyn services::audio::ports::AudioServiceTrait>;
+
+    // Create realtime service
+    let realtime_service = Arc::new(services::realtime::RealtimeServiceImpl::new(
+        inference_provider_pool.clone(),
+    )) as Arc<dyn services::realtime::ports::RealtimeServiceTrait>;
+
     DomainServices {
         conversation_service,
         response_service,
@@ -456,6 +471,8 @@ pub async fn init_domain_services_with_pool(
         user_service,
         files_service,
         metrics_service,
+        audio_service,
+        realtime_service,
     }
 }
 
@@ -678,7 +695,7 @@ pub fn build_app_with_config(
         domain_services.response_service,
         domain_services.attestation_service.clone(),
         &auth_components.auth_state_middleware,
-        usage_state,
+        usage_state.clone(),
         rate_limit_state.clone(),
     );
 
@@ -717,6 +734,19 @@ pub fn build_app_with_config(
 
     let billing_routes = build_billing_routes(
         domain_services.usage_service.clone(),
+        &auth_components.auth_state_middleware,
+    );
+
+    let audio_routes = build_audio_routes(
+        domain_services.audio_service.clone(),
+        domain_services.models_service.clone() as Arc<dyn ModelsServiceTrait>,
+        &auth_components.auth_state_middleware,
+        usage_state.clone(),
+        rate_limit_state,
+    );
+
+    let realtime_routes = build_realtime_routes(
+        domain_services.realtime_service.clone(),
         &auth_components.auth_state_middleware,
     );
 
@@ -764,6 +794,8 @@ pub fn build_app_with_config(
                 .merge(auth_vpc_routes)
                 .merge(files_routes)
                 .merge(billing_routes)
+                .merge(audio_routes)
+                .merge(realtime_routes)
                 .merge(health_routes),
         )
         .merge(openapi_routes)
@@ -1081,6 +1113,55 @@ pub fn build_billing_routes(
     Router::new()
         .route("/billing/costs", post(get_billing_costs))
         .with_state(billing_state)
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::auth_middleware_with_workspace_context,
+        ))
+}
+
+/// Build audio routes (authenticated endpoints for STT/TTS)
+pub fn build_audio_routes(
+    audio_service: Arc<dyn services::audio::ports::AudioServiceTrait>,
+    models_service: Arc<dyn ModelsServiceTrait>,
+    auth_state_middleware: &AuthState,
+    usage_state: middleware::UsageState,
+    rate_limit_state: middleware::RateLimitState,
+) -> Router {
+    let audio_state = AudioRouteState {
+        audio_service,
+        models_service,
+    };
+
+    Router::new()
+        .route("/audio/transcriptions", post(transcribe_audio))
+        .route("/audio/speech", post(generate_speech))
+        .layer(DefaultBodyLimit::max(25 * 1024 * 1024)) // 25MB for audio files
+        .with_state(audio_state)
+        .layer(from_fn_with_state(
+            usage_state,
+            middleware::usage_check_middleware,
+        ))
+        .layer(from_fn_with_state(
+            rate_limit_state,
+            middleware::api_key_rate_limit_middleware,
+        ))
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::auth_middleware_with_workspace_context,
+        ))
+        .layer(from_fn(middleware::body_hash_middleware))
+}
+
+/// Build realtime WebSocket routes for voice-to-voice conversations
+pub fn build_realtime_routes(
+    realtime_service: Arc<dyn services::realtime::ports::RealtimeServiceTrait>,
+    auth_state_middleware: &AuthState,
+) -> Router {
+    let realtime_state = RealtimeRouteState { realtime_service };
+
+    Router::new()
+        .route("/realtime", get(realtime_handler))
+        .with_state(realtime_state)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,

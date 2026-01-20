@@ -69,12 +69,14 @@ use tokio_stream::StreamExt;
 // Re-export commonly used types for convenience
 pub use mock::MockProvider;
 pub use models::{
-    AudioOutput, ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
+    AudioChunk, AudioError, AudioOutput, AudioSpeechParams, AudioSpeechResponseWithBytes,
+    AudioTranscriptionParams, AudioTranscriptionResponse, AudioTranscriptionResponseWithBytes,
+    ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionResponseWithBytes, ChatDelta, ChatMessage, ChatResponseMessage, ChatSignature,
     CompletionError, CompletionParams, FinishReason, FunctionChoice, FunctionDefinition, ImageData,
     ImageGenerationError, ImageGenerationParams, ImageGenerationResponse,
     ImageGenerationResponseWithBytes, MessageRole, ModelInfo, StreamChunk, StreamOptions,
-    TokenUsage, ToolChoice, ToolDefinition,
+    TokenUsage, ToolChoice, ToolDefinition, TranscriptionSegment, TranscriptionWord,
 };
 pub use sse_parser::{new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser};
 pub use vllm::{VLlmConfig, VLlmProvider};
@@ -91,6 +93,11 @@ pub use external::{
 /// - `raw_bytes` - The exact bytes received from the source (for forwarding)
 /// - `chunk` - The parsed StreamChunk for processing
 pub type StreamingResult = Pin<Box<dyn Stream<Item = Result<SSEEvent, CompletionError>> + Send>>;
+
+/// Type alias for streaming audio (TTS) results
+///
+/// This represents a stream of audio chunks for text-to-speech streaming.
+pub type AudioStreamingResult = Pin<Box<dyn Stream<Item = Result<AudioChunk, AudioError>> + Send>>;
 
 /// Type alias for peekable streaming completion results
 pub type PeekableStreamingResult = tokio_stream::adapters::Peekable<StreamingResult>;
@@ -164,4 +171,46 @@ pub trait InferenceProvider {
         nonce: Option<String>,
         signing_address: Option<String>,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError>;
+
+    /// Performs an audio transcription (speech-to-text) request
+    ///
+    /// Converts audio input to text using a speech recognition model.
+    /// Default implementation returns ModelNotSupported error.
+    async fn audio_transcription(
+        &self,
+        _params: AudioTranscriptionParams,
+        _request_hash: String,
+    ) -> Result<AudioTranscriptionResponseWithBytes, AudioError> {
+        Err(AudioError::ModelNotSupported(
+            "Audio transcription is not supported by this provider".to_string(),
+        ))
+    }
+
+    /// Performs a text-to-speech request (non-streaming)
+    ///
+    /// Converts text input to audio using a speech synthesis model.
+    /// Default implementation returns ModelNotSupported error.
+    async fn audio_speech(
+        &self,
+        _params: AudioSpeechParams,
+        _request_hash: String,
+    ) -> Result<AudioSpeechResponseWithBytes, AudioError> {
+        Err(AudioError::ModelNotSupported(
+            "Text-to-speech is not supported by this provider".to_string(),
+        ))
+    }
+
+    /// Performs a streaming text-to-speech request
+    ///
+    /// Converts text input to audio and streams chunks as they become available.
+    /// Default implementation returns ModelNotSupported error.
+    async fn audio_speech_stream(
+        &self,
+        _params: AudioSpeechParams,
+        _request_hash: String,
+    ) -> Result<AudioStreamingResult, AudioError> {
+        Err(AudioError::ModelNotSupported(
+            "Streaming text-to-speech is not supported by this provider".to_string(),
+        ))
+    }
 }

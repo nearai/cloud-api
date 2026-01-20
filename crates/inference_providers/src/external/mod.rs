@@ -29,10 +29,11 @@ pub mod gemini;
 pub mod openai_compatible;
 
 use crate::{
-    AttestationError, ChatCompletionParams, ChatCompletionResponseWithBytes, ChatSignature,
-    CompletionError, CompletionParams, ImageGenerationError, ImageGenerationParams,
-    ImageGenerationResponseWithBytes, InferenceProvider, ListModelsError, ModelsResponse,
-    StreamingResult,
+    AttestationError, AudioError, AudioSpeechParams, AudioSpeechResponseWithBytes,
+    AudioStreamingResult, AudioTranscriptionParams, AudioTranscriptionResponseWithBytes,
+    ChatCompletionParams, ChatCompletionResponseWithBytes, ChatSignature, CompletionError,
+    CompletionParams, ImageGenerationError, ImageGenerationParams, ImageGenerationResponseWithBytes,
+    InferenceProvider, ListModelsError, ModelsResponse, StreamingResult,
 };
 use async_trait::async_trait;
 use backend::{BackendConfig, ExternalBackend};
@@ -269,6 +270,51 @@ impl InferenceProvider for ExternalProvider {
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
         self.backend
             .image_generation(&self.config, &self.model_name, params)
+            .await
+    }
+
+    /// Audio transcription via external provider
+    ///
+    /// Delegates to the backend implementation. Supported by:
+    /// - OpenAI-compatible backends (Whisper)
+    /// - Not supported by Anthropic or Gemini (will return error)
+    async fn audio_transcription(
+        &self,
+        params: AudioTranscriptionParams,
+        _request_hash: String,
+    ) -> Result<AudioTranscriptionResponseWithBytes, AudioError> {
+        self.backend
+            .audio_transcription(&self.config, &self.model_name, params)
+            .await
+    }
+
+    /// Text-to-speech via external provider (non-streaming)
+    ///
+    /// Delegates to the backend implementation. Supported by:
+    /// - OpenAI-compatible backends (TTS-1, TTS-1-HD)
+    /// - Not supported by Anthropic or Gemini (will return error)
+    async fn audio_speech(
+        &self,
+        params: AudioSpeechParams,
+        _request_hash: String,
+    ) -> Result<AudioSpeechResponseWithBytes, AudioError> {
+        self.backend
+            .audio_speech(&self.config, &self.model_name, params)
+            .await
+    }
+
+    /// Streaming text-to-speech via external provider
+    ///
+    /// Delegates to the backend implementation. Supported by:
+    /// - OpenAI-compatible backends (TTS-1, TTS-1-HD)
+    /// - Not supported by Anthropic or Gemini (will return error)
+    async fn audio_speech_stream(
+        &self,
+        params: AudioSpeechParams,
+        _request_hash: String,
+    ) -> Result<AudioStreamingResult, AudioError> {
+        self.backend
+            .audio_speech_stream(&self.config, &self.model_name, params)
             .await
     }
 }

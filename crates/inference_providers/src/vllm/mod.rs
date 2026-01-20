@@ -1,6 +1,11 @@
 use crate::{models::StreamOptions, sse_parser::new_sse_parser, ImageGenerationError, *};
 use async_trait::async_trait;
-use reqwest::{header::HeaderValue, Client};
+use futures_util::StreamExt;
+use reqwest::{
+    header::HeaderValue,
+    multipart::{Form, Part},
+    Client,
+};
 use serde::Serialize;
 
 /// Convert any displayable error to ImageGenerationError::GenerationError
@@ -448,5 +453,228 @@ impl InferenceProvider for VLlmProvider {
             response: image_response,
             raw_bytes,
         })
+    }
+
+    /// Performs an audio transcription (speech-to-text) request
+    async fn audio_transcription(
+        &self,
+        params: AudioTranscriptionParams,
+        request_hash: String,
+    ) -> Result<AudioTranscriptionResponseWithBytes, AudioError> {
+        let url = format!("{}/v1/audio/transcriptions", self.config.base_url);
+
+        let mut headers = self
+            .build_headers()
+            .map_err(|e| AudioError::TranscriptionFailed(e))?;
+
+        // Remove Content-Type header as reqwest will set it for multipart
+        headers.remove("Content-Type");
+
+        headers.insert(
+            "X-Request-Hash",
+            HeaderValue::from_str(&request_hash)
+                .map_err(|e| AudioError::TranscriptionFailed(format!("Invalid request hash: {e}")))?,
+        );
+
+        // Build multipart form
+        let file_part = Part::bytes(params.audio_data)
+            .file_name(params.filename.clone())
+            .mime_str(Self::get_audio_mime_type(&params.filename))
+            .map_err(|e| AudioError::InvalidAudioFormat(format!("Invalid MIME type: {e}")))?;
+
+        let mut form = Form::new()
+            .part("file", file_part)
+            .text("model", params.model.clone());
+
+        if let Some(language) = &params.language {
+            form = form.text("language", language.clone());
+        }
+        if let Some(prompt) = &params.prompt {
+            form = form.text("prompt", prompt.clone());
+        }
+        if let Some(format) = &params.response_format {
+            form = form.text("response_format", format.clone());
+        }
+        if let Some(temp) = params.temperature {
+            form = form.text("temperature", temp.to_string());
+        }
+        if let Some(granularities) = &params.timestamp_granularities {
+            for granularity in granularities {
+                form = form.text("timestamp_granularities[]", granularity.clone());
+            }
+        }
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e: reqwest::Error| AudioError::TranscriptionFailed(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_: reqwest::Error| "Unknown error".to_string());
+            return Err(AudioError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        let raw_bytes = response
+            .bytes()
+            .await
+            .map_err(|e: reqwest::Error| AudioError::TranscriptionFailed(e.to_string()))?
+            .to_vec();
+
+        let transcription_response: AudioTranscriptionResponse =
+            serde_json::from_slice(&raw_bytes)
+                .map_err(|e| AudioError::TranscriptionFailed(format!("Invalid response: {e}")))?;
+
+        let audio_duration_seconds = transcription_response.duration;
+
+        Ok(AudioTranscriptionResponseWithBytes {
+            response: transcription_response,
+            raw_bytes,
+            audio_duration_seconds,
+        })
+    }
+
+    /// Performs a text-to-speech request (non-streaming)
+    async fn audio_speech(
+        &self,
+        params: AudioSpeechParams,
+        request_hash: String,
+    ) -> Result<AudioSpeechResponseWithBytes, AudioError> {
+        let url = format!("{}/v1/audio/speech", self.config.base_url);
+
+        let mut headers = self
+            .build_headers()
+            .map_err(|e| AudioError::SynthesisFailed(e))?;
+
+        headers.insert(
+            "X-Request-Hash",
+            HeaderValue::from_str(&request_hash)
+                .map_err(|e| AudioError::SynthesisFailed(format!("Invalid request hash: {e}")))?,
+        );
+
+        let character_count = params.input.chars().count() as i32;
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&params)
+            .send()
+            .await
+            .map_err(|e| AudioError::SynthesisFailed(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AudioError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        // Get content type from response headers
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("audio/mpeg")
+            .to_string();
+
+        let audio_data = response
+            .bytes()
+            .await
+            .map_err(|e| AudioError::SynthesisFailed(e.to_string()))?
+            .to_vec();
+
+        Ok(AudioSpeechResponseWithBytes {
+            audio_data: audio_data.clone(),
+            content_type,
+            raw_bytes: audio_data,
+            character_count,
+        })
+    }
+
+    /// Performs a streaming text-to-speech request
+    async fn audio_speech_stream(
+        &self,
+        params: AudioSpeechParams,
+        request_hash: String,
+    ) -> Result<AudioStreamingResult, AudioError> {
+        let url = format!("{}/v1/audio/speech", self.config.base_url);
+
+        let mut headers = self
+            .build_headers()
+            .map_err(|e| AudioError::SynthesisFailed(e))?;
+
+        headers.insert(
+            "X-Request-Hash",
+            HeaderValue::from_str(&request_hash)
+                .map_err(|e| AudioError::SynthesisFailed(format!("Invalid request hash: {e}")))?,
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&params)
+            .send()
+            .await
+            .map_err(|e| AudioError::SynthesisFailed(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AudioError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        // Stream the response bytes
+        let byte_stream = response.bytes_stream();
+
+        let audio_stream = byte_stream.map(|result| match result {
+            Ok(bytes) => Ok(AudioChunk {
+                data: bytes.to_vec(),
+                is_final: false, // We mark the last chunk as final in a chain combinator if needed
+            }),
+            Err(e) => Err(AudioError::SynthesisFailed(e.to_string())),
+        });
+
+        Ok(Box::pin(audio_stream))
+    }
+}
+
+impl VLlmProvider {
+    /// Get MIME type based on file extension
+    fn get_audio_mime_type(filename: &str) -> &'static str {
+        let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
+        match ext.as_str() {
+            "mp3" => "audio/mpeg",
+            "mp4" => "audio/mp4",
+            "m4a" => "audio/mp4",
+            "wav" => "audio/wav",
+            "webm" => "audio/webm",
+            "ogg" => "audio/ogg",
+            "flac" => "audio/flac",
+            "mpeg" => "audio/mpeg",
+            _ => "application/octet-stream",
+        }
     }
 }

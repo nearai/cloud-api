@@ -291,6 +291,154 @@ pub struct ImageData {
     pub revised_prompt: Option<String>,
 }
 
+// ==================== Audio API Models ====================
+
+/// Request for audio transcription (speech-to-text)
+/// Note: The actual audio file is sent as multipart form data, not in this struct.
+/// This struct captures the form fields.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct AudioTranscriptionRequest {
+    /// Model ID to use for transcription (e.g., "whisper-1")
+    pub model: String,
+    /// Language of the audio in ISO-639-1 format (e.g., "en")
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Optional prompt to guide the transcription style
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Response format: json, text, srt, verbose_json, vtt
+    #[serde(default)]
+    pub response_format: Option<String>,
+    /// Sampling temperature between 0 and 1 (default: 0)
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Timestamp granularities: word, segment (only for verbose_json format)
+    #[serde(default)]
+    pub timestamp_granularities: Option<Vec<String>>,
+}
+
+/// Response from audio transcription
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AudioTranscriptionResponse {
+    /// Transcribed text
+    pub text: String,
+    /// Task performed (typically "transcribe")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Detected or specified language
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Duration of the audio in seconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<f64>,
+    /// Word-level timestamps (if requested with verbose_json)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub words: Option<Vec<AudioTranscriptionWord>>,
+    /// Segment-level timestamps (if requested with verbose_json)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segments: Option<Vec<AudioTranscriptionSegment>>,
+}
+
+/// Word-level timestamp information
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AudioTranscriptionWord {
+    /// The transcribed word
+    pub word: String,
+    /// Start time in seconds
+    pub start: f64,
+    /// End time in seconds
+    pub end: f64,
+}
+
+/// Segment-level timestamp information
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AudioTranscriptionSegment {
+    /// Segment ID
+    pub id: i32,
+    /// Seek position
+    pub seek: i32,
+    /// Start time in seconds
+    pub start: f64,
+    /// End time in seconds
+    pub end: f64,
+    /// Transcribed text for this segment
+    pub text: String,
+    /// Token IDs
+    pub tokens: Vec<i32>,
+    /// Average log probability
+    pub avg_logprob: f64,
+    /// Compression ratio
+    pub compression_ratio: f64,
+    /// No speech probability
+    pub no_speech_prob: f64,
+    /// Temperature used
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+}
+
+/// Request for text-to-speech
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct AudioSpeechRequest {
+    /// Model ID to use for synthesis (e.g., "tts-1", "tts-1-hd")
+    pub model: String,
+    /// Text to convert to speech (max 4096 characters)
+    pub input: String,
+    /// Voice to use (e.g., "alloy", "echo", "fable", "onyx", "nova", "shimmer")
+    pub voice: String,
+    /// Response format: mp3, opus, aac, flac, wav, pcm (default: mp3)
+    #[serde(default)]
+    pub response_format: Option<String>,
+    /// Speed of speech (0.25 to 4.0, default: 1.0)
+    #[serde(default)]
+    pub speed: Option<f32>,
+    /// Whether to stream the response (default: false)
+    #[serde(default)]
+    pub stream: Option<bool>,
+}
+
+impl AudioSpeechRequest {
+    /// Validate the speech request
+    pub fn validate(&self) -> Result<(), String> {
+        // Model is required
+        if self.model.trim().is_empty() {
+            return Err("model is required".to_string());
+        }
+
+        // Input is required and has max length
+        if self.input.is_empty() {
+            return Err("input is required".to_string());
+        }
+        if self.input.len() > 4096 {
+            return Err("input exceeds maximum length of 4096 characters".to_string());
+        }
+
+        // Voice is required
+        if self.voice.trim().is_empty() {
+            return Err("voice is required".to_string());
+        }
+
+        // Validate speed if provided
+        if let Some(speed) = self.speed {
+            if !(0.25..=4.0).contains(&speed) {
+                return Err("speed must be between 0.25 and 4.0".to_string());
+            }
+        }
+
+        // Validate response_format if provided
+        if let Some(ref format) = self.response_format {
+            let valid_formats = ["mp3", "opus", "aac", "flac", "wav", "pcm"];
+            if !valid_formats.contains(&format.as_str()) {
+                return Err(format!(
+                    "response_format must be one of: {}",
+                    valid_formats.join(", ")
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelsResponse {
     pub object: String,

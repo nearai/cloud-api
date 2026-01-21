@@ -14,7 +14,8 @@ pub use executor::{
 
 // Tool configuration helpers
 pub use tool_config::{
-    convert_tool_calls, get_tool_names, prepare_tool_choice, prepare_tools, ERROR_TOOL_TYPE,
+    convert_tool_calls, get_tool_names, prepare_tool_choice, prepare_tools,
+    CODE_INTERPRETER_TOOL_NAME, COMPUTER_TOOL_NAME, ERROR_TOOL_TYPE,
 };
 
 // Tool executors

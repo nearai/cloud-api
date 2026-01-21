@@ -12,6 +12,12 @@ use crate::responses::service_helpers::ToolCallInfo;
 /// Special tool type for error tool calls (malformed calls from LLM)
 pub const ERROR_TOOL_TYPE: &str = "__error__";
 
+/// Tool name for code interpreter
+pub const CODE_INTERPRETER_TOOL_NAME: &str = "code_interpreter";
+
+/// Tool name for computer use
+pub const COMPUTER_TOOL_NAME: &str = "computer";
+
 /// Extract tool names from request tools configuration
 ///
 /// Returns a list of tool names that can be used to infer tool names when
@@ -32,10 +38,10 @@ pub fn get_tool_names(request: &CreateResponseRequest) -> Vec<String> {
                     names.push(name.clone());
                 }
                 ResponseTool::CodeInterpreter {} => {
-                    names.push("code_interpreter".to_string());
+                    names.push(CODE_INTERPRETER_TOOL_NAME.to_string());
                 }
                 ResponseTool::Computer {} => {
-                    names.push("computer".to_string());
+                    names.push(COMPUTER_TOOL_NAME.to_string());
                 }
                 // MCP tools are dynamically discovered - we don't know actual tool names
                 // until the MCP server is queried asynchronously later
@@ -178,7 +184,7 @@ pub fn prepare_tools(request: &CreateResponseRequest) -> Vec<inference_providers
                     tool_definitions.push(inference_providers::ToolDefinition {
                         type_: "function".to_string(),
                         function: inference_providers::FunctionDefinition {
-                            name: "code_interpreter".to_string(),
+                            name: CODE_INTERPRETER_TOOL_NAME.to_string(),
                             description: Some(
                                 "Execute Python code in a sandboxed environment.".to_string(),
                             ),
@@ -199,7 +205,7 @@ pub fn prepare_tools(request: &CreateResponseRequest) -> Vec<inference_providers
                     tool_definitions.push(inference_providers::ToolDefinition {
                         type_: "function".to_string(),
                         function: inference_providers::FunctionDefinition {
-                            name: "computer".to_string(),
+                            name: COMPUTER_TOOL_NAME.to_string(),
                             description: Some(
                                 "Control computer actions like mouse clicks and keyboard input."
                                     .to_string(),
@@ -576,9 +582,12 @@ pub fn convert_tool_calls(
             }
         };
 
-        // Check if this is an MCP tool (format: "server_label:tool_name")
-        if name.contains(':') {
-            tracing::debug!("MCP tool call detected: {}", name);
+        // Check if this is a tool that doesn't use the 'query' parameter:
+        // - MCP tools (format: "server_label:tool_name")
+        // - code_interpreter (uses "code" parameter)
+        // - computer (uses "action" parameter)
+        if name.contains(':') || name == CODE_INTERPRETER_TOOL_NAME || name == COMPUTER_TOOL_NAME {
+            tracing::debug!("Tool call detected (no query required): {}", name);
             tool_calls_detected.push(ToolCallInfo {
                 tool_type: name,
                 query: String::new(),

@@ -31,8 +31,15 @@ pub fn get_tool_names(request: &CreateResponseRequest) -> Vec<String> {
                 ResponseTool::Function { name, .. } => {
                     names.push(name.clone());
                 }
-                // MCP, CodeInterpreter, Computer - not included as they have different behaviors
-                _ => {}
+                ResponseTool::CodeInterpreter {} => {
+                    names.push("code_interpreter".to_string());
+                }
+                ResponseTool::Computer {} => {
+                    names.push("computer".to_string());
+                }
+                // MCP tools are dynamically discovered - we don't know actual tool names
+                // until the MCP server is queried asynchronously later
+                ResponseTool::Mcp { .. } => {}
             }
         }
     }

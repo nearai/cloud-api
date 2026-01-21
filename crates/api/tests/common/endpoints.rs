@@ -3,6 +3,7 @@
 use api::models::{ConversationItemList, ConversationObject, ResponseObject};
 use api::routes::attestation::{AttestationResponse, SignatureResponse};
 use inference_providers::StreamChunk;
+use serde_json::json;
 
 /// POST `/v1/chat/completions` and return the raw response body text.
 ///
@@ -171,7 +172,12 @@ pub async fn create_conversation(
     server: &axum_test::TestServer,
     api_key: String,
 ) -> ConversationObject {
-    create_conversation_with_metadata(server, api_key, None).await
+    create_conversation_with_metadata(
+        server,
+        api_key,
+        Some(json!({"name": "Test Conversation", "description": "A test conversation"})),
+    )
+    .await
 }
 
 pub async fn create_conversation_with_metadata(

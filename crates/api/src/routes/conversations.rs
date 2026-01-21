@@ -1369,6 +1369,17 @@ fn convert_domain_conversation_to_http(
         metadata.remove("archived_at");
     }
 
+    // Update cloned_from_id in metadata based on database field
+    if let Some(cloned_from_id) = domain_conversation.cloned_from_id {
+        metadata.insert(
+            "cloned_from_id".to_string(),
+            serde_json::json!(cloned_from_id.to_string()),
+        );
+    } else {
+        // Remove cloned_from_id from metadata if it's not a clone
+        metadata.remove("cloned_from_id");
+    }
+
     ConversationObject {
         id: domain_conversation.id.to_string(),
         object: "conversation".to_string(),

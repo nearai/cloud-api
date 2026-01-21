@@ -432,34 +432,6 @@ pub async fn setup_test_server_with_mcp_factory(
     (server, inference_provider_pool, mock_provider, infra.guard)
 }
 
-/// Setup test server backed by the real inference provider pool
-/// The provider pool is shared across all tests (initialized once) to avoid repeated expensive initialization
-pub async fn setup_test_server_with_real_provider() -> (
-    axum_test::TestServer,
-    std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
-    TestDatabaseGuard,
-) {
-    // Each test still gets its own database for isolation
-    let test_id = uuid::Uuid::new_v4().to_string();
-    let base_db_config = db_config_for_tests();
-    let db_name = db_setup::create_test_database_from_template(&base_db_config, &test_id)
-        .await
-        .expect("Failed to create test database from template");
-
-    let config = test_config_with_db(&db_name);
-    let db_config = config.database.clone();
-
-    let database = init_database_connection(&config.database).await;
-
-    // Build server using the shared provider pool
-    let components =
-        build_test_server_components_with_real_providers(database.clone(), config).await;
-
-    let guard = TestDatabaseGuard { db_name, db_config };
-
-    (components.0, components.1, guard)
-}
-
 pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, String) {
     let user_id = uuid::Uuid::new_v4();
     let user_id_str = user_id.to_string();

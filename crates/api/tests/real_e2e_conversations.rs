@@ -7,7 +7,7 @@ use api::models::{ConversationContentPart, ConversationItem};
 
 #[tokio::test]
 async fn real_test_conversation_items_populated_by_responses_non_stream() {
-    let (server, _pool, _guard) = setup_test_server_with_real_provider().await;
+    let (server, _pool, _db, _guard) = setup_test_server_real_providers().await;
 
     // Seed model metadata/pricing into DB so /v1/responses passes validation/usage logic.
     let model_name = setup_qwen_model(&server).await;
@@ -60,7 +60,7 @@ async fn real_test_conversation_items_populated_by_responses_non_stream() {
 
 #[tokio::test]
 async fn real_test_conversation_items_populated_by_responses_streaming() {
-    let (server, _pool, _guard) = setup_test_server_with_real_provider().await;
+    let (server, _pool, _db, _guard) = setup_test_server_real_providers().await;
 
     // Seed model metadata/pricing into DB so /v1/responses passes validation/usage logic.
     let model_name = setup_qwen_model(&server).await;
@@ -108,7 +108,7 @@ async fn real_test_conversation_items_populated_by_responses_streaming() {
 
 #[tokio::test]
 async fn real_test_update_conversation_metadata() {
-    let (server, _pool, _guard) = setup_test_server_with_real_provider().await;
+    let (server, _pool, _db, _guard) = setup_test_server_real_providers().await;
     let _model_name = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -165,7 +165,7 @@ async fn real_test_update_conversation_metadata() {
 
 #[tokio::test]
 async fn real_test_delete_conversation() {
-    let (server, _pool, _guard) = setup_test_server_with_real_provider().await;
+    let (server, _pool, _db, _guard) = setup_test_server_real_providers().await;
     let _model_name = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;

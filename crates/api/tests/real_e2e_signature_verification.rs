@@ -5,7 +5,7 @@ use endpoints::*;
 
 #[tokio::test]
 async fn real_test_signature_signing_address_matches_model_attestation_stream() {
-    let (server, _pool, _guard) = setup_test_server_with_real_provider().await;
+    let (server, _pool, _db, _guard) = setup_test_server_real_providers().await;
     let model_name = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -66,7 +66,7 @@ async fn real_test_signature_signing_address_matches_model_attestation_stream() 
 
 #[tokio::test]
 async fn real_test_signature_signing_address_matches_model_attestation_non_stream() {
-    let (server, _pool, _guard) = setup_test_server_with_real_provider().await;
+    let (server, _pool, _db, _guard) = setup_test_server_real_providers().await;
     let model_name = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;

@@ -58,16 +58,20 @@ build:
 	@echo "Building all crates..."
 	cargo build
 
-test: test-unit test-integration
+test: test-unit test-integration test-integration-real
 	@echo "All tests completed."
 
 test-unit:
 	@echo "Running unit tests..."
-	cargo test --lib --bins
+	cargo nextest run --lib --bins
 
 test-integration:
 	@echo "Running integration/e2e tests..."
-	cargo test --test '*'
+	cargo nextest run -p api --tests -E 'not test(/^real_test_/)'
+
+test-integration-real:
+	@echo "Running integration/real_e2e tests..."
+	cargo nextest run -p api --tests -E 'test(/^real_test_/)'
 
 lint:
 	@echo "Running clippy linter (strict mode)..."

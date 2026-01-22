@@ -1,6 +1,8 @@
 name: Real E2E Tests
 
 on:
+  pull_request:
+    types: [ opened, ready_for_review ] # When PR is ready for review (not draft)
   issue_comment:
     types: [ created ]  # Only trigger on PR comments with @tester test
 

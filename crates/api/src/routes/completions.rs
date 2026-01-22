@@ -687,6 +687,23 @@ pub async fn image_generations(
         }
     };
 
+    // Validate response_format for verifiable models
+    // Verifiable models (attestation_supported = true) only support "b64_json" format
+    if model.attestation_supported {
+        if let Some(ref format) = request.response_format {
+            if format == "url" {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        "response_format 'url' is not supported for verifiable models. Use 'b64_json' instead.".to_string(),
+                        "invalid_request_error".to_string(),
+                    )),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     // Convert API request to provider params
     let params = inference_providers::ImageGenerationParams {
         model: request.model.clone(),

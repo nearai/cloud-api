@@ -441,5 +441,6 @@ mod tests {
         assert!(json.contains("\"n\":1"));
         assert!(json.contains("\"size\":\"1024x1024\""));
         assert!(json.contains("\"quality\":\"hd\""));
+        assert!(json.contains("\"style\":\"vivid\""));
     }
 }

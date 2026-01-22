@@ -184,19 +184,19 @@ pub struct ImageGenerationRequest {
     pub model: String,
     /// Text prompt describing the image to generate
     pub prompt: String,
-    /// Number of images to generate (default: 1)
+    /// Number of images to generate (1-10, default: 1)
     #[serde(default = "default_n_images")]
     pub n: Option<i32>,
-    /// Size of the generated images (e.g., "1024x1024", "512x512")
+    /// Size of the generated images in WxH format (e.g., "1024x1024", "512x512")
     #[serde(default)]
     pub size: Option<String>,
-    /// Response format: "url" or "b64_json"
+    /// Response format: "b64_json" or "url" (only "b64_json" is supported for verifiable models)
     #[serde(default)]
     pub response_format: Option<String>,
-    /// Quality of the generated image: "standard" or "hd"
+    /// Quality of the generated image: "standard" or "hd" ("quality" parameter is not supported for verifiable models)
     #[serde(default)]
     pub quality: Option<String>,
-    /// Style of the generated image: "vivid" or "natural"
+    /// Style of the generated image: "vivid" or "natural" ("style" parameter is not supported for verifiable models)
     #[serde(default)]
     pub style: Option<String>,
 }

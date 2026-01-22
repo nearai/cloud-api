@@ -1007,6 +1007,8 @@ pub struct OutputTokensDetails {
 
 impl CreateResponseRequest {
     pub fn validate(&self) -> Result<(), String> {
+        use crate::common::MAX_METADATA_SIZE_BYTES;
+
         if self.model.trim().is_empty() {
             return Err("Model cannot be empty".to_string());
         }
@@ -1032,6 +1034,17 @@ impl CreateResponseRequest {
         if let Some(top_p) = self.top_p {
             if top_p <= 0.0 || top_p > 1.0 {
                 return Err("top_p must be between 0.0 and 1.0".to_string());
+            }
+        }
+
+        if let Some(metadata) = &self.metadata {
+            let serialized =
+                serde_json::to_string(metadata).map_err(|_| "Invalid metadata".to_string())?;
+            if serialized.len() > MAX_METADATA_SIZE_BYTES {
+                return Err(format!(
+                    "metadata is too large (max {} bytes when serialized)",
+                    MAX_METADATA_SIZE_BYTES
+                ));
             }
         }
 
@@ -1231,5 +1244,217 @@ mod tests {
             }
             _ => panic!("Expected Message variant for old format"),
         }
+    }
+
+    #[test]
+    fn test_deserialize_old_response_item_message_without_metadata_field() {
+        // Simulate old JSON data that doesn't have metadata field at all
+        // This represents data stored in the database before the metadata field was added
+        let old_json = json!({
+            "type": "message",
+            "id": "msg_123",
+            "response_id": "resp_abc",
+            "created_at": 1234567890,
+            "status": "completed",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": "Hello!",
+                "annotations": []
+            }],
+            "model": "gpt-4"
+            // Note: no "metadata" field at all
+        });
+
+        let result: Result<ResponseOutputItem, _> = serde_json::from_value(old_json);
+
+        assert!(
+            result.is_ok(),
+            "Failed to deserialize old format without metadata: {:?}",
+            result.err()
+        );
+
+        let item = result.unwrap();
+        match item {
+            ResponseOutputItem::Message {
+                id,
+                metadata,
+                content,
+                ..
+            } => {
+                assert_eq!(id, "msg_123");
+                assert!(
+                    metadata.is_none(),
+                    "metadata should be None when field is missing from JSON"
+                );
+                assert_eq!(content.len(), 1);
+            }
+            _ => panic!("Expected Message variant"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_response_item_message_with_metadata_field() {
+        // Test that new format with metadata field works correctly
+        let new_json = json!({
+            "type": "message",
+            "id": "msg_456",
+            "response_id": "resp_def",
+            "created_at": 1234567890,
+            "status": "completed",
+            "role": "assistant",
+            "content": [],
+            "model": "gpt-4",
+            "metadata": {
+                "custom_key": "custom_value",
+                "nested": {"foo": "bar"}
+            }
+        });
+
+        let result: Result<ResponseOutputItem, _> = serde_json::from_value(new_json);
+
+        assert!(result.is_ok());
+
+        let item = result.unwrap();
+        match item {
+            ResponseOutputItem::Message { id, metadata, .. } => {
+                assert_eq!(id, "msg_456");
+                assert!(metadata.is_some(), "metadata should be present");
+                let meta = metadata.unwrap();
+                assert_eq!(meta["custom_key"], "custom_value");
+                assert_eq!(meta["nested"]["foo"], "bar");
+            }
+            _ => panic!("Expected Message variant"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_response_item_message_with_null_metadata() {
+        // Test that explicit null metadata also deserializes correctly
+        let json_with_null = json!({
+            "type": "message",
+            "id": "msg_789",
+            "response_id": "resp_ghi",
+            "created_at": 1234567890,
+            "status": "completed",
+            "role": "assistant",
+            "content": [],
+            "model": "gpt-4",
+            "metadata": null
+        });
+
+        let result: Result<ResponseOutputItem, _> = serde_json::from_value(json_with_null);
+
+        assert!(result.is_ok());
+
+        let item = result.unwrap();
+        match item {
+            ResponseOutputItem::Message { id, metadata, .. } => {
+                assert_eq!(id, "msg_789");
+                assert!(
+                    metadata.is_none(),
+                    "metadata should be None when explicitly set to null"
+                );
+            }
+            _ => panic!("Expected Message variant"),
+        }
+    }
+
+    #[test]
+    fn test_create_response_request_validates_metadata_size() {
+        use crate::common::MAX_METADATA_SIZE_BYTES;
+
+        // Test that valid metadata passes validation
+        let request_with_small_metadata = CreateResponseRequest {
+            model: "gpt-4".to_string(),
+            input: None,
+            instructions: None,
+            conversation: None,
+            previous_response_id: None,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            temperature: None,
+            top_p: None,
+            stream: None,
+            store: None,
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            include: None,
+            metadata: Some(json!({"key": "value"})),
+            safety_identifier: None,
+            prompt_cache_key: None,
+        };
+
+        assert!(
+            request_with_small_metadata.validate().is_ok(),
+            "Small metadata should pass validation"
+        );
+
+        // Test that metadata exceeding the limit fails validation
+        let large_string = "x".repeat(MAX_METADATA_SIZE_BYTES + 1);
+        let request_with_large_metadata = CreateResponseRequest {
+            model: "gpt-4".to_string(),
+            input: None,
+            instructions: None,
+            conversation: None,
+            previous_response_id: None,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            temperature: None,
+            top_p: None,
+            stream: None,
+            store: None,
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            include: None,
+            metadata: Some(json!({"large_field": large_string})),
+            safety_identifier: None,
+            prompt_cache_key: None,
+        };
+
+        let result = request_with_large_metadata.validate();
+        assert!(result.is_err(), "Large metadata should fail validation");
+        assert!(
+            result.unwrap_err().contains("metadata is too large"),
+            "Error message should mention metadata size"
+        );
+    }
+
+    #[test]
+    fn test_create_response_request_validates_without_metadata() {
+        // Test that request without metadata passes validation
+        let request_without_metadata = CreateResponseRequest {
+            model: "gpt-4".to_string(),
+            input: None,
+            instructions: None,
+            conversation: None,
+            previous_response_id: None,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            temperature: None,
+            top_p: None,
+            stream: None,
+            store: None,
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            include: None,
+            metadata: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
+        };
+
+        assert!(
+            request_without_metadata.validate().is_ok(),
+            "Request without metadata should pass validation"
+        );
     }
 }

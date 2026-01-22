@@ -44,7 +44,6 @@ jobs:
 
     steps:
     - name: Get PR head SHA
-      if: github.event_name == 'issue_comment'
       id: pr-head
       env:
         GH_TOKEN: ${{ github.token }}
@@ -56,7 +55,7 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v6
       with:
-        ref: ${{ github.event_name == 'issue_comment' && steps.pr-head.outputs.sha || github.ref }}
+        ref: ${{ steps.pr-head.outputs.sha }}
     
     - name: Install Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1

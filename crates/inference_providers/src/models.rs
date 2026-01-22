@@ -684,7 +684,7 @@ pub struct ImageGenerationParams {
     /// Number of images to generate (1-10, default: 1)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub n: Option<i32>,
-    /// Size of the generated images (e.g., "1024x1024", "512x512")
+    /// Size of the generated images in WxH format (e.g., "1024x1024", "512x512")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
     /// Response format: "b64_json" or "url" (only "b64_json" is supported for verifiable models)

@@ -48,7 +48,21 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
-        PR_HEAD_SHA=$(gh pr view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json headRefOid --jq '.headRefOid')
+        set -e
+        PR_NUMBER=${{ github.event.issue.number }}
+        echo "Fetching PR #${PR_NUMBER} head SHA..."
+        
+        if ! PR_HEAD_SHA=$(gh pr view "$PR_NUMBER" --repo ${{ github.repository }} --json headRefOid --jq '.headRefOid' 2>&1); then
+          echo "Error: Failed to fetch PR #${PR_NUMBER} information" >&2
+          echo "$PR_HEAD_SHA" >&2
+          exit 1
+        fi
+        
+        if [ -z "$PR_HEAD_SHA" ]; then
+          echo "Error: PR head SHA is empty for PR #${PR_NUMBER}" >&2
+          exit 1
+        fi
+        
         echo "sha=$PR_HEAD_SHA" >> $GITHUB_OUTPUT
         echo "PR head SHA: $PR_HEAD_SHA"
 

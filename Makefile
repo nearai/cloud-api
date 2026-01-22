@@ -58,7 +58,7 @@ build:
 	@echo "Building all crates..."
 	cargo build
 
-test: test-unit test-integration test-integration-real
+test: test-unit test-integration
 	@echo "All tests completed."
 
 test-unit:

@@ -6,7 +6,6 @@
 
 mod common;
 
-use api::models::BatchUpdateModelApiRequest;
 use common::*;
 
 /// Test audio input in chat completions (sending audio data to the model)
@@ -699,38 +698,8 @@ async fn test_verifiable_model_response_format_validation() {
     let (server, guard) = setup_test_server().await;
     let _guard = guard;
 
-    // Set up a verifiable model with attestation_supported = true
-    let mut batch = BatchUpdateModelApiRequest::new();
-    batch.insert(
-        "test/verifiable-image-model".to_string(),
-        serde_json::from_value(serde_json::json!({
-            "inputCostPerToken": {
-                "amount": 0,
-                "currency": "USD"
-            },
-            "outputCostPerToken": {
-                "amount": 0,
-                "currency": "USD"
-            },
-            "costPerImage": {
-                "amount": 40000000,
-                "currency": "USD"
-            },
-            "modelDisplayName": "Verifiable Image Model",
-            "modelDescription": "Test model for verifiable response_format validation",
-            "contextLength": 4096,
-            "verifiable": true,
-            "isActive": true,
-            "attestationSupported": true
-        }))
-        .unwrap(),
-    );
-    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
-    assert_eq!(updated.len(), 1, "Should have created 1 model");
-    assert!(
-        updated[0].metadata.attestation_supported,
-        "Model should have attestation_supported = true"
-    );
+    // Set up the verifiable image model (Qwen/Qwen-Image-2512 has verifiable=true and defaults to attestation_supported=true)
+    setup_qwen_image_model(&server).await;
 
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -741,7 +710,7 @@ async fn test_verifiable_model_response_format_validation() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "test/verifiable-image-model",
+            "model": "Qwen/Qwen-Image-2512",
             "prompt": "A beautiful sunset",
             "response_format": "url"
         }))
@@ -775,7 +744,7 @@ async fn test_verifiable_model_response_format_validation() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "test/verifiable-image-model",
+            "model": "Qwen/Qwen-Image-2512",
             "prompt": "A beautiful sunset"
             // response_format omitted
         }))
@@ -804,7 +773,7 @@ async fn test_verifiable_model_response_format_validation() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "test/verifiable-image-model",
+            "model": "Qwen/Qwen-Image-2512",
             "prompt": "A beautiful sunset",
             "response_format": "b64_json"
         }))
@@ -833,7 +802,7 @@ async fn test_verifiable_model_response_format_validation() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "test/verifiable-image-model",
+            "model": "Qwen/Qwen-Image-2512",
             "prompt": "A beautiful sunset",
             "response_format": "invalid_format"
         }))
@@ -851,8 +820,8 @@ async fn test_verifiable_model_response_format_validation() {
         .and_then(|m| m.as_str())
         .unwrap_or("");
     assert!(
-        error_message.contains("not supported for verifiable models"),
-        "Error message should mention verifiable models, got: {}",
+        error_message.contains("response_format must be 'url' or 'b64_json'"),
+        "Error message should mention valid response formats, got: {}",
         error_message
     );
 }

@@ -100,13 +100,10 @@ pub async fn list_models(
                 provider_type: model.provider_type.clone(),
                 provider_config: model.provider_config.clone(),
                 attestation_supported: model.attestation_supported,
-                architecture: match (&model.input_modalities, &model.output_modalities) {
-                    (Some(input), Some(output)) => Some(ModelArchitecture {
-                        input_modalities: input.clone(),
-                        output_modalities: output.clone(),
-                    }),
-                    _ => None,
-                },
+                architecture: ModelArchitecture::from_options(
+                    model.input_modalities.clone(),
+                    model.output_modalities.clone(),
+                ),
             },
         })
         .collect();
@@ -200,13 +197,10 @@ pub async fn get_model_by_name(
             provider_type: model.provider_type,
             provider_config: model.provider_config,
             attestation_supported: model.attestation_supported,
-            architecture: match (model.input_modalities, model.output_modalities) {
-                (Some(input), Some(output)) => Some(ModelArchitecture {
-                    input_modalities: input,
-                    output_modalities: output,
-                }),
-                _ => None,
-            },
+            architecture: ModelArchitecture::from_options(
+                model.input_modalities,
+                model.output_modalities,
+            ),
         },
     };
 

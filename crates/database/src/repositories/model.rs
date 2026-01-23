@@ -862,11 +862,13 @@ impl ModelRepository {
                         .ok(),
                     &model_row.try_get::<_, bool>("attestation_supported").ok(),
                     &model_row
-                        .try_get::<_, serde_json::Value>("input_modalities")
-                        .ok(),
+                        .try_get::<_, Option<serde_json::Value>>("input_modalities")
+                        .ok()
+                        .flatten(),
                     &model_row
-                        .try_get::<_, serde_json::Value>("output_modalities")
-                        .ok(),
+                        .try_get::<_, Option<serde_json::Value>>("output_modalities")
+                        .ok()
+                        .flatten(),
                     &changed_by_user_id,
                     &changed_by_user_email,
                     change_reason,

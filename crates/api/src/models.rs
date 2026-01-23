@@ -2037,6 +2037,20 @@ pub struct ModelArchitecture {
     pub output_modalities: Vec<String>,
 }
 
+impl ModelArchitecture {
+    /// Create ModelArchitecture from optional modalities.
+    /// Returns Some only if both input and output modalities are present.
+    pub fn from_options(input: Option<Vec<String>>, output: Option<Vec<String>>) -> Option<Self> {
+        match (input, output) {
+            (Some(input_modalities), Some(output_modalities)) => Some(Self {
+                input_modalities,
+                output_modalities,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Model metadata
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelMetadata {

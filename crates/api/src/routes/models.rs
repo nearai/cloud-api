@@ -1,5 +1,6 @@
 use crate::models::{
-    DecimalPrice, ErrorResponse, ModelListResponse, ModelMetadata, ModelWithPricing,
+    DecimalPrice, ErrorResponse, ModelArchitecture, ModelListResponse, ModelMetadata,
+    ModelWithPricing,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -99,6 +100,13 @@ pub async fn list_models(
                 provider_type: model.provider_type.clone(),
                 provider_config: model.provider_config.clone(),
                 attestation_supported: model.attestation_supported,
+                architecture: match (&model.input_modalities, &model.output_modalities) {
+                    (Some(input), Some(output)) => Some(ModelArchitecture {
+                        input_modalities: input.clone(),
+                        output_modalities: output.clone(),
+                    }),
+                    _ => None,
+                },
             },
         })
         .collect();
@@ -192,6 +200,13 @@ pub async fn get_model_by_name(
             provider_type: model.provider_type,
             provider_config: model.provider_config,
             attestation_supported: model.attestation_supported,
+            architecture: match (model.input_modalities, model.output_modalities) {
+                (Some(input), Some(output)) => Some(ModelArchitecture {
+                    input_modalities: input,
+                    output_modalities: output,
+                }),
+                _ => None,
+            },
         },
     };
 

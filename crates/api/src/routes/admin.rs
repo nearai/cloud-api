@@ -5,7 +5,7 @@ use crate::models::{
     BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, DecimalPrice,
     DeleteAdminAccessTokenRequest, DeleteModelRequest, ErrorResponse,
     GetOrganizationConcurrentLimitResponse, ListOrganizationsAdminResponse, ListUsersResponse,
-    ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
+    ModelArchitecture, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
     OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, SpendLimit,
     UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
     UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
@@ -102,6 +102,8 @@ pub async fn batch_upsert_models(
                     provider_type: request.provider_type.clone(),
                     provider_config: request.provider_config.clone(),
                     attestation_supported: request.attestation_supported,
+                    input_modalities: request.input_modalities.clone(),
+                    output_modalities: request.output_modalities.clone(),
                     change_reason: request.change_reason.clone(),
                     changed_by_user_id: Some(admin_user_id),
                     changed_by_user_email: Some(admin_user_email.clone()),
@@ -240,6 +242,16 @@ pub async fn batch_upsert_models(
                 provider_type: updated_model.provider_type,
                 provider_config: updated_model.provider_config,
                 attestation_supported: updated_model.attestation_supported,
+                architecture: match (
+                    updated_model.input_modalities,
+                    updated_model.output_modalities,
+                ) {
+                    (Some(input), Some(output)) => Some(ModelArchitecture {
+                        input_modalities: input,
+                        output_modalities: output,
+                    }),
+                    _ => None,
+                },
             },
         })
         .collect();
@@ -326,6 +338,13 @@ pub async fn list_models(
                 provider_type: model.provider_type,
                 provider_config: model.provider_config,
                 attestation_supported: model.attestation_supported,
+                architecture: match (model.input_modalities, model.output_modalities) {
+                    (Some(input), Some(output)) => Some(ModelArchitecture {
+                        input_modalities: input,
+                        output_modalities: output,
+                    }),
+                    _ => None,
+                },
             },
             is_active: model.is_active,
             created_at: model.created_at,
@@ -448,6 +467,8 @@ pub async fn get_model_history(
             changed_by_user_email: h.changed_by_user_email,
             change_reason: h.change_reason,
             created_at: h.created_at.to_rfc3339(),
+            input_modalities: h.input_modalities,
+            output_modalities: h.output_modalities,
         })
         .collect();
 

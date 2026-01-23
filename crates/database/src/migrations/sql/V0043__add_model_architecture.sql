@@ -3,7 +3,7 @@
 --
 -- Columns are nullable for now - existing models will have NULL values.
 -- A future migration will make these NOT NULL once all models are populated.
--- The API layer treats NULL as ["text"] for backward compatibility.
+-- The API layer omits the architecture field when modalities are NULL.
 
 -- Add input/output modalities to models table (nullable)
 ALTER TABLE models ADD COLUMN input_modalities JSONB;

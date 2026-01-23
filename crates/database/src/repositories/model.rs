@@ -12,6 +12,21 @@ use tokio_postgres::Row;
 // Default reason for soft delete operations
 const DEFAULT_SOFT_DELETE_REASON: &str = "Model soft deleted";
 
+/// Serialize optional modalities to JSON value for database storage.
+/// Returns Ok(None) if input is None, Ok(Some(value)) if serialization succeeds,
+/// or an error if serialization fails.
+fn serialize_modalities(
+    modalities: &Option<Vec<String>>,
+    field_name: &str,
+) -> Result<Option<serde_json::Value>> {
+    modalities
+        .as_ref()
+        .map(|v| {
+            serde_json::to_value(v).with_context(|| format!("Failed to serialize {}", field_name))
+        })
+        .transpose()
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelRepository {
     pool: DbPool,
@@ -355,6 +370,12 @@ impl ModelRepository {
 
         let owned_by = update_request.owned_by.as_ref().cloned();
 
+        // Serialize modalities before entering retry block to propagate errors
+        let input_modalities_json =
+            serialize_modalities(&update_request.input_modalities, "input_modalities")?;
+        let output_modalities_json =
+            serialize_modalities(&update_request.output_modalities, "output_modalities")?;
+
         let row = retry_db!("upsert_model_pricing", {
             let client = self
                 .pool
@@ -407,8 +428,8 @@ impl ModelRepository {
                             &update_request.provider_type,
                             &update_request.provider_config,
                             &update_request.attestation_supported,
-                            &update_request.input_modalities.as_ref().and_then(|v| serde_json::to_value(v).ok()),
-                            &update_request.output_modalities.as_ref().and_then(|v| serde_json::to_value(v).ok()),
+                            &input_modalities_json,
+                            &output_modalities_json,
                         ],
                     )
                     .await
@@ -492,8 +513,8 @@ impl ModelRepository {
                             &update_request.provider_type,
                             &update_request.provider_config,
                             &update_request.attestation_supported,
-                            &update_request.input_modalities.as_ref().and_then(|v| serde_json::to_value(v).ok()),
-                            &update_request.output_modalities.as_ref().and_then(|v| serde_json::to_value(v).ok()),
+                            &input_modalities_json,
+                            &output_modalities_json,
                         ],
                     )
                     .await
@@ -523,6 +544,12 @@ impl ModelRepository {
 
     /// Create a new model with pricing
     pub async fn create_model(&self, model: &Model) -> Result<Model> {
+        // Serialize modalities before entering retry block to propagate errors
+        let input_modalities_json =
+            serialize_modalities(&model.input_modalities, "input_modalities")?;
+        let output_modalities_json =
+            serialize_modalities(&model.output_modalities, "output_modalities")?;
+
         let row = retry_db!("create_model", {
             let client = self
                 .pool
@@ -562,8 +589,8 @@ impl ModelRepository {
                         &model.provider_type,
                         &model.provider_config,
                         &model.attestation_supported,
-                        &model.input_modalities.as_ref().and_then(|v| serde_json::to_value(v).ok()),
-                        &model.output_modalities.as_ref().and_then(|v| serde_json::to_value(v).ok()),
+                        &input_modalities_json,
+                        &output_modalities_json,
                     ],
                 )
                 .await

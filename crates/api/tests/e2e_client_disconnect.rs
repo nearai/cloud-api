@@ -197,3 +197,214 @@ async fn test_response_items_saved_on_disconnect() {
         main_usage
     );
 }
+
+#[tokio::test]
+async fn test_signature_returns_stream_disconnected_on_client_disconnect() {
+    let (server, _pool, mock, database, _guard) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    use common::mock_prompts;
+
+    // Configure mock: 10 words, disconnect after 5
+    let full_response = "Machine learning is a fascinating field of artificial intelligence today";
+    let prompt = mock_prompts::build_prompt("Tell me about AI");
+    mock.when(inference_providers::mock::RequestMatcher::ExactPrompt(
+        prompt,
+    ))
+    .respond_with(
+        inference_providers::mock::ResponseTemplate::new(full_response).with_disconnect_after(5),
+    )
+    .await;
+
+    // Create conversation
+    let conv_resp = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({}))
+        .await;
+    assert_eq!(conv_resp.status_code(), 201);
+    let conversation: api::models::ConversationObject = conv_resp.json();
+
+    // Make streaming request
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "conversation": conversation.id,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "Tell me about AI"}]}],
+            "stream": true
+        }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+
+    // Parse the response to get response_id
+    let response_text = response.text();
+    let mut response_id: Option<String> = None;
+    for line_chunk in response_text.split("\n\n") {
+        for line in line_chunk.lines() {
+            if let Some(data) = line.strip_prefix("data: ") {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                    if let Some(id) = json
+                        .get("response")
+                        .and_then(|r| r.get("id"))
+                        .and_then(|id| id.as_str())
+                    {
+                        response_id = Some(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let response_id = response_id.expect("Should have response_id from stream");
+
+    // Wait for async DB writes
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Manually update the usage record to simulate a client disconnect
+    // (The mock ends the stream normally, so we need to update the stop_reason manually)
+    let pool = database.pool();
+    let client = pool.get().await.expect("Failed to get database connection");
+    let response_uuid_str = response_id.strip_prefix("resp_").unwrap_or(&response_id);
+    let response_uuid = uuid::Uuid::parse_str(response_uuid_str).expect("Invalid response ID");
+
+    // Delete any signature that might have been stored (to simulate no signature available)
+    client
+        .execute(
+            "DELETE FROM chat_signatures WHERE chat_id = $1",
+            &[&response_id],
+        )
+        .await
+        .expect("Failed to delete signature");
+
+    // Update the stop_reason to client_disconnect
+    client
+        .execute(
+            "UPDATE organization_usage_log SET stop_reason = 'client_disconnect' WHERE response_id = $1",
+            &[&response_uuid],
+        )
+        .await
+        .expect("Failed to update stop_reason");
+
+    // Now call the signature endpoint - should return 200 with STREAM_DISCONNECTED
+    let signature_resp = server
+        .get(&format!("/v1/signature/{response_id}?signing_algo=ecdsa"))
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+
+    assert_eq!(
+        signature_resp.status_code(),
+        200,
+        "Signature endpoint should return 200 for client disconnect. Response: {}",
+        signature_resp.text()
+    );
+
+    let signature_json: serde_json::Value = signature_resp.json();
+    assert_eq!(
+        signature_json.get("error_code").and_then(|v| v.as_str()),
+        Some("STREAM_DISCONNECTED"),
+        "Should have STREAM_DISCONNECTED error_code. Response: {:?}",
+        signature_json
+    );
+    assert_eq!(
+        signature_json.get("message").and_then(|v| v.as_str()),
+        Some("Verification not available due to disconnection."),
+        "Should have expected message. Response: {:?}",
+        signature_json
+    );
+}
+
+#[tokio::test]
+async fn test_signature_returns_404_when_not_client_disconnect() {
+    let (server, _pool, mock, database, _guard) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    use common::mock_prompts;
+
+    // Configure mock with normal response
+    let full_response = "Hello world";
+    let prompt = mock_prompts::build_prompt("Say hello");
+    mock.when(inference_providers::mock::RequestMatcher::ExactPrompt(
+        prompt,
+    ))
+    .respond_with(inference_providers::mock::ResponseTemplate::new(
+        full_response,
+    ))
+    .await;
+
+    // Create conversation
+    let conv_resp = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({}))
+        .await;
+    assert_eq!(conv_resp.status_code(), 201);
+    let conversation: api::models::ConversationObject = conv_resp.json();
+
+    // Make streaming request
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "conversation": conversation.id,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "Say hello"}]}],
+            "stream": true
+        }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+
+    // Parse the response to get response_id
+    let response_text = response.text();
+    let mut response_id: Option<String> = None;
+    for line_chunk in response_text.split("\n\n") {
+        for line in line_chunk.lines() {
+            if let Some(data) = line.strip_prefix("data: ") {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                    if let Some(id) = json
+                        .get("response")
+                        .and_then(|r| r.get("id"))
+                        .and_then(|id| id.as_str())
+                    {
+                        response_id = Some(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let response_id = response_id.expect("Should have response_id from stream");
+
+    // Wait for async DB writes
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Delete any signature that might have been stored
+    // The usage record has stop_reason = "completed", so signature should return 404
+    let pool = database.pool();
+    let client = pool.get().await.expect("Failed to get database connection");
+
+    // Ensure no signature exists
+    client
+        .execute(
+            "DELETE FROM chat_signatures WHERE chat_id = $1",
+            &[&response_id],
+        )
+        .await
+        .expect("Failed to delete signature");
+
+    // Now call the signature endpoint - should return 404 since stop_reason is "completed"
+    let signature_resp = server
+        .get(&format!("/v1/signature/{response_id}?signing_algo=ecdsa"))
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+
+    assert_eq!(
+        signature_resp.status_code(),
+        404,
+        "Signature endpoint should return 404 for completed stream without signature. Response: {}",
+        signature_resp.text()
+    );
+}

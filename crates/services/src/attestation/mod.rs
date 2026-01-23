@@ -1,6 +1,6 @@
 pub mod models;
 use dstack_sdk::dstack_client;
-pub use models::{AttestationError, ChatSignature};
+pub use models::{AttestationError, ChatSignature, SignatureLookupResult};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -12,6 +12,7 @@ use k256::ecdsa::{
 };
 use rand_core::{OsRng, RngCore};
 use sha3::{Digest, Keccak256};
+use uuid::Uuid;
 
 use crate::{
     attestation::{
@@ -21,6 +22,7 @@ use crate::{
     inference_provider_pool::InferenceProviderPool,
     metrics::{consts::*, MetricsServiceTrait},
     models::ModelsRepository,
+    usage::{StopReason, UsageRepository},
 };
 
 use chrono;
@@ -38,6 +40,7 @@ pub struct AttestationService {
     pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub models_repository: Arc<dyn ModelsRepository>,
     pub metrics_service: Arc<dyn MetricsServiceTrait>,
+    pub usage_repository: Arc<dyn UsageRepository>,
     pub vpc_info: Option<VpcInfo>,
     pub vpc_shared_secret: Option<String>,
     ed25519_signing_key: Arc<SigningKey>,
@@ -52,6 +55,7 @@ impl AttestationService {
         inference_provider_pool: Arc<InferenceProviderPool>,
         models_repository: Arc<dyn ModelsRepository>,
         metrics_service: Arc<dyn MetricsServiceTrait>,
+        usage_repository: Arc<dyn UsageRepository>,
     ) -> Result<Self, AttestationError> {
         // Load VPC info once during initialization
         let vpc_info = load_vpc_info();
@@ -97,6 +101,7 @@ impl AttestationService {
             inference_provider_pool,
             models_repository,
             metrics_service,
+            usage_repository,
             vpc_info,
             vpc_shared_secret,
             ed25519_signing_key: Arc::new(ed25519_signing_key),
@@ -278,6 +283,45 @@ impl AttestationService {
             ))),
         }
     }
+
+    /// Check if the response was stopped due to client disconnect
+    /// If so, return an Unavailable result instead of NotFound error
+    async fn check_fallback_conditions(
+        &self,
+        chat_id: &str,
+        signing_algo: &str,
+    ) -> Result<SignatureLookupResult, AttestationError> {
+        // Parse response UUID from chat_id (strip "resp_" prefix if present)
+        let uuid_str = chat_id.strip_prefix("resp_").unwrap_or(chat_id);
+
+        let response_uuid = match Uuid::parse_str(uuid_str) {
+            Ok(uuid) => uuid,
+            Err(_) => {
+                return Err(AttestationError::SignatureNotFound(format!(
+                    "{}:{}",
+                    chat_id, signing_algo
+                )))
+            }
+        };
+
+        // Query usage repository for stop_reason
+        let stop_reason = self
+            .usage_repository
+            .get_stop_reason_by_response_id(response_uuid)
+            .await
+            .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
+
+        match stop_reason {
+            Some(StopReason::ClientDisconnect) => Ok(SignatureLookupResult::Unavailable {
+                error_code: "STREAM_DISCONNECTED".to_string(),
+                message: "Verification not available due to disconnection.".to_string(),
+            }),
+            _ => Err(AttestationError::SignatureNotFound(format!(
+                "{}:{}",
+                chat_id, signing_algo
+            ))),
+        }
+    }
 }
 
 /// Load VPC (Virtual Private Cloud) information from environment variables
@@ -325,14 +369,24 @@ impl ports::AttestationServiceTrait for AttestationService {
         &self,
         chat_id: &str,
         signing_algo: Option<String>,
-    ) -> Result<ChatSignature, AttestationError> {
+    ) -> Result<SignatureLookupResult, AttestationError> {
         let signing_algo = signing_algo
             .map(|s| s.to_lowercase())
             .unwrap_or_else(|| "ecdsa".to_string());
 
-        self.repository
+        // Try to get signature from repository
+        match self
+            .repository
             .get_chat_signature(chat_id, &signing_algo)
             .await
+        {
+            Ok(signature) => Ok(SignatureLookupResult::Found(signature)),
+            Err(AttestationError::SignatureNotFound(_)) => {
+                // Check if the response was stopped due to client disconnect
+                self.check_fallback_conditions(chat_id, &signing_algo).await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn store_chat_signature_from_provider(

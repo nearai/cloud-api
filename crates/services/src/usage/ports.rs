@@ -230,6 +230,13 @@ pub trait UsageRepository: Send + Sync {
         organization_id: Uuid,
         inference_ids: Vec<Uuid>,
     ) -> anyhow::Result<Vec<InferenceCost>>;
+
+    /// Get the stop reason for a specific response ID
+    /// Used to check if a response was stopped due to client disconnect
+    async fn get_stop_reason_by_response_id(
+        &self,
+        response_id: Uuid,
+    ) -> anyhow::Result<Option<StopReason>>;
 }
 
 #[async_trait::async_trait]

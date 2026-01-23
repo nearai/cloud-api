@@ -170,4 +170,11 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
         self.get_costs_by_inference_ids(organization_id, inference_ids)
             .await
     }
+
+    async fn get_stop_reason_by_response_id(
+        &self,
+        response_id: Uuid,
+    ) -> anyhow::Result<Option<services::usage::StopReason>> {
+        self.get_stop_reason_by_response_id(response_id).await
+    }
 }

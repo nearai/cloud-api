@@ -6,6 +6,7 @@
 
 mod common;
 
+use api::models::BatchUpdateModelApiRequest;
 use common::*;
 
 /// Test audio input in chat completions (sending audio data to the model)
@@ -685,6 +686,175 @@ async fn test_image_generation_validation() {
 
     // Should fail validation
     assert_eq!(response.status_code(), 400, "Should reject empty prompt");
+}
+
+/// Test response_format validation for verifiable models (attestation_supported = true)
+/// Verifiable models only support "b64_json" format:
+/// - response_format: "url" should be rejected
+/// - response_format omitted should default to "b64_json"
+/// - response_format: "b64_json" should work
+/// - Any other value should be rejected
+#[tokio::test]
+async fn test_verifiable_model_response_format_validation() {
+    let (server, guard) = setup_test_server().await;
+    let _guard = guard;
+
+    // Set up a verifiable model with attestation_supported = true
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        "test/verifiable-image-model".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 0,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 0,
+                "currency": "USD"
+            },
+            "costPerImage": {
+                "amount": 40000000,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Verifiable Image Model",
+            "modelDescription": "Test model for verifiable response_format validation",
+            "contextLength": 4096,
+            "verifiable": true,
+            "isActive": true,
+            "attestationSupported": true
+        }))
+        .unwrap(),
+    );
+    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    assert_eq!(updated.len(), 1, "Should have created 1 model");
+    assert!(
+        updated[0].metadata.attestation_supported,
+        "Model should have attestation_supported = true"
+    );
+
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Test 1: response_format: "url" should be rejected
+    let response = server
+        .post("/v1/images/generations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": "test/verifiable-image-model",
+            "prompt": "A beautiful sunset",
+            "response_format": "url"
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        400,
+        "Should reject response_format 'url' for verifiable models"
+    );
+    let error_json: serde_json::Value = response.json();
+    let error_message = error_json
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("");
+    assert!(
+        error_message.contains("not supported for verifiable models"),
+        "Error message should mention verifiable models, got: {}",
+        error_message
+    );
+    assert!(
+        error_message.contains("b64_json"),
+        "Error message should mention b64_json, got: {}",
+        error_message
+    );
+
+    // Test 2: response_format omitted should default to "b64_json" and succeed
+    let response = server
+        .post("/v1/images/generations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": "test/verifiable-image-model",
+            "prompt": "A beautiful sunset"
+            // response_format omitted
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Should accept omitted response_format and default to b64_json"
+    );
+    let response_json: serde_json::Value = response.json();
+    let data = response_json
+        .get("data")
+        .and_then(|d| d.as_array())
+        .expect("Should have data array");
+    assert!(!data.is_empty(), "Should have at least one image");
+    let first_image = &data[0];
+    assert!(
+        first_image.get("b64_json").is_some(),
+        "Should have b64_json field when response_format is omitted (defaulted to b64_json)"
+    );
+
+    // Test 3: response_format: "b64_json" should work
+    let response = server
+        .post("/v1/images/generations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": "test/verifiable-image-model",
+            "prompt": "A beautiful sunset",
+            "response_format": "b64_json"
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Should accept response_format 'b64_json' for verifiable models"
+    );
+    let response_json: serde_json::Value = response.json();
+    let data = response_json
+        .get("data")
+        .and_then(|d| d.as_array())
+        .expect("Should have data array");
+    assert!(!data.is_empty(), "Should have at least one image");
+    let first_image = &data[0];
+    assert!(
+        first_image.get("b64_json").is_some(),
+        "Should have b64_json field"
+    );
+
+    // Test 4: Any other value should be rejected
+    let response = server
+        .post("/v1/images/generations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": "test/verifiable-image-model",
+            "prompt": "A beautiful sunset",
+            "response_format": "invalid_format"
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        400,
+        "Should reject invalid response_format values for verifiable models"
+    );
+    let error_json: serde_json::Value = response.json();
+    let error_message = error_json
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("");
+    assert!(
+        error_message.contains("not supported for verifiable models"),
+        "Error message should mention verifiable models, got: {}",
+        error_message
+    );
 }
 
 /// Test that audio content is properly passed through to providers

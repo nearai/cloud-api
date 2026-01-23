@@ -284,32 +284,37 @@ impl AttestationService {
         }
     }
 
-    /// Check if the response was stopped due to client disconnect
+    /// Check if the response/completion was stopped due to client disconnect
     /// If so, return an Unavailable result instead of NotFound error
     async fn check_fallback_conditions(
         &self,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<SignatureLookupResult, AttestationError> {
-        // Parse response UUID from chat_id (strip "resp_" prefix if present)
-        let uuid_str = chat_id.strip_prefix("resp_").unwrap_or(chat_id);
-
-        let response_uuid = match Uuid::parse_str(uuid_str) {
-            Ok(uuid) => uuid,
-            Err(_) => {
-                return Err(AttestationError::SignatureNotFound(format!(
-                    "{}:{}",
-                    chat_id, signing_algo
-                )))
-            }
+        // Query usage repository for stop_reason based on ID format
+        let stop_reason = if chat_id.starts_with("resp_") {
+            // Response API - query by response_id
+            let uuid_str = chat_id.strip_prefix("resp_").unwrap_or(chat_id);
+            let response_uuid = match Uuid::parse_str(uuid_str) {
+                Ok(uuid) => uuid,
+                Err(_) => {
+                    return Err(AttestationError::SignatureNotFound(format!(
+                        "{}:{}",
+                        chat_id, signing_algo
+                    )))
+                }
+            };
+            self.usage_repository
+                .get_stop_reason_by_response_id(response_uuid)
+                .await
+                .map_err(|e| AttestationError::RepositoryError(e.to_string()))?
+        } else {
+            // Chat Completions API - query by provider_request_id
+            self.usage_repository
+                .get_stop_reason_by_provider_request_id(chat_id)
+                .await
+                .map_err(|e| AttestationError::RepositoryError(e.to_string()))?
         };
-
-        // Query usage repository for stop_reason
-        let stop_reason = self
-            .usage_repository
-            .get_stop_reason_by_response_id(response_uuid)
-            .await
-            .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
 
         match stop_reason {
             Some(StopReason::ClientDisconnect) => Ok(SignatureLookupResult::Unavailable {

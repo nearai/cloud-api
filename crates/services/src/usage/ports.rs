@@ -237,6 +237,13 @@ pub trait UsageRepository: Send + Sync {
         &self,
         response_id: Uuid,
     ) -> anyhow::Result<Option<StopReason>>;
+
+    /// Get the stop reason for a specific provider request ID (e.g., chatcmpl-xxx)
+    /// Used to check if a chat completion was stopped due to client disconnect
+    async fn get_stop_reason_by_provider_request_id(
+        &self,
+        provider_request_id: &str,
+    ) -> anyhow::Result<Option<StopReason>>;
 }
 
 #[async_trait::async_trait]

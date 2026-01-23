@@ -408,3 +408,106 @@ async fn test_signature_returns_404_when_not_client_disconnect() {
         signature_resp.text()
     );
 }
+
+#[tokio::test]
+async fn test_chat_completion_signature_returns_stream_disconnected_on_client_disconnect() {
+    let (server, _pool, mock, database, _guard) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    use common::mock_prompts;
+
+    // Configure mock: 10 words, disconnect after 5
+    let full_response = "Machine learning is a fascinating field of artificial intelligence today";
+    let prompt = mock_prompts::build_prompt("Tell me about AI");
+    mock.when(inference_providers::mock::RequestMatcher::ExactPrompt(
+        prompt,
+    ))
+    .respond_with(
+        inference_providers::mock::ResponseTemplate::new(full_response).with_disconnect_after(5),
+    )
+    .await;
+
+    // Make streaming chat completion request
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "messages": [{"role": "user", "content": "Tell me about AI"}],
+            "stream": true
+        }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+
+    // Parse the response to get completion id (chatcmpl-xxx format)
+    let response_text = response.text();
+    let mut completion_id: Option<String> = None;
+    for line in response_text.lines() {
+        if let Some(data) = line.strip_prefix("data: ") {
+            if data == "[DONE]" {
+                continue;
+            }
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(id) = json.get("id").and_then(|id| id.as_str()) {
+                    completion_id = Some(id.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    let completion_id = completion_id.expect("Should have completion_id from stream");
+
+    // Wait for async DB writes
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Manually update the usage record to simulate a client disconnect
+    let pool = database.pool();
+    let client = pool.get().await.expect("Failed to get database connection");
+
+    // Delete any signature that might have been stored
+    client
+        .execute(
+            "DELETE FROM chat_signatures WHERE chat_id = $1",
+            &[&completion_id],
+        )
+        .await
+        .expect("Failed to delete signature");
+
+    // Update the stop_reason to client_disconnect (by provider_request_id for chat completions)
+    client
+        .execute(
+            "UPDATE organization_usage_log SET stop_reason = 'client_disconnect' WHERE provider_request_id = $1",
+            &[&completion_id],
+        )
+        .await
+        .expect("Failed to update stop_reason");
+
+    // Now call the signature endpoint - should return 200 with STREAM_DISCONNECTED
+    let signature_resp = server
+        .get(&format!("/v1/signature/{completion_id}?signing_algo=ecdsa"))
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+
+    assert_eq!(
+        signature_resp.status_code(),
+        200,
+        "Signature endpoint should return 200 for client disconnect on chat completion. Response: {}",
+        signature_resp.text()
+    );
+
+    let signature_json: serde_json::Value = signature_resp.json();
+    assert_eq!(
+        signature_json.get("error_code").and_then(|v| v.as_str()),
+        Some("STREAM_DISCONNECTED"),
+        "Should have STREAM_DISCONNECTED error_code. Response: {:?}",
+        signature_json
+    );
+    assert_eq!(
+        signature_json.get("message").and_then(|v| v.as_str()),
+        Some("Verification not available due to disconnection."),
+        "Should have expected message. Response: {:?}",
+        signature_json
+    );
+}

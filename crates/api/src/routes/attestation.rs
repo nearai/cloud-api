@@ -90,15 +90,36 @@ pub async fn get_signature(
     match result {
         SignatureLookupResult::Found(signature) => {
             let response: SignatureResponse = signature.into();
-            Ok(ResponseJson(serde_json::to_value(response).unwrap()))
+            serde_json::to_value(response)
+                .map(ResponseJson)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse {
+                            error: format!("Failed to serialize signature response: {e}"),
+                        }),
+                    )
+                })
         }
         SignatureLookupResult::Unavailable {
             error_code,
             message,
-        } => Ok(ResponseJson(serde_json::json!({
-            "error_code": error_code,
-            "message": message
-        }))),
+        } => {
+            let response = SignatureUnavailableResponse {
+                error_code,
+                message,
+            };
+            serde_json::to_value(response)
+                .map(ResponseJson)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse {
+                            error: format!("Failed to serialize unavailable response: {e}"),
+                        }),
+                    )
+                })
+        }
     }
 }
 

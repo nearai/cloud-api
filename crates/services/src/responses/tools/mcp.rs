@@ -116,6 +116,7 @@ impl McpClient for RealMcpClient {
         let request = CallToolRequestParam {
             name: tool_name.to_string().into(),
             arguments: args,
+            task: None,
         };
 
         let client = self.client.lock().await;

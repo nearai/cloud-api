@@ -27,6 +27,27 @@ fn serialize_modalities(
         .transpose()
 }
 
+/// Deserialize optional modalities from JSON value.
+/// Returns None if the value is None or if deserialization fails.
+/// Logs an error if deserialization fails (indicates data corruption).
+fn deserialize_modalities(
+    value: Option<serde_json::Value>,
+    field_name: &str,
+    model_identifier: &str,
+) -> Option<Vec<String>> {
+    value.and_then(|v| {
+        serde_json::from_value(v.clone()).unwrap_or_else(|e| {
+            tracing::error!(
+                field = field_name,
+                model = model_identifier,
+                error = %e,
+                "Failed to deserialize modalities from database - data may be corrupted"
+            );
+            None
+        })
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelRepository {
     pool: DbPool,
@@ -1008,9 +1029,10 @@ impl ModelRepository {
 
     /// Helper method to convert database row to Model
     fn row_to_model(&self, row: &Row) -> Model {
+        let model_name: String = row.get("model_name");
         Model {
             id: row.get("id"),
-            model_name: row.get("model_name"),
+            model_name: model_name.clone(),
             model_display_name: row.get("model_display_name"),
             model_description: row.get("model_description"),
             model_icon: row.get("model_icon"),
@@ -1029,21 +1051,26 @@ impl ModelRepository {
                 .unwrap_or_else(|_| "vllm".to_string()),
             provider_config: row.try_get("provider_config").ok().flatten(),
             attestation_supported: row.try_get("attestation_supported").unwrap_or(true),
-            input_modalities: row
-                .try_get::<_, Option<serde_json::Value>>("input_modalities")
-                .ok()
-                .flatten()
-                .and_then(|v| serde_json::from_value(v).ok()),
-            output_modalities: row
-                .try_get::<_, Option<serde_json::Value>>("output_modalities")
-                .ok()
-                .flatten()
-                .and_then(|v| serde_json::from_value(v).ok()),
+            input_modalities: deserialize_modalities(
+                row.try_get::<_, Option<serde_json::Value>>("input_modalities")
+                    .ok()
+                    .flatten(),
+                "input_modalities",
+                &model_name,
+            ),
+            output_modalities: deserialize_modalities(
+                row.try_get::<_, Option<serde_json::Value>>("output_modalities")
+                    .ok()
+                    .flatten(),
+                "output_modalities",
+                &model_name,
+            ),
         }
     }
 
     /// Helper method to convert database row to ModelHistory
     fn row_to_model_history(&self, row: &Row) -> ModelHistory {
+        let model_name: String = row.get("model_name");
         ModelHistory {
             id: row.get("id"),
             model_id: row.get("model_id"),
@@ -1051,7 +1078,7 @@ impl ModelRepository {
             output_cost_per_token: row.get("output_cost_per_token"),
             cost_per_image: row.get("cost_per_image"),
             context_length: row.get("context_length"),
-            model_name: row.get("model_name"),
+            model_name: model_name.clone(),
             model_display_name: row.get("model_display_name"),
             model_description: row.get("model_description"),
             model_icon: row.get("model_icon"),
@@ -1061,16 +1088,20 @@ impl ModelRepository {
             provider_type: row.try_get("provider_type").ok().flatten(),
             provider_config: row.try_get("provider_config").ok().flatten(),
             attestation_supported: row.try_get("attestation_supported").ok().flatten(),
-            input_modalities: row
-                .try_get::<_, Option<serde_json::Value>>("input_modalities")
-                .ok()
-                .flatten()
-                .and_then(|v| serde_json::from_value(v).ok()),
-            output_modalities: row
-                .try_get::<_, Option<serde_json::Value>>("output_modalities")
-                .ok()
-                .flatten()
-                .and_then(|v| serde_json::from_value(v).ok()),
+            input_modalities: deserialize_modalities(
+                row.try_get::<_, Option<serde_json::Value>>("input_modalities")
+                    .ok()
+                    .flatten(),
+                "input_modalities",
+                &model_name,
+            ),
+            output_modalities: deserialize_modalities(
+                row.try_get::<_, Option<serde_json::Value>>("output_modalities")
+                    .ok()
+                    .flatten(),
+                "output_modalities",
+                &model_name,
+            ),
             effective_from: row.get("effective_from"),
             effective_until: row.get("effective_until"),
             changed_by_user_id: row.get("changed_by_user_id"),

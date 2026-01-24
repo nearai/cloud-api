@@ -322,6 +322,11 @@ pub async fn init_domain_services_with_pool(
         response_items_repo.clone(),
     ));
 
+    // Prepare usage repository for attestation service (needed to check stop_reason for disconnected streams)
+    let usage_repository_for_attestation = Arc::new(
+        database::repositories::OrganizationUsageRepository::new(database.pool().clone()),
+    ) as Arc<dyn services::usage::UsageRepository>;
+
     // Create attestation service
     let attestation_service = Arc::new(
         services::attestation::AttestationService::init(
@@ -329,6 +334,7 @@ pub async fn init_domain_services_with_pool(
             inference_provider_pool.clone(),
             models_repo.clone(),
             metrics_service.clone(),
+            usage_repository_for_attestation,
         )
         .await
         .unwrap(),

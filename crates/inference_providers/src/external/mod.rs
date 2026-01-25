@@ -30,9 +30,9 @@ pub mod openai_compatible;
 
 use crate::{
     AttestationError, ChatCompletionParams, ChatCompletionResponseWithBytes, ChatSignature,
-    CompletionError, CompletionParams, ImageGenerationError, ImageGenerationParams,
-    ImageGenerationResponseWithBytes, InferenceProvider, ListModelsError, ModelsResponse,
-    StreamingResult,
+    CompletionError, CompletionParams, ImageEditError, ImageEditParams, ImageEditResponseWithBytes,
+    ImageGenerationError, ImageGenerationParams, ImageGenerationResponseWithBytes,
+    InferenceProvider, ListModelsError, ModelsResponse, StreamingResult,
 };
 use async_trait::async_trait;
 use backend::{BackendConfig, ExternalBackend};
@@ -296,6 +296,17 @@ impl InferenceProvider for ExternalProvider {
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
         self.backend
             .image_generation(&self.config, &self.model_name, params)
+            .await
+    }
+
+    /// Performs an image edit request through the appropriate backend
+    async fn image_edit(
+        &self,
+        params: ImageEditParams,
+        _request_hash: String,
+    ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
+        self.backend
+            .image_edit(&self.config, &self.model_name, params)
             .await
     }
 }

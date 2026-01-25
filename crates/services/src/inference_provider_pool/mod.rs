@@ -2,9 +2,10 @@ use crate::common::encryption_headers;
 use config::ExternalProvidersConfig;
 use inference_providers::{
     models::{AttestationError, CompletionError, ListModelsError, ModelsResponse},
-    ChatCompletionParams, ExternalProvider, ExternalProviderConfig, ImageGenerationError,
-    ImageGenerationParams, ImageGenerationResponseWithBytes, InferenceProvider, ProviderConfig,
-    StreamingResult, StreamingResultExt, VLlmConfig, VLlmProvider,
+    ChatCompletionParams, ExternalProvider, ExternalProviderConfig, ImageEditError,
+    ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponseWithBytes, InferenceProvider, ProviderConfig, StreamingResult,
+    StreamingResultExt, VLlmConfig, VLlmProvider,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -1162,6 +1163,46 @@ impl InferenceProviderPool {
         tracing::info!(
             image_id = %image_id,
             "Storing chat_id mapping for image generation"
+        );
+        self.store_chat_id_mapping(image_id, provider).await;
+
+        Ok(response)
+    }
+
+    pub async fn image_edit(
+        &self,
+        params: ImageEditParams,
+        request_hash: String,
+    ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
+        let model_id = params.model.clone();
+
+        tracing::debug!(
+            model = %model_id,
+            "Starting image edit request"
+        );
+
+        let params_for_provider = params.clone();
+
+        let (response, provider) = self
+            .retry_with_fallback(&model_id, "image_edit", None, |provider| {
+                let params = params_for_provider.clone();
+                let request_hash = request_hash.clone();
+                async move {
+                    provider
+                        .image_edit(params, request_hash)
+                        .await
+                        .map_err(|e| CompletionError::CompletionError(e.to_string()))
+                }
+            })
+            .await
+            .map_err(|e| ImageEditError::EditError(e.to_string()))?;
+
+        // Store the chat_id mapping so attestation service can find the provider
+        // (same pattern as image_generation)
+        let image_id = response.response.id.clone();
+        tracing::info!(
+            image_id = %image_id,
+            "Storing chat_id mapping for image edit"
         );
         self.store_chat_id_mapping(image_id, provider).await;
 

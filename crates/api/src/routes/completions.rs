@@ -842,3 +842,340 @@ pub async fn image_generations(
         }
     }
 }
+
+/// Edit images from a text prompt and image
+///
+/// Edit images using an AI model from an image and text description. OpenAI-compatible endpoint.
+///
+/// **Request Body (multipart/form-data):**
+/// All fields should be provided as text values or files as indicated in the schema.
+#[utoipa::path(
+    post,
+    path = "/v1/images/edits",
+    tag = "Images",
+    request_body(content = ImageEditRequestSchema, content_type = "multipart/form-data"),
+    responses(
+        (status = 200, description = "Image edited successfully", body = ImageGenerationResponse),
+        (status = 400, description = "Invalid request parameters", body = ErrorResponse),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 413, description = "Payload too large", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn image_edits(
+    State(app_state): State<AppState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(body_hash): Extension<RequestBodyHash>,
+    mut multipart: axum::extract::Multipart,
+) -> axum::response::Response {
+    debug!("Image edit request from api key: {:?}", api_key.api_key.id);
+
+    let mut model = String::new();
+    let mut prompt = String::new();
+    let mut image: Option<Vec<u8>> = None;
+    let mut size: Option<String> = None;
+    let mut response_format: Option<String> = None;
+
+    // Parse multipart form data
+    while let Ok(Some(field)) = multipart.next_field().await {
+        match field.name().unwrap_or("") {
+            "image" => {
+                let bytes = match field.bytes().await {
+                    Ok(b) => b.to_vec(),
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            ResponseJson(ErrorResponse::new(
+                                format!("Failed to read image: {}", e),
+                                "invalid_request_error".to_string(),
+                            )),
+                        )
+                            .into_response();
+                    }
+                };
+
+                // Check size limit (512 MB)
+                if bytes.len() > 512 * 1024 * 1024 {
+                    return (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        ResponseJson(ErrorResponse::new(
+                            "Image size exceeds maximum of 512 MB".to_string(),
+                            "invalid_request_error".to_string(),
+                        )),
+                    )
+                        .into_response();
+                }
+
+                image = Some(bytes);
+            }
+            "model" => match field.text().await {
+                Ok(text) => model = text,
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!("Failed to read model: {}", e),
+                            "invalid_request_error".to_string(),
+                        )),
+                    )
+                        .into_response();
+                }
+            },
+            "prompt" => match field.text().await {
+                Ok(text) => prompt = text,
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!("Failed to read prompt: {}", e),
+                            "invalid_request_error".to_string(),
+                        )),
+                    )
+                        .into_response();
+                }
+            },
+            "size" => match field.text().await {
+                Ok(text) => size = Some(text),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!("Failed to read size: {}", e),
+                            "invalid_request_error".to_string(),
+                        )),
+                    )
+                        .into_response();
+                }
+            },
+            "response_format" => match field.text().await {
+                Ok(text) => response_format = Some(text),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!("Failed to read response_format: {}", e),
+                            "invalid_request_error".to_string(),
+                        )),
+                    )
+                        .into_response();
+                }
+            },
+            _ => {
+                // Ignore unknown fields
+            }
+        }
+    }
+
+    // Build the request
+    let request = crate::models::ImageEditRequest {
+        model,
+        prompt,
+        image: image.unwrap_or_default(),
+        size,
+        response_format,
+    };
+
+    debug!(
+        "Image edit request: model={}, org={}, workspace={}",
+        request.model, api_key.organization.id, api_key.workspace.id.0
+    );
+
+    // Validate the request
+    if let Err(error) = request.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                error,
+                "invalid_request_error".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
+    // Resolve model to get UUID for usage tracking
+    let model = match app_state
+        .models_service
+        .get_model_by_name(&request.model)
+        .await
+    {
+        Ok(model) => model,
+        Err(services::models::ModelsError::NotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    format!("Model '{}' not found", request.model),
+                    "invalid_request_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to resolve model for image edit");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to resolve model".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    // Validate and enforce response_format for verifiable models
+    // Verifiable models (attestation_supported = true) only support "b64_json" format
+    // Default to "b64_json" if not specified to prevent downstream server from applying "url" default
+    let response_format = if model.attestation_supported {
+        match &request.response_format {
+            Some(format) if format == "b64_json" => Some(format.clone()),
+            Some(format) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        format!(
+                            "response_format '{}' is not supported for verifiable models. Only 'b64_json' is supported.",
+                            format
+                        ),
+                        "invalid_request_error".to_string(),
+                    )),
+                )
+                    .into_response();
+            }
+            None => Some("b64_json".to_string()), // Default to b64_json for verifiable models
+        }
+    } else {
+        request.response_format.clone()
+    };
+
+    // Convert API request to provider params
+    let params = inference_providers::ImageEditParams {
+        model: request.model.clone(),
+        prompt: request.prompt.clone(),
+        image: request.image,
+        size: request.size,
+        response_format,
+    };
+
+    // Call the inference provider pool
+    match app_state
+        .inference_provider_pool
+        .image_edit(params, body_hash.hash.clone())
+        .await
+    {
+        Ok(response_with_bytes) => {
+            // Store attestation signature for image edit (same pattern as image generation)
+            let attestation_service = app_state.attestation_service.clone();
+            let image_id_for_sig = response_with_bytes.response.id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = attestation_service
+                    .store_chat_signature_from_provider(&image_id_for_sig)
+                    .await
+                {
+                    tracing::error!(error = %e, "Failed to store image edit signature");
+                } else {
+                    tracing::debug!(image_id = %image_id_for_sig, "Stored signature for image edit");
+                }
+            });
+
+            // Record usage for image edit
+            let organization_id = api_key.organization.id.0;
+            let workspace_id = api_key.workspace.id.0;
+            let api_key_id_str = api_key.api_key.id.0.clone();
+            let model_id = model.id;
+            let image_count = response_with_bytes.response.data.len() as i32;
+            let provider_request_id = response_with_bytes.response.id.clone();
+            let usage_service = app_state.usage_service.clone();
+
+            // Spawn async task to record usage (fire-and-forget like image generation)
+            tokio::spawn(async move {
+                // Parse API key ID to UUID
+                let api_key_id = match Uuid::parse_str(&api_key_id_str) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Invalid API key ID for usage tracking");
+                        return;
+                    }
+                };
+
+                // Hash the provider request ID to UUID for storage
+                let inference_id = Some(hash_inference_id_to_uuid(&provider_request_id));
+
+                let usage_request = services::usage::RecordUsageServiceRequest {
+                    organization_id,
+                    workspace_id,
+                    api_key_id,
+                    model_id,
+                    // Image edit doesn't have traditional token counts
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    inference_type: "image_edit".to_string(),
+                    ttft_ms: None,
+                    avg_itl_ms: None,
+                    inference_id,
+                    provider_request_id: Some(provider_request_id),
+                    stop_reason: Some(services::usage::StopReason::Completed),
+                    response_id: None,
+                    image_count: Some(image_count),
+                };
+
+                if let Err(e) = usage_service.record_usage(usage_request).await {
+                    tracing::error!(
+                        error = %e,
+                        %organization_id,
+                        %workspace_id,
+                        "Failed to record image edit usage"
+                    );
+                }
+            });
+
+            // Return the exact bytes from the provider for hash verification
+            // This ensures clients can hash the response and compare with attestation endpoints
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(response_with_bytes.raw_bytes))
+                .unwrap()
+        }
+        Err(e) => {
+            // Log the full error internally but return a sanitized message to the client
+            tracing::error!(error = %e, "Image edit failed");
+
+            // Map error to appropriate status code and sanitized message
+            let (status_code, message) = match &e {
+                inference_providers::ImageEditError::EditError(msg) => {
+                    // Check if it's a model not found error
+                    if msg.contains("not found") || msg.contains("does not exist") {
+                        (StatusCode::NOT_FOUND, "Model not found".to_string())
+                    } else {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Image edit failed".to_string(),
+                        )
+                    }
+                }
+                inference_providers::ImageEditError::HttpError { status_code, .. } => {
+                    // Map HTTP status codes appropriately
+                    let code = StatusCode::from_u16(*status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let msg = match code {
+                        StatusCode::NOT_FOUND => "Model not found".to_string(),
+                        StatusCode::BAD_REQUEST => "Invalid request".to_string(),
+                        StatusCode::TOO_MANY_REQUESTS => "Rate limit exceeded".to_string(),
+                        _ => "Image edit failed".to_string(),
+                    };
+                    (code, msg)
+                }
+            };
+
+            (
+                status_code,
+                ResponseJson(ErrorResponse::new(message, "server_error".to_string())),
+            )
+                .into_response()
+        }
+    }
+}

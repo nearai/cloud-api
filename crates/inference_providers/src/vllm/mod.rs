@@ -449,4 +449,97 @@ impl InferenceProvider for VLlmProvider {
             raw_bytes,
         })
     }
+
+    /// Performs an image edit request
+    async fn image_edit(
+        &self,
+        params: ImageEditParams,
+        request_hash: String,
+    ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
+        let url = format!("{}/v1/images/edits", self.config.base_url);
+
+        // Build headers without Content-Type (let reqwest set multipart boundary)
+        let mut headers = reqwest::header::HeaderMap::new();
+
+        if let Some(ref api_key) = self.config.api_key {
+            let auth_value = format!("Bearer {api_key}");
+            let header_value = HeaderValue::from_str(&auth_value)
+                .map_err(|e| ImageEditError::EditError(format!("Invalid API key format: {e}")))?;
+            headers.insert("Authorization", header_value);
+        }
+
+        headers.insert(
+            "X-Request-Hash",
+            HeaderValue::from_str(&request_hash)
+                .map_err(|e| ImageEditError::EditError(format!("Invalid request hash: {e}")))?,
+        );
+
+        // Detect image MIME type based on magic bytes
+        let image_mime_type = if params.image.len() >= 3 && &params.image[0..3] == b"\xFF\xD8\xFF" {
+            "image/jpeg"
+        } else if params.image.len() >= 4 && &params.image[0..4] == b"\x89PNG" {
+            "image/png"
+        } else {
+            "image/jpeg" // Default to jpeg
+        };
+
+        // Build multipart form data
+        let mut form = reqwest::multipart::Form::new();
+
+        // Add text fields first
+        form = form.text("model", params.model);
+        form = form.text("prompt", params.prompt);
+
+        // Add image as image[] field (vLLM expects array syntax)
+        let image_part = reqwest::multipart::Part::bytes(params.image)
+            .file_name("image.bin")
+            .mime_str(image_mime_type)
+            .map_err(|e| ImageEditError::EditError(format!("Invalid image MIME type: {e}")))?;
+        form = form.part("image[]", image_part);
+
+        // Add optional text parameters
+        if let Some(size) = params.size {
+            form = form.text("size", size);
+        }
+        if let Some(response_format) = params.response_format {
+            form = form.text("response_format", response_format);
+        }
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| ImageEditError::EditError(format!("Request failed: {e}")))?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(ImageEditError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        // Get raw bytes first for exact hash verification (same pattern as image_generation)
+        let raw_bytes = response
+            .bytes()
+            .await
+            .map_err(|e| ImageEditError::EditError(format!("Failed to read response body: {e}")))?
+            .to_vec();
+
+        // Parse the response from the raw bytes
+        let edit_response: ImageGenerationResponse = serde_json::from_slice(&raw_bytes)
+            .map_err(|e| ImageEditError::EditError(format!("Failed to parse response: {e}")))?;
+
+        Ok(ImageEditResponseWithBytes {
+            response: edit_response,
+            raw_bytes,
+        })
+    }
 }

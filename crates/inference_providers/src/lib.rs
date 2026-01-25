@@ -72,6 +72,7 @@ pub use models::{
     AudioOutput, ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionResponseWithBytes, ChatDelta, ChatMessage, ChatResponseMessage, ChatSignature,
     CompletionError, CompletionParams, FinishReason, FunctionChoice, FunctionDefinition, ImageData,
+    ImageEditError, ImageEditParams, ImageEditResponse, ImageEditResponseWithBytes,
     ImageGenerationError, ImageGenerationParams, ImageGenerationResponse,
     ImageGenerationResponseWithBytes, MessageRole, ModelInfo, StreamChunk, StreamOptions,
     TokenUsage, ToolChoice, ToolDefinition,
@@ -150,6 +151,16 @@ pub trait InferenceProvider {
         params: ImageGenerationParams,
         request_hash: String,
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError>;
+
+    /// Performs an image edit request
+    ///
+    /// Returns edited images based on the provided image and prompt.
+    /// Includes raw bytes for TEE signature verification.
+    async fn image_edit(
+        &self,
+        params: ImageEditParams,
+        request_hash: String,
+    ) -> Result<ImageEditResponseWithBytes, ImageEditError>;
 
     async fn get_signature(
         &self,

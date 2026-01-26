@@ -1131,20 +1131,30 @@ impl InferenceProviderPool {
     /// Generate images using the specified model
     pub async fn image_generation(
         &self,
-        params: ImageGenerationParams,
+        mut params: ImageGenerationParams,
         request_hash: String,
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
         let model_id = params.model.clone();
+
+        // Extract model_pub_key from params.extra for routing before any cloning.
+        // This ensures the key is removed from params.extra so it won't be passed to the provider,
+        // and we have a stable reference for routing even if retries occur.
+        let model_pub_key_str = params
+            .extra
+            .remove(encryption_headers::MODEL_PUB_KEY)
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
+        let model_pub_key = model_pub_key_str.as_deref();
 
         tracing::debug!(
             model = %model_id,
             "Starting image generation request"
         );
 
+        // Clone params after removing model_pub_key to ensure it's not in the cloned version
         let params_for_provider = params.clone();
 
         let (response, provider) = self
-            .retry_with_fallback(&model_id, "image_generation", None, |provider| {
+            .retry_with_fallback(&model_id, "image_generation", model_pub_key, |provider| {
                 let params = params_for_provider.clone();
                 let request_hash = request_hash.clone();
                 async move {

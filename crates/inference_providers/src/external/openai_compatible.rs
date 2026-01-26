@@ -433,6 +433,7 @@ mod tests {
             response_format: Some("b64_json".to_string()),
             quality: Some("hd".to_string()),
             style: Some("vivid".to_string()),
+            extra: std::collections::HashMap::new(),
         };
 
         let json = serde_json::to_string(&params).unwrap();

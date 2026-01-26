@@ -404,7 +404,7 @@ impl InferenceProvider for VLlmProvider {
     /// Performs an image generation request
     async fn image_generation(
         &self,
-        params: ImageGenerationParams,
+        mut params: ImageGenerationParams,
         request_hash: String,
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
         let url = format!("{}/v1/images/generations", self.config.base_url);
@@ -415,6 +415,9 @@ impl InferenceProvider for VLlmProvider {
             "X-Request-Hash",
             HeaderValue::from_str(&request_hash).map_err(to_image_gen_error)?,
         );
+
+        // Forward encryption headers from extra to HTTP headers
+        self.prepare_encryption_headers(&mut headers, &mut params.extra);
 
         let response = self
             .client

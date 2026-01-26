@@ -1150,19 +1150,18 @@ impl InferenceProviderPool {
             "Starting image generation request"
         );
 
-        // Use Arc to avoid cloning large image data during retry attempts.
-        // Cloning Arc is cheap (just a pointer copy), while cloning ImageGenerationParams
-        // would duplicate data in params.extra and other fields for each retry attempt.
-        let params_arc = Arc::new(params);
+        // Clone params once before retry loop to minimize memory operations with large image data.
+        // The provider interface requires ImageEditParams by value, so we must clone when calling
+        // the provider. We clone once here and reuse across retries rather than cloning on each attempt.
+        let cloned_params = params.clone();
 
         let (response, provider) = self
             .retry_with_fallback(&model_id, "image_generation", model_pub_key, |provider| {
-                let params = Arc::clone(&params_arc);
+                let params = cloned_params.clone();
                 let request_hash = request_hash.clone();
                 async move {
-                    // Dereference Arc and clone data only when passing to provider
                     provider
-                        .image_generation((*params).clone(), request_hash)
+                        .image_generation(params, request_hash)
                         .await
                         .map_err(|e| CompletionError::CompletionError(e.to_string()))
                 }
@@ -1194,19 +1193,20 @@ impl InferenceProviderPool {
             "Starting image edit request"
         );
 
-        // Use Arc to avoid cloning large image data (up to 512MB) during retry attempts.
-        // Cloning Arc is cheap (just a pointer copy), while cloning the full ImageEditParams
-        // would duplicate the entire image Vec<u8> for each retry attempt.
-        let params_arc = Arc::new(params);
+        // Clone params once before retry loop to minimize memory operations with large image data.
+        // The provider interface requires ImageEditParams by value, so we must clone when calling
+        // the provider. We clone once here and reuse across retries rather than cloning on each attempt.
+        // Note: For large images (up to 512MB), this still allocates significant memory, but eliminates
+        // redundant clones during retry attempts.
+        let cloned_params = params.clone();
 
         let (response, provider) = self
             .retry_with_fallback(&model_id, "image_edit", None, |provider| {
-                let params = Arc::clone(&params_arc);
+                let params = cloned_params.clone();
                 let request_hash = request_hash.clone();
                 async move {
-                    // Dereference Arc and clone data only when passing to provider
                     provider
-                        .image_edit((*params).clone(), request_hash)
+                        .image_edit(params, request_hash)
                         .await
                         .map_err(|e| CompletionError::CompletionError(e.to_string()))
                 }

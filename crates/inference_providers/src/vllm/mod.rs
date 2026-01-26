@@ -2,6 +2,7 @@ use crate::{models::StreamOptions, sse_parser::new_sse_parser, ImageGenerationEr
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
+use std::time::Duration;
 
 /// Convert any displayable error to ImageGenerationError::GenerationError
 fn to_image_gen_error<E: std::fmt::Display>(e: E) -> ImageGenerationError {
@@ -424,6 +425,7 @@ impl InferenceProvider for VLlmProvider {
             .post(&url)
             .headers(headers)
             .json(&params)
+            .timeout(Duration::from_secs(180))
             .send()
             .await
             .map_err(to_image_gen_error)?;
@@ -513,6 +515,7 @@ impl InferenceProvider for VLlmProvider {
             .post(&url)
             .headers(headers)
             .multipart(form)
+            .timeout(Duration::from_secs(180))
             .send()
             .await
             .map_err(|e| ImageEditError::EditError(format!("Request failed: {e}")))?;

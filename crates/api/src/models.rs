@@ -234,12 +234,31 @@ impl ImageGenerationRequest {
             if parts.len() != 2 {
                 return Err("size must be in format 'WIDTHxHEIGHT' (e.g., '1024x1024')".to_string());
             }
-            for part in parts {
-                if part.parse::<u32>().is_err() {
+
+            let width: u32 = match parts[0].parse() {
+                Ok(w) => w,
+                Err(_) => {
                     return Err(
                         "size must be in format 'WIDTHxHEIGHT' with numeric values".to_string()
                     );
                 }
+            };
+
+            let height: u32 = match parts[1].parse() {
+                Ok(h) => h,
+                Err(_) => {
+                    return Err(
+                        "size must be in format 'WIDTHxHEIGHT' with numeric values".to_string()
+                    );
+                }
+            };
+
+            // Validate dimension ranges (1 to 4096)
+            if !(1..=4096).contains(&width) {
+                return Err("width must be between 1 and 4096".to_string());
+            }
+            if !(1..=4096).contains(&height) {
+                return Err("height must be between 1 and 4096".to_string());
             }
         }
 
@@ -295,11 +314,9 @@ pub struct ImageEditRequestSchema {
     pub prompt: String,
     /// Image size in WxH format (e.g., "512x512")
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(format = Binary)]
     pub size: Option<String>,
     /// Response format ("b64_json" or "url")
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(format = Binary)]
     pub response_format: Option<String>,
 }
 
@@ -334,12 +351,31 @@ impl ImageEditRequest {
             if parts.len() != 2 {
                 return Err("size must be in format 'WIDTHxHEIGHT' (e.g., '1024x1024')".to_string());
             }
-            for part in parts {
-                if part.parse::<u32>().is_err() {
+
+            let width: u32 = match parts[0].parse() {
+                Ok(w) => w,
+                Err(_) => {
                     return Err(
                         "size must be in format 'WIDTHxHEIGHT' with numeric values".to_string()
                     );
                 }
+            };
+
+            let height: u32 = match parts[1].parse() {
+                Ok(h) => h,
+                Err(_) => {
+                    return Err(
+                        "size must be in format 'WIDTHxHEIGHT' with numeric values".to_string()
+                    );
+                }
+            };
+
+            // Validate dimension ranges (1 to 4096)
+            if !(1..=4096).contains(&width) {
+                return Err("width must be between 1 and 4096".to_string());
+            }
+            if !(1..=4096).contains(&height) {
+                return Err("height must be between 1 and 4096".to_string());
             }
         }
 

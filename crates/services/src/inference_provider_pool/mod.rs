@@ -1150,16 +1150,19 @@ impl InferenceProviderPool {
             "Starting image generation request"
         );
 
-        // Clone params after removing model_pub_key to ensure it's not in the cloned version
-        let params_for_provider = params.clone();
+        // Use Arc to avoid cloning large image data during retry attempts.
+        // Cloning Arc is cheap (just a pointer copy), while cloning ImageGenerationParams
+        // would duplicate data in params.extra and other fields for each retry attempt.
+        let params_arc = Arc::new(params);
 
         let (response, provider) = self
             .retry_with_fallback(&model_id, "image_generation", model_pub_key, |provider| {
-                let params = params_for_provider.clone();
+                let params = Arc::clone(&params_arc);
                 let request_hash = request_hash.clone();
                 async move {
+                    // Dereference Arc and clone data only when passing to provider
                     provider
-                        .image_generation(params, request_hash)
+                        .image_generation((*params).clone(), request_hash)
                         .await
                         .map_err(|e| CompletionError::CompletionError(e.to_string()))
                 }
@@ -1191,15 +1194,19 @@ impl InferenceProviderPool {
             "Starting image edit request"
         );
 
-        let params_for_provider = params.clone();
+        // Use Arc to avoid cloning large image data (up to 512MB) during retry attempts.
+        // Cloning Arc is cheap (just a pointer copy), while cloning the full ImageEditParams
+        // would duplicate the entire image Vec<u8> for each retry attempt.
+        let params_arc = Arc::new(params);
 
         let (response, provider) = self
             .retry_with_fallback(&model_id, "image_edit", None, |provider| {
-                let params = params_for_provider.clone();
+                let params = Arc::clone(&params_arc);
                 let request_hash = request_hash.clone();
                 async move {
+                    // Dereference Arc and clone data only when passing to provider
                     provider
-                        .image_edit(params, request_hash)
+                        .image_edit((*params).clone(), request_hash)
                         .await
                         .map_err(|e| CompletionError::CompletionError(e.to_string()))
                 }

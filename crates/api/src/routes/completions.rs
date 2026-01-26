@@ -682,7 +682,8 @@ pub async fn image_generations(
                 .into_response();
         }
         Err(e) => {
-            tracing::error!(error = %e, "Failed to resolve model for image generation");
+            tracing::debug!(error = %e, "Failed to resolve model for image generation");
+            tracing::warn!("Image generation: model resolution failed");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -768,7 +769,8 @@ pub async fn image_generations(
                     .store_chat_signature_from_provider(&image_id_for_sig)
                     .await
                 {
-                    tracing::error!(error = %e, "Failed to store image generation signature");
+                    tracing::debug!(error = %e, "Failed to store image generation signature");
+                    tracing::warn!("Image generation: signature storage failed");
                 } else {
                     tracing::debug!(image_id = %image_id_for_sig, "Stored signature for image generation");
                 }
@@ -779,7 +781,20 @@ pub async fn image_generations(
             let workspace_id = api_key.workspace.id.0;
             let api_key_id_str = api_key.api_key.id.0.clone();
             let model_id = model.id;
-            let image_count = response_with_bytes.response.data.len() as i32;
+            let image_count = match i32::try_from(response_with_bytes.response.data.len()) {
+                Ok(count) => count,
+                Err(_) => {
+                    tracing::error!("Too many images in provider response, cannot fit in i32 for usage tracking");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse::new(
+                            "Internal error: too many images in provider response".to_string(),
+                            "server_error".to_string(),
+                        )),
+                    )
+                        .into_response();
+                }
+            };
             let provider_request_id = response_with_bytes.response.id.clone();
             let usage_service = app_state.usage_service.clone();
 
@@ -834,8 +849,8 @@ pub async fn image_generations(
                 .unwrap()
         }
         Err(e) => {
-            // Log the full error internally but return a sanitized message to the client
-            tracing::error!(error = %e, "Image generation failed");
+            // Log provider errors at debug level to avoid exposing infrastructure details in production
+            tracing::debug!(error = %e, "Image generation failed");
 
             // Map error to appropriate status code and sanitized message
             let (status_code, message) = match &e {
@@ -844,6 +859,7 @@ pub async fn image_generations(
                     if msg.contains("not found") || msg.contains("does not exist") {
                         (StatusCode::NOT_FOUND, "Model not found".to_string())
                     } else {
+                        tracing::warn!("Image generation error: service unavailable");
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "Image generation failed".to_string(),
@@ -858,7 +874,13 @@ pub async fn image_generations(
                         StatusCode::NOT_FOUND => "Model not found".to_string(),
                         StatusCode::BAD_REQUEST => "Invalid request".to_string(),
                         StatusCode::TOO_MANY_REQUESTS => "Rate limit exceeded".to_string(),
-                        _ => "Image generation failed".to_string(),
+                        _ => {
+                            tracing::warn!(
+                                http_status = *status_code,
+                                "Image generation HTTP error"
+                            );
+                            "Image generation failed".to_string()
+                        }
                     };
                     (code, msg)
                 }
@@ -911,100 +933,132 @@ pub async fn image_edits(
     let mut response_format: Option<String> = None;
 
     // Parse multipart form data
-    while let Ok(Some(field)) = multipart.next_field().await {
-        match field.name().unwrap_or("") {
-            "image" => {
-                let bytes = match field.bytes().await {
-                    Ok(b) => b.to_vec(),
-                    Err(e) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            ResponseJson(ErrorResponse::new(
-                                format!("Failed to read image: {}", e),
-                                "invalid_request_error".to_string(),
-                            )),
-                        )
-                            .into_response();
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(field)) => {
+                match field.name().unwrap_or("") {
+                    "image" => {
+                        let bytes = match field.bytes().await {
+                            Ok(b) => b.to_vec(),
+                            Err(e) => {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    ResponseJson(ErrorResponse::new(
+                                        format!("Failed to read image: {}", e),
+                                        "invalid_request_error".to_string(),
+                                    )),
+                                )
+                                    .into_response();
+                            }
+                        };
+
+                        // Check size limit (512 MB)
+                        if bytes.len() > 512 * 1024 * 1024 {
+                            return (
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                ResponseJson(ErrorResponse::new(
+                                    "Image size exceeds maximum of 512 MB".to_string(),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                                .into_response();
+                        }
+
+                        image = Some(bytes);
                     }
-                };
-
-                // Check size limit (512 MB)
-                if bytes.len() > 512 * 1024 * 1024 {
-                    return (
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        ResponseJson(ErrorResponse::new(
-                            "Image size exceeds maximum of 512 MB".to_string(),
-                            "invalid_request_error".to_string(),
-                        )),
-                    )
-                        .into_response();
+                    "model" => match field.text().await {
+                        Ok(text) => model = text,
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                ResponseJson(ErrorResponse::new(
+                                    format!("Failed to read model: {}", e),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                                .into_response();
+                        }
+                    },
+                    "prompt" => match field.text().await {
+                        Ok(text) => prompt = text,
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                ResponseJson(ErrorResponse::new(
+                                    format!("Failed to read prompt: {}", e),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                                .into_response();
+                        }
+                    },
+                    "size" => match field.text().await {
+                        Ok(text) => size = Some(text),
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                ResponseJson(ErrorResponse::new(
+                                    format!("Failed to read size: {}", e),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                                .into_response();
+                        }
+                    },
+                    "response_format" => match field.text().await {
+                        Ok(text) => response_format = Some(text),
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                ResponseJson(ErrorResponse::new(
+                                    format!("Failed to read response_format: {}", e),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                                .into_response();
+                        }
+                    },
+                    _ => {
+                        // Ignore unknown fields
+                    }
                 }
-
-                image = Some(bytes);
             }
-            "model" => match field.text().await {
-                Ok(text) => model = text,
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        ResponseJson(ErrorResponse::new(
-                            format!("Failed to read model: {}", e),
-                            "invalid_request_error".to_string(),
-                        )),
-                    )
-                        .into_response();
-                }
-            },
-            "prompt" => match field.text().await {
-                Ok(text) => prompt = text,
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        ResponseJson(ErrorResponse::new(
-                            format!("Failed to read prompt: {}", e),
-                            "invalid_request_error".to_string(),
-                        )),
-                    )
-                        .into_response();
-                }
-            },
-            "size" => match field.text().await {
-                Ok(text) => size = Some(text),
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        ResponseJson(ErrorResponse::new(
-                            format!("Failed to read size: {}", e),
-                            "invalid_request_error".to_string(),
-                        )),
-                    )
-                        .into_response();
-                }
-            },
-            "response_format" => match field.text().await {
-                Ok(text) => response_format = Some(text),
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        ResponseJson(ErrorResponse::new(
-                            format!("Failed to read response_format: {}", e),
-                            "invalid_request_error".to_string(),
-                        )),
-                    )
-                        .into_response();
-                }
-            },
-            _ => {
-                // Ignore unknown fields
+            Ok(None) => break, // All fields read successfully
+            Err(e) => {
+                // Multipart parsing error (malformed boundary, invalid encoding, etc.)
+                tracing::debug!(error = %e, "Multipart parsing error");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        "Invalid multipart form data".to_string(),
+                        "invalid_request_error".to_string(),
+                    )),
+                )
+                    .into_response();
             }
         }
     }
+
+    // Fail fast if image is missing
+    let image = match image {
+        Some(img) => img,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "Missing required field: image".to_string(),
+                    "invalid_request_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
 
     // Build the request
     let request = crate::models::ImageEditRequest {
         model,
         prompt,
-        image: image.unwrap_or_default(),
+        image,
         size,
         response_format,
     };
@@ -1044,7 +1098,8 @@ pub async fn image_edits(
                 .into_response();
         }
         Err(e) => {
-            tracing::error!(error = %e, "Failed to resolve model for image edit");
+            tracing::debug!(error = %e, "Failed to resolve model for image edit");
+            tracing::warn!("Image edit: model resolution failed");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -1105,7 +1160,8 @@ pub async fn image_edits(
                     .store_chat_signature_from_provider(&image_id_for_sig)
                     .await
                 {
-                    tracing::error!(error = %e, "Failed to store image edit signature");
+                    tracing::debug!(error = %e, "Failed to store image edit signature");
+                    tracing::warn!("Image edit: signature storage failed");
                 } else {
                     tracing::debug!(image_id = %image_id_for_sig, "Stored signature for image edit");
                 }
@@ -1116,7 +1172,20 @@ pub async fn image_edits(
             let workspace_id = api_key.workspace.id.0;
             let api_key_id_str = api_key.api_key.id.0.clone();
             let model_id = model.id;
-            let image_count = response_with_bytes.response.data.len() as i32;
+            let image_count = match i32::try_from(response_with_bytes.response.data.len()) {
+                Ok(count) => count,
+                Err(_) => {
+                    tracing::error!("Too many images in provider response, cannot fit in i32 for usage tracking");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse::new(
+                            "Internal error: too many images in provider response".to_string(),
+                            "server_error".to_string(),
+                        )),
+                    )
+                        .into_response();
+                }
+            };
             let provider_request_id = response_with_bytes.response.id.clone();
             let usage_service = app_state.usage_service.clone();
 
@@ -1171,8 +1240,8 @@ pub async fn image_edits(
                 .unwrap()
         }
         Err(e) => {
-            // Log the full error internally but return a sanitized message to the client
-            tracing::error!(error = %e, "Image edit failed");
+            // Log provider errors at debug level to avoid exposing infrastructure details in production
+            tracing::debug!(error = %e, "Image edit failed");
 
             // Map error to appropriate status code and sanitized message
             let (status_code, message) = match &e {
@@ -1181,6 +1250,7 @@ pub async fn image_edits(
                     if msg.contains("not found") || msg.contains("does not exist") {
                         (StatusCode::NOT_FOUND, "Model not found".to_string())
                     } else {
+                        tracing::warn!("Image edit error: service unavailable");
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "Image edit failed".to_string(),
@@ -1195,7 +1265,10 @@ pub async fn image_edits(
                         StatusCode::NOT_FOUND => "Model not found".to_string(),
                         StatusCode::BAD_REQUEST => "Invalid request".to_string(),
                         StatusCode::TOO_MANY_REQUESTS => "Rate limit exceeded".to_string(),
-                        _ => "Image edit failed".to_string(),
+                        _ => {
+                            tracing::warn!(http_status = *status_code, "Image edit HTTP error");
+                            "Image edit failed".to_string()
+                        }
                     };
                     (code, msg)
                 }

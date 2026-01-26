@@ -319,6 +319,9 @@ pub struct ModelInfo {
     /// Context length in tokens
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<i32>,
+    /// Model architecture (input/output modalities)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<ModelArchitecture>,
 }
 
 #[derive(Debug, Serialize)]

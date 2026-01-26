@@ -697,11 +697,7 @@ pub struct ImageGenerationParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub style: Option<String>,
     /// Extra parameters for encryption headers and other pass-through data
-    #[serde(
-        flatten,
-        default,
-        skip_serializing_if = "std::collections::HashMap::is_empty"
-    )]
+    #[serde(flatten, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 

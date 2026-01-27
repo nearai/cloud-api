@@ -4,7 +4,8 @@ use inference_providers::{
     models::{AttestationError, CompletionError, ListModelsError, ModelsResponse},
     ChatCompletionParams, ExternalProvider, ExternalProviderConfig, ImageGenerationError,
     ImageGenerationParams, ImageGenerationResponseWithBytes, InferenceProvider, ProviderConfig,
-    StreamingResult, StreamingResultExt, VLlmConfig, VLlmProvider,
+    ScoreError, ScoreParams, ScoreResponse, StreamingResult, StreamingResultExt, VLlmConfig,
+    VLlmProvider,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -1174,6 +1175,47 @@ impl InferenceProviderPool {
             "Storing chat_id mapping for image generation"
         );
         self.store_chat_id_mapping(image_id, provider).await;
+
+        Ok(response)
+    }
+
+    pub async fn score(
+        &self,
+        params: ScoreParams,
+        request_hash: String,
+    ) -> Result<ScoreResponse, ScoreError> {
+        let model_id = params.model.clone();
+
+        tracing::debug!(
+            model = %model_id,
+            text_1_len = params.text_1.len(),
+            text_2_len = params.text_2.len(),
+            "Starting score request"
+        );
+
+        let (response, _provider) = self
+            .retry_with_fallback(&model_id, "score", None, |provider| {
+                let params = params.clone();
+                let request_hash = request_hash.clone();
+                async move {
+                    provider
+                        .score(params, request_hash)
+                        .await
+                        .map_err(|e| CompletionError::CompletionError(e.to_string()))
+                }
+            })
+            .await
+            .map_err(|e| {
+                // Sanitize error messages to remove sensitive details (URLs, IPs)
+                // while preserving keywords like "not found" for proper error detection in route handlers
+                ScoreError::GenerationError(Self::sanitize_error_message(&e.to_string()))
+            })?;
+
+        tracing::info!(
+            model = %model_id,
+            score = response.data.first().map(|d| d.score),
+            "Score completed successfully"
+        );
 
         Ok(response)
     }

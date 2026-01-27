@@ -9,8 +9,9 @@ use crate::{
     ChatDelta, ChatResponseMessage, ChatSignature, CompletionChunk, CompletionError,
     CompletionParams, FinishReason, FunctionCallDelta, ImageData, ImageGenerationError,
     ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes,
-    ListModelsError, MessageRole, ModelInfo, ModelsResponse, SSEEvent, StreamChunk,
-    StreamingResult, TokenUsage, ToolCallDelta,
+    ListModelsError, MessageRole, ModelInfo, ModelsResponse, SSEEvent, ScoreError, ScoreParams,
+    ScoreResponse, ScoreResult, ScoreUsage, StreamChunk, StreamingResult, TokenUsage,
+    ToolCallDelta,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -883,6 +884,35 @@ impl crate::InferenceProvider for MockProvider {
         Ok(ImageGenerationResponseWithBytes {
             response,
             raw_bytes,
+        })
+    }
+
+    async fn score(
+        &self,
+        params: ScoreParams,
+        _request_hash: String,
+    ) -> Result<ScoreResponse, ScoreError> {
+        // Mock implementation returns a similarity score based on text length similarity
+        let len_1 = params.text_1.len() as f64;
+        let len_2 = params.text_2.len() as f64;
+        let mock_score = 1.0 - ((len_1 - len_2).abs() / len_1.max(len_2).max(1.0));
+
+        Ok(ScoreResponse {
+            id: format!("score-{}", uuid::Uuid::new_v4()),
+            object: "list".to_string(),
+            created: self.current_timestamp(),
+            model: params.model.clone(),
+            data: vec![ScoreResult {
+                index: 0,
+                score: mock_score.clamp(0.0, 1.0),
+                object: "score".to_string(),
+            }],
+            usage: Some(ScoreUsage {
+                prompt_tokens: Some((len_1 + len_2) as i32 / 4),
+                total_tokens: Some((len_1 + len_2) as i32 / 4),
+                completion_tokens: Some(0),
+                prompt_tokens_details: None,
+            }),
         })
     }
 

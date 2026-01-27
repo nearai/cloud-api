@@ -5,7 +5,9 @@ use crate::inference_provider_pool::InferenceProviderPool;
 use crate::models::ModelsRepository;
 use crate::responses::models::ResponseId;
 use crate::usage::{RecordUsageServiceRequest, UsageServiceTrait};
-use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, StreamingResult};
+use inference_providers::{
+    ChatMessage, MessageRole, SSEEvent, ScoreError, StreamChunk, StreamingResult,
+};
 use moka::future::Cache;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -1017,6 +1019,43 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         });
 
         Ok(response_with_bytes)
+    }
+
+    async fn try_score(
+        &self,
+        organization_id: uuid::Uuid,
+        model_id: uuid::Uuid,
+        model_name: &str,
+        params: inference_providers::ScoreParams,
+        request_hash: String,
+    ) -> Result<inference_providers::ScoreResponse, ports::CompletionError> {
+        // Acquire concurrent request slot to enforce organization limits
+        let counter = self
+            .try_acquire_concurrent_slot(organization_id, model_id, model_name)
+            .await?;
+
+        // Call inference provider pool
+        let result = self
+            .inference_provider_pool
+            .score(params, request_hash)
+            .await;
+
+        // Release the concurrent request slot
+        counter.fetch_sub(1, Ordering::Release);
+
+        // Map provider errors to service errors
+        result.map_err(|e| {
+            let error_msg = match e {
+                ScoreError::GenerationError(msg) => msg,
+                ScoreError::HttpError {
+                    status_code,
+                    message,
+                } => {
+                    format!("HTTP {}: {}", status_code, message)
+                }
+            };
+            ports::CompletionError::ProviderError(error_msg)
+        })
     }
 }
 

@@ -113,4 +113,19 @@ pub trait CompletionServiceTrait: Send + Sync {
         &self,
         request: CompletionRequest,
     ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError>;
+
+    /// Execute a score request with proper concurrent request limiting.
+    ///
+    /// Each organization has a per-model concurrent request limit (default: 64).
+    /// This method acquires a concurrent slot before calling the inference provider.
+    /// If the limit is exceeded, returns CompletionError::RateLimitExceeded (429 HTTP status).
+    /// Slots are automatically released after the provider call (success or error).
+    async fn try_score(
+        &self,
+        organization_id: uuid::Uuid,
+        model_id: uuid::Uuid,
+        model_name: &str,
+        params: inference_providers::ScoreParams,
+        request_hash: String,
+    ) -> Result<inference_providers::ScoreResponse, CompletionError>;
 }

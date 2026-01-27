@@ -83,6 +83,10 @@ impl UsageServiceTrait for UsageServiceImpl {
             let image_count = request.image_count.unwrap_or(0);
             let image_cost = (image_count as i64) * model.cost_per_image;
             (0, image_cost, image_cost)
+        } else if request.inference_type == "score" {
+            // For score: use input tokens as the billing unit
+            let score_cost = (request.input_tokens as i64) * model.input_cost_per_token;
+            (score_cost, 0, score_cost)
         } else {
             // For token-based models (chat completions, etc.)
             let input_cost = (request.input_tokens as i64) * model.input_cost_per_token;

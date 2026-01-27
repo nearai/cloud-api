@@ -1129,17 +1129,57 @@ impl ResponseServiceImpl {
             // Update response state
             if !stream_result.text.is_empty() {
                 final_response_text.push_str(&stream_result.text);
-                messages.push(CompletionMessage {
-                    role: "assistant".to_string(),
-                    content: stream_result.text.clone(),
-                });
-                ctx.next_output_index();
             }
 
-            // Check if we're done
+            // Check if we're done (no tool calls)
             if stream_result.tool_calls.is_empty() {
+                // No tool calls - add assistant message with just text (if any)
+                if !stream_result.text.is_empty() {
+                    messages.push(CompletionMessage {
+                        role: "assistant".to_string(),
+                        content: stream_result.text.clone(),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    });
+                    ctx.next_output_index();
+                }
                 tracing::debug!("No tool calls detected, ending agent loop");
                 break;
+            }
+
+            // Tool calls present - add assistant message with tool_calls
+            // This is REQUIRED by all providers (OpenAI, Anthropic, Gemini):
+            // "messages with role 'tool' must be a response to a preceding message with 'tool_calls'"
+            let completion_tool_calls: Vec<crate::completions::ports::CompletionToolCall> =
+                stream_result
+                    .tool_calls
+                    .iter()
+                    .map(|tc| {
+                        let id = tc.id.clone().unwrap_or_else(|| {
+                            // Fallback: generate ID if LLM didn't provide one
+                            format!("{}_{}", tc.tool_type, uuid::Uuid::new_v4().simple())
+                        });
+                        crate::completions::ports::CompletionToolCall {
+                            id,
+                            name: tc.tool_type.clone(),
+                            arguments: tc
+                                .params
+                                .as_ref()
+                                .map(|p| p.to_string())
+                                .unwrap_or_else(|| "{}".to_string()),
+                            thought_signature: tc.thought_signature.clone(),
+                        }
+                    })
+                    .collect();
+
+            messages.push(CompletionMessage {
+                role: "assistant".to_string(),
+                content: stream_result.text.clone(),
+                tool_call_id: None,
+                tool_calls: Some(completion_tool_calls.clone()),
+            });
+            if !stream_result.text.is_empty() {
+                ctx.next_output_index();
             }
 
             let has_errors = stream_result
@@ -1188,7 +1228,6 @@ impl ResponseServiceImpl {
         Ok(AgentLoopResult::Completed)
     }
 
-    /// Execute a tool call and emit appropriate events
     /// Execute a tool call and emit appropriate events.
     ///
     /// Returns `Ok(ToolExecutionResult::Success)` if the tool executed normally,
@@ -1202,18 +1241,25 @@ impl ResponseServiceImpl {
     ) -> Result<tools::ToolExecutionResult, errors::ResponseError> {
         use crate::completions::ports::CompletionMessage;
 
-        let tool_call_id = format!("{}_{}", tool_call.tool_type, uuid::Uuid::new_v4().simple());
+        // Use the LLM's tool call ID (required for matching tool results to tool calls)
+        // Fallback to generated ID if the LLM didn't provide one
+        let tool_call_id = tool_call.id.clone().unwrap_or_else(|| {
+            format!("{}_{}", tool_call.tool_type, uuid::Uuid::new_v4().simple())
+        });
 
         // Handle error tool calls (malformed tool calls detected during parsing)
         if tool_call.tool_type == ERROR_TOOL_TYPE {
-            // For error tool calls, just return the error message as the tool result
+            // For error tool calls, return the error message as the tool result
             // This allows the LLM to see what went wrong and retry
+            // Note: tool_call_id is required for the API to match results to calls
             messages.push(CompletionMessage {
                 role: "tool".to_string(),
                 content: format!(
                     "ERROR: {}\n\nPlease correct the tool call format and try again.",
                     tool_call.query
                 ),
+                tool_call_id: Some(tool_call_id),
+                tool_calls: None,
             });
             return Ok(tools::ToolExecutionResult::Success);
         }
@@ -1326,10 +1372,13 @@ impl ResponseServiceImpl {
                 .await?;
         }
 
-        // Add tool result to message history
+        // Add tool result to message history with matching tool_call_id
+        // This is REQUIRED by all providers for the agent loop to work correctly
         messages.push(CompletionMessage {
             role: "tool".to_string(),
             content: tool_content,
+            tool_call_id: Some(tool_call_id),
+            tool_calls: None,
         });
 
         // Add citation instruction if provided (first web search)
@@ -1337,6 +1386,8 @@ impl ResponseServiceImpl {
             messages.push(CompletionMessage {
                 role: "system".to_string(),
                 content: instruction,
+                tool_call_id: None,
+                tool_calls: None,
             });
         }
 
@@ -1515,6 +1566,8 @@ impl ResponseServiceImpl {
                 messages.push(CompletionMessage {
                     role: "system".to_string(),
                     content: prompt,
+                    tool_call_id: None,
+                    tool_calls: None,
                 });
                 tracing::debug!("Prepended organization system prompt to messages");
             }
@@ -1538,6 +1591,8 @@ impl ResponseServiceImpl {
             messages.push(CompletionMessage {
                 role: "system".to_string(),
                 content: combined_instructions,
+                tool_call_id: None,
+                tool_calls: None,
             });
         } else {
             // Add language instruction and time context as a system message if no instructions provided
@@ -1545,6 +1600,8 @@ impl ResponseServiceImpl {
             messages.push(CompletionMessage {
                 role: "system".to_string(),
                 content: system_content,
+                tool_call_id: None,
+                tool_calls: None,
             });
         }
 
@@ -1646,6 +1703,8 @@ impl ResponseServiceImpl {
                         messages.push(CompletionMessage {
                             role: role.clone(),
                             content: text,
+                            tool_call_id: None,
+                            tool_calls: None,
                         });
                     }
                 }
@@ -1668,6 +1727,8 @@ impl ResponseServiceImpl {
                     messages.push(CompletionMessage {
                         role: "user".to_string(),
                         content: text.clone(),
+                        tool_call_id: None,
+                        tool_calls: None,
                     });
                 }
                 models::ResponseInput::Items(items) => {
@@ -1694,7 +1755,12 @@ impl ResponseServiceImpl {
                             }
                         };
 
-                        messages.push(CompletionMessage { role, content });
+                        messages.push(CompletionMessage {
+                            role,
+                            content,
+                            tool_call_id: None,
+                            tool_calls: None,
+                        });
                     }
                 }
             }
@@ -1957,7 +2023,7 @@ impl ResponseServiceImpl {
     /// Accumulate tool call fragments from streaming chunks
     fn accumulate_tool_calls(
         event: &inference_providers::SSEEvent,
-        accumulator: &mut std::collections::HashMap<i64, (Option<String>, String)>,
+        accumulator: &mut crate::responses::service_helpers::ToolCallAccumulator,
     ) {
         use inference_providers::StreamChunk;
 
@@ -1970,7 +2036,13 @@ impl ResponseServiceImpl {
                             let index = tool_call.index.unwrap_or(0);
 
                             // Get or create accumulator entry for this index
-                            let entry = accumulator.entry(index).or_insert((None, String::new()));
+                            let entry = accumulator.entry(index).or_default();
+
+                            // Capture tool call ID (typically in first chunk)
+                            if let Some(id) = &tool_call.id {
+                                tracing::debug!("Accumulated tool call {} id: {}", index, id);
+                                entry.id = Some(id.clone());
+                            }
 
                             // Handle function delta if present
                             if let Some(function) = &tool_call.function {
@@ -1981,7 +2053,7 @@ impl ResponseServiceImpl {
                                         index,
                                         name
                                     );
-                                    entry.0 = Some(name.clone());
+                                    entry.name = Some(name.clone());
                                 }
 
                                 // Accumulate arguments (streamed across multiple chunks)
@@ -1991,8 +2063,18 @@ impl ResponseServiceImpl {
                                         index,
                                         args_fragment.len()
                                     );
-                                    entry.1.push_str(args_fragment);
+                                    entry.arguments.push_str(args_fragment);
                                 }
+                            }
+
+                            // Capture thought_signature (Gemini 3 models)
+                            if let Some(thought_sig) = &tool_call.thought_signature {
+                                tracing::debug!(
+                                    "Accumulated tool call {} thought_signature (len={})",
+                                    index,
+                                    thought_sig.len()
+                                );
+                                entry.thought_signature = Some(thought_sig.clone());
                             }
                         }
                     }
@@ -2151,6 +2233,8 @@ impl ResponseServiceImpl {
             messages: vec![crate::completions::ports::CompletionMessage {
                 role: "user".to_string(),
                 content: title_prompt,
+                tool_call_id: None,
+                tool_calls: None,
             }],
             max_tokens: Some(150),
             temperature: Some(1.0),

@@ -98,6 +98,11 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         }
         streaming_params.max_tokens = None;
 
+        // DEBUG: Log the request being sent to OpenAI (remove after debugging)
+        if let Ok(json) = serde_json::to_string_pretty(&streaming_params) {
+            tracing::debug!(target: "openai_debug", "OpenAI request:\n{}", json);
+        }
+
         let headers = self
             .build_headers(config)
             .map_err(CompletionError::CompletionError)?;
@@ -121,6 +126,8 @@ impl ExternalBackend for OpenAiCompatibleBackend {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
+            // DEBUG: Log the full error response from OpenAI
+            tracing::debug!(target: "openai_debug", "OpenAI error response: {}", error_text);
             return Err(CompletionError::HttpError {
                 status_code,
                 message: error_text,

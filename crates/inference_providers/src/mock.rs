@@ -212,6 +212,7 @@ impl ResponseTemplate {
                         name: Some(tc.name.clone()),
                         arguments: Some(tc.arguments.clone()),
                     },
+                    thought_signature: None,
                 })
                 .collect()
         });
@@ -381,6 +382,7 @@ impl ResponseTemplate {
                                     name: Some(tc.name.clone()),
                                     arguments: None,
                                 }),
+                                thought_signature: None,
                             }]),
                             reasoning_content: None,
                             reasoning: None,
@@ -430,6 +432,7 @@ impl ResponseTemplate {
                                         name: None,
                                         arguments: Some(part_with_space),
                                     }),
+                                    thought_signature: None,
                                 }]),
                                 reasoning_content: None,
                                 reasoning: None,

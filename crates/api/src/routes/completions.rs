@@ -789,8 +789,8 @@ pub async fn image_generations(
 
             // Spawn async task to record usage (fire-and-forget like chat completions)
             tokio::spawn(async move {
-                // Parse API key ID to UUID
-                let api_key_id = match Uuid::parse_str(&api_key_id_str) {
+                // Parse API key ID to UUID (ApiKeyId is validated at creation, so parse is safe)
+                let api_key_id = match api_key_id_str.parse::<Uuid>() {
                     Ok(id) => id,
                     Err(e) => {
                         tracing::error!(error = %e, "Invalid API key ID for usage tracking");
@@ -984,14 +984,15 @@ pub async fn score(
             // Record usage for score SYNCHRONOUSLY to ensure billing accuracy
             let organization_id = api_key.organization.id.0;
             let workspace_id = api_key.workspace.id.0;
+            // Use prompt_tokens for input billing (scoring has no completion tokens)
             let token_count = response
                 .usage
                 .as_ref()
-                .and_then(|u| u.total_tokens)
+                .and_then(|u| u.prompt_tokens)
                 .unwrap_or(0);
 
-            let api_key_id_str = api_key.api_key.id.0.clone();
-            let api_key_id = match Uuid::parse_str(&api_key_id_str) {
+            // Parse API key ID to UUID (ApiKeyId is validated at creation, so parse is safe)
+            let api_key_id = match api_key.api_key.id.0.parse::<Uuid>() {
                 Ok(id) => id,
                 Err(e) => {
                     tracing::error!(error = %e, "Invalid API key ID for usage tracking");

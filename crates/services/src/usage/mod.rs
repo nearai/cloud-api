@@ -84,7 +84,9 @@ impl UsageServiceTrait for UsageServiceImpl {
             let image_cost = (image_count as i64) * model.cost_per_image;
             (0, image_cost, image_cost)
         } else if request.inference_type == "score" {
-            // For score: use input tokens as the billing unit
+            // For score (reranker models): use input tokens only for billing
+            // Scoring models don't generate text, so output_tokens is always 0
+            // input_tokens represents prompt_tokens (text to score)
             let score_cost = (request.input_tokens as i64) * model.input_cost_per_token;
             (score_cost, 0, score_cost)
         } else {

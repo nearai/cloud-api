@@ -425,6 +425,8 @@ pub struct CompletionServiceImpl {
     org_concurrent_limits: Cache<Uuid, u32>,
     /// Repository for fetching organization concurrent limits
     organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
+    /// Inference timeout in seconds for service-level timeout protection
+    inference_timeout_secs: u64,
 }
 
 /// TTL for organization concurrent limit cache (5 minutes)
@@ -438,6 +440,26 @@ impl CompletionServiceImpl {
         metrics_service: Arc<dyn MetricsServiceTrait>,
         models_repository: Arc<dyn ModelsRepository>,
         organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
+    ) -> Self {
+        Self::with_timeout(
+            inference_provider_pool,
+            attestation_service,
+            usage_service,
+            metrics_service,
+            models_repository,
+            organization_limit_repository,
+            300, // Default 5 minutes
+        )
+    }
+
+    pub fn with_timeout(
+        inference_provider_pool: Arc<InferenceProviderPool>,
+        attestation_service: Arc<dyn AttestationServiceTrait>,
+        usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
+        metrics_service: Arc<dyn MetricsServiceTrait>,
+        models_repository: Arc<dyn ModelsRepository>,
+        organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
+        inference_timeout_secs: u64,
     ) -> Self {
         let concurrent_counts = Cache::builder().max_capacity(100_000).build();
 
@@ -457,6 +479,7 @@ impl CompletionServiceImpl {
             concurrent_limit: DEFAULT_CONCURRENT_LIMIT,
             org_concurrent_limits,
             organization_limit_repository,
+            inference_timeout_secs,
         }
     }
 
@@ -1034,28 +1057,55 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
             .await?;
 
-        // Call inference provider pool
-        let result = self
-            .inference_provider_pool
-            .score(params, request_hash)
-            .await;
+        // RAII guard to ensure slot is always released, even on panic or task cancellation
+        struct SlotGuard {
+            counter: Arc<AtomicU32>,
+        }
+        impl Drop for SlotGuard {
+            fn drop(&mut self) {
+                self.counter.fetch_sub(1, Ordering::Release);
+            }
+        }
+        let _guard = SlotGuard {
+            counter: counter.clone(),
+        };
 
-        // Release the concurrent request slot
-        counter.fetch_sub(1, Ordering::Release);
+        // Call inference provider pool with service-level timeout protection
+        // Defense-in-depth: even if backend timeout fails, we still protect the concurrent slot
+        let result = match tokio::time::timeout(
+            Duration::from_secs(self.inference_timeout_secs),
+            self.inference_provider_pool.score(params, request_hash),
+        )
+        .await
+        {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(e)) => {
+                // Provider error - map ScoreError to CompletionError
+                let error_msg = match e {
+                    ScoreError::GenerationError(msg) => msg,
+                    ScoreError::HttpError {
+                        status_code,
+                        message,
+                    } => {
+                        format!("HTTP {}: {}", status_code, message)
+                    }
+                };
+                Err(ports::CompletionError::ProviderError(error_msg))
+            }
+            Err(_) => {
+                // Timeout error
+                tracing::warn!(
+                    "Score request timeout after {} seconds",
+                    self.inference_timeout_secs
+                );
+                Err(ports::CompletionError::ProviderError(format!(
+                    "Scoring request timed out after {} seconds",
+                    self.inference_timeout_secs
+                )))
+            }
+        };
 
-        // Map provider errors to service errors
-        result.map_err(|e| {
-            let error_msg = match e {
-                ScoreError::GenerationError(msg) => msg,
-                ScoreError::HttpError {
-                    status_code,
-                    message,
-                } => {
-                    format!("HTTP {}: {}", status_code, message)
-                }
-            };
-            ports::CompletionError::ProviderError(error_msg)
-        })
+        result
     }
 }
 

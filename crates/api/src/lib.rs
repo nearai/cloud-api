@@ -389,13 +389,14 @@ pub async fn init_domain_services_with_pool(
         as Arc<dyn services::completions::ports::OrganizationConcurrentLimitRepository>;
 
     // Create completion service with usage tracking (needs usage_service)
-    let completion_service = Arc::new(services::CompletionServiceImpl::new(
+    let completion_service = Arc::new(services::CompletionServiceImpl::with_timeout(
         inference_provider_pool.clone(),
         attestation_service.clone(),
         usage_service.clone(),
         metrics_service.clone(),
         models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
         org_limit_repository,
+        config.model_discovery.inference_timeout as u64,
     ));
 
     let web_search_provider =
@@ -581,6 +582,7 @@ pub async fn init_inference_providers_with_mocks(
         "deepseek-ai/DeepSeek-V3.1".to_string(),
         "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string(),
         "Qwen/Qwen-Image-2512".to_string(),
+        "Qwen/Qwen3-Reranker-0.6B".to_string(),
     ];
 
     let providers: Vec<(

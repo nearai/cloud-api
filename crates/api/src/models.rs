@@ -2726,6 +2726,11 @@ mod tests {
     }
 }
 
+/// Maximum character length for score request texts (100k chars ≈ 25k tokens)
+/// Reranker models typically have token limits (512-8192 tokens)
+/// This limit provides a safety margin while allowing reasonable text lengths
+const MAX_SCORE_TEXT_LENGTH: usize = 100_000;
+
 /// Request for text similarity scoring
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ScoreRequest {
@@ -2753,6 +2758,21 @@ impl ScoreRequest {
         // Text 2 is required and must not be empty or whitespace-only
         if self.text_2.trim().is_empty() {
             return Err("text_2 is required and must not be empty".to_string());
+        }
+
+        // Validate text lengths to prevent resource exhaustion
+        if self.text_1.len() > MAX_SCORE_TEXT_LENGTH {
+            return Err(format!(
+                "text_1 exceeds maximum length of {} characters",
+                MAX_SCORE_TEXT_LENGTH
+            ));
+        }
+
+        if self.text_2.len() > MAX_SCORE_TEXT_LENGTH {
+            return Err(format!(
+                "text_2 exceeds maximum length of {} characters",
+                MAX_SCORE_TEXT_LENGTH
+            ));
         }
 
         Ok(())

@@ -62,6 +62,8 @@ pub struct CompletionRequest {
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
     pub metadata: Option<serde_json::Value>,
+    /// Whether to store the output (required for metadata to be sent to OpenAI)
+    pub store: Option<bool>,
     pub body_hash: String,
     /// Response ID when called from Responses API (for usage tracking FK)
     pub response_id: Option<ResponseId>,

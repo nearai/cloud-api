@@ -8,7 +8,7 @@ use serde_json::json;
 #[tokio::test]
 async fn test_input_message_metadata_preserved() {
     let (server, _, _mock, _db, _guard) = setup_test_server_with_pool().await;
-    let org = create_org(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Setup a model for testing
@@ -78,7 +78,7 @@ async fn test_input_message_metadata_preserved() {
 #[tokio::test]
 async fn test_input_message_without_metadata() {
     let (server, _, _mock, _db, _guard) = setup_test_server_with_pool().await;
-    let org = create_org(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     let model = setup_qwen_model(&server).await;
@@ -139,7 +139,7 @@ async fn test_input_message_without_metadata() {
 #[tokio::test]
 async fn test_input_message_metadata_size_limit() {
     let (server, _, _mock, _db, _guard) = setup_test_server_with_pool().await;
-    let org = create_org(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     let model = setup_qwen_model(&server).await;
@@ -193,7 +193,7 @@ async fn test_input_message_metadata_size_limit() {
 #[tokio::test]
 async fn test_simple_text_input_no_metadata() {
     let (server, _, _mock, _db, _guard) = setup_test_server_with_pool().await;
-    let org = create_org(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     let model = setup_qwen_model(&server).await;

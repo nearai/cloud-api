@@ -65,7 +65,9 @@ async fn test_admin_list_models_with_models() {
             "modelDescription": "A test model for e2e testing",
             "contextLength": 4096,
             "verifiable": false,
-            "isActive": true
+            "isActive": true,
+            "inputModalities": ["text", "image"],
+            "outputModalities": ["text"]
         }))
         .unwrap(),
     );
@@ -103,6 +105,23 @@ async fn test_admin_list_models_with_models() {
     assert!(model.is_active, "Model should be active");
     assert_eq!(model.metadata.model_display_name, "Test Model");
     assert_eq!(model.metadata.context_length, 4096);
+
+    // Verify architecture/modalities
+    let architecture = model
+        .metadata
+        .architecture
+        .as_ref()
+        .expect("Model should have architecture");
+    assert_eq!(
+        architecture.input_modalities,
+        vec!["text", "image"],
+        "Input modalities should match"
+    );
+    assert_eq!(
+        architecture.output_modalities,
+        vec!["text"],
+        "Output modalities should match"
+    );
 
     println!("✅ Admin list models with models works correctly");
 }

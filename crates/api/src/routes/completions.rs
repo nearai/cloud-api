@@ -88,6 +88,7 @@ fn convert_chat_request_to_service(
         organization_id,
         workspace_id,
         metadata: None,
+        store: None,
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct chat completions API calls don't have a response_id
         extra: request.extra.clone(),
@@ -120,6 +121,7 @@ fn convert_text_request_to_service(
         organization_id,
         workspace_id,
         metadata: None,
+        store: None,
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct text completions API calls don't have a response_id
         extra: request.extra.clone(),
@@ -519,6 +521,10 @@ pub async fn models(
                     owned_by: model.owned_by,
                     pricing: Some(pricing),
                     context_length: Some(model.context_length),
+                    architecture: ModelArchitecture::from_options(
+                        model.input_modalities,
+                        model.output_modalities,
+                    ),
                 }
             })
             .collect(),

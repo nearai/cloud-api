@@ -696,6 +696,9 @@ pub struct ImageGenerationParams {
     /// Style of the generated image: "vivid" or "natural" ("style" parameter is not supported for verifiable models)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub style: Option<String>,
+    /// Extra parameters for encryption headers and other pass-through data
+    #[serde(flatten, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Response from image generation

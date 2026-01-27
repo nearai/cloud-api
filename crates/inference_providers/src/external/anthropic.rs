@@ -1131,6 +1131,7 @@ mod tests {
             response_format: None,
             quality: None,
             style: None,
+            extra: std::collections::HashMap::new(),
         };
 
         let result = backend

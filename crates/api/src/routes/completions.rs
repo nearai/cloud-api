@@ -634,6 +634,7 @@ pub async fn image_generations(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    headers: header::HeaderMap,
     Json(request): Json<crate::models::ImageGenerationRequest>,
 ) -> axum::response::Response {
     debug!(
@@ -656,6 +657,12 @@ pub async fn image_generations(
         )
             .into_response();
     }
+
+    // Extract and validate encryption headers if present
+    let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
+        Ok(headers) => headers,
+        Err(err) => return err.into_response(),
+    };
 
     // Resolve model to get UUID for usage tracking
     let model = match app_state
@@ -713,6 +720,28 @@ pub async fn image_generations(
     };
 
     // Convert API request to provider params
+    let mut extra = std::collections::HashMap::new();
+
+    // Add validated encryption headers to extra
+    if let Some(ref signing_algo) = encryption_headers.signing_algo {
+        extra.insert(
+            service_encryption_headers::SIGNING_ALGO.to_string(),
+            serde_json::Value::String(signing_algo.clone()),
+        );
+    }
+    if let Some(ref client_pub_key) = encryption_headers.client_pub_key {
+        extra.insert(
+            service_encryption_headers::CLIENT_PUB_KEY.to_string(),
+            serde_json::Value::String(client_pub_key.clone()),
+        );
+    }
+    if let Some(ref model_pub_key) = encryption_headers.model_pub_key {
+        extra.insert(
+            service_encryption_headers::MODEL_PUB_KEY.to_string(),
+            serde_json::Value::String(model_pub_key.clone()),
+        );
+    }
+
     let params = inference_providers::ImageGenerationParams {
         model: request.model.clone(),
         prompt: request.prompt.clone(),
@@ -721,6 +750,7 @@ pub async fn image_generations(
         response_format,
         quality: request.quality.clone(),
         style: request.style.clone(),
+        extra,
     };
 
     // Call the inference provider pool

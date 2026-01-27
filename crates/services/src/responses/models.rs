@@ -1048,13 +1048,51 @@ impl CreateResponseRequest {
             }
         }
 
+        // Validate mutual exclusivity
+        if self.conversation.is_some() && self.previous_response_id.is_some() {
+            return Err("Cannot specify both conversation and previous_response_id".to_string());
+        }
+
         Ok(())
     }
 }
 
 impl CreateConversationRequest {
     pub fn validate(&self) -> Result<(), String> {
-        // Basic validation - can be extended if needed
+        use crate::common::MAX_METADATA_SIZE_BYTES;
+
+        if let Some(metadata) = &self.metadata {
+            // Prevent extremely large metadata blobs from being stored
+            let serialized =
+                serde_json::to_string(metadata).map_err(|_| "Invalid metadata".to_string())?;
+            if serialized.len() > MAX_METADATA_SIZE_BYTES {
+                return Err(format!(
+                    "metadata is too large (max {} bytes when serialized)",
+                    MAX_METADATA_SIZE_BYTES
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl UpdateConversationRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        use crate::common::MAX_METADATA_SIZE_BYTES;
+
+        if let Some(metadata) = &self.metadata {
+            // Prevent extremely large metadata blobs from being stored
+            let serialized =
+                serde_json::to_string(metadata).map_err(|_| "Invalid metadata".to_string())?;
+            if serialized.len() > MAX_METADATA_SIZE_BYTES {
+                return Err(format!(
+                    "metadata is too large (max {} bytes when serialized)",
+                    MAX_METADATA_SIZE_BYTES
+                ));
+            }
+        }
+
         Ok(())
     }
 }

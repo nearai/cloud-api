@@ -367,6 +367,26 @@ impl AudioTranscriptionRequest {
             ));
         }
 
+        // Validate filename
+        if self.filename.is_empty() {
+            return Err("Filename cannot be empty".to_string());
+        }
+
+        // Validate filename length (max 255 characters per common filesystem limit)
+        if self.filename.len() > 255 {
+            return Err("Filename exceeds maximum length of 255 characters".to_string());
+        }
+
+        // Validate filename doesn't contain path traversal characters
+        if self.filename.contains("..")
+            || self.filename.contains('/')
+            || self.filename.contains('\\')
+        {
+            return Err(
+                "Filename cannot contain path traversal characters (.., /, \\)".to_string(),
+            );
+        }
+
         // Validate filename has extension
         if !self.filename.contains('.') {
             return Err("Filename must have an extension (e.g., .mp3, .wav)".to_string());
@@ -387,6 +407,20 @@ impl AudioTranscriptionRequest {
                     "Invalid response_format. Must be one of: {}",
                     valid_formats.join(", ")
                 ));
+            }
+        }
+
+        // Validate timestamp_granularities if provided
+        if let Some(granularities) = &self.timestamp_granularities {
+            let valid_granularities = ["word", "segment"];
+            for granularity in granularities {
+                if !valid_granularities.contains(&granularity.as_str()) {
+                    return Err(format!(
+                        "Invalid timestamp_granularity '{}'. Must be one of: {}",
+                        granularity,
+                        valid_granularities.join(", ")
+                    ));
+                }
             }
         }
 
@@ -417,7 +451,8 @@ pub struct AudioTranscriptionResponse {
     pub words: Option<Vec<TranscriptionWord>>,
 }
 
-/// Transcription segment (with OpenAPI schema)
+/// Transcription segment with optional metadata fields
+/// Matches the inference_providers version to ensure consistency with actual provider responses
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TranscriptionSegment {
     pub id: i32,
@@ -427,12 +462,18 @@ pub struct TranscriptionSegment {
     pub text: String,
     pub tokens: Vec<i32>,
     pub temperature: f64,
-    pub avg_logprob: f64,
-    pub compression_ratio: f64,
-    pub no_speech_prob: f64,
+    /// Optional: may be null in some provider responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_logprob: Option<f64>,
+    /// Optional: may be null in some provider responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression_ratio: Option<f64>,
+    /// Optional: may be null in some provider responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_speech_prob: Option<f64>,
 }
 
-/// Word-level timing (with OpenAPI schema)
+/// Word-level timing information
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TranscriptionWord {
     pub word: String,

@@ -113,4 +113,14 @@ pub trait CompletionServiceTrait: Send + Sync {
         &self,
         request: CompletionRequest,
     ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError>;
+
+    /// Execute an audio transcription request with concurrent request limiting
+    async fn audio_transcription(
+        &self,
+        organization_id: uuid::Uuid,
+        model_id: uuid::Uuid,
+        model_name: &str,
+        params: inference_providers::AudioTranscriptionParams,
+        request_hash: String,
+    ) -> Result<inference_providers::AudioTranscriptionResponse, CompletionError>;
 }

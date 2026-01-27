@@ -1215,7 +1215,6 @@ impl InferenceProviderPool {
         tracing::info!(
             model = %model_id,
             duration = ?response.duration,
-            text_len = response.text.len(),
             "Audio transcription completed successfully"
         );
 

@@ -916,15 +916,29 @@ pub async fn audio_transcriptions(
     let mut timestamp_granularities: Option<Vec<String>> = None;
 
     while let Ok(Some(field)) = multipart.next_field().await {
-        let field_name = field.name().unwrap_or("").to_string();
+        let field_name = match field.name() {
+            Some(name) => name.to_string(),
+            None => {
+                tracing::warn!("Multipart field name is missing");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        "Missing field name in multipart request".to_string(),
+                        "invalid_request_error".to_string(),
+                    )),
+                )
+                    .into_response();
+            }
+        };
 
         match field_name.as_str() {
             "file" => {
                 filename = field.file_name().map(|s| s.to_string());
                 match field.bytes().await {
                     Ok(bytes) => file_bytes = Some(bytes.to_vec()),
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to read file field");
+                    Err(_) => {
+                        // Don't log error details - may contain customer data
+                        tracing::error!("Failed to read file field");
                         return (
                             StatusCode::BAD_REQUEST,
                             ResponseJson(ErrorResponse::new(
@@ -1047,91 +1061,101 @@ pub async fn audio_transcriptions(
         extra: std::collections::HashMap::new(),
     };
 
-    // Call inference provider pool directly (concurrent limiting is handled by the pool)
+    // Call completion service which handles concurrent request limiting
     match app_state
-        .inference_provider_pool
-        .audio_transcription(params, body_hash.hash.clone())
+        .completion_service
+        .audio_transcription(
+            organization_id,
+            model_id,
+            &model_name,
+            params,
+            body_hash.hash.clone(),
+        )
         .await
     {
         Ok(response) => {
-            // Record usage for audio transcription SYNCHRONOUSLY
+            // Record usage for audio transcription asynchronously (fire-and-forget)
+            // Following the same pattern as image_generations
             // Bill by audio duration in seconds (use input_tokens field)
-            let duration_seconds = response.duration.unwrap_or(0.0).ceil() as i32;
-
             let workspace_id = api_key.workspace.id.0;
             let api_key_id_str = api_key.api_key.id.0.clone();
-            let api_key_id = match uuid::Uuid::parse_str(&api_key_id_str) {
-                Ok(id) => id,
-                Err(e) => {
-                    tracing::error!(error = %e, "Invalid API key ID for usage tracking");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        ResponseJson(ErrorResponse::new(
-                            "Failed to record usage".to_string(),
-                            "server_error".to_string(),
-                        )),
-                    )
-                        .into_response();
+            // Clamp duration to valid range [0, i32::MAX] to prevent overflow and negative values
+            let duration_seconds = response
+                .duration
+                .unwrap_or(0.0)
+                .max(0.0)
+                .min(i32::MAX as f64)
+                .ceil() as i32;
+            let usage_service = app_state.usage_service.clone();
+
+            // Spawn async task to record usage (fire-and-forget like image generations)
+            tokio::spawn(async move {
+                // Parse API key ID to UUID
+                let api_key_id = match uuid::Uuid::parse_str(&api_key_id_str) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        tracing::error!("Invalid API key ID for usage tracking");
+                        return;
+                    }
+                };
+
+                let inference_id = uuid::Uuid::new_v4();
+                let usage_request = services::usage::RecordUsageServiceRequest {
+                    organization_id,
+                    workspace_id,
+                    api_key_id,
+                    model_id,
+                    input_tokens: duration_seconds, // Bill by duration in seconds
+                    output_tokens: 0,
+                    inference_type: "audio_transcription".to_string(),
+                    ttft_ms: None,
+                    avg_itl_ms: None,
+                    inference_id: Some(inference_id),
+                    provider_request_id: None,
+                    stop_reason: Some(services::usage::StopReason::Completed),
+                    response_id: None,
+                    image_count: None,
+                };
+
+                if let Err(e) = usage_service.record_usage(usage_request).await {
+                    tracing::error!(
+                        error = %e,
+                        %organization_id,
+                        %workspace_id,
+                        "Failed to record audio transcription usage"
+                    );
                 }
-            };
-
-            let inference_id = uuid::Uuid::new_v4();
-            let usage_request = services::usage::RecordUsageServiceRequest {
-                organization_id,
-                workspace_id,
-                api_key_id,
-                model_id,
-                input_tokens: duration_seconds, // Bill by duration in seconds
-                output_tokens: 0,
-                inference_type: "audio_transcription".to_string(),
-                ttft_ms: None,
-                avg_itl_ms: None,
-                inference_id: Some(inference_id),
-                provider_request_id: None,
-                stop_reason: Some(services::usage::StopReason::Completed),
-                response_id: None,
-                image_count: None,
-            };
-
-            // Record usage synchronously
-            if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
-                tracing::error!(error = %e, "Failed to record audio transcription usage");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ResponseJson(ErrorResponse::new(
-                        "Failed to record usage - please retry".to_string(),
-                        "server_error".to_string(),
-                    )),
-                )
-                    .into_response();
-            }
+            });
 
             (StatusCode::OK, ResponseJson(response)).into_response()
         }
         Err(e) => {
             let (status_code, error_type, message) = match e {
-                inference_providers::AudioTranscriptionError::TranscriptionError(msg) => {
-                    tracing::error!(error = %msg, "Audio transcription provider error");
+                services::completions::ports::CompletionError::RateLimitExceeded => {
+                    tracing::warn!("Concurrent request limit exceeded for audio transcription");
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "rate_limit_error",
+                        "Too many concurrent audio transcription requests. Organization limit: 64 concurrent requests per model.".to_string(),
+                    )
+                }
+                services::completions::ports::CompletionError::ProviderError(_) => {
+                    // Don't log error details - may contain customer data
+                    tracing::error!("Audio transcription provider error");
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "server_error",
                         "Audio transcription failed".to_string(),
                     )
                 }
-                inference_providers::AudioTranscriptionError::HttpError {
-                    status_code,
-                    message,
-                } => {
-                    tracing::error!(status_code = status_code, error = %message, "Audio transcription HTTP error");
-                    let code = StatusCode::from_u16(status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    let msg = match code {
-                        StatusCode::NOT_FOUND => "Model not found".to_string(),
-                        StatusCode::BAD_REQUEST => "Invalid request".to_string(),
-                        StatusCode::TOO_MANY_REQUESTS => "Rate limit exceeded".to_string(),
-                        _ => "Audio transcription failed".to_string(),
-                    };
-                    (code, "server_error", msg)
+                _ => {
+                    // Don't log error details - may contain customer data
+                    tracing::error!("Unexpected audio transcription error");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "Audio transcription failed".to_string(),
+                    )
                 }
             };
 

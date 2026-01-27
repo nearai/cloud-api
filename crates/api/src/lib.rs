@@ -47,6 +47,9 @@ use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use utoipa::OpenApi;
 
+// Audio transcription file size limit (25 MB for OpenAI Whisper API compatibility)
+const AUDIO_TRANSCRIPTION_MAX_BODY_SIZE: usize = 25 * 1024 * 1024; // 25 MB
+
 /// Service initialization components
 #[derive(Clone)]
 pub struct AuthComponents {
@@ -863,6 +866,7 @@ pub fn build_completion_routes(
         .route("/chat/completions", post(chat_completions))
         .route("/images/generations", post(image_generations))
         .route("/audio/transcriptions", post(audio_transcriptions))
+        .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
         .with_state(app_state.clone())
         .layer(from_fn_with_state(
             usage_state,

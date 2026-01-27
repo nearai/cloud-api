@@ -1092,6 +1092,7 @@ impl ResponseServiceImpl {
                 organization_id: process_context.organization_id,
                 workspace_id: process_context.workspace_id,
                 metadata: process_context.request.metadata.clone(),
+                store: process_context.request.store,
                 body_hash: process_context.body_hash.to_string(),
                 response_id: Some(ctx.response_id.clone()),
                 n: None,
@@ -2158,6 +2159,7 @@ impl ResponseServiceImpl {
             organization_id,
             workspace_id,
             metadata: None,
+            store: None,
             body_hash: String::new(),
             response_id: None, // Title generation is not tied to a specific response
             n: None,

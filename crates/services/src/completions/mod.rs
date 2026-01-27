@@ -718,8 +718,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             seed: None,
             tool_choice: None,
             parallel_tool_calls: None,
-            metadata: request.metadata,
-            store: None,
+            // Drop metadata if store is not explicitly enabled (OpenAI requirement)
+            metadata: if request.store == Some(true) {
+                request.metadata.clone()
+            } else {
+                None
+            },
+            store: request.store,
             stream_options: None,
             modalities: None,
             extra: request.extra.clone(),
@@ -839,8 +844,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             seed: None,
             tool_choice: None,
             parallel_tool_calls: None,
-            metadata: request.metadata,
-            store: None,
+            // Drop metadata if store is not explicitly enabled (OpenAI requirement)
+            metadata: if request.store == Some(true) {
+                request.metadata.clone()
+            } else {
+                None
+            },
+            store: request.store,
             stream_options: None,
             modalities: None,
             extra: request.extra.clone(),

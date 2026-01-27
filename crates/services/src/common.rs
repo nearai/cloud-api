@@ -4,6 +4,9 @@ use uuid::Uuid;
 pub const API_KEY_PREFIX: &str = "sk-";
 pub const API_KEY_LENGTH: usize = 35;
 
+/// Maximum serialized size for metadata blobs (e.g. conversation metadata, response metadata)
+pub const MAX_METADATA_SIZE_BYTES: usize = 16 * 1024;
+
 /// Encryption header keys used in params.extra for passing encryption information
 /// These keys are used to pass encryption headers from API routes to completion services.
 /// Note: These use underscores (x_signing_algo) for params.extra HashMap keys,

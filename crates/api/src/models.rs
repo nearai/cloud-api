@@ -4,8 +4,24 @@ use serde_json::Value;
 use std::collections::HashMap;
 use utoipa::ToSchema;
 
-// Re-export ResponseImageUrl from services to avoid duplication
-pub use services::responses::models::ResponseImageUrl;
+// Re-export types from services to avoid duplication
+// These are the canonical definitions used across the codebase
+pub use services::responses::models::{
+    // Request/Response types used by routes and OpenAPI
+    CreateResponseRequest, ResponseObject, ResponseInput,
+    // Conversation types
+    CreateConversationRequest, UpdateConversationRequest, ConversationObject, ConversationDeleteResult,
+    // Response output types
+    ResponseOutputItem, ResponseItemStatus, ResponseContentItem, ResponseOutputFunction,
+    ResponseOutputToolCall, ResponseStreamEvent,
+    // Supporting types used by the above
+    ResponseImageUrl, ResponseStatus, ResponseError, ResponseIncompleteDetails,
+    ResponseReasoningOutput, ResponseToolChoiceOutput, ResponseDeleteResult,
+    ResponseTool, ResponseToolChoice, ResponseToolChoiceFunction, ResponseReasoningConfig,
+    ConversationReference,
+    // MCP types
+    McpApprovalRequirement, McpApprovalMode, McpToolNameFilter, McpDiscoveredTool,
+};
 
 // Streaming response models
 #[derive(Debug, Serialize, Deserialize)]
@@ -761,8 +777,8 @@ fn default_n() -> Option<i64> {
 // ============================================
 
 use crate::consts::{
-    MAX_DESCRIPTION_LENGTH, MAX_EMAIL_LENGTH, MAX_INVITATIONS_PER_REQUEST, MAX_METADATA_SIZE_BYTES,
-    MAX_NAME_LENGTH, MAX_SETTINGS_SIZE_BYTES, MAX_SYSTEM_PROMPT_LENGTH,
+    MAX_DESCRIPTION_LENGTH, MAX_EMAIL_LENGTH, MAX_INVITATIONS_PER_REQUEST, MAX_NAME_LENGTH,
+    MAX_SETTINGS_SIZE_BYTES, MAX_SYSTEM_PROMPT_LENGTH,
 };
 use crate::routes::common::{validate_max_length, validate_non_empty_field};
 
@@ -900,66 +916,12 @@ impl ErrorResponse {
 }
 
 // ============================================
-// Response API Models
+// Response API Models (API-specific types for input listing)
+// Note: Most response types are re-exported from services::responses::models
 // ============================================
 
-/// Request to create a response
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct CreateResponseRequest {
-    pub model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input: Option<ResponseInput>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub conversation: Option<ConversationReference>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_response_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_output_tokens: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tool_calls: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub store: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub background: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<ResponseTool>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<ResponseToolChoice>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parallel_tool_calls: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<ResponseTextConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<ResponseReasoningConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub include: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub safety_identifier: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_cache_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signing_algo: Option<String>,
-}
-
-/// Input for a response - can be text, array of items, or single item
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum ResponseInput {
-    Text(String),
-    Items(Vec<ResponseInputItem>),
-}
-
-/// Single input item
+/// Single input item for API responses (simplified struct version).
+/// Used by list_input_items endpoint for returning input items.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResponseInputItem {
     pub role: String,
@@ -1391,43 +1353,14 @@ pub struct ResponseInputItemList {
 
 // ============================================
 // Conversation API Models
+// Note: CreateConversationRequest, UpdateConversationRequest, ConversationObject,
+// and ConversationDeleteResult are re-exported from services::responses::models
 // ============================================
-
-/// Request to create a conversation
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct CreateConversationRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<serde_json::Value>,
-}
-
-/// Request to update a conversation
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct UpdateConversationRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<serde_json::Value>,
-}
 
 /// Request to create items in a conversation
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateConversationItemsRequest {
     pub items: Vec<ConversationInputItem>,
-}
-
-/// Conversation object (follows OpenAI spec)
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ConversationObject {
-    pub id: String,
-    pub object: String, // "conversation"
-    pub created_at: i64,
-    pub metadata: serde_json::Value,
-}
-
-/// Deleted conversation result
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ConversationDeleteResult {
-    pub id: String,
-    pub object: String, // "conversation.deleted"
-    pub deleted: bool,
 }
 
 /// Input item for conversations
@@ -1479,14 +1412,7 @@ pub enum ConversationContentPart {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct McpDiscoveredTool {
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input_schema: Option<serde_json::Value>,
-}
+// McpDiscoveredTool is re-exported from services::responses::models
 
 /// Conversation item (for responses)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1696,86 +1622,8 @@ pub struct ConversationBatchResponse {
     pub missing_ids: Vec<String>,
 }
 
-// ============================================
-// Validation implementations
-// ============================================
-
-impl CreateResponseRequest {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.model.trim().is_empty() {
-            return Err("Model cannot be empty".to_string());
-        }
-
-        if let Some(max_tokens) = self.max_output_tokens {
-            if max_tokens == 0 {
-                return Err("max_output_tokens must be greater than 0".to_string());
-            }
-        }
-
-        if let Some(max_calls) = self.max_tool_calls {
-            if max_calls == 0 {
-                return Err("max_tool_calls must be greater than 0".to_string());
-            }
-        }
-
-        if let Some(temp) = self.temperature {
-            if !(0.0..=2.0).contains(&temp) {
-                return Err("temperature must be between 0.0 and 2.0".to_string());
-            }
-        }
-
-        if let Some(top_p) = self.top_p {
-            if top_p <= 0.0 || top_p > 1.0 {
-                return Err("top_p must be between 0.0 and 1.0".to_string());
-            }
-        }
-
-        // Validate mutual exclusivity
-        if self.conversation.is_some() && self.previous_response_id.is_some() {
-            return Err("Cannot specify both conversation and previous_response_id".to_string());
-        }
-
-        Ok(())
-    }
-}
-
-impl CreateConversationRequest {
-    pub fn validate(&self) -> Result<(), String> {
-        if let Some(metadata) = &self.metadata {
-            // Prevent extremely large metadata blobs from being stored
-            let serialized =
-                serde_json::to_string(metadata).map_err(|_| "Invalid metadata".to_string())?;
-            // Allow reasonably large metadata but cap to protect the database
-            if serialized.len() > MAX_METADATA_SIZE_BYTES {
-                return Err(format!(
-                    "metadata is too large (max {} bytes when serialized)",
-                    MAX_METADATA_SIZE_BYTES
-                ));
-            }
-        }
-
-        Ok(())
-    }
-}
-
-impl UpdateConversationRequest {
-    pub fn validate(&self) -> Result<(), String> {
-        if let Some(metadata) = &self.metadata {
-            // Prevent extremely large metadata blobs from being stored
-            let serialized =
-                serde_json::to_string(metadata).map_err(|_| "Invalid metadata".to_string())?;
-            // Allow reasonably large metadata but cap to protect the database
-            if serialized.len() > MAX_METADATA_SIZE_BYTES {
-                return Err(format!(
-                    "metadata is too large (max {} bytes when serialized)",
-                    MAX_METADATA_SIZE_BYTES
-                ));
-            }
-        }
-
-        Ok(())
-    }
-}
+// Validation implementations are in services::responses::models
+// for CreateResponseRequest, CreateConversationRequest, and UpdateConversationRequest
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateApiKeyRequest {
@@ -2951,31 +2799,43 @@ mod tests {
         let request = result.unwrap();
         assert_eq!(request.model, "gpt-4.1");
 
+        // Use services types directly since CreateResponseRequest is re-exported from services
+        use services::responses::models::{
+            ResponseInputItem as SvcInputItem, ResponseContent as SvcContent,
+            ResponseContentPart as SvcContentPart,
+        };
+
         if let Some(ResponseInput::Items(items)) = request.input {
             assert_eq!(items.len(), 1);
-            assert_eq!(items[0].role, "user");
 
-            if let ResponseContent::Parts(parts) = &items[0].content {
-                assert_eq!(parts.len(), 2);
-                assert!(matches!(parts[0], ResponseContentPart::InputText { .. }));
-                assert!(matches!(parts[1], ResponseContentPart::InputImage { .. }));
+            // Match against the services ResponseInputItem enum
+            if let SvcInputItem::Message { role, content } = &items[0] {
+                assert_eq!(role, "user");
 
-                if let ResponseContentPart::InputText { text } = &parts[0] {
-                    assert_eq!(text, "what is in this image?");
-                }
+                if let SvcContent::Parts(parts) = content {
+                    assert_eq!(parts.len(), 2);
+                    assert!(matches!(parts[0], SvcContentPart::InputText { .. }));
+                    assert!(matches!(parts[1], SvcContentPart::InputImage { .. }));
 
-                if let ResponseContentPart::InputImage { image_url, .. } = &parts[1] {
-                    match image_url {
-                        ResponseImageUrl::String(url) => {
-                            assert_eq!(url, "https://example.com/image.jpg");
-                        }
-                        ResponseImageUrl::Object { url } => {
-                            assert_eq!(url, "https://example.com/image.jpg");
+                    if let SvcContentPart::InputText { text } = &parts[0] {
+                        assert_eq!(text, "what is in this image?");
+                    }
+
+                    if let SvcContentPart::InputImage { image_url, .. } = &parts[1] {
+                        match image_url {
+                            ResponseImageUrl::String(url) => {
+                                assert_eq!(url, "https://example.com/image.jpg");
+                            }
+                            ResponseImageUrl::Object { url } => {
+                                assert_eq!(url, "https://example.com/image.jpg");
+                            }
                         }
                     }
+                } else {
+                    panic!("Expected Parts content");
                 }
             } else {
-                panic!("Expected Parts content");
+                panic!("Expected Message variant");
             }
         } else {
             panic!("Expected Items input");

@@ -1261,6 +1261,7 @@ fn convert_output_item_to_conversation_item(
                     name: t.name,
                     description: t.description,
                     input_schema: t.input_schema,
+                    annotations: t.annotations,
                 })
                 .collect(),
             error,

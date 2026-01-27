@@ -1391,10 +1391,12 @@ impl ResponseServiceImpl {
             models::ResponseInput::Items(items) => {
                 // Store each input item as a response_item
                 for input_item in items {
-                    let (role, input_content) = match &input_item {
-                        models::ResponseInputItem::Message { role, content } => {
-                            (role.clone(), content)
-                        }
+                    let (role, input_content, metadata) = match &input_item {
+                        models::ResponseInputItem::Message {
+                            role,
+                            content,
+                            metadata,
+                        } => (role.clone(), content, metadata.clone()),
                         models::ResponseInputItem::McpApprovalResponse { .. } => {
                             continue;
                         }
@@ -1454,7 +1456,7 @@ impl ResponseServiceImpl {
                         role,
                         content,
                         model: model.to_string(),
-                        metadata: None,
+                        metadata,
                     };
 
                     response_items_repository
@@ -1677,7 +1679,7 @@ impl ResponseServiceImpl {
                     for item in items {
                         // Only process message input items
                         let (role, item_content) = match item {
-                            models::ResponseInputItem::Message { role, content } => {
+                            models::ResponseInputItem::Message { role, content, .. } => {
                                 (role.clone(), content)
                             }
                             models::ResponseInputItem::McpApprovalResponse { .. } => {
@@ -2037,7 +2039,9 @@ impl ResponseServiceImpl {
                 items
                     .iter()
                     .filter_map(|item| match item {
-                        models::ResponseInputItem::Message { role, content } if role == "user" => {
+                        models::ResponseInputItem::Message { role, content, .. }
+                            if role == "user" =>
+                        {
                             Some(content)
                         }
                         _ => None,

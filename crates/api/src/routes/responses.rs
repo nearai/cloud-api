@@ -790,7 +790,13 @@ pub async fn list_input_items(
     let mut input_items: Vec<crate::models::ResponseInputItem> = Vec::new();
 
     for item in items {
-        if let ResponseOutputItem::Message { role, content, .. } = item {
+        if let ResponseOutputItem::Message {
+            role,
+            content,
+            metadata,
+            ..
+        } = item
+        {
             if role == "user" {
                 // Convert service ResponseContentItem to API ResponseContentPart (input-only)
                 // This provides type safety - only input variants can exist here
@@ -802,6 +808,7 @@ pub async fn list_input_items(
                 input_items.push(crate::models::ResponseInputItem {
                     role,
                     content: crate::models::ResponseContent::Parts(api_content),
+                    metadata,
                 });
             }
         }

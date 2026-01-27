@@ -519,6 +519,10 @@ pub async fn models(
                     owned_by: model.owned_by,
                     pricing: Some(pricing),
                     context_length: Some(model.context_length),
+                    architecture: ModelArchitecture::from_options(
+                        model.input_modalities,
+                        model.output_modalities,
+                    ),
                 }
             })
             .collect(),

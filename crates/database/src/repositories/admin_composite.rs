@@ -58,6 +58,8 @@ impl AdminRepository for AdminCompositeRepository {
             provider_type: request.provider_type,
             provider_config: request.provider_config,
             attestation_supported: request.attestation_supported,
+            input_modalities: request.input_modalities,
+            output_modalities: request.output_modalities,
             change_reason: request.change_reason,
             changed_by_user_id: request.changed_by_user_id,
             changed_by_user_email: request.changed_by_user_email,
@@ -90,6 +92,8 @@ impl AdminRepository for AdminCompositeRepository {
             provider_type: model.provider_type,
             provider_config: model.provider_config,
             attestation_supported: model.attestation_supported,
+            input_modalities: model.input_modalities,
+            output_modalities: model.output_modalities,
         })
     }
 
@@ -125,6 +129,8 @@ impl AdminRepository for AdminCompositeRepository {
                 verifiable: h.verifiable,
                 is_active: h.is_active,
                 owned_by: h.owned_by,
+                input_modalities: h.input_modalities,
+                output_modalities: h.output_modalities,
                 effective_from: h.effective_from,
                 effective_until: h.effective_until,
                 changed_by_user_id: h.changed_by_user_id,
@@ -314,6 +320,8 @@ impl AdminRepository for AdminCompositeRepository {
                 provider_type: m.provider_type,
                 provider_config: m.provider_config,
                 attestation_supported: m.attestation_supported,
+                input_modalities: m.input_modalities,
+                output_modalities: m.output_modalities,
             })
             .collect();
 

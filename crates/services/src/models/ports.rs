@@ -44,6 +44,12 @@ pub struct ModelWithPricing {
     pub provider_config: Option<serde_json::Value>,
     /// Whether this model supports TEE attestation
     pub attestation_supported: bool,
+
+    // Architecture/modalities
+    /// Input modalities the model accepts, e.g., ["text"], ["text", "image"]
+    pub input_modalities: Option<Vec<String>>,
+    /// Output modalities the model produces, e.g., ["text"], ["image"]
+    pub output_modalities: Option<Vec<String>>,
 }
 
 #[derive(Debug, thiserror::Error)]

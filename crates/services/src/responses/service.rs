@@ -2128,10 +2128,12 @@ impl ResponseServiceImpl {
         }
 
         // Truncate user message for title generation (max 500 chars for context)
-        let truncated_message = if user_message.len() > 500 {
-            format!("{}...", &user_message[..500])
+        // Use iterator to safely handle UTF-8 (cannot panic)
+        let truncated_message: String = user_message.chars().take(500).collect();
+        let truncated_message = if truncated_message.len() < user_message.len() {
+            format!("{truncated_message}...")
         } else {
-            user_message.clone()
+            truncated_message
         };
 
         // Create prompt for title generation
@@ -2206,9 +2208,10 @@ impl ResponseServiceImpl {
             generated_title.to_string()
         };
 
-        // Truncate to max 60 characters
-        let title = if generated_title.len() > 60 {
-            format!("{}...", &generated_title[..57])
+        // Truncate to max 60 characters (iterator approach cannot panic)
+        let title: String = generated_title.chars().take(57).collect();
+        let title = if title.len() < generated_title.len() {
+            format!("{title}...")
         } else {
             generated_title
         };
@@ -3160,5 +3163,47 @@ mod tests {
             &Some("resp_z".to_string()),
         );
         assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_utf8_truncation_does_not_panic() {
+        // Regression test: truncation must handle multi-byte UTF-8 characters
+        // Bug: byte index 500 falling inside Chinese character '文' (bytes 498..501)
+
+        // Helper mimicking the fixed truncation logic
+        fn truncate_safe(s: &str, max_chars: usize) -> String {
+            let truncated: String = s.chars().take(max_chars).collect();
+            if truncated.len() < s.len() {
+                format!("{truncated}...")
+            } else {
+                truncated
+            }
+        }
+
+        // Case 1: Exact reproduction of the bug - 498 ASCII + Chinese chars
+        // '文' is UTF-8 bytes E6 96 87, so byte 500 = 0x87 (mid-character)
+        let input = format!("{}文件内容", "a".repeat(498));
+        assert_eq!(input.as_bytes()[500], 0x87); // Verify byte 500 is mid-char
+
+        // Old code: &input[..500] would panic here
+        let result = truncate_safe(&input, 500);
+        assert!(result.ends_with("..."));
+        assert_eq!(result.chars().count(), 503); // 500 chars + "..."
+
+        // Case 2: All multi-byte characters
+        let chinese = "中".repeat(200); // 600 bytes, 200 chars
+        let result = truncate_safe(&chinese, 100);
+        assert_eq!(result.chars().count(), 103);
+
+        // Case 3: 4-byte emoji at boundary
+        let emoji_input = format!("{}🎉", "x".repeat(499));
+        let result = truncate_safe(&emoji_input, 500);
+        assert_eq!(result, emoji_input); // Exactly 500 chars, no truncation
+
+        // Case 4: Title truncation (57 chars) with Chinese (needs 60+ chars)
+        let title = "中".repeat(70); // 70 Chinese chars, 210 bytes
+        let result = truncate_safe(&title, 57);
+        assert!(result.ends_with("..."));
+        assert_eq!(result.chars().count(), 60); // 57 + "..."
     }
 }

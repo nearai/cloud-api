@@ -83,6 +83,15 @@ impl UsageServiceTrait for UsageServiceImpl {
             let image_count = request.image_count.unwrap_or(0);
             let image_cost = (image_count as i64) * model.cost_per_image;
             (0, image_cost, image_cost)
+        } else if request.inference_type == "audio_transcription" {
+            // For audio transcription: bill by duration in seconds (stored in input_tokens)
+            // input_tokens contains the audio duration rounded up to nearest second
+            let duration_cost = (request.input_tokens as i64)
+                .checked_mul(model.input_cost_per_token)
+                .ok_or_else(|| {
+                    UsageError::InternalError("Cost calculation overflow".to_string())
+                })?;
+            (duration_cost, 0, duration_cost)
         } else {
             // For token-based models (chat completions, etc.)
             let input_cost = (request.input_tokens as i64) * model.input_cost_per_token;

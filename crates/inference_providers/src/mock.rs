@@ -4,13 +4,14 @@
 //! without requiring external dependencies like VLLM.
 
 use crate::{
-    AttestationError, ChatChoice, ChatCompletionChunk, ChatCompletionParams,
+    AttestationError, AudioTranscriptionError, AudioTranscriptionParams,
+    AudioTranscriptionResponse, ChatChoice, ChatCompletionChunk, ChatCompletionParams,
     ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseWithBytes,
     ChatDelta, ChatResponseMessage, ChatSignature, CompletionChunk, CompletionError,
     CompletionParams, FinishReason, FunctionCallDelta, ImageData, ImageGenerationError,
     ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes,
     ListModelsError, MessageRole, ModelInfo, ModelsResponse, SSEEvent, StreamChunk,
-    StreamingResult, TokenUsage, ToolCallDelta,
+    StreamingResult, TokenUsage, ToolCallDelta, TranscriptionSegment, TranscriptionWord,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -952,6 +953,47 @@ impl crate::InferenceProvider for MockProvider {
         );
 
         Ok(report)
+    }
+
+    async fn audio_transcription(
+        &self,
+        params: AudioTranscriptionParams,
+        _request_hash: String,
+    ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
+        // Mock implementation returns simple transcription with mock timing
+        let file_size_kb = params.file_bytes.len() / 1024;
+        let mock_duration = (file_size_kb as f64) * 0.1; // Assume ~0.1s per KB
+
+        Ok(AudioTranscriptionResponse {
+            text: format!("Mock transcription for file: {}", params.filename),
+            duration: Some(mock_duration),
+            language: params.language.or(Some("en".to_string())),
+            segments: Some(vec![TranscriptionSegment {
+                id: 0,
+                seek: 0,
+                start: 0.0,
+                end: mock_duration,
+                text: format!("Mock transcription for file: {}", params.filename),
+                tokens: vec![50364, 15947],
+                temperature: 0.0,
+                avg_logprob: Some(-0.5),
+                compression_ratio: Some(1.0),
+                no_speech_prob: Some(0.0),
+            }]),
+            words: Some(vec![
+                TranscriptionWord {
+                    word: "Mock".to_string(),
+                    start: 0.0,
+                    end: 0.5,
+                },
+                TranscriptionWord {
+                    word: "transcription".to_string(),
+                    start: 0.5,
+                    end: 1.5,
+                },
+            ]),
+            id: None,
+        })
     }
 }
 

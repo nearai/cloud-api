@@ -11,7 +11,8 @@
 
 use super::backend::{BackendConfig, ExternalBackend};
 use crate::{
-    models::StreamOptions, sse_parser::new_sse_parser, ChatCompletionParams,
+    models::StreamOptions, sse_parser::new_sse_parser, AudioTranscriptionError,
+    AudioTranscriptionParams, AudioTranscriptionResponse, ChatCompletionParams,
     ChatCompletionResponse, ChatCompletionResponseWithBytes, CompletionError, ImageGenerationError,
     ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes,
     StreamingResult,
@@ -261,6 +262,84 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             response: image_response,
             raw_bytes,
         })
+    }
+
+    async fn audio_transcription(
+        &self,
+        config: &BackendConfig,
+        model: &str,
+        params: AudioTranscriptionParams,
+    ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
+        let url = format!("{}/audio/transcriptions", config.base_url);
+
+        // Detect content type
+        let content_type = crate::models::detect_audio_content_type(&params.filename);
+
+        let file_part = reqwest::multipart::Part::bytes(params.file_bytes)
+            .file_name(params.filename.clone())
+            .mime_str(&content_type)
+            .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
+
+        let mut form = reqwest::multipart::Form::new()
+            .part("file", file_part)
+            .text("model", model.to_string());
+
+        if let Some(language) = params.language {
+            form = form.text("language", language);
+        }
+
+        if let Some(response_format) = params.response_format {
+            form = form.text("response_format", response_format);
+        }
+
+        if let Some(temperature) = params.temperature {
+            form = form.text("temperature", temperature.to_string());
+        }
+
+        let mut headers = self
+            .build_headers(config)
+            .map_err(AudioTranscriptionError::TranscriptionError)?;
+
+        // Remove Content-Type header if set - reqwest will set it automatically for multipart
+        headers.remove("Content-Type");
+
+        // Add OpenAI-Organization header if provided
+        if let Some(org_id) = config.extra.get("organization_id") {
+            if let Ok(value) = HeaderValue::from_str(org_id) {
+                headers.insert("OpenAI-Organization", value);
+            }
+        }
+
+        let timeout = std::time::Duration::from_secs(config.timeout_seconds as u64);
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .multipart(form)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AudioTranscriptionError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        let transcription_response: AudioTranscriptionResponse = response
+            .json()
+            .await
+            .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
+
+        Ok(transcription_response)
     }
 }
 

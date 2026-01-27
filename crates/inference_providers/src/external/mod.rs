@@ -61,6 +61,9 @@ pub enum ProviderConfig {
         /// Optional organization ID for OpenAI
         #[serde(default)]
         organization_id: Option<String>,
+        /// Optional model name override (e.g., "gpt-5.2" when our model ID is "openai/gpt-5.2")
+        #[serde(default)]
+        model_name: Option<String>,
     },
 
     /// Anthropic provider
@@ -71,6 +74,9 @@ pub enum ProviderConfig {
         /// API version (defaults to "2023-06-01")
         #[serde(default = "default_anthropic_version")]
         version: String,
+        /// Optional model name override (e.g., "claude-3-opus-20240229" when our model ID is "anthropic/claude-3-opus")
+        #[serde(default)]
+        model_name: Option<String>,
     },
 
     /// Google Gemini provider
@@ -78,6 +84,9 @@ pub enum ProviderConfig {
     Gemini {
         /// Base URL for the API (e.g., "https://generativelanguage.googleapis.com/v1beta")
         base_url: String,
+        /// Optional model name override (e.g., "gemini-1.5-pro" when our model ID is "google/gemini-1.5-pro")
+        #[serde(default)]
+        model_name: Option<String>,
     },
 }
 
@@ -118,10 +127,15 @@ impl ExternalProvider {
             timeout_seconds,
         } = external_config;
 
-        let (backend, config): (Arc<dyn ExternalBackend>, BackendConfig) = match provider_config {
+        let (backend, config, remote_model_name): (
+            Arc<dyn ExternalBackend>,
+            BackendConfig,
+            Option<String>,
+        ) = match provider_config {
             ProviderConfig::OpenAiCompatible {
                 base_url,
                 organization_id,
+                model_name: config_model_name,
             } => {
                 let mut extra = std::collections::HashMap::new();
                 if let Some(org_id) = organization_id {
@@ -136,9 +150,14 @@ impl ExternalProvider {
                         timeout_seconds,
                         extra,
                     },
+                    config_model_name,
                 )
             }
-            ProviderConfig::Anthropic { base_url, version } => {
+            ProviderConfig::Anthropic {
+                base_url,
+                version,
+                model_name: config_model_name,
+            } => {
                 let mut extra = std::collections::HashMap::new();
                 extra.insert("version".to_string(), version);
 
@@ -150,9 +169,13 @@ impl ExternalProvider {
                         timeout_seconds,
                         extra,
                     },
+                    config_model_name,
                 )
             }
-            ProviderConfig::Gemini { base_url } => (
+            ProviderConfig::Gemini {
+                base_url,
+                model_name: config_model_name,
+            } => (
                 Arc::new(GeminiBackend::new()),
                 BackendConfig {
                     base_url,
@@ -160,13 +183,17 @@ impl ExternalProvider {
                     timeout_seconds,
                     extra: std::collections::HashMap::new(),
                 },
+                config_model_name,
             ),
         };
+
+        // Use the model name from provider config if specified, otherwise use the database model name
+        let effective_model_name = remote_model_name.unwrap_or(model_name);
 
         Self {
             backend,
             config,
-            model_name,
+            model_name: effective_model_name,
         }
     }
 
@@ -335,9 +362,11 @@ mod tests {
             ProviderConfig::OpenAiCompatible {
                 base_url,
                 organization_id,
+                model_name,
             } => {
                 assert_eq!(base_url, "https://api.openai.com/v1");
                 assert!(organization_id.is_none());
+                assert!(model_name.is_none());
             }
             _ => panic!("Expected OpenAiCompatible variant"),
         }
@@ -356,9 +385,34 @@ mod tests {
             ProviderConfig::OpenAiCompatible {
                 base_url,
                 organization_id,
+                model_name,
             } => {
                 assert_eq!(base_url, "https://api.openai.com/v1");
                 assert_eq!(organization_id, Some("org-123".to_string()));
+                assert!(model_name.is_none());
+            }
+            _ => panic!("Expected OpenAiCompatible variant"),
+        }
+    }
+
+    #[test]
+    fn test_provider_config_deserialization_openai_with_model_name() {
+        let json = r#"{
+            "backend": "openai_compatible",
+            "base_url": "https://api.openai.com/v1",
+            "model_name": "gpt-5.2"
+        }"#;
+        let config: ProviderConfig = serde_json::from_str(json).unwrap();
+
+        match config {
+            ProviderConfig::OpenAiCompatible {
+                base_url,
+                organization_id,
+                model_name,
+            } => {
+                assert_eq!(base_url, "https://api.openai.com/v1");
+                assert!(organization_id.is_none());
+                assert_eq!(model_name, Some("gpt-5.2".to_string()));
             }
             _ => panic!("Expected OpenAiCompatible variant"),
         }
@@ -370,9 +424,14 @@ mod tests {
         let config: ProviderConfig = serde_json::from_str(json).unwrap();
 
         match config {
-            ProviderConfig::Anthropic { base_url, version } => {
+            ProviderConfig::Anthropic {
+                base_url,
+                version,
+                model_name,
+            } => {
                 assert_eq!(base_url, "https://api.anthropic.com/v1");
                 assert_eq!(version, "2023-06-01"); // Default version
+                assert!(model_name.is_none());
             }
             _ => panic!("Expected Anthropic variant"),
         }
@@ -388,9 +447,14 @@ mod tests {
         let config: ProviderConfig = serde_json::from_str(json).unwrap();
 
         match config {
-            ProviderConfig::Anthropic { base_url, version } => {
+            ProviderConfig::Anthropic {
+                base_url,
+                version,
+                model_name,
+            } => {
                 assert_eq!(base_url, "https://api.anthropic.com/v1");
                 assert_eq!(version, "2024-01-01");
+                assert!(model_name.is_none());
             }
             _ => panic!("Expected Anthropic variant"),
         }
@@ -402,8 +466,12 @@ mod tests {
         let config: ProviderConfig = serde_json::from_str(json).unwrap();
 
         match config {
-            ProviderConfig::Gemini { base_url } => {
+            ProviderConfig::Gemini {
+                base_url,
+                model_name,
+            } => {
                 assert_eq!(base_url, "https://generativelanguage.googleapis.com/v1beta");
+                assert!(model_name.is_none());
             }
             _ => panic!("Expected Gemini variant"),
         }
@@ -432,6 +500,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://api.openai.com/v1".to_string(),
                 organization_id: Some("org-123".to_string()),
+                model_name: None,
             },
             api_key: "sk-test-key".to_string(),
             timeout_seconds: 60,
@@ -444,12 +513,34 @@ mod tests {
     }
 
     #[test]
+    fn test_create_external_provider_openai_with_model_name_override() {
+        // Test that model_name in provider config overrides the database model name
+        let config = ExternalProviderConfig {
+            model_name: "openai/gpt-5.2".to_string(), // Our internal model ID
+            provider_config: ProviderConfig::OpenAiCompatible {
+                base_url: "https://api.openai.com/v1".to_string(),
+                organization_id: None,
+                model_name: Some("gpt-5.2".to_string()), // What OpenAI expects
+            },
+            api_key: "sk-test-key".to_string(),
+            timeout_seconds: 60,
+        };
+
+        let provider = ExternalProvider::new(config);
+
+        // The provider should use the config model_name, not the database model name
+        assert_eq!(provider.model_name(), "gpt-5.2");
+        assert_eq!(provider.backend_type(), "openai_compatible");
+    }
+
+    #[test]
     fn test_create_external_provider_anthropic() {
         let config = ExternalProviderConfig {
             model_name: "claude-3-opus-20240229".to_string(),
             provider_config: ProviderConfig::Anthropic {
                 base_url: "https://api.anthropic.com/v1".to_string(),
                 version: "2024-01-01".to_string(),
+                model_name: None,
             },
             api_key: "sk-ant-test".to_string(),
             timeout_seconds: 120,
@@ -462,11 +553,33 @@ mod tests {
     }
 
     #[test]
+    fn test_create_external_provider_anthropic_with_model_name_override() {
+        // Test that model_name in provider config overrides the database model name
+        let config = ExternalProviderConfig {
+            model_name: "anthropic/claude-3-opus".to_string(), // Our internal model ID
+            provider_config: ProviderConfig::Anthropic {
+                base_url: "https://api.anthropic.com/v1".to_string(),
+                version: "2024-01-01".to_string(),
+                model_name: Some("claude-3-opus-20240229".to_string()), // What Anthropic expects
+            },
+            api_key: "sk-ant-test".to_string(),
+            timeout_seconds: 120,
+        };
+
+        let provider = ExternalProvider::new(config);
+
+        // The provider should use the config model_name, not the database model name
+        assert_eq!(provider.model_name(), "claude-3-opus-20240229");
+        assert_eq!(provider.backend_type(), "anthropic");
+    }
+
+    #[test]
     fn test_create_external_provider_gemini() {
         let config = ExternalProviderConfig {
             model_name: "gemini-1.5-pro".to_string(),
             provider_config: ProviderConfig::Gemini {
                 base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+                model_name: None,
             },
             api_key: "AIza-test".to_string(),
             timeout_seconds: 90,
@@ -474,6 +587,26 @@ mod tests {
 
         let provider = ExternalProvider::new(config);
 
+        assert_eq!(provider.model_name(), "gemini-1.5-pro");
+        assert_eq!(provider.backend_type(), "gemini");
+    }
+
+    #[test]
+    fn test_create_external_provider_gemini_with_model_name_override() {
+        // Test that model_name in provider config overrides the database model name
+        let config = ExternalProviderConfig {
+            model_name: "google/gemini-1.5-pro".to_string(), // Our internal model ID
+            provider_config: ProviderConfig::Gemini {
+                base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+                model_name: Some("gemini-1.5-pro".to_string()), // What Google expects
+            },
+            api_key: "AIza-test".to_string(),
+            timeout_seconds: 90,
+        };
+
+        let provider = ExternalProvider::new(config);
+
+        // The provider should use the config model_name, not the database model name
         assert_eq!(provider.model_name(), "gemini-1.5-pro");
         assert_eq!(provider.backend_type(), "gemini");
     }
@@ -487,6 +620,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://api.openai.com/v1".to_string(),
                 organization_id: None,
+                model_name: None,
             },
             api_key: "test-key".to_string(),
             timeout_seconds: 30,
@@ -508,6 +642,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://api.openai.com/v1".to_string(),
                 organization_id: None,
+                model_name: None,
             },
             api_key: "test-key".to_string(),
             timeout_seconds: 30,
@@ -553,6 +688,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://api.openai.com/v1".to_string(),
                 organization_id: None,
+                model_name: None,
             },
             api_key: "test-key".to_string(),
             timeout_seconds: 30,
@@ -578,6 +714,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://api.openai.com/v1".to_string(),
                 organization_id: None,
+                model_name: None,
             },
             api_key: "test-key".to_string(),
             timeout_seconds: 30,
@@ -607,6 +744,7 @@ mod tests {
             provider_config: ProviderConfig::OpenAiCompatible {
                 base_url: "https://example.com".to_string(),
                 organization_id: None,
+                model_name: None,
             },
             api_key: "key".to_string(),
             timeout_seconds: 30,

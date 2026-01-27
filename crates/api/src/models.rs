@@ -184,19 +184,19 @@ pub struct ImageGenerationRequest {
     pub model: String,
     /// Text prompt describing the image to generate
     pub prompt: String,
-    /// Number of images to generate (default: 1)
+    /// Number of images to generate (1-10, default: 1)
     #[serde(default = "default_n_images")]
     pub n: Option<i32>,
-    /// Size of the generated images (e.g., "1024x1024", "512x512")
+    /// Size of the generated images in WxH format (e.g., "1024x1024", "512x512")
     #[serde(default)]
     pub size: Option<String>,
-    /// Response format: "url" or "b64_json"
+    /// Response format: "b64_json" or "url" (only "b64_json" is supported for verifiable models)
     #[serde(default)]
     pub response_format: Option<String>,
-    /// Quality of the generated image: "standard" or "hd"
+    /// Quality of the generated image: "standard" or "hd" ("quality" parameter is not supported for verifiable models)
     #[serde(default)]
     pub quality: Option<String>,
-    /// Style of the generated image: "vivid" or "natural"
+    /// Style of the generated image: "vivid" or "natural" ("style" parameter is not supported for verifiable models)
     #[serde(default)]
     pub style: Option<String>,
 }
@@ -467,6 +467,9 @@ pub struct ModelInfo {
     /// Context length in tokens
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<i32>,
+    /// Model architecture (input/output modalities)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<ModelArchitecture>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2174,6 +2177,31 @@ pub struct DecimalPrice {
     pub currency: String,
 }
 
+/// Model architecture describing input/output modalities
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelArchitecture {
+    /// Input modalities the model accepts, e.g., ["text"], ["text", "image"]
+    #[serde(rename = "inputModalities")]
+    pub input_modalities: Vec<String>,
+    /// Output modalities the model produces, e.g., ["text"], ["image"]
+    #[serde(rename = "outputModalities")]
+    pub output_modalities: Vec<String>,
+}
+
+impl ModelArchitecture {
+    /// Create ModelArchitecture from optional modalities.
+    /// Returns Some only if both input and output modalities are present.
+    pub fn from_options(input: Option<Vec<String>>, output: Option<Vec<String>>) -> Option<Self> {
+        match (input, output) {
+            (Some(input_modalities), Some(output_modalities)) => Some(Self {
+                input_modalities,
+                output_modalities,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Model metadata
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelMetadata {
@@ -2201,6 +2229,10 @@ pub struct ModelMetadata {
     /// Whether this model supports TEE attestation
     #[serde(rename = "attestationSupported")]
     pub attestation_supported: bool,
+
+    /// Model architecture (input/output modalities)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<ModelArchitecture>,
 }
 
 /// Request to update model pricing (admin endpoint)
@@ -2238,6 +2270,12 @@ pub struct UpdateModelApiRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub attestation_supported: Option<bool>,
+    /// Input modalities the model accepts, e.g., ["text"], ["text", "image"]
+    #[serde(rename = "inputModalities", skip_serializing_if = "Option::is_none")]
+    pub input_modalities: Option<Vec<String>>,
+    /// Output modalities the model produces, e.g., ["text"], ["image"]
+    #[serde(rename = "outputModalities", skip_serializing_if = "Option::is_none")]
+    pub output_modalities: Option<Vec<String>>,
     #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
     pub change_reason: Option<String>,
 }
@@ -2291,6 +2329,12 @@ pub struct ModelHistoryEntry {
     pub change_reason: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
+    /// Input modalities the model accepts, e.g., ["text"], ["text", "image"]
+    #[serde(rename = "inputModalities", skip_serializing_if = "Option::is_none")]
+    pub input_modalities: Option<Vec<String>>,
+    /// Output modalities the model produces, e.g., ["text"], ["image"]
+    #[serde(rename = "outputModalities", skip_serializing_if = "Option::is_none")]
+    pub output_modalities: Option<Vec<String>>,
 }
 
 /// Model history response - complete history of model changes

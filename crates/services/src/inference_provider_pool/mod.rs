@@ -764,6 +764,36 @@ impl InferenceProviderPool {
         Some(ordered_providers)
     }
 
+    /// Sanitize a CompletionError by preserving its variant structure while sanitizing messages
+    fn sanitize_completion_error(error: CompletionError, model_id: &str) -> CompletionError {
+        // Helper to sanitize message and format with model_id context
+        let sanitize_and_format = |msg: &str| -> String {
+            let sanitized = Self::sanitize_error_message(msg);
+            format!("Provider failed for model '{}': {}", model_id, sanitized)
+        };
+
+        match error {
+            CompletionError::HttpError {
+                status_code,
+                message,
+            } => {
+                // For HttpError, sanitize the message and include model_id context
+                // Preserve status_code for proper error mapping (4xx vs 5xx)
+                CompletionError::HttpError {
+                    status_code,
+                    message: sanitize_and_format(&message),
+                }
+            }
+            CompletionError::CompletionError(msg) => {
+                CompletionError::CompletionError(sanitize_and_format(&msg))
+            }
+            CompletionError::InvalidResponse(msg) => {
+                CompletionError::InvalidResponse(sanitize_and_format(&msg))
+            }
+            CompletionError::Unknown(msg) => CompletionError::Unknown(sanitize_and_format(&msg)),
+        }
+    }
+
     /// Sanitize error message by removing sensitive information like IP addresses, URLs, and internal details
     fn sanitize_error_message(error: &str) -> String {
         let mut sanitized = error.to_string();
@@ -840,12 +870,7 @@ impl InferenceProviderPool {
                     return Ok((result, external_provider));
                 }
                 Err(e) => {
-                    // External providers have no fallback
-                    let sanitized = Self::sanitize_error_message(&e.to_string());
-                    return Err(CompletionError::CompletionError(format!(
-                        "External provider failed for model '{}': {}",
-                        model_id, sanitized
-                    )));
+                    return Err(Self::sanitize_completion_error(e, model_id));
                 }
             }
         }
@@ -1132,20 +1157,30 @@ impl InferenceProviderPool {
     /// Generate images using the specified model
     pub async fn image_generation(
         &self,
-        params: ImageGenerationParams,
+        mut params: ImageGenerationParams,
         request_hash: String,
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
         let model_id = params.model.clone();
+
+        // Extract model_pub_key from params.extra for routing before any cloning.
+        // This ensures the key is removed from params.extra so it won't be passed to the provider,
+        // and we have a stable reference for routing even if retries occur.
+        let model_pub_key_str = params
+            .extra
+            .remove(encryption_headers::MODEL_PUB_KEY)
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
+        let model_pub_key = model_pub_key_str.as_deref();
 
         tracing::debug!(
             model = %model_id,
             "Starting image generation request"
         );
 
+        // Clone params after removing model_pub_key to ensure it's not in the cloned version
         let params_for_provider = params.clone();
 
         let (response, provider) = self
-            .retry_with_fallback(&model_id, "image_generation", None, |provider| {
+            .retry_with_fallback(&model_id, "image_generation", model_pub_key, |provider| {
                 let params = params_for_provider.clone();
                 let request_hash = request_hash.clone();
                 async move {

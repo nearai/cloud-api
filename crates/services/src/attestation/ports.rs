@@ -1,15 +1,18 @@
-use crate::attestation::models::{AttestationError, AttestationReport, ChatSignature};
+use crate::attestation::models::{
+    AttestationError, AttestationReport, ChatSignature, SignatureLookupResult,
+};
 use async_trait::async_trait;
 
 #[async_trait]
 pub trait AttestationServiceTrait: Send + Sync {
-    /// Get a chat signature from the database only
+    /// Get a chat signature from the database, with fallback for client disconnect
     /// signing_algo: Optional signing algorithm ("ed25519" or "ecdsa"), defaults to "ecdsa" if None
+    /// Returns SignatureLookupResult which can be Found (signature) or Unavailable (client disconnect)
     async fn get_chat_signature(
         &self,
         chat_id: &str,
         signing_algo: Option<String>,
-    ) -> Result<ChatSignature, AttestationError>;
+    ) -> Result<SignatureLookupResult, AttestationError>;
 
     /// Fetch signature from provider and store it in the database
     /// This should be called when a completion finishes

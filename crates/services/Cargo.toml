@@ -32,7 +32,7 @@ url = "2.5"
 bytes = "1.11"
 tokio-stream = "0.1"
 # MCP protocol
-rmcp = { version = "0.12", features = [
+rmcp = { version = "0.13", features = [
     "client",
     "transport-streamable-http-client-reqwest",
 ] }
@@ -50,7 +50,7 @@ regex = "1.11"
 base64 = "0.22"
 # AWS S3 for file storage
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1.119"
+aws-sdk-s3 = "1.120"
 # Encryption for file storage
 aes-gcm = "0.10"
 # HMAC for VPC signature verification

@@ -88,6 +88,7 @@ fn convert_chat_request_to_service(
         organization_id,
         workspace_id,
         metadata: None,
+        store: None,
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct chat completions API calls don't have a response_id
         extra: request.extra.clone(),
@@ -120,6 +121,7 @@ fn convert_text_request_to_service(
         organization_id,
         workspace_id,
         metadata: None,
+        store: None,
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct text completions API calls don't have a response_id
         extra: request.extra.clone(),
@@ -519,6 +521,10 @@ pub async fn models(
                     owned_by: model.owned_by,
                     pricing: Some(pricing),
                     context_length: Some(model.context_length),
+                    architecture: ModelArchitecture::from_options(
+                        model.input_modalities,
+                        model.output_modalities,
+                    ),
                 }
             })
             .collect(),
@@ -634,6 +640,7 @@ pub async fn image_generations(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    headers: header::HeaderMap,
     Json(request): Json<crate::models::ImageGenerationRequest>,
 ) -> axum::response::Response {
     debug!(
@@ -656,6 +663,12 @@ pub async fn image_generations(
         )
             .into_response();
     }
+
+    // Extract and validate encryption headers if present
+    let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
+        Ok(headers) => headers,
+        Err(err) => return err.into_response(),
+    };
 
     // Resolve model to get UUID for usage tracking
     let model = match app_state
@@ -687,15 +700,63 @@ pub async fn image_generations(
         }
     };
 
+    // Validate and enforce response_format for verifiable models
+    // Verifiable models (attestation_supported = true) only support "b64_json" format
+    // Default to "b64_json" if not specified to prevent downstream server from applying "url" default
+    let response_format = if model.attestation_supported {
+        match &request.response_format {
+            Some(format) if format == "b64_json" => Some(format.clone()),
+            Some(format) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        format!(
+                            "response_format '{}' is not supported for verifiable models. Only 'b64_json' is supported.",
+                            format
+                        ),
+                        "invalid_request_error".to_string(),
+                    )),
+                )
+                    .into_response();
+            }
+            None => Some("b64_json".to_string()), // Default to b64_json for verifiable models
+        }
+    } else {
+        request.response_format.clone()
+    };
+
     // Convert API request to provider params
+    let mut extra = std::collections::HashMap::new();
+
+    // Add validated encryption headers to extra
+    if let Some(ref signing_algo) = encryption_headers.signing_algo {
+        extra.insert(
+            service_encryption_headers::SIGNING_ALGO.to_string(),
+            serde_json::Value::String(signing_algo.clone()),
+        );
+    }
+    if let Some(ref client_pub_key) = encryption_headers.client_pub_key {
+        extra.insert(
+            service_encryption_headers::CLIENT_PUB_KEY.to_string(),
+            serde_json::Value::String(client_pub_key.clone()),
+        );
+    }
+    if let Some(ref model_pub_key) = encryption_headers.model_pub_key {
+        extra.insert(
+            service_encryption_headers::MODEL_PUB_KEY.to_string(),
+            serde_json::Value::String(model_pub_key.clone()),
+        );
+    }
+
     let params = inference_providers::ImageGenerationParams {
         model: request.model.clone(),
         prompt: request.prompt.clone(),
         n: request.n,
         size: request.size.clone(),
-        response_format: request.response_format.clone(),
+        response_format,
         quality: request.quality.clone(),
         style: request.style.clone(),
+        extra,
     };
 
     // Call the inference provider pool

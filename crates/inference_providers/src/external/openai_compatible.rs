@@ -95,6 +95,16 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             continuous_usage_stats: None, // Not all providers support this
         });
 
+        // Convert max_tokens to max_completion_tokens for newer OpenAI models
+        // Some models (e.g., gpt-5.2) require max_completion_tokens instead of max_tokens
+        // If max_completion_tokens is not set but max_tokens is, convert it
+        // Always clear max_tokens to avoid sending unsupported parameter to newer models
+        if streaming_params.max_completion_tokens.is_none() && streaming_params.max_tokens.is_some()
+        {
+            streaming_params.max_completion_tokens = streaming_params.max_tokens;
+        }
+        streaming_params.max_tokens = None;
+
         let headers = self
             .build_headers(config)
             .map_err(CompletionError::CompletionError)?;
@@ -141,6 +151,17 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         let mut non_streaming_params = params;
         non_streaming_params.model = model.to_string();
         non_streaming_params.stream = Some(false);
+
+        // Convert max_tokens to max_completion_tokens for newer OpenAI models
+        // Some models (e.g., gpt-5.2) require max_completion_tokens instead of max_tokens
+        // If max_completion_tokens is not set but max_tokens is, convert it
+        // Always clear max_tokens to avoid sending unsupported parameter to newer models
+        if non_streaming_params.max_completion_tokens.is_none()
+            && non_streaming_params.max_tokens.is_some()
+        {
+            non_streaming_params.max_completion_tokens = non_streaming_params.max_tokens;
+        }
+        non_streaming_params.max_tokens = None;
 
         let headers = self
             .build_headers(config)
@@ -714,6 +735,7 @@ mod tests {
             response_format: Some("b64_json".to_string()),
             quality: Some("hd".to_string()),
             style: Some("vivid".to_string()),
+            extra: std::collections::HashMap::new(),
         };
 
         let json = serde_json::to_string(&params).unwrap();
@@ -722,6 +744,7 @@ mod tests {
         assert!(json.contains("\"n\":1"));
         assert!(json.contains("\"size\":\"1024x1024\""));
         assert!(json.contains("\"quality\":\"hd\""));
+        assert!(json.contains("\"style\":\"vivid\""));
     }
 
     // ==================== Audio Tests ====================

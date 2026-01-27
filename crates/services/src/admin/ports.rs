@@ -19,6 +19,9 @@ pub struct UpdateModelAdminRequest {
     pub provider_type: Option<String>,
     pub provider_config: Option<serde_json::Value>,
     pub attestation_supported: Option<bool>,
+    // Architecture/modalities
+    pub input_modalities: Option<Vec<String>>,
+    pub output_modalities: Option<Vec<String>>,
     // User audit tracking for history
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<uuid::Uuid>,
@@ -53,6 +56,9 @@ pub struct ModelPricing {
     pub provider_config: Option<serde_json::Value>,
     /// Whether this model supports TEE attestation
     pub attestation_supported: bool,
+    // Architecture/modalities
+    pub input_modalities: Option<Vec<String>>,
+    pub output_modalities: Option<Vec<String>>,
 }
 
 /// Model history entry - includes pricing, context length, and other model attributes
@@ -72,6 +78,8 @@ pub struct ModelHistoryEntry {
     pub verifiable: bool,
     pub is_active: bool,
     pub owned_by: String,
+    pub input_modalities: Option<Vec<String>>,
+    pub output_modalities: Option<Vec<String>>,
     pub effective_from: chrono::DateTime<chrono::Utc>,
     pub effective_until: Option<chrono::DateTime<chrono::Utc>>,
     pub changed_by_user_id: Option<uuid::Uuid>,
@@ -167,6 +175,9 @@ pub struct AdminModelInfo {
     pub provider_config: Option<serde_json::Value>,
     /// Whether this model supports TEE attestation
     pub attestation_supported: bool,
+    // Architecture/modalities
+    pub input_modalities: Option<Vec<String>>,
+    pub output_modalities: Option<Vec<String>>,
 }
 
 /// Organization information for admin listing (includes spend limit and usage)

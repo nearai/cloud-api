@@ -21,6 +21,16 @@ pub enum AttestationError {
     InternalError(String),
 }
 
+/// Result of looking up a signature that includes fallback cases
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SignatureLookupResult {
+    /// Signature found successfully
+    Found(ChatSignature),
+    /// Signature unavailable (e.g., due to client disconnect)
+    Unavailable { error_code: String, message: String },
+}
+
 /// Chat signature for cryptographic verification
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSignature {

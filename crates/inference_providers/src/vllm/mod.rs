@@ -1,4 +1,6 @@
-use crate::{models::StreamOptions, sse_parser::new_sse_parser, ImageGenerationError, *};
+use crate::{
+    models::StreamOptions, sse_parser::new_sse_parser, ImageGenerationError, RerankError, *,
+};
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
@@ -6,6 +8,11 @@ use serde::Serialize;
 /// Convert any displayable error to ImageGenerationError::GenerationError
 fn to_image_gen_error<E: std::fmt::Display>(e: E) -> ImageGenerationError {
     ImageGenerationError::GenerationError(e.to_string())
+}
+
+/// Convert any displayable error to RerankError::GenerationError
+fn to_rerank_error<E: std::fmt::Display>(e: E) -> RerankError {
+    RerankError::GenerationError(e.to_string())
 }
 
 /// Encryption header keys used in params.extra for passing encryption information
@@ -451,6 +458,37 @@ impl InferenceProvider for VLlmProvider {
             response: image_response,
             raw_bytes,
         })
+    }
+
+    /// Performs a document reranking request
+    async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+        let url = format!("{}/v1/rerank", self.config.base_url);
+
+        let headers = self.build_headers().map_err(to_rerank_error)?;
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&params)
+            .send()
+            .await
+            .map_err(to_rerank_error)?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(RerankError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        let rerank_response: RerankResponse = response.json().await.map_err(to_rerank_error)?;
+        Ok(rerank_response)
     }
 }
 

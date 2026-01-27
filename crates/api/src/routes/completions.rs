@@ -878,3 +878,166 @@ pub async fn image_generations(
         }
     }
 }
+
+/// Document reranking endpoint
+#[utoipa::path(
+    post,
+    path = "/v1/rerank",
+    tag = "Rerank",
+    request_body = crate::models::RerankRequest,
+    responses(
+        (status = 200, description = "Successful rerank", body = crate::models::RerankResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse),
+    ),
+    security(("ApiKeyAuth" = []))
+)]
+pub async fn rerank(
+    State(app_state): State<AppState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Json(request): Json<crate::models::RerankRequest>,
+) -> axum::response::Response {
+    debug!("Rerank request from api key: {:?}", api_key.api_key.id);
+    debug!(
+        "Rerank request: model={}, doc_count={}, org={}, workspace={}",
+        request.model,
+        request.documents.len(),
+        api_key.organization.id,
+        api_key.workspace.id.0
+    );
+
+    // Validate the request
+    if let Err(error) = request.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                error,
+                "invalid_request_error".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
+    // Try to resolve model for usage tracking, but don't fail if not found
+    // (models discovered dynamically may not be in the database yet)
+    let model_id = match app_state
+        .models_service
+        .get_model_by_name(&request.model)
+        .await
+    {
+        Ok(model) => model.id,
+        Err(_) => {
+            // Model not in database - use a generated ID based on model name hash
+            // This allows usage tracking even for newly discovered models
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            request.model.hash(&mut hasher);
+            let hash = hasher.finish();
+            uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_DNS,
+                format!("model-{}", hash).as_bytes(),
+            )
+        }
+    };
+
+    // Convert API request to provider params
+    let params = inference_providers::RerankParams {
+        model: request.model.clone(),
+        query: request.query.clone(),
+        documents: request.documents.clone(),
+        extra: std::collections::HashMap::new(),
+    };
+
+    // Call inference provider pool
+    match app_state.inference_provider_pool.rerank(params).await {
+        Ok(response) => {
+            // Record usage for rerank
+            let organization_id = api_key.organization.id.0;
+            let workspace_id = api_key.workspace.id.0;
+            let api_key_id_str = api_key.api_key.id.0.clone();
+            let usage_service = app_state.usage_service.clone();
+            let token_count = response
+                .usage
+                .as_ref()
+                .and_then(|u| u.total_tokens)
+                .unwrap_or(0);
+
+            // Spawn async task to record usage (fire-and-forget)
+            tokio::spawn(async move {
+                // Parse API key ID to UUID
+                let api_key_id = match Uuid::parse_str(&api_key_id_str) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Invalid API key ID for usage tracking");
+                        return;
+                    }
+                };
+
+                let inference_id = uuid::Uuid::new_v4();
+                let usage_request = services::usage::RecordUsageServiceRequest {
+                    organization_id,
+                    workspace_id,
+                    api_key_id,
+                    model_id,
+                    input_tokens: token_count,
+                    output_tokens: 0,
+                    inference_type: "rerank".to_string(),
+                    ttft_ms: None,
+                    avg_itl_ms: None,
+                    inference_id: Some(inference_id),
+                    provider_request_id: None,
+                    stop_reason: Some(services::usage::StopReason::Completed),
+                    response_id: None,
+                    image_count: None,
+                };
+
+                if let Err(e) = usage_service.record_usage(usage_request).await {
+                    tracing::error!(error = %e, "Failed to record rerank usage");
+                }
+            });
+
+            (StatusCode::OK, ResponseJson(response)).into_response()
+        }
+        Err(e) => {
+            let (status_code, message) = match e {
+                inference_providers::RerankError::GenerationError(msg) => {
+                    tracing::error!(error = %msg, "Rerank generation error");
+                    // Check if it's a model not found error
+                    if msg.contains("not found") || msg.contains("does not exist") {
+                        (StatusCode::NOT_FOUND, "Model not found".to_string())
+                    } else {
+                        (StatusCode::INTERNAL_SERVER_ERROR, msg)
+                    }
+                }
+                inference_providers::RerankError::HttpError {
+                    status_code,
+                    message: _,
+                } => {
+                    let code = StatusCode::from_u16(status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let msg = match code {
+                        StatusCode::NOT_FOUND => "Model not found".to_string(),
+                        StatusCode::BAD_REQUEST => "Invalid request".to_string(),
+                        StatusCode::TOO_MANY_REQUESTS => "Rate limit exceeded".to_string(),
+                        _ => "Reranking failed".to_string(),
+                    };
+                    (code, msg)
+                }
+            };
+
+            let error_type = if status_code == StatusCode::NOT_FOUND {
+                "not_found_error"
+            } else {
+                "server_error"
+            };
+
+            (
+                status_code,
+                ResponseJson(ErrorResponse::new(message, error_type.to_string())),
+            )
+                .into_response()
+        }
+    }
+}

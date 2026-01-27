@@ -4,7 +4,8 @@ use inference_providers::{
     models::{AttestationError, CompletionError, ListModelsError, ModelsResponse},
     ChatCompletionParams, ExternalProvider, ExternalProviderConfig, ImageGenerationError,
     ImageGenerationParams, ImageGenerationResponseWithBytes, InferenceProvider, ProviderConfig,
-    StreamingResult, StreamingResultExt, VLlmConfig, VLlmProvider,
+    RerankError, RerankParams, RerankResponse, StreamingResult, StreamingResultExt, VLlmConfig,
+    VLlmProvider,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -1199,6 +1200,39 @@ impl InferenceProviderPool {
             "Storing chat_id mapping for image generation"
         );
         self.store_chat_id_mapping(image_id, provider).await;
+
+        Ok(response)
+    }
+
+    pub async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+        let model_id = params.model.clone();
+
+        tracing::debug!(
+            model = %model_id,
+            document_count = params.documents.len(),
+            "Starting rerank request"
+        );
+
+        let (response, _provider) = self
+            .retry_with_fallback(&model_id, "rerank", None, |provider| {
+                let params = params.clone();
+                async move {
+                    provider
+                        .rerank(params)
+                        .await
+                        .map_err(|e| CompletionError::CompletionError(e.to_string()))
+                }
+            })
+            .await
+            .map_err(|e| {
+                RerankError::GenerationError(Self::sanitize_error_message(&e.to_string()))
+            })?;
+
+        tracing::info!(
+            model = %model_id,
+            result_count = response.results.len(),
+            "Rerank completed successfully"
+        );
 
         Ok(response)
     }

@@ -13,8 +13,8 @@ use super::backend::{BackendConfig, ExternalBackend};
 use crate::{
     models::StreamOptions, sse_parser::new_sse_parser, ChatCompletionParams,
     ChatCompletionResponse, ChatCompletionResponseWithBytes, CompletionError, ImageGenerationError,
-    ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes,
-    StreamingResult,
+    ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes, RerankError,
+    RerankParams, RerankResponse, StreamingResult,
 };
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
@@ -261,6 +261,53 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             response: image_response,
             raw_bytes,
         })
+    }
+
+    async fn rerank(
+        &self,
+        config: &BackendConfig,
+        model: &str,
+        mut params: RerankParams,
+    ) -> Result<RerankResponse, RerankError> {
+        let url = format!("{}/rerank", config.base_url);
+
+        // Override model in params
+        params.model = model.to_string();
+
+        let headers = self
+            .build_headers(config)
+            .map_err(RerankError::GenerationError)?;
+
+        let timeout = std::time::Duration::from_secs(config.timeout_seconds as u64);
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .timeout(timeout)
+            .json(&params)
+            .send()
+            .await
+            .map_err(|e| RerankError::GenerationError(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(RerankError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        let rerank_response: RerankResponse = response
+            .json()
+            .await
+            .map_err(|e| RerankError::GenerationError(format!("Failed to parse response: {e}")))?;
+
+        Ok(rerank_response)
     }
 }
 

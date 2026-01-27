@@ -744,6 +744,68 @@ pub enum ImageGenerationError {
     HttpError { status_code: u16, message: String },
 }
 
+// ========== Rerank Models ==========
+
+/// Parameters for document reranking
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankParams {
+    /// Model ID to use for reranking
+    pub model: String,
+    /// Query to rerank documents against
+    pub query: String,
+    /// Documents to rerank
+    pub documents: Vec<String>,
+    /// Extra parameters for future extensions
+    #[serde(flatten, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Response from document reranking
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankResponse {
+    /// Unique identifier for the rerank request
+    pub id: String,
+    /// Model used for reranking
+    pub model: String,
+    /// Reranked results
+    pub results: Vec<RerankResult>,
+    /// Usage information (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<RerankUsage>,
+}
+
+/// Individual reranked result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankResult {
+    /// Index of the document in the original input
+    pub index: i32,
+    /// Relevance score (typically 0.0 to 1.0)
+    pub relevance_score: f64,
+    /// The document (can be string or object depending on provider)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document: Option<serde_json::Value>,
+}
+
+/// Usage information for rerank request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankUsage {
+    /// Input tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<i32>,
+    /// Total number of tokens used
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<i32>,
+}
+
+/// Reranking errors
+#[derive(Debug, Error, Clone, Serialize, Deserialize)]
+pub enum RerankError {
+    #[error("Failed to rerank documents: {0}")]
+    GenerationError(String),
+    #[error("HTTP error {status_code}: {message}")]
+    HttpError { status_code: u16, message: String },
+}
+
 /// Attestation report errors
 #[derive(Debug, Error, Clone, Serialize, Deserialize)]
 pub enum AttestationError {

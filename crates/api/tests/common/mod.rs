@@ -781,6 +781,37 @@ pub async fn setup_qwen_image_model(server: &axum_test::TestServer) -> String {
     "Qwen/Qwen-Image-2512".to_string()
 }
 
+pub async fn setup_rerank_model(server: &axum_test::TestServer) -> String {
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        "Qwen/Qwen3-Reranker-0.6B".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 1,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 0,
+                "currency": "USD"
+            },
+            "costPerImage": {
+                "amount": 0,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Qwen3 Reranker",
+            "modelDescription": "Qwen3 document reranking model",
+            "contextLength": 32768,
+            "verifiable": false,
+            "isActive": true
+        }))
+        .unwrap(),
+    );
+    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    assert_eq!(updated.len(), 1, "Should have updated 1 model");
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    "Qwen/Qwen3-Reranker-0.6B".to_string()
+}
+
 /// Generate a minimal valid WAV audio file as base64
 pub fn create_test_audio_base64() -> String {
     use base64::Engine;

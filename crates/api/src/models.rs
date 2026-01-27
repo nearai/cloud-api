@@ -291,6 +291,83 @@ pub struct ImageData {
     pub revised_prompt: Option<String>,
 }
 
+// ========== Rerank Models ==========
+
+/// Request for document reranking
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RerankRequest {
+    /// Model ID to use for reranking
+    pub model: String,
+    /// Query to rerank documents against
+    pub query: String,
+    /// Documents to rerank
+    pub documents: Vec<String>,
+}
+
+impl RerankRequest {
+    /// Validate the rerank request
+    pub fn validate(&self) -> Result<(), String> {
+        // Model is required and must not be empty
+        if self.model.trim().is_empty() {
+            return Err("model is required".to_string());
+        }
+
+        // Query is required and must not be empty
+        if self.query.trim().is_empty() {
+            return Err("query is required".to_string());
+        }
+
+        // Documents must have at least 1 item
+        if self.documents.is_empty() {
+            return Err("documents must contain at least 1 item".to_string());
+        }
+
+        // Documents must not exceed 1000 items
+        if self.documents.len() > 1000 {
+            return Err("documents must contain at most 1000 items".to_string());
+        }
+
+        Ok(())
+    }
+}
+
+/// Response from document reranking
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RerankResponse {
+    /// Unique identifier for the rerank request
+    pub id: String,
+    /// Model used for reranking
+    pub model: String,
+    /// Reranked results
+    pub results: Vec<RerankResult>,
+    /// Usage information (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<RerankUsage>,
+}
+
+/// Individual reranked result
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RerankResult {
+    /// Index of the document in the original input
+    pub index: i32,
+    /// Relevance score (typically 0.0 to 1.0)
+    pub relevance_score: f64,
+    /// The document (can be string or object depending on provider)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document: Option<serde_json::Value>,
+}
+
+/// Usage information for rerank request
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RerankUsage {
+    /// Input tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<i32>,
+    /// Total number of tokens used
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<i32>,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelsResponse {
     pub object: String,

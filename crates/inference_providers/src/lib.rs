@@ -73,8 +73,9 @@ pub use models::{
     ChatCompletionResponseWithBytes, ChatDelta, ChatMessage, ChatResponseMessage, ChatSignature,
     CompletionError, CompletionParams, FinishReason, FunctionChoice, FunctionDefinition, ImageData,
     ImageGenerationError, ImageGenerationParams, ImageGenerationResponse,
-    ImageGenerationResponseWithBytes, MessageRole, ModelInfo, StreamChunk, StreamOptions,
-    TokenUsage, ToolChoice, ToolDefinition,
+    ImageGenerationResponseWithBytes, MessageRole, ModelInfo, RerankError, RerankParams,
+    RerankResponse, RerankResult, RerankUsage, StreamChunk, StreamOptions, TokenUsage, ToolChoice,
+    ToolDefinition,
 };
 pub use sse_parser::{new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser};
 pub use vllm::{VLlmConfig, VLlmProvider};
@@ -150,6 +151,12 @@ pub trait InferenceProvider {
         params: ImageGenerationParams,
         request_hash: String,
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError>;
+
+    /// Performs a document reranking request
+    ///
+    /// Returns documents reranked by relevance to the provided query.
+    /// Returns scored and ranked results.
+    async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError>;
 
     async fn get_signature(
         &self,

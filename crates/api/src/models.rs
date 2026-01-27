@@ -367,29 +367,44 @@ impl AudioTranscriptionRequest {
             ));
         }
 
-        // Validate filename
+        // Validate filename by extracting just the base filename component
+        // This prevents path traversal attacks (including encoded variants)
+        use std::path::Path;
+
         if self.filename.is_empty() {
             return Err("Filename cannot be empty".to_string());
         }
 
-        // Validate filename length (max 255 characters per common filesystem limit)
-        if self.filename.len() > 255 {
-            return Err("Filename exceeds maximum length of 255 characters".to_string());
-        }
+        // Extract safe filename by stripping any path components
+        // This handles both Unix and Windows paths, and prevents traversal attacks
+        let safe_filename = Path::new(&self.filename)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                "Invalid filename: must be a valid UTF-8 filename without path components"
+                    .to_string()
+            })?;
 
-        // Validate filename doesn't contain path traversal characters
-        if self.filename.contains("..")
-            || self.filename.contains('/')
-            || self.filename.contains('\\')
-        {
+        // Check if filename was stripped of path components (indicates traversal attempt)
+        if safe_filename != self.filename {
             return Err(
-                "Filename cannot contain path traversal characters (.., /, \\)".to_string(),
+                "Filename cannot contain path components or traversal sequences".to_string(),
             );
         }
 
+        // Validate filename length (max 255 characters per common filesystem limit)
+        if safe_filename.len() > 255 {
+            return Err("Filename exceeds maximum length of 255 characters".to_string());
+        }
+
         // Validate filename has extension
-        if !self.filename.contains('.') {
+        if !safe_filename.contains('.') {
             return Err("Filename must have an extension (e.g., .mp3, .wav)".to_string());
+        }
+
+        // Reject null bytes which could truncate paths in C-based systems
+        if safe_filename.contains('\0') {
+            return Err("Filename cannot contain null bytes".to_string());
         }
 
         // Validate temperature if provided

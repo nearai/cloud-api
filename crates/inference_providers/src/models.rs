@@ -902,6 +902,33 @@ pub enum AudioTranscriptionError {
     HttpError { status_code: u16, message: String },
 }
 
+/// Utility function to detect audio MIME type from filename extension
+///
+/// Used by audio transcription providers to set proper Content-Type headers
+/// in multipart form uploads.
+///
+/// # Examples
+///
+/// ```
+/// # use inference_providers::detect_audio_content_type;
+/// assert_eq!(detect_audio_content_type("speech.mp3"), "audio/mpeg");
+/// assert_eq!(detect_audio_content_type("recording.wav"), "audio/wav");
+/// assert_eq!(detect_audio_content_type("unknown.xyz"), "application/octet-stream");
+/// ```
+pub fn detect_audio_content_type(filename: &str) -> String {
+    let ext = filename.rsplit('.').next().unwrap_or("");
+    match ext.to_lowercase().as_str() {
+        "mp3" => "audio/mpeg",
+        "mp4" | "m4a" => "audio/mp4",
+        "wav" => "audio/wav",
+        "webm" => "audio/webm",
+        "flac" => "audio/flac",
+        "ogg" => "audio/ogg",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

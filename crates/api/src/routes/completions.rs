@@ -1074,11 +1074,13 @@ pub async fn audio_transcriptions(
         .await
     {
         Ok(response) => {
-            // Record usage for audio transcription asynchronously (fire-and-forget)
-            // Following the same pattern as image_generations
+            // Record usage for audio transcription SYNCHRONOUSLY before returning response
+            // Critical for financial accuracy: if usage recording fails, client gets 500 error
+            // rather than 200 success. This prevents lost revenue and maintains audit trail.
             // Bill by audio duration in seconds (use input_tokens field)
             let workspace_id = api_key.workspace.id.0;
             let api_key_id_str = api_key.api_key.id.0.clone();
+
             // Clamp duration to valid range [0, i32::MAX] to prevent overflow and negative values
             let duration_seconds = response
                 .duration
@@ -1086,46 +1088,65 @@ pub async fn audio_transcriptions(
                 .max(0.0)
                 .min(i32::MAX as f64)
                 .ceil() as i32;
-            let usage_service = app_state.usage_service.clone();
 
-            // Spawn async task to record usage (fire-and-forget like image generations)
-            tokio::spawn(async move {
-                // Parse API key ID to UUID
-                let api_key_id = match uuid::Uuid::parse_str(&api_key_id_str) {
-                    Ok(id) => id,
-                    Err(_) => {
-                        tracing::error!("Invalid API key ID for usage tracking");
-                        return;
-                    }
-                };
-
-                let inference_id = uuid::Uuid::new_v4();
-                let usage_request = services::usage::RecordUsageServiceRequest {
-                    organization_id,
-                    workspace_id,
-                    api_key_id,
-                    model_id,
-                    input_tokens: duration_seconds, // Bill by duration in seconds
-                    output_tokens: 0,
-                    inference_type: "audio_transcription".to_string(),
-                    ttft_ms: None,
-                    avg_itl_ms: None,
-                    inference_id: Some(inference_id),
-                    provider_request_id: None,
-                    stop_reason: Some(services::usage::StopReason::Completed),
-                    response_id: None,
-                    image_count: None,
-                };
-
-                if let Err(e) = usage_service.record_usage(usage_request).await {
-                    tracing::error!(
-                        error = %e,
-                        %organization_id,
-                        %workspace_id,
-                        "Failed to record audio transcription usage"
-                    );
+            // Parse API key ID to UUID
+            let api_key_id = match uuid::Uuid::parse_str(&api_key_id_str) {
+                Ok(id) => id,
+                Err(_) => {
+                    tracing::error!("Invalid API key ID for usage tracking");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse::new(
+                            "Failed to record usage - invalid API key format".to_string(),
+                            "server_error".to_string(),
+                        )),
+                    )
+                        .into_response();
                 }
-            });
+            };
+
+            let inference_id = uuid::Uuid::new_v4();
+            let usage_request = services::usage::RecordUsageServiceRequest {
+                organization_id,
+                workspace_id,
+                api_key_id,
+                model_id,
+                input_tokens: duration_seconds, // Bill by duration in seconds
+                output_tokens: 0,
+                inference_type: "audio_transcription".to_string(),
+                ttft_ms: None,
+                avg_itl_ms: None,
+                inference_id: Some(inference_id),
+                provider_request_id: None,
+                stop_reason: Some(services::usage::StopReason::Completed),
+                response_id: None,
+                image_count: None,
+            };
+
+            // Record usage synchronously - fail the request if usage recording fails
+            if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
+                tracing::error!(
+                    error = %e,
+                    %organization_id,
+                    %workspace_id,
+                    "Failed to record audio transcription usage"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to record usage - please retry".to_string(),
+                        "server_error".to_string(),
+                    )),
+                )
+                    .into_response();
+            }
+
+            tracing::info!(
+                %organization_id,
+                %workspace_id,
+                duration_seconds,
+                "Audio transcription completed and usage recorded successfully"
+            );
 
             (StatusCode::OK, ResponseJson(response)).into_response()
         }

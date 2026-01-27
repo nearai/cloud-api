@@ -252,7 +252,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         let url = format!("{}/audio/transcriptions", config.base_url);
 
         // Detect content type
-        let content_type = Self::detect_audio_content_type(&params.filename);
+        let content_type = crate::models::detect_audio_content_type(&params.filename);
 
         let file_part = reqwest::multipart::Part::bytes(params.file_bytes)
             .file_name(params.filename.clone())
@@ -319,22 +319,6 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
 
         Ok(transcription_response)
-    }
-}
-
-impl OpenAiCompatibleBackend {
-    fn detect_audio_content_type(filename: &str) -> String {
-        let ext = filename.rsplit('.').next().unwrap_or("");
-        match ext.to_lowercase().as_str() {
-            "mp3" => "audio/mpeg",
-            "mp4" | "m4a" => "audio/mp4",
-            "wav" => "audio/wav",
-            "webm" => "audio/webm",
-            "flac" => "audio/flac",
-            "ogg" => "audio/ogg",
-            _ => "application/octet-stream",
-        }
-        .to_string()
     }
 }
 

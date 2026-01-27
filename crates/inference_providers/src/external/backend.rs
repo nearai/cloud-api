@@ -5,6 +5,7 @@
 //! and the provider's native format.
 
 use crate::{
+    AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
     ChatCompletionParams, ChatCompletionResponseWithBytes, CompletionError, ImageGenerationError,
     ImageGenerationParams, ImageGenerationResponseWithBytes, StreamingResult,
 };
@@ -86,6 +87,21 @@ pub trait ExternalBackend: Send + Sync {
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
         Err(ImageGenerationError::GenerationError(format!(
             "Image generation is not supported by the {} backend.",
+            self.backend_type()
+        )))
+    }
+
+    /// Performs an audio transcription request
+    ///
+    /// Default implementation returns an error indicating audio transcription is not supported.
+    async fn audio_transcription(
+        &self,
+        _config: &BackendConfig,
+        _model: &str,
+        _params: AudioTranscriptionParams,
+    ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
+        Err(AudioTranscriptionError::TranscriptionError(format!(
+            "Audio transcription is not supported by the {} backend.",
             self.backend_type()
         )))
     }

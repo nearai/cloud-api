@@ -5,7 +5,10 @@ use crate::inference_provider_pool::InferenceProviderPool;
 use crate::models::ModelsRepository;
 use crate::responses::models::ResponseId;
 use crate::usage::{RecordUsageServiceRequest, UsageServiceTrait};
-use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, StreamingResult};
+use inference_providers::{
+    AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse, ChatMessage,
+    MessageRole, SSEEvent, StreamChunk, StreamingResult,
+};
 use moka::future::Cache;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -672,6 +675,59 @@ impl CompletionServiceImpl {
             attestation_supported,
         };
         Box::pin(intercepted_stream)
+    }
+
+    /// Perform audio transcription with concurrent request limiting
+    ///
+    /// Each organization has a per-model concurrent request limit (default: 64).
+    /// Acquires a concurrent slot before calling the inference provider.
+    /// If the limit is exceeded, returns CompletionError::RateLimitExceeded (429 HTTP status).
+    /// Slots are automatically released after the provider call (success or error).
+    /// Usage is tracked by audio duration in seconds.
+    pub async fn audio_transcription(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        params: AudioTranscriptionParams,
+        request_hash: String,
+    ) -> Result<AudioTranscriptionResponse, ports::CompletionError> {
+        // Acquire concurrent request slot to enforce organization limits
+        let counter = self
+            .try_acquire_concurrent_slot(organization_id, model_id, model_name)
+            .await?;
+
+        // Call inference provider pool with timeout protection
+        let timeout_duration = std::time::Duration::from_secs(120); // 2 minute timeout for audio
+        let result = tokio::time::timeout(
+            timeout_duration,
+            self.inference_provider_pool
+                .audio_transcription(params, request_hash),
+        )
+        .await;
+
+        // Release the concurrent request slot
+        counter.fetch_sub(1, Ordering::Release);
+
+        // Handle timeout and map provider errors
+        match result {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(e)) => {
+                let error_msg = match e {
+                    AudioTranscriptionError::TranscriptionError(msg) => msg,
+                    AudioTranscriptionError::HttpError {
+                        status_code,
+                        message,
+                    } => {
+                        format!("HTTP {}: {}", status_code, message)
+                    }
+                };
+                Err(ports::CompletionError::ProviderError(error_msg))
+            }
+            Err(_) => Err(ports::CompletionError::ProviderError(
+                "Audio transcription request timed out".to_string(),
+            )),
+        }
     }
 }
 

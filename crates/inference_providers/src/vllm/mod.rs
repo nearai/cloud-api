@@ -452,6 +452,104 @@ impl InferenceProvider for VLlmProvider {
             raw_bytes,
         })
     }
+
+    async fn audio_transcription(
+        &self,
+        params: AudioTranscriptionParams,
+        request_hash: String,
+    ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
+        let url = format!("{}/v1/audio/transcriptions", self.config.base_url);
+
+        // Detect content type from filename
+        let content_type = Self::detect_audio_content_type(&params.filename);
+
+        // Build multipart form
+        let file_part = reqwest::multipart::Part::bytes(params.file_bytes)
+            .file_name(params.filename.clone())
+            .mime_str(&content_type)
+            .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
+
+        let mut form = reqwest::multipart::Form::new()
+            .part("file", file_part)
+            .text("model", params.model.clone());
+
+        if let Some(language) = params.language {
+            form = form.text("language", language);
+        }
+
+        if let Some(response_format) = params.response_format {
+            form = form.text("response_format", response_format);
+        }
+
+        if let Some(temperature) = params.temperature {
+            form = form.text("temperature", temperature.to_string());
+        }
+
+        if let Some(granularities) = params.timestamp_granularities {
+            // Send as JSON array string
+            form = form.text("timestamp_granularities[]", granularities.join(","));
+        }
+
+        // Build headers (no Content-Type - reqwest sets it automatically for multipart)
+        let mut headers = self
+            .build_headers()
+            .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
+        // Remove Content-Type header - reqwest will set it automatically for multipart
+        headers.remove("Content-Type");
+        headers.insert(
+            "X-Request-Hash",
+            HeaderValue::from_str(&request_hash)
+                .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?,
+        );
+
+        // Send request with timeout
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .multipart(form)
+            .timeout(std::time::Duration::from_secs(
+                self.config.timeout_seconds as u64,
+            ))
+            .send()
+            .await
+            .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AudioTranscriptionError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        let transcription_response: AudioTranscriptionResponse = response
+            .json()
+            .await
+            .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
+
+        Ok(transcription_response)
+    }
+}
+
+impl VLlmProvider {
+    fn detect_audio_content_type(filename: &str) -> String {
+        let ext = filename.rsplit('.').next().unwrap_or("");
+        match ext.to_lowercase().as_str() {
+            "mp3" => "audio/mpeg",
+            "mp4" | "m4a" => "audio/mp4",
+            "wav" => "audio/wav",
+            "webm" => "audio/webm",
+            "flac" => "audio/flac",
+            "ogg" => "audio/ogg",
+            _ => "application/octet-stream",
+        }
+        .to_string()
+    }
 }
 
 #[cfg(test)]

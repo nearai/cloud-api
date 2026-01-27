@@ -291,6 +291,155 @@ pub struct ImageData {
     pub revised_prompt: Option<String>,
 }
 
+// ========================================
+// Audio Transcription
+// ========================================
+
+/// Audio transcription request schema for OpenAPI documentation
+/// This represents the multipart/form-data fields
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AudioTranscriptionRequestSchema {
+    /// Audio file (required) - binary audio data
+    pub file: String, // Placeholder for binary data in OpenAPI
+
+    /// Model identifier (required) - e.g. "openai/whisper-large-v3"
+    pub model: String,
+
+    /// Language code (optional) - e.g. "en", "es"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+
+    /// Response format (optional) - one of: "json", "text", "srt", "verbose_json", "vtt"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+}
+
+/// Audio transcription request (internal runtime struct)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioTranscriptionRequest {
+    /// Model identifier (required via form field)
+    #[serde(skip)]
+    pub model: String,
+
+    /// Audio file bytes (required via form field)
+    #[serde(skip)]
+    pub file_bytes: Vec<u8>,
+
+    /// Original filename
+    #[serde(skip)]
+    pub filename: String,
+
+    /// Language code (optional, e.g. "en", "es")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+
+    /// Response format: "json", "text", "srt", "verbose_json", "vtt"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+
+    /// Sampling temperature (0-1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+
+    /// Timestamp granularities: "word", "segment"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp_granularities: Option<Vec<String>>,
+}
+
+impl AudioTranscriptionRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        // Validate model is not empty
+        if self.model.trim().is_empty() {
+            return Err("Model is required and cannot be empty".to_string());
+        }
+
+        // Validate file is not empty
+        if self.file_bytes.is_empty() {
+            return Err("Audio file is required and cannot be empty".to_string());
+        }
+
+        // Validate file size (25 MB limit per OpenAI spec)
+        const MAX_FILE_SIZE: usize = 25 * 1024 * 1024; // 25 MB
+        if self.file_bytes.len() > MAX_FILE_SIZE {
+            return Err(format!(
+                "Audio file size exceeds maximum of 25 MB (got {} MB)",
+                self.file_bytes.len() / (1024 * 1024)
+            ));
+        }
+
+        // Validate filename has extension
+        if !self.filename.contains('.') {
+            return Err("Filename must have an extension (e.g., .mp3, .wav)".to_string());
+        }
+
+        // Validate temperature if provided
+        if let Some(temp) = self.temperature {
+            if !(0.0..=1.0).contains(&temp) {
+                return Err("Temperature must be between 0 and 1".to_string());
+            }
+        }
+
+        // Validate response_format if provided
+        if let Some(format) = &self.response_format {
+            let valid_formats = ["json", "text", "srt", "verbose_json", "vtt"];
+            if !valid_formats.contains(&format.as_str()) {
+                return Err(format!(
+                    "Invalid response_format. Must be one of: {}",
+                    valid_formats.join(", ")
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Audio transcription response (with OpenAPI schema)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AudioTranscriptionResponse {
+    /// Transcribed text
+    pub text: String,
+
+    /// Total audio duration in seconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<f64>,
+
+    /// Detected language code
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+
+    /// Transcription segments with timing
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segments: Option<Vec<TranscriptionSegment>>,
+
+    /// Word-level timing information
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub words: Option<Vec<TranscriptionWord>>,
+}
+
+/// Transcription segment (with OpenAPI schema)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TranscriptionSegment {
+    pub id: i32,
+    pub seek: i32,
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+    pub tokens: Vec<i32>,
+    pub temperature: f64,
+    pub avg_logprob: f64,
+    pub compression_ratio: f64,
+    pub no_speech_prob: f64,
+}
+
+/// Word-level timing (with OpenAPI schema)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TranscriptionWord {
+    pub word: String,
+    pub start: f64,
+    pub end: f64,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelsResponse {
     pub object: String,

@@ -772,6 +772,136 @@ pub struct ChatSignature {
     pub signing_algo: String,
 }
 
+// ========================================
+// Audio Transcription
+// ========================================
+
+/// Parameters for audio transcription request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioTranscriptionParams {
+    /// Model identifier (e.g., "openai/whisper-large-v3")
+    pub model: String,
+
+    /// Audio file bytes
+    #[serde(skip)]
+    pub file_bytes: Vec<u8>,
+
+    /// Original filename (for content-type detection)
+    #[serde(skip)]
+    pub filename: String,
+
+    /// Language code (e.g., "en", "es", optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+
+    /// Response format: "json", "text", "srt", "verbose_json", "vtt"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+
+    /// Sampling temperature (0-1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+
+    /// Timestamp granularities: "word", "segment"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp_granularities: Option<Vec<String>>,
+
+    /// Additional provider-specific parameters
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Word-level timing information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptionWord {
+    pub word: String,
+    pub start: f64,
+    pub end: f64,
+}
+
+/// Segment-level transcription with timing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptionSegment {
+    pub id: i32,
+    pub seek: i32,
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+    pub tokens: Vec<i32>,
+    pub temperature: f64,
+    /// Optional: may be null in some provider responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_logprob: Option<f64>,
+    /// Optional: may be null in some provider responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression_ratio: Option<f64>,
+    /// Optional: may be null in some provider responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_speech_prob: Option<f64>,
+}
+
+/// Audio transcription response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioTranscriptionResponse {
+    /// Transcribed text
+    pub text: String,
+
+    /// Total audio duration in seconds (may be a string in some provider responses)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub duration: Option<f64>,
+
+    /// Detected language code
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+
+    /// Transcription segments with timing
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segments: Option<Vec<TranscriptionSegment>>,
+
+    /// Word-level timing information
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub words: Option<Vec<TranscriptionWord>>,
+
+    /// Unique identifier for the transcription
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+/// Custom deserializer to handle duration as either string or number
+fn deserialize_duration<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    use serde_json::Value;
+
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Null => Ok(None),
+        Value::Number(n) => n
+            .as_f64()
+            .map(Some)
+            .ok_or_else(|| Error::custom("duration must be a valid f64")),
+        Value::String(s) => s
+            .parse::<f64>()
+            .ok()
+            .map(Some)
+            .ok_or_else(|| Error::custom("duration string must be a valid number")),
+        _ => Err(Error::custom("duration must be a number or string")),
+    }
+}
+
+/// Audio transcription errors
+#[derive(Debug, Error, Clone, Serialize, Deserialize)]
+pub enum AudioTranscriptionError {
+    #[error("Transcription error: {0}")]
+    TranscriptionError(String),
+
+    #[error("HTTP error {status_code}: {message}")]
+    HttpError { status_code: u16, message: String },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

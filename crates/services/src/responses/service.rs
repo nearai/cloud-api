@@ -2129,8 +2129,9 @@ impl ResponseServiceImpl {
 
         // Truncate user message for title generation (max 500 chars for context)
         // Use iterator to safely handle UTF-8 (cannot panic)
-        let truncated_message: String = user_message.chars().take(500).collect();
-        let truncated_message = if truncated_message.len() < user_message.len() {
+        let mut chars = user_message.chars();
+        let truncated_message: String = chars.by_ref().take(500).collect();
+        let truncated_message = if chars.next().is_some() {
             format!("{truncated_message}...")
         } else {
             truncated_message
@@ -2209,8 +2210,9 @@ impl ResponseServiceImpl {
         };
 
         // Truncate to max 60 characters (iterator approach cannot panic)
-        let title: String = generated_title.chars().take(57).collect();
-        let title = if title.len() < generated_title.len() {
+        let mut chars = generated_title.chars();
+        let title: String = chars.by_ref().take(57).collect();
+        let title = if chars.next().is_some() {
             format!("{title}...")
         } else {
             generated_title
@@ -3172,8 +3174,9 @@ mod tests {
 
         // Helper mimicking the fixed truncation logic
         fn truncate_safe(s: &str, max_chars: usize) -> String {
-            let truncated: String = s.chars().take(max_chars).collect();
-            if truncated.len() < s.len() {
+            let mut chars = s.chars();
+            let truncated: String = chars.by_ref().take(max_chars).collect();
+            if chars.next().is_some() {
                 format!("{truncated}...")
             } else {
                 truncated

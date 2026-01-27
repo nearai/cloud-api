@@ -114,17 +114,28 @@ pub trait CompletionServiceTrait: Send + Sync {
         request: CompletionRequest,
     ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError>;
 
-    /// Execute a score request with proper concurrent request limiting.
+    /// Execute a score request with proper concurrent request limiting and usage recording.
     ///
     /// Each organization has a per-model concurrent request limit (default: 64).
     /// This method acquires a concurrent slot before calling the inference provider.
     /// If the limit is exceeded, returns CompletionError::RateLimitExceeded (429 HTTP status).
-    /// Slots are automatically released after the provider call (success or error).
+    /// Usage is recorded BEFORE the slot is released to prevent race conditions.
+    /// Slots are automatically released after usage recording (success or error).
+    ///
+    /// NOTE: Multiple parameters are necessary for atomicity guarantee:
+    /// - organization_id, workspace_id: required for usage tracking
+    /// - api_key_id: required for usage tracking and authorization audit
+    /// - model_id, model_name: required for cost calculation
+    /// - params: inference parameters
+    /// - request_hash: required for request tracking
+    #[allow(clippy::too_many_arguments)]
     async fn try_score(
         &self,
         organization_id: uuid::Uuid,
+        workspace_id: uuid::Uuid,
         model_id: uuid::Uuid,
         model_name: &str,
+        api_key_id: Uuid,
         params: inference_providers::ScoreParams,
         request_hash: String,
     ) -> Result<inference_providers::ScoreResponse, CompletionError>;

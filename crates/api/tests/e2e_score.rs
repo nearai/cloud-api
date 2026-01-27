@@ -61,7 +61,7 @@ async fn test_score_basic_success() {
     assert!(
         data[0]["score"]
             .as_f64()
-            .map_or(false, |s| s >= 0.0 && s <= 1.0),
+            .is_some_and(|s| (0.0..=1.0).contains(&s)),
         "Score should be between 0 and 1"
     );
     assert_eq!(data[0]["index"].as_i64(), Some(0), "Index should be 0");
@@ -368,9 +368,9 @@ async fn test_score_invalid_api_key() {
     let _ = guard;
 }
 
-/// Test concurrent request limiting
+/// Test sequential score requests (concurrent limit testing is covered by chat_completions tests)
 #[tokio::test]
-async fn test_score_concurrent_limit() {
+async fn test_score_sequential_requests() {
     let (server, guard) = setup_test_server().await;
 
     setup_qwen_reranker_model(&server).await;
@@ -378,8 +378,8 @@ async fn test_score_concurrent_limit() {
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Test: Send sequential requests to verify no blocking at low concurrency
-    // Note: This test simulates rapid requests sequentially.
-    // A proper concurrent test would need a concurrent test framework to hold requests open.
+    // Note: Concurrent request limiting is the same as chat_completions and tested there.
+    // This test verifies sequential requests succeed without blocking.
     for i in 0..5 {
         let response = server
             .post("/v1/score")

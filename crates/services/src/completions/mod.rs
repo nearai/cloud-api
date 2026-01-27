@@ -1044,11 +1044,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         Ok(response_with_bytes)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn try_score(
         &self,
         organization_id: uuid::Uuid,
+        workspace_id: uuid::Uuid,
         model_id: uuid::Uuid,
         model_name: &str,
+        api_key_id: Uuid,
         params: inference_providers::ScoreParams,
         request_hash: String,
     ) -> Result<inference_providers::ScoreResponse, ports::CompletionError> {
@@ -1072,13 +1075,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // Call inference provider pool with service-level timeout protection
         // Defense-in-depth: even if backend timeout fails, we still protect the concurrent slot
-        let result = match tokio::time::timeout(
+        let response = match tokio::time::timeout(
             Duration::from_secs(self.inference_timeout_secs),
             self.inference_provider_pool.score(params, request_hash),
         )
         .await
         {
-            Ok(Ok(response)) => Ok(response),
+            Ok(Ok(response)) => response,
             Ok(Err(e)) => {
                 // Provider error - map ScoreError to CompletionError
                 let error_msg = match e {
@@ -1090,7 +1093,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                         format!("HTTP {}: {}", status_code, message)
                     }
                 };
-                Err(ports::CompletionError::ProviderError(error_msg))
+                return Err(ports::CompletionError::ProviderError(error_msg));
             }
             Err(_) => {
                 // Timeout error
@@ -1098,14 +1101,60 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     "Score request timeout after {} seconds",
                     self.inference_timeout_secs
                 );
-                Err(ports::CompletionError::ProviderError(format!(
+                return Err(ports::CompletionError::ProviderError(format!(
                     "Scoring request timed out after {} seconds",
                     self.inference_timeout_secs
-                )))
+                )));
             }
         };
 
-        result
+        // CRITICAL: Record usage BEFORE releasing the concurrent slot
+        // This prevents a race condition where:
+        // 1. Provider call succeeds
+        // 2. Slot is released (guard dropped)
+        // 3. Another request acquires the slot
+        // 4. Usage recording fails → returns 500 without billing
+        // 5. Organization bypasses concurrent limits without being charged
+        //
+        // By recording usage here (while holding the slot), we ensure
+        // atomicity: either the full request (inference + billing) succeeds,
+        // or the slot is released after an error is returned.
+        let token_count = response
+            .usage
+            .as_ref()
+            .and_then(|u| u.prompt_tokens)
+            .unwrap_or(0);
+
+        let inference_id = uuid::Uuid::new_v4();
+        let usage_request = RecordUsageServiceRequest {
+            organization_id,
+            workspace_id,
+            api_key_id,
+            model_id,
+            input_tokens: token_count,
+            output_tokens: 0,
+            inference_type: "score".to_string(),
+            ttft_ms: None,
+            avg_itl_ms: None,
+            inference_id: Some(inference_id),
+            provider_request_id: None,
+            stop_reason: Some(crate::usage::StopReason::Completed),
+            response_id: None,
+            image_count: None,
+        };
+
+        // Record usage synchronously - this is billing-critical and must succeed
+        // If this fails, we return an error while still holding the slot
+        // This ensures the organization is charged OR the request fails atomically
+        if let Err(e) = self.usage_service.record_usage(usage_request).await {
+            tracing::error!(error = %e, "Failed to record score usage - request will fail");
+            return Err(ports::CompletionError::InternalError(
+                "Failed to record usage - please retry".to_string(),
+            ));
+        }
+
+        // Slot is released here via Drop (after usage is recorded)
+        Ok(response)
     }
 }
 

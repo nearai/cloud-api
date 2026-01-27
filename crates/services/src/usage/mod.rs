@@ -53,9 +53,29 @@ impl UsageServiceTrait for UsageServiceImpl {
             .ok_or_else(|| UsageError::ModelNotFound(format!("Model '{model_id}' not found")))?;
 
         // Calculate costs: tokens * cost_per_token (all in nano-dollars, scale 9)
-        let input_cost = (input_tokens as i64) * model.input_cost_per_token;
-        let output_cost = (output_tokens as i64) * model.output_cost_per_token;
-        let total_cost = input_cost + output_cost;
+        // Use checked_mul to prevent silent overflow that could cause incorrect billing
+        let input_cost = (input_tokens as i64)
+            .checked_mul(model.input_cost_per_token)
+            .ok_or_else(|| {
+                UsageError::InternalError(format!(
+                    "Cost calculation overflow: {} tokens * {} cost_per_token",
+                    input_tokens, model.input_cost_per_token
+                ))
+            })?;
+        let output_cost = (output_tokens as i64)
+            .checked_mul(model.output_cost_per_token)
+            .ok_or_else(|| {
+                UsageError::InternalError(format!(
+                    "Cost calculation overflow: {} tokens * {} cost_per_token",
+                    output_tokens, model.output_cost_per_token
+                ))
+            })?;
+        let total_cost = input_cost.checked_add(output_cost).ok_or_else(|| {
+            UsageError::InternalError(format!(
+                "Cost calculation overflow: {} + {} exceeds i64::MAX",
+                input_cost, output_cost
+            ))
+        })?;
 
         Ok(CostBreakdown {
             input_cost,
@@ -77,23 +97,58 @@ impl UsageServiceTrait for UsageServiceImpl {
             })?;
 
         // Calculate costs based on inference type
+        // Use checked_mul/checked_add to prevent silent overflow that could cause incorrect billing
         let (input_cost, output_cost, total_cost) = if request.inference_type == "image_generation"
         {
             // For image generation: use image_count and cost_per_image
             let image_count = request.image_count.unwrap_or(0);
-            let image_cost = (image_count as i64) * model.cost_per_image;
+            let image_cost = (image_count as i64)
+                .checked_mul(model.cost_per_image)
+                .ok_or_else(|| {
+                    UsageError::InternalError(format!(
+                        "Cost calculation overflow: {} images * {} cost_per_image",
+                        image_count, model.cost_per_image
+                    ))
+                })?;
             (0, image_cost, image_cost)
         } else if request.inference_type == "score" {
             // For score (reranker models): use input tokens only for billing
             // Scoring models don't generate text, so output_tokens is always 0
             // input_tokens represents prompt_tokens (text to score)
-            let score_cost = (request.input_tokens as i64) * model.input_cost_per_token;
+            let score_cost = (request.input_tokens as i64)
+                .checked_mul(model.input_cost_per_token)
+                .ok_or_else(|| {
+                    UsageError::InternalError(format!(
+                        "Cost calculation overflow: {} tokens * {} cost_per_token",
+                        request.input_tokens, model.input_cost_per_token
+                    ))
+                })?;
             (score_cost, 0, score_cost)
         } else {
             // For token-based models (chat completions, etc.)
-            let input_cost = (request.input_tokens as i64) * model.input_cost_per_token;
-            let output_cost = (request.output_tokens as i64) * model.output_cost_per_token;
-            (input_cost, output_cost, input_cost + output_cost)
+            let input_cost = (request.input_tokens as i64)
+                .checked_mul(model.input_cost_per_token)
+                .ok_or_else(|| {
+                    UsageError::InternalError(format!(
+                        "Cost calculation overflow: {} tokens * {} cost_per_token",
+                        request.input_tokens, model.input_cost_per_token
+                    ))
+                })?;
+            let output_cost = (request.output_tokens as i64)
+                .checked_mul(model.output_cost_per_token)
+                .ok_or_else(|| {
+                    UsageError::InternalError(format!(
+                        "Cost calculation overflow: {} tokens * {} cost_per_token",
+                        request.output_tokens, model.output_cost_per_token
+                    ))
+                })?;
+            let total_cost = input_cost.checked_add(output_cost).ok_or_else(|| {
+                UsageError::InternalError(format!(
+                    "Cost calculation overflow: {} + {} exceeds i64::MAX",
+                    input_cost, output_cost
+                ))
+            })?;
+            (input_cost, output_cost, total_cost)
         };
 
         // Create database request with model UUID and name (denormalized)

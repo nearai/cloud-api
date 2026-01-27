@@ -327,6 +327,16 @@ impl RerankRequest {
             return Err("documents must contain at most 1000 items".to_string());
         }
 
+        // Each document must not be empty or whitespace-only
+        for (idx, doc) in self.documents.iter().enumerate() {
+            if doc.trim().is_empty() {
+                return Err(format!(
+                    "document at index {} is empty or contains only whitespace",
+                    idx
+                ));
+            }
+        }
+
         Ok(())
     }
 }

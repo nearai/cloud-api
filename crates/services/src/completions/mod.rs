@@ -1028,6 +1028,39 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         Ok(response_with_bytes)
     }
+
+    async fn try_rerank(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        params: inference_providers::RerankParams,
+    ) -> Result<inference_providers::RerankResponse, ports::CompletionError> {
+        // Acquire concurrent request slot to enforce organization limits
+        let counter = self
+            .try_acquire_concurrent_slot(organization_id, model_id, model_name)
+            .await?;
+
+        // Call inference provider pool
+        let result = self.inference_provider_pool.rerank(params).await;
+
+        // Release the concurrent request slot
+        counter.fetch_sub(1, Ordering::Release);
+
+        // Map provider errors to service errors
+        result.map_err(|e| {
+            let error_msg = match e {
+                inference_providers::RerankError::GenerationError(msg) => msg,
+                inference_providers::RerankError::HttpError {
+                    status_code,
+                    message,
+                } => {
+                    format!("HTTP {}: {}", status_code, message)
+                }
+            };
+            ports::CompletionError::ProviderError(error_msg)
+        })
+    }
 }
 
 pub use ports::*;

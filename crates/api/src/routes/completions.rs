@@ -880,6 +880,11 @@ pub async fn image_generations(
 }
 
 /// Document reranking endpoint
+///
+/// Ranks documents by relevance to a query using a reranker model.
+///
+/// **Concurrent Request Limits:** Each organization has a per-model concurrent request limit (default: 64).
+/// When the limit is reached, new requests will fail with 429 status code. Wait for in-flight requests to complete before retrying.
 #[utoipa::path(
     post,
     path = "/v1/rerank",
@@ -887,15 +892,18 @@ pub async fn image_generations(
     request_body = crate::models::RerankRequest,
     responses(
         (status = 200, description = "Successful rerank", body = crate::models::RerankResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 400, description = "Invalid request (empty documents, invalid model, etc.)", body = ErrorResponse),
+        (status = 401, description = "Unauthorized (missing or invalid API key)", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
-        (status = 500, description = "Server error", body = ErrorResponse),
+        (status = 429, description = "Concurrent request limit exceeded for the organization. Max concurrent requests per model: 64 (configurable)", body = ErrorResponse),
+        (status = 500, description = "Server error (billing failure, provider error)", body = ErrorResponse),
     ),
     security(("ApiKeyAuth" = []))
 )]
 pub async fn rerank(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(_body_hash): Extension<RequestBodyHash>,
     Json(request): Json<crate::models::RerankRequest>,
 ) -> axum::response::Response {
     debug!("Rerank request from api key: {:?}", api_key.api_key.id);
@@ -919,28 +927,38 @@ pub async fn rerank(
             .into_response();
     }
 
-    // Try to resolve model for usage tracking, but don't fail if not found
-    // (models discovered dynamically may not be in the database yet)
-    let model_id = match app_state
+    // Resolve model to get UUID for usage tracking - fail fast if not found
+    // Models must be registered in the database to be available for use
+    let model = match app_state
         .models_service
         .get_model_by_name(&request.model)
         .await
     {
-        Ok(model) => model.id,
-        Err(_) => {
-            // Model not in database - use a generated ID based on model name hash
-            // This allows usage tracking even for newly discovered models
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            request.model.hash(&mut hasher);
-            let hash = hasher.finish();
-            uuid::Uuid::new_v5(
-                &uuid::Uuid::NAMESPACE_DNS,
-                format!("model-{}", hash).as_bytes(),
+        Ok(model) => model,
+        Err(services::models::ModelsError::NotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    format!("Model '{}' not found", request.model),
+                    "not_found_error".to_string(),
+                )),
             )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to resolve model for rerank");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to resolve model".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+                .into_response();
         }
     };
+    let model_id = model.id;
+    let organization_id = api_key.organization.id.0;
 
     // Convert API request to provider params
     let params = inference_providers::RerankParams {
@@ -950,87 +968,110 @@ pub async fn rerank(
         extra: std::collections::HashMap::new(),
     };
 
-    // Call inference provider pool
-    match app_state.inference_provider_pool.rerank(params).await {
+    // Call completion service which handles concurrent request limiting
+    // Each organization has a per-model concurrent request limit (default: 64 concurrent requests).
+    // This prevents resource exhaustion and ensures fair usage. Returns 429 if limit exceeded.
+    match app_state
+        .completion_service
+        .try_rerank(organization_id, model_id, &request.model, params)
+        .await
+    {
         Ok(response) => {
-            // Record usage for rerank
+            // Record usage for rerank SYNCHRONOUSLY to ensure billing accuracy
+            // This is critical for revenue tracking and must complete before returning response
             let organization_id = api_key.organization.id.0;
             let workspace_id = api_key.workspace.id.0;
-            let api_key_id_str = api_key.api_key.id.0.clone();
-            let usage_service = app_state.usage_service.clone();
             let token_count = response
                 .usage
                 .as_ref()
                 .and_then(|u| u.total_tokens)
                 .unwrap_or(0);
 
-            // Spawn async task to record usage (fire-and-forget)
-            tokio::spawn(async move {
-                // Parse API key ID to UUID
-                let api_key_id = match Uuid::parse_str(&api_key_id_str) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        tracing::error!(error = %e, "Invalid API key ID for usage tracking");
-                        return;
-                    }
-                };
-
-                let inference_id = uuid::Uuid::new_v4();
-                let usage_request = services::usage::RecordUsageServiceRequest {
-                    organization_id,
-                    workspace_id,
-                    api_key_id,
-                    model_id,
-                    input_tokens: token_count,
-                    output_tokens: 0,
-                    inference_type: "rerank".to_string(),
-                    ttft_ms: None,
-                    avg_itl_ms: None,
-                    inference_id: Some(inference_id),
-                    provider_request_id: None,
-                    stop_reason: Some(services::usage::StopReason::Completed),
-                    response_id: None,
-                    image_count: None,
-                };
-
-                if let Err(e) = usage_service.record_usage(usage_request).await {
-                    tracing::error!(error = %e, "Failed to record rerank usage");
+            // Parse API key ID to UUID
+            let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::error!(error = %e, "Invalid API key ID for usage tracking");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse::new(
+                            "Failed to record usage".to_string(),
+                            "server_error".to_string(),
+                        )),
+                    )
+                        .into_response();
                 }
-            });
+            };
+
+            let inference_id = uuid::Uuid::new_v4();
+            let usage_request = services::usage::RecordUsageServiceRequest {
+                organization_id,
+                workspace_id,
+                api_key_id,
+                model_id,
+                input_tokens: token_count,
+                output_tokens: 0,
+                inference_type: "rerank".to_string(),
+                ttft_ms: None,
+                avg_itl_ms: None,
+                inference_id: Some(inference_id),
+                provider_request_id: None,
+                stop_reason: Some(services::usage::StopReason::Completed),
+                response_id: None,
+                image_count: None,
+            };
+
+            // Record usage synchronously - this is billing-critical and must succeed
+            // If usage recording fails, we must fail the request to prevent revenue loss
+            if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
+                tracing::error!(error = %e, "Failed to record rerank usage - blocking request to ensure billing accuracy");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to record usage - please retry".to_string(),
+                        "server_error".to_string(),
+                    )),
+                )
+                    .into_response();
+            }
 
             (StatusCode::OK, ResponseJson(response)).into_response()
         }
         Err(e) => {
-            let (status_code, message) = match e {
-                inference_providers::RerankError::GenerationError(msg) => {
-                    tracing::error!(error = %msg, "Rerank generation error");
+            let (status_code, error_type, message) = match e {
+                services::completions::ports::CompletionError::RateLimitExceeded => {
+                    tracing::warn!("Concurrent request limit exceeded for rerank");
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "rate_limit_error",
+                        "Too many concurrent rerank requests. Organization limit: 64 concurrent requests per model. Please wait for in-flight requests to complete before retrying.".to_string(),
+                    )
+                }
+                services::completions::ports::CompletionError::ProviderError(msg) => {
+                    tracing::error!(error = %msg, "Rerank provider error");
                     // Check if it's a model not found error
                     if msg.contains("not found") || msg.contains("does not exist") {
-                        (StatusCode::NOT_FOUND, "Model not found".to_string())
+                        (
+                            StatusCode::NOT_FOUND,
+                            "not_found_error",
+                            "Model not found".to_string(),
+                        )
                     } else {
-                        (StatusCode::INTERNAL_SERVER_ERROR, msg)
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "server_error",
+                            "Reranking failed".to_string(),
+                        )
                     }
                 }
-                inference_providers::RerankError::HttpError {
-                    status_code,
-                    message: _,
-                } => {
-                    let code = StatusCode::from_u16(status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    let msg = match code {
-                        StatusCode::NOT_FOUND => "Model not found".to_string(),
-                        StatusCode::BAD_REQUEST => "Invalid request".to_string(),
-                        StatusCode::TOO_MANY_REQUESTS => "Rate limit exceeded".to_string(),
-                        _ => "Reranking failed".to_string(),
-                    };
-                    (code, msg)
+                _ => {
+                    tracing::error!(error = %e, "Unexpected rerank error");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "Reranking failed".to_string(),
+                    )
                 }
-            };
-
-            let error_type = if status_code == StatusCode::NOT_FOUND {
-                "not_found_error"
-            } else {
-                "server_error"
             };
 
             (

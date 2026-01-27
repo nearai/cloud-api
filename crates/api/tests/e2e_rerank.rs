@@ -243,6 +243,74 @@ async fn test_rerank_validation_too_many_documents() {
     );
 }
 
+/// Test validation: empty/whitespace-only documents
+#[tokio::test]
+async fn test_rerank_validation_empty_document_items() {
+    let (server, guard) = setup_test_server().await;
+    let _guard = guard;
+
+    setup_rerank_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let response = server
+        .post("/v1/rerank")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-Reranker-0.6B",
+            "query": "Test query",
+            "documents": ["Document 1", "", "Document 3"]
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        400,
+        "Should reject documents with empty strings"
+    );
+
+    let error: ErrorResponse = response.json();
+    assert!(
+        error.error.message.contains("empty") || error.error.message.contains("index 1"),
+        "Error message should mention empty document at index 1"
+    );
+}
+
+/// Test validation: whitespace-only documents
+#[tokio::test]
+async fn test_rerank_validation_whitespace_only_document() {
+    let (server, guard) = setup_test_server().await;
+    let _guard = guard;
+
+    setup_rerank_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let response = server
+        .post("/v1/rerank")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-Reranker-0.6B",
+            "query": "Test query",
+            "documents": ["Document 1", "   ", "Document 3"]
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        400,
+        "Should reject documents with only whitespace"
+    );
+
+    let error: ErrorResponse = response.json();
+    assert!(
+        error.error.message.contains("empty") || error.error.message.contains("whitespace"),
+        "Error message should mention whitespace-only document"
+    );
+}
+
 /// Test model not found
 #[tokio::test]
 async fn test_rerank_model_not_found() {

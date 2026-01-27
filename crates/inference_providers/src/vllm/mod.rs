@@ -471,6 +471,9 @@ impl InferenceProvider for VLlmProvider {
             .post(&url)
             .headers(headers)
             .json(&params)
+            .timeout(std::time::Duration::from_secs(
+                self.config.timeout_seconds as u64,
+            ))
             .send()
             .await
             .map_err(to_rerank_error)?;

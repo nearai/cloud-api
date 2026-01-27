@@ -1225,6 +1225,8 @@ impl InferenceProviderPool {
             })
             .await
             .map_err(|e| {
+                // Sanitize error messages to remove sensitive details (URLs, IPs)
+                // while preserving keywords like "not found" for proper error detection in route handlers
                 RerankError::GenerationError(Self::sanitize_error_message(&e.to_string()))
             })?;
 
@@ -1399,6 +1401,27 @@ mod tests {
 
         // HTTP status should still be present (not sensitive)
         assert!(sanitized.contains("401 Unauthorized"));
+
+        // Test that "not found" keywords are preserved for error detection
+        // This is important because route handlers check for "not found" to return 404 errors
+        let error_not_found =
+            "Model 'Qwen/Qwen3-Reranker-0.6B' not found at http://192.168.0.1:8000";
+        let sanitized_not_found = InferenceProviderPool::sanitize_error_message(error_not_found);
+        assert!(
+            sanitized_not_found.contains("not found"),
+            "Keywords 'not found' must be preserved for error detection"
+        );
+        assert!(!sanitized_not_found.contains("http://"));
+        assert!(!sanitized_not_found.contains("192.168.0.1"));
+
+        let error_does_not_exist =
+            "Model 'gpt-4' does not exist on the server https://api.example.com";
+        let sanitized_exists = InferenceProviderPool::sanitize_error_message(error_does_not_exist);
+        assert!(
+            sanitized_exists.contains("does not exist"),
+            "Keywords 'does not exist' must be preserved for error detection"
+        );
+        assert!(!sanitized_exists.contains("https://api.example.com"));
     }
 
     #[tokio::test]

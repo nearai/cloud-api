@@ -1227,7 +1227,15 @@ impl ResponseServiceImpl {
                         // Continue processing tool calls
                     }
                     tools::ToolExecutionResult::ApprovalRequired => {
-                        // MCP tool requires approval - pause the agent loop
+                        // MCP tool requires approval - flush any deferred instructions before pausing
+                        if !deferred_instructions.is_empty() {
+                            messages.push(CompletionMessage {
+                                role: "system".to_string(),
+                                content: std::mem::take(&mut deferred_instructions).join("\n\n"),
+                                tool_call_id: None,
+                                tool_calls: None,
+                            });
+                        }
                         return Ok(AgentLoopResult::ApprovalRequired);
                     }
                 }

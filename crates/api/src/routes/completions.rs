@@ -75,6 +75,8 @@ fn convert_chat_request_to_service(
             .map(|msg| CompletionMessage {
                 role: msg.role.clone(),
                 content: extract_text_from_content(&msg.content),
+                tool_call_id: None,
+                tool_calls: None,
             })
             .collect(),
         max_tokens: request.max_tokens,
@@ -88,6 +90,7 @@ fn convert_chat_request_to_service(
         organization_id,
         workspace_id,
         metadata: None,
+        store: None,
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct chat completions API calls don't have a response_id
         extra: request.extra.clone(),
@@ -108,6 +111,8 @@ fn convert_text_request_to_service(
         messages: vec![CompletionMessage {
             role: "user".to_string(),
             content: request.prompt.clone(),
+            tool_call_id: None,
+            tool_calls: None,
         }],
         max_tokens: request.max_tokens,
         temperature: request.temperature,
@@ -120,6 +125,7 @@ fn convert_text_request_to_service(
         organization_id,
         workspace_id,
         metadata: None,
+        store: None,
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct text completions API calls don't have a response_id
         extra: request.extra.clone(),
@@ -519,6 +525,10 @@ pub async fn models(
                     owned_by: model.owned_by,
                     pricing: Some(pricing),
                     context_length: Some(model.context_length),
+                    architecture: ModelArchitecture::from_options(
+                        model.input_modalities,
+                        model.output_modalities,
+                    ),
                 }
             })
             .collect(),

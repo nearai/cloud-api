@@ -441,6 +441,9 @@ pub struct ModelInfo {
     /// Context length in tokens
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<i32>,
+    /// Model architecture (input/output modalities)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<ModelArchitecture>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2148,6 +2151,31 @@ pub struct DecimalPrice {
     pub currency: String,
 }
 
+/// Model architecture describing input/output modalities
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelArchitecture {
+    /// Input modalities the model accepts, e.g., ["text"], ["text", "image"]
+    #[serde(rename = "inputModalities")]
+    pub input_modalities: Vec<String>,
+    /// Output modalities the model produces, e.g., ["text"], ["image"]
+    #[serde(rename = "outputModalities")]
+    pub output_modalities: Vec<String>,
+}
+
+impl ModelArchitecture {
+    /// Create ModelArchitecture from optional modalities.
+    /// Returns Some only if both input and output modalities are present.
+    pub fn from_options(input: Option<Vec<String>>, output: Option<Vec<String>>) -> Option<Self> {
+        match (input, output) {
+            (Some(input_modalities), Some(output_modalities)) => Some(Self {
+                input_modalities,
+                output_modalities,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Model metadata
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelMetadata {
@@ -2175,6 +2203,10 @@ pub struct ModelMetadata {
     /// Whether this model supports TEE attestation
     #[serde(rename = "attestationSupported")]
     pub attestation_supported: bool,
+
+    /// Model architecture (input/output modalities)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<ModelArchitecture>,
 }
 
 /// Request to update model pricing (admin endpoint)
@@ -2212,6 +2244,12 @@ pub struct UpdateModelApiRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub attestation_supported: Option<bool>,
+    /// Input modalities the model accepts, e.g., ["text"], ["text", "image"]
+    #[serde(rename = "inputModalities", skip_serializing_if = "Option::is_none")]
+    pub input_modalities: Option<Vec<String>>,
+    /// Output modalities the model produces, e.g., ["text"], ["image"]
+    #[serde(rename = "outputModalities", skip_serializing_if = "Option::is_none")]
+    pub output_modalities: Option<Vec<String>>,
     #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
     pub change_reason: Option<String>,
 }
@@ -2265,6 +2303,12 @@ pub struct ModelHistoryEntry {
     pub change_reason: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
+    /// Input modalities the model accepts, e.g., ["text"], ["text", "image"]
+    #[serde(rename = "inputModalities", skip_serializing_if = "Option::is_none")]
+    pub input_modalities: Option<Vec<String>>,
+    /// Output modalities the model produces, e.g., ["text"], ["image"]
+    #[serde(rename = "outputModalities", skip_serializing_if = "Option::is_none")]
+    pub output_modalities: Option<Vec<String>>,
 }
 
 /// Model history response - complete history of model changes

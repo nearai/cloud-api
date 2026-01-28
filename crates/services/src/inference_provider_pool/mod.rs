@@ -763,6 +763,36 @@ impl InferenceProviderPool {
         Some(ordered_providers)
     }
 
+    /// Sanitize a CompletionError by preserving its variant structure while sanitizing messages
+    fn sanitize_completion_error(error: CompletionError, model_id: &str) -> CompletionError {
+        // Helper to sanitize message and format with model_id context
+        let sanitize_and_format = |msg: &str| -> String {
+            let sanitized = Self::sanitize_error_message(msg);
+            format!("Provider failed for model '{}': {}", model_id, sanitized)
+        };
+
+        match error {
+            CompletionError::HttpError {
+                status_code,
+                message,
+            } => {
+                // For HttpError, sanitize the message and include model_id context
+                // Preserve status_code for proper error mapping (4xx vs 5xx)
+                CompletionError::HttpError {
+                    status_code,
+                    message: sanitize_and_format(&message),
+                }
+            }
+            CompletionError::CompletionError(msg) => {
+                CompletionError::CompletionError(sanitize_and_format(&msg))
+            }
+            CompletionError::InvalidResponse(msg) => {
+                CompletionError::InvalidResponse(sanitize_and_format(&msg))
+            }
+            CompletionError::Unknown(msg) => CompletionError::Unknown(sanitize_and_format(&msg)),
+        }
+    }
+
     /// Sanitize error message by removing sensitive information like IP addresses, URLs, and internal details
     fn sanitize_error_message(error: &str) -> String {
         let mut sanitized = error.to_string();
@@ -839,12 +869,7 @@ impl InferenceProviderPool {
                     return Ok((result, external_provider));
                 }
                 Err(e) => {
-                    // External providers have no fallback
-                    let sanitized = Self::sanitize_error_message(&e.to_string());
-                    return Err(CompletionError::CompletionError(format!(
-                        "External provider failed for model '{}': {}",
-                        model_id, sanitized
-                    )));
+                    return Err(Self::sanitize_completion_error(e, model_id));
                 }
             }
         }

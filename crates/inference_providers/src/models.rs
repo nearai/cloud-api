@@ -35,7 +35,7 @@ pub struct ChatDelta {
     pub reasoning: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
     System,
@@ -58,6 +58,10 @@ pub struct ToolCall {
     /// Index of the tool call in streaming responses (for tracking multiple parallel tool calls)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<i64>,
+    /// Thought signature for Gemini 3 models (required for tool calls to work correctly)
+    /// Only included if the model returned one - older models don't use this
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 /// Delta tool call in streaming chat completions
@@ -72,6 +76,9 @@ pub struct ToolCallDelta {
     pub index: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function: Option<FunctionCallDelta>,
+    /// Thought signature for Gemini 3 models (internal use only, not exposed to clients)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 /// Function call details

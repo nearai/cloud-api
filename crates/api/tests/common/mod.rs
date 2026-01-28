@@ -787,7 +787,7 @@ pub async fn setup_rerank_model(server: &axum_test::TestServer) -> String {
         "Qwen/Qwen3-Reranker-0.6B".to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
-                "amount": 1,
+                "amount": 1000000,
                 "currency": "USD"
             },
             "outputCostPerToken": {

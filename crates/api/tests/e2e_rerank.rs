@@ -453,11 +453,109 @@ async fn test_rerank_usage_tracking() {
 
     assert_eq!(response.status_code(), 200, "Rerank should succeed");
 
-    // Give usage tracking async task time to complete
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
+    // Usage recording is synchronous - the handler blocks on
+    // app_state.usage_service.record_usage().await before returning the response.
+    // No sleep needed; the database write is guaranteed to be committed.
     // Note: In a real test, we would query the database to verify usage was recorded
     // For now, we just verify the request succeeded
+}
+
+/// Test that rerank costs are correctly deducted from organization balance
+#[tokio::test]
+async fn test_rerank_costs_deducted_correctly() {
+    let (server, guard) = setup_test_server().await;
+    let _guard = guard;
+
+    setup_rerank_model(&server).await;
+    let org = setup_org_with_credits(&server, 100_000_000_000i64).await; // $100.00 USD
+    let org_id = org.id.clone();
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Get initial balance
+    let initial_balance_response = server
+        .get(format!("/v1/organizations/{}/usage/balance", org_id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+
+    assert_eq!(
+        initial_balance_response.status_code(),
+        200,
+        "Should get initial balance"
+    );
+    let initial_balance = serde_json::from_str::<api::routes::usage::OrganizationBalanceResponse>(
+        &initial_balance_response.text(),
+    )
+    .expect("Failed to parse initial balance response");
+    let initial_spent = initial_balance.total_spent;
+
+    // Make rerank request
+    let response = server
+        .post("/v1/rerank")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-Reranker-0.6B",
+            "query": "What is machine learning?",
+            "documents": [
+                "Machine learning is a subset of artificial intelligence",
+                "Deep learning uses neural networks",
+                "AI is transforming industries"
+            ]
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200, "Rerank request should succeed");
+
+    // Usage is recorded synchronously in the handler via:
+    //   app_state.usage_service.record_usage(usage_request).await
+    // The handler blocks until the database write completes before returning.
+    // No sleep needed - the balance update is already committed.
+
+    // Get final balance
+    let final_balance_response = server
+        .get(format!("/v1/organizations/{}/usage/balance", org_id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+
+    assert_eq!(
+        final_balance_response.status_code(),
+        200,
+        "Should get final balance"
+    );
+    let final_balance = serde_json::from_str::<api::routes::usage::OrganizationBalanceResponse>(
+        &final_balance_response.text(),
+    )
+    .expect("Failed to parse final balance response");
+    let final_spent = final_balance.total_spent;
+
+    // Verify cost was charged
+    let actual_cost = final_spent - initial_spent;
+    assert!(
+        actual_cost > 0,
+        "Cost should be greater than 0, got {actual_cost}"
+    );
+
+    // Mock provider returns 50 tokens (see mock.rs line 922)
+    // Cost per token: 1,000,000 nano-dollars
+    // Expected cost: 50 * 1,000,000 = 50,000,000 nano-dollars = $0.05
+    let expected_cost = 50_000_000i64;
+    let tolerance = 10; // Allow small rounding differences
+
+    assert!(
+        (actual_cost - expected_cost).abs() <= tolerance,
+        "Cost calculation mismatch: expected {expected_cost} nano-dollars (±{tolerance}), got {actual_cost}. \
+         This is a ${} charge (expected $0.05)",
+        actual_cost as f64 / 1_000_000_000.0
+    );
+
+    // Verify total_tokens in balance response increased
+    assert!(
+        final_balance.total_tokens > 0,
+        "total_tokens should be tracked, got {}",
+        final_balance.total_tokens
+    );
 }
 
 /// Test response structure matches spec

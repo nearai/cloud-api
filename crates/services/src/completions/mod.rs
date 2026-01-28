@@ -411,6 +411,18 @@ where
     }
 }
 
+/// RAII guard for concurrent request slots
+/// Automatically releases the slot when dropped, ensuring proper cleanup even if the request panics
+struct ConcurrentSlotGuard {
+    counter: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl Drop for ConcurrentSlotGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Release);
+    }
+}
+
 pub struct CompletionServiceImpl {
     pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub attestation_service: Arc<dyn AttestationServiceTrait>,
@@ -1041,11 +1053,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
             .await?;
 
-        // Call inference provider pool
-        let result = self.inference_provider_pool.rerank(params).await;
+        // Create RAII guard to ensure slot is released on drop (panic, error, or success)
+        let _guard = ConcurrentSlotGuard { counter };
 
-        // Release the concurrent request slot
-        counter.fetch_sub(1, Ordering::Release);
+        // Call inference provider pool
+        // The guard will automatically release the slot when this function returns or panics
+        let result = self.inference_provider_pool.rerank(params).await;
 
         // Map provider errors to service errors
         result.map_err(|e| {

@@ -906,7 +906,6 @@ pub async fn rerank(
     Extension(_body_hash): Extension<RequestBodyHash>,
     Json(request): Json<crate::models::RerankRequest>,
 ) -> axum::response::Response {
-    debug!("Rerank request from api key: {:?}", api_key.api_key.id);
     debug!(
         "Rerank request: model={}, doc_count={}, org={}, workspace={}",
         request.model,
@@ -981,11 +980,51 @@ pub async fn rerank(
             // This is critical for revenue tracking and must complete before returning response
             let organization_id = api_key.organization.id.0;
             let workspace_id = api_key.workspace.id.0;
-            let token_count = response
+            let mut token_count = response
                 .usage
                 .as_ref()
                 .and_then(|u| u.total_tokens)
                 .unwrap_or(0);
+
+            // Validate token count is reasonable (prevent provider misreporting)
+            const MAX_REASONABLE_TOKENS: i32 = 1_000_000; // 1M tokens max
+            let mut token_anomaly_detected = false;
+
+            if token_count > MAX_REASONABLE_TOKENS {
+                // Log at ERROR level with full context for monitoring/alerting
+                // This indicates a provider bug that needs investigation
+                tracing::error!(
+                    token_count = token_count,
+                    max_expected = MAX_REASONABLE_TOKENS,
+                    model = %request.model,
+                    organization_id = %organization_id,
+                    "Provider returned unreasonable token count - capping to prevent billing errors. This may indicate provider misconfiguration or a bug."
+                );
+                token_anomaly_detected = true;
+
+                // Cap to maximum to prevent billing errors
+                token_count = MAX_REASONABLE_TOKENS;
+            }
+
+            // Warn if provider didn't return usage data
+            if token_count == 0 {
+                tracing::warn!(
+                    model = %request.model,
+                    organization_id = %organization_id,
+                    "Provider returned zero tokens for rerank - no cost will be charged. This may indicate provider misconfiguration or incomplete response."
+                );
+                token_anomaly_detected = true;
+            }
+
+            // If anomaly detected, log additional context for debugging
+            if token_anomaly_detected {
+                tracing::info!(
+                    model = %request.model,
+                    organization_id = %organization_id,
+                    final_token_count = token_count,
+                    "Token count anomaly: Provider data quality issue detected. Recommendation: Check provider logs and configuration."
+                );
+            }
 
             // Parse API key ID to UUID
             let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {

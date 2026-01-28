@@ -786,6 +786,10 @@ pub struct AudioTranscriptionParams {
     /// Timestamp granularities: word, segment
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp_granularities: Option<Vec<String>>,
+    /// Sample rate in Hz (e.g., 16000, 44100). Used by providers that require explicit sample rate.
+    /// If not provided, provider defaults will be used (typically 16000 Hz for speech-to-text).
+    #[serde(skip)]
+    pub sample_rate_hertz: Option<u32>,
 }
 
 /// Word-level timestamp information
@@ -794,8 +798,10 @@ pub struct TranscriptionWord {
     /// The transcribed word
     pub word: String,
     /// Start time in seconds
+    #[serde(deserialize_with = "deserialize_flexible_f64_required")]
     pub start: f64,
     /// End time in seconds
+    #[serde(deserialize_with = "deserialize_flexible_f64_required")]
     pub end: f64,
 }
 
@@ -807,22 +813,68 @@ pub struct TranscriptionSegment {
     /// Seek position
     pub seek: i32,
     /// Start time in seconds
+    #[serde(deserialize_with = "deserialize_flexible_f64_required")]
     pub start: f64,
     /// End time in seconds
+    #[serde(deserialize_with = "deserialize_flexible_f64_required")]
     pub end: f64,
     /// Transcribed text for this segment
     pub text: String,
     /// Token IDs
     pub tokens: Vec<i32>,
     /// Average log probability
-    pub avg_logprob: f64,
+    #[serde(default, deserialize_with = "deserialize_flexible_f64")]
+    pub avg_logprob: Option<f64>,
     /// Compression ratio
-    pub compression_ratio: f64,
+    #[serde(default, deserialize_with = "deserialize_flexible_f64")]
+    pub compression_ratio: Option<f64>,
     /// No speech probability
-    pub no_speech_prob: f64,
+    #[serde(default, deserialize_with = "deserialize_flexible_f64")]
+    pub no_speech_prob: Option<f64>,
     /// Temperature used
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+}
+
+/// Helper function to deserialize flexible numeric types (handles both string and f64 for Option)
+fn deserialize_flexible_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Deserialize};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum FlexibleF64 {
+        Float(f64),
+        String(String),
+    }
+
+    match Option::<FlexibleF64>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(FlexibleF64::Float(f)) => Ok(Some(f)),
+        Some(FlexibleF64::String(s)) => s.parse::<f64>().map(Some).map_err(de::Error::custom),
+    }
+}
+
+/// Helper function to deserialize flexible numeric types (handles both string and f64 for required fields)
+fn deserialize_flexible_f64_required<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Deserialize};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum FlexibleF64 {
+        Float(f64),
+        String(String),
+    }
+
+    match FlexibleF64::deserialize(deserializer)? {
+        FlexibleF64::Float(f) => Ok(f),
+        FlexibleF64::String(s) => s.parse::<f64>().map_err(de::Error::custom),
+    }
 }
 
 /// Response from audio transcription
@@ -837,7 +889,10 @@ pub struct AudioTranscriptionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
     /// Duration of the audio in seconds
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_flexible_f64"
+    )]
     pub duration: Option<f64>,
     /// Word-level timestamps (if requested)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -845,6 +900,9 @@ pub struct AudioTranscriptionResponse {
     /// Segment-level timestamps (if requested)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segments: Option<Vec<TranscriptionSegment>>,
+    /// Response ID (provider-specific)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 /// Transcription response with raw bytes for verification

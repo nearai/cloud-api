@@ -18,6 +18,9 @@ use services::realtime::ports::{
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+/// Maximum size for a single WebSocket message (1MB)
+const MAX_WEBSOCKET_MESSAGE_SIZE: usize = 1024 * 1024;
+
 /// State for realtime routes
 #[derive(Clone)]
 pub struct RealtimeRouteState {
@@ -51,10 +54,28 @@ pub async fn realtime_handler(
     );
 
     // Build workspace context from authenticated API key
+    let api_key_id = uuid::Uuid::parse_str(&api_key.api_key.id.0).unwrap_or_else(|_| {
+        error!("Invalid API key ID format");
+        uuid::Uuid::nil()
+    });
+
+    // If API key ID is invalid (nil), reject the request
+    if api_key_id.is_nil() {
+        error!("Rejecting WebSocket connection due to invalid API key ID");
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(ErrorResponse::new(
+                "Invalid API key configuration".to_string(),
+                "server_error".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
     let workspace_ctx = WorkspaceContext {
         organization_id: api_key.organization.id.0,
         workspace_id: api_key.workspace.id.0,
-        api_key_id: uuid::Uuid::parse_str(&api_key.api_key.id.0).unwrap_or_default(),
+        api_key_id,
         user_id: uuid::Uuid::nil(), // API key auth doesn't have user context
     };
 
@@ -146,7 +167,7 @@ async fn handle_realtime_socket(
                                 error: ErrorInfo {
                                     error_type: "server_error".to_string(),
                                     code: "event_handling_failed".to_string(),
-                                    message: format!("Failed to handle event: {e}"),
+                                    message: "Failed to process event".to_string(),
                                 },
                             };
                             let _ = send_event(&mut sender, &error_event).await;
@@ -162,7 +183,7 @@ async fn handle_realtime_socket(
                             error: ErrorInfo {
                                 error_type: "invalid_request_error".to_string(),
                                 code: "invalid_event".to_string(),
-                                message: format!("Failed to parse event: {e}"),
+                                message: "Invalid event format".to_string(),
                             },
                         };
                         let _ = send_event(&mut sender, &error_event).await;
@@ -170,6 +191,19 @@ async fn handle_realtime_socket(
                 }
             }
             Message::Binary(audio) => {
+                // Validate message size
+                if audio.len() > MAX_WEBSOCKET_MESSAGE_SIZE {
+                    let error_event = ServerEvent::Error {
+                        error: ErrorInfo {
+                            error_type: "invalid_request_error".to_string(),
+                            code: "message_too_large".to_string(),
+                            message: "Audio chunk exceeds size limit".to_string(),
+                        },
+                    };
+                    let _ = send_event(&mut sender, &error_event).await;
+                    continue;
+                }
+
                 // Direct binary audio input (alternative to base64)
                 let audio_base64 =
                     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &audio);
@@ -183,6 +217,14 @@ async fn handle_realtime_socket(
                         session_id = %session.session_id,
                         "Error handling binary audio"
                     );
+                    let error_event = ServerEvent::Error {
+                        error: ErrorInfo {
+                            error_type: "server_error".to_string(),
+                            code: "audio_processing_failed".to_string(),
+                            message: "Failed to process audio chunk".to_string(),
+                        },
+                    };
+                    let _ = send_event(&mut sender, &error_event).await;
                 }
             }
             Message::Close(_) => {
@@ -271,11 +313,12 @@ async fn handle_client_event(
                     send_event(sender, &transcription_event).await?;
                 }
                 Err(e) => {
+                    error!(error = %e, "Transcription failed");
                     let error_event = ServerEvent::Error {
                         error: ErrorInfo {
                             error_type: "server_error".to_string(),
                             code: "transcription_failed".to_string(),
-                            message: format!("Transcription failed: {e}"),
+                            message: "Failed to transcribe audio".to_string(),
                         },
                     };
                     send_event(sender, &error_event).await?;
@@ -303,24 +346,12 @@ async fn handle_client_event(
                 "Creating conversation item"
             );
 
-            // Add item to conversation context if it's a message
-            if item.item_type == "message" {
-                if let (Some(role), Some(content)) = (&item.role, &item.content) {
-                    // Extract text from content parts
-                    let text = content
-                        .iter()
-                        .filter_map(|part| part.text.clone())
-                        .collect::<Vec<_>>()
-                        .join("");
-
-                    session
-                        .context
-                        .push(services::realtime::ports::ConversationMessage {
-                            role: role.clone(),
-                            content: text,
-                        });
-                }
-            }
+            // Add item to conversation context through service layer
+            state
+                .realtime_service
+                .add_conversation_item(session, item.clone())
+                .await
+                .map_err(|e| e.to_string())?;
 
             let created_event = ServerEvent::ConversationItemCreated { item };
             send_event(sender, &created_event).await?;
@@ -339,11 +370,12 @@ async fn handle_client_event(
                     }
                 }
                 Err(e) => {
+                    error!(error = %e, "Response generation failed");
                     let error_event = ServerEvent::Error {
                         error: ErrorInfo {
                             error_type: "server_error".to_string(),
                             code: "response_generation_failed".to_string(),
-                            message: format!("Response generation failed: {e}"),
+                            message: "Failed to generate response".to_string(),
                         },
                     };
                     send_event(sender, &error_event).await?;

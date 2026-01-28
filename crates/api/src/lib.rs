@@ -461,6 +461,10 @@ pub async fn init_domain_services_with_pool(
     // Create realtime service
     let realtime_service = Arc::new(services::realtime::RealtimeServiceImpl::new(
         inference_provider_pool.clone(),
+        completion_service.clone(),
+        audio_service.clone(),
+        usage_service.clone(),
+        models_service.clone(),
     )) as Arc<dyn services::realtime::ports::RealtimeServiceTrait>;
 
     DomainServices {

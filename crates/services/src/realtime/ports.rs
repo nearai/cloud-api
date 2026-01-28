@@ -350,4 +350,11 @@ pub trait RealtimeServiceTrait: Send + Sync {
 
     /// Clear the audio buffer
     async fn clear_audio_buffer(&self, session: &mut RealtimeSession) -> Result<(), RealtimeError>;
+
+    /// Add a conversation item (e.g., user message) to the session context
+    async fn add_conversation_item(
+        &self,
+        session: &mut RealtimeSession,
+        item: ConversationItem,
+    ) -> Result<(), RealtimeError>;
 }

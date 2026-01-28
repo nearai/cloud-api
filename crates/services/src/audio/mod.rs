@@ -5,6 +5,9 @@
 
 pub mod ports;
 
+#[cfg(test)]
+mod tests;
+
 use async_trait::async_trait;
 use futures::stream::StreamExt;
 use inference_providers::{AudioSpeechParams, AudioTranscriptionParams};
@@ -39,6 +42,7 @@ impl AudioServiceImpl {
     }
 
     /// Record usage for audio operations
+    #[allow(clippy::too_many_arguments)]
     async fn record_usage(
         &self,
         organization_id: Uuid,
@@ -95,10 +99,11 @@ impl AudioServiceTrait for AudioServiceImpl {
             audio_data: request.audio_data,
             filename: request.filename,
             language: request.language,
-            prompt: request.prompt,
+            prompt: None,
             response_format: request.response_format,
-            temperature: request.temperature,
-            timestamp_granularities: request.timestamp_granularities,
+            temperature: None,
+            timestamp_granularities: None,
+            sample_rate_hertz: None,
         };
 
         // Call the inference provider
@@ -110,9 +115,10 @@ impl AudioServiceTrait for AudioServiceImpl {
 
         // Record usage based on audio duration
         // For STT, we track audio seconds as "input tokens" (scaled by 1000 for precision)
+        // Use i64 to prevent overflow for very long audio (> 35 minutes)
         let audio_seconds_scaled = response
             .audio_duration_seconds
-            .map(|d| (d * 1000.0) as i32)
+            .map(|d| ((d * 1000.0) as i64).min(i32::MAX as i64) as i32)
             .unwrap_or(0);
 
         self.record_usage(
@@ -152,8 +158,9 @@ impl AudioServiceTrait for AudioServiceImpl {
             "Processing text-to-speech request"
         );
 
-        // Validate input length
-        if request.input.len() > 4096 {
+        // Validate input length using character count (consistent with billing)
+        let character_count = request.input.chars().count();
+        if character_count > 4096 {
             return Err(AudioServiceError::InvalidRequest(
                 "Input text exceeds maximum length of 4096 characters".to_string(),
             ));
@@ -168,7 +175,7 @@ impl AudioServiceTrait for AudioServiceImpl {
             speed: request.speed,
         };
 
-        let character_count = request.input.chars().count() as i32;
+        let character_count = character_count as i32;
 
         // Call the inference provider
         let response = self
@@ -213,8 +220,9 @@ impl AudioServiceTrait for AudioServiceImpl {
             "Processing streaming text-to-speech request"
         );
 
-        // Validate input length
-        if request.input.len() > 4096 {
+        // Validate input length using character count (consistent with billing)
+        let character_count = request.input.chars().count();
+        if character_count > 4096 {
             return Err(AudioServiceError::InvalidRequest(
                 "Input text exceeds maximum length of 4096 characters".to_string(),
             ));
@@ -229,7 +237,7 @@ impl AudioServiceTrait for AudioServiceImpl {
             speed: request.speed,
         };
 
-        let character_count = request.input.chars().count() as i32;
+        let character_count = character_count as i32;
 
         // Call the inference provider
         let audio_stream = self
@@ -238,51 +246,18 @@ impl AudioServiceTrait for AudioServiceImpl {
             .await
             .map_err(|e| AudioServiceError::ProviderError(e.to_string()))?;
 
-        // Record usage upfront for streaming (we know the character count)
-        let usage_service = self.usage_service.clone();
-        let organization_id = request.organization_id;
-        let workspace_id = request.workspace_id;
-        let api_key_id = request.api_key_id;
-        let model_id = request.model_id;
-        let model_name = request.model.clone();
-        let voice = request.voice.clone();
-
-        // Spawn a task to record usage after some initial streaming
-        // This is fire-and-forget to not block the stream
-        tokio::spawn(async move {
-            let usage_request = RecordUsageServiceRequest {
-                organization_id,
-                workspace_id,
-                api_key_id,
-                model_id,
-                input_tokens: 0,
-                output_tokens: character_count,
-                inference_type: "audio_speech_stream".to_string(),
-                ttft_ms: None,
-                avg_itl_ms: None,
-                inference_id: None,
-                provider_request_id: None,
-                stop_reason: Some(StopReason::Completed),
-                response_id: None,
-                image_count: None,
-            };
-
-            if let Err(e) = usage_service.record_usage(usage_request).await {
-                tracing::error!(
-                    error = %e,
-                    %organization_id,
-                    %workspace_id,
-                    "Failed to record streaming TTS usage"
-                );
-            } else {
-                tracing::info!(
-                    model = %model_name,
-                    voice = %voice,
-                    characters = character_count,
-                    "Streaming text-to-speech usage recorded"
-                );
-            }
-        });
+        // Record usage upfront for streaming (we know the character count before streaming starts)
+        // This is done immediately rather than fire-and-forget to prevent data loss on shutdown
+        self.record_usage(
+            request.organization_id,
+            request.workspace_id,
+            request.api_key_id,
+            request.model_id,
+            "audio_speech_stream",
+            0,               // No input tokens for TTS
+            character_count, // Character count as output tokens
+        )
+        .await;
 
         // Map the provider stream to our service stream
         let service_stream = audio_stream.map(|result| {

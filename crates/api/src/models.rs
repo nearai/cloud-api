@@ -294,27 +294,21 @@ pub struct ImageData {
 // ==================== Audio API Models ====================
 
 /// Request for audio transcription (speech-to-text)
-/// Note: The actual audio file is sent as multipart form data, not in this struct.
-/// This struct captures the form fields.
+/// Sent as multipart form data with audio file and parameters
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct AudioTranscriptionRequest {
+    /// Audio file to transcribe (binary audio data)
+    #[serde(default)]
+    #[schema(value_type = String, format = Binary)]
+    pub file: Option<Vec<u8>>,
     /// Model ID to use for transcription (e.g., "whisper-1")
     pub model: String,
     /// Language of the audio in ISO-639-1 format (e.g., "en")
     #[serde(default)]
     pub language: Option<String>,
-    /// Optional prompt to guide the transcription style
-    #[serde(default)]
-    pub prompt: Option<String>,
     /// Response format: json, text, srt, verbose_json, vtt
     #[serde(default)]
     pub response_format: Option<String>,
-    /// Sampling temperature between 0 and 1 (default: 0)
-    #[serde(default)]
-    pub temperature: Option<f32>,
-    /// Timestamp granularities: word, segment (only for verbose_json format)
-    #[serde(default)]
-    pub timestamp_granularities: Option<Vec<String>>,
 }
 
 /// Response from audio transcription
@@ -366,11 +360,14 @@ pub struct AudioTranscriptionSegment {
     /// Token IDs
     pub tokens: Vec<i32>,
     /// Average log probability
-    pub avg_logprob: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_logprob: Option<f64>,
     /// Compression ratio
-    pub compression_ratio: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression_ratio: Option<f64>,
     /// No speech probability
-    pub no_speech_prob: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_speech_prob: Option<f64>,
     /// Temperature used
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
@@ -385,14 +382,8 @@ pub struct AudioSpeechRequest {
     pub input: String,
     /// Voice to use (e.g., "alloy", "echo", "fable", "onyx", "nova", "shimmer")
     pub voice: String,
-    /// Response format: mp3, opus, aac, flac, wav, pcm (default: mp3)
-    #[serde(default)]
-    pub response_format: Option<String>,
-    /// Speed of speech (0.25 to 4.0, default: 1.0)
-    #[serde(default)]
-    pub speed: Option<f32>,
     /// Whether to stream the response (default: false)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
 }
 
@@ -415,24 +406,6 @@ impl AudioSpeechRequest {
         // Voice is required
         if self.voice.trim().is_empty() {
             return Err("voice is required".to_string());
-        }
-
-        // Validate speed if provided
-        if let Some(speed) = self.speed {
-            if !(0.25..=4.0).contains(&speed) {
-                return Err("speed must be between 0.25 and 4.0".to_string());
-            }
-        }
-
-        // Validate response_format if provided
-        if let Some(ref format) = self.response_format {
-            let valid_formats = ["mp3", "opus", "aac", "flac", "wav", "pcm"];
-            if !valid_formats.contains(&format.as_str()) {
-                return Err(format!(
-                    "response_format must be one of: {}",
-                    valid_formats.join(", ")
-                ));
-            }
         }
 
         Ok(())

@@ -947,9 +947,12 @@ impl ExternalBackend for GeminiBackend {
         let encoding = map_file_extension_to_google_stt_encoding(&params.filename);
 
         // Build request
+        // Use provided sample rate or default to 16000 Hz (standard for speech-to-text)
+        let sample_rate_hertz = params.sample_rate_hertz.unwrap_or(16000) as i32;
+
         let stt_config = GoogleSttConfig {
             encoding,
-            sample_rate_hertz: Some(16000), // Default sample rate
+            sample_rate_hertz: Some(sample_rate_hertz),
             language_code: params
                 .language
                 .clone()
@@ -1035,6 +1038,7 @@ impl ExternalBackend for GeminiBackend {
             duration: None,
             words: None,
             segments: None,
+            id: None,
         };
 
         // Re-serialize for consistent raw bytes

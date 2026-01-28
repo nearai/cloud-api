@@ -7,10 +7,8 @@ pub mod ports;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use futures::stream;
-use inference_providers::{
-    AudioSpeechParams, AudioTranscriptionParams, ChatCompletionParams, ChatMessage, MessageRole,
-};
+use futures::stream::{self, StreamExt};
+use inference_providers::{AudioTranscriptionParams, StreamChunk};
 use ports::{
     ContentPart, ConversationItem, ConversationMessage, RealtimeError, RealtimeServiceTrait,
     RealtimeSession, ResponseInfo, ServerEvent, ServerEventStream, SessionConfig,
@@ -19,64 +17,115 @@ use ports::{
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::audio::ports::AudioServiceTrait;
+use crate::completions::ports::CompletionServiceTrait;
 use crate::inference_provider_pool::InferenceProviderPool;
+use crate::models::ports::ModelsServiceTrait;
+use crate::usage::{ports::UsageServiceTrait, RecordUsageServiceRequest, StopReason};
+
+/// Maximum size for audio buffer in bytes (10MB)
+const MAX_AUDIO_BUFFER_SIZE: usize = 10 * 1024 * 1024;
+
+/// Maximum size for base64-encoded audio chunks before decoding (14MB)
+const MAX_BASE64_CHUNK_SIZE: usize = 14 * 1024 * 1024;
+
+/// Parameters for recording usage
+struct UsageParams {
+    organization_id: Uuid,
+    workspace_id: Uuid,
+    api_key_id: Uuid,
+    model_id: Uuid,
+    inference_type: String,
+    input_tokens: i32,
+    output_tokens: i32,
+}
 
 /// Realtime service implementation
 pub struct RealtimeServiceImpl {
     inference_pool: Arc<InferenceProviderPool>,
+    completion_service: Arc<dyn CompletionServiceTrait>,
+    audio_service: Arc<dyn AudioServiceTrait>,
+    usage_service: Arc<dyn UsageServiceTrait>,
+    models_service: Arc<dyn ModelsServiceTrait>,
 }
 
 impl RealtimeServiceImpl {
     /// Create a new realtime service
-    pub fn new(inference_pool: Arc<InferenceProviderPool>) -> Self {
-        Self { inference_pool }
+    pub fn new(
+        inference_pool: Arc<InferenceProviderPool>,
+        completion_service: Arc<dyn CompletionServiceTrait>,
+        audio_service: Arc<dyn AudioServiceTrait>,
+        usage_service: Arc<dyn UsageServiceTrait>,
+        models_service: Arc<dyn ModelsServiceTrait>,
+    ) -> Self {
+        Self {
+            inference_pool,
+            completion_service,
+            audio_service,
+            usage_service,
+            models_service,
+        }
     }
 
     /// Generate a unique ID for items
     fn generate_id(prefix: &str) -> String {
-        format!(
-            "{}_{}",
-            prefix,
-            Uuid::new_v4().to_string().replace("-", "")[..24].to_string()
-        )
+        let uuid_str = Uuid::new_v4().to_string();
+        let short_id = uuid_str.replace("-", "");
+        format!("{}_{}", prefix, &short_id[..24])
     }
 
-    /// Convert conversation context to chat messages
-    fn context_to_messages(
-        context: &[ConversationMessage],
-        instructions: &Option<String>,
-    ) -> Vec<ChatMessage> {
-        let mut messages = Vec::new();
-
-        // Add system instructions if present
-        if let Some(ref instructions) = instructions {
-            messages.push(ChatMessage {
-                role: MessageRole::System,
-                content: Some(serde_json::Value::String(instructions.clone())),
-                name: None,
-                tool_call_id: None,
-                tool_calls: None,
-            });
+    /// Convert audio format codec name to file extension
+    /// Maps codec names like "pcm16", "mp3", "wav" to proper file extensions
+    fn audio_format_to_extension(format: &str) -> &'static str {
+        match format.to_lowercase().as_str() {
+            "pcm16" | "pcm" | "raw" => "wav", // PCM16 is typically sent as WAV
+            "mp3" | "mpeg" => "mp3",
+            "wav" | "wave" => "wav",
+            "ogg" | "opus" => "ogg",
+            "flac" => "flac",
+            "m4a" | "aac" => "m4a",
+            "webm" => "webm",
+            _ => "wav", // Default to WAV for unknown formats
         }
+    }
 
-        // Add conversation context
-        for msg in context {
-            let role = match msg.role.as_str() {
-                "user" => MessageRole::User,
-                "assistant" => MessageRole::Assistant,
-                "system" => MessageRole::System,
-                _ => MessageRole::User,
-            };
-            messages.push(ChatMessage {
-                role,
-                content: Some(serde_json::Value::String(msg.content.clone())),
-                name: None,
-                tool_call_id: None,
-                tool_calls: None,
-            });
+    /// Record usage for a realtime operation
+    async fn record_usage(&self, params: UsageParams) {
+        let usage_request = RecordUsageServiceRequest {
+            organization_id: params.organization_id,
+            workspace_id: params.workspace_id,
+            api_key_id: params.api_key_id,
+            model_id: params.model_id,
+            input_tokens: params.input_tokens,
+            output_tokens: params.output_tokens,
+            inference_type: params.inference_type.clone(),
+            ttft_ms: None,
+            avg_itl_ms: None,
+            inference_id: None,
+            provider_request_id: None,
+            stop_reason: Some(StopReason::Completed),
+            response_id: None,
+            image_count: None,
+        };
+
+        if let Err(e) = self.usage_service.record_usage(usage_request).await {
+            tracing::error!(
+                error = %e,
+                organization_id = %params.organization_id,
+                workspace_id = %params.workspace_id,
+                inference_type = %params.inference_type,
+                "Failed to record realtime usage"
+            );
         }
+    }
 
-        messages
+    /// Resolve a model name to its UUID
+    async fn resolve_model_id(&self, model_name: &str) -> Result<Uuid, RealtimeError> {
+        self.models_service
+            .resolve_and_get_model(model_name)
+            .await
+            .map_err(|e| RealtimeError::InternalError(format!("Failed to resolve model: {}", e)))
+            .map(|model| model.id)
     }
 }
 
@@ -111,10 +160,25 @@ impl RealtimeServiceTrait for RealtimeServiceImpl {
         session: &mut RealtimeSession,
         audio_base64: &str,
     ) -> Result<(), RealtimeError> {
+        // Validate base64 size before decoding
+        if audio_base64.len() > MAX_BASE64_CHUNK_SIZE {
+            return Err(RealtimeError::InvalidAudioData(
+                "Audio chunk exceeds size limit (max 14MB base64)".to_string(),
+            ));
+        }
+
         // Decode base64 audio and append to buffer
-        let audio_bytes = BASE64
-            .decode(audio_base64)
-            .map_err(|e| RealtimeError::InvalidAudioData(format!("Invalid base64: {e}")))?;
+        let audio_bytes = BASE64.decode(audio_base64).map_err(|_| {
+            RealtimeError::InvalidAudioData("Invalid audio data format".to_string())
+        })?;
+
+        // Check if adding this chunk would exceed buffer limit
+        if session.audio_buffer.len() + audio_bytes.len() > MAX_AUDIO_BUFFER_SIZE {
+            return Err(RealtimeError::InvalidAudioData(format!(
+                "Audio buffer size limit exceeded (max {} bytes)",
+                MAX_AUDIO_BUFFER_SIZE
+            )));
+        }
 
         session.audio_buffer.extend(audio_bytes);
 
@@ -130,7 +194,7 @@ impl RealtimeServiceTrait for RealtimeServiceImpl {
     async fn commit_audio_buffer(
         &self,
         session: &mut RealtimeSession,
-        _ctx: &WorkspaceContext,
+        ctx: &WorkspaceContext,
     ) -> Result<TranscriptionResult, RealtimeError> {
         if session.audio_buffer.is_empty() {
             return Err(RealtimeError::InvalidAudioData(
@@ -148,16 +212,21 @@ impl RealtimeServiceTrait for RealtimeServiceImpl {
             "Committing audio buffer for transcription"
         );
 
+        // Resolve STT model ID for billing
+        let model_id = self.resolve_model_id(&session.config.stt_model).await?;
+
         // Call transcription service
+        let file_extension = Self::audio_format_to_extension(&session.config.input_audio_format);
         let params = AudioTranscriptionParams {
             model: session.config.stt_model.clone(),
             audio_data,
-            filename: format!("audio_{}.{}", item_id, session.config.input_audio_format),
+            filename: format!("audio_{}.{}", item_id, file_extension),
             language: None,
             prompt: None,
             response_format: Some("json".to_string()),
             temperature: None,
             timestamp_granularities: None,
+            sample_rate_hertz: None,
         };
 
         let request_hash = format!("realtime_{}", Uuid::new_v4());
@@ -169,6 +238,23 @@ impl RealtimeServiceTrait for RealtimeServiceImpl {
             .map_err(|e| RealtimeError::TranscriptionFailed(e.to_string()))?;
 
         let transcript = response.response.text.clone();
+
+        // Record STT usage
+        let audio_seconds_scaled = response
+            .audio_duration_seconds
+            .map(|d| (d * 1000.0) as i32)
+            .unwrap_or(0);
+
+        self.record_usage(UsageParams {
+            organization_id: ctx.organization_id,
+            workspace_id: ctx.workspace_id,
+            api_key_id: ctx.api_key_id,
+            model_id,
+            inference_type: "audio_transcription".to_string(),
+            input_tokens: audio_seconds_scaled,
+            output_tokens: 0,
+        })
+        .await;
 
         // Add to conversation context
         session.context.push(ConversationMessage {
@@ -202,81 +288,53 @@ impl RealtimeServiceTrait for RealtimeServiceImpl {
             "Generating response"
         );
 
-        // Build chat completion request
-        let messages = Self::context_to_messages(&session.context, &session.config.instructions);
+        // Resolve model IDs for billing (fail if not found)
+        let llm_model_id = self.resolve_model_id(&session.config.llm_model).await?;
+        let tts_model_id = self.resolve_model_id(&session.config.tts_model).await?;
 
-        let params = ChatCompletionParams {
+        // Convert realtime conversation context to completion messages
+        let completion_messages: Vec<crate::completions::ports::CompletionMessage> = session
+            .context
+            .iter()
+            .map(|msg| crate::completions::ports::CompletionMessage {
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+            })
+            .collect();
+
+        // Add system instructions if present
+        let mut messages = Vec::new();
+        if let Some(ref instructions) = session.config.instructions {
+            messages.push(crate::completions::ports::CompletionMessage {
+                role: "system".to_string(),
+                content: instructions.clone(),
+            });
+        }
+        messages.extend(completion_messages);
+
+        // Build completion request through the service layer
+        let completion_request = crate::completions::ports::CompletionRequest {
             model: session.config.llm_model.clone(),
             messages,
             max_tokens: None,
             temperature: Some(session.config.temperature),
             top_p: None,
             stop: None,
-            stream: Some(false), // Non-streaming for simplicity
-            tools: None,
-            max_completion_tokens: None,
+            stream: Some(true), // Enable streaming
             n: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            logit_bias: None,
-            logprobs: None,
-            top_logprobs: None,
-            user: Some(ctx.user_id.to_string()),
-            seed: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
+            user_id: crate::UserId(ctx.user_id),
+            api_key_id: ctx.api_key_id.to_string(),
+            organization_id: ctx.organization_id,
+            workspace_id: ctx.workspace_id,
             metadata: None,
             store: None,
-            stream_options: None,
-            modalities: None,
+            body_hash: format!("realtime_llm_{}", Uuid::new_v4()),
+            response_id: None,
             extra: std::collections::HashMap::new(),
         };
 
-        let request_hash = format!("realtime_llm_{}", Uuid::new_v4());
-
-        // Get LLM response
-        let llm_response = self
-            .inference_pool
-            .chat_completion(params, request_hash)
-            .await
-            .map_err(|e| RealtimeError::LlmError(e.to_string()))?;
-
-        let assistant_text = llm_response
-            .response
-            .choices
-            .first()
-            .and_then(|c| c.message.content.clone())
-            .unwrap_or_default();
-
-        // Add assistant response to context
-        session.context.push(ConversationMessage {
-            role: "assistant".to_string(),
-            content: assistant_text.clone(),
-        });
-
-        // Generate TTS audio
-        let tts_params = AudioSpeechParams {
-            model: session.config.tts_model.clone(),
-            input: assistant_text.clone(),
-            voice: session.config.voice.clone(),
-            response_format: Some(session.config.output_audio_format.clone()),
-            speed: None,
-        };
-
-        let tts_request_hash = format!("realtime_tts_{}", Uuid::new_v4());
-
-        let tts_response = self
-            .inference_pool
-            .audio_speech(tts_params, tts_request_hash)
-            .await
-            .map_err(|e| RealtimeError::TtsError(e.to_string()))?;
-
-        let audio_base64 = BASE64.encode(&tts_response.audio_data);
-
-        // Build event stream
-        let response_id_clone = response_id.clone();
-
-        let events = vec![
+        // Stream LLM response and collect events
+        let mut events = vec![
             ServerEvent::ResponseCreated {
                 response: ResponseInfo {
                     id: response_id.clone(),
@@ -292,46 +350,156 @@ impl RealtimeServiceTrait for RealtimeServiceImpl {
                     content: None,
                 },
             },
-            ServerEvent::ResponseTextDelta {
-                item_id: item_id.clone(),
-                delta: assistant_text.clone(),
-            },
-            ServerEvent::ResponseTextDone {
-                item_id: item_id.clone(),
-                text: assistant_text.clone(),
-            },
-            ServerEvent::ResponseAudioDelta {
-                item_id: item_id.clone(),
-                delta: audio_base64,
-            },
-            ServerEvent::ResponseAudioDone {
-                item_id: item_id.clone(),
-            },
-            ServerEvent::ResponseOutputItemDone {
-                item: ConversationItem {
-                    id: item_id.clone(),
-                    item_type: "message".to_string(),
-                    role: Some("assistant".to_string()),
-                    content: Some(vec![ContentPart {
-                        part_type: "text".to_string(),
-                        text: Some(assistant_text),
-                        audio: None,
-                        transcript: None,
-                    }]),
-                },
-            },
-            ServerEvent::ResponseDone {
-                response: ResponseInfo {
-                    id: response_id,
-                    status: "completed".to_string(),
-                    output: None,
-                },
-            },
         ];
+
+        // Use completion service for streaming LLM response
+        let mut llm_stream = self
+            .completion_service
+            .create_chat_completion_stream(completion_request)
+            .await
+            .map_err(|e| RealtimeError::LlmError(e.to_string()))?;
+
+        let mut complete_text = String::new();
+        let mut llm_input_tokens = 0i32;
+        let mut llm_output_tokens = 0i32;
+
+        while let Some(event_result) = llm_stream.next().await {
+            match event_result {
+                Ok(sse_event) => {
+                    // Parse the SSE event for text content
+                    match &sse_event.chunk {
+                        StreamChunk::Chat(chat_chunk) => {
+                            // Track token usage from completion response
+                            if let Some(usage) = &chat_chunk.usage {
+                                llm_input_tokens = usage.prompt_tokens;
+                                llm_output_tokens = usage.completion_tokens;
+                            }
+
+                            for choice in &chat_chunk.choices {
+                                if let Some(delta) = &choice.delta {
+                                    if let Some(content) = &delta.content {
+                                        if !content.is_empty() {
+                                            complete_text.push_str(content);
+                                            // Emit text delta event for real-time text delivery
+                                            events.push(ServerEvent::ResponseTextDelta {
+                                                item_id: item_id.clone(),
+                                                delta: content.clone(),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            // Ignore non-chat chunks
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        session_id = %session.session_id,
+                        error = %e,
+                        "Error streaming LLM response"
+                    );
+                    return Err(RealtimeError::LlmError(e.to_string()));
+                }
+            }
+        }
+
+        // Record LLM usage
+        self.record_usage(UsageParams {
+            organization_id: ctx.organization_id,
+            workspace_id: ctx.workspace_id,
+            api_key_id: ctx.api_key_id,
+            model_id: llm_model_id,
+            inference_type: "chat_completion".to_string(),
+            input_tokens: llm_input_tokens,
+            output_tokens: llm_output_tokens,
+        })
+        .await;
+
+        // Add complete text event
+        events.push(ServerEvent::ResponseTextDone {
+            item_id: item_id.clone(),
+            text: complete_text.clone(),
+        });
+
+        // Add assistant response to session context
+        session.context.push(ConversationMessage {
+            role: "assistant".to_string(),
+            content: complete_text.clone(),
+        });
+
+        // Use audio service for TTS synthesis
+        let speech_request = crate::audio::ports::SpeechRequest {
+            model: session.config.tts_model.clone(),
+            input: complete_text.clone(),
+            voice: session.config.voice.clone(),
+            response_format: Some(session.config.output_audio_format.clone()),
+            speed: None,
+            organization_id: ctx.organization_id,
+            workspace_id: ctx.workspace_id,
+            api_key_id: ctx.api_key_id,
+            model_id: tts_model_id,
+            request_hash: format!("realtime_tts_{}", Uuid::new_v4()),
+        };
+
+        let tts_response = self
+            .audio_service
+            .synthesize(speech_request)
+            .await
+            .map_err(|e| RealtimeError::TtsError(e.to_string()))?;
+
+        // Record TTS usage based on character count
+        let character_count = complete_text.chars().count() as i32;
+        self.record_usage(UsageParams {
+            organization_id: ctx.organization_id,
+            workspace_id: ctx.workspace_id,
+            api_key_id: ctx.api_key_id,
+            model_id: tts_model_id,
+            inference_type: "audio_speech".to_string(),
+            input_tokens: 0,
+            output_tokens: character_count,
+        })
+        .await;
+
+        let audio_base64 = BASE64.encode(&tts_response.audio_data);
+
+        // Add audio events
+        events.push(ServerEvent::ResponseAudioDelta {
+            item_id: item_id.clone(),
+            delta: audio_base64,
+        });
+
+        events.push(ServerEvent::ResponseAudioDone {
+            item_id: item_id.clone(),
+        });
+
+        events.push(ServerEvent::ResponseOutputItemDone {
+            item: ConversationItem {
+                id: item_id.clone(),
+                item_type: "message".to_string(),
+                role: Some("assistant".to_string()),
+                content: Some(vec![ContentPart {
+                    part_type: "text".to_string(),
+                    text: Some(complete_text),
+                    audio: None,
+                    transcript: None,
+                }]),
+            },
+        });
+
+        events.push(ServerEvent::ResponseDone {
+            response: ResponseInfo {
+                id: response_id.clone(),
+                status: "completed".to_string(),
+                output: None,
+            },
+        });
 
         tracing::info!(
             session_id = %session.session_id,
-            response_id = %response_id_clone,
+            response_id = %response_id,
             "Response generation completed"
         );
 
@@ -360,6 +528,39 @@ impl RealtimeServiceTrait for RealtimeServiceImpl {
             session_id = %session.session_id,
             "Audio buffer cleared"
         );
+
+        Ok(())
+    }
+
+    async fn add_conversation_item(
+        &self,
+        session: &mut RealtimeSession,
+        item: ConversationItem,
+    ) -> Result<(), RealtimeError> {
+        // Only process message-type items
+        if item.item_type != "message" {
+            return Ok(());
+        }
+
+        // Extract text from content parts if both role and content are present
+        if let (Some(role), Some(content)) = (item.role, item.content) {
+            let text = content
+                .iter()
+                .filter_map(|part| part.text.clone())
+                .collect::<Vec<_>>()
+                .join("");
+
+            session.context.push(ConversationMessage {
+                role,
+                content: text,
+            });
+
+            tracing::debug!(
+                session_id = %session.session_id,
+                item_id = %item.id,
+                "Conversation item added to context"
+            );
+        }
 
         Ok(())
     }

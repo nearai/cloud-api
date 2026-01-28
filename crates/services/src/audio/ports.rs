@@ -22,14 +22,8 @@ pub struct TranscribeRequest {
     pub filename: String,
     /// Optional language hint (ISO-639-1)
     pub language: Option<String>,
-    /// Optional prompt to guide transcription
-    pub prompt: Option<String>,
     /// Response format: json, text, srt, verbose_json, vtt
     pub response_format: Option<String>,
-    /// Sampling temperature (0-1)
-    pub temperature: Option<f32>,
-    /// Timestamp granularities: word, segment
-    pub timestamp_granularities: Option<Vec<String>>,
     /// Organization ID for usage tracking
     pub organization_id: Uuid,
     /// Workspace ID for usage tracking

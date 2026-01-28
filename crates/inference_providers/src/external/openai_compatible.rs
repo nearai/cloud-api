@@ -52,7 +52,7 @@ impl OpenAiCompatibleBackend {
         // Authorization header
         let auth_value = format!("Bearer {}", config.api_key);
         let header_value = HeaderValue::from_str(&auth_value)
-            .map_err(|e| format!("Invalid API key format: {e}"))?;
+            .map_err(|_| "Invalid authentication header".to_string())?;
         headers.insert("Authorization", header_value);
 
         // OpenAI organization header (if provided)
@@ -327,14 +327,19 @@ impl ExternalBackend for OpenAiCompatibleBackend {
 
         if !response.status().is_success() {
             let status_code = response.status().as_u16();
-            let message = response
+            let _message = response
                 .text()
                 .await
                 .unwrap_or_else(|_: reqwest::Error| "Unknown error".to_string());
-            return Err(AudioError::HttpError {
-                status_code,
-                message,
-            });
+            // Log the full error but return generic message
+            tracing::error!(
+                status_code = %status_code,
+                error = %_message,
+                "Provider STT error"
+            );
+            return Err(AudioError::TranscriptionFailed(
+                "Transcription provider request failed".to_string(),
+            ));
         }
 
         let content_type = response
@@ -389,7 +394,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             .post(&url)
             .headers(headers)
             .timeout(timeout)
-            .json(&Self::build_speech_stream_payload(&speech_params)?)
+            .json(&speech_params)
             .send()
             .await
             .map_err(|e| AudioError::SynthesisFailed(e.to_string()))?;
@@ -400,18 +405,29 @@ impl ExternalBackend for OpenAiCompatibleBackend {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(AudioError::HttpError {
-                status_code,
-                message,
-            });
+            tracing::error!(
+                status_code = %status_code,
+                error = %message,
+                "Provider TTS error"
+            );
+            return Err(AudioError::SynthesisFailed(
+                "TTS request failed".to_string(),
+            ));
         }
 
-        let content_type = response
+        let content_type_str = response
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("audio/mpeg")
+            .ok_or_else(|| AudioError::SynthesisFailed("Missing content-type header".to_string()))?
             .to_string();
+
+        // Validate that content type is audio
+        if !content_type_str.starts_with("audio/") {
+            return Err(AudioError::InvalidAudioFormat(
+                "Invalid content type from provider".to_string(),
+            ));
+        }
 
         let audio_data = response
             .bytes()
@@ -421,7 +437,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
 
         Ok(AudioSpeechResponseWithBytes {
             audio_data: audio_data.clone(),
-            content_type,
+            content_type: content_type_str,
             raw_bytes: audio_data,
             character_count,
         })
@@ -450,7 +466,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             .post(&url)
             .headers(headers)
             .timeout(timeout)
-            .json(&speech_params)
+            .json(&Self::build_speech_stream_payload(&speech_params)?)
             .send()
             .await
             .map_err(|e| AudioError::SynthesisFailed(e.to_string()))?;
@@ -525,6 +541,7 @@ impl OpenAiCompatibleBackend {
                 duration: None,
                 words: None,
                 segments: None,
+                id: None,
             })
         } else {
             serde_json::from_slice(raw_bytes)

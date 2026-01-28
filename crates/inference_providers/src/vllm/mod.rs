@@ -76,7 +76,7 @@ impl VLlmProvider {
         if let Some(ref api_key) = self.config.api_key {
             let auth_value = format!("Bearer {api_key}");
             let header_value = HeaderValue::from_str(&auth_value)
-                .map_err(|e| format!("Invalid API key format: {e}"))?;
+                .map_err(|_| "Invalid authentication header".to_string())?;
             headers.insert("Authorization", header_value);
         }
 
@@ -519,14 +519,19 @@ impl InferenceProvider for VLlmProvider {
 
         if !response.status().is_success() {
             let status_code = response.status().as_u16();
-            let message = response
+            let _message = response
                 .text()
                 .await
                 .unwrap_or_else(|_: reqwest::Error| "Unknown error".to_string());
-            return Err(AudioError::HttpError {
-                status_code,
-                message,
-            });
+            // Log the full error but return generic message
+            tracing::error!(
+                status_code = %status_code,
+                error = %_message,
+                "Provider STT error"
+            );
+            return Err(AudioError::TranscriptionFailed(
+                "Transcription provider request failed".to_string(),
+            ));
         }
 
         let raw_bytes = response
@@ -576,23 +581,35 @@ impl InferenceProvider for VLlmProvider {
 
         if !response.status().is_success() {
             let status_code = response.status().as_u16();
-            let message = response
+            let _message = response
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(AudioError::HttpError {
-                status_code,
-                message,
-            });
+            // Log the full error but return generic message
+            tracing::error!(
+                status_code = %status_code,
+                error = %_message,
+                "Provider TTS error"
+            );
+            return Err(AudioError::SynthesisFailed(
+                "TTS request failed".to_string(),
+            ));
         }
 
-        // Get content type from response headers
-        let content_type = response
+        // Get content type from response headers with validation
+        let content_type_str = response
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("audio/mpeg")
+            .ok_or_else(|| AudioError::SynthesisFailed("Missing content-type header".to_string()))?
             .to_string();
+
+        // Validate that content type is audio
+        if !content_type_str.starts_with("audio/") {
+            return Err(AudioError::InvalidAudioFormat(
+                "Invalid content type from provider".to_string(),
+            ));
+        }
 
         let audio_data = response
             .bytes()
@@ -602,7 +619,7 @@ impl InferenceProvider for VLlmProvider {
 
         Ok(AudioSpeechResponseWithBytes {
             audio_data: audio_data.clone(),
-            content_type,
+            content_type: content_type_str,
             raw_bytes: audio_data,
             character_count,
         })
@@ -628,7 +645,7 @@ impl InferenceProvider for VLlmProvider {
             .client
             .post(&url)
             .headers(headers)
-            .json(&params)
+            .json(&Self::build_speech_stream_payload(&params)?)
             .send()
             .await
             .map_err(|e| AudioError::SynthesisFailed(e.to_string()))?;
@@ -675,6 +692,19 @@ impl VLlmProvider {
             "mpeg" => "audio/mpeg",
             _ => "application/octet-stream",
         }
+    }
+
+    /// Build a speech streaming payload with stream: true explicitly set
+    fn build_speech_stream_payload(
+        params: &AudioSpeechParams,
+    ) -> Result<serde_json::Value, AudioError> {
+        let mut payload =
+            serde_json::to_value(params).map_err(|e| AudioError::SynthesisFailed(e.to_string()))?;
+        let payload_map = payload
+            .as_object_mut()
+            .ok_or_else(|| AudioError::SynthesisFailed("Invalid speech params".to_string()))?;
+        payload_map.insert("stream".to_string(), serde_json::Value::Bool(true));
+        Ok(payload)
     }
 }
 

@@ -3,8 +3,8 @@
 use crate::{
     middleware::{auth::AuthenticatedApiKey, RequestBodyHash},
     models::{
-        AudioSpeechRequest, AudioTranscriptionResponse, AudioTranscriptionSegment,
-        AudioTranscriptionWord, ErrorResponse,
+        AudioSpeechRequest, AudioTranscriptionRequest, AudioTranscriptionResponse,
+        AudioTranscriptionSegment, AudioTranscriptionWord, ErrorResponse,
     },
 };
 use axum::{
@@ -30,11 +30,31 @@ pub struct AudioRouteState {
 /// Transcribe audio to text
 ///
 /// POST /v1/audio/transcriptions
+///
 /// Accepts multipart form data with audio file and model parameters.
+///
+/// **Form Fields:**
+/// - `file` (required): Binary audio file data
+/// - `model` (required): Model ID (e.g., "whisper-1")
+/// - `language` (optional): ISO-639-1 language code (e.g., "en")
+/// - `response_format` (optional): json, text, srt, verbose_json, or vtt
+/// - `prompt` (optional): Optional text to guide transcription style
+/// - `temperature` (optional): Sampling temperature 0-1 (default: 0)
+/// - `timestamp_granularities[]` (optional): "word" or "segment" for detailed timestamps
+///
+/// **Example Usage:**
+/// ```bash
+/// curl -X POST http://localhost:3000/v1/audio/transcriptions \
+///   -H "Authorization: Bearer sk-live-xxx" \
+///   -F "file=@audio.wav" \
+///   -F "model=whisper-1" \
+///   -F "language=en"
+/// ```
 #[utoipa::path(
     post,
     path = "/v1/audio/transcriptions",
     tag = "Audio",
+    request_body(content = AudioTranscriptionRequest, content_type = "multipart/form-data"),
     responses(
         (status = 200, description = "Transcription successful", body = AudioTranscriptionResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
@@ -61,18 +81,18 @@ pub async fn transcribe_audio(
     let mut filename: Option<String> = None;
     let mut model: Option<String> = None;
     let mut language: Option<String> = None;
-    let mut prompt: Option<String> = None;
     let mut response_format: Option<String> = None;
-    let mut temperature: Option<f32> = None;
-    let mut timestamp_granularities: Vec<String> = Vec::new();
 
     while let Some(field) = multipart.next_field().await.map_err(|e| {
+        let error_str = e.to_string();
+        let error_message = if error_str.contains("boundary") {
+            "Invalid multipart/form-data: missing or malformed boundary. Ensure Content-Type header includes boundary parameter (e.g., 'multipart/form-data; boundary=----...')".to_string()
+        } else {
+            "Invalid multipart/form-data format".to_string()
+        };
         (
             StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                format!("Failed to parse multipart form: {e}"),
-                "invalid_request_error".to_string(),
-            )),
+            ResponseJson(ErrorResponse::new(error_message, "invalid_request_error".to_string())),
         )
     })? {
         let name = field.name().unwrap_or("").to_string();
@@ -118,17 +138,6 @@ pub async fn transcribe_audio(
                     )
                 })?);
             }
-            "prompt" => {
-                prompt = Some(field.text().await.map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        ResponseJson(ErrorResponse::new(
-                            format!("Failed to read prompt field: {e}"),
-                            "invalid_request_error".to_string(),
-                        )),
-                    )
-                })?);
-            }
             "response_format" => {
                 response_format = Some(field.text().await.map_err(|e| {
                     (
@@ -139,38 +148,6 @@ pub async fn transcribe_audio(
                         )),
                     )
                 })?);
-            }
-            "temperature" => {
-                let temp_str = field.text().await.map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        ResponseJson(ErrorResponse::new(
-                            format!("Failed to read temperature field: {e}"),
-                            "invalid_request_error".to_string(),
-                        )),
-                    )
-                })?;
-                temperature = Some(temp_str.parse().map_err(|_| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        ResponseJson(ErrorResponse::new(
-                            "temperature must be a number".to_string(),
-                            "invalid_request_error".to_string(),
-                        )),
-                    )
-                })?);
-            }
-            "timestamp_granularities[]" => {
-                let granularity = field.text().await.map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        ResponseJson(ErrorResponse::new(
-                            format!("Failed to read timestamp_granularities field: {e}"),
-                            "invalid_request_error".to_string(),
-                        )),
-                    )
-                })?;
-                timestamp_granularities.push(granularity);
             }
             _ => {
                 // Ignore unknown fields
@@ -188,6 +165,18 @@ pub async fn transcribe_audio(
             )),
         )
     })?;
+
+    // Validate audio file size (25MB limit)
+    const MAX_AUDIO_FILE_SIZE: usize = 25 * 1024 * 1024;
+    if audio_data.len() > MAX_AUDIO_FILE_SIZE {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ResponseJson(ErrorResponse::new(
+                "Audio file exceeds 25MB limit".to_string(),
+                "invalid_request_error".to_string(),
+            )),
+        ));
+    }
 
     let model = model.ok_or_else(|| {
         (
@@ -223,14 +212,7 @@ pub async fn transcribe_audio(
         audio_data,
         filename,
         language,
-        prompt,
         response_format,
-        temperature,
-        timestamp_granularities: if timestamp_granularities.is_empty() {
-            None
-        } else {
-            Some(timestamp_granularities)
-        },
         organization_id: api_key.organization.id.0,
         workspace_id: api_key.workspace.id.0,
         api_key_id: Uuid::parse_str(&api_key.api_key.id.0).map_err(|_| {
@@ -301,8 +283,7 @@ pub async fn transcribe_audio(
 /// Generate speech from text
 ///
 /// POST /v1/audio/speech
-/// Returns audio in the requested format (default: mp3).
-/// If stream: true, returns chunked audio stream.
+/// Returns audio as MP3.
 #[utoipa::path(
     post,
     path = "/v1/audio/speech",
@@ -369,24 +350,15 @@ pub async fn generate_speech(
         }
     };
 
-    // Determine content type based on response format
-    let content_type = match request.response_format.as_deref() {
-        Some("mp3") | None => "audio/mpeg",
-        Some("opus") => "audio/opus",
-        Some("aac") => "audio/aac",
-        Some("flac") => "audio/flac",
-        Some("wav") => "audio/wav",
-        Some("pcm") => "audio/pcm",
-        _ => "audio/mpeg",
-    };
+    let content_type = "audio/mpeg";
 
     // Build service request
     let service_request = SpeechRequest {
         model: request.model.clone(),
         input: request.input.clone(),
         voice: request.voice.clone(),
-        response_format: request.response_format.clone(),
-        speed: request.speed,
+        response_format: None,
+        speed: None,
         organization_id: api_key.organization.id.0,
         workspace_id: api_key.workspace.id.0,
         api_key_id,
@@ -396,14 +368,17 @@ pub async fn generate_speech(
 
     // Check if streaming is requested
     if request.stream == Some(true) {
-        // Streaming response
+        // Streaming response with proper error handling
         match state.audio_service.synthesize_stream(service_request).await {
-            Ok(stream) => {
-                let byte_stream = stream.map(|result| match result {
-                    Ok(bytes) => Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(bytes)),
+            Ok(audio_stream) => {
+                // Map stream items with String error type that can be propagated to client
+                let byte_stream = audio_stream.map(|result| match result {
+                    Ok(bytes) => Ok::<_, String>(axum::body::Bytes::from(bytes)),
                     Err(e) => {
-                        tracing::error!(error = %e, "Streaming TTS error");
-                        Ok(axum::body::Bytes::new())
+                        let error_msg = format!("Streaming TTS error: {}", e);
+                        tracing::error!("{}", error_msg);
+                        // Return error to interrupt stream and inform client
+                        Err(error_msg)
                     }
                 });
 
@@ -415,7 +390,7 @@ pub async fn generate_speech(
                     .unwrap()
             }
             Err(e) => {
-                tracing::error!(error = %e, "Streaming TTS failed");
+                tracing::error!(error = %e, "Failed to initialize streaming TTS");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(
@@ -438,7 +413,7 @@ pub async fn generate_speech(
 
                 Response::builder()
                     .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, response.content_type)
+                    .header(header::CONTENT_TYPE, content_type)
                     .body(Body::from(response.audio_data))
                     .unwrap()
             }

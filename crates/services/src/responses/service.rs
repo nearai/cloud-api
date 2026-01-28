@@ -1233,12 +1233,12 @@ impl ResponseServiceImpl {
                 }
             }
 
-            // Add deferred instructions AFTER all tool results
+            // Add deferred instructions AFTER all tool results (combined into one system message)
             // This ensures tool results are consecutive (required by OpenAI/Anthropic/Gemini)
-            for instruction in deferred_instructions {
+            if !deferred_instructions.is_empty() {
                 messages.push(CompletionMessage {
                     role: "system".to_string(),
-                    content: instruction,
+                    content: deferred_instructions.join("\n\n"),
                     tool_call_id: None,
                     tool_calls: None,
                 });

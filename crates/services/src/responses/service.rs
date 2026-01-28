@@ -1210,7 +1210,8 @@ impl ResponseServiceImpl {
 
             tracing::debug!("Executing {} tool calls", stream_result.tool_calls.len());
 
-            // Execute each tool call
+            // Execute each tool call, collecting any deferred instructions
+            let mut deferred_instructions: Vec<String> = Vec::new();
             for tool_call in stream_result.tool_calls {
                 match Self::execute_and_emit_tool_call(
                     ctx,
@@ -1218,6 +1219,7 @@ impl ResponseServiceImpl {
                     &tool_call,
                     messages,
                     process_context,
+                    &mut deferred_instructions,
                 )
                 .await?
                 {
@@ -1230,6 +1232,17 @@ impl ResponseServiceImpl {
                     }
                 }
             }
+
+            // Add deferred instructions AFTER all tool results
+            // This ensures tool results are consecutive (required by OpenAI/Anthropic/Gemini)
+            for instruction in deferred_instructions {
+                messages.push(CompletionMessage {
+                    role: "system".to_string(),
+                    content: instruction,
+                    tool_call_id: None,
+                    tool_calls: None,
+                });
+            }
         }
 
         Ok(AgentLoopResult::Completed)
@@ -1239,12 +1252,17 @@ impl ResponseServiceImpl {
     ///
     /// Returns `Ok(ToolExecutionResult::Success)` if the tool executed normally,
     /// or `Ok(ToolExecutionResult::ApprovalRequired)` if the tool requires user approval.
+    ///
+    /// Any instructions (e.g., citation instructions from web search) are collected into
+    /// `deferred_instructions` to be added after all tool results. This ensures tool results
+    /// are consecutive (required by OpenAI/Anthropic/Gemini for parallel tool calls).
     async fn execute_and_emit_tool_call(
         ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
         emitter: &mut crate::responses::service_helpers::EventEmitter,
         tool_call: &crate::responses::service_helpers::ToolCallInfo,
         messages: &mut Vec<crate::completions::ports::CompletionMessage>,
         process_context: &mut ProcessStreamContext,
+        deferred_instructions: &mut Vec<String>,
     ) -> Result<tools::ToolExecutionResult, errors::ResponseError> {
         use crate::completions::ports::CompletionMessage;
 
@@ -1388,14 +1406,10 @@ impl ResponseServiceImpl {
             tool_calls: None,
         });
 
-        // Add citation instruction if provided (first web search)
+        // Defer citation instruction to be added after all tool results
+        // This ensures tool results are consecutive (required by OpenAI/Anthropic/Gemini)
         if let Some(instruction) = instruction {
-            messages.push(CompletionMessage {
-                role: "system".to_string(),
-                content: instruction,
-                tool_call_id: None,
-                tool_calls: None,
-            });
+            deferred_instructions.push(instruction);
         }
 
         Ok(tools::ToolExecutionResult::Success)

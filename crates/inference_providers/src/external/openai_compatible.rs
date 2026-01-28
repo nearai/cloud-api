@@ -11,13 +11,20 @@
 
 use super::backend::{BackendConfig, ExternalBackend};
 use crate::{
-    models::StreamOptions, sse_parser::new_sse_parser, ChatCompletionParams,
+    models::StreamOptions, sse_parser::new_sse_parser, AudioChunk, AudioError, AudioSpeechParams,
+    AudioSpeechResponseWithBytes, AudioStreamingResult, AudioTranscriptionParams,
+    AudioTranscriptionResponse, AudioTranscriptionResponseWithBytes, ChatCompletionParams,
     ChatCompletionResponse, ChatCompletionResponseWithBytes, CompletionError, ImageGenerationError,
     ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes,
     StreamingResult,
 };
 use async_trait::async_trait;
-use reqwest::{header::HeaderValue, Client};
+use futures_util::StreamExt;
+use reqwest::{
+    header::HeaderValue,
+    multipart::{Form, Part},
+    Client,
+};
 
 /// OpenAI-compatible backend
 ///
@@ -45,7 +52,7 @@ impl OpenAiCompatibleBackend {
         // Authorization header
         let auth_value = format!("Bearer {}", config.api_key);
         let header_value = HeaderValue::from_str(&auth_value)
-            .map_err(|e| format!("Invalid API key format: {e}"))?;
+            .map_err(|_| "Invalid authentication header".to_string())?;
         headers.insert("Authorization", header_value);
 
         // OpenAI organization header (if provided)
@@ -262,6 +269,297 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             raw_bytes,
         })
     }
+
+    async fn audio_transcription(
+        &self,
+        config: &BackendConfig,
+        model: &str,
+        params: AudioTranscriptionParams,
+    ) -> Result<AudioTranscriptionResponseWithBytes, AudioError> {
+        let url = format!("{}/audio/transcriptions", config.base_url);
+
+        let mut headers = self
+            .build_headers(config)
+            .map_err(AudioError::TranscriptionFailed)?;
+
+        // Remove Content-Type as it will be set by multipart
+        headers.remove("Content-Type");
+
+        // Build multipart form
+        let file_part = Part::bytes(params.audio_data)
+            .file_name(params.filename.clone())
+            .mime_str(Self::get_audio_mime_type(&params.filename))
+            .map_err(|e| AudioError::InvalidAudioFormat(format!("Invalid MIME type: {e}")))?;
+
+        let mut form = Form::new()
+            .part("file", file_part)
+            .text("model", model.to_string());
+
+        if let Some(language) = &params.language {
+            form = form.text("language", language.clone());
+        }
+        if let Some(prompt) = &params.prompt {
+            form = form.text("prompt", prompt.clone());
+        }
+        if let Some(format) = &params.response_format {
+            form = form.text("response_format", format.clone());
+        }
+        if let Some(temp) = params.temperature {
+            form = form.text("temperature", temp.to_string());
+        }
+        if let Some(granularities) = &params.timestamp_granularities {
+            for granularity in granularities {
+                form = form.text("timestamp_granularities[]", granularity.clone());
+            }
+        }
+
+        let timeout = std::time::Duration::from_secs(config.timeout_seconds as u64);
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .timeout(timeout)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e: reqwest::Error| AudioError::TranscriptionFailed(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let _message = response
+                .text()
+                .await
+                .unwrap_or_else(|_: reqwest::Error| "Unknown error".to_string());
+            // Log the full error but return generic message
+            tracing::error!(
+                status_code = %status_code,
+                error = %_message,
+                "Provider STT error"
+            );
+            return Err(AudioError::TranscriptionFailed(
+                "Transcription provider request failed".to_string(),
+            ));
+        }
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|value| value.to_string());
+
+        let raw_bytes = response
+            .bytes()
+            .await
+            .map_err(|e: reqwest::Error| AudioError::TranscriptionFailed(e.to_string()))?
+            .to_vec();
+
+        let transcription_response = Self::parse_transcription_response(
+            &raw_bytes,
+            params.response_format.as_deref(),
+            content_type.as_deref(),
+        )?;
+
+        let audio_duration_seconds = transcription_response.duration;
+
+        Ok(AudioTranscriptionResponseWithBytes {
+            response: transcription_response,
+            raw_bytes,
+            audio_duration_seconds,
+        })
+    }
+
+    async fn audio_speech(
+        &self,
+        config: &BackendConfig,
+        model: &str,
+        params: AudioSpeechParams,
+    ) -> Result<AudioSpeechResponseWithBytes, AudioError> {
+        let url = format!("{}/audio/speech", config.base_url);
+
+        let headers = self
+            .build_headers(config)
+            .map_err(AudioError::SynthesisFailed)?;
+
+        let character_count = params.input.chars().count() as i32;
+
+        // Override model in params
+        let mut speech_params = params;
+        speech_params.model = model.to_string();
+
+        let timeout = std::time::Duration::from_secs(config.timeout_seconds as u64);
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .timeout(timeout)
+            .json(&speech_params)
+            .send()
+            .await
+            .map_err(|e| AudioError::SynthesisFailed(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            tracing::error!(
+                status_code = %status_code,
+                error = %message,
+                "Provider TTS error"
+            );
+            return Err(AudioError::SynthesisFailed(
+                "TTS request failed".to_string(),
+            ));
+        }
+
+        let content_type_str = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| AudioError::SynthesisFailed("Missing content-type header".to_string()))?
+            .to_string();
+
+        // Validate that content type is audio
+        if !content_type_str.starts_with("audio/") {
+            return Err(AudioError::InvalidAudioFormat(
+                "Invalid content type from provider".to_string(),
+            ));
+        }
+
+        let audio_data = response
+            .bytes()
+            .await
+            .map_err(|e| AudioError::SynthesisFailed(e.to_string()))?
+            .to_vec();
+
+        Ok(AudioSpeechResponseWithBytes {
+            audio_data: audio_data.clone(),
+            content_type: content_type_str,
+            raw_bytes: audio_data,
+            character_count,
+        })
+    }
+
+    async fn audio_speech_stream(
+        &self,
+        config: &BackendConfig,
+        model: &str,
+        params: AudioSpeechParams,
+    ) -> Result<AudioStreamingResult, AudioError> {
+        let url = format!("{}/audio/speech", config.base_url);
+
+        let headers = self
+            .build_headers(config)
+            .map_err(AudioError::SynthesisFailed)?;
+
+        // Override model in params
+        let mut speech_params = params;
+        speech_params.model = model.to_string();
+
+        let timeout = std::time::Duration::from_secs(config.timeout_seconds as u64);
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .timeout(timeout)
+            .json(&Self::build_speech_stream_payload(&speech_params)?)
+            .send()
+            .await
+            .map_err(|e| AudioError::SynthesisFailed(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AudioError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        let byte_stream = response.bytes_stream();
+
+        let audio_stream = byte_stream.map(|result| match result {
+            Ok(bytes) => Ok(AudioChunk {
+                data: bytes.to_vec(),
+                is_final: false,
+            }),
+            Err(e) => Err(AudioError::SynthesisFailed(e.to_string())),
+        });
+
+        Ok(Box::pin(audio_stream))
+    }
+}
+
+impl OpenAiCompatibleBackend {
+    /// Get MIME type based on file extension
+    fn get_audio_mime_type(filename: &str) -> &'static str {
+        let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
+        match ext.as_str() {
+            "mp3" => "audio/mpeg",
+            "mp4" => "audio/mp4",
+            "m4a" => "audio/mp4",
+            "wav" => "audio/wav",
+            "webm" => "audio/webm",
+            "ogg" => "audio/ogg",
+            "flac" => "audio/flac",
+            "mpeg" => "audio/mpeg",
+            _ => "application/octet-stream",
+        }
+    }
+
+    fn parse_transcription_response(
+        raw_bytes: &[u8],
+        response_format: Option<&str>,
+        content_type: Option<&str>,
+    ) -> Result<AudioTranscriptionResponse, AudioError> {
+        let response_format = response_format.map(|value| value.to_ascii_lowercase());
+        let content_type = content_type.map(|value| value.to_ascii_lowercase());
+
+        let wants_text = matches!(
+            response_format.as_deref(),
+            Some("text") | Some("srt") | Some("vtt")
+        );
+        let is_text_response = content_type
+            .as_deref()
+            .is_some_and(|ct| ct.starts_with("text/") || ct.contains("text/plain"));
+
+        if wants_text || is_text_response {
+            let text = String::from_utf8(raw_bytes.to_vec()).map_err(|e| {
+                AudioError::TranscriptionFailed(format!("Invalid text response: {e}"))
+            })?;
+            Ok(AudioTranscriptionResponse {
+                text,
+                task: None,
+                language: None,
+                duration: None,
+                words: None,
+                segments: None,
+                id: None,
+            })
+        } else {
+            serde_json::from_slice(raw_bytes)
+                .map_err(|e| AudioError::TranscriptionFailed(format!("Invalid response: {e}")))
+        }
+    }
+
+    fn build_speech_stream_payload(
+        params: &AudioSpeechParams,
+    ) -> Result<serde_json::Value, AudioError> {
+        let mut payload =
+            serde_json::to_value(params).map_err(|e| AudioError::SynthesisFailed(e.to_string()))?;
+        let payload_map = payload
+            .as_object_mut()
+            .ok_or_else(|| AudioError::SynthesisFailed("Invalid speech params".to_string()))?;
+        payload_map.insert("stream".to_string(), serde_json::Value::Bool(true));
+        Ok(payload)
+    }
 }
 
 #[cfg(test)]
@@ -464,5 +762,65 @@ mod tests {
         assert!(json.contains("\"size\":\"1024x1024\""));
         assert!(json.contains("\"quality\":\"hd\""));
         assert!(json.contains("\"style\":\"vivid\""));
+    }
+
+    // ==================== Audio Tests ====================
+
+    #[test]
+    fn test_parse_transcription_response_text_format() {
+        let raw_bytes = b"hello world";
+        let response =
+            OpenAiCompatibleBackend::parse_transcription_response(raw_bytes, Some("text"), None)
+                .unwrap();
+
+        assert_eq!(response.text, "hello world");
+        assert!(response.duration.is_none());
+    }
+
+    #[test]
+    fn test_parse_transcription_response_text_content_type() {
+        let raw_bytes = b"1\n00:00:00,000 --> 00:00:01,000\nhello";
+        let response = OpenAiCompatibleBackend::parse_transcription_response(
+            raw_bytes,
+            None,
+            Some("text/vtt"),
+        )
+        .unwrap();
+
+        assert!(response.text.contains("hello"));
+        assert!(response.words.is_none());
+    }
+
+    #[test]
+    fn test_parse_transcription_response_json() {
+        let raw_bytes = br#"{"text":"hi","duration":1.25}"#;
+        let response =
+            OpenAiCompatibleBackend::parse_transcription_response(raw_bytes, None, None).unwrap();
+
+        assert_eq!(response.text, "hi");
+        assert_eq!(response.duration, Some(1.25));
+    }
+
+    #[test]
+    fn test_build_speech_stream_payload_sets_stream() {
+        let params = AudioSpeechParams {
+            model: "tts-1".to_string(),
+            input: "hello".to_string(),
+            voice: "alloy".to_string(),
+            response_format: Some("mp3".to_string()),
+            speed: Some(1.0),
+        };
+
+        let payload = OpenAiCompatibleBackend::build_speech_stream_payload(&params).unwrap();
+        let payload_map = payload.as_object().unwrap();
+
+        assert_eq!(
+            payload_map.get("stream"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            payload_map.get("model"),
+            Some(&serde_json::Value::String("tts-1".to_string()))
+        );
     }
 }

@@ -759,6 +759,217 @@ pub enum AttestationError {
     Unknown(String),
 }
 
+// ==================== Audio Types ====================
+
+/// Parameters for audio transcription (speech-to-text) requests
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioTranscriptionParams {
+    /// Model ID to use for transcription (e.g., "whisper-1")
+    pub model: String,
+    /// Raw audio data bytes
+    #[serde(skip)]
+    pub audio_data: Vec<u8>,
+    /// Original filename of the audio file (e.g., "audio.mp3")
+    pub filename: String,
+    /// Language of the audio in ISO-639-1 format (e.g., "en")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Optional prompt to guide the transcription style
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Response format: json, text, srt, verbose_json, vtt
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+    /// Sampling temperature between 0 and 1
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Timestamp granularities: word, segment
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp_granularities: Option<Vec<String>>,
+    /// Sample rate in Hz (e.g., 16000, 44100). Used by providers that require explicit sample rate.
+    /// If not provided, provider defaults will be used (typically 16000 Hz for speech-to-text).
+    #[serde(skip)]
+    pub sample_rate_hertz: Option<u32>,
+}
+
+/// Word-level timestamp information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptionWord {
+    /// The transcribed word
+    pub word: String,
+    /// Start time in seconds
+    #[serde(deserialize_with = "deserialize_flexible_f64_required")]
+    pub start: f64,
+    /// End time in seconds
+    #[serde(deserialize_with = "deserialize_flexible_f64_required")]
+    pub end: f64,
+}
+
+/// Segment-level timestamp information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptionSegment {
+    /// Segment ID
+    pub id: i32,
+    /// Seek position
+    pub seek: i32,
+    /// Start time in seconds
+    #[serde(deserialize_with = "deserialize_flexible_f64_required")]
+    pub start: f64,
+    /// End time in seconds
+    #[serde(deserialize_with = "deserialize_flexible_f64_required")]
+    pub end: f64,
+    /// Transcribed text for this segment
+    pub text: String,
+    /// Token IDs
+    pub tokens: Vec<i32>,
+    /// Average log probability
+    #[serde(default, deserialize_with = "deserialize_flexible_f64")]
+    pub avg_logprob: Option<f64>,
+    /// Compression ratio
+    #[serde(default, deserialize_with = "deserialize_flexible_f64")]
+    pub compression_ratio: Option<f64>,
+    /// No speech probability
+    #[serde(default, deserialize_with = "deserialize_flexible_f64")]
+    pub no_speech_prob: Option<f64>,
+    /// Temperature used
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+}
+
+/// Helper function to deserialize flexible numeric types (handles both string and f64 for Option)
+fn deserialize_flexible_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Deserialize};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum FlexibleF64 {
+        Float(f64),
+        String(String),
+    }
+
+    match Option::<FlexibleF64>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(FlexibleF64::Float(f)) => Ok(Some(f)),
+        Some(FlexibleF64::String(s)) => s.parse::<f64>().map(Some).map_err(de::Error::custom),
+    }
+}
+
+/// Helper function to deserialize flexible numeric types (handles both string and f64 for required fields)
+fn deserialize_flexible_f64_required<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Deserialize};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum FlexibleF64 {
+        Float(f64),
+        String(String),
+    }
+
+    match FlexibleF64::deserialize(deserializer)? {
+        FlexibleF64::Float(f) => Ok(f),
+        FlexibleF64::String(s) => s.parse::<f64>().map_err(de::Error::custom),
+    }
+}
+
+/// Response from audio transcription
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioTranscriptionResponse {
+    /// Transcribed text
+    pub text: String,
+    /// Task performed (typically "transcribe")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Detected or specified language
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Duration of the audio in seconds
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_flexible_f64"
+    )]
+    pub duration: Option<f64>,
+    /// Word-level timestamps (if requested)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub words: Option<Vec<TranscriptionWord>>,
+    /// Segment-level timestamps (if requested)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segments: Option<Vec<TranscriptionSegment>>,
+    /// Response ID (provider-specific)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+/// Transcription response with raw bytes for verification
+#[derive(Debug, Clone)]
+pub struct AudioTranscriptionResponseWithBytes {
+    /// The parsed response
+    pub response: AudioTranscriptionResponse,
+    /// The raw bytes from the provider response
+    pub raw_bytes: Vec<u8>,
+    /// Duration of the audio in seconds (for usage tracking)
+    pub audio_duration_seconds: Option<f64>,
+}
+
+/// Parameters for text-to-speech requests
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioSpeechParams {
+    /// Model ID to use for synthesis (e.g., "tts-1", "tts-1-hd")
+    pub model: String,
+    /// Text to convert to speech (max 4096 characters)
+    pub input: String,
+    /// Voice to use (e.g., "alloy", "echo", "fable", "onyx", "nova", "shimmer")
+    pub voice: String,
+    /// Response format: mp3, opus, aac, flac, wav, pcm
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+    /// Speed of speech (0.25 to 4.0, default 1.0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f32>,
+}
+
+/// Speech response with audio data
+#[derive(Debug, Clone)]
+pub struct AudioSpeechResponseWithBytes {
+    /// Raw audio data
+    pub audio_data: Vec<u8>,
+    /// Content type (e.g., "audio/mpeg", "audio/wav")
+    pub content_type: String,
+    /// The raw bytes from the provider response (same as audio_data)
+    pub raw_bytes: Vec<u8>,
+    /// Number of characters in the input (for usage tracking)
+    pub character_count: i32,
+}
+
+/// Audio chunk for streaming TTS
+#[derive(Debug, Clone)]
+pub struct AudioChunk {
+    /// Audio data bytes
+    pub data: Vec<u8>,
+    /// Whether this is the final chunk
+    pub is_final: bool,
+}
+
+/// Audio-related errors
+#[derive(Debug, Error, Clone, Serialize, Deserialize)]
+pub enum AudioError {
+    #[error("Invalid audio format: {0}")]
+    InvalidAudioFormat(String),
+    #[error("Transcription failed: {0}")]
+    TranscriptionFailed(String),
+    #[error("Speech synthesis failed: {0}")]
+    SynthesisFailed(String),
+    #[error("Model does not support audio: {0}")]
+    ModelNotSupported(String),
+    #[error("HTTP error {status_code}: {message}")]
+    HttpError { status_code: u16, message: String },
+}
+
 /// Chat signature for cryptographic verification
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSignature {

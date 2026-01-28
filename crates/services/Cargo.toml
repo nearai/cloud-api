@@ -46,6 +46,8 @@ k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 sha3 = "0.10"
 jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 regex = "1.11"
+# Base64 encoding for audio data
+base64 = "0.22"
 # AWS S3 for file storage
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.120"

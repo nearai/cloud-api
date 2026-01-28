@@ -2,9 +2,11 @@ use crate::common::encryption_headers;
 use config::ExternalProvidersConfig;
 use inference_providers::{
     models::{AttestationError, CompletionError, ListModelsError, ModelsResponse},
-    ChatCompletionParams, ExternalProvider, ExternalProviderConfig, ImageGenerationError,
-    ImageGenerationParams, ImageGenerationResponseWithBytes, InferenceProvider, ProviderConfig,
-    StreamingResult, StreamingResultExt, VLlmConfig, VLlmProvider,
+    AudioError, AudioSpeechParams, AudioSpeechResponseWithBytes, AudioStreamingResult,
+    AudioTranscriptionParams, AudioTranscriptionResponseWithBytes, ChatCompletionParams,
+    ExternalProvider, ExternalProviderConfig, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponseWithBytes, InferenceProvider, ProviderConfig, StreamingResult,
+    StreamingResultExt, VLlmConfig, VLlmProvider,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -1199,6 +1201,102 @@ impl InferenceProviderPool {
             "Storing chat_id mapping for image generation"
         );
         self.store_chat_id_mapping(image_id, provider).await;
+
+        Ok(response)
+    }
+
+    /// Transcribe audio to text using the specified model
+    pub async fn audio_transcription(
+        &self,
+        params: AudioTranscriptionParams,
+        request_hash: String,
+    ) -> Result<AudioTranscriptionResponseWithBytes, AudioError> {
+        let model_id = params.model.clone();
+
+        tracing::debug!(
+            model = %model_id,
+            "Starting audio transcription request"
+        );
+
+        let params_for_provider = params.clone();
+
+        let (response, _provider) = self
+            .retry_with_fallback(&model_id, "audio_transcription", None, |provider| {
+                let params = params_for_provider.clone();
+                let request_hash = request_hash.clone();
+                async move {
+                    provider
+                        .audio_transcription(params, request_hash)
+                        .await
+                        .map_err(|e| CompletionError::CompletionError(e.to_string()))
+                }
+            })
+            .await
+            .map_err(|e| AudioError::TranscriptionFailed(e.to_string()))?;
+
+        Ok(response)
+    }
+
+    /// Generate speech from text using the specified model (non-streaming)
+    pub async fn audio_speech(
+        &self,
+        params: AudioSpeechParams,
+        request_hash: String,
+    ) -> Result<AudioSpeechResponseWithBytes, AudioError> {
+        let model_id = params.model.clone();
+
+        tracing::debug!(
+            model = %model_id,
+            "Starting text-to-speech request"
+        );
+
+        let params_for_provider = params.clone();
+
+        let (response, _provider) = self
+            .retry_with_fallback(&model_id, "audio_speech", None, |provider| {
+                let params = params_for_provider.clone();
+                let request_hash = request_hash.clone();
+                async move {
+                    provider
+                        .audio_speech(params, request_hash)
+                        .await
+                        .map_err(|e| CompletionError::CompletionError(e.to_string()))
+                }
+            })
+            .await
+            .map_err(|e| AudioError::SynthesisFailed(e.to_string()))?;
+
+        Ok(response)
+    }
+
+    /// Generate speech from text using the specified model (streaming)
+    pub async fn audio_speech_stream(
+        &self,
+        params: AudioSpeechParams,
+        request_hash: String,
+    ) -> Result<AudioStreamingResult, AudioError> {
+        let model_id = params.model.clone();
+
+        tracing::debug!(
+            model = %model_id,
+            "Starting streaming text-to-speech request"
+        );
+
+        let params_for_provider = params.clone();
+
+        let (response, _provider) = self
+            .retry_with_fallback(&model_id, "audio_speech_stream", None, |provider| {
+                let params = params_for_provider.clone();
+                let request_hash = request_hash.clone();
+                async move {
+                    provider
+                        .audio_speech_stream(params, request_hash)
+                        .await
+                        .map_err(|e| CompletionError::CompletionError(e.to_string()))
+                }
+            })
+            .await
+            .map_err(|e| AudioError::SynthesisFailed(e.to_string()))?;
 
         Ok(response)
     }

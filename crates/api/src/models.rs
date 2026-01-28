@@ -291,6 +291,127 @@ pub struct ImageData {
     pub revised_prompt: Option<String>,
 }
 
+// ==================== Audio API Models ====================
+
+/// Request for audio transcription (speech-to-text)
+/// Sent as multipart form data with audio file and parameters
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct AudioTranscriptionRequest {
+    /// Audio file to transcribe (binary audio data)
+    #[serde(default)]
+    #[schema(value_type = String, format = Binary)]
+    pub file: Option<Vec<u8>>,
+    /// Model ID to use for transcription (e.g., "whisper-1")
+    pub model: String,
+    /// Language of the audio in ISO-639-1 format (e.g., "en")
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Response format: json, text, srt, verbose_json, vtt
+    #[serde(default)]
+    pub response_format: Option<String>,
+}
+
+/// Response from audio transcription
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AudioTranscriptionResponse {
+    /// Transcribed text
+    pub text: String,
+    /// Task performed (typically "transcribe")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Detected or specified language
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Duration of the audio in seconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<f64>,
+    /// Word-level timestamps (if requested with verbose_json)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub words: Option<Vec<AudioTranscriptionWord>>,
+    /// Segment-level timestamps (if requested with verbose_json)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segments: Option<Vec<AudioTranscriptionSegment>>,
+}
+
+/// Word-level timestamp information
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AudioTranscriptionWord {
+    /// The transcribed word
+    pub word: String,
+    /// Start time in seconds
+    pub start: f64,
+    /// End time in seconds
+    pub end: f64,
+}
+
+/// Segment-level timestamp information
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AudioTranscriptionSegment {
+    /// Segment ID
+    pub id: i32,
+    /// Seek position
+    pub seek: i32,
+    /// Start time in seconds
+    pub start: f64,
+    /// End time in seconds
+    pub end: f64,
+    /// Transcribed text for this segment
+    pub text: String,
+    /// Token IDs
+    pub tokens: Vec<i32>,
+    /// Average log probability
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_logprob: Option<f64>,
+    /// Compression ratio
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression_ratio: Option<f64>,
+    /// No speech probability
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_speech_prob: Option<f64>,
+    /// Temperature used
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+}
+
+/// Request for text-to-speech
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct AudioSpeechRequest {
+    /// Model ID to use for synthesis (e.g., "tts-1", "tts-1-hd")
+    pub model: String,
+    /// Text to convert to speech (max 4096 characters)
+    pub input: String,
+    /// Voice to use (e.g., "alloy", "echo", "fable", "onyx", "nova", "shimmer")
+    pub voice: String,
+    /// Whether to stream the response (default: false)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+}
+
+impl AudioSpeechRequest {
+    /// Validate the speech request
+    pub fn validate(&self) -> Result<(), String> {
+        // Model is required
+        if self.model.trim().is_empty() {
+            return Err("model is required".to_string());
+        }
+
+        // Input is required and has max length
+        if self.input.is_empty() {
+            return Err("input is required".to_string());
+        }
+        if self.input.len() > 4096 {
+            return Err("input exceeds maximum length of 4096 characters".to_string());
+        }
+
+        // Voice is required
+        if self.voice.trim().is_empty() {
+            return Err("voice is required".to_string());
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelsResponse {
     pub object: String,

@@ -20,6 +20,8 @@ use utoipa::{Modify, OpenApi};
     tags(
         (name = "Chat", description = "Chat completion endpoints for AI model inference"),
         (name = "Images", description = "Image generation endpoints"),
+        (name = "Audio", description = "Speech-to-text and text-to-speech endpoints"),
+        (name = "Realtime", description = "Realtime WebSocket voice-to-voice conversations"),
         (name = "Models", description = "Public model catalog and information"),
         (name = "Conversations", description = "Conversation management"),
         (name = "Responses", description = "Response handling and streaming"),
@@ -41,6 +43,11 @@ use utoipa::{Modify, OpenApi};
         crate::routes::completions::image_generations,
         // crate::routes::completions::completions,
         crate::routes::completions::models,
+        // Audio endpoints
+        crate::routes::audio::transcribe_audio,
+        crate::routes::audio::generate_speech,
+        // Realtime endpoints
+        crate::routes::realtime::realtime_handler,
         // Model endpoints (public model catalog)
         crate::routes::models::list_models,
         crate::routes::models::get_model_by_name,
@@ -141,6 +148,9 @@ use utoipa::{Modify, OpenApi};
             CompletionRequest, ModelsResponse, ModelInfo, ModelPricing, ErrorResponse,
             // Image generation models
             ImageGenerationRequest, ImageGenerationResponse, ImageData,
+            // Audio models
+            AudioTranscriptionRequest, AudioTranscriptionResponse, AudioTranscriptionWord, AudioTranscriptionSegment,
+            AudioSpeechRequest,
             // Organization models
             CreateOrganizationRequest, OrganizationResponse,
             UpdateOrganizationRequest, CreateApiKeyRequest, ApiKeyResponse,

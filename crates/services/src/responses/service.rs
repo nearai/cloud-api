@@ -2032,48 +2032,23 @@ impl ResponseServiceImpl {
                 if let Some(delta) = &choice.delta {
                     if let Some(tool_calls) = &delta.tool_calls {
                         for tool_call in tool_calls {
-                            // Get or default to index 0 if not present
                             let index = tool_call.index.unwrap_or(0);
-
-                            // Get or create accumulator entry for this index
                             let entry = accumulator.entry(index).or_default();
 
-                            // Capture tool call ID (typically in first chunk)
                             if let Some(id) = &tool_call.id {
-                                tracing::debug!("Accumulated tool call {} id: {}", index, id);
                                 entry.id = Some(id.clone());
                             }
 
-                            // Handle function delta if present
                             if let Some(function) = &tool_call.function {
-                                // Accumulate function name (only set once, typically in first chunk)
                                 if let Some(name) = &function.name {
-                                    tracing::debug!(
-                                        "Accumulated tool call {} name: {}",
-                                        index,
-                                        name
-                                    );
                                     entry.name = Some(name.clone());
                                 }
-
-                                // Accumulate arguments (streamed across multiple chunks)
                                 if let Some(args_fragment) = &function.arguments {
-                                    tracing::debug!(
-                                        "Accumulated tool call {} args fragment (len={})",
-                                        index,
-                                        args_fragment.len()
-                                    );
                                     entry.arguments.push_str(args_fragment);
                                 }
                             }
 
-                            // Capture thought_signature (Gemini 3 models)
                             if let Some(thought_sig) = &tool_call.thought_signature {
-                                tracing::debug!(
-                                    "Accumulated tool call {} thought_signature (len={})",
-                                    index,
-                                    thought_sig.len()
-                                );
                                 entry.thought_signature = Some(thought_sig.clone());
                             }
                         }

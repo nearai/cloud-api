@@ -122,11 +122,6 @@ impl ExternalBackend for AnthropicBackend {
         let url = format!("{}/messages", config.base_url);
         let request = self.build_request(model, &params, true);
 
-        // DEBUG: Log the request being sent to Anthropic (remove after debugging)
-        if let Ok(json) = serde_json::to_string_pretty(&request) {
-            tracing::debug!(target: "anthropic_debug", "Anthropic request:\n{}", json);
-        }
-
         let headers = self
             .build_headers(config)
             .map_err(CompletionError::CompletionError)?;
@@ -148,8 +143,6 @@ impl ExternalBackend for AnthropicBackend {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
-            // DEBUG: Log the full error response from Anthropic
-            tracing::debug!(target: "anthropic_debug", "Anthropic error response: {}", error_text);
             return Err(CompletionError::HttpError {
                 status_code,
                 message: error_text,

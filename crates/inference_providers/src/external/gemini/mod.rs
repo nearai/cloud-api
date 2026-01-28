@@ -194,11 +194,6 @@ impl ExternalBackend for GeminiBackend {
 
         let request = self.build_request(&params);
 
-        // DEBUG: Log the request being sent to Gemini (remove after debugging)
-        if let Ok(json) = serde_json::to_string_pretty(&request) {
-            tracing::debug!(target: "gemini_debug", "Gemini request:\n{}", json);
-        }
-
         let headers = self.build_headers(config)?;
         let timeout = std::time::Duration::from_secs(config.timeout_seconds as u64);
 
@@ -218,8 +213,6 @@ impl ExternalBackend for GeminiBackend {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
-            // DEBUG: Log the full error response from Gemini
-            tracing::debug!(target: "gemini_debug", "Gemini error response: {}", error_text);
             return Err(CompletionError::HttpError {
                 status_code,
                 message: error_text,

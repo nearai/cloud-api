@@ -24,7 +24,7 @@ inference_providers = { path = "../inference_providers" }
 # Authentication dependencies
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
-uuid = { version = "1.19", features = ["v4", "serde"] }
+uuid = { version = "1.20", features = ["v4", "serde"] }
 opentelemetry = { version = "0.31", features = ["metrics"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.31", features = ["metrics", "grpc-tonic"] }
@@ -44,11 +44,11 @@ http-body-util = "0.1"
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.120"
 # NEAR wallet authentication
-near-api = "0.8.2"
+near-api = "0.8.3"
 base64 = "0.22"
 # Ordered collections
 indexmap = "2"
-moka = { version = "0.12.12", features = ["future"] }
+moka = { version = "0.12.13", features = ["future"] }
 # URL encoding
 urlencoding = "2.1"
 

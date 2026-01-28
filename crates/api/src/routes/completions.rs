@@ -1,7 +1,7 @@
 use crate::{
     middleware::{auth::AuthenticatedApiKey, RequestBodyHash},
     models::*,
-    routes::{api::AppState, common::map_domain_error_to_status},
+    routes::{api::AppState, common::map_domain_error_to_status, files::MAX_FILE_SIZE},
 };
 use axum::{
     body::{Body, Bytes},
@@ -962,8 +962,8 @@ pub async fn image_edits(
                             }
                         };
 
-                        // Check size limit (512 MB)
-                        if bytes.len() > 512 * 1024 * 1024 {
+                        // Check size limit
+                        if bytes.len() > MAX_FILE_SIZE {
                             return (
                                 StatusCode::PAYLOAD_TOO_LARGE,
                                 ResponseJson(ErrorResponse::new(
@@ -1150,7 +1150,7 @@ pub async fn image_edits(
     let params = inference_providers::ImageEditParams {
         model: request.model.clone(),
         prompt: request.prompt.clone(),
-        image: request.image,
+        image: Arc::new(request.image),
         size: request.size,
         response_format,
     };

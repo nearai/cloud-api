@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -759,7 +760,9 @@ pub struct ImageEditParams {
     /// Text prompt describing the edits to make
     pub prompt: String,
     /// Image bytes to edit (raw PNG/JPEG data)
-    pub image: Vec<u8>,
+    /// Wrapped in Arc to avoid cloning large data (up to 512MB) during retry attempts.
+    /// Cloning ImageEditParams is now cheap (clones only the Arc pointer, not the data).
+    pub image: Arc<Vec<u8>>,
     /// Size of the generated images in WxH format (e.g., "1024x1024", "512x512")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,

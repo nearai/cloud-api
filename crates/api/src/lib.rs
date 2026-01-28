@@ -867,7 +867,6 @@ pub fn build_completion_routes(
         .route("/chat/completions", post(chat_completions))
         .route("/images/generations", post(image_generations))
         .with_state(app_state.clone())
-        .layer(from_fn(middleware::body_hash_middleware))
         .layer(from_fn_with_state(
             usage_state.clone(),
             middleware::usage_check_middleware,
@@ -879,7 +878,8 @@ pub fn build_completion_routes(
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
-        ));
+        ))
+        .layer(from_fn(middleware::body_hash_middleware));
 
     // File-based inference routes (image edits)
     // Apply 512 MB limit only to endpoints that accept file uploads
@@ -888,7 +888,6 @@ pub fn build_completion_routes(
     let file_inference_routes = Router::new()
         .route("/images/edits", post(image_edits))
         .with_state(app_state.clone())
-        .layer(from_fn(middleware::body_hash_middleware))
         .layer(from_fn_with_state(
             usage_state,
             middleware::usage_check_middleware,
@@ -901,6 +900,7 @@ pub fn build_completion_routes(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
+        .layer(from_fn(middleware::body_hash_middleware))
         .layer(DefaultBodyLimit::max(MAX_FILE_SIZE));
 
     let metadata_routes = Router::new()

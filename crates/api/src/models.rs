@@ -228,37 +228,16 @@ impl ImageGenerationRequest {
             }
         }
 
-        // Validate size format if provided (should be "WxH")
+        // Validate size format if provided (should be "WxH" with numeric values)
+        // Dimension validation is delegated to the inference provider
         if let Some(ref size) = self.size {
             let parts: Vec<&str> = size.split('x').collect();
             if parts.len() != 2 {
                 return Err("size must be in format 'WIDTHxHEIGHT' (e.g., '1024x1024')".to_string());
             }
-
-            let width: u32 = match parts[0].parse() {
-                Ok(w) => w,
-                Err(_) => {
-                    return Err(
-                        "size must be in format 'WIDTHxHEIGHT' with numeric values".to_string()
-                    );
-                }
-            };
-
-            let height: u32 = match parts[1].parse() {
-                Ok(h) => h,
-                Err(_) => {
-                    return Err(
-                        "size must be in format 'WIDTHxHEIGHT' with numeric values".to_string()
-                    );
-                }
-            };
-
-            // Validate dimension ranges (1 to 4096)
-            if !(1..=4096).contains(&width) {
-                return Err("width must be between 1 and 4096".to_string());
-            }
-            if !(1..=4096).contains(&height) {
-                return Err("height must be between 1 and 4096".to_string());
+            // Validate that both parts are numeric
+            if parts[0].parse::<u32>().is_err() || parts[1].parse::<u32>().is_err() {
+                return Err("size must be in format 'WIDTHxHEIGHT' with numeric values".to_string());
             }
         }
 
@@ -345,37 +324,16 @@ impl ImageEditRequest {
             return Err("image must be a valid PNG or JPEG file".to_string());
         }
 
-        // Validate size format if provided (should be "WxH")
+        // Validate size format if provided (should be "WxH" with numeric values)
+        // Dimension validation is delegated to the inference provider
         if let Some(ref size) = self.size {
             let parts: Vec<&str> = size.split('x').collect();
             if parts.len() != 2 {
                 return Err("size must be in format 'WIDTHxHEIGHT' (e.g., '1024x1024')".to_string());
             }
-
-            let width: u32 = match parts[0].parse() {
-                Ok(w) => w,
-                Err(_) => {
-                    return Err(
-                        "size must be in format 'WIDTHxHEIGHT' with numeric values".to_string()
-                    );
-                }
-            };
-
-            let height: u32 = match parts[1].parse() {
-                Ok(h) => h,
-                Err(_) => {
-                    return Err(
-                        "size must be in format 'WIDTHxHEIGHT' with numeric values".to_string()
-                    );
-                }
-            };
-
-            // Validate dimension ranges (1 to 4096)
-            if !(1..=4096).contains(&width) {
-                return Err("width must be between 1 and 4096".to_string());
-            }
-            if !(1..=4096).contains(&height) {
-                return Err("height must be between 1 and 4096".to_string());
+            // Validate that both parts are numeric
+            if parts[0].parse::<u32>().is_err() || parts[1].parse::<u32>().is_err() {
+                return Err("size must be in format 'WIDTHxHEIGHT' with numeric values".to_string());
             }
         }
 

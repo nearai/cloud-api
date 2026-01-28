@@ -1218,20 +1218,18 @@ impl InferenceProviderPool {
             "Starting image edit request"
         );
 
-        // Clone params once before retry loop to minimize memory operations with large image data.
-        // The provider interface requires ImageEditParams by value, so we must clone when calling
-        // the provider. We clone once here and reuse across retries rather than cloning on each attempt.
-        // Note: For large images (up to 512MB), this still allocates significant memory, but eliminates
-        // redundant clones during retry attempts.
-        let cloned_params = params.clone();
+        // Wrap params in Arc to enable cheap cloning across retries.
+        // Since image data is already Arc<Vec<u8>>, cloning the params struct is now O(1).
+        // Each retry clones the Arc pointer (8 bytes) instead of the entire struct.
+        let params = Arc::new(params);
 
         let (response, provider) = self
             .retry_with_fallback(&model_id, "image_edit", None, |provider| {
-                let params = cloned_params.clone();
+                let params = params.clone();
                 let request_hash = request_hash.clone();
                 async move {
                     provider
-                        .image_edit(params, request_hash)
+                        .image_edit((*params).clone(), request_hash)
                         .await
                         .map_err(|e| CompletionError::CompletionError(e.to_string()))
                 }

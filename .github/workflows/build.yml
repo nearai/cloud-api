@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - fix/repro-build-packages
     tags:
       - 'v*'
 
@@ -57,7 +58,7 @@ jobs:
 
       - name: Build and push reproducible image
         run: |
-          ./docker-build.sh --push "${{ env.IMAGE_REFERENCE }}"
+          ./build-image.sh --push "${{ env.IMAGE_REFERENCE }}"
 
       - name: Get image digest
         run: |

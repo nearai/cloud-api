@@ -53,6 +53,7 @@
 //! }
 //! ```
 
+pub mod chunk_builder;
 pub mod external;
 pub mod mock;
 pub mod models;
@@ -78,6 +79,9 @@ pub use models::{
 };
 pub use sse_parser::{new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser};
 pub use vllm::{VLlmConfig, VLlmProvider};
+
+// Chunk builder for external provider parsers
+pub use chunk_builder::ChunkContext;
 
 // External provider exports
 pub use external::{

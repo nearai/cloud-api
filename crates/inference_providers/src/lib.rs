@@ -61,6 +61,7 @@ pub mod sse_parser;
 pub mod vllm;
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_core::Stream;
@@ -160,9 +161,10 @@ pub trait InferenceProvider {
     ///
     /// Returns edited images based on the provided image and prompt.
     /// Includes raw bytes for TEE signature verification.
+    /// Accepts Arc<ImageEditParams> to avoid unnecessary cloning during retries (image data is already Arc-wrapped).
     async fn image_edit(
         &self,
-        params: ImageEditParams,
+        params: Arc<ImageEditParams>,
         request_hash: String,
     ) -> Result<ImageEditResponseWithBytes, ImageEditError>;
 

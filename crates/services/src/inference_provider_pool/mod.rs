@@ -1229,7 +1229,7 @@ impl InferenceProviderPool {
                 let request_hash = request_hash.clone();
                 async move {
                     provider
-                        .image_edit((*params).clone(), request_hash)
+                        .image_edit(params, request_hash)
                         .await
                         .map_err(|e| CompletionError::CompletionError(e.to_string()))
                 }

@@ -11,6 +11,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Configuration for a backend connection
 #[derive(Debug, Clone)]
@@ -103,7 +104,7 @@ pub trait ExternalBackend: Send + Sync {
         &self,
         _config: &BackendConfig,
         _model: &str,
-        _params: ImageEditParams,
+        _params: Arc<ImageEditParams>,
     ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
         Err(ImageEditError::EditError(format!(
             "Image editing is not supported by the {} backend.",

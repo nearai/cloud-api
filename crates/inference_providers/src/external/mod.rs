@@ -302,7 +302,7 @@ impl InferenceProvider for ExternalProvider {
     /// Performs an image edit request through the appropriate backend
     async fn image_edit(
         &self,
-        params: ImageEditParams,
+        params: Arc<ImageEditParams>,
         _request_hash: String,
     ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
         self.backend

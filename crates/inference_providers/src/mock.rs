@@ -891,7 +891,7 @@ impl crate::InferenceProvider for MockProvider {
 
     async fn image_edit(
         &self,
-        params: ImageEditParams,
+        params: Arc<ImageEditParams>,
         _request_hash: String,
     ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
         // Check for invalid model

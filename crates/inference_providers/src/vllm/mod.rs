@@ -2,6 +2,7 @@ use crate::{models::StreamOptions, sse_parser::new_sse_parser, ImageGenerationEr
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Convert any displayable error to ImageGenerationError::GenerationError
@@ -458,7 +459,7 @@ impl InferenceProvider for VLlmProvider {
     /// Performs an image edit request
     async fn image_edit(
         &self,
-        params: ImageEditParams,
+        params: Arc<ImageEditParams>,
         request_hash: String,
     ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
         let url = format!("{}/v1/images/edits", self.config.base_url);
@@ -494,9 +495,9 @@ impl InferenceProvider for VLlmProvider {
         // Build multipart form data
         let mut form = reqwest::multipart::Form::new();
 
-        // Add text fields first
-        form = form.text("model", params.model);
-        form = form.text("prompt", params.prompt);
+        // Add text fields first (clone strings since Arc doesn't allow moving)
+        form = form.text("model", params.model.clone());
+        form = form.text("prompt", params.prompt.clone());
 
         // Add image as image[] field (vLLM expects array syntax)
         let image_part = reqwest::multipart::Part::bytes(image_data.to_vec())
@@ -506,11 +507,11 @@ impl InferenceProvider for VLlmProvider {
         form = form.part("image[]", image_part);
 
         // Add optional text parameters
-        if let Some(size) = params.size {
-            form = form.text("size", size);
+        if let Some(size) = params.size.as_ref() {
+            form = form.text("size", size.clone());
         }
-        if let Some(response_format) = params.response_format {
-            form = form.text("response_format", response_format);
+        if let Some(response_format) = params.response_format.as_ref() {
+            form = form.text("response_format", response_format.clone());
         }
 
         let response = self

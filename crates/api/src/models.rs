@@ -235,9 +235,18 @@ impl ImageGenerationRequest {
             if parts.len() != 2 {
                 return Err("size must be in format 'WIDTHxHEIGHT' (e.g., '1024x1024')".to_string());
             }
-            // Validate that both parts are numeric
-            if parts[0].parse::<u32>().is_err() || parts[1].parse::<u32>().is_err() {
-                return Err("size must be in format 'WIDTHxHEIGHT' with numeric values".to_string());
+            // Validate that both parts are numeric and greater than zero
+            match (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                (Ok(w), Ok(h)) => {
+                    if w == 0 || h == 0 {
+                        return Err("size dimensions must be greater than zero".to_string());
+                    }
+                }
+                _ => {
+                    return Err(
+                        "size must be in format 'WIDTHxHEIGHT' with numeric values".to_string()
+                    );
+                }
             }
         }
 
@@ -331,9 +340,18 @@ impl ImageEditRequest {
             if parts.len() != 2 {
                 return Err("size must be in format 'WIDTHxHEIGHT' (e.g., '1024x1024')".to_string());
             }
-            // Validate that both parts are numeric
-            if parts[0].parse::<u32>().is_err() || parts[1].parse::<u32>().is_err() {
-                return Err("size must be in format 'WIDTHxHEIGHT' with numeric values".to_string());
+            // Validate that both parts are numeric and greater than zero
+            match (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                (Ok(w), Ok(h)) => {
+                    if w == 0 || h == 0 {
+                        return Err("size dimensions must be greater than zero".to_string());
+                    }
+                }
+                _ => {
+                    return Err(
+                        "size must be in format 'WIDTHxHEIGHT' with numeric values".to_string()
+                    );
+                }
             }
         }
 

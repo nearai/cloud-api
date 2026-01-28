@@ -17,12 +17,56 @@ use services::completions::{
 };
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::debug;
 use utoipa;
 use uuid::Uuid;
 
+// Timeout for synchronous usage recording before response is returned
+const USAGE_RECORDING_TIMEOUT_SECS: u64 = 5;
+
 // Custom header for exposing the inference ID as a UUID
 const HEADER_INFERENCE_ID: &str = "Inference-Id";
+
+// Helper function to provide detailed error context for multipart parsing failures
+fn analyze_multipart_error(e: &axum::extract::multipart::MultipartError) -> (StatusCode, String) {
+    let error_str = e.to_string();
+
+    // Match against known multipart error patterns to provide specific guidance
+    let (status, message) = if error_str.contains("boundary") {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid Content-Type boundary in multipart request. Ensure the boundary parameter in the Content-Type header matches the actual boundary markers in the message body.".to_string(),
+        )
+    } else if error_str.contains("unexpected end") || error_str.contains("unexpected EOF") {
+        (
+            StatusCode::BAD_REQUEST,
+            "Request body ended unexpectedly. The multipart message may be truncated or missing the final boundary marker.".to_string(),
+        )
+    } else if error_str.contains("field") && error_str.contains("size") {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Individual form field size exceeded. A single field in the multipart request is too large.".to_string(),
+        )
+    } else if error_str.contains("field") {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid form field in multipart request. Check field encoding and format.".to_string(),
+        )
+    } else if error_str.contains("content") {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid Content-Type or content encoding in multipart request.".to_string(),
+        )
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid multipart form data. The request does not conform to multipart/form-data format.".to_string(),
+        )
+    };
+
+    (status, message)
+}
 
 // Helper function to extract inference ID from first SSE chunk
 fn extract_inference_id_from_sse(raw_bytes: &[u8]) -> Option<Uuid> {
@@ -808,47 +852,95 @@ pub async fn image_generations(
             let provider_request_id = response_with_bytes.response.id.clone();
             let usage_service = app_state.usage_service.clone();
 
-            // Spawn async task to record usage (fire-and-forget like chat completions)
-            tokio::spawn(async move {
-                // Parse API key ID to UUID
-                let api_key_id = match Uuid::parse_str(&api_key_id_str) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        tracing::error!(error = %e, "Invalid API key ID for usage tracking");
-                        return;
-                    }
-                };
+            // Parse API key ID early for usage recording
+            let api_key_id = match Uuid::parse_str(&api_key_id_str) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::error!(error = %e, "Invalid API key ID for usage tracking");
+                    // Still return response but log error
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(response_with_bytes.raw_bytes))
+                        .unwrap();
+                }
+            };
 
-                // Hash the provider request ID to UUID for storage
-                let inference_id = Some(hash_inference_id_to_uuid(&provider_request_id));
+            // Hash the provider request ID to UUID for storage
+            let inference_id = Some(hash_inference_id_to_uuid(&provider_request_id));
 
-                let usage_request = services::usage::RecordUsageServiceRequest {
-                    organization_id,
-                    workspace_id,
-                    api_key_id,
-                    model_id,
-                    // Image generation doesn't have traditional token counts
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    inference_type: "image_generation".to_string(),
-                    ttft_ms: None,
-                    avg_itl_ms: None,
-                    inference_id,
-                    provider_request_id: Some(provider_request_id),
-                    stop_reason: Some(services::usage::StopReason::Completed),
-                    response_id: None,
-                    image_count: Some(image_count),
-                };
+            let usage_request = services::usage::RecordUsageServiceRequest {
+                organization_id,
+                workspace_id,
+                api_key_id,
+                model_id,
+                // Image generation doesn't have traditional token counts
+                input_tokens: 0,
+                output_tokens: 0,
+                inference_type: "image_generation".to_string(),
+                ttft_ms: None,
+                avg_itl_ms: None,
+                inference_id,
+                provider_request_id: Some(provider_request_id.clone()),
+                stop_reason: Some(services::usage::StopReason::Completed),
+                response_id: None,
+                image_count: Some(image_count),
+            };
 
-                if let Err(e) = usage_service.record_usage(usage_request).await {
-                    tracing::error!(
-                        error = %e,
+            // Attempt synchronous usage recording with timeout before returning response.
+            // This ensures usage is persisted to the database before the client considers the request complete.
+            // If recording times out (>5s), fall back to fire-and-forget async task with retry logic.
+            let timeout_duration = Duration::from_secs(USAGE_RECORDING_TIMEOUT_SECS);
+            match tokio::time::timeout(
+                timeout_duration,
+                usage_service.record_usage(usage_request.clone()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    // Usage recorded successfully before response returned
+                    tracing::debug!(
+                        image_id = %provider_request_id,
                         %organization_id,
-                        %workspace_id,
-                        "Failed to record image generation usage"
+                        "Image generation usage recorded synchronously"
                     );
                 }
-            });
+                Ok(Err(e)) => {
+                    // Recording failed, fall back to async retry
+                    tracing::warn!(
+                        error = %e,
+                        image_id = %provider_request_id,
+                        "Failed to record usage synchronously, retrying async"
+                    );
+                    let usage_service_clone = usage_service.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = usage_service_clone.record_usage(usage_request).await {
+                            tracing::error!(
+                                error = %e,
+                                image_id = %provider_request_id,
+                                "Failed to record image generation usage in async retry"
+                            );
+                        }
+                    });
+                }
+                Err(_timeout) => {
+                    // Recording timed out, fall back to async retry to avoid blocking client
+                    tracing::warn!(
+                        image_id = %provider_request_id,
+                        "Usage recording timed out ({USAGE_RECORDING_TIMEOUT_SECS}s), retrying async"
+                    );
+                    let usage_service_clone = usage_service.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = usage_service_clone.record_usage(usage_request).await {
+                            tracing::error!(
+                                error = %e,
+                                image_id = %provider_request_id,
+                                "Failed to record image generation usage in async retry after timeout"
+                            );
+                        }
+                    });
+                }
+            }
 
             // Return the exact bytes from the provider for hash verification
             // This ensures clients can hash the response and compare with attestation endpoints
@@ -945,33 +1037,43 @@ pub async fn image_edits(
     // Parse multipart form data
     loop {
         match multipart.next_field().await {
-            Ok(Some(field)) => {
+            Ok(Some(mut field)) => {
                 match field.name().unwrap_or("") {
                     "image" => {
-                        let bytes = match field.bytes().await {
-                            Ok(b) => b.to_vec(),
-                            Err(e) => {
-                                return (
-                                    StatusCode::BAD_REQUEST,
-                                    ResponseJson(ErrorResponse::new(
-                                        format!("Failed to read image: {}", e),
-                                        "invalid_request_error".to_string(),
-                                    )),
-                                )
-                                    .into_response();
-                            }
-                        };
+                        // Use streaming validation to detect oversized payloads before buffering entirely in memory.
+                        // This prevents memory exhaustion DoS attacks where attackers send payloads larger than MAX_FILE_SIZE.
+                        let mut bytes = Vec::new();
+                        let mut size = 0usize;
 
-                        // Check size limit
-                        if bytes.len() > MAX_FILE_SIZE {
-                            return (
-                                StatusCode::PAYLOAD_TOO_LARGE,
-                                ResponseJson(ErrorResponse::new(
-                                    "Image size exceeds maximum of 512 MB".to_string(),
-                                    "invalid_request_error".to_string(),
-                                )),
-                            )
-                                .into_response();
+                        loop {
+                            match field.chunk().await {
+                                Ok(Some(chunk)) => {
+                                    size += chunk.len();
+                                    // Reject early if size exceeds limit, before allocating memory
+                                    if size > MAX_FILE_SIZE {
+                                        return (
+                                            StatusCode::PAYLOAD_TOO_LARGE,
+                                            ResponseJson(ErrorResponse::new(
+                                                "Image size exceeds maximum of 512 MB".to_string(),
+                                                "invalid_request_error".to_string(),
+                                            )),
+                                        )
+                                            .into_response();
+                                    }
+                                    bytes.extend_from_slice(&chunk);
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    return (
+                                        StatusCode::BAD_REQUEST,
+                                        ResponseJson(ErrorResponse::new(
+                                            format!("Failed to read image: {}", e),
+                                            "invalid_request_error".to_string(),
+                                        )),
+                                    )
+                                        .into_response();
+                                }
+                            }
                         }
 
                         image = Some(bytes);
@@ -1036,11 +1138,12 @@ pub async fn image_edits(
             Ok(None) => break, // All fields read successfully
             Err(e) => {
                 // Multipart parsing error (malformed boundary, invalid encoding, etc.)
-                tracing::debug!(error = %e, "Multipart parsing error");
+                let (status, error_message) = analyze_multipart_error(&e);
+                tracing::debug!(error = %e, message = %error_message, "Multipart parsing error");
                 return (
-                    StatusCode::BAD_REQUEST,
+                    status,
                     ResponseJson(ErrorResponse::new(
-                        "Invalid multipart form data".to_string(),
+                        error_message,
                         "invalid_request_error".to_string(),
                     )),
                 )
@@ -1199,47 +1302,95 @@ pub async fn image_edits(
             let provider_request_id = response_with_bytes.response.id.clone();
             let usage_service = app_state.usage_service.clone();
 
-            // Spawn async task to record usage (fire-and-forget like image generation)
-            tokio::spawn(async move {
-                // Parse API key ID to UUID
-                let api_key_id = match Uuid::parse_str(&api_key_id_str) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        tracing::error!(error = %e, "Invalid API key ID for usage tracking");
-                        return;
-                    }
-                };
+            // Parse API key ID early for usage recording
+            let api_key_id = match Uuid::parse_str(&api_key_id_str) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::error!(error = %e, "Invalid API key ID for usage tracking");
+                    // Still return response but log error
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(response_with_bytes.raw_bytes))
+                        .unwrap();
+                }
+            };
 
-                // Hash the provider request ID to UUID for storage
-                let inference_id = Some(hash_inference_id_to_uuid(&provider_request_id));
+            // Hash the provider request ID to UUID for storage
+            let inference_id = Some(hash_inference_id_to_uuid(&provider_request_id));
 
-                let usage_request = services::usage::RecordUsageServiceRequest {
-                    organization_id,
-                    workspace_id,
-                    api_key_id,
-                    model_id,
-                    // Image edit doesn't have traditional token counts
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    inference_type: "image_edit".to_string(),
-                    ttft_ms: None,
-                    avg_itl_ms: None,
-                    inference_id,
-                    provider_request_id: Some(provider_request_id),
-                    stop_reason: Some(services::usage::StopReason::Completed),
-                    response_id: None,
-                    image_count: Some(image_count),
-                };
+            let usage_request = services::usage::RecordUsageServiceRequest {
+                organization_id,
+                workspace_id,
+                api_key_id,
+                model_id,
+                // Image edit doesn't have traditional token counts
+                input_tokens: 0,
+                output_tokens: 0,
+                inference_type: "image_edit".to_string(),
+                ttft_ms: None,
+                avg_itl_ms: None,
+                inference_id,
+                provider_request_id: Some(provider_request_id.clone()),
+                stop_reason: Some(services::usage::StopReason::Completed),
+                response_id: None,
+                image_count: Some(image_count),
+            };
 
-                if let Err(e) = usage_service.record_usage(usage_request).await {
-                    tracing::error!(
-                        error = %e,
+            // Attempt synchronous usage recording with timeout before returning response.
+            // This ensures usage is persisted to the database before the client considers the request complete.
+            // If recording times out (>5s), fall back to fire-and-forget async task with retry logic.
+            let timeout_duration = Duration::from_secs(USAGE_RECORDING_TIMEOUT_SECS);
+            match tokio::time::timeout(
+                timeout_duration,
+                usage_service.record_usage(usage_request.clone()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    // Usage recorded successfully before response returned
+                    tracing::debug!(
+                        image_id = %provider_request_id,
                         %organization_id,
-                        %workspace_id,
-                        "Failed to record image edit usage"
+                        "Image edit usage recorded synchronously"
                     );
                 }
-            });
+                Ok(Err(e)) => {
+                    // Recording failed, fall back to async retry
+                    tracing::warn!(
+                        error = %e,
+                        image_id = %provider_request_id,
+                        "Failed to record usage synchronously, retrying async"
+                    );
+                    let usage_service_clone = usage_service.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = usage_service_clone.record_usage(usage_request).await {
+                            tracing::error!(
+                                error = %e,
+                                image_id = %provider_request_id,
+                                "Failed to record image edit usage in async retry"
+                            );
+                        }
+                    });
+                }
+                Err(_timeout) => {
+                    // Recording timed out, fall back to async retry to avoid blocking client
+                    tracing::warn!(
+                        image_id = %provider_request_id,
+                        "Usage recording timed out ({USAGE_RECORDING_TIMEOUT_SECS}s), retrying async"
+                    );
+                    let usage_service_clone = usage_service.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = usage_service_clone.record_usage(usage_request).await {
+                            tracing::error!(
+                                error = %e,
+                                image_id = %provider_request_id,
+                                "Failed to record image edit usage in async retry after timeout"
+                            );
+                        }
+                    });
+                }
+            }
 
             // Return the exact bytes from the provider for hash verification
             // This ensures clients can hash the response and compare with attestation endpoints

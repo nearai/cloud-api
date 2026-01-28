@@ -536,9 +536,13 @@ impl SSEEventParser for AnthropicEventParser {
                 )))
             }
 
-            AnthropicStreamEvent::Error { error } => Err(CompletionError::CompletionError(
-                format!("Anthropic error: {} - {}", error.type_, error.message),
-            )),
+            AnthropicStreamEvent::Error { error } => {
+                tracing::warn!(backend = "anthropic", error_type = %error.type_, "Stream error received");
+                Err(CompletionError::CompletionError(format!(
+                    "Anthropic error: {} - {}",
+                    error.type_, error.message
+                )))
+            }
 
             // Ignore Ping, MessageStop
             _ => Ok(None),

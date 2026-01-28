@@ -83,6 +83,12 @@ impl UsageServiceTrait for UsageServiceImpl {
             let image_count = request.image_count.unwrap_or(0);
             let image_cost = (image_count as i64) * model.cost_per_image;
             (0, image_cost, image_cost)
+        } else if request.inference_type == "rerank" {
+            // For rerank: use input tokens as the billing unit
+            // Rerank models should set their input_cost_per_token appropriately for the billing model
+            // (e.g., cost per token, cost per document, cost per query, etc.)
+            let rerank_cost = (request.input_tokens as i64) * model.input_cost_per_token;
+            (rerank_cost, 0, rerank_cost)
         } else {
             // For token-based models (chat completions, etc.)
             let input_cost = (request.input_tokens as i64) * model.input_cost_per_token;

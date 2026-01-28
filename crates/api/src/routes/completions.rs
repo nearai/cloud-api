@@ -17,7 +17,7 @@ use services::completions::{
 };
 use std::convert::Infallible;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, info};
 use utoipa;
 use uuid::Uuid;
 
@@ -795,8 +795,8 @@ pub async fn image_generations(
 
             // Spawn async task to record usage (fire-and-forget like chat completions)
             tokio::spawn(async move {
-                // Parse API key ID to UUID
-                let api_key_id = match Uuid::parse_str(&api_key_id_str) {
+                // Parse API key ID to UUID (ApiKeyId is validated at creation, so parse is safe)
+                let api_key_id = match api_key_id_str.parse::<Uuid>() {
                     Ok(id) => id,
                     Err(e) => {
                         tracing::error!(error = %e, "Invalid API key ID for usage tracking");
@@ -848,26 +848,35 @@ pub async fn image_generations(
             tracing::error!(error = %e, "Image generation failed");
 
             // Map error to appropriate status code and sanitized message
+            // NOTE: Model existence is already validated above at lines 672-699.
+            // If provider returns an error here, it's either:
+            // - A legitimate provider error (network, timeout, rate limit, etc.)
+            // - A rare consistency issue (model deleted between validation and call)
+            // We use structured HTTP status codes for reliable error mapping.
             let (status_code, message) = match &e {
-                inference_providers::ImageGenerationError::GenerationError(msg) => {
-                    // Check if it's a model not found error
-                    if msg.contains("not found") || msg.contains("does not exist") {
-                        (StatusCode::NOT_FOUND, "Model not found".to_string())
-                    } else {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "Image generation failed".to_string(),
-                        )
-                    }
+                inference_providers::ImageGenerationError::GenerationError(_) => {
+                    // GenerationError without specific status code - treat as server error
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Image generation failed".to_string(),
+                    )
                 }
                 inference_providers::ImageGenerationError::HttpError { status_code, .. } => {
-                    // Map HTTP status codes appropriately
+                    // Map HTTP status codes appropriately using structured error information
                     let code = StatusCode::from_u16(*status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     let msg = match code {
-                        StatusCode::NOT_FOUND => "Model not found".to_string(),
                         StatusCode::BAD_REQUEST => "Invalid request".to_string(),
                         StatusCode::TOO_MANY_REQUESTS => "Rate limit exceeded".to_string(),
+                        StatusCode::NOT_FOUND => {
+                            // Model was validated above, so 404 from provider is unexpected.
+                            // Log for debugging, return generic error to client.
+                            tracing::warn!(
+                                "Provider returned 404 for model validation that succeeded. \
+                                 This suggests a model consistency issue between validation and call."
+                            );
+                            "Image generation failed".to_string()
+                        }
                         _ => "Image generation failed".to_string(),
                     };
                     (code, msg)
@@ -877,6 +886,173 @@ pub async fn image_generations(
             (
                 status_code,
                 ResponseJson(ErrorResponse::new(message, "server_error".to_string())),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Text similarity scoring endpoint
+///
+/// Compares two texts and returns a similarity score using a reranker model.
+///
+/// **Concurrent Request Limits:** Each organization has a per-model concurrent request limit (default: 64).
+/// When the limit is reached, new requests will fail with 429 status code. Wait for in-flight requests to complete before retrying.
+#[utoipa::path(
+    post,
+    path = "/v1/score",
+    tag = "Score",
+    request_body = crate::models::ScoreRequest,
+    responses(
+        (status = 200, description = "Successful score", body = crate::models::ScoreResponse),
+        (status = 400, description = "Invalid request (empty texts, invalid model, etc.)", body = ErrorResponse),
+        (status = 401, description = "Unauthorized (missing or invalid API key)", body = ErrorResponse),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 429, description = "Concurrent request limit exceeded for the organization. Max concurrent requests per model: 64 (configurable)", body = ErrorResponse),
+        (status = 500, description = "Server error (billing failure, provider error)", body = ErrorResponse),
+    ),
+    security(("ApiKeyAuth" = []))
+)]
+pub async fn score(
+    State(app_state): State<AppState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(body_hash): Extension<RequestBodyHash>,
+    Json(request): Json<crate::models::ScoreRequest>,
+) -> axum::response::Response {
+    info!(
+        "Score request: model={}, text_1_len={}, text_2_len={}, organization_id={}, workspace_id={}",
+        request.model,
+        request.text_1.len(),
+        request.text_2.len(),
+        api_key.organization.id,
+        api_key.workspace.id.0
+    );
+
+    // Validate the request
+    if let Err(error) = request.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                error,
+                "invalid_request_error".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
+    // Resolve model to get UUID for usage tracking - fail fast if not found
+    let model = match app_state
+        .models_service
+        .get_model_by_name(&request.model)
+        .await
+    {
+        Ok(model) => model,
+        Err(services::models::ModelsError::NotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    format!("Model '{}' not found", request.model),
+                    "not_found_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to resolve model for score");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to resolve model".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+    let model_id = model.id;
+    let organization_id = api_key.organization.id.0;
+    // Extract model_name before moving to avoid borrow issues
+    let model_name = request.model.clone();
+
+    // Convert API request to provider params
+    // Move strings instead of cloning to avoid unnecessary allocations in hot path
+    // With MAX_SCORE_TEXT_LENGTH = 100k, this could be up to 200KB of data
+    let params = inference_providers::ScoreParams {
+        model: request.model,
+        text_1: request.text_1,
+        text_2: request.text_2,
+        extra: std::collections::HashMap::new(),
+    };
+
+    // Call completion service which handles concurrent request limiting AND usage recording
+    // Usage is recorded BEFORE the concurrent slot is released to prevent race conditions.
+    // Each organization has a per-model concurrent request limit (default: 64 concurrent requests).
+    // This prevents resource exhaustion and ensures fair usage. Returns 429 if limit exceeded.
+    let api_key_id = match api_key.api_key.id.0.parse::<Uuid>() {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(error = %e, "Invalid API key ID for score request");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to process request".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    match app_state
+        .completion_service
+        .try_score(
+            organization_id,
+            api_key.workspace.id.0,
+            model_id,
+            &model_name,
+            api_key_id,
+            params,
+            body_hash.hash.clone(),
+        )
+        .await
+    {
+        Ok(response) => (StatusCode::OK, ResponseJson(response)).into_response(),
+        Err(e) => {
+            let (status_code, error_type, message) = match e {
+                services::completions::ports::CompletionError::RateLimitExceeded => {
+                    tracing::warn!("Concurrent request limit exceeded for score");
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "rate_limit_error",
+                        "Too many concurrent score requests. Organization limit: 64 concurrent requests per model. Please wait for in-flight requests to complete before retrying.".to_string(),
+                    )
+                }
+                services::completions::ports::CompletionError::ProviderError(msg) => {
+                    tracing::error!(error = %msg, "Score provider error");
+                    // NOTE: Model existence is already validated at lines 928-942 above.
+                    // If provider returns an error here, it's either:
+                    // - A legitimate provider error (network, timeout, etc.)
+                    // - A rare consistency issue (model deleted between validation and call)
+                    // We map HTTP 404 specifically, but most errors are server errors.
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "Scoring failed".to_string(),
+                    )
+                }
+                _ => {
+                    tracing::error!(error = %e, "Unexpected score error");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "Scoring failed".to_string(),
+                    )
+                }
+            };
+
+            (
+                status_code,
+                ResponseJson(ErrorResponse::new(message, error_type.to_string())),
             )
                 .into_response()
         }

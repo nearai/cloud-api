@@ -39,6 +39,7 @@ use utoipa::{Modify, OpenApi};
         // Chat completion endpoints (most important for users)
         crate::routes::completions::chat_completions,
         crate::routes::completions::image_generations,
+        crate::routes::completions::score,
         // crate::routes::completions::completions,
         crate::routes::completions::models,
         // Model endpoints (public model catalog)
@@ -141,6 +142,8 @@ use utoipa::{Modify, OpenApi};
             CompletionRequest, ModelsResponse, ModelInfo, ModelPricing, ErrorResponse,
             // Image generation models
             ImageGenerationRequest, ImageGenerationResponse, ImageData,
+            // Score models
+            ScoreRequest, ScoreResponse, ScoreResult, ScoreUsage,
             // Organization models
             CreateOrganizationRequest, OrganizationResponse,
             UpdateOrganizationRequest, CreateApiKeyRequest, ApiKeyResponse,

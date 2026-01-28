@@ -32,7 +32,7 @@ use crate::{
     AttestationError, ChatCompletionParams, ChatCompletionResponseWithBytes, ChatSignature,
     CompletionError, CompletionParams, ImageGenerationError, ImageGenerationParams,
     ImageGenerationResponseWithBytes, InferenceProvider, ListModelsError, ModelsResponse,
-    StreamingResult,
+    ScoreError, ScoreParams, ScoreResponse, StreamingResult,
 };
 use async_trait::async_trait;
 use backend::{BackendConfig, ExternalBackend};
@@ -296,6 +296,21 @@ impl InferenceProvider for ExternalProvider {
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
         self.backend
             .image_generation(&self.config, &self.model_name, params)
+            .await
+    }
+
+    /// Text similarity scoring via external provider
+    ///
+    /// Delegates to the backend implementation. Supported by:
+    /// - OpenAI-compatible backends (reranker models, etc.)
+    /// - Not supported by other backends
+    async fn score(
+        &self,
+        params: ScoreParams,
+        _request_hash: String,
+    ) -> Result<ScoreResponse, ScoreError> {
+        self.backend
+            .score(&self.config, &self.model_name, params)
             .await
     }
 }

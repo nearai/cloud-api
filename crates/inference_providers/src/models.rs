@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -747,6 +748,40 @@ pub struct ImageGenerationResponseWithBytes {
 pub enum ImageGenerationError {
     #[error("Failed to generate image: {0}")]
     GenerationError(String),
+    #[error("HTTP error {status_code}: {message}")]
+    HttpError { status_code: u16, message: String },
+}
+
+/// Parameters for image edit requests
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageEditParams {
+    /// Model ID to use for editing
+    pub model: String,
+    /// Text prompt describing the edits to make
+    pub prompt: String,
+    /// Image bytes to edit (raw PNG/JPEG data)
+    /// Wrapped in Arc to avoid cloning large data (up to 512MB) during retry attempts.
+    /// Cloning ImageEditParams is now cheap (clones only the Arc pointer, not the data).
+    pub image: Arc<Vec<u8>>,
+    /// Size of the generated images in WxH format (e.g., "1024x1024", "512x512")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// Response format: "b64_json" or "url" (only "b64_json" is supported for verifiable models)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+}
+
+/// Image edit response (reuses same structure as image generation)
+pub type ImageEditResponse = ImageGenerationResponse;
+
+/// Image edit response with raw bytes (for TEE verification)
+pub type ImageEditResponseWithBytes = ImageGenerationResponseWithBytes;
+
+/// Image edit errors
+#[derive(Debug, Error, Clone, Serialize, Deserialize)]
+pub enum ImageEditError {
+    #[error("Failed to edit image: {0}")]
+    EditError(String),
     #[error("HTTP error {status_code}: {message}")]
     HttpError { status_code: u16, message: String },
 }

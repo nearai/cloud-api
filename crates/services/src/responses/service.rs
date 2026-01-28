@@ -1172,11 +1172,18 @@ impl ResponseServiceImpl {
                     })
                     .collect();
 
+            // Defensive: only set tool_calls if non-empty (some providers reject empty arrays)
+            let tool_calls = if completion_tool_calls.is_empty() {
+                None
+            } else {
+                Some(completion_tool_calls.clone())
+            };
+
             messages.push(CompletionMessage {
                 role: "assistant".to_string(),
                 content: stream_result.text.clone(),
                 tool_call_id: None,
-                tool_calls: Some(completion_tool_calls.clone()),
+                tool_calls,
             });
             if !stream_result.text.is_empty() {
                 ctx.next_output_index();

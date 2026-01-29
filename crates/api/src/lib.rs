@@ -721,6 +721,8 @@ pub fn build_app_with_config(
     let files_routes =
         build_files_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
+    let vector_store_routes = build_vector_store_routes(&auth_components.auth_state_middleware);
+
     let billing_routes = build_billing_routes(
         domain_services.usage_service.clone(),
         &auth_components.auth_state_middleware,
@@ -769,6 +771,7 @@ pub fn build_app_with_config(
                 .merge(invitation_routes)
                 .merge(auth_vpc_routes)
                 .merge(files_routes)
+                .merge(vector_store_routes)
                 .merge(billing_routes)
                 .merge(health_routes),
         )
@@ -1087,6 +1090,53 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware,
+        ))
+}
+
+/// Build vector store routes (stub — returns 501 for all endpoints)
+pub fn build_vector_store_routes(auth_state_middleware: &AuthState) -> Router {
+    use crate::routes::vector_stores::*;
+
+    Router::new()
+        .route(
+            "/vector_stores",
+            post(create_vector_store).get(list_vector_stores),
+        )
+        .route(
+            "/vector_stores/{vector_store_id}",
+            get(get_vector_store)
+                .post(modify_vector_store)
+                .delete(delete_vector_store),
+        )
+        .route(
+            "/vector_stores/{vector_store_id}/files",
+            post(create_vector_store_file).get(list_vector_store_files),
+        )
+        .route(
+            "/vector_stores/{vector_store_id}/files/{file_id}",
+            get(get_vector_store_file)
+                .post(update_vector_store_file)
+                .delete(delete_vector_store_file),
+        )
+        .route(
+            "/vector_stores/{vector_store_id}/file_batches",
+            post(create_vs_file_batch),
+        )
+        .route(
+            "/vector_stores/{vector_store_id}/file_batches/{batch_id}",
+            get(get_vs_file_batch),
+        )
+        .route(
+            "/vector_stores/{vector_store_id}/file_batches/{batch_id}/cancel",
+            post(cancel_vs_file_batch),
+        )
+        .route(
+            "/vector_stores/{vector_store_id}/file_batches/{batch_id}/files",
+            get(list_vs_file_batch_files),
+        )
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            auth_middleware_with_api_key,
         ))
 }
 

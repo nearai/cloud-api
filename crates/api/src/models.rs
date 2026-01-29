@@ -2470,6 +2470,244 @@ pub struct FileDeleteResponse {
     pub deleted: bool,
 }
 
+// ============================================
+// Vector Store Models
+// ============================================
+
+/// Configuration for when a vector store expires
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct VectorStoreExpiresAfter {
+    /// Anchor timestamp after which the expiration policy kicks in. Supported anchors: `last_active_at`.
+    pub anchor: String,
+    /// The number of days after the anchor time that the vector store will expire.
+    pub days: i64,
+}
+
+/// Static chunking configuration
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct StaticChunkingConfig {
+    /// The maximum number of tokens in each chunk.
+    pub max_chunk_size_tokens: i64,
+    /// The number of tokens that overlap between chunks.
+    pub chunk_overlap_tokens: i64,
+}
+
+/// Chunking strategy for vector store files
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ChunkingStrategy {
+    /// The type of chunking strategy. Can be `auto` or `static`.
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// Configuration for static chunking. Only present when type is `static`.
+    #[serde(rename = "static", skip_serializing_if = "Option::is_none")]
+    pub static_config: Option<StaticChunkingConfig>,
+}
+
+/// File counts for a vector store or file batch
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct VectorStoreFileCounts {
+    pub in_progress: i64,
+    pub completed: i64,
+    pub failed: i64,
+    pub cancelled: i64,
+    pub total: i64,
+}
+
+/// A vector store is a collection of processed files can be used by the `file_search` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct VectorStoreObject {
+    pub id: String,
+    /// The object type, which is always `vector_store`.
+    pub object: String,
+    /// The Unix timestamp (in seconds) for when the vector store was created.
+    pub created_at: i64,
+    /// The Unix timestamp (in seconds) for when the vector store was last active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_active_at: Option<i64>,
+    /// The name of the vector store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The description of the vector store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The status of the vector store.
+    pub status: String,
+    /// The total number of bytes used by the files in the vector store.
+    pub usage_bytes: i64,
+    /// Counts of files by status.
+    pub file_counts: VectorStoreFileCounts,
+    /// The expiration policy for a vector store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_after: Option<VectorStoreExpiresAfter>,
+    /// The Unix timestamp (in seconds) for when the vector store will expire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    /// Set of key-value pairs attached to the object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HashMap<String, Value>>,
+}
+
+/// Error information for a failed vector store file
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct VectorStoreFileError {
+    pub code: String,
+    pub message: String,
+}
+
+/// A vector store file
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct VectorStoreFileObject {
+    pub id: String,
+    /// The object type, which is always `vector_store.file`.
+    pub object: String,
+    /// The Unix timestamp (in seconds) for when the vector store file was created.
+    pub created_at: i64,
+    /// The ID of the vector store that the file is attached to.
+    pub vector_store_id: String,
+    /// The status of the vector store file.
+    pub status: String,
+    /// The last error associated with this vector store file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<VectorStoreFileError>,
+    /// The total vector store usage in bytes.
+    pub usage_bytes: i64,
+    /// The strategy used to chunk the file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunking_strategy: Option<ChunkingStrategy>,
+    /// Set of key-value pairs attached to the object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<HashMap<String, Value>>,
+}
+
+/// A batch of files attached to a vector store
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct VectorStoreFileBatchObject {
+    pub id: String,
+    /// The object type, which is always `vector_store.files_batch`.
+    pub object: String,
+    /// The Unix timestamp (in seconds) for when the vector store files batch was created.
+    pub created_at: i64,
+    /// The ID of the vector store that the file batch is attached to.
+    pub vector_store_id: String,
+    /// The status of the vector store files batch.
+    pub status: String,
+    /// Counts of files by status.
+    pub file_counts: VectorStoreFileCounts,
+}
+
+/// List response for vector stores
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct VectorStoreListResponse {
+    pub object: String,
+    pub data: Vec<VectorStoreObject>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_id: Option<String>,
+    pub has_more: bool,
+}
+
+/// List response for vector store files
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct VectorStoreFileListResponse {
+    pub object: String,
+    pub data: Vec<VectorStoreFileObject>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_id: Option<String>,
+    pub has_more: bool,
+}
+
+/// Delete response for a vector store
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct VectorStoreDeleteResponse {
+    pub id: String,
+    /// The object type, which is always `vector_store.deleted`.
+    pub object: String,
+    pub deleted: bool,
+}
+
+/// Delete response for a vector store file
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct VectorStoreFileDeleteResponse {
+    pub id: String,
+    /// The object type, which is always `vector_store.file.deleted`.
+    pub object: String,
+    pub deleted: bool,
+}
+
+/// Request to create a vector store
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateVectorStoreRequest {
+    /// The name of the vector store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The description of the vector store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// A list of file IDs to add to the vector store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_ids: Option<Vec<String>>,
+    /// The expiration policy for a vector store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_after: Option<VectorStoreExpiresAfter>,
+    /// The chunking strategy used to chunk the file(s).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunking_strategy: Option<ChunkingStrategy>,
+    /// Set of key-value pairs to attach to the object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HashMap<String, Value>>,
+}
+
+/// Request to modify a vector store
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModifyVectorStoreRequest {
+    /// The name of the vector store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The expiration policy for a vector store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_after: Option<VectorStoreExpiresAfter>,
+    /// Set of key-value pairs to attach to the object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HashMap<String, Value>>,
+}
+
+/// Request to create a vector store file
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateVectorStoreFileRequest {
+    /// The ID of the file to attach to the vector store.
+    pub file_id: String,
+    /// The chunking strategy used to chunk the file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunking_strategy: Option<ChunkingStrategy>,
+    /// Set of key-value pairs to attach to the file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<HashMap<String, Value>>,
+}
+
+/// Request to update vector store file attributes
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpdateVectorStoreFileAttributesRequest {
+    /// Set of key-value pairs to attach to the file.
+    pub attributes: HashMap<String, Value>,
+}
+
+/// Request to create a vector store file batch
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateVectorStoreFileBatchRequest {
+    /// A list of file IDs to add to the vector store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_ids: Option<Vec<String>>,
+    /// The chunking strategy used to chunk the file(s).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunking_strategy: Option<ChunkingStrategy>,
+    /// Set of key-value pairs to attach to the files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<HashMap<String, Value>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

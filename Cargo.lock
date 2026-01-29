@@ -908,9 +908,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-s3"
-version = "1.120.0"
+version = "1.121.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06673901e961f20fa8d7da907da48f7ad6c1b383e3726c22bd418900f015abe1"
+checksum = "61948728b681f88a1e49b9500469cf9e36575a424e745e2c5a651a42386e7d9c"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -3570,9 +3570,9 @@ dependencies = [
 
 [[package]]
 name = "jsonwebtoken"
-version = "10.2.0"
+version = "10.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c76e1c7d7df3e34443b3621b459b066a7b79644f059fc8b2db7070c825fd417e"
+checksum = "0529410abe238729a60b108898784df8984c87f6054c9c4fcacc47e4803c1ce1"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -3801,9 +3801,9 @@ dependencies = [
 
 [[package]]
 name = "moka"
-version = "0.12.12"
+version = "0.12.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3dec6bd31b08944e08b58fd99373893a6c17054d6f3ea5006cc894f4f4eee2a"
+checksum = "b4ac832c50ced444ef6be0767a008b02c106a909ba79d1d830501e94b96f6b7e"
 dependencies = [
  "async-lock",
  "crossbeam-channel",
@@ -3877,9 +3877,9 @@ dependencies = [
 
 [[package]]
 name = "near-api"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17a87920038b8a0eb5b4c91691651ce235810beb1f3a8626596b303b82750b75"
+checksum = "321d2778c3cfb314cf6410376788a17b5c34f6154ee61bcd1579748edda454bb"
 dependencies = [
  "async-trait",
  "base64",
@@ -3903,9 +3903,9 @@ dependencies = [
 
 [[package]]
 name = "near-api-types"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42a5ca7d481bf75b61afb8552c8504df5d76f0a6c3e47482f498f2d65c349f8b"
+checksum = "b4740cd9996fda91dd1cc9034528f0e987ac2c2266f15c6459df7a595e11eb71"
 dependencies = [
  "base64",
  "borsh",
@@ -3937,9 +3937,9 @@ dependencies = [
 
 [[package]]
 name = "near-openapi-client"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8b0e00ba3bdba682deb964ac5db504558aea3c9434b521ad0b803b7f3c06dcf"
+checksum = "c6d2a3dd4e669e14cdd0748b449d7539d0b0fefba17ed8e2d1404a0826908630"
 dependencies = [
  "bytes",
  "chrono",
@@ -3954,10 +3954,11 @@ dependencies = [
 
 [[package]]
 name = "near-openapi-types"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a8d5398e4fa9931e9d1639e36f80b3f0a365a93773d5e92b6094c6d6198d24b"
+checksum = "7e0c9eaf432ddedd9409d6b1477b49e94679c077adbadce173292f759454afc7"
 dependencies = [
+ "bs58",
  "chrono",
  "near-account-id",
  "near-gas",
@@ -5184,9 +5185,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1815dbc06c414d720f8bc1951eccd66bc99efc6376331f1e7093a119b3eb508"
+checksum = "0a621b37a548ff6ab6292d57841eb25785a7f146d89391a19c9f199414bd13da"
 dependencies = [
  "async-trait",
  "base64",
@@ -5210,9 +5211,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11f0bc7008fa102e771a76c6d2c9b253be3f2baa5964e060464d038ae1cbc573"
+checksum = "6b79ed92303f9262db79575aa8c3652581668e9d136be6fd0b9ededa78954c95"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -6972,9 +6973,9 @@ dependencies = [
 
 [[package]]
 name = "uuid"
-version = "1.19.0"
+version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2e054861b4bd027cd373e18e8d8d8e6548085000e41290d95ce0c373a654b4a"
+checksum = "ee48d38b119b0cd71fe4141b30f5ba9c7c5d9f4e7a3a8b4a674e4b6ef789976f"
 dependencies = [
  "getrandom 0.3.4",
  "js-sys",

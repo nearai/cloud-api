@@ -267,18 +267,14 @@ impl AdminService for AdminServiceImpl {
         &self,
         limit: i64,
         offset: i64,
+        order_by: Option<AdminOrganizationOrderBy>,
+        order_direction: Option<AdminOrganizationOrderDirection>,
+        search: Option<String>,
     ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError> {
-        // Execute both queries in parallel for better performance
-        let (organizations_result, total_result) = tokio::join!(
-            self.repository.list_all_organizations(limit, offset),
-            self.repository.count_all_organizations()
-        );
-
-        let organizations =
-            organizations_result.map_err(|e| AdminError::InternalError(e.to_string()))?;
-        let total = total_result.map_err(|e| AdminError::InternalError(e.to_string()))?;
-
-        Ok((organizations, total))
+        self.repository
+            .list_all_organizations(limit, offset, order_by, order_direction, search.as_deref())
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))
     }
 }
 

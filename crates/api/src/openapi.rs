@@ -40,6 +40,7 @@ use utoipa::{Modify, OpenApi};
         // Chat completion endpoints (most important for users)
         crate::routes::completions::chat_completions,
         crate::routes::completions::image_generations,
+        crate::routes::completions::image_edits,
         crate::routes::completions::rerank,
         // crate::routes::completions::completions,
         crate::routes::completions::models,
@@ -143,6 +144,8 @@ use utoipa::{Modify, OpenApi};
             CompletionRequest, ModelsResponse, ModelInfo, ModelPricing, ErrorResponse,
             // Image generation models
             ImageGenerationRequest, ImageGenerationResponse, ImageData,
+            // Image edit models
+            ImageEditRequestSchema,
             // Rerank models
             RerankRequest, RerankResponse, RerankResult, RerankUsage,
             // Organization models

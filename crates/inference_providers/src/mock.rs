@@ -7,11 +7,11 @@ use crate::{
     AttestationError, ChatChoice, ChatCompletionChunk, ChatCompletionParams,
     ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseWithBytes,
     ChatDelta, ChatResponseMessage, ChatSignature, CompletionChunk, CompletionError,
-    CompletionParams, FinishReason, FunctionCallDelta, ImageData, ImageGenerationError,
-    ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes,
-    ListModelsError, MessageRole, ModelInfo, ModelsResponse, RerankError, RerankParams,
-    RerankResponse, RerankResult, RerankUsage, SSEEvent, StreamChunk, StreamingResult, TokenUsage,
-    ToolCallDelta,
+    CompletionParams, FinishReason, FunctionCallDelta, ImageData, ImageEditError, ImageEditParams,
+    ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponse, ImageGenerationResponseWithBytes, ListModelsError, MessageRole,
+    ModelInfo, ModelsResponse, RerankError, RerankParams, RerankResponse, RerankResult,
+    RerankUsage, SSEEvent, StreamChunk, StreamingResult, TokenUsage, ToolCallDelta,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -213,6 +213,7 @@ impl ResponseTemplate {
                         name: Some(tc.name.clone()),
                         arguments: Some(tc.arguments.clone()),
                     },
+                    thought_signature: None,
                 })
                 .collect()
         });
@@ -382,6 +383,7 @@ impl ResponseTemplate {
                                     name: Some(tc.name.clone()),
                                     arguments: None,
                                 }),
+                                thought_signature: None,
                             }]),
                             reasoning_content: None,
                             reasoning: None,
@@ -431,6 +433,7 @@ impl ResponseTemplate {
                                         name: None,
                                         arguments: Some(part_with_space),
                                     }),
+                                    thought_signature: None,
                                 }]),
                                 reasoning_content: None,
                                 reasoning: None,
@@ -882,6 +885,44 @@ impl crate::InferenceProvider for MockProvider {
             .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
 
         Ok(ImageGenerationResponseWithBytes {
+            response,
+            raw_bytes,
+        })
+    }
+
+    async fn image_edit(
+        &self,
+        params: Arc<ImageEditParams>,
+        _request_hash: String,
+    ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
+        // Check for invalid model
+        if !self.is_valid_model(&params.model) {
+            return Err(ImageEditError::EditError(format!(
+                "The model `{}` does not exist.",
+                params.model
+            )));
+        }
+
+        let created = self.current_timestamp();
+
+        // Generate mock edited image data (always 1 image for edit)
+        let data = vec![ImageData {
+            b64_json: Some("mock_base64_edited_image_data_0".to_string()),
+            url: None,
+            revised_prompt: Some(params.prompt.clone()),
+        }];
+
+        let response = ImageGenerationResponse {
+            id: format!("img-edit-{}", self.generate_id()),
+            created,
+            data,
+        };
+
+        // Serialize to raw bytes for TEE verification consistency
+        let raw_bytes =
+            serde_json::to_vec(&response).map_err(|e| ImageEditError::EditError(e.to_string()))?;
+
+        Ok(ImageEditResponseWithBytes {
             response,
             raw_bytes,
         })

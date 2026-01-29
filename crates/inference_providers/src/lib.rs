@@ -53,6 +53,7 @@
 //! }
 //! ```
 
+pub mod chunk_builder;
 pub mod external;
 pub mod mock;
 pub mod models;
@@ -60,6 +61,7 @@ pub mod sse_parser;
 pub mod vllm;
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_core::Stream;
@@ -72,6 +74,7 @@ pub use models::{
     AudioOutput, ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionResponseWithBytes, ChatDelta, ChatMessage, ChatResponseMessage, ChatSignature,
     CompletionError, CompletionParams, FinishReason, FunctionChoice, FunctionDefinition, ImageData,
+    ImageEditError, ImageEditParams, ImageEditResponse, ImageEditResponseWithBytes,
     ImageGenerationError, ImageGenerationParams, ImageGenerationResponse,
     ImageGenerationResponseWithBytes, MessageRole, ModelInfo, RerankError, RerankParams,
     RerankResponse, RerankResult, RerankUsage, StreamChunk, StreamOptions, TokenUsage, ToolChoice,
@@ -79,6 +82,9 @@ pub use models::{
 };
 pub use sse_parser::{new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser};
 pub use vllm::{VLlmConfig, VLlmProvider};
+
+// Chunk builder for external provider parsers
+pub use chunk_builder::ChunkContext;
 
 // External provider exports
 pub use external::{
@@ -151,6 +157,17 @@ pub trait InferenceProvider {
         params: ImageGenerationParams,
         request_hash: String,
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError>;
+
+    /// Performs an image edit request
+    ///
+    /// Returns edited images based on the provided image and prompt.
+    /// Includes raw bytes for TEE signature verification.
+    /// Accepts Arc<ImageEditParams> to avoid unnecessary cloning during retries (image data is already Arc-wrapped).
+    async fn image_edit(
+        &self,
+        params: Arc<ImageEditParams>,
+        request_hash: String,
+    ) -> Result<ImageEditResponseWithBytes, ImageEditError>;
 
     /// Performs a document reranking request
     ///

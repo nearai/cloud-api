@@ -71,10 +71,30 @@ pub struct CompletionRequest {
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
+/// Tool call information for completion messages
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionToolCall {
+    /// Tool call ID (e.g., "toolu_xxx" for Anthropic, "call_xxx" for OpenAI)
+    pub id: String,
+    /// Tool name (e.g., "web_search")
+    pub name: String,
+    /// JSON-encoded arguments for the tool
+    pub arguments: String,
+    /// Thought signature for Gemini 3 models (internal use only, not exposed to clients)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionMessage {
     pub role: String,
     pub content: String,
+    /// Tool call ID - required for tool role messages to match with assistant's tool_calls
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Tool calls made by the assistant - required for assistant messages that invoke tools
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<CompletionToolCall>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

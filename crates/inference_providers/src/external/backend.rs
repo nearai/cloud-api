@@ -5,12 +5,13 @@
 //! and the provider's native format.
 
 use crate::{
-    ChatCompletionParams, ChatCompletionResponseWithBytes, CompletionError, ImageGenerationError,
-    ImageGenerationParams, ImageGenerationResponseWithBytes, RerankError, RerankParams,
-    RerankResponse, StreamingResult,
+    ChatCompletionParams, ChatCompletionResponseWithBytes, CompletionError, ImageEditError,
+    ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponseWithBytes, RerankError, RerankParams, RerankResponse, StreamingResult,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Configuration for a backend connection
 #[derive(Debug, Clone)]
@@ -87,6 +88,26 @@ pub trait ExternalBackend: Send + Sync {
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
         Err(ImageGenerationError::GenerationError(format!(
             "Image generation is not supported by the {} backend.",
+            self.backend_type()
+        )))
+    }
+
+    /// Performs an image edit request
+    ///
+    /// The backend is responsible for:
+    /// - Translating ImageEditParams to provider-specific format
+    /// - Making the HTTP request
+    /// - Parsing the response and translating it back to our ImageEditResponse format
+    ///
+    /// Default implementation returns an error indicating image editing is not supported.
+    async fn image_edit(
+        &self,
+        _config: &BackendConfig,
+        _model: &str,
+        _params: Arc<ImageEditParams>,
+    ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
+        Err(ImageEditError::EditError(format!(
+            "Image editing is not supported by the {} backend.",
             self.backend_type()
         )))
     }

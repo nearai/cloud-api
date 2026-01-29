@@ -78,8 +78,9 @@ impl UsageServiceTrait for UsageServiceImpl {
 
         // Calculate costs based on inference type
         let (input_cost, output_cost, total_cost) = if request.inference_type == "image_generation"
+            || request.inference_type == "image_edit"
         {
-            // For image generation: use image_count and cost_per_image
+            // For image-based operations: use image_count and cost_per_image
             let image_count = request.image_count.unwrap_or(0);
             let image_cost = (image_count as i64) * model.cost_per_image;
             (0, image_cost, image_cost)

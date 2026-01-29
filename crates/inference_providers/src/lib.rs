@@ -61,6 +61,7 @@ pub mod sse_parser;
 pub mod vllm;
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_core::Stream;
@@ -73,6 +74,7 @@ pub use models::{
     AudioOutput, ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionResponseWithBytes, ChatDelta, ChatMessage, ChatResponseMessage, ChatSignature,
     CompletionError, CompletionParams, FinishReason, FunctionChoice, FunctionDefinition, ImageData,
+    ImageEditError, ImageEditParams, ImageEditResponse, ImageEditResponseWithBytes,
     ImageGenerationError, ImageGenerationParams, ImageGenerationResponse,
     ImageGenerationResponseWithBytes, MessageRole, ModelInfo, StreamChunk, StreamOptions,
     TokenUsage, ToolChoice, ToolDefinition,
@@ -154,6 +156,17 @@ pub trait InferenceProvider {
         params: ImageGenerationParams,
         request_hash: String,
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError>;
+
+    /// Performs an image edit request
+    ///
+    /// Returns edited images based on the provided image and prompt.
+    /// Includes raw bytes for TEE signature verification.
+    /// Accepts Arc<ImageEditParams> to avoid unnecessary cloning during retries (image data is already Arc-wrapped).
+    async fn image_edit(
+        &self,
+        params: Arc<ImageEditParams>,
+        request_hash: String,
+    ) -> Result<ImageEditResponseWithBytes, ImageEditError>;
 
     async fn get_signature(
         &self,

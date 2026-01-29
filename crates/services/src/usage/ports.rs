@@ -277,7 +277,7 @@ pub struct RecordUsageServiceRequest {
     pub model_id: Uuid,
     pub input_tokens: i32,
     pub output_tokens: i32,
-    pub inference_type: String, // 'chat_completion', 'chat_completion_stream', 'image_generation', etc.
+    pub inference_type: String, // 'chat_completion', 'chat_completion_stream', 'image_generation', 'image_edit', etc.
     /// Time to first token in milliseconds
     pub ttft_ms: Option<i32>,
     /// Average inter-token latency in milliseconds

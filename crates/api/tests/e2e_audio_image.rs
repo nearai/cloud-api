@@ -1490,3 +1490,344 @@ async fn test_audio_output_signature_verification() {
     // Allow background tasks to complete
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 }
+
+/// Helper function to create a minimal PNG image (1x1 pixel)
+fn create_test_png_image() -> Vec<u8> {
+    // PNG magic bytes + minimal 1x1 PNG with alpha channel
+    vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
+        0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1 pixel
+        0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, // 8-bit RGBA
+        0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, // IDAT chunk
+        0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, // minimal image data
+        0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44,
+        0xAE, // IEND chunk
+        0x42, 0x60, 0x82,
+    ]
+}
+
+/// Test image edit with basic parameters
+#[tokio::test]
+async fn test_image_edit() {
+    let use_real = use_real_providers();
+    println!(
+        "Running image edit test with {} providers",
+        if use_real { "REAL" } else { "MOCK" }
+    );
+
+    let (server, api_key, _guard) = if use_real {
+        let (server, _pool, _db, guard) = setup_test_server_real_providers().await;
+        setup_qwen_image_model(&server).await;
+        let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+        let api_key = get_api_key_for_org(&server, org.id).await;
+        (server, api_key, guard)
+    } else {
+        let (server, guard) = setup_test_server().await;
+        setup_qwen_image_model(&server).await;
+        let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+        let api_key = get_api_key_for_org(&server, org.id).await;
+        (server, api_key, guard)
+    };
+
+    let image_data = create_test_png_image();
+
+    // Send image edit request
+    let response = server
+        .post("/v1/images/edits")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "image",
+                    axum_test::multipart::Part::bytes(image_data.clone())
+                        .file_name("image.png")
+                        .mime_type("image/png"),
+                )
+                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("prompt", "Change the background to a sunny day"),
+        )
+        .await;
+
+    println!("Image edit response status: {}", response.status_code());
+
+    if !use_real {
+        assert_eq!(response.status_code(), 200, "Image edit should succeed");
+
+        let response_json: serde_json::Value = response.json();
+        println!(
+            "Response: {}",
+            serde_json::to_string_pretty(&response_json).unwrap()
+        );
+
+        // Verify response structure
+        assert!(
+            response_json.get("created").is_some(),
+            "Should have created timestamp"
+        );
+        assert!(
+            response_json.get("data").is_some(),
+            "Should have data array"
+        );
+
+        let data = response_json.get("data").unwrap().as_array().unwrap();
+        assert!(!data.is_empty(), "Should have at least one edited image");
+
+        let first_image = &data[0];
+        assert!(
+            first_image.get("b64_json").is_some(),
+            "Should have b64_json field"
+        );
+
+        let b64_data = first_image.get("b64_json").unwrap().as_str().unwrap();
+        assert!(!b64_data.is_empty(), "b64_json should not be empty");
+        println!("Edited image data length: {} chars", b64_data.len());
+    } else {
+        let status = response.status_code();
+        println!("Real provider response status: {}", status);
+
+        if status == 200 {
+            let response_json: serde_json::Value = response.json();
+            println!(
+                "Response: {}",
+                serde_json::to_string_pretty(&response_json).unwrap()
+            );
+
+            // Verify response structure for real provider
+            assert!(
+                response_json.get("data").is_some(),
+                "Should have data array"
+            );
+
+            let data = response_json.get("data").unwrap().as_array().unwrap();
+            if !data.is_empty() {
+                let first_image = &data[0];
+                if let Some(b64_data) = first_image.get("b64_json") {
+                    let b64_str = b64_data.as_str().unwrap_or("");
+                    println!("Real edited image data length: {} chars", b64_str.len());
+
+                    // Verify it's valid base64
+                    if !b64_str.is_empty() {
+                        use base64::Engine;
+                        let decode_result =
+                            base64::engine::general_purpose::STANDARD.decode(b64_str);
+                        assert!(decode_result.is_ok(), "Image data should be valid base64");
+                        println!(
+                            "Decoded edited image size: {} bytes",
+                            decode_result.unwrap().len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Allow background tasks to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+}
+
+/// Test image edit validation
+#[tokio::test]
+async fn test_image_edit_validation() {
+    let (server, guard) = setup_test_server().await;
+    let _guard = guard;
+
+    setup_qwen_image_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Test 1: Missing image
+    let response = server
+        .post("/v1/images/edits")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("prompt", "Edit this image"),
+        )
+        .await;
+
+    assert_eq!(response.status_code(), 400, "Should reject missing image");
+
+    // Test 2: Invalid PNG format
+    let response = server
+        .post("/v1/images/edits")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "image",
+                    axum_test::multipart::Part::bytes(b"not a png".to_vec())
+                        .file_name("image.png")
+                        .mime_type("image/png"),
+                )
+                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("prompt", "Edit this image"),
+        )
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        400,
+        "Should reject invalid PNG format"
+    );
+
+    // Test 3: Missing prompt
+    let image_data = create_test_png_image();
+    let response = server
+        .post("/v1/images/edits")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "image",
+                    axum_test::multipart::Part::bytes(image_data.clone())
+                        .file_name("image.png")
+                        .mime_type("image/png"),
+                )
+                .add_text("model", "Qwen/Qwen-Image-2512"),
+        )
+        .await;
+
+    assert_eq!(response.status_code(), 400, "Should reject missing prompt");
+
+    // Test 4: Invalid size format
+    let response = server
+        .post("/v1/images/edits")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "image",
+                    axum_test::multipart::Part::bytes(image_data.clone())
+                        .file_name("image.png")
+                        .mime_type("image/png"),
+                )
+                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("prompt", "Edit this")
+                .add_text("size", "invalid"),
+        )
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        400,
+        "Should reject invalid size format"
+    );
+
+    // Test 5: Invalid dimension (0x0)
+    let response = server
+        .post("/v1/images/edits")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "image",
+                    axum_test::multipart::Part::bytes(image_data.clone())
+                        .file_name("image.png")
+                        .mime_type("image/png"),
+                )
+                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("prompt", "Edit this")
+                .add_text("size", "0x0"),
+        )
+        .await;
+
+    assert_eq!(response.status_code(), 400, "Should reject zero dimensions");
+}
+
+/// Test verifiable model response_format validation for image edit
+#[tokio::test]
+async fn test_image_edit_verifiable_model_response_format() {
+    let (server, guard) = setup_test_server().await;
+    let _guard = guard;
+
+    setup_qwen_image_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let image_data = create_test_png_image();
+
+    // Test 1: response_format "url" should be rejected for verifiable models
+    let response = server
+        .post("/v1/images/edits")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "image",
+                    axum_test::multipart::Part::bytes(image_data.clone())
+                        .file_name("image.png")
+                        .mime_type("image/png"),
+                )
+                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("prompt", "Edit this")
+                .add_text("response_format", "url"),
+        )
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        400,
+        "Should reject 'url' format for verifiable models"
+    );
+
+    // Test 2: response_format "b64_json" should work
+    let response = server
+        .post("/v1/images/edits")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "image",
+                    axum_test::multipart::Part::bytes(image_data.clone())
+                        .file_name("image.png")
+                        .mime_type("image/png"),
+                )
+                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("prompt", "Edit this")
+                .add_text("response_format", "b64_json"),
+        )
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Should accept 'b64_json' format for verifiable models"
+    );
+
+    // Test 3: No response_format should default to "b64_json" (no error)
+    let response = server
+        .post("/v1/images/edits")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "image",
+                    axum_test::multipart::Part::bytes(image_data.clone())
+                        .file_name("image.png")
+                        .mime_type("image/png"),
+                )
+                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("prompt", "Edit this"),
+        )
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Should default to 'b64_json' format for verifiable models"
+    );
+
+    // Allow background tasks to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+}

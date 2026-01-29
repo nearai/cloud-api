@@ -14,7 +14,8 @@ pub use pool::DbPool;
 pub use repositories::{
     ApiKeyRepository, McpConnectorRepository, OAuthStateRepository, PgAttestationRepository,
     PgConversationRepository, PgOrganizationInvitationRepository, PgOrganizationRepository,
-    PgResponseItemsRepository, PgResponseRepository, PostgresNearNonceRepository,
+    PgResponseItemsRepository, PgResponseRepository, PgVectorStoreFileBatchRepository,
+    PgVectorStoreFileRepository, PgVectorStoreRepository, PostgresNearNonceRepository,
     SessionRepository, UserRepository,
 };
 pub use shutdown_coordinator::{ShutdownCoordinator, ShutdownStage, ShutdownStageResult};

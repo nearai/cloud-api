@@ -14,6 +14,7 @@ pub mod organization;
 pub mod responses;
 pub mod usage;
 pub mod user;
+pub mod vector_stores;
 pub mod workspace;
 
 pub use auth::UserId;

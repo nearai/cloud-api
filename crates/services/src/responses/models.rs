@@ -1135,7 +1135,7 @@ pub struct OutputTokensDetails {
 
 impl CreateResponseRequest {
     pub fn validate(&self) -> Result<(), String> {
-        use crate::common::MAX_METADATA_SIZE_BYTES;
+        use crate::common::validate_metadata_size;
 
         if self.model.trim().is_empty() {
             return Err("Model cannot be empty".to_string());
@@ -1166,14 +1166,7 @@ impl CreateResponseRequest {
         }
 
         if let Some(metadata) = &self.metadata {
-            let serialized =
-                serde_json::to_string(metadata).map_err(|_| "Invalid metadata".to_string())?;
-            if serialized.len() > MAX_METADATA_SIZE_BYTES {
-                return Err(format!(
-                    "metadata is too large (max {} bytes when serialized)",
-                    MAX_METADATA_SIZE_BYTES
-                ));
-            }
+            validate_metadata_size(metadata, "metadata")?;
         }
 
         // Validate input message metadata sizes
@@ -1184,14 +1177,7 @@ impl CreateResponseRequest {
                     ..
                 } = item
                 {
-                    let serialized = serde_json::to_string(meta)
-                        .map_err(|_| "Invalid message metadata".to_string())?;
-                    if serialized.len() > MAX_METADATA_SIZE_BYTES {
-                        return Err(format!(
-                            "message metadata is too large (max {} bytes when serialized)",
-                            MAX_METADATA_SIZE_BYTES
-                        ));
-                    }
+                    validate_metadata_size(meta, "message metadata")?;
                 }
             }
         }
@@ -1202,40 +1188,18 @@ impl CreateResponseRequest {
 
 impl CreateConversationRequest {
     pub fn validate(&self) -> Result<(), String> {
-        use crate::common::MAX_METADATA_SIZE_BYTES;
-
         if let Some(metadata) = &self.metadata {
-            // Prevent extremely large metadata blobs from being stored
-            let serialized =
-                serde_json::to_string(metadata).map_err(|_| "Invalid metadata".to_string())?;
-            if serialized.len() > MAX_METADATA_SIZE_BYTES {
-                return Err(format!(
-                    "metadata is too large (max {} bytes when serialized)",
-                    MAX_METADATA_SIZE_BYTES
-                ));
-            }
+            crate::common::validate_metadata_size(metadata, "metadata")?;
         }
-
         Ok(())
     }
 }
 
 impl UpdateConversationRequest {
     pub fn validate(&self) -> Result<(), String> {
-        use crate::common::MAX_METADATA_SIZE_BYTES;
-
         if let Some(metadata) = &self.metadata {
-            // Prevent extremely large metadata blobs from being stored
-            let serialized =
-                serde_json::to_string(metadata).map_err(|_| "Invalid metadata".to_string())?;
-            if serialized.len() > MAX_METADATA_SIZE_BYTES {
-                return Err(format!(
-                    "metadata is too large (max {} bytes when serialized)",
-                    MAX_METADATA_SIZE_BYTES
-                ));
-            }
+            crate::common::validate_metadata_size(metadata, "metadata")?;
         }
-
         Ok(())
     }
 }

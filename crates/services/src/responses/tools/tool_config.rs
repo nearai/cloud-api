@@ -4,13 +4,52 @@
 //! to the inference provider format used by the LLM, and parsing tool calls
 //! from LLM responses.
 
-use std::collections::HashMap;
-
 use crate::responses::models::{CreateResponseRequest, ResponseTool, ResponseToolChoice};
 use crate::responses::service_helpers::ToolCallInfo;
 
 /// Special tool type for error tool calls (malformed calls from LLM)
 pub const ERROR_TOOL_TYPE: &str = "__error__";
+
+/// Tool name for code interpreter
+pub const CODE_INTERPRETER_TOOL_NAME: &str = "code_interpreter";
+
+/// Tool name for computer use
+pub const COMPUTER_TOOL_NAME: &str = "computer";
+
+/// Extract tool names from request tools configuration
+///
+/// Returns a list of tool names that can be used to infer tool names when
+/// the model doesn't provide one (e.g., GLM-4.6 intermittently omits function.name).
+pub fn get_tool_names(request: &CreateResponseRequest) -> Vec<String> {
+    let mut names = Vec::new();
+
+    if let Some(tools) = &request.tools {
+        for tool in tools {
+            match tool {
+                ResponseTool::WebSearch { .. } => {
+                    names.push(super::WEB_SEARCH_TOOL_NAME.to_string());
+                }
+                ResponseTool::FileSearch {} => {
+                    names.push(super::FILE_SEARCH_TOOL_NAME.to_string());
+                }
+                ResponseTool::Function { name, .. } => {
+                    names.push(name.clone());
+                }
+                ResponseTool::CodeInterpreter {} => {
+                    names.push(CODE_INTERPRETER_TOOL_NAME.to_string());
+                }
+                ResponseTool::Computer {} => {
+                    names.push(COMPUTER_TOOL_NAME.to_string());
+                }
+                // MCP tools are dynamically discovered - we don't know actual tool names
+                // until the MCP server is queried asynchronously later
+                ResponseTool::Mcp { .. } => {}
+            }
+        }
+    }
+
+    names
+}
 
 /// Prepare tools configuration for LLM in OpenAI function calling format
 pub fn prepare_tools(request: &CreateResponseRequest) -> Vec<inference_providers::ToolDefinition> {
@@ -143,7 +182,7 @@ pub fn prepare_tools(request: &CreateResponseRequest) -> Vec<inference_providers
                     tool_definitions.push(inference_providers::ToolDefinition {
                         type_: "function".to_string(),
                         function: inference_providers::FunctionDefinition {
-                            name: "code_interpreter".to_string(),
+                            name: CODE_INTERPRETER_TOOL_NAME.to_string(),
                             description: Some(
                                 "Execute Python code in a sandboxed environment.".to_string(),
                             ),
@@ -164,7 +203,7 @@ pub fn prepare_tools(request: &CreateResponseRequest) -> Vec<inference_providers
                     tool_definitions.push(inference_providers::ToolDefinition {
                         type_: "function".to_string(),
                         function: inference_providers::FunctionDefinition {
-                            name: "computer".to_string(),
+                            name: COMPUTER_TOOL_NAME.to_string(),
                             description: Some(
                                 "Control computer actions like mouse clicks and keyboard input."
                                     .to_string(),
@@ -411,8 +450,14 @@ fn parse_tool_args(tool_name: &str, args_str: &str) -> ParseArgsResult {
 }
 
 /// Create an error ToolCallInfo for invalid JSON arguments
-fn create_invalid_json_error(name: &str, idx: i64) -> ToolCallInfo {
+fn create_invalid_json_error(
+    name: &str,
+    idx: i64,
+    id: Option<String>,
+    thought_signature: Option<String>,
+) -> ToolCallInfo {
     ToolCallInfo {
+        id,
         tool_type: ERROR_TOOL_TYPE.to_string(),
         query: format!(
             "Tool call for '{name}' (index {idx}) has invalid JSON arguments. \
@@ -423,12 +468,19 @@ fn create_invalid_json_error(name: &str, idx: i64) -> ToolCallInfo {
             "tool_name": name,
             "index": idx
         })),
+        thought_signature,
     }
 }
 
 /// Create an error ToolCallInfo for missing query field
-fn create_missing_query_error(name: &str, idx: i64) -> ToolCallInfo {
+fn create_missing_query_error(
+    name: &str,
+    idx: i64,
+    id: Option<String>,
+    thought_signature: Option<String>,
+) -> ToolCallInfo {
     ToolCallInfo {
+        id,
         tool_type: ERROR_TOOL_TYPE.to_string(),
         query: format!(
             "Tool call for '{name}' (index {idx}) is missing the required 'query' field \
@@ -439,54 +491,80 @@ fn create_missing_query_error(name: &str, idx: i64) -> ToolCallInfo {
             "tool_name": name,
             "index": idx
         })),
+        thought_signature,
     }
 }
 
 /// Convert accumulated tool calls from LLM response to ToolCallInfo
 ///
-/// Takes a map of tool call index -> (name, arguments_json) and converts
+/// Takes a map of tool call index -> (id, name, arguments_json) and converts
 /// them to structured ToolCallInfo. Invalid or malformed tool calls are
 /// converted to error tool calls that inform the LLM of the issue.
 ///
 /// The `model` parameter is used for logging to help identify which models
 /// produce malformed tool calls.
+///
+/// The `available_tool_names` parameter is used to infer the tool name when
+/// the model doesn't provide one (e.g., GLM-4.6 intermittently omits function.name).
+/// If only one tool is available and the name is missing, we default to that tool.
 pub fn convert_tool_calls(
-    tool_call_accumulator: HashMap<i64, (Option<String>, String)>,
+    tool_call_accumulator: crate::responses::service_helpers::ToolCallAccumulator,
     model: &str,
+    available_tool_names: &[String],
 ) -> Vec<ToolCallInfo> {
     let mut tool_calls_detected = Vec::new();
 
-    for (idx, (name_opt, args_str)) in tool_call_accumulator {
+    for (idx, entry) in tool_call_accumulator {
+        let id_opt = entry.id;
+        let args_str = entry.arguments;
+        let thought_signature = entry.thought_signature;
+
         // Check if name is None or empty string
-        let name = match name_opt {
+        let name = match entry.name {
             Some(n) if !n.trim().is_empty() => n,
             _ => {
-                tracing::warn!(
-                    model = model,
-                    index = idx,
-                    "Tool call has no name or empty name"
-                );
-                // Log args at debug level for staging troubleshooting (not in prod)
-                tracing::debug!(
-                    model = model,
-                    index = idx,
-                    args = args_str,
-                    "Tool call missing name - arguments for debugging"
-                );
-                tool_calls_detected.push(ToolCallInfo {
-                    tool_type: ERROR_TOOL_TYPE.to_string(),
-                    query: format!(
-                        "Tool call at index {idx} is missing a tool name. \
-                         Please ensure all tool calls include a valid 'name' field. \
-                         Arguments provided: {args_str}"
-                    ),
-                    params: Some(serde_json::json!({
-                        "error_type": "missing_tool_name",
-                        "index": idx,
-                        "arguments": args_str
-                    })),
-                });
-                continue;
+                // Fallback: if only one tool is available, use that tool's name
+                // This handles models like GLM-4.6 that intermittently omit function.name
+                if available_tool_names.len() == 1 {
+                    let inferred_name = available_tool_names[0].clone();
+                    tracing::info!(
+                        model = model,
+                        index = idx,
+                        inferred_tool = %inferred_name,
+                        "Tool call missing name, inferring from single available tool"
+                    );
+                    inferred_name
+                } else {
+                    tracing::warn!(
+                        model = model,
+                        index = idx,
+                        available_tools = ?available_tool_names,
+                        "Tool call has no name and multiple tools available, cannot infer"
+                    );
+                    // Log args at debug level for staging troubleshooting (not in prod)
+                    tracing::debug!(
+                        model = model,
+                        index = idx,
+                        args = args_str,
+                        "Tool call missing name - arguments for debugging"
+                    );
+                    tool_calls_detected.push(ToolCallInfo {
+                        id: id_opt,
+                        tool_type: ERROR_TOOL_TYPE.to_string(),
+                        query: format!(
+                            "Tool call at index {idx} is missing a tool name. \
+                             Please ensure all tool calls include a valid 'name' field. \
+                             Arguments provided: {args_str}"
+                        ),
+                        params: Some(serde_json::json!({
+                            "error_type": "missing_tool_name",
+                            "index": idx,
+                            "arguments": args_str
+                        })),
+                        thought_signature,
+                    });
+                    continue;
+                }
             }
         };
 
@@ -517,25 +595,37 @@ pub fn convert_tool_calls(
                     args = args_str,
                     "Failed to parse tool call - arguments for debugging"
                 );
-                tool_calls_detected.push(create_invalid_json_error(&name, idx));
+                tool_calls_detected.push(create_invalid_json_error(
+                    &name,
+                    idx,
+                    id_opt,
+                    thought_signature,
+                ));
                 continue;
             }
         };
 
-        // Check if this is an MCP tool (format: "server_label:tool_name")
-        if name.contains(':') {
-            tracing::debug!("MCP tool call detected: {}", name);
+        // Check if this is a tool that doesn't use the 'query' parameter:
+        // - MCP tools (format: "server_label:tool_name")
+        // - code_interpreter (uses "code" parameter)
+        // - computer (uses "action" parameter)
+        if name.contains(':') || name == CODE_INTERPRETER_TOOL_NAME || name == COMPUTER_TOOL_NAME {
+            tracing::debug!("Tool call detected (no query required): {}", name);
             tool_calls_detected.push(ToolCallInfo {
+                id: id_opt,
                 tool_type: name,
                 query: String::new(),
                 params: Some(args),
+                thought_signature,
             });
         } else if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
             tracing::debug!("Tool call detected: {}", name);
             tool_calls_detected.push(ToolCallInfo {
+                id: id_opt,
                 tool_type: name,
                 query: query.to_string(),
                 params: Some(args),
+                thought_signature,
             });
         } else {
             tracing::warn!(
@@ -544,7 +634,12 @@ pub fn convert_tool_calls(
                 index = idx,
                 "Tool call has no 'query' field in arguments"
             );
-            tool_calls_detected.push(create_missing_query_error(&name, idx));
+            tool_calls_detected.push(create_missing_query_error(
+                &name,
+                idx,
+                id_opt,
+                thought_signature,
+            ));
         }
     }
 
@@ -554,6 +649,8 @@ pub fn convert_tool_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::responses::service_helpers::ToolCallAccumulatorEntry;
+    use std::collections::HashMap;
 
     #[test]
     fn test_try_repair_json_valid_json() {
@@ -692,14 +789,17 @@ mod tests {
         let mut accumulator = HashMap::new();
         accumulator.insert(
             0,
-            (
-                Some("web_search".to_string()),
-                r#"{"query": "test search"}"#.to_string(),
-            ),
+            ToolCallAccumulatorEntry {
+                id: Some("call_123".to_string()),
+                name: Some("web_search".to_string()),
+                arguments: r#"{"query": "test search"}"#.to_string(),
+                thought_signature: None,
+            },
         );
 
-        let result = convert_tool_calls(accumulator, "test-model");
+        let result = convert_tool_calls(accumulator, "test-model", &[]);
         assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, Some("call_123".to_string()));
         assert_eq!(result[0].tool_type, "web_search");
         assert_eq!(result[0].query, "test search");
     }
@@ -709,24 +809,80 @@ mod tests {
         let mut accumulator = HashMap::new();
         accumulator.insert(
             0,
-            (
-                Some("web_search".to_string()),
-                r#"{"query": "Bitcoin price", "freshness":"#.to_string(),
-            ),
+            ToolCallAccumulatorEntry {
+                id: Some("call_456".to_string()),
+                name: Some("web_search".to_string()),
+                arguments: r#"{"query": "Bitcoin price", "freshness":"#.to_string(),
+                thought_signature: None,
+            },
         );
 
-        let result = convert_tool_calls(accumulator, "test-model");
+        let result = convert_tool_calls(accumulator, "test-model", &[]);
         assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, Some("call_456".to_string()));
         assert_eq!(result[0].tool_type, "web_search");
         assert_eq!(result[0].query, "Bitcoin price");
     }
 
     #[test]
-    fn test_convert_tool_calls_missing_name() {
+    fn test_convert_tool_calls_missing_name_with_multiple_tools() {
+        // When name is missing and multiple tools available, should return error
         let mut accumulator = HashMap::new();
-        accumulator.insert(0, (None, r#"{"query": "test"}"#.to_string()));
+        accumulator.insert(
+            0,
+            ToolCallAccumulatorEntry {
+                id: Some("call_789".to_string()),
+                name: None,
+                arguments: r#"{"query": "test"}"#.to_string(),
+                thought_signature: None,
+            },
+        );
 
-        let result = convert_tool_calls(accumulator, "test-model");
+        let available_tools = vec!["web_search".to_string(), "file_search".to_string()];
+        let result = convert_tool_calls(accumulator, "test-model", &available_tools);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].tool_type, ERROR_TOOL_TYPE);
+        assert_eq!(result[0].id, Some("call_789".to_string())); // ID preserved even in error
+    }
+
+    #[test]
+    fn test_convert_tool_calls_missing_name_infers_single_tool() {
+        // When name is missing but only one tool available, should infer the tool name
+        // This handles models like GLM-4.6 that intermittently omit function.name
+        let mut accumulator = HashMap::new();
+        accumulator.insert(
+            0,
+            ToolCallAccumulatorEntry {
+                id: Some("call_abc".to_string()),
+                name: None,
+                arguments: r#"{"query": "Bitcoin price"}"#.to_string(),
+                thought_signature: None,
+            },
+        );
+
+        let available_tools = vec!["web_search".to_string()];
+        let result = convert_tool_calls(accumulator, "test-model", &available_tools);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, Some("call_abc".to_string()));
+        assert_eq!(result[0].tool_type, "web_search");
+        assert_eq!(result[0].query, "Bitcoin price");
+    }
+
+    #[test]
+    fn test_convert_tool_calls_missing_name_no_tools_available() {
+        // When name is missing and no tools available, should return error
+        let mut accumulator = HashMap::new();
+        accumulator.insert(
+            0,
+            ToolCallAccumulatorEntry {
+                id: None,
+                name: None,
+                arguments: r#"{"query": "test"}"#.to_string(),
+                thought_signature: None,
+            },
+        );
+
+        let result = convert_tool_calls(accumulator, "test-model", &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].tool_type, ERROR_TOOL_TYPE);
     }
@@ -736,14 +892,17 @@ mod tests {
         let mut accumulator = HashMap::new();
         accumulator.insert(
             0,
-            (
-                Some("server:tool_name".to_string()),
-                r#"{"param1": "value1"}"#.to_string(),
-            ),
+            ToolCallAccumulatorEntry {
+                id: Some("toolu_xyz".to_string()),
+                name: Some("server:tool_name".to_string()),
+                arguments: r#"{"param1": "value1"}"#.to_string(),
+                thought_signature: None,
+            },
         );
 
-        let result = convert_tool_calls(accumulator, "test-model");
+        let result = convert_tool_calls(accumulator, "test-model", &[]);
         assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, Some("toolu_xyz".to_string()));
         assert_eq!(result[0].tool_type, "server:tool_name");
         assert!(result[0].query.is_empty()); // MCP tools don't require query
     }
@@ -754,15 +913,18 @@ mod tests {
         let mut accumulator = HashMap::new();
         accumulator.insert(
             0,
-            (
-                Some("file_search".to_string()),
-                r#"{"query": "test", "truncated":"#.to_string(), // Invalid JSON
-            ),
+            ToolCallAccumulatorEntry {
+                id: Some("call_err".to_string()),
+                name: Some("file_search".to_string()),
+                arguments: r#"{"query": "test", "truncated":"#.to_string(),
+                thought_signature: None,
+            },
         );
 
-        let result = convert_tool_calls(accumulator, "test-model");
+        let result = convert_tool_calls(accumulator, "test-model", &[]);
         assert_eq!(result.len(), 1);
         // Should return an error, not attempt repair
         assert_eq!(result[0].tool_type, ERROR_TOOL_TYPE);
+        assert_eq!(result[0].id, Some("call_err".to_string())); // ID preserved in error
     }
 }

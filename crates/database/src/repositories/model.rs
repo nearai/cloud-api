@@ -12,6 +12,42 @@ use tokio_postgres::Row;
 // Default reason for soft delete operations
 const DEFAULT_SOFT_DELETE_REASON: &str = "Model soft deleted";
 
+/// Serialize optional modalities to JSON value for database storage.
+/// Returns Ok(None) if input is None, Ok(Some(value)) if serialization succeeds,
+/// or an error if serialization fails.
+fn serialize_modalities(
+    modalities: &Option<Vec<String>>,
+    field_name: &str,
+) -> Result<Option<serde_json::Value>> {
+    modalities
+        .as_ref()
+        .map(|v| {
+            serde_json::to_value(v).with_context(|| format!("Failed to serialize {}", field_name))
+        })
+        .transpose()
+}
+
+/// Deserialize optional modalities from JSON value.
+/// Returns None if the value is None or if deserialization fails.
+/// Logs an error if deserialization fails (indicates data corruption).
+fn deserialize_modalities(
+    value: Option<serde_json::Value>,
+    field_name: &str,
+    model_identifier: &str,
+) -> Option<Vec<String>> {
+    value.and_then(|v| {
+        serde_json::from_value(v.clone()).unwrap_or_else(|e| {
+            tracing::error!(
+                field = field_name,
+                model = model_identifier,
+                error = %e,
+                "Failed to deserialize modalities from database - data may be corrupted"
+            );
+            None
+        })
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelRepository {
     pool: DbPool,
@@ -62,6 +98,7 @@ impl ModelRepository {
                         m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image,
                         m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
                         m.provider_type, m.provider_config, m.attestation_supported,
+                        m.input_modalities, m.output_modalities,
                         COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                     FROM models m
                     LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -142,6 +179,7 @@ impl ModelRepository {
                             m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image,
                             m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
                             m.provider_type, m.provider_config, m.attestation_supported,
+                            m.input_modalities, m.output_modalities,
                             COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                         FROM models m
                         LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -162,6 +200,7 @@ impl ModelRepository {
                             m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image,
                             m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
                             m.provider_type, m.provider_config, m.attestation_supported,
+                            m.input_modalities, m.output_modalities,
                             COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                         FROM models m
                         LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -202,7 +241,8 @@ impl ModelRepository {
                         id, model_name, model_display_name, model_description, model_icon,
                         input_cost_per_token, output_cost_per_token, cost_per_image,
                         context_length, verifiable, is_active, owned_by, created_at, updated_at,
-                        provider_type, provider_config, attestation_supported
+                        provider_type, provider_config, attestation_supported,
+                        input_modalities, output_modalities
                     FROM models
                     WHERE model_name = $1
                     "#,
@@ -236,7 +276,8 @@ impl ModelRepository {
                         id, model_name, model_display_name, model_description, model_icon,
                         input_cost_per_token, output_cost_per_token, cost_per_image,
                         context_length, verifiable, is_active, owned_by, created_at, updated_at,
-                        provider_type, provider_config, attestation_supported
+                        provider_type, provider_config, attestation_supported,
+                        input_modalities, output_modalities
                     FROM models
                     WHERE id = $1
                     "#,
@@ -285,6 +326,8 @@ impl ModelRepository {
                         m.provider_type,
                         m.provider_config,
                         m.attestation_supported,
+                        m.input_modalities,
+                        m.output_modalities,
                         COALESCE(
                             array_agg(ma.alias_name)
                             FILTER (WHERE ma.alias_name IS NOT NULL),
@@ -348,6 +391,12 @@ impl ModelRepository {
 
         let owned_by = update_request.owned_by.as_ref().cloned();
 
+        // Serialize modalities before entering retry block to propagate errors
+        let input_modalities_json =
+            serialize_modalities(&update_request.input_modalities, "input_modalities")?;
+        let output_modalities_json =
+            serialize_modalities(&update_request.output_modalities, "output_modalities")?;
+
         let row = retry_db!("upsert_model_pricing", {
             let client = self
                 .pool
@@ -375,12 +424,15 @@ impl ModelRepository {
                             provider_type = COALESCE($12, provider_type),
                             provider_config = COALESCE($13, provider_config),
                             attestation_supported = COALESCE($14, attestation_supported),
+                            input_modalities = COALESCE($15, input_modalities),
+                            output_modalities = COALESCE($16, output_modalities),
                             updated_at = NOW()
                         WHERE model_name = $1
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token, cost_per_image,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
-                                  provider_type, provider_config, attestation_supported
+                                  provider_type, provider_config, attestation_supported,
+                                  input_modalities, output_modalities
                         "#,
                         &[
                             &model_name,
@@ -397,6 +449,8 @@ impl ModelRepository {
                             &update_request.provider_type,
                             &update_request.provider_config,
                             &update_request.attestation_supported,
+                            &input_modalities_json,
+                            &output_modalities_json,
                         ],
                     )
                     .await
@@ -428,7 +482,8 @@ impl ModelRepository {
                             input_cost_per_token, output_cost_per_token, cost_per_image,
                             model_display_name, model_description, model_icon,
                             context_length, verifiable, is_active, owned_by,
-                            provider_type, provider_config, attestation_supported
+                            provider_type, provider_config, attestation_supported,
+                            input_modalities, output_modalities
                         ) VALUES (
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                             COALESCE($11, $12),
@@ -437,7 +492,8 @@ impl ModelRepository {
                             -- Default attestation_supported based on provider_type:
                             -- External providers cannot support attestation, so default to false
                             -- vLLM providers support attestation, so default to true
-                            COALESCE($15, CASE WHEN COALESCE($13, 'vllm') = 'external' THEN false ELSE true END)
+                            COALESCE($15, CASE WHEN COALESCE($13, 'vllm') = 'external' THEN false ELSE true END),
+                            $16, $17
                         )
                         ON CONFLICT (model_name) DO UPDATE SET
                             input_cost_per_token = EXCLUDED.input_cost_per_token,
@@ -453,11 +509,14 @@ impl ModelRepository {
                             provider_type = EXCLUDED.provider_type,
                             provider_config = EXCLUDED.provider_config,
                             attestation_supported = EXCLUDED.attestation_supported,
+                            input_modalities = COALESCE(EXCLUDED.input_modalities, models.input_modalities),
+                            output_modalities = COALESCE(EXCLUDED.output_modalities, models.output_modalities),
                             updated_at = NOW()
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token, cost_per_image,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
-                                  provider_type, provider_config, attestation_supported
+                                  provider_type, provider_config, attestation_supported,
+                                  input_modalities, output_modalities
                         "#,
                         &[
                             &model_name,
@@ -475,6 +534,8 @@ impl ModelRepository {
                             &update_request.provider_type,
                             &update_request.provider_config,
                             &update_request.attestation_supported,
+                            &input_modalities_json,
+                            &output_modalities_json,
                         ],
                     )
                     .await
@@ -504,6 +565,12 @@ impl ModelRepository {
 
     /// Create a new model with pricing
     pub async fn create_model(&self, model: &Model) -> Result<Model> {
+        // Serialize modalities before entering retry block to propagate errors
+        let input_modalities_json =
+            serialize_modalities(&model.input_modalities, "input_modalities")?;
+        let output_modalities_json =
+            serialize_modalities(&model.output_modalities, "output_modalities")?;
+
         let row = retry_db!("create_model", {
             let client = self
                 .pool
@@ -519,12 +586,14 @@ impl ModelRepository {
                         model_name, model_display_name, model_description, model_icon,
                         input_cost_per_token, output_cost_per_token, cost_per_image,
                         context_length, verifiable, is_active, owned_by,
-                        provider_type, provider_config, attestation_supported
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                        provider_type, provider_config, attestation_supported,
+                        input_modalities, output_modalities
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token, cost_per_image,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
-                              provider_type, provider_config, attestation_supported
+                              provider_type, provider_config, attestation_supported,
+                              input_modalities, output_modalities
                     "#,
                     &[
                         &model.model_name,
@@ -541,6 +610,8 @@ impl ModelRepository {
                         &model.provider_type,
                         &model.provider_config,
                         &model.attestation_supported,
+                        &input_modalities_json,
+                        &output_modalities_json,
                     ],
                 )
                 .await
@@ -568,6 +639,7 @@ impl ModelRepository {
                         context_length, model_name, model_display_name, model_description,
                         model_icon, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
+                        input_modalities, output_modalities,
                         effective_from, effective_until, changed_by_user_id, changed_by_user_email,
                         change_reason, created_at
                     FROM model_history
@@ -609,6 +681,7 @@ impl ModelRepository {
                         context_length, model_name, model_display_name, model_description,
                         model_icon, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
+                        input_modalities, output_modalities,
                         effective_from, effective_until, changed_by_user_id, changed_by_user_email,
                         change_reason, created_at
                     FROM model_history
@@ -680,6 +753,7 @@ impl ModelRepository {
                         h.context_length, h.model_name, h.model_display_name, h.model_description,
                         h.model_icon, h.verifiable, h.is_active, h.owned_by,
                         h.provider_type, h.provider_config, h.attestation_supported,
+                        h.input_modalities, h.output_modalities,
                         h.effective_from, h.effective_until, h.changed_by_user_id, h.changed_by_user_email,
                         h.change_reason, h.created_at
                     FROM model_history h
@@ -726,7 +800,8 @@ impl ModelRepository {
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token, cost_per_image,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
-                              provider_type, provider_config, attestation_supported
+                              provider_type, provider_config, attestation_supported,
+                              input_modalities, output_modalities
                     "#,
                     &[&model_name],
                 )
@@ -803,6 +878,8 @@ impl ModelRepository {
                     provider_type,
                     provider_config,
                     attestation_supported,
+                    input_modalities,
+                    output_modalities,
                     effective_from,
                     effective_until,
                     changed_by_user_id,
@@ -810,8 +887,8 @@ impl ModelRepository {
                     change_reason,
                     created_at
                 ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-                    NOW(), NULL, $16, $17, $18, NOW()
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                    NOW(), NULL, $18, $19, $20, NOW()
                 )
                 "#,
                 &[
@@ -832,6 +909,14 @@ impl ModelRepository {
                         .try_get::<_, serde_json::Value>("provider_config")
                         .ok(),
                     &model_row.try_get::<_, bool>("attestation_supported").ok(),
+                    &model_row
+                        .try_get::<_, Option<serde_json::Value>>("input_modalities")
+                        .ok()
+                        .flatten(),
+                    &model_row
+                        .try_get::<_, Option<serde_json::Value>>("output_modalities")
+                        .ok()
+                        .flatten(),
                     &changed_by_user_id,
                     &changed_by_user_email,
                     change_reason,
@@ -908,6 +993,8 @@ impl ModelRepository {
                         m.provider_type,
                         m.provider_config,
                         m.attestation_supported,
+                        m.input_modalities,
+                        m.output_modalities,
                         COALESCE(
                             array_agg(ma_all.alias_name)
                             FILTER (WHERE ma_all.alias_name IS NOT NULL),
@@ -942,9 +1029,10 @@ impl ModelRepository {
 
     /// Helper method to convert database row to Model
     fn row_to_model(&self, row: &Row) -> Model {
+        let model_name: String = row.get("model_name");
         Model {
             id: row.get("id"),
-            model_name: row.get("model_name"),
+            model_name: model_name.clone(),
             model_display_name: row.get("model_display_name"),
             model_description: row.get("model_description"),
             model_icon: row.get("model_icon"),
@@ -963,11 +1051,26 @@ impl ModelRepository {
                 .unwrap_or_else(|_| "vllm".to_string()),
             provider_config: row.try_get("provider_config").ok().flatten(),
             attestation_supported: row.try_get("attestation_supported").unwrap_or(true),
+            input_modalities: deserialize_modalities(
+                row.try_get::<_, Option<serde_json::Value>>("input_modalities")
+                    .ok()
+                    .flatten(),
+                "input_modalities",
+                &model_name,
+            ),
+            output_modalities: deserialize_modalities(
+                row.try_get::<_, Option<serde_json::Value>>("output_modalities")
+                    .ok()
+                    .flatten(),
+                "output_modalities",
+                &model_name,
+            ),
         }
     }
 
     /// Helper method to convert database row to ModelHistory
     fn row_to_model_history(&self, row: &Row) -> ModelHistory {
+        let model_name: String = row.get("model_name");
         ModelHistory {
             id: row.get("id"),
             model_id: row.get("model_id"),
@@ -975,7 +1078,7 @@ impl ModelRepository {
             output_cost_per_token: row.get("output_cost_per_token"),
             cost_per_image: row.get("cost_per_image"),
             context_length: row.get("context_length"),
-            model_name: row.get("model_name"),
+            model_name: model_name.clone(),
             model_display_name: row.get("model_display_name"),
             model_description: row.get("model_description"),
             model_icon: row.get("model_icon"),
@@ -985,6 +1088,20 @@ impl ModelRepository {
             provider_type: row.try_get("provider_type").ok().flatten(),
             provider_config: row.try_get("provider_config").ok().flatten(),
             attestation_supported: row.try_get("attestation_supported").ok().flatten(),
+            input_modalities: deserialize_modalities(
+                row.try_get::<_, Option<serde_json::Value>>("input_modalities")
+                    .ok()
+                    .flatten(),
+                "input_modalities",
+                &model_name,
+            ),
+            output_modalities: deserialize_modalities(
+                row.try_get::<_, Option<serde_json::Value>>("output_modalities")
+                    .ok()
+                    .flatten(),
+                "output_modalities",
+                &model_name,
+            ),
             effective_from: row.get("effective_from"),
             effective_until: row.get("effective_until"),
             changed_by_user_id: row.get("changed_by_user_id"),
@@ -1012,6 +1129,7 @@ impl ModelRepository {
                         m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image,
                         m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
                         m.provider_type, m.provider_config, m.attestation_supported,
+                        m.input_modalities, m.output_modalities,
                         COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                     FROM models m
                     LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -1064,6 +1182,8 @@ impl services::models::ModelsRepository for ModelRepository {
                 provider_type: m.provider_type,
                 provider_config: m.provider_config,
                 attestation_supported: m.attestation_supported,
+                input_modalities: m.input_modalities,
+                output_modalities: m.output_modalities,
             })
             .collect())
     }
@@ -1089,6 +1209,8 @@ impl services::models::ModelsRepository for ModelRepository {
             provider_type: m.provider_type,
             provider_config: m.provider_config,
             attestation_supported: m.attestation_supported,
+            input_modalities: m.input_modalities,
+            output_modalities: m.output_modalities,
         }))
     }
 
@@ -1113,6 +1235,8 @@ impl services::models::ModelsRepository for ModelRepository {
             provider_type: m.provider_type,
             provider_config: m.provider_config,
             attestation_supported: m.attestation_supported,
+            input_modalities: m.input_modalities,
+            output_modalities: m.output_modalities,
         }))
     }
 

@@ -389,6 +389,64 @@ impl OrganizationUsageRepository {
         }
     }
 
+    /// Get the stop reason for a specific response ID
+    /// Used to check if a response was stopped due to client disconnect
+    pub async fn get_stop_reason_by_response_id(
+        &self,
+        response_id: Uuid,
+    ) -> Result<Option<StopReason>> {
+        let row_opt = retry_db!("get_stop_reason_by_response_id", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_opt(
+                    r#"SELECT stop_reason FROM organization_usage_log WHERE response_id = $1"#,
+                    &[&response_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(row_opt.and_then(|row| {
+            let stop_reason_str: Option<String> = row.get("stop_reason");
+            stop_reason_str.as_deref().map(StopReason::parse)
+        }))
+    }
+
+    /// Get the stop reason for a specific provider request ID (e.g., chatcmpl-xxx)
+    /// Used to check if a chat completion was stopped due to client disconnect
+    pub async fn get_stop_reason_by_provider_request_id(
+        &self,
+        provider_request_id: &str,
+    ) -> Result<Option<StopReason>> {
+        let row_opt = retry_db!("get_stop_reason_by_provider_request_id", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_opt(
+                    r#"SELECT stop_reason FROM organization_usage_log WHERE provider_request_id = $1"#,
+                    &[&provider_request_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(row_opt.and_then(|row| {
+            let stop_reason_str: Option<String> = row.get("stop_reason");
+            stop_reason_str.as_deref().map(StopReason::parse)
+        }))
+    }
+
     /// Get costs by inference IDs (for HuggingFace billing integration)
     /// Returns costs for all requested inference_ids that belong to the organization
     /// Missing inference_ids will have cost = 0

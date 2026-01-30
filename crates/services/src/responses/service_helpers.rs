@@ -476,10 +476,15 @@ impl EventEmitter {
 /// Information about a detected tool call from the LLM
 #[derive(Debug, Clone)]
 pub struct ToolCallInfo {
+    /// The tool call ID from the LLM (e.g., "toolu_xxx" for Anthropic, "call_xxx" for OpenAI)
+    /// Used to match tool results back to the original tool call
+    pub id: Option<String>,
     pub tool_type: String,
     pub query: String,
     /// Additional parameters parsed from the tool call arguments
     pub params: Option<serde_json::Value>,
+    /// Thought signature for Gemini 3 models (required for tool calls to work correctly)
+    pub thought_signature: Option<String>,
 }
 
 /// Result of processing a completion stream
@@ -496,5 +501,19 @@ pub struct ProcessStreamResult {
     pub stream_error: bool,
 }
 
+/// Entry for accumulated tool call data from streaming chunks
+#[derive(Debug, Clone, Default)]
+pub struct ToolCallAccumulatorEntry {
+    /// The tool call ID from the LLM (e.g., "call_xxx" for OpenAI, "toolu_xxx" for Anthropic)
+    pub id: Option<String>,
+    /// The function name
+    pub name: Option<String>,
+    /// Accumulated arguments JSON string
+    pub arguments: String,
+    /// Thought signature for Gemini 3 models
+    pub thought_signature: Option<String>,
+}
+
 /// Accumulator for streaming tool calls
-pub type ToolCallAccumulator = std::collections::HashMap<i64, (Option<String>, String)>;
+/// Maps tool call index -> accumulated entry data
+pub type ToolCallAccumulator = std::collections::HashMap<i64, ToolCallAccumulatorEntry>;

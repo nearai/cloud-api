@@ -25,7 +25,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Log in to Docker registry
-        uses: docker/login-action@6862ffc5ab2cdb4405cf318a62a6f4c066e2298b
+        uses: docker/login-action@0567fa5ae8c9a197cb207537dc5cbb43ca3d803f
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ vars.DOCKER_REGISTRY_USER }}
@@ -57,7 +57,7 @@ jobs:
 
       - name: Build and push reproducible image
         run: |
-          ./docker-build.sh --push "${{ env.IMAGE_REFERENCE }}"
+          ./build-image.sh --push "${{ env.IMAGE_REFERENCE }}"
 
       - name: Get image digest
         run: |

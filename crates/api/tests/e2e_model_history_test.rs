@@ -529,3 +529,134 @@ async fn test_soft_delete_without_reason_backward_compatibility() {
         "Should use default reason when none provided"
     );
 }
+
+/// Test 8: Model history should track input/output modalities
+#[tokio::test]
+async fn test_model_history_tracks_modalities() {
+    let (server, _guard) = setup_test_server().await;
+    let model_name = format!("test-model-modalities-{}", uuid::Uuid::new_v4());
+
+    // Create a model with modalities
+    let mut batch = HashMap::new();
+    batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 1000,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 2000,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Multimodal Model",
+            "modelDescription": "A model with text and image input",
+            "contextLength": 4096,
+            "verifiable": true,
+            "isActive": true,
+            "inputModalities": ["text", "image"],
+            "outputModalities": ["text"],
+            "changeReason": "Initial creation with modalities"
+        }))
+        .unwrap(),
+    );
+
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+
+    // Get history via API
+    let response = server
+        .get(format!("/v1/admin/models/{model_name}/history").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(response.status_code(), 200, "Failed to get model history");
+    let history_response = response.json::<api::models::ModelHistoryResponse>();
+
+    assert_eq!(
+        history_response.history.len(),
+        1,
+        "Should have 1 history record"
+    );
+
+    let history_entry = &history_response.history[0];
+
+    // Verify modalities are recorded in history
+    assert_eq!(
+        history_entry.input_modalities.as_ref().unwrap(),
+        &vec!["text".to_string(), "image".to_string()],
+        "Input modalities should be recorded in history"
+    );
+    assert_eq!(
+        history_entry.output_modalities.as_ref().unwrap(),
+        &vec!["text".to_string()],
+        "Output modalities should be recorded in history"
+    );
+
+    // Update the model with different modalities
+    let mut batch2 = HashMap::new();
+    batch2.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 1500,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 2500,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Multimodal Model V2",
+            "modelDescription": "Now supports audio input too",
+            "contextLength": 8192,
+            "verifiable": true,
+            "isActive": true,
+            "inputModalities": ["text", "image", "audio"],
+            "outputModalities": ["text", "audio"],
+            "changeReason": "Added audio modality"
+        }))
+        .unwrap(),
+    );
+
+    admin_batch_upsert_models(&server, batch2, get_session_id()).await;
+
+    // Get updated history
+    let response = server
+        .get(format!("/v1/admin/models/{model_name}/history").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    let history_response = response.json::<api::models::ModelHistoryResponse>();
+
+    assert_eq!(
+        history_response.history.len(),
+        2,
+        "Should have 2 history records"
+    );
+
+    // Most recent entry (index 0) should have updated modalities
+    let latest_entry = &history_response.history[0];
+    assert_eq!(
+        latest_entry.input_modalities.as_ref().unwrap(),
+        &vec!["text".to_string(), "image".to_string(), "audio".to_string()],
+        "Latest history should have updated input modalities"
+    );
+    assert_eq!(
+        latest_entry.output_modalities.as_ref().unwrap(),
+        &vec!["text".to_string(), "audio".to_string()],
+        "Latest history should have updated output modalities"
+    );
+
+    // Previous entry (index 1) should have original modalities
+    let previous_entry = &history_response.history[1];
+    assert_eq!(
+        previous_entry.input_modalities.as_ref().unwrap(),
+        &vec!["text".to_string(), "image".to_string()],
+        "Previous history should have original input modalities"
+    );
+    assert_eq!(
+        previous_entry.output_modalities.as_ref().unwrap(),
+        &vec!["text".to_string()],
+        "Previous history should have original output modalities"
+    );
+}

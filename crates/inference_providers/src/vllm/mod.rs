@@ -2,6 +2,8 @@ use crate::{models::StreamOptions, sse_parser::new_sse_parser, ImageGenerationEr
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Convert any displayable error to ImageGenerationError::GenerationError
 fn to_image_gen_error<E: std::fmt::Display>(e: E) -> ImageGenerationError {
@@ -404,7 +406,7 @@ impl InferenceProvider for VLlmProvider {
     /// Performs an image generation request
     async fn image_generation(
         &self,
-        params: ImageGenerationParams,
+        mut params: ImageGenerationParams,
         request_hash: String,
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
         let url = format!("{}/v1/images/generations", self.config.base_url);
@@ -416,11 +418,15 @@ impl InferenceProvider for VLlmProvider {
             HeaderValue::from_str(&request_hash).map_err(to_image_gen_error)?,
         );
 
+        // Forward encryption headers from extra to HTTP headers
+        self.prepare_encryption_headers(&mut headers, &mut params.extra);
+
         let response = self
             .client
             .post(&url)
             .headers(headers)
             .json(&params)
+            .timeout(Duration::from_secs(180))
             .send()
             .await
             .map_err(to_image_gen_error)?;
@@ -448,5 +454,321 @@ impl InferenceProvider for VLlmProvider {
             response: image_response,
             raw_bytes,
         })
+    }
+
+    /// Performs an image edit request
+    async fn image_edit(
+        &self,
+        params: Arc<ImageEditParams>,
+        request_hash: String,
+    ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
+        let url = format!("{}/v1/images/edits", self.config.base_url);
+
+        // Build headers without Content-Type (let reqwest set multipart boundary)
+        let mut headers = reqwest::header::HeaderMap::new();
+
+        if let Some(ref api_key) = self.config.api_key {
+            let auth_value = format!("Bearer {api_key}");
+            let header_value = HeaderValue::from_str(&auth_value)
+                .map_err(|e| ImageEditError::EditError(format!("Invalid API key format: {e}")))?;
+            headers.insert("Authorization", header_value);
+        }
+
+        headers.insert(
+            "X-Request-Hash",
+            HeaderValue::from_str(&request_hash)
+                .map_err(|e| ImageEditError::EditError(format!("Invalid request hash: {e}")))?,
+        );
+
+        // Dereference Arc<Vec<u8>> to get &[u8] for efficient handling
+        let image_data: &[u8] = &params.image;
+
+        // Detect image MIME type based on magic bytes
+        let image_mime_type = if image_data.len() >= 3 && &image_data[0..3] == b"\xFF\xD8\xFF" {
+            "image/jpeg"
+        } else if image_data.len() >= 4 && &image_data[0..4] == b"\x89PNG" {
+            "image/png"
+        } else {
+            "image/jpeg" // Default to jpeg
+        };
+
+        // Build multipart form data
+        let mut form = reqwest::multipart::Form::new();
+
+        // Add text fields first (clone strings since Arc doesn't allow moving)
+        form = form.text("model", params.model.clone());
+        form = form.text("prompt", params.prompt.clone());
+
+        // Add image as image[] field (vLLM expects array syntax)
+        let image_part = reqwest::multipart::Part::bytes(image_data.to_vec())
+            .file_name("image.bin")
+            .mime_str(image_mime_type)
+            .map_err(|e| ImageEditError::EditError(format!("Invalid image MIME type: {e}")))?;
+        form = form.part("image[]", image_part);
+
+        // Add optional text parameters
+        if let Some(size) = params.size.as_ref() {
+            form = form.text("size", size.clone());
+        }
+        if let Some(response_format) = params.response_format.as_ref() {
+            form = form.text("response_format", response_format.clone());
+        }
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .multipart(form)
+            .timeout(Duration::from_secs(180))
+            .send()
+            .await
+            .map_err(|e| ImageEditError::EditError(format!("Request failed: {e}")))?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(ImageEditError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        // Get raw bytes first for exact hash verification (same pattern as image_generation)
+        let raw_bytes = response
+            .bytes()
+            .await
+            .map_err(|e| ImageEditError::EditError(format!("Failed to read response body: {e}")))?
+            .to_vec();
+
+        // Parse the response from the raw bytes
+        let edit_response: ImageGenerationResponse = serde_json::from_slice(&raw_bytes)
+            .map_err(|e| ImageEditError::EditError(format!("Failed to parse response: {e}")))?;
+
+        Ok(ImageEditResponseWithBytes {
+            response: edit_response,
+            raw_bytes,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_provider() -> VLlmProvider {
+        VLlmProvider::new(VLlmConfig {
+            base_url: "http://localhost".to_string(),
+            api_key: None,
+            timeout_seconds: 30,
+        })
+    }
+
+    #[test]
+    fn test_prepare_encryption_headers_removes_keys_from_extra() {
+        let provider = create_test_provider();
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            encryption_headers::SIGNING_ALGO.to_string(),
+            serde_json::Value::String("ecdsa".to_string()),
+        );
+        extra.insert(
+            encryption_headers::CLIENT_PUB_KEY.to_string(),
+            serde_json::Value::String("abc123".to_string()),
+        );
+        extra.insert(
+            encryption_headers::MODEL_PUB_KEY.to_string(),
+            serde_json::Value::String("def456".to_string()),
+        );
+
+        provider.prepare_encryption_headers(&mut headers, &mut extra);
+
+        // Verify all encryption keys removed from extra
+        assert!(
+            !extra.contains_key(encryption_headers::SIGNING_ALGO),
+            "x_signing_algo should be removed from extra"
+        );
+        assert!(
+            !extra.contains_key(encryption_headers::CLIENT_PUB_KEY),
+            "x_client_pub_key should be removed from extra"
+        );
+        assert!(
+            !extra.contains_key(encryption_headers::MODEL_PUB_KEY),
+            "x_model_pub_key should be removed from extra"
+        );
+    }
+
+    #[test]
+    fn test_prepare_encryption_headers_forwards_to_http_headers() {
+        let provider = create_test_provider();
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            encryption_headers::SIGNING_ALGO.to_string(),
+            serde_json::Value::String("ecdsa".to_string()),
+        );
+        extra.insert(
+            encryption_headers::CLIENT_PUB_KEY.to_string(),
+            serde_json::Value::String("abc123".to_string()),
+        );
+        extra.insert(
+            encryption_headers::MODEL_PUB_KEY.to_string(),
+            serde_json::Value::String("def456".to_string()),
+        );
+
+        provider.prepare_encryption_headers(&mut headers, &mut extra);
+
+        // Verify encryption headers forwarded (except model_pub_key)
+        assert_eq!(
+            headers.get("X-Signing-Algo").unwrap(),
+            "ecdsa",
+            "X-Signing-Algo header should be forwarded"
+        );
+        assert_eq!(
+            headers.get("X-Client-Pub-Key").unwrap(),
+            "abc123",
+            "X-Client-Pub-Key header should be forwarded"
+        );
+        // model_pub_key should NOT be forwarded (used only for routing, not sent to vllm-proxy)
+        assert!(
+            headers.get("X-Model-Pub-Key").is_none(),
+            "X-Model-Pub-Key should NOT be forwarded to HTTP headers"
+        );
+    }
+
+    #[test]
+    fn test_prepare_encryption_headers_preserves_other_extra_fields() {
+        let provider = create_test_provider();
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            encryption_headers::SIGNING_ALGO.to_string(),
+            serde_json::Value::String("ecdsa".to_string()),
+        );
+        extra.insert(
+            "some_other_field".to_string(),
+            serde_json::Value::String("should_remain".to_string()),
+        );
+        extra.insert(
+            "another_field".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(42)),
+        );
+
+        provider.prepare_encryption_headers(&mut headers, &mut extra);
+
+        // Encryption key should be removed
+        assert!(!extra.contains_key(encryption_headers::SIGNING_ALGO));
+        // Other fields should remain
+        assert_eq!(
+            extra.get("some_other_field"),
+            Some(&serde_json::Value::String("should_remain".to_string())),
+            "Non-encryption fields should be preserved in extra"
+        );
+        assert_eq!(
+            extra.get("another_field"),
+            Some(&serde_json::Value::Number(serde_json::Number::from(42))),
+            "Non-encryption fields should be preserved in extra"
+        );
+    }
+
+    /// This test documents the danger of serde(flatten) on extra fields.
+    /// If encryption headers are NOT removed from extra before serialization,
+    /// they WILL appear in the JSON body sent to vLLM.
+    #[test]
+    fn test_image_generation_params_flatten_behavior_leaks_extra_to_json() {
+        let mut extra = std::collections::HashMap::new();
+        // Simulate encryption headers that SHOULD have been removed
+        extra.insert(
+            encryption_headers::SIGNING_ALGO.to_string(),
+            serde_json::Value::String("ecdsa".to_string()),
+        );
+
+        let params = ImageGenerationParams {
+            model: "test-model".to_string(),
+            prompt: "test prompt".to_string(),
+            n: None,
+            size: None,
+            response_format: None,
+            quality: None,
+            style: None,
+            extra,
+        };
+
+        let json = serde_json::to_string(&params).unwrap();
+
+        // This test documents the DANGER: if encryption headers are NOT removed
+        // from extra before serialization, they WILL appear in JSON due to flatten
+        assert!(
+            json.contains("x_signing_algo"),
+            "Test demonstrates flatten behavior - encryption headers in extra leak to JSON body. \
+             This is why prepare_encryption_headers MUST be called before serialization."
+        );
+    }
+
+    /// Regression test: verifies that after prepare_encryption_headers is called,
+    /// the serialized ImageGenerationParams will NOT contain encryption keys.
+    #[test]
+    fn test_image_generation_params_no_encryption_keys_after_preparation() {
+        let provider = create_test_provider();
+
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            encryption_headers::SIGNING_ALGO.to_string(),
+            serde_json::Value::String("ecdsa".to_string()),
+        );
+        extra.insert(
+            encryption_headers::CLIENT_PUB_KEY.to_string(),
+            serde_json::Value::String("abc123".to_string()),
+        );
+        extra.insert(
+            encryption_headers::MODEL_PUB_KEY.to_string(),
+            serde_json::Value::String("def456".to_string()),
+        );
+        extra.insert(
+            "some_valid_param".to_string(),
+            serde_json::Value::String("value".to_string()),
+        );
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        provider.prepare_encryption_headers(&mut headers, &mut extra);
+
+        let params = ImageGenerationParams {
+            model: "test-model".to_string(),
+            prompt: "test prompt".to_string(),
+            n: None,
+            size: None,
+            response_format: None,
+            quality: None,
+            style: None,
+            extra,
+        };
+
+        let json = serde_json::to_string(&params).unwrap();
+
+        // After preparation, encryption keys should NOT appear in JSON
+        assert!(
+            !json.contains("x_signing_algo"),
+            "x_signing_algo should NOT appear in serialized JSON after prepare_encryption_headers"
+        );
+        assert!(
+            !json.contains("x_client_pub_key"),
+            "x_client_pub_key should NOT appear in serialized JSON after prepare_encryption_headers"
+        );
+        assert!(
+            !json.contains("x_model_pub_key"),
+            "x_model_pub_key should NOT appear in serialized JSON after prepare_encryption_headers"
+        );
+
+        // Valid params should still be present
+        assert!(
+            json.contains("some_valid_param"),
+            "Non-encryption extra fields should still be serialized"
+        );
     }
 }

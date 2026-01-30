@@ -177,9 +177,11 @@ mod tests {
         let executor = FileSearchToolExecutor::new(provider);
 
         let tool_call = ToolCallInfo {
+            id: None,
             tool_type: FILE_SEARCH_TOOL_NAME.to_string(),
             query: "test query".to_string(),
             params: None,
+            thought_signature: None,
         };
 
         let request = create_test_request(); // No conversation
@@ -207,9 +209,11 @@ mod tests {
 
         let executor = FileSearchToolExecutor::new(provider);
         let tool_call = ToolCallInfo {
+            id: None,
             tool_type: FILE_SEARCH_TOOL_NAME.to_string(),
             query: "test query".to_string(),
             params: None,
+            thought_signature: None,
         };
 
         let conv_uuid = uuid::Uuid::new_v4();

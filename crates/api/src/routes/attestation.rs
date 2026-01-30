@@ -5,7 +5,7 @@ use axum::{
     response::Json as ResponseJson,
 };
 use serde::{Deserialize, Serialize};
-use services::attestation::AttestationError;
+use services::attestation::{AttestationError, SignatureLookupResult};
 use utoipa::{IntoParams, ToSchema};
 
 /// Query parameters for signature endpoint
@@ -35,9 +35,17 @@ impl From<services::attestation::ChatSignature> for SignatureResponse {
     }
 }
 
+/// Response when signature is unavailable (e.g., due to client disconnect)
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SignatureUnavailableResponse {
+    pub error_code: String,
+    pub message: String,
+}
+
 /// Get completion signature
 ///
 /// Get cryptographic signature for a chat completion for verification.
+/// Returns signature data on success, or an unavailable response if the stream was disconnected.
 #[utoipa::path(
     get,
     path = "/v1/signature/{chat_id}",
@@ -46,7 +54,7 @@ impl From<services::attestation::ChatSignature> for SignatureResponse {
         SignatureQuery
     ),
     responses(
-        (status = 200, description = "Signature retrieved", body = SignatureResponse),
+        (status = 200, description = "Signature retrieved or unavailable due to disconnect", body = SignatureResponse),
         (status = 404, description = "Signature not found", body = ErrorResponse),
         (status = 400, description = "Invalid parameters", body = ErrorResponse)
     ),
@@ -59,9 +67,9 @@ pub async fn get_signature(
     Path(chat_id): Path<String>,
     Query(params): Query<SignatureQuery>,
     State(app_state): State<AppState>,
-) -> Result<ResponseJson<SignatureResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+) -> Result<ResponseJson<serde_json::Value>, (StatusCode, ResponseJson<ErrorResponse>)> {
     let signing_algo = params.signing_algo;
-    let signature = app_state
+    let result = app_state
         .attestation_service
         .get_chat_signature(chat_id.as_str(), signing_algo)
         .await
@@ -78,8 +86,41 @@ pub async fn get_signature(
             )
         })?;
 
-    let signature = signature.into();
-    Ok(ResponseJson(signature))
+    // Handle both Found and Unavailable results
+    match result {
+        SignatureLookupResult::Found(signature) => {
+            let response: SignatureResponse = signature.into();
+            serde_json::to_value(response)
+                .map(ResponseJson)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse {
+                            error: format!("Failed to serialize signature response: {e}"),
+                        }),
+                    )
+                })
+        }
+        SignatureLookupResult::Unavailable {
+            error_code,
+            message,
+        } => {
+            let response = SignatureUnavailableResponse {
+                error_code,
+                message,
+            };
+            serde_json::to_value(response)
+                .map(ResponseJson)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse {
+                            error: format!("Failed to serialize unavailable response: {e}"),
+                        }),
+                    )
+                })
+        }
+    }
 }
 
 /// Query parameters for attestation report

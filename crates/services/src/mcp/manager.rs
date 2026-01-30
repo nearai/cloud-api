@@ -320,6 +320,7 @@ impl McpClientManager {
         let request_params = CallToolRequestParam {
             name: name.clone().into(),
             arguments: args,
+            task: None,
         };
 
         let result = {

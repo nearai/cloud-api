@@ -553,6 +553,37 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
 
         Ok(conversations)
     }
+
+    async fn get_or_create_root_response(
+        &self,
+        conversation_id: models::ConversationId,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<crate::responses::models::ResponseObject>, errors::ConversationError> {
+        // Ensure the conversation exists and belongs to this workspace.
+        let conversation = self
+            .conv_repo
+            .get_by_id(conversation_id, workspace_id.clone())
+            .await
+            .map_err(|e| {
+                errors::ConversationError::InternalError(format!("Failed to get conversation: {e}"))
+            })?;
+
+        let Some(conversation) = conversation else {
+            return Ok(None);
+        };
+
+        let root = self
+            .resp_repo
+            .get_or_create_root_response(conversation_id, workspace_id, conversation.api_key_id)
+            .await
+            .map_err(|e| {
+                errors::ConversationError::InternalError(format!(
+                    "Failed to get or create root response: {e}"
+                ))
+            })?;
+
+        Ok(Some(root))
+    }
 }
 
 #[cfg(test)]

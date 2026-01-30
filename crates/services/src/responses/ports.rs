@@ -69,6 +69,17 @@ pub trait ResponseRepositoryTrait: Send + Sync {
         conversation_id: ConversationId,
         workspace_id: WorkspaceId,
     ) -> anyhow::Result<Option<models::ResponseObject>>;
+
+    /// Get or create the hidden structural root response ("root_response") for a conversation.
+    ///
+    /// This is idempotent per conversation and safe under concurrent calls (enforced by a
+    /// partial unique index on responses where metadata.root_response=true).
+    async fn get_or_create_root_response(
+        &self,
+        conversation_id: ConversationId,
+        workspace_id: WorkspaceId,
+        api_key_id: uuid::Uuid,
+    ) -> anyhow::Result<models::ResponseObject>;
 }
 
 #[async_trait]

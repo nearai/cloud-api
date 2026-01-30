@@ -986,6 +986,10 @@ pub fn build_conversation_routes(
     Router::new()
         .route("/conversations", post(conversations::create_conversation))
         .route(
+            "/conversations/{conversation_id}/root_response",
+            post(conversations::get_or_create_root_response),
+        )
+        .route(
             "/conversations/batch",
             post(conversations::batch_get_conversations),
         )

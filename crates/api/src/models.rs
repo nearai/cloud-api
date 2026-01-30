@@ -1095,6 +1095,12 @@ pub struct ConversationObject {
     pub metadata: serde_json::Value,
 }
 
+/// Conversation root response reference (idempotent get-or-create result)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ConversationRootResponse {
+    pub root_response_id: String,
+}
+
 /// Deleted conversation result
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ConversationDeleteResult {

@@ -846,4 +846,22 @@ impl ResponseRepositoryTrait for PgResponseRepository {
 
         Ok(Some(response_obj))
     }
+
+    async fn get_or_create_root_response(
+        &self,
+        conversation_id: services::conversations::models::ConversationId,
+        workspace_id: WorkspaceId,
+        api_key_id: uuid::Uuid,
+    ) -> Result<ResponseObject, anyhow::Error> {
+        let root_uuid = self
+            .get_or_create_root(conversation_id.0, &workspace_id, &api_key_id)
+            .await?;
+
+        let root = self
+            .get_by_id(ResponseId(root_uuid), workspace_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("root_response not found after create"))?;
+
+        Ok(root)
+    }
 }

@@ -142,4 +142,17 @@ pub trait ConversationServiceTrait: Send + Sync {
         conversation_ids: Vec<conversations::models::ConversationId>,
         workspace_id: WorkspaceId,
     ) -> Result<Vec<conversations::models::Conversation>, conversations::errors::ConversationError>;
+
+    /// Get or create the hidden structural root response for a conversation.
+    ///
+    /// This is an explicit API-oriented helper to support first-turn parallel responses
+    /// (multiple models sharing the same parent) without changing default response creation.
+    async fn get_or_create_root_response(
+        &self,
+        conversation_id: conversations::models::ConversationId,
+        workspace_id: WorkspaceId,
+    ) -> Result<
+        Option<crate::responses::models::ResponseObject>,
+        conversations::errors::ConversationError,
+    >;
 }

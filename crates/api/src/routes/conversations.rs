@@ -105,6 +105,70 @@ pub async fn create_conversation(
     }
 }
 
+/// Get or create the structural root response for a conversation
+///
+/// This endpoint is idempotent: repeated calls return the same root response.
+/// It is intended for clients that need first-turn parallel responses (multiple models)
+/// to share the same parent node.
+#[utoipa::path(
+    post,
+    path = "/v1/conversations/{conversation_id}/root_response",
+    tag = "Conversations",
+    params(
+        ("conversation_id" = String, Path, description = "Conversation ID")
+    ),
+    responses(
+        (status = 200, description = "Root response id", body = ConversationRootResponse),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Conversation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn get_or_create_root_response(
+    Path(conversation_id): Path<String>,
+    State(service): State<Arc<dyn services::conversations::ports::ConversationServiceTrait>>,
+    Extension(api_key): Extension<services::workspace::ApiKey>,
+) -> Result<ResponseJson<ConversationRootResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    debug!(
+        "Get or create root_response for conversation {} in workspace {}",
+        conversation_id, api_key.workspace_id.0
+    );
+
+    let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
+        Ok(id) => id,
+        Err(error) => {
+            return Err((
+                map_conversation_error_to_status(&error),
+                ResponseJson(error.into()),
+            ))
+        }
+    };
+
+    match service
+        .get_or_create_root_response(parsed_conversation_id, api_key.workspace_id.clone())
+        .await
+    {
+        Ok(Some(root_response)) => Ok(ResponseJson(ConversationRootResponse {
+            root_response_id: root_response.id,
+        })),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            ResponseJson(ErrorResponse::new(
+                "Conversation not found".to_string(),
+                "not_found_error".to_string(),
+            )),
+        )),
+        Err(error) => Err((
+            map_conversation_error_to_status(&error),
+            ResponseJson(error.into()),
+        )),
+    }
+}
+
 /// Batch retrieve conversations
 ///
 /// Retrieve multiple conversations in a single request using their IDs.

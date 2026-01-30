@@ -47,6 +47,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::models::get_model_by_name,
         // Conversation endpoints
         crate::routes::conversations::create_conversation,
+        crate::routes::conversations::get_or_create_root_response,
         crate::routes::conversations::get_conversation,
         crate::routes::conversations::update_conversation,
         crate::routes::conversations::delete_conversation,

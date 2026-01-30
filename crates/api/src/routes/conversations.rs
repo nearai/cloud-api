@@ -1384,6 +1384,9 @@ fn convert_domain_conversation_to_http(
         id: domain_conversation.id.to_string(),
         object: "conversation".to_string(),
         created_at: domain_conversation.created_at.timestamp(),
+        root_response_id: domain_conversation
+            .root_response_id
+            .expect("ConversationService should always set root_response_id"),
         metadata: serde_json::Value::Object(metadata),
     }
 }

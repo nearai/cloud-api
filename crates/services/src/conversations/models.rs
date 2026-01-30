@@ -46,6 +46,8 @@ pub struct Conversation {
     pub id: ConversationId,
     pub workspace_id: WorkspaceId,
     pub api_key_id: uuid::Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_response_id: Option<String>,
     pub pinned_at: Option<DateTime<Utc>>, // Timestamp when pinned, NULL if not pinned
     pub archived_at: Option<DateTime<Utc>>, // Timestamp when archived, NULL if not archived
     pub deleted_at: Option<DateTime<Utc>>, // Timestamp when soft-deleted, NULL if not deleted

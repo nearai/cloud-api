@@ -846,4 +846,16 @@ impl ResponseRepositoryTrait for PgResponseRepository {
 
         Ok(Some(response_obj))
     }
+
+    async fn ensure_root_response(
+        &self,
+        conversation_id: services::conversations::models::ConversationId,
+        workspace_id: WorkspaceId,
+        api_key_id: uuid::Uuid,
+    ) -> Result<String, anyhow::Error> {
+        let root_uuid = self
+            .get_or_create_root(conversation_id.0, &workspace_id, &api_key_id)
+            .await?;
+        Ok(format!("resp_{}", root_uuid.simple()))
+    }
 }

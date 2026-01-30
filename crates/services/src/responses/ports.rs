@@ -69,6 +69,17 @@ pub trait ResponseRepositoryTrait: Send + Sync {
         conversation_id: ConversationId,
         workspace_id: WorkspaceId,
     ) -> anyhow::Result<Option<models::ResponseObject>>;
+
+    /// Ensure the structural "root_response" exists for a conversation and return its ID.
+    ///
+    /// This is used to support first-turn parallel responses (multiple models starting from
+    /// the same parent) without racing on implicit "latest response" selection.
+    async fn ensure_root_response(
+        &self,
+        conversation_id: ConversationId,
+        workspace_id: WorkspaceId,
+        api_key_id: uuid::Uuid,
+    ) -> anyhow::Result<String>;
 }
 
 #[async_trait]

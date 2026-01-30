@@ -53,6 +53,27 @@ impl ConversationServiceImpl {
             response_items_repo,
         }
     }
+
+    async fn attach_root_response_id(
+        &self,
+        conversation: models::Conversation,
+        workspace_id: WorkspaceId,
+    ) -> Result<models::Conversation, errors::ConversationError> {
+        let root_response_id = self
+            .resp_repo
+            .ensure_root_response(conversation.id, workspace_id, conversation.api_key_id)
+            .await
+            .map_err(|e| {
+                errors::ConversationError::InternalError(format!(
+                    "Failed to ensure root response for conversation: {e}"
+                ))
+            })?;
+
+        Ok(models::Conversation {
+            root_response_id: Some(root_response_id),
+            ..conversation
+        })
+    }
 }
 
 #[async_trait]
@@ -81,10 +102,27 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
 
         tracing::info!("Created conversation: {}", db_conversation.id);
 
+        // Create the hidden structural root response immediately so clients can
+        // reliably run first-turn parallel responses (multiple models) under the same parent.
+        let root_response_id = self
+            .resp_repo
+            .ensure_root_response(
+                db_conversation.id,
+                request.workspace_id.clone(),
+                request.api_key_id,
+            )
+            .await
+            .map_err(|e| {
+                errors::ConversationError::InternalError(format!(
+                    "Failed to create root response for conversation: {e}"
+                ))
+            })?;
+
         let conversation = models::Conversation {
             id: db_conversation.id,
             workspace_id: db_conversation.workspace_id,
             api_key_id: db_conversation.api_key_id,
+            root_response_id: Some(root_response_id),
             pinned_at: db_conversation.pinned_at,
             archived_at: db_conversation.archived_at,
             deleted_at: db_conversation.deleted_at,
@@ -111,10 +149,11 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
                 errors::ConversationError::InternalError(format!("Failed to get conversation: {e}"))
             })?;
 
-        Ok(db_conversation.map(|c| models::Conversation {
+        let Some(c) = db_conversation.map(|c| models::Conversation {
             id: c.id,
             workspace_id: c.workspace_id,
             api_key_id: c.api_key_id,
+            root_response_id: None,
             pinned_at: c.pinned_at,
             archived_at: c.archived_at,
             deleted_at: c.deleted_at,
@@ -122,7 +161,11 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,
-        }))
+        }) else {
+            return Ok(None);
+        };
+
+        Ok(Some(self.attach_root_response_id(c, workspace_id).await?))
     }
 
     /// Update a conversation
@@ -142,10 +185,11 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
                 ))
             })?;
 
-        Ok(db_conversation.map(|c| models::Conversation {
+        let Some(c) = db_conversation.map(|c| models::Conversation {
             id: c.id,
             workspace_id: c.workspace_id,
             api_key_id: c.api_key_id,
+            root_response_id: None,
             pinned_at: c.pinned_at,
             archived_at: c.archived_at,
             deleted_at: c.deleted_at,
@@ -153,7 +197,11 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,
-        }))
+        }) else {
+            return Ok(None);
+        };
+
+        Ok(Some(self.attach_root_response_id(c, workspace_id).await?))
     }
 
     /// Pin or unpin a conversation
@@ -173,10 +221,11 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
                 ))
             })?;
 
-        Ok(db_conversation.map(|c| models::Conversation {
+        let Some(c) = db_conversation.map(|c| models::Conversation {
             id: c.id,
             workspace_id: c.workspace_id,
             api_key_id: c.api_key_id,
+            root_response_id: None,
             pinned_at: c.pinned_at,
             archived_at: c.archived_at,
             deleted_at: c.deleted_at,
@@ -184,7 +233,11 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,
-        }))
+        }) else {
+            return Ok(None);
+        };
+
+        Ok(Some(self.attach_root_response_id(c, workspace_id).await?))
     }
 
     /// Archive or unarchive a conversation
@@ -204,10 +257,11 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
                 ))
             })?;
 
-        Ok(db_conversation.map(|c| models::Conversation {
+        let Some(c) = db_conversation.map(|c| models::Conversation {
             id: c.id,
             workspace_id: c.workspace_id,
             api_key_id: c.api_key_id,
+            root_response_id: None,
             pinned_at: c.pinned_at,
             archived_at: c.archived_at,
             deleted_at: c.deleted_at,
@@ -215,7 +269,11 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,
-        }))
+        }) else {
+            return Ok(None);
+        };
+
+        Ok(Some(self.attach_root_response_id(c, workspace_id).await?))
     }
 
     /// Clone a conversation
@@ -235,10 +293,11 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
                 ))
             })?;
 
-        Ok(db_conversation.map(|c| models::Conversation {
+        let Some(c) = db_conversation.map(|c| models::Conversation {
             id: c.id,
             workspace_id: c.workspace_id,
             api_key_id: c.api_key_id,
+            root_response_id: None,
             pinned_at: c.pinned_at,
             archived_at: c.archived_at,
             deleted_at: c.deleted_at,
@@ -246,7 +305,11 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,
-        }))
+        }) else {
+            return Ok(None);
+        };
+
+        Ok(Some(self.attach_root_response_id(c, workspace_id).await?))
     }
 
     /// Delete a conversation
@@ -529,12 +592,13 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
 
         let num_conversations = db_conversations.len();
 
-        let conversations = db_conversations
-            .into_iter()
-            .map(|c| models::Conversation {
+        let mut conversations = Vec::with_capacity(db_conversations.len());
+        for c in db_conversations {
+            let conv = models::Conversation {
                 id: c.id,
                 workspace_id: c.workspace_id,
                 api_key_id: c.api_key_id,
+                root_response_id: None,
                 pinned_at: c.pinned_at,
                 archived_at: c.archived_at,
                 deleted_at: c.deleted_at,
@@ -542,8 +606,12 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
                 metadata: c.metadata,
                 created_at: c.created_at,
                 updated_at: c.updated_at,
-            })
-            .collect();
+            };
+            conversations.push(
+                self.attach_root_response_id(conv, workspace_id.clone())
+                    .await?,
+            );
+        }
 
         tracing::debug!(
             "Batch retrieved {} conversations for workspace: {}",
@@ -605,6 +673,7 @@ mod tests {
             id,
             workspace_id: workspace_id.clone(),
             api_key_id,
+            root_response_id: None,
             pinned_at: None,
             archived_at: None,
             deleted_at: None,

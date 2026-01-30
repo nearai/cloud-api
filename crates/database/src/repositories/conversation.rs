@@ -31,6 +31,7 @@ impl PgConversationRepository {
             id: id.into(),
             workspace_id: workspace_id.into(),
             api_key_id,
+            root_response_id: None,
             pinned_at: row.try_get("pinned_at")?,
             archived_at: row.try_get("archived_at")?,
             deleted_at: row.try_get("deleted_at")?,

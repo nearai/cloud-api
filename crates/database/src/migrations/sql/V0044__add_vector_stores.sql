@@ -145,3 +145,10 @@ CREATE TRIGGER set_vsf_updated_at
     BEFORE UPDATE ON vector_store_files
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
+
+-- =============================================================================
+-- Composite indexes for cursor-based pagination
+-- =============================================================================
+CREATE INDEX idx_vector_stores_pagination ON vector_stores(created_at, id);
+CREATE INDEX idx_vsf_pagination ON vector_store_files(vector_store_id, created_at, id);
+CREATE INDEX idx_vsfb_pagination ON vector_store_file_batches(vector_store_id, created_at, id);

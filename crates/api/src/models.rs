@@ -684,6 +684,8 @@ pub enum ResponseInput {
 pub struct ResponseInputItem {
     pub role: String,
     pub content: ResponseContent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Content can be text or array of content parts

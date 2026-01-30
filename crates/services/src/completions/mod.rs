@@ -458,6 +458,26 @@ impl CompletionServiceImpl {
         }
     }
 
+    /// Extract tools and tool_choice from extra HashMap if present.
+    /// This handles the case where the Responses API places tools in request.extra.
+    /// Returns (tools, tool_choice) and removes them from extra to avoid duplication.
+    fn extract_tools_from_extra(
+        extra: &mut std::collections::HashMap<String, serde_json::Value>,
+    ) -> (
+        Option<Vec<inference_providers::ToolDefinition>>,
+        Option<inference_providers::ToolChoice>,
+    ) {
+        let tools = extra.remove("tools").and_then(|v| {
+            serde_json::from_value::<Vec<inference_providers::ToolDefinition>>(v).ok()
+        });
+
+        let tool_choice = extra
+            .remove("tool_choice")
+            .and_then(|v| serde_json::from_value::<inference_providers::ToolChoice>(v).ok());
+
+        (tools, tool_choice)
+    }
+
     /// Get the concurrent request limit for an organization (cached)
     async fn get_org_concurrent_limit(&self, organization_id: Uuid) -> u32 {
         let default_limit = self.concurrent_limit;
@@ -560,17 +580,36 @@ impl CompletionServiceImpl {
     fn prepare_chat_messages(messages: &[ports::CompletionMessage]) -> Vec<ChatMessage> {
         messages
             .iter()
-            .map(|msg| ChatMessage {
-                role: match msg.role.as_str() {
-                    "system" => MessageRole::System,
-                    "assistant" => MessageRole::Assistant,
-                    "tool" => MessageRole::Tool,
-                    _ => MessageRole::User,
-                },
-                content: Some(serde_json::Value::String(msg.content.clone())),
-                name: None,
-                tool_call_id: None,
-                tool_calls: None,
+            .map(|msg| {
+                // Convert tool_calls from CompletionToolCall to inference_providers::models::ToolCall
+                let tool_calls = msg.tool_calls.as_ref().map(|calls| {
+                    calls
+                        .iter()
+                        .map(|tc| inference_providers::models::ToolCall {
+                            id: Some(tc.id.clone()),
+                            type_: Some("function".to_string()),
+                            function: inference_providers::models::FunctionCall {
+                                name: Some(tc.name.clone()),
+                                arguments: Some(tc.arguments.clone()),
+                            },
+                            index: None,
+                            thought_signature: tc.thought_signature.clone(),
+                        })
+                        .collect()
+                });
+
+                ChatMessage {
+                    role: match msg.role.as_str() {
+                        "system" => MessageRole::System,
+                        "assistant" => MessageRole::Assistant,
+                        "tool" => MessageRole::Tool,
+                        _ => MessageRole::User,
+                    },
+                    content: Some(serde_json::Value::String(msg.content.clone())),
+                    name: None,
+                    tool_call_id: msg.tool_call_id.clone(),
+                    tool_calls,
+                }
             })
             .collect()
     }
@@ -698,6 +737,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         let chat_messages = Self::prepare_chat_messages(&request.messages);
 
+        // Extract tools from extra if present (Responses API puts them there)
+        let mut extra = request.extra.clone();
+        let (tools, tool_choice) = Self::extract_tools_from_extra(&mut extra);
+
         let mut chat_params = inference_providers::ChatCompletionParams {
             model: request.model.clone(),
             messages: chat_messages,
@@ -706,7 +749,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             top_p: request.top_p,
             stop: request.stop,
             stream: Some(true),
-            tools: None,
+            tools,
             max_completion_tokens: None,
             n: request.n,
             frequency_penalty: None,
@@ -716,7 +759,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             top_logprobs: None,
             user: Some(request.user_id.to_string()),
             seed: None,
-            tool_choice: None,
+            tool_choice,
             parallel_tool_calls: None,
             // Drop metadata if store is not explicitly enabled (OpenAI requirement)
             metadata: if request.store == Some(true) {
@@ -727,7 +770,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             store: request.store,
             stream_options: None,
             modalities: None,
-            extra: request.extra.clone(),
+            extra,
         };
 
         // Resolve model name (could be an alias) and get model details in a single DB call
@@ -824,6 +867,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let service_start_time = Instant::now();
         let chat_messages = Self::prepare_chat_messages(&request.messages);
 
+        // Extract tools from extra if present (Responses API puts them there)
+        let mut extra = request.extra.clone();
+        let (tools, tool_choice) = Self::extract_tools_from_extra(&mut extra);
+
         let mut chat_params = inference_providers::ChatCompletionParams {
             model: request.model.clone(),
             messages: chat_messages,
@@ -832,7 +879,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             top_p: request.top_p,
             stop: request.stop,
             stream: Some(false),
-            tools: None,
+            tools,
             max_completion_tokens: None,
             n: request.n,
             frequency_penalty: None,
@@ -842,7 +889,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             top_logprobs: None,
             user: Some(request.user_id.to_string()),
             seed: None,
-            tool_choice: None,
+            tool_choice,
             parallel_tool_calls: None,
             // Drop metadata if store is not explicitly enabled (OpenAI requirement)
             metadata: if request.store == Some(true) {
@@ -853,7 +900,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             store: request.store,
             stream_options: None,
             modalities: None,
-            extra: request.extra.clone(),
+            extra,
         };
 
         // Resolve model name (could be an alias) and get model details in a single DB call

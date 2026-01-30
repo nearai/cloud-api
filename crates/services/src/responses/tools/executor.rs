@@ -425,9 +425,11 @@ mod tests {
     async fn test_registry_execute_unknown_tool() {
         let registry = ToolRegistry::new();
         let tool_call = ToolCallInfo {
+            id: None,
             tool_type: "unknown".to_string(),
             query: "test".to_string(),
             params: None,
+            thought_signature: None,
         };
 
         let request = create_test_request();
@@ -441,9 +443,11 @@ mod tests {
     async fn test_registry_execute_empty_tool_name() {
         let registry = ToolRegistry::new();
         let tool_call = ToolCallInfo {
+            id: None,
             tool_type: "  ".to_string(),
             query: "test".to_string(),
             params: None,
+            thought_signature: None,
         };
 
         let request = create_test_request();
@@ -462,9 +466,11 @@ mod tests {
         }));
 
         let tool_call = ToolCallInfo {
+            id: None,
             tool_type: "web_search".to_string(),
             query: "test".to_string(),
             params: None,
+            thought_signature: None,
         };
 
         let request = create_test_request();

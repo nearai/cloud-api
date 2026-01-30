@@ -1092,7 +1092,6 @@ pub struct ConversationObject {
     pub id: String,
     pub object: String, // "conversation"
     pub created_at: i64,
-    pub root_response_id: String,
     pub metadata: serde_json::Value,
 }
 

@@ -2474,22 +2474,37 @@ pub struct FileDeleteResponse {
 // Vector Store Models
 // ============================================
 
+/// Anchor for vector store expiration policy
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpiresAfterAnchor {
+    LastActiveAt,
+}
+
 /// Configuration for when a vector store expires
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct VectorStoreExpiresAfter {
     /// Anchor timestamp after which the expiration policy kicks in. Supported anchors: `last_active_at`.
-    pub anchor: String,
+    pub anchor: ExpiresAfterAnchor,
     /// The number of days after the anchor time that the vector store will expire.
-    pub days: i64,
+    pub days: i32,
 }
 
 /// Static chunking configuration
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct StaticChunkingConfig {
     /// The maximum number of tokens in each chunk.
-    pub max_chunk_size_tokens: i64,
+    pub max_chunk_size_tokens: i32,
     /// The number of tokens that overlap between chunks.
-    pub chunk_overlap_tokens: i64,
+    pub chunk_overlap_tokens: i32,
+}
+
+/// Type of chunking strategy
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChunkingStrategyType {
+    Auto,
+    Static,
 }
 
 /// Chunking strategy for vector store files
@@ -2497,7 +2512,7 @@ pub struct StaticChunkingConfig {
 pub struct ChunkingStrategy {
     /// The type of chunking strategy. Can be `auto` or `static`.
     #[serde(rename = "type")]
-    pub type_: String,
+    pub type_: ChunkingStrategyType,
     /// Configuration for static chunking. Only present when type is `static`.
     #[serde(rename = "static", skip_serializing_if = "Option::is_none")]
     pub static_config: Option<StaticChunkingConfig>,
@@ -2506,11 +2521,20 @@ pub struct ChunkingStrategy {
 /// File counts for a vector store or file batch
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct VectorStoreFileCounts {
-    pub in_progress: i64,
-    pub completed: i64,
-    pub failed: i64,
-    pub cancelled: i64,
-    pub total: i64,
+    pub in_progress: i32,
+    pub completed: i32,
+    pub failed: i32,
+    pub cancelled: i32,
+    pub total: i32,
+}
+
+/// Status of a vector store
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorStoreStatus {
+    Expired,
+    InProgress,
+    Completed,
 }
 
 /// A vector store is a collection of processed files can be used by the `file_search` tool.
@@ -2531,7 +2555,7 @@ pub struct VectorStoreObject {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// The status of the vector store.
-    pub status: String,
+    pub status: VectorStoreStatus,
     /// The total number of bytes used by the files in the vector store.
     pub usage_bytes: i64,
     /// Counts of files by status.
@@ -2547,11 +2571,32 @@ pub struct VectorStoreObject {
     pub metadata: Option<HashMap<String, Value>>,
 }
 
+/// Error code for a failed vector store file
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorStoreFileErrorCode {
+    ServerError,
+    UnsupportedFile,
+    InvalidFile,
+}
+
 /// Error information for a failed vector store file
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct VectorStoreFileError {
-    pub code: String,
+    /// One of `server_error`, `unsupported_file`, or `invalid_file`.
+    pub code: VectorStoreFileErrorCode,
+    /// A human-readable description of the error.
     pub message: String,
+}
+
+/// Status of a vector store file or file batch
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorStoreFileStatus {
+    InProgress,
+    Completed,
+    Cancelled,
+    Failed,
 }
 
 /// A vector store file
@@ -2565,7 +2610,7 @@ pub struct VectorStoreFileObject {
     /// The ID of the vector store that the file is attached to.
     pub vector_store_id: String,
     /// The status of the vector store file.
-    pub status: String,
+    pub status: VectorStoreFileStatus,
     /// The last error associated with this vector store file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<VectorStoreFileError>,
@@ -2583,14 +2628,14 @@ pub struct VectorStoreFileObject {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct VectorStoreFileBatchObject {
     pub id: String,
-    /// The object type, which is always `vector_store.files_batch`.
+    /// The object type, which is always `vector_store.file_batch`.
     pub object: String,
     /// The Unix timestamp (in seconds) for when the vector store files batch was created.
     pub created_at: i64,
     /// The ID of the vector store that the file batch is attached to.
     pub vector_store_id: String,
     /// The status of the vector store files batch.
-    pub status: String,
+    pub status: VectorStoreFileStatus,
     /// Counts of files by status.
     pub file_counts: VectorStoreFileCounts,
 }

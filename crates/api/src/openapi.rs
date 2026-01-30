@@ -144,10 +144,10 @@ use utoipa::{Modify, OpenApi};
         crate::routes::vector_stores::get_vector_store_file,
         crate::routes::vector_stores::update_vector_store_file,
         crate::routes::vector_stores::delete_vector_store_file,
-        crate::routes::vector_stores::create_vs_file_batch,
-        crate::routes::vector_stores::get_vs_file_batch,
-        crate::routes::vector_stores::cancel_vs_file_batch,
-        crate::routes::vector_stores::list_vs_file_batch_files,
+        crate::routes::vector_stores::create_vector_store_file_batch,
+        crate::routes::vector_stores::get_vector_store_file_batch,
+        crate::routes::vector_stores::cancel_vector_store_file_batch,
+        crate::routes::vector_stores::list_vector_store_file_batch_files,
     ),
     components(
         schemas(
@@ -229,9 +229,10 @@ use utoipa::{Modify, OpenApi};
             // File models
             FileUploadResponse, ExpiresAfter, FileListResponse, FileDeleteResponse,
             // Vector Store models
-            VectorStoreObject, VectorStoreFileCounts, VectorStoreExpiresAfter,
-            ChunkingStrategy, StaticChunkingConfig,
-            VectorStoreFileObject, VectorStoreFileError, VectorStoreFileBatchObject,
+            VectorStoreObject, VectorStoreFileCounts, VectorStoreExpiresAfter, ExpiresAfterAnchor,
+            ChunkingStrategy, ChunkingStrategyType, StaticChunkingConfig,
+            VectorStoreStatus, VectorStoreFileStatus,
+            VectorStoreFileObject, VectorStoreFileError, VectorStoreFileErrorCode, VectorStoreFileBatchObject,
             VectorStoreListResponse, VectorStoreFileListResponse,
             VectorStoreDeleteResponse, VectorStoreFileDeleteResponse,
             CreateVectorStoreRequest, ModifyVectorStoreRequest,

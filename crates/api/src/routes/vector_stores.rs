@@ -5,7 +5,8 @@ use crate::models::{
     CreateVectorStoreFileBatchRequest, CreateVectorStoreFileRequest, CreateVectorStoreRequest,
     ErrorResponse, ModifyVectorStoreRequest, UpdateVectorStoreFileAttributesRequest,
     VectorStoreDeleteResponse, VectorStoreFileBatchObject, VectorStoreFileDeleteResponse,
-    VectorStoreFileListResponse, VectorStoreFileObject, VectorStoreListResponse, VectorStoreObject,
+    VectorStoreFileListResponse, VectorStoreFileObject, VectorStoreFileStatus,
+    VectorStoreListResponse, VectorStoreObject,
 };
 
 fn not_implemented() -> (StatusCode, Json<ErrorResponse>) {
@@ -50,9 +51,9 @@ pub struct BatchFileListQueryParams {
     /// A cursor for use in pagination.
     #[serde(default)]
     pub before: Option<String>,
-    /// Filter by status.
+    /// Filter by file status.
     #[serde(default)]
-    pub filter: Option<String>,
+    pub filter: Option<VectorStoreFileStatus>,
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +279,7 @@ pub async fn delete_vector_store_file(
     ),
     security(("api_key" = []))
 )]
-pub async fn create_vs_file_batch(
+pub async fn create_vector_store_file_batch(
     Path(_vector_store_id): Path<String>,
     Json(_body): Json<CreateVectorStoreFileBatchRequest>,
 ) -> Result<Json<VectorStoreFileBatchObject>, (StatusCode, Json<ErrorResponse>)> {
@@ -299,7 +300,7 @@ pub async fn create_vs_file_batch(
     ),
     security(("api_key" = []))
 )]
-pub async fn get_vs_file_batch(
+pub async fn get_vector_store_file_batch(
     Path((_vector_store_id, _batch_id)): Path<(String, String)>,
 ) -> Result<Json<VectorStoreFileBatchObject>, (StatusCode, Json<ErrorResponse>)> {
     Err(not_implemented())
@@ -319,7 +320,7 @@ pub async fn get_vs_file_batch(
     ),
     security(("api_key" = []))
 )]
-pub async fn cancel_vs_file_batch(
+pub async fn cancel_vector_store_file_batch(
     Path((_vector_store_id, _batch_id)): Path<(String, String)>,
 ) -> Result<Json<VectorStoreFileBatchObject>, (StatusCode, Json<ErrorResponse>)> {
     Err(not_implemented())
@@ -340,7 +341,7 @@ pub async fn cancel_vs_file_batch(
     ),
     security(("api_key" = []))
 )]
-pub async fn list_vs_file_batch_files(
+pub async fn list_vector_store_file_batch_files(
     Path((_vector_store_id, _batch_id)): Path<(String, String)>,
     axum::extract::Query(_params): axum::extract::Query<BatchFileListQueryParams>,
 ) -> Result<Json<VectorStoreFileListResponse>, (StatusCode, Json<ErrorResponse>)> {

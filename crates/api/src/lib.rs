@@ -1120,19 +1120,19 @@ pub fn build_vector_store_routes(auth_state_middleware: &AuthState) -> Router {
         )
         .route(
             "/vector_stores/{vector_store_id}/file_batches",
-            post(create_vs_file_batch),
+            post(create_vector_store_file_batch),
         )
         .route(
             "/vector_stores/{vector_store_id}/file_batches/{batch_id}",
-            get(get_vs_file_batch),
+            get(get_vector_store_file_batch),
         )
         .route(
             "/vector_stores/{vector_store_id}/file_batches/{batch_id}/cancel",
-            post(cancel_vs_file_batch),
+            post(cancel_vector_store_file_batch),
         )
         .route(
             "/vector_stores/{vector_store_id}/file_batches/{batch_id}/files",
-            get(list_vs_file_batch_files),
+            get(list_vector_store_file_batch_files),
         )
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),

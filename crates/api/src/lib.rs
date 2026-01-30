@@ -74,6 +74,8 @@ pub struct DomainServices {
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
+    pub vector_store_service:
+        Arc<dyn services::vector_stores::VectorStoreServiceTrait + Send + Sync>,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 }
 
@@ -436,6 +438,26 @@ pub async fn init_domain_services_with_pool(
         s3_storage,
     )) as Arc<dyn services::files::FileServiceTrait + Send + Sync>;
 
+    // Create vector store repositories and service
+    let vs_store_repo = Arc::new(database::PgVectorStoreRepository::new(
+        database.pool().clone(),
+    )) as Arc<dyn services::vector_stores::VectorStoreRepository>;
+
+    let vs_file_repo = Arc::new(database::PgVectorStoreFileRepository::new(
+        database.pool().clone(),
+    )) as Arc<dyn services::vector_stores::VectorStoreFileRepository>;
+
+    let vs_batch_repo = Arc::new(database::PgVectorStoreFileBatchRepository::new(
+        database.pool().clone(),
+    )) as Arc<dyn services::vector_stores::VectorStoreFileBatchRepository>;
+
+    let vector_store_service = Arc::new(services::vector_stores::VectorStoreServiceImpl::new(
+        vs_store_repo,
+        vs_file_repo,
+        vs_batch_repo,
+    ))
+        as Arc<dyn services::vector_stores::VectorStoreServiceTrait + Send + Sync>;
+
     let response_service = Arc::new(services::ResponseService::new(
         response_repo,
         response_items_repo.clone(),
@@ -461,6 +483,7 @@ pub async fn init_domain_services_with_pool(
         usage_service,
         user_service,
         files_service,
+        vector_store_service,
         metrics_service,
     }
 }
@@ -646,6 +669,7 @@ pub fn build_app_with_config(
         usage_service: domain_services.usage_service.clone(),
         user_service: domain_services.user_service.clone(),
         files_service: domain_services.files_service.clone(),
+        vector_store_service: domain_services.vector_store_service.clone(),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
         config: config.clone(),
     };
@@ -721,7 +745,8 @@ pub fn build_app_with_config(
     let files_routes =
         build_files_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
-    let vector_store_routes = build_vector_store_routes(&auth_components.auth_state_middleware);
+    let vector_store_routes =
+        build_vector_store_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
     let billing_routes = build_billing_routes(
         domain_services.usage_service.clone(),
@@ -1093,8 +1118,8 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
         ))
 }
 
-/// Build vector store routes (stub — returns 501 for all endpoints)
-pub fn build_vector_store_routes(auth_state_middleware: &AuthState) -> Router {
+/// Build vector store routes
+pub fn build_vector_store_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
     use crate::routes::vector_stores::*;
 
     Router::new()
@@ -1134,6 +1159,7 @@ pub fn build_vector_store_routes(auth_state_middleware: &AuthState) -> Router {
             "/vector_stores/{vector_store_id}/file_batches/{batch_id}/files",
             get(list_vector_store_file_batch_files),
         )
+        .with_state(app_state)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware_with_api_key,

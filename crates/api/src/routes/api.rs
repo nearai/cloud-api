@@ -25,6 +25,8 @@ pub struct AppState {
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub files_service: Arc<dyn FileServiceTrait + Send + Sync>,
+    pub vector_store_service:
+        Arc<dyn services::vector_stores::VectorStoreServiceTrait + Send + Sync>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub config: Arc<config::ApiConfig>,
 }

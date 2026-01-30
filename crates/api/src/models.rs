@@ -7,20 +7,40 @@ use utoipa::ToSchema;
 // Re-export types from services to avoid duplication
 // These are the canonical definitions used across the codebase
 pub use services::responses::models::{
-    // Request/Response types used by routes and OpenAPI
-    CreateResponseRequest, ResponseObject, ResponseInput,
-    // Conversation types
-    CreateConversationRequest, UpdateConversationRequest, ConversationObject, ConversationDeleteResult,
-    // Response output types
-    ResponseOutputItem, ResponseItemStatus, ResponseContentItem, ResponseOutputFunction,
-    ResponseOutputToolCall, ResponseStreamEvent,
-    // Supporting types used by the above
-    ResponseImageUrl, ResponseStatus, ResponseError, ResponseIncompleteDetails,
-    ResponseReasoningOutput, ResponseToolChoiceOutput, ResponseDeleteResult,
-    ResponseTool, ResponseToolChoice, ResponseToolChoiceFunction, ResponseReasoningConfig,
+    ConversationDeleteResult,
+    ConversationObject,
     ConversationReference,
+    // Conversation types
+    CreateConversationRequest,
+    // Request/Response types used by routes and OpenAPI
+    CreateResponseRequest,
+    McpApprovalMode,
     // MCP types
-    McpApprovalRequirement, McpApprovalMode, McpToolNameFilter, McpDiscoveredTool,
+    McpApprovalRequirement,
+    McpDiscoveredTool,
+    McpToolNameFilter,
+    ResponseContentItem,
+    ResponseDeleteResult,
+    ResponseError,
+    // Supporting types used by the above
+    ResponseImageUrl,
+    ResponseIncompleteDetails,
+    ResponseInput,
+    ResponseItemStatus,
+    ResponseObject,
+    ResponseOutputFunction,
+    // Response output types
+    ResponseOutputItem,
+    ResponseOutputToolCall,
+    ResponseReasoningConfig,
+    ResponseReasoningOutput,
+    ResponseStatus,
+    ResponseStreamEvent,
+    ResponseTool,
+    ResponseToolChoice,
+    ResponseToolChoiceFunction,
+    ResponseToolChoiceOutput,
+    UpdateConversationRequest,
 };
 
 // Streaming response models
@@ -2801,8 +2821,8 @@ mod tests {
 
         // Use services types directly since CreateResponseRequest is re-exported from services
         use services::responses::models::{
-            ResponseInputItem as SvcInputItem, ResponseContent as SvcContent,
-            ResponseContentPart as SvcContentPart,
+            ResponseContent as SvcContent, ResponseContentPart as SvcContentPart,
+            ResponseInputItem as SvcInputItem,
         };
 
         if let Some(ResponseInput::Items(items)) = request.input {

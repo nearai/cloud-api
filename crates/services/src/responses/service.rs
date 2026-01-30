@@ -1537,7 +1537,7 @@ impl ResponseServiceImpl {
                         role,
                         content,
                         model: model.to_string(),
-metadata,
+                        metadata,
                     };
 
                     response_items_repository

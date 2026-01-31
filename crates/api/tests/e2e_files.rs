@@ -1011,7 +1011,7 @@ async fn test_file_in_response_api() {
     for item in &final_resp.output {
         if let api::models::ResponseOutputItem::Message { content, .. } = item {
             for part in content {
-                if let api::models::ResponseOutputContent::OutputText { text, .. } = part {
+                if let api::models::ResponseContentItem::OutputText { text, .. } = part {
                     final_text.push_str(text);
                 }
             }

@@ -526,6 +526,7 @@ pub async fn create_response(
                                 logprobs: vec![],
                             }],
                             model: request.model,
+                            metadata: None,
                         }],
                         parallel_tool_calls: request.parallel_tool_calls.unwrap_or(false),
                         previous_response_id: request.previous_response_id.clone(),
@@ -789,7 +790,13 @@ pub async fn list_input_items(
     let mut input_items: Vec<crate::models::ResponseInputItem> = Vec::new();
 
     for item in items {
-        if let ResponseOutputItem::Message { role, content, .. } = item {
+        if let ResponseOutputItem::Message {
+            role,
+            content,
+            metadata,
+            ..
+        } = item
+        {
             if role == "user" {
                 // Convert service ResponseContentItem to API ResponseContentPart (input-only)
                 // This provides type safety - only input variants can exist here
@@ -801,6 +808,7 @@ pub async fn list_input_items(
                 input_items.push(crate::models::ResponseInputItem {
                     role,
                     content: crate::models::ResponseContent::Parts(api_content),
+                    metadata,
                 });
             }
         }

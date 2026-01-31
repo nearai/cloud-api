@@ -28,6 +28,7 @@ pub use services::responses::models::{
     ResponseInput,
     ResponseItemStatus,
     ResponseObject,
+    ResponseOutputContent,
     ResponseOutputFunction,
     // Response output types
     ResponseOutputItem,
@@ -2829,7 +2830,7 @@ mod tests {
             assert_eq!(items.len(), 1);
 
             // Match against the services ResponseInputItem enum
-            if let SvcInputItem::Message { role, content } = &items[0] {
+            if let SvcInputItem::Message { role, content, .. } = &items[0] {
                 assert_eq!(role, "user");
 
                 if let SvcContent::Parts(parts) = content {

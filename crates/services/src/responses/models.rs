@@ -1052,10 +1052,6 @@ impl CreateResponseRequest {
         }
 
         // Validate mutual exclusivity
-        if self.conversation.is_some() && self.previous_response_id.is_some() {
-            return Err("Cannot specify both conversation and previous_response_id".to_string());
-        }
-
         // Validate input message metadata sizes
         if let Some(ResponseInput::Items(items)) = &self.input {
             for item in items {

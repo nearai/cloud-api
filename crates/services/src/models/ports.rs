@@ -29,12 +29,27 @@ pub struct ModelWithPricing {
     // Pricing (fixed scale 9 = nano-dollars, USD only)
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
+    pub cost_per_image: i64,
 
     // Model metadata
     pub context_length: i32,
     pub verifiable: bool,
     pub aliases: Vec<String>,
     pub owned_by: String,
+
+    // Provider configuration
+    /// Provider type: "vllm" (TEE-enabled) or "external" (3rd party)
+    pub provider_type: String,
+    /// JSON config for external providers (backend, base_url, etc.)
+    pub provider_config: Option<serde_json::Value>,
+    /// Whether this model supports TEE attestation
+    pub attestation_supported: bool,
+
+    // Architecture/modalities
+    /// Input modalities the model accepts, e.g., ["text"], ["text", "image"]
+    pub input_modalities: Option<Vec<String>>,
+    /// Output modalities the model produces, e.g., ["text"], ["image"]
+    pub output_modalities: Option<Vec<String>>,
 }
 
 #[derive(Debug, thiserror::Error)]

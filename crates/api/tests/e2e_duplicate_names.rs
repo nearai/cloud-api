@@ -103,6 +103,77 @@ async fn test_duplicate_organization_name_case_sensitive() {
 }
 
 // ============================================
+// Organization Name Reuse After Deletion Tests
+// ============================================
+
+#[tokio::test]
+async fn test_organization_name_reuse_after_deletion() {
+    let (server, _guard) = setup_test_server().await;
+
+    let org_name = format!("reusable-org-{}", uuid::Uuid::new_v4());
+
+    // Step 1: Create an organization
+    let create_request = api::models::CreateOrganizationRequest {
+        name: org_name.clone(),
+        description: Some("Original organization".to_string()),
+    };
+
+    let create_response = server
+        .post("/v1/organizations")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&create_request)
+        .await;
+
+    assert_eq!(
+        create_response.status_code(),
+        200,
+        "Organization creation should succeed"
+    );
+
+    let org = create_response.json::<api::models::OrganizationResponse>();
+    assert_eq!(org.name, org_name);
+
+    // Step 2: Delete the organization
+    let delete_response = server
+        .delete(format!("/v1/organizations/{}", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(
+        delete_response.status_code(),
+        200,
+        "Organization deletion should succeed"
+    );
+
+    // Step 3: Re-create an organization with the same name (should succeed after fix)
+    let recreate_request = api::models::CreateOrganizationRequest {
+        name: org_name.clone(),
+        description: Some("Re-created organization with same name".to_string()),
+    };
+
+    let recreate_response = server
+        .post("/v1/organizations")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&recreate_request)
+        .await;
+
+    assert_eq!(
+        recreate_response.status_code(),
+        200,
+        "Re-creating organization with deleted organization's name should succeed (was bug #337)"
+    );
+
+    let new_org = recreate_response.json::<api::models::OrganizationResponse>();
+    assert_eq!(new_org.name, org_name);
+    assert_ne!(
+        new_org.id, org.id,
+        "New organization should have a different ID"
+    );
+
+    println!("✓ Organization name can be reused after deletion (fix for #337)");
+}
+
+// ============================================
 // Workspace Duplicate Name Tests
 // ============================================
 
@@ -389,6 +460,78 @@ async fn test_update_workspace_name_to_same_name_succeeds() {
     );
 
     println!("✓ Updating workspace name to same name succeeds");
+}
+
+// ============================================
+// Workspace Name Reuse After Deletion Tests
+// ============================================
+
+#[tokio::test]
+async fn test_workspace_name_reuse_after_deletion() {
+    let (server, _guard) = setup_test_server().await;
+    let org = create_org(&server).await;
+
+    let workspace_name = format!("reusable-workspace-{}", uuid::Uuid::new_v4());
+
+    // Step 1: Create a workspace
+    let create_request = api::routes::workspaces::CreateWorkspaceRequest {
+        name: workspace_name.clone(),
+        description: Some("Original workspace".to_string()),
+    };
+
+    let create_response = server
+        .post(format!("/v1/organizations/{}/workspaces", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&create_request)
+        .await;
+
+    assert_eq!(
+        create_response.status_code(),
+        201,
+        "Workspace creation should succeed"
+    );
+
+    let workspace = create_response.json::<api::routes::workspaces::WorkspaceResponse>();
+    assert_eq!(workspace.name, workspace_name);
+
+    // Step 2: Delete the workspace
+    let delete_response = server
+        .delete(format!("/v1/workspaces/{}", workspace.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(
+        delete_response.status_code(),
+        200,
+        "Workspace deletion should succeed"
+    );
+
+    // Step 3: Re-create a workspace with the same name (should succeed after fix)
+    let recreate_request = api::routes::workspaces::CreateWorkspaceRequest {
+        name: workspace_name.clone(),
+        description: Some("Re-created workspace with same name".to_string()),
+    };
+
+    let recreate_response = server
+        .post(format!("/v1/organizations/{}/workspaces", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&recreate_request)
+        .await;
+
+    assert_eq!(
+        recreate_response.status_code(),
+        201,
+        "Re-creating workspace with deleted workspace's name should succeed (was bug #338)"
+    );
+
+    let new_workspace = recreate_response.json::<api::routes::workspaces::WorkspaceResponse>();
+    assert_eq!(new_workspace.name, workspace_name);
+    assert_ne!(
+        new_workspace.id, workspace.id,
+        "New workspace should have a different ID"
+    );
+
+    println!("✓ Workspace name can be reused after deletion (fix for #338)");
 }
 
 // ============================================

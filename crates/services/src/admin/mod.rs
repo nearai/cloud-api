@@ -187,16 +187,11 @@ impl AdminService for AdminServiceImpl {
         &self,
         limit: i64,
         offset: i64,
+        search_by_name: Option<String>,
     ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64), AdminError> {
-        let users_with_orgs = self
+        let (users_with_orgs, total) = self
             .repository
-            .list_users_with_organizations(limit, offset)
-            .await
-            .map_err(|e| AdminError::InternalError(e.to_string()))?;
-
-        let total = self
-            .repository
-            .get_active_user_count()
+            .list_users_with_organizations(limit, offset, search_by_name)
             .await
             .map_err(|e| AdminError::InternalError(e.to_string()))?;
 
@@ -266,6 +261,24 @@ impl AdminService for AdminServiceImpl {
                     AdminError::InternalError(error_msg)
                 }
             })
+    }
+
+    async fn list_organizations(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError> {
+        // Execute both queries in parallel for better performance
+        let (organizations_result, total_result) = tokio::join!(
+            self.repository.list_all_organizations(limit, offset),
+            self.repository.count_all_organizations()
+        );
+
+        let organizations =
+            organizations_result.map_err(|e| AdminError::InternalError(e.to_string()))?;
+        let total = total_result.map_err(|e| AdminError::InternalError(e.to_string()))?;
+
+        Ok((organizations, total))
     }
 }
 

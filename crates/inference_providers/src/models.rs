@@ -1,10 +1,13 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: MessageRole,
-    pub content: Option<String>,
+    /// Message content - passthrough any structure (text string or array of content parts)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -33,7 +36,7 @@ pub struct ChatDelta {
     pub reasoning: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
     System,
@@ -56,6 +59,10 @@ pub struct ToolCall {
     /// Index of the tool call in streaming responses (for tracking multiple parallel tool calls)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<i64>,
+    /// Thought signature for Gemini 3 models (required for tool calls to work correctly)
+    /// Only included if the model returned one - older models don't use this
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 /// Delta tool call in streaming chat completions
@@ -70,6 +77,9 @@ pub struct ToolCallDelta {
     pub index: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function: Option<FunctionCallDelta>,
+    /// Thought signature for Gemini 3 models (internal use only, not exposed to clients)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 /// Function call details
@@ -226,6 +236,10 @@ pub struct ChatCompletionParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
 
+    /// Output modalities: ["text"], ["audio"], or ["text", "audio"] (for Qwen3-Omni)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modalities: Option<Vec<String>>,
+
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -304,7 +318,7 @@ pub struct CompletionParams {
     pub stream_options: Option<StreamOptions>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     Stop,
@@ -332,6 +346,16 @@ impl TokenUsage {
             prompt_tokens_details: None,
         }
     }
+}
+
+/// Audio output data (for Qwen3-Omni and similar models)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioOutput {
+    /// Base64-encoded audio data
+    pub data: String,
+    /// MIME type of the audio (e.g., "audio/wav", "audio/mp3")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
 }
 
 /// Chat completion streaming chunk (matches OpenAI format)
@@ -365,6 +389,10 @@ pub struct ChatCompletionChunk {
     /// Token IDs for the prompt (typically only in first chunk)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_token_ids: Option<Vec<i64>>,
+
+    /// Modality indicator for Qwen3-Omni streaming ("text" or "audio")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modality: Option<String>,
 }
 
 /// Text completion streaming chunk (matches OpenAI legacy format)
@@ -652,6 +680,110 @@ pub enum CompletionError {
     InvalidResponse(String),
     #[error("Unknown error")]
     Unknown(String),
+}
+
+/// Parameters for image generation requests
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageGenerationParams {
+    /// Model ID to use for generation
+    pub model: String,
+    /// Text prompt describing the image to generate
+    pub prompt: String,
+    /// Number of images to generate (1-10, default: 1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<i32>,
+    /// Size of the generated images in WxH format (e.g., "1024x1024", "512x512")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// Response format: "b64_json" or "url" (only "b64_json" is supported for verifiable models)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+    /// Quality of the generated image: "standard" or "hd" ("quality" parameter is not supported for verifiable models)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<String>,
+    /// Style of the generated image: "vivid" or "natural" ("style" parameter is not supported for verifiable models)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+    /// Extra parameters for encryption headers and other pass-through data
+    #[serde(flatten, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Response from image generation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageGenerationResponse {
+    /// Unique identifier for the generation
+    pub id: String,
+    /// Unix timestamp of when the generation was created
+    pub created: i64,
+    /// Generated images
+    pub data: Vec<ImageData>,
+}
+
+/// Individual generated image
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageData {
+    /// Base64-encoded image data (when response_format is "b64_json")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub b64_json: Option<String>,
+    /// URL to the generated image (when response_format is "url")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Revised prompt used for generation (if model modified it)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revised_prompt: Option<String>,
+}
+
+/// Image generation response with raw bytes for TEE verification
+#[derive(Debug, Clone)]
+pub struct ImageGenerationResponseWithBytes {
+    /// The parsed response
+    pub response: ImageGenerationResponse,
+    /// The raw bytes from the provider response (for hash verification)
+    pub raw_bytes: Vec<u8>,
+}
+
+/// Image generation errors
+#[derive(Debug, Error, Clone, Serialize, Deserialize)]
+pub enum ImageGenerationError {
+    #[error("Failed to generate image: {0}")]
+    GenerationError(String),
+    #[error("HTTP error {status_code}: {message}")]
+    HttpError { status_code: u16, message: String },
+}
+
+/// Parameters for image edit requests
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageEditParams {
+    /// Model ID to use for editing
+    pub model: String,
+    /// Text prompt describing the edits to make
+    pub prompt: String,
+    /// Image bytes to edit (raw PNG/JPEG data)
+    /// Wrapped in Arc to avoid cloning large data (up to 512MB) during retry attempts.
+    /// Cloning ImageEditParams is now cheap (clones only the Arc pointer, not the data).
+    pub image: Arc<Vec<u8>>,
+    /// Size of the generated images in WxH format (e.g., "1024x1024", "512x512")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// Response format: "b64_json" or "url" (only "b64_json" is supported for verifiable models)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+}
+
+/// Image edit response (reuses same structure as image generation)
+pub type ImageEditResponse = ImageGenerationResponse;
+
+/// Image edit response with raw bytes (for TEE verification)
+pub type ImageEditResponseWithBytes = ImageGenerationResponseWithBytes;
+
+/// Image edit errors
+#[derive(Debug, Error, Clone, Serialize, Deserialize)]
+pub enum ImageEditError {
+    #[error("Failed to edit image: {0}")]
+    EditError(String),
+    #[error("HTTP error {status_code}: {message}")]
+    HttpError { status_code: u16, message: String },
 }
 
 /// Attestation report errors

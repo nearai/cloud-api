@@ -63,7 +63,8 @@ pub enum MessageContent {
     Parts(Vec<MessageContentPart>),
 }
 
-/// Content part (text, image, audio, file)
+/// Content part (text, image, audio, video, file)
+/// Supports both OpenAI format (input_audio) and vLLM format (audio_url, video_url)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
 pub enum MessageContentPart {
@@ -75,8 +76,15 @@ pub enum MessageContentPart {
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
-    #[serde(rename = "audio")]
-    Audio { audio: MessageAudio },
+    // OpenAI format: input_audio with data + format
+    #[serde(rename = "input_audio")]
+    InputAudio { input_audio: MessageInputAudio },
+    // vLLM format: audio_url with url field
+    #[serde(rename = "audio_url")]
+    AudioUrl { audio_url: MessageAudioUrl },
+    // vLLM format: video_url with url field
+    #[serde(rename = "video_url")]
+    VideoUrl { video_url: MessageVideoUrl },
     #[serde(rename = "file")]
     File { file_id: String },
 }
@@ -88,11 +96,28 @@ pub enum MessageImageUrl {
     Object { url: String },
 }
 
+/// OpenAI format: input_audio with data + format
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct MessageAudio {
+pub struct MessageInputAudio {
     pub data: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
+}
+
+/// vLLM format: audio_url with url field
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum MessageAudioUrl {
+    String(String),
+    Object { url: String },
+}
+
+/// vLLM format: video_url with url field
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum MessageVideoUrl {
+    String(String),
+    Object { url: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -152,6 +177,218 @@ pub struct CompletionResponse {
     pub usage: Usage,
 }
 
+/// Request for image generation
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ImageGenerationRequest {
+    /// Model ID to use for generation
+    pub model: String,
+    /// Text prompt describing the image to generate
+    pub prompt: String,
+    /// Number of images to generate (1-10, default: 1)
+    #[serde(default = "default_n_images")]
+    pub n: Option<i32>,
+    /// Size of the generated images in WxH format (e.g., "1024x1024", "512x512")
+    #[serde(default)]
+    pub size: Option<String>,
+    /// Response format: "b64_json" or "url" (only "b64_json" is supported for verifiable models)
+    #[serde(default)]
+    pub response_format: Option<String>,
+    /// Quality of the generated image: "standard" or "hd" ("quality" parameter is not supported for verifiable models)
+    #[serde(default)]
+    pub quality: Option<String>,
+    /// Style of the generated image: "vivid" or "natural" ("style" parameter is not supported for verifiable models)
+    #[serde(default)]
+    pub style: Option<String>,
+}
+
+fn default_n_images() -> Option<i32> {
+    Some(1)
+}
+
+impl ImageGenerationRequest {
+    /// Validate the image generation request
+    pub fn validate(&self) -> Result<(), String> {
+        // Model is required and must not be empty
+        if self.model.trim().is_empty() {
+            return Err("model is required".to_string());
+        }
+
+        // Prompt is required and must not be empty
+        if self.prompt.trim().is_empty() {
+            return Err("prompt is required".to_string());
+        }
+
+        // Validate n if provided
+        if let Some(n) = self.n {
+            if n < 1 {
+                return Err("n must be at least 1".to_string());
+            }
+            if n > 10 {
+                return Err("n must be at most 10".to_string());
+            }
+        }
+
+        // Validate size format if provided (should be "WxH" with numeric values)
+        // Dimension validation is delegated to the inference provider
+        if let Some(ref size) = self.size {
+            let parts: Vec<&str> = size.split('x').collect();
+            if parts.len() != 2 {
+                return Err("size must be in format 'WIDTHxHEIGHT' (e.g., '1024x1024')".to_string());
+            }
+            // Validate that both parts are numeric and greater than zero
+            match (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                (Ok(w), Ok(h)) => {
+                    if w == 0 || h == 0 {
+                        return Err("size dimensions must be greater than zero".to_string());
+                    }
+                }
+                _ => {
+                    return Err(
+                        "size must be in format 'WIDTHxHEIGHT' with numeric values".to_string()
+                    );
+                }
+            }
+        }
+
+        // Validate response_format if provided
+        if let Some(ref format) = self.response_format {
+            if format != "url" && format != "b64_json" {
+                return Err("response_format must be 'url' or 'b64_json'".to_string());
+            }
+        }
+
+        // Validate quality if provided
+        if let Some(ref quality) = self.quality {
+            if quality != "standard" && quality != "hd" {
+                return Err("quality must be 'standard' or 'hd'".to_string());
+            }
+        }
+
+        // Validate style if provided
+        if let Some(ref style) = self.style {
+            if style != "vivid" && style != "natural" {
+                return Err("style must be 'vivid' or 'natural'".to_string());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Request for image editing (internal - uses multipart form data)
+#[derive(Debug, Clone)]
+pub struct ImageEditRequest {
+    /// Model ID to use for editing
+    pub model: String,
+    /// Text prompt describing the edits to make
+    pub prompt: String,
+    /// Image bytes to edit (raw PNG/JPEG data)
+    pub image: Vec<u8>,
+    /// Size of the generated images in WxH format (e.g., "1024x1024", "512x512")
+    pub size: Option<String>,
+    /// Response format: "b64_json" or "url" (only "b64_json" is supported for verifiable models)
+    pub response_format: Option<String>,
+}
+
+/// Schema for image edit request documentation in OpenAPI
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImageEditRequestSchema {
+    /// Image file to edit (file upload)
+    #[schema(format = Binary)]
+    pub image: String,
+    /// Model ID to use for editing (e.g., "Qwen/Qwen-Image-2512")
+    pub model: String,
+    /// Text prompt describing the edits to make
+    pub prompt: String,
+    /// Image size in WxH format (e.g., "512x512")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// Response format ("b64_json" or "url")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+}
+
+impl ImageEditRequest {
+    /// Validate the image edit request
+    pub fn validate(&self) -> Result<(), String> {
+        // Model is required and must not be empty
+        if self.model.trim().is_empty() {
+            return Err("model is required".to_string());
+        }
+
+        // Prompt is required and must not be empty
+        if self.prompt.trim().is_empty() {
+            return Err("prompt is required".to_string());
+        }
+
+        // Image is required
+        if self.image.is_empty() {
+            return Err("image is required".to_string());
+        }
+
+        // Validate image is PNG or JPEG (magic bytes)
+        let is_png = self.image.len() >= 4 && &self.image[0..4] == b"\x89PNG";
+        let is_jpeg = self.image.len() >= 3 && &self.image[0..3] == b"\xFF\xD8\xFF";
+        if !is_png && !is_jpeg {
+            return Err("image must be a valid PNG or JPEG file".to_string());
+        }
+
+        // Validate size format if provided (should be "WxH" with numeric values)
+        // Dimension validation is delegated to the inference provider
+        if let Some(ref size) = self.size {
+            let parts: Vec<&str> = size.split('x').collect();
+            if parts.len() != 2 {
+                return Err("size must be in format 'WIDTHxHEIGHT' (e.g., '1024x1024')".to_string());
+            }
+            // Validate that both parts are numeric and greater than zero
+            match (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                (Ok(w), Ok(h)) => {
+                    if w == 0 || h == 0 {
+                        return Err("size dimensions must be greater than zero".to_string());
+                    }
+                }
+                _ => {
+                    return Err(
+                        "size must be in format 'WIDTHxHEIGHT' with numeric values".to_string()
+                    );
+                }
+            }
+        }
+
+        // Validate response_format if provided
+        if let Some(ref format) = self.response_format {
+            if format != "url" && format != "b64_json" {
+                return Err("response_format must be 'url' or 'b64_json'".to_string());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Response from image generation
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ImageGenerationResponse {
+    /// Unix timestamp of when the generation was created
+    pub created: i64,
+    /// Generated images
+    pub data: Vec<ImageData>,
+}
+
+/// Individual generated image
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ImageData {
+    /// Base64-encoded image data (when response_format is "b64_json")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub b64_json: Option<String>,
+    /// URL to the generated image (when response_format is "url")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Revised prompt used for generation (if model modified it)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revised_prompt: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelsResponse {
     pub object: String,
@@ -180,6 +417,9 @@ pub struct ModelInfo {
     /// Context length in tokens
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<i32>,
+    /// Model architecture (input/output modalities)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<ModelArchitecture>,
 }
 
 #[derive(Debug, Serialize)]
@@ -258,29 +498,20 @@ impl ChatCompletionRequest {
             return Err("messages cannot be empty".to_string());
         }
 
-        for message in &self.messages {
+        for (idx, message) in self.messages.iter().enumerate() {
             if message.role.is_empty() {
                 return Err("message role is required".to_string());
             }
             if !["system", "user", "assistant", "tool"].contains(&message.role.as_str()) {
                 return Err(format!("invalid message role: {}", message.role));
             }
-
-            // Validate content: if it's an array, check that all parts are text-only
-            if let Some(MessageContent::Parts(parts)) = &message.content {
-                for part in parts {
-                    match part {
-                        MessageContentPart::Text { .. } => {
-                            // Text parts are allowed
-                        }
-                        MessageContentPart::ImageUrl { .. }
-                        | MessageContentPart::Audio { .. }
-                        | MessageContentPart::File { .. } => {
-                            return Err(
-                                "Content array contains non-text parts (image, audio, or file). Only text content is currently supported.".to_string()
-                            );
-                        }
-                    }
+            // Validate message content can be serialized (catches malformed multimodal content)
+            if let Some(ref content) = message.content {
+                if serde_json::to_value(content).is_err() {
+                    return Err(format!(
+                        "message at index {} has invalid content that cannot be processed",
+                        idx
+                    ));
                 }
             }
         }
@@ -298,6 +529,29 @@ impl ChatCompletionRequest {
         }
 
         Ok(())
+    }
+
+    /// Check if request contains image content (for size limit selection)
+    pub fn has_image_content(&self) -> bool {
+        self.messages.iter().any(|m| {
+            matches!(
+                &m.content,
+                Some(MessageContent::Parts(parts))
+                    if parts.iter().any(|p| matches!(p, MessageContentPart::ImageUrl { .. }))
+            )
+        })
+    }
+
+    /// Check if request contains audio content (for size limit selection)
+    /// Checks for both OpenAI format (input_audio) and vLLM format (audio_url)
+    pub fn has_audio_content(&self) -> bool {
+        self.messages.iter().any(|m| {
+            matches!(
+                &m.content,
+                Some(MessageContent::Parts(parts))
+                    if parts.iter().any(|p| matches!(p, MessageContentPart::InputAudio { .. } | MessageContentPart::AudioUrl { .. }))
+            )
+        })
     }
 }
 
@@ -683,6 +937,22 @@ pub enum ResponseOutputItem {
         tools: Vec<McpDiscoveredTool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+    #[serde(rename = "mcp_approval_request")]
+    McpApprovalRequest {
+        id: String,
+        #[serde(default)]
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        #[serde(default)]
+        created_at: i64,
+        server_label: String,
+        name: String,
+        arguments: String,
+        model: String,
     },
 }
 
@@ -1591,6 +1861,28 @@ pub struct ListUsersResponse {
     pub offset: i64,
 }
 
+/// Organization details for admin organization listing
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminOrganizationResponse {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(rename = "spendLimit", skip_serializing_if = "Option::is_none")]
+    pub spend_limit: Option<SpendLimit>,
+    #[serde(rename = "currentUsage", skip_serializing_if = "Option::is_none")]
+    pub current_usage: Option<OrganizationUsage>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// List organizations response model (admin only)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListOrganizationsAdminResponse {
+    pub organizations: Vec<AdminOrganizationResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 /// Admin access token request model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateAdminAccessTokenRequest {
@@ -1771,6 +2063,8 @@ pub struct AdminModelWithPricing {
     pub input_cost_per_token: DecimalPrice,
     #[serde(rename = "outputCostPerToken")]
     pub output_cost_per_token: DecimalPrice,
+    #[serde(rename = "costPerImage")]
+    pub cost_per_image: DecimalPrice,
     pub metadata: ModelMetadata,
     #[serde(rename = "isActive")]
     pub is_active: bool,
@@ -1789,6 +2083,8 @@ pub struct ModelWithPricing {
     pub input_cost_per_token: DecimalPrice,
     #[serde(rename = "outputCostPerToken")]
     pub output_cost_per_token: DecimalPrice,
+    #[serde(rename = "costPerImage")]
+    pub cost_per_image: DecimalPrice,
     pub metadata: ModelMetadata,
 }
 
@@ -1831,6 +2127,31 @@ pub struct DecimalPrice {
     pub currency: String,
 }
 
+/// Model architecture describing input/output modalities
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelArchitecture {
+    /// Input modalities the model accepts, e.g., ["text"], ["text", "image"]
+    #[serde(rename = "inputModalities")]
+    pub input_modalities: Vec<String>,
+    /// Output modalities the model produces, e.g., ["text"], ["image"]
+    #[serde(rename = "outputModalities")]
+    pub output_modalities: Vec<String>,
+}
+
+impl ModelArchitecture {
+    /// Create ModelArchitecture from optional modalities.
+    /// Returns Some only if both input and output modalities are present.
+    pub fn from_options(input: Option<Vec<String>>, output: Option<Vec<String>>) -> Option<Self> {
+        match (input, output) {
+            (Some(input_modalities), Some(output_modalities)) => Some(Self {
+                input_modalities,
+                output_modalities,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Model metadata
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelMetadata {
@@ -1848,6 +2169,20 @@ pub struct ModelMetadata {
 
     #[serde(rename = "aliases", skip_serializing_if = "Vec::is_empty", default)]
     pub aliases: Vec<String>,
+
+    /// Provider type: "vllm" (TEE-enabled) or "external" (3rd party)
+    #[serde(rename = "providerType")]
+    pub provider_type: String,
+    /// JSON config for external providers (backend, base_url, etc.)
+    #[serde(rename = "providerConfig", skip_serializing_if = "Option::is_none")]
+    pub provider_config: Option<serde_json::Value>,
+    /// Whether this model supports TEE attestation
+    #[serde(rename = "attestationSupported")]
+    pub attestation_supported: bool,
+
+    /// Model architecture (input/output modalities)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<ModelArchitecture>,
 }
 
 /// Request to update model pricing (admin endpoint)
@@ -1857,6 +2192,8 @@ pub struct UpdateModelApiRequest {
     pub input_cost_per_token: Option<DecimalPriceRequest>,
     #[serde(rename = "outputCostPerToken")]
     pub output_cost_per_token: Option<DecimalPriceRequest>,
+    #[serde(rename = "costPerImage")]
+    pub cost_per_image: Option<DecimalPriceRequest>,
     #[serde(rename = "modelDisplayName")]
     pub model_display_name: Option<String>,
     #[serde(rename = "modelDescription")]
@@ -1871,6 +2208,24 @@ pub struct UpdateModelApiRequest {
     pub aliases: Option<Vec<String>>,
     #[serde(rename = "ownedBy")]
     pub owned_by: Option<String>,
+    /// Provider type: "vllm" (default, TEE-enabled) or "external" (3rd party)
+    #[serde(rename = "providerType", skip_serializing_if = "Option::is_none")]
+    pub provider_type: Option<String>,
+    /// JSON config for external providers (backend, base_url, etc.)
+    #[serde(rename = "providerConfig", skip_serializing_if = "Option::is_none")]
+    pub provider_config: Option<serde_json::Value>,
+    /// Whether this model supports TEE attestation
+    #[serde(
+        rename = "attestationSupported",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub attestation_supported: Option<bool>,
+    /// Input modalities the model accepts, e.g., ["text"], ["text", "image"]
+    #[serde(rename = "inputModalities", skip_serializing_if = "Option::is_none")]
+    pub input_modalities: Option<Vec<String>>,
+    /// Output modalities the model produces, e.g., ["text"], ["image"]
+    #[serde(rename = "outputModalities", skip_serializing_if = "Option::is_none")]
+    pub output_modalities: Option<Vec<String>>,
     #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
     pub change_reason: Option<String>,
 }
@@ -1895,6 +2250,8 @@ pub struct ModelHistoryEntry {
     pub input_cost_per_token: DecimalPrice,
     #[serde(rename = "outputCostPerToken")]
     pub output_cost_per_token: DecimalPrice,
+    #[serde(rename = "costPerImage")]
+    pub cost_per_image: DecimalPrice,
     #[serde(rename = "contextLength")]
     pub context_length: i32,
     #[serde(rename = "modelName")]
@@ -1922,6 +2279,12 @@ pub struct ModelHistoryEntry {
     pub change_reason: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
+    /// Input modalities the model accepts, e.g., ["text"], ["text", "image"]
+    #[serde(rename = "inputModalities", skip_serializing_if = "Option::is_none")]
+    pub input_modalities: Option<Vec<String>>,
+    /// Output modalities the model produces, e.g., ["text"], ["image"]
+    #[serde(rename = "outputModalities", skip_serializing_if = "Option::is_none")]
+    pub output_modalities: Option<Vec<String>>,
 }
 
 /// Model history response - complete history of model changes
@@ -2365,27 +2728,28 @@ mod tests {
             extra: std::collections::HashMap::new(),
         };
 
-        // Image content should be rejected
+        // Image content is now allowed for multimodal passthrough
         let result = request.validate();
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err(),
-            "Content array contains non-text parts (image, audio, or file). Only text content is currently supported."
-        );
+        assert!(result.is_ok());
+        // Test helper method
+        assert!(request.has_image_content());
+        assert!(!request.has_audio_content());
     }
 
     #[test]
-    fn test_chat_completion_request_with_audio_content_rejected() {
+    fn test_chat_completion_request_with_audio_content_allowed() {
         let request = ChatCompletionRequest {
             model: "gpt-4".to_string(),
             messages: vec![Message {
                 role: "user".to_string(),
-                content: Some(MessageContent::Parts(vec![MessageContentPart::Audio {
-                    audio: MessageAudio {
-                        data: "base64_audio_data".to_string(),
-                        format: Some("mp3".to_string()),
+                content: Some(MessageContent::Parts(vec![
+                    MessageContentPart::InputAudio {
+                        input_audio: MessageInputAudio {
+                            data: "base64_audio_data".to_string(),
+                            format: Some("mp3".to_string()),
+                        },
                     },
-                }])),
+                ])),
                 name: None,
             }],
             max_tokens: Some(100),
@@ -2399,17 +2763,16 @@ mod tests {
             extra: std::collections::HashMap::new(),
         };
 
-        // Audio content should be rejected
+        // Audio content is now allowed for multimodal passthrough
         let result = request.validate();
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err(),
-            "Content array contains non-text parts (image, audio, or file). Only text content is currently supported."
-        );
+        assert!(result.is_ok());
+        // Test helper method
+        assert!(!request.has_image_content());
+        assert!(request.has_audio_content());
     }
 
     #[test]
-    fn test_chat_completion_request_with_file_content_rejected() {
+    fn test_chat_completion_request_with_file_content_allowed() {
         let request = ChatCompletionRequest {
             model: "gpt-4".to_string(),
             messages: vec![Message {
@@ -2430,13 +2793,12 @@ mod tests {
             extra: std::collections::HashMap::new(),
         };
 
-        // File content should be rejected
+        // File content is now allowed for multimodal passthrough
         let result = request.validate();
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err(),
-            "Content array contains non-text parts (image, audio, or file). Only text content is currently supported."
-        );
+        assert!(result.is_ok());
+        // File content doesn't count as image or audio
+        assert!(!request.has_image_content());
+        assert!(!request.has_audio_content());
     }
 
     #[test]

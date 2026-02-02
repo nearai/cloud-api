@@ -1,11 +1,12 @@
 use crate::middleware::AdminUser;
 use crate::models::{
     AdminAccessTokenResponse, AdminModelListResponse, AdminModelWithPricing,
-    AdminUserOrganizationDetails, AdminUserResponse, BatchUpdateModelApiRequest,
-    CreateAdminAccessTokenRequest, DecimalPrice, DeleteAdminAccessTokenRequest, DeleteModelRequest,
-    ErrorResponse, GetOrganizationConcurrentLimitResponse, ListUsersResponse, ModelHistoryEntry,
-    ModelHistoryResponse, ModelMetadata, ModelWithPricing, OrgLimitsHistoryEntry,
-    OrgLimitsHistoryResponse, OrganizationUsage, SpendLimit,
+    AdminOrganizationResponse, AdminUserOrganizationDetails, AdminUserResponse,
+    BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, DecimalPrice,
+    DeleteAdminAccessTokenRequest, DeleteModelRequest, ErrorResponse,
+    GetOrganizationConcurrentLimitResponse, ListOrganizationsAdminResponse, ListUsersResponse,
+    ModelArchitecture, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
+    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, SpendLimit,
     UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
     UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
 };
@@ -31,6 +32,7 @@ pub struct AdminAppState {
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub config: Arc<ApiConfig>,
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
+    pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
 }
 
 /// Batch upsert models metadata (Admin only)
@@ -88,6 +90,7 @@ pub async fn batch_upsert_models(
                 UpdateModelAdminRequest {
                     input_cost_per_token: request.input_cost_per_token.as_ref().map(|p| p.amount),
                     output_cost_per_token: request.output_cost_per_token.as_ref().map(|p| p.amount),
+                    cost_per_image: request.cost_per_image.as_ref().map(|p| p.amount),
                     model_display_name: request.model_display_name.clone(),
                     model_description: request.model_description.clone(),
                     model_icon: request.model_icon.clone(),
@@ -96,6 +99,11 @@ pub async fn batch_upsert_models(
                     is_active: request.is_active,
                     aliases: request.aliases.clone(),
                     owned_by: request.owned_by.clone(),
+                    provider_type: request.provider_type.clone(),
+                    provider_config: request.provider_config.clone(),
+                    attestation_supported: request.attestation_supported,
+                    input_modalities: request.input_modalities.clone(),
+                    output_modalities: request.output_modalities.clone(),
                     change_reason: request.change_reason.clone(),
                     changed_by_user_id: Some(admin_user_id),
                     changed_by_user_email: Some(admin_user_email.clone()),
@@ -133,6 +141,75 @@ pub async fn batch_upsert_models(
             }
         })?;
 
+    // Update external providers at runtime
+    // This allows newly added/updated external models to be used without server restart
+
+    // Collect models to register (active external providers with valid config)
+    let models_to_register: Vec<(String, serde_json::Value)> = batch_request
+        .iter()
+        .filter_map(|(model_name, request)| {
+            // Only register models that are:
+            // 1. External providers with valid config
+            // 2. Active (is_active != Some(false))
+            let is_external = request.provider_type.as_deref() == Some("external");
+            let is_active = request.is_active != Some(false);
+
+            if is_external && is_active {
+                request
+                    .provider_config
+                    .clone()
+                    .map(|config| (model_name.clone(), config))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Collect models to unregister:
+    // - Models explicitly set to non-external provider_type
+    // - Models explicitly set to is_active = false
+    let models_to_unregister: Vec<String> = batch_request
+        .iter()
+        .filter_map(|(model_name, request)| {
+            let is_non_external = request
+                .provider_type
+                .as_ref()
+                .is_some_and(|t| t != "external");
+            let is_inactive = request.is_active == Some(false);
+
+            if is_non_external || is_inactive {
+                Some(model_name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Unregister models that are no longer external or are inactive
+    for model_name in &models_to_unregister {
+        app_state
+            .inference_provider_pool
+            .unregister_external_provider(model_name)
+            .await;
+    }
+
+    // Register/update external providers
+    if !models_to_register.is_empty() {
+        tracing::info!(
+            count = models_to_register.len(),
+            "Registering external providers at runtime"
+        );
+        if let Err(e) = app_state
+            .inference_provider_pool
+            .load_external_providers(models_to_register)
+            .await
+        {
+            // Log but don't fail the request - the models are saved to DB
+            // They will be loaded on next server restart if runtime registration fails
+            tracing::warn!(error = %e, "Failed to register some external providers at runtime");
+        }
+    }
+
     // Convert to API response - map from HashMap to Vec
     // The key in the HashMap is the canonical model_name
     let api_models: Vec<ModelWithPricing> = updated_models
@@ -149,6 +226,11 @@ pub async fn batch_upsert_models(
                 scale: 9,
                 currency: "USD".to_string(),
             },
+            cost_per_image: DecimalPrice {
+                amount: updated_model.cost_per_image,
+                scale: 9,
+                currency: "USD".to_string(),
+            },
             metadata: ModelMetadata {
                 verifiable: updated_model.verifiable,
                 context_length: updated_model.context_length,
@@ -157,6 +239,13 @@ pub async fn batch_upsert_models(
                 model_icon: updated_model.model_icon,
                 owned_by: updated_model.owned_by,
                 aliases: updated_model.aliases,
+                provider_type: updated_model.provider_type,
+                provider_config: updated_model.provider_config,
+                attestation_supported: updated_model.attestation_supported,
+                architecture: ModelArchitecture::from_options(
+                    updated_model.input_modalities,
+                    updated_model.output_modalities,
+                ),
             },
         })
         .collect();
@@ -227,6 +316,11 @@ pub async fn list_models(
                 scale: 9,
                 currency: "USD".to_string(),
             },
+            cost_per_image: DecimalPrice {
+                amount: model.cost_per_image,
+                scale: 9,
+                currency: "USD".to_string(),
+            },
             metadata: ModelMetadata {
                 verifiable: model.verifiable,
                 context_length: model.context_length,
@@ -235,6 +329,13 @@ pub async fn list_models(
                 model_icon: model.model_icon,
                 aliases: model.aliases,
                 owned_by: model.owned_by,
+                provider_type: model.provider_type,
+                provider_config: model.provider_config,
+                attestation_supported: model.attestation_supported,
+                architecture: ModelArchitecture::from_options(
+                    model.input_modalities,
+                    model.output_modalities,
+                ),
             },
             is_active: model.is_active,
             created_at: model.created_at,
@@ -338,6 +439,11 @@ pub async fn get_model_history(
                 scale: 9,
                 currency: "USD".to_string(),
             },
+            cost_per_image: DecimalPrice {
+                amount: h.cost_per_image,
+                scale: 9,
+                currency: "USD".to_string(),
+            },
             context_length: h.context_length,
             model_name: h.model_name,
             model_display_name: h.model_display_name,
@@ -352,6 +458,8 @@ pub async fn get_model_history(
             changed_by_user_email: h.changed_by_user_email,
             change_reason: h.change_reason,
             created_at: h.created_at.to_rfc3339(),
+            input_modalities: h.input_modalities,
+            output_modalities: h.output_modalities,
         })
         .collect();
 
@@ -675,6 +783,13 @@ pub async fn delete_model(
             }
         })?;
 
+    // Unregister external provider if it was registered
+    // This is a no-op for vLLM models (they are discovered, not registered)
+    app_state
+        .inference_provider_pool
+        .unregister_external_provider(&model_name)
+        .await;
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -688,7 +803,8 @@ pub async fn delete_model(
     params(
         ("limit" = Option<i64>, Query, description = "Maximum number of users to return (default: 100)"),
         ("offset" = Option<i64>, Query, description = "Number of users to skip (default: 0)"),
-        ("include_organizations" = Option<bool>, Query, description = "Whether to include organization information and spend limits for the first organization owned by each user (default: false)")
+        ("include_organizations" = Option<bool>, Query, description = "Whether to include organization information and spend limits for the first organization owned by each user (default: false)"),
+        ("search_by_name" = Option<String>, Query, description = "Filter users by organization name (case-insensitive match). Only effective when include_organizations=true; ignored otherwise.")
     ),
     responses(
         (status = 200, description = "Users retrieved successfully", body = ListUsersResponse),
@@ -707,15 +823,15 @@ pub async fn list_users(
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     debug!(
-        "List users request with limit={}, offset={}, include_organizations={}",
-        params.limit, params.offset, params.include_organizations
+        "List users request with limit={}, offset={}, include_organizations={}, search_by_name={:?}",
+        params.limit, params.offset, params.include_organizations, params.search_by_name
     );
 
     let (user_responses, total) = if params.include_organizations {
         // Fetch users with their default organization and spend limit
         let (users_with_orgs, total) = app_state
             .admin_service
-            .list_users_with_organizations(params.limit, params.offset)
+            .list_users_with_organizations(params.limit, params.offset, params.search_by_name)
             .await
             .map_err(|e| {
                 error!("Failed to list users with organizations");
@@ -816,6 +932,96 @@ pub async fn list_users(
 
     let response = ListUsersResponse {
         users: user_responses,
+        total,
+        limit: params.limit,
+        offset: params.offset,
+    };
+
+    Ok(ResponseJson(response))
+}
+
+/// List all organizations with pagination (Admin only)
+///
+/// Returns a paginated list of all organizations in the system with their spend limits and usage.
+/// Only authenticated admins can perform this operation.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations",
+    tag = "Admin",
+    params(
+        ("limit" = Option<i64>, Query, description = "Maximum number of organizations to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Number of organizations to skip (default: 0)")
+    ),
+    responses(
+        (status = 200, description = "Organizations retrieved successfully", body = ListOrganizationsAdminResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_organizations(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    axum::extract::Query(params): axum::extract::Query<ListOrganizationsQueryParams>,
+) -> Result<ResponseJson<ListOrganizationsAdminResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
+{
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+
+    debug!(
+        "List organizations request with limit={}, offset={}",
+        params.limit, params.offset
+    );
+
+    let (organizations, total) = app_state
+        .admin_service
+        .list_organizations(params.limit, params.offset)
+        .await
+        .map_err(|e| {
+            error!("Failed to list organizations: {:?}", e);
+            match e {
+                services::admin::AdminError::Unauthorized(msg) => (
+                    StatusCode::UNAUTHORIZED,
+                    ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve organizations".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+
+    let org_responses: Vec<AdminOrganizationResponse> = organizations
+        .into_iter()
+        .map(|org| {
+            let current_usage = org.total_spent.map(|total_spent| OrganizationUsage {
+                total_spent,
+                total_spent_display: format_amount(total_spent),
+                total_requests: org.total_requests.unwrap_or(0),
+                total_tokens: org.total_tokens.unwrap_or(0),
+            });
+
+            AdminOrganizationResponse {
+                id: org.id.to_string(),
+                name: org.name,
+                description: org.description,
+                spend_limit: org.spend_limit.map(|amount| SpendLimit {
+                    amount,
+                    scale: 9,
+                    currency: "USD".to_string(),
+                }),
+                current_usage,
+                created_at: org.created_at,
+            }
+        })
+        .collect();
+
+    let response = ListOrganizationsAdminResponse {
+        organizations: org_responses,
         total,
         limit: params.limit,
         offset: params.offset,
@@ -1084,6 +1290,15 @@ pub struct ListUsersQueryParams {
     pub offset: i64,
     #[serde(default)]
     pub include_organizations: bool,
+    pub search_by_name: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ListOrganizationsQueryParams {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
 }
 
 #[derive(Debug, serde::Deserialize)]

@@ -93,6 +93,8 @@ where
     /// Last error from provider (for determining stop_reason)
     last_error: Option<inference_providers::CompletionError>,
     state: StreamState,
+    /// Whether the model supports TEE attestation (false for external providers)
+    attestation_supported: bool,
 }
 
 impl<S> InterceptStream<S>
@@ -101,7 +103,13 @@ where
 {
     /// Store attestation signature before sending [DONE] to client.
     /// This runs in the hot path to ensure signature is available when client receives [DONE].
+    /// Skipped for external providers that don't support TEE attestation.
     fn create_signature_future(&self) -> FinalizeFuture {
+        // Skip attestation for external providers (OpenAI, Anthropic, Gemini, etc.)
+        if !self.attestation_supported {
+            return Box::pin(async {});
+        }
+
         let chat_id = match &self.last_chat_id {
             Some(id) => id.clone(),
             None => {
@@ -258,6 +266,7 @@ where
                             provider_request_id: Some(chat_id),
                             stop_reason,
                             response_id,
+                            image_count: None,
                         })
                         .await
                         .is_err()
@@ -449,6 +458,26 @@ impl CompletionServiceImpl {
         }
     }
 
+    /// Extract tools and tool_choice from extra HashMap if present.
+    /// This handles the case where the Responses API places tools in request.extra.
+    /// Returns (tools, tool_choice) and removes them from extra to avoid duplication.
+    fn extract_tools_from_extra(
+        extra: &mut std::collections::HashMap<String, serde_json::Value>,
+    ) -> (
+        Option<Vec<inference_providers::ToolDefinition>>,
+        Option<inference_providers::ToolChoice>,
+    ) {
+        let tools = extra.remove("tools").and_then(|v| {
+            serde_json::from_value::<Vec<inference_providers::ToolDefinition>>(v).ok()
+        });
+
+        let tool_choice = extra
+            .remove("tool_choice")
+            .and_then(|v| serde_json::from_value::<inference_providers::ToolChoice>(v).ok());
+
+        (tools, tool_choice)
+    }
+
     /// Get the concurrent request limit for an organization (cached)
     async fn get_org_concurrent_limit(&self, organization_id: Uuid) -> u32 {
         let default_limit = self.concurrent_limit;
@@ -551,17 +580,36 @@ impl CompletionServiceImpl {
     fn prepare_chat_messages(messages: &[ports::CompletionMessage]) -> Vec<ChatMessage> {
         messages
             .iter()
-            .map(|msg| ChatMessage {
-                role: match msg.role.as_str() {
-                    "system" => MessageRole::System,
-                    "assistant" => MessageRole::Assistant,
-                    "tool" => MessageRole::Tool,
-                    _ => MessageRole::User,
-                },
-                content: Some(msg.content.clone()),
-                name: None,
-                tool_call_id: None,
-                tool_calls: None,
+            .map(|msg| {
+                // Convert tool_calls from CompletionToolCall to inference_providers::models::ToolCall
+                let tool_calls = msg.tool_calls.as_ref().map(|calls| {
+                    calls
+                        .iter()
+                        .map(|tc| inference_providers::models::ToolCall {
+                            id: Some(tc.id.clone()),
+                            type_: Some("function".to_string()),
+                            function: inference_providers::models::FunctionCall {
+                                name: Some(tc.name.clone()),
+                                arguments: Some(tc.arguments.clone()),
+                            },
+                            index: None,
+                            thought_signature: tc.thought_signature.clone(),
+                        })
+                        .collect()
+                });
+
+                ChatMessage {
+                    role: match msg.role.as_str() {
+                        "system" => MessageRole::System,
+                        "assistant" => MessageRole::Assistant,
+                        "tool" => MessageRole::Tool,
+                        _ => MessageRole::User,
+                    },
+                    content: Some(serde_json::Value::String(msg.content.clone())),
+                    name: None,
+                    tool_call_id: msg.tool_call_id.clone(),
+                    tool_calls,
+                }
             })
             .collect()
     }
@@ -619,6 +667,7 @@ impl CompletionServiceImpl {
         provider_start_time: Instant,
         concurrent_counter: Option<Arc<AtomicU32>>,
         response_id: Option<ResponseId>,
+        attestation_supported: bool,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
         let metric_tags = Self::create_metric_tags(&model_name);
@@ -659,6 +708,7 @@ impl CompletionServiceImpl {
             last_finish_reason: None,
             last_error: None,
             state: StreamState::Streaming,
+            attestation_supported,
         };
         Box::pin(intercepted_stream)
     }
@@ -687,6 +737,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         let chat_messages = Self::prepare_chat_messages(&request.messages);
 
+        // Extract tools from extra if present (Responses API puts them there)
+        let mut extra = request.extra.clone();
+        let (tools, tool_choice) = Self::extract_tools_from_extra(&mut extra);
+
         let mut chat_params = inference_providers::ChatCompletionParams {
             model: request.model.clone(),
             messages: chat_messages,
@@ -695,7 +749,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             top_p: request.top_p,
             stop: request.stop,
             stream: Some(true),
-            tools: None,
+            tools,
             max_completion_tokens: None,
             n: request.n,
             frequency_penalty: None,
@@ -705,12 +759,18 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             top_logprobs: None,
             user: Some(request.user_id.to_string()),
             seed: None,
-            tool_choice: None,
+            tool_choice,
             parallel_tool_calls: None,
-            metadata: request.metadata,
-            store: None,
+            // Drop metadata if store is not explicitly enabled (OpenAI requirement)
+            metadata: if request.store == Some(true) {
+                request.metadata.clone()
+            } else {
+                None
+            },
+            store: request.store,
             stream_options: None,
-            extra: request.extra.clone(),
+            modalities: None,
+            extra,
         };
 
         // Resolve model name (could be an alias) and get model details in a single DB call
@@ -793,6 +853,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 provider_start_time,
                 Some(counter),
                 request.response_id,
+                model.attestation_supported,
             )
             .await;
 
@@ -806,6 +867,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let service_start_time = Instant::now();
         let chat_messages = Self::prepare_chat_messages(&request.messages);
 
+        // Extract tools from extra if present (Responses API puts them there)
+        let mut extra = request.extra.clone();
+        let (tools, tool_choice) = Self::extract_tools_from_extra(&mut extra);
+
         let mut chat_params = inference_providers::ChatCompletionParams {
             model: request.model.clone(),
             messages: chat_messages,
@@ -814,7 +879,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             top_p: request.top_p,
             stop: request.stop,
             stream: Some(false),
-            tools: None,
+            tools,
             max_completion_tokens: None,
             n: request.n,
             frequency_penalty: None,
@@ -824,12 +889,18 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             top_logprobs: None,
             user: Some(request.user_id.to_string()),
             seed: None,
-            tool_choice: None,
+            tool_choice,
             parallel_tool_calls: None,
-            metadata: request.metadata,
-            store: None,
+            // Drop metadata if store is not explicitly enabled (OpenAI requirement)
+            metadata: if request.store == Some(true) {
+                request.metadata.clone()
+            } else {
+                None
+            },
+            store: request.store,
             stream_options: None,
-            extra: request.extra.clone(),
+            modalities: None,
+            extra,
         };
 
         // Resolve model name (could be an alias) and get model details in a single DB call
@@ -904,20 +975,22 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let backend_latency = provider_start_time.elapsed();
         let queue_time = provider_start_time.duration_since(service_start_time);
 
-        // Store attestation signature
-        let attestation_service = self.attestation_service.clone();
-        let chat_id = response_with_bytes.response.id.clone();
-        tokio::spawn(async move {
-            if attestation_service
-                .store_chat_signature_from_provider(chat_id.as_str())
-                .await
-                .is_err()
-            {
-                tracing::error!("Failed to store chat signature");
-            } else {
-                tracing::debug!("Stored signature for chat_id: {}", chat_id);
-            }
-        });
+        // Store attestation signature (only for models that support TEE attestation)
+        if model.attestation_supported {
+            let attestation_service = self.attestation_service.clone();
+            let chat_id = response_with_bytes.response.id.clone();
+            tokio::spawn(async move {
+                if attestation_service
+                    .store_chat_signature_from_provider(chat_id.as_str())
+                    .await
+                    .is_err()
+                {
+                    tracing::error!("Failed to store chat signature");
+                } else {
+                    tracing::debug!("Stored signature for chat_id: {}", chat_id);
+                }
+            });
+        }
 
         // Record metrics with low-cardinality tags only
         let metrics_service = self.metrics_service.clone();
@@ -983,6 +1056,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     provider_request_id: Some(provider_request_id),
                     stop_reason: Some(stop_reason),
                     response_id,
+                    image_count: None,
                 })
                 .await
                 .is_err()
@@ -1038,6 +1112,7 @@ mod tests {
                 usage: None,
                 prompt_token_ids: None,
                 system_fingerprint: None,
+                modality: None,
             }),
         };
 
@@ -1063,6 +1138,7 @@ mod tests {
                 }),
                 prompt_token_ids: None,
                 system_fingerprint: None,
+                modality: None,
             }),
         };
 
@@ -1099,6 +1175,7 @@ mod tests {
             last_finish_reason: None,
             last_error: None,
             state: StreamState::Streaming,
+            attestation_supported: true,
         };
 
         // Consume the stream
@@ -1172,6 +1249,7 @@ mod tests {
                 usage: None,
                 prompt_token_ids: None,
                 system_fingerprint: None,
+                modality: None,
             }),
         };
 
@@ -1186,6 +1264,7 @@ mod tests {
                 usage: None,
                 prompt_token_ids: None,
                 system_fingerprint: None,
+                modality: None,
             }),
         };
 
@@ -1210,6 +1289,7 @@ mod tests {
                     prompt_tokens_details: None,
                 }),
                 prompt_token_ids: None,
+                modality: None,
                 system_fingerprint: None,
             }),
         };
@@ -1251,6 +1331,7 @@ mod tests {
             last_finish_reason: None,
             last_error: None,
             state: StreamState::Streaming,
+            attestation_supported: true,
         };
 
         // Consume the stream
@@ -1330,6 +1411,7 @@ mod tests {
                     prompt_tokens_details: None,
                 }),
                 prompt_token_ids: None,
+                modality: None,
                 system_fingerprint: None,
             }),
         };
@@ -1366,6 +1448,7 @@ mod tests {
             last_finish_reason: None,
             last_error: None,
             state: StreamState::Streaming,
+            attestation_supported: true,
         };
 
         let _ = intercept_stream.collect::<Vec<_>>().await;
@@ -1529,6 +1612,7 @@ mod tests {
                 last_finish_reason: None,
                 last_error: None,
                 state: StreamState::Streaming,
+                attestation_supported: true,
             };
             // InterceptStream goes out of scope here and Drop is called
         }

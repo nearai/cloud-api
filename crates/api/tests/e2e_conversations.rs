@@ -2144,6 +2144,87 @@ async fn test_rename_conversation_via_metadata() {
 }
 
 #[tokio::test]
+async fn test_pin_rename_unpin_conversation() {
+    // Test the bug: pin -> rename -> unpin should remove pinned_at from metadata
+    let (server, _guard) = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    // Create a conversation
+    let create_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "metadata": {
+                "title": "Test Conversation"
+            }
+        }))
+        .await;
+    assert_eq!(create_response.status_code(), 201);
+    let conversation = create_response.json::<api::models::ConversationObject>();
+    println!("Created conversation: {}", conversation.id);
+
+    // Step 1: Pin the conversation
+    let pin_response = server
+        .post(format!("/v1/conversations/{}/pin", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(pin_response.status_code(), 200);
+    let pinned_conv = pin_response.json::<api::models::ConversationObject>();
+
+    // Verify pinned_at is present
+    assert!(
+        pinned_conv.metadata.get("pinned_at").is_some(),
+        "pinned_at should be present after pinning"
+    );
+    println!("✅ Conversation pinned successfully");
+
+    // Step 2: Rename the conversation (update metadata)
+    let rename_response = server
+        .post(format!("/v1/conversations/{}", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "metadata": {
+                "title": "Renamed Conversation"
+            }
+        }))
+        .await;
+    assert_eq!(rename_response.status_code(), 200);
+    let renamed_conv = rename_response.json::<api::models::ConversationObject>();
+
+    // Verify title was updated
+    assert_eq!(
+        renamed_conv.metadata.get("title").and_then(|v| v.as_str()),
+        Some("Renamed Conversation")
+    );
+    // Verify pinned_at is still present after rename
+    assert!(
+        renamed_conv.metadata.get("pinned_at").is_some(),
+        "pinned_at should still be present after rename"
+    );
+    println!("✅ Conversation renamed successfully, pinned_at preserved");
+
+    // Step 3: Unpin the conversation
+    let unpin_response = server
+        .delete(format!("/v1/conversations/{}/pin", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(unpin_response.status_code(), 200);
+    let unpinned_conv = unpin_response.json::<api::models::ConversationObject>();
+
+    // Verify pinned_at is removed after unpinning (this was the bug)
+    assert!(
+        unpinned_conv.metadata.get("pinned_at").is_none(),
+        "pinned_at should be removed from metadata after unpinning, even after rename"
+    );
+    // Verify title is still preserved
+    assert_eq!(
+        unpinned_conv.metadata.get("title").and_then(|v| v.as_str()),
+        Some("Renamed Conversation")
+    );
+    println!("✅ Conversation unpinned successfully, pinned_at removed from metadata");
+}
+
+#[tokio::test]
 async fn test_clone_conversation() {
     let (server, _guard) = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;

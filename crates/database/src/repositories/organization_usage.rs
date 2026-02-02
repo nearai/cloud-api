@@ -74,8 +74,8 @@ impl OrganizationUsageRepository {
                         model_id, model_name, input_tokens, output_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
                         inference_type, created_at, ttft_ms, avg_itl_ms, inference_id,
-                        provider_request_id, stop_reason, response_id
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+                        provider_request_id, stop_reason, response_id, image_count
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
                     RETURNING *
                     "#,
                     &[
@@ -99,6 +99,7 @@ impl OrganizationUsageRepository {
                         &request.provider_request_id,
                         &stop_reason_str,
                         &response_id_uuid,
+                        &request.image_count,
                     ],
                 )
                 .await
@@ -221,7 +222,7 @@ impl OrganizationUsageRepository {
                         model_id, model_name, input_tokens, output_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
                         inference_type, created_at, ttft_ms, avg_itl_ms, inference_id,
-                        provider_request_id, stop_reason, response_id
+                        provider_request_id, stop_reason, response_id, image_count
                     FROM organization_usage_log
                     WHERE organization_id = $1
                     ORDER BY created_at DESC
@@ -288,7 +289,7 @@ impl OrganizationUsageRepository {
                         model_id, model_name, input_tokens, output_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
                         inference_type, created_at, ttft_ms, avg_itl_ms, inference_id,
-                        provider_request_id, stop_reason, response_id
+                        provider_request_id, stop_reason, response_id, image_count
                     FROM organization_usage_log
                     WHERE api_key_id = $1
                     ORDER BY created_at DESC
@@ -373,6 +374,7 @@ impl OrganizationUsageRepository {
             provider_request_id: row.get("provider_request_id"),
             stop_reason,
             response_id,
+            image_count: row.get("image_count"),
         })
     }
 
@@ -385,6 +387,64 @@ impl OrganizationUsageRepository {
             total_tokens: row.get("total_tokens"),
             updated_at: row.get("updated_at"),
         }
+    }
+
+    /// Get the stop reason for a specific response ID
+    /// Used to check if a response was stopped due to client disconnect
+    pub async fn get_stop_reason_by_response_id(
+        &self,
+        response_id: Uuid,
+    ) -> Result<Option<StopReason>> {
+        let row_opt = retry_db!("get_stop_reason_by_response_id", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_opt(
+                    r#"SELECT stop_reason FROM organization_usage_log WHERE response_id = $1"#,
+                    &[&response_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(row_opt.and_then(|row| {
+            let stop_reason_str: Option<String> = row.get("stop_reason");
+            stop_reason_str.as_deref().map(StopReason::parse)
+        }))
+    }
+
+    /// Get the stop reason for a specific provider request ID (e.g., chatcmpl-xxx)
+    /// Used to check if a chat completion was stopped due to client disconnect
+    pub async fn get_stop_reason_by_provider_request_id(
+        &self,
+        provider_request_id: &str,
+    ) -> Result<Option<StopReason>> {
+        let row_opt = retry_db!("get_stop_reason_by_provider_request_id", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_opt(
+                    r#"SELECT stop_reason FROM organization_usage_log WHERE provider_request_id = $1"#,
+                    &[&provider_request_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(row_opt.and_then(|row| {
+            let stop_reason_str: Option<String> = row.get("stop_reason");
+            stop_reason_str.as_deref().map(StopReason::parse)
+        }))
     }
 
     /// Get costs by inference IDs (for HuggingFace billing integration)

@@ -86,7 +86,7 @@ cargo run --bin api
 docker-compose up -d
 
 # Check code formatting
-cargo fmt --check
+cargo fmt --all -- --check
 
 # Run linter
 cargo clippy

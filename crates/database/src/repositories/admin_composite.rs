@@ -6,9 +6,9 @@ use crate::repositories::{
 use anyhow::Result;
 use async_trait::async_trait;
 use services::admin::{
-    AdminModelInfo, AdminRepository, ModelHistoryEntry, ModelPricing, OrganizationLimits,
-    OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate, UpdateModelAdminRequest, UserInfo,
-    UserOrganizationInfo,
+    AdminModelInfo, AdminOrganizationInfo, AdminRepository, ModelHistoryEntry, ModelPricing,
+    OrganizationLimits, OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate,
+    UpdateModelAdminRequest, UserInfo, UserOrganizationInfo,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -46,6 +46,7 @@ impl AdminRepository for AdminCompositeRepository {
         let db_request = UpdateModelPricingRequest {
             input_cost_per_token: request.input_cost_per_token,
             output_cost_per_token: request.output_cost_per_token,
+            cost_per_image: request.cost_per_image,
             model_display_name: request.model_display_name,
             model_description: request.model_description,
             model_icon: request.model_icon,
@@ -54,6 +55,11 @@ impl AdminRepository for AdminCompositeRepository {
             is_active: request.is_active,
             aliases: request.aliases.clone(),
             owned_by: request.owned_by,
+            provider_type: request.provider_type,
+            provider_config: request.provider_config,
+            attestation_supported: request.attestation_supported,
+            input_modalities: request.input_modalities,
+            output_modalities: request.output_modalities,
             change_reason: request.change_reason,
             changed_by_user_id: request.changed_by_user_id,
             changed_by_user_email: request.changed_by_user_email,
@@ -77,11 +83,17 @@ impl AdminRepository for AdminCompositeRepository {
             model_icon: model.model_icon,
             input_cost_per_token: model.input_cost_per_token,
             output_cost_per_token: model.output_cost_per_token,
+            cost_per_image: model.cost_per_image,
             context_length: model.context_length,
             verifiable: model.verifiable,
             is_active: model.is_active,
             aliases: model.aliases,
             owned_by: model.owned_by,
+            provider_type: model.provider_type,
+            provider_config: model.provider_config,
+            attestation_supported: model.attestation_supported,
+            input_modalities: model.input_modalities,
+            output_modalities: model.output_modalities,
         })
     }
 
@@ -108,6 +120,7 @@ impl AdminRepository for AdminCompositeRepository {
                 model_id: h.model_id,
                 input_cost_per_token: h.input_cost_per_token,
                 output_cost_per_token: h.output_cost_per_token,
+                cost_per_image: h.cost_per_image,
                 context_length: h.context_length,
                 model_name: h.model_name,
                 model_display_name: h.model_display_name,
@@ -116,6 +129,8 @@ impl AdminRepository for AdminCompositeRepository {
                 verifiable: h.verifiable,
                 is_active: h.is_active,
                 owned_by: h.owned_by,
+                input_modalities: h.input_modalities,
+                output_modalities: h.output_modalities,
                 effective_from: h.effective_from,
                 effective_until: h.effective_until,
                 changed_by_user_id: h.changed_by_user_id,
@@ -252,13 +267,14 @@ impl AdminRepository for AdminCompositeRepository {
         &self,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<(UserInfo, Option<UserOrganizationInfo>)>> {
-        let users_with_orgs = self
+        search_by_name: Option<String>,
+    ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64)> {
+        let (users_with_orgs, total_count) = self
             .user_repo
-            .list_with_organizations(limit, offset)
+            .list_with_organizations(limit, offset, search_by_name)
             .await?;
 
-        Ok(users_with_orgs
+        let result = users_with_orgs
             .into_iter()
             .map(|(u, org_data)| {
                 let user_info = UserInfo {
@@ -273,7 +289,9 @@ impl AdminRepository for AdminCompositeRepository {
                 };
                 (user_info, org_data)
             })
-            .collect())
+            .collect();
+
+        Ok((result, total_count))
     }
 
     async fn get_active_user_count(&self) -> Result<i64> {
@@ -306,6 +324,7 @@ impl AdminRepository for AdminCompositeRepository {
                 model_icon: m.model_icon,
                 input_cost_per_token: m.input_cost_per_token,
                 output_cost_per_token: m.output_cost_per_token,
+                cost_per_image: m.cost_per_image,
                 context_length: m.context_length,
                 verifiable: m.verifiable,
                 is_active: m.is_active,
@@ -313,6 +332,11 @@ impl AdminRepository for AdminCompositeRepository {
                 aliases: m.aliases,
                 created_at: m.created_at,
                 updated_at: m.updated_at,
+                provider_type: m.provider_type,
+                provider_config: m.provider_config,
+                attestation_supported: m.attestation_supported,
+                input_modalities: m.input_modalities,
+                output_modalities: m.output_modalities,
             })
             .collect();
 
@@ -364,5 +388,76 @@ impl AdminRepository for AdminCompositeRepository {
             }
             None => anyhow::bail!("Organization not found or inactive: {}", organization_id),
         }
+    }
+
+    async fn list_all_organizations(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AdminOrganizationInfo>> {
+        let client = self.pool.get().await?;
+
+        let rows = client
+            .query(
+                r#"
+                SELECT
+                    o.id,
+                    o.name,
+                    o.description,
+                    o.created_at,
+                    olh.spend_limit,
+                    ob.total_spent,
+                    ob.total_requests,
+                    ob.total_tokens
+                FROM organizations o
+                LEFT JOIN LATERAL (
+                    SELECT spend_limit
+                    FROM organization_limits_history
+                    WHERE organization_id = o.id
+                      AND effective_until IS NULL
+                    ORDER BY effective_from DESC
+                    LIMIT 1
+                ) olh ON true
+                LEFT JOIN organization_balance ob ON o.id = ob.organization_id
+                WHERE o.is_active = true
+                ORDER BY o.created_at DESC
+                LIMIT $1 OFFSET $2
+                "#,
+                &[&limit, &offset],
+            )
+            .await?;
+
+        let organizations = rows
+            .into_iter()
+            .map(|row| AdminOrganizationInfo {
+                id: row.get("id"),
+                name: row.get("name"),
+                description: row.get("description"),
+                spend_limit: row.get("spend_limit"),
+                total_spent: row.get("total_spent"),
+                total_requests: row.get("total_requests"),
+                total_tokens: row.get("total_tokens"),
+                created_at: row.get("created_at"),
+            })
+            .collect();
+
+        Ok(organizations)
+    }
+
+    async fn count_all_organizations(&self) -> Result<i64> {
+        let client = self.pool.get().await?;
+
+        let row = client
+            .query_one(
+                r#"
+                SELECT COUNT(*) as count
+                FROM organizations
+                WHERE is_active = true
+                "#,
+                &[],
+            )
+            .await?;
+
+        Ok(row.get::<_, i64>("count"))
     }
 }

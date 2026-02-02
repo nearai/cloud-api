@@ -230,6 +230,20 @@ pub trait UsageRepository: Send + Sync {
         organization_id: Uuid,
         inference_ids: Vec<Uuid>,
     ) -> anyhow::Result<Vec<InferenceCost>>;
+
+    /// Get the stop reason for a specific response ID
+    /// Used to check if a response was stopped due to client disconnect
+    async fn get_stop_reason_by_response_id(
+        &self,
+        response_id: Uuid,
+    ) -> anyhow::Result<Option<StopReason>>;
+
+    /// Get the stop reason for a specific provider request ID (e.g., chatcmpl-xxx)
+    /// Used to check if a chat completion was stopped due to client disconnect
+    async fn get_stop_reason_by_provider_request_id(
+        &self,
+        provider_request_id: &str,
+    ) -> anyhow::Result<Option<StopReason>>;
 }
 
 #[async_trait::async_trait]
@@ -263,7 +277,7 @@ pub struct RecordUsageServiceRequest {
     pub model_id: Uuid,
     pub input_tokens: i32,
     pub output_tokens: i32,
-    pub inference_type: String, // 'chat_completion', 'chat_completion_stream', 'image_generation', etc.
+    pub inference_type: String, // 'chat_completion', 'chat_completion_stream', 'image_generation', 'image_edit', etc.
     /// Time to first token in milliseconds
     pub ttft_ms: Option<i32>,
     /// Average inter-token latency in milliseconds
@@ -276,6 +290,8 @@ pub struct RecordUsageServiceRequest {
     pub stop_reason: Option<StopReason>,
     /// Response ID for Response API calls (FK to responses table)
     pub response_id: Option<ResponseId>,
+    /// Number of images generated (for image generation requests)
+    pub image_count: Option<i32>,
 }
 
 /// Request to record usage (database layer)
@@ -305,6 +321,8 @@ pub struct RecordUsageDbRequest {
     pub stop_reason: Option<StopReason>,
     /// Response ID for Response API calls (FK to responses table)
     pub response_id: Option<ResponseId>,
+    /// Number of images generated (for image generation requests)
+    pub image_count: Option<i32>,
 }
 
 /// Model pricing information
@@ -315,6 +333,7 @@ pub struct ModelPricing {
     pub model_name: String, // Canonical model name
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
+    pub cost_per_image: i64,
 }
 
 /// Organization spending limit
@@ -393,6 +412,8 @@ pub struct UsageLogEntry {
     pub stop_reason: Option<StopReason>,
     /// Response ID for Response API calls (FK to responses table)
     pub response_id: Option<ResponseId>,
+    /// Number of images generated (for image generation requests)
+    pub image_count: Option<i32>,
 }
 
 // ============================================

@@ -28,6 +28,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             provider_request_id: request.provider_request_id,
             stop_reason: request.stop_reason,
             response_id: request.response_id,
+            image_count: request.image_count,
         };
 
         let log = self.record_usage(db_request).await?;
@@ -53,6 +54,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             provider_request_id: log.provider_request_id,
             stop_reason: log.stop_reason,
             response_id: log.response_id,
+            image_count: log.image_count,
         })
     }
 
@@ -107,6 +109,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 provider_request_id: log.provider_request_id,
                 stop_reason: log.stop_reason,
                 response_id: log.response_id,
+                image_count: log.image_count,
             })
             .collect();
 
@@ -148,6 +151,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 provider_request_id: log.provider_request_id,
                 stop_reason: log.stop_reason,
                 response_id: log.response_id,
+                image_count: log.image_count,
             })
             .collect();
 
@@ -164,6 +168,21 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
         inference_ids: Vec<Uuid>,
     ) -> anyhow::Result<Vec<InferenceCost>> {
         self.get_costs_by_inference_ids(organization_id, inference_ids)
+            .await
+    }
+
+    async fn get_stop_reason_by_response_id(
+        &self,
+        response_id: Uuid,
+    ) -> anyhow::Result<Option<services::usage::StopReason>> {
+        self.get_stop_reason_by_response_id(response_id).await
+    }
+
+    async fn get_stop_reason_by_provider_request_id(
+        &self,
+        provider_request_id: &str,
+    ) -> anyhow::Result<Option<services::usage::StopReason>> {
+        self.get_stop_reason_by_provider_request_id(provider_request_id)
             .await
     }
 }

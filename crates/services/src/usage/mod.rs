@@ -76,10 +76,20 @@ impl UsageServiceTrait for UsageServiceImpl {
                 UsageError::ModelNotFound(format!("Model with ID '{}' not found", request.model_id))
             })?;
 
-        // Calculate costs using the model's pricing
-        let input_cost = (request.input_tokens as i64) * model.input_cost_per_token;
-        let output_cost = (request.output_tokens as i64) * model.output_cost_per_token;
-        let total_cost = input_cost + output_cost;
+        // Calculate costs based on inference type
+        let (input_cost, output_cost, total_cost) = if request.inference_type == "image_generation"
+            || request.inference_type == "image_edit"
+        {
+            // For image-based operations: use image_count and cost_per_image
+            let image_count = request.image_count.unwrap_or(0);
+            let image_cost = (image_count as i64) * model.cost_per_image;
+            (0, image_cost, image_cost)
+        } else {
+            // For token-based models (chat completions, etc.)
+            let input_cost = (request.input_tokens as i64) * model.input_cost_per_token;
+            let output_cost = (request.output_tokens as i64) * model.output_cost_per_token;
+            (input_cost, output_cost, input_cost + output_cost)
+        };
 
         // Create database request with model UUID and name (denormalized)
         let db_request = RecordUsageDbRequest {
@@ -100,6 +110,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             provider_request_id: request.provider_request_id,
             stop_reason: request.stop_reason,
             response_id: request.response_id,
+            image_count: request.image_count,
         };
 
         // Record in database

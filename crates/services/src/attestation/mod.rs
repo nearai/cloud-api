@@ -1,6 +1,6 @@
 pub mod models;
 use dstack_sdk::dstack_client;
-pub use models::{AttestationError, ChatSignature};
+pub use models::{AttestationError, ChatSignature, SignatureLookupResult};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -12,6 +12,7 @@ use k256::ecdsa::{
 };
 use rand_core::{OsRng, RngCore};
 use sha3::{Digest, Keccak256};
+use uuid::Uuid;
 
 use crate::{
     attestation::{
@@ -21,6 +22,7 @@ use crate::{
     inference_provider_pool::InferenceProviderPool,
     metrics::{consts::*, MetricsServiceTrait},
     models::ModelsRepository,
+    usage::{StopReason, UsageRepository},
 };
 
 use chrono;
@@ -29,11 +31,16 @@ use sha2::Sha256;
 
 pub mod ports;
 
+// Constants for key paths
+const GATEWAY_KEY_PATH_ED25519: &str = "/signing-key/ed25519";
+const GATEWAY_KEY_PATH_ECDSA: &str = "/signing-key/ecdsa";
+
 pub struct AttestationService {
     pub repository: Arc<dyn AttestationRepository + Send + Sync>,
     pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub models_repository: Arc<dyn ModelsRepository>,
     pub metrics_service: Arc<dyn MetricsServiceTrait>,
+    pub usage_repository: Arc<dyn UsageRepository>,
     pub vpc_info: Option<VpcInfo>,
     pub vpc_shared_secret: Option<String>,
     ed25519_signing_key: Arc<SigningKey>,
@@ -43,12 +50,13 @@ pub struct AttestationService {
 }
 
 impl AttestationService {
-    pub fn new(
+    pub async fn init(
         repository: Arc<dyn AttestationRepository + Send + Sync>,
         inference_provider_pool: Arc<InferenceProviderPool>,
         models_repository: Arc<dyn ModelsRepository>,
         metrics_service: Arc<dyn MetricsServiceTrait>,
-    ) -> Self {
+        usage_repository: Arc<dyn UsageRepository>,
+    ) -> Result<Self, AttestationError> {
         // Load VPC info once during initialization
         let vpc_info = load_vpc_info();
 
@@ -60,45 +68,169 @@ impl AttestationService {
             );
         }
 
-        let mut csprng = OsRng;
+        // In TEE, use dstack-derived key material based on app_id so the signing address
+        // stays stable across multiple instances of the same app.
+        // In DEV mode, fall back to per-process keys for local development.
+        let (ed25519_signing_key, ed25519_verifying_key, ecdsa_signing_key, ecdsa_verifying_key) =
+            match Self::derive_signing_keys_from_dstack().await {
+                Ok(keys) => keys,
+                Err(e) => {
+                    if std::env::var("DEV").is_ok() {
+                        tracing::warn!(
+                            "DEV mode: Unable to derive signing keys from dstack ({}); falling back to ephemeral keys",
+                            e
+                        );
+                        Self::generate_ephemeral_signing_keys()
+                    } else {
+                        tracing::error!(
+                            "Failed to derive signing keys from dstack ({}). \
+                             This service must run in a CVM/TEE with dstack available.",
+                            e
+                        );
+                        return Err(AttestationError::InternalError(format!(
+                            "Failed to derive signing keys from dstack: {}. \
+                             Ensure this service runs in a CVM/TEE with dstack available.",
+                            e
+                        )));
+                    }
+                }
+            };
 
-        // Generate ed25519 key pair on startup
-        let ed25519_signing_key = SigningKey::generate(&mut csprng);
-        let ed25519_verifying_key = ed25519_signing_key.verifying_key();
-        let ed25519_signing_key = Arc::new(ed25519_signing_key);
-        let ed25519_verifying_key = Arc::new(ed25519_verifying_key);
-
-        let ed25519_address = hex::encode(ed25519_verifying_key.as_bytes());
-        tracing::info!(
-            "Generated ed25519 key pair for response signing. Public key (signing address): {}",
-            ed25519_address
-        );
-
-        // Generate ECDSA (secp256k1) key pair on startup
-        let ecdsa_signing_key = EcdsaSigningKey::random(&mut csprng);
-        let ecdsa_verifying_key = *ecdsa_signing_key.verifying_key();
-        let ecdsa_signing_key = Arc::new(ecdsa_signing_key);
-        let ecdsa_verifying_key = Arc::new(ecdsa_verifying_key);
-
-        // Convert ECDSA public key to Ethereum address (20 bytes = 40 hex chars)
-        let ecdsa_address_raw = Self::ecdsa_public_key_to_ethereum_address(&ecdsa_verifying_key);
-        tracing::info!(
-            "Generated ECDSA (secp256k1) key pair for response signing. Ethereum address (signing address): 0x{}",
-            hex::encode(ecdsa_address_raw)
-        );
-
-        Self {
+        Ok(Self {
             repository,
             inference_provider_pool,
             models_repository,
             metrics_service,
+            usage_repository,
             vpc_info,
             vpc_shared_secret,
+            ed25519_signing_key: Arc::new(ed25519_signing_key),
+            ed25519_verifying_key: Arc::new(ed25519_verifying_key),
+            ecdsa_signing_key: Arc::new(ecdsa_signing_key),
+            ecdsa_verifying_key: Arc::new(ecdsa_verifying_key),
+        })
+    }
+
+    fn generate_ephemeral_signing_keys(
+    ) -> (SigningKey, VerifyingKey, EcdsaSigningKey, EcdsaVerifyingKey) {
+        let mut csprng = OsRng;
+
+        // ed25519 key pair
+        let ed25519_signing_key = SigningKey::generate(&mut csprng);
+        let ed25519_verifying_key = ed25519_signing_key.verifying_key();
+        let ed25519_address = hex::encode(ed25519_verifying_key.as_bytes());
+        tracing::info!(
+            "Generated ed25519 key pair for response signing (ephemeral). Public key (signing address): {}",
+            ed25519_address
+        );
+
+        // ECDSA key pair
+        let ecdsa_signing_key = EcdsaSigningKey::random(&mut csprng);
+        let ecdsa_verifying_key = *ecdsa_signing_key.verifying_key();
+        let ecdsa_address_raw = Self::ecdsa_public_key_to_ethereum_address(&ecdsa_verifying_key);
+        tracing::info!(
+            "Generated ECDSA (secp256k1) key pair for response signing (ephemeral). Ethereum address (signing address): 0x{}",
+            hex::encode(ecdsa_address_raw)
+        );
+
+        (
             ed25519_signing_key,
             ed25519_verifying_key,
             ecdsa_signing_key,
             ecdsa_verifying_key,
+        )
+    }
+
+    async fn derive_signing_keys_from_dstack(
+    ) -> Result<(SigningKey, VerifyingKey, EcdsaSigningKey, EcdsaVerifyingKey), AttestationError>
+    {
+        let client = dstack_client::DstackClient::new(None);
+
+        // Get ed25519 signing key from dstack
+        // Note: Treating a secp256k1 private key as an ed25519 private key
+        // is not theoretically safe, but it is acceptable in practice
+        let ed25519_key_resp = client
+            .get_key(Some(GATEWAY_KEY_PATH_ED25519.into()), None)
+            .await
+            .map_err(|e| {
+                AttestationError::InternalError(format!(
+                    "failed to get ed25519 key from dstack: {e:?}"
+                ))
+            })?;
+
+        let ed25519_key_bytes = ed25519_key_resp.decode_key().map_err(|e| {
+            AttestationError::InternalError(format!("failed to decode ed25519 key hex: {e}"))
+        })?;
+
+        // Validate key length (ed25519 requires 32 bytes)
+        if ed25519_key_bytes.len() != 32 {
+            return Err(AttestationError::InternalError(format!(
+                "Invalid ed25519 key length: expected 32 bytes, got {} bytes",
+                ed25519_key_bytes.len()
+            )));
         }
+
+        let ed25519_key_array: [u8; 32] = ed25519_key_bytes.try_into().map_err(|_| {
+            AttestationError::InternalError(
+                "Failed to convert ed25519 key bytes to array".to_string(),
+            )
+        })?;
+
+        let ed25519_signing_key = SigningKey::from_bytes(&ed25519_key_array);
+        let ed25519_verifying_key = ed25519_signing_key.verifying_key();
+
+        // Get secp256k1 signing key from dstack
+        let ecdsa_key_resp = client
+            .get_key(Some(GATEWAY_KEY_PATH_ECDSA.into()), None)
+            .await
+            .map_err(|e| {
+                AttestationError::InternalError(format!(
+                    "failed to get ecdsa key from dstack: {e:?}"
+                ))
+            })?;
+
+        let ecdsa_key_bytes = ecdsa_key_resp.decode_key().map_err(|e| {
+            AttestationError::InternalError(format!("failed to decode ecdsa key hex: {e}"))
+        })?;
+
+        // Validate key length (secp256k1 requires 32 bytes)
+        if ecdsa_key_bytes.len() != 32 {
+            return Err(AttestationError::InternalError(format!(
+                "Invalid ecdsa key length: expected 32 bytes, got {} bytes",
+                ecdsa_key_bytes.len()
+            )));
+        }
+
+        let ecdsa_key_array: [u8; 32] = ecdsa_key_bytes.try_into().map_err(|_| {
+            AttestationError::InternalError(
+                "Failed to convert ecdsa key bytes to array".to_string(),
+            )
+        })?;
+
+        let ecdsa_signing_key =
+            EcdsaSigningKey::from_bytes(&ecdsa_key_array.into()).map_err(|_| {
+                AttestationError::InternalError("Invalid secp256k1 private key from dstack".into())
+            })?;
+
+        let ecdsa_verifying_key = *ecdsa_signing_key.verifying_key();
+
+        let ed25519_address = hex::encode(ed25519_verifying_key.as_bytes());
+        tracing::info!(
+            "Loaded ed25519 key pair for response signing from dstack. Public key (signing address): {}",
+            ed25519_address
+        );
+        let ecdsa_address_raw = Self::ecdsa_public_key_to_ethereum_address(&ecdsa_verifying_key);
+        tracing::info!(
+            "Loaded ECDSA (secp256k1) key pair for response signing from dstack. Ethereum address (signing address): 0x{}",
+            hex::encode(ecdsa_address_raw)
+        );
+
+        Ok((
+            ed25519_signing_key,
+            ed25519_verifying_key,
+            ecdsa_signing_key,
+            ecdsa_verifying_key,
+        ))
     }
 
     /// Convert ECDSA public key to Ethereum address (20 bytes)
@@ -151,6 +283,50 @@ impl AttestationService {
             ))),
         }
     }
+
+    /// Check if the response/completion was stopped due to client disconnect
+    /// If so, return an Unavailable result instead of NotFound error
+    async fn check_fallback_conditions(
+        &self,
+        chat_id: &str,
+        signing_algo: &str,
+    ) -> Result<SignatureLookupResult, AttestationError> {
+        // Query usage repository for stop_reason based on ID format
+        let stop_reason = if chat_id.starts_with("resp_") {
+            // Response API - query by response_id
+            let uuid_str = chat_id.strip_prefix("resp_").unwrap_or(chat_id);
+            let response_uuid = match Uuid::parse_str(uuid_str) {
+                Ok(uuid) => uuid,
+                Err(_) => {
+                    return Err(AttestationError::SignatureNotFound(format!(
+                        "{}:{}",
+                        chat_id, signing_algo
+                    )))
+                }
+            };
+            self.usage_repository
+                .get_stop_reason_by_response_id(response_uuid)
+                .await
+                .map_err(|e| AttestationError::RepositoryError(e.to_string()))?
+        } else {
+            // Chat Completions API - query by provider_request_id
+            self.usage_repository
+                .get_stop_reason_by_provider_request_id(chat_id)
+                .await
+                .map_err(|e| AttestationError::RepositoryError(e.to_string()))?
+        };
+
+        match stop_reason {
+            Some(StopReason::ClientDisconnect) => Ok(SignatureLookupResult::Unavailable {
+                error_code: "STREAM_DISCONNECTED".to_string(),
+                message: "Verification not available due to disconnection.".to_string(),
+            }),
+            _ => Err(AttestationError::SignatureNotFound(format!(
+                "{}:{}",
+                chat_id, signing_algo
+            ))),
+        }
+    }
 }
 
 /// Load VPC (Virtual Private Cloud) information from environment variables
@@ -198,14 +374,24 @@ impl ports::AttestationServiceTrait for AttestationService {
         &self,
         chat_id: &str,
         signing_algo: Option<String>,
-    ) -> Result<ChatSignature, AttestationError> {
+    ) -> Result<SignatureLookupResult, AttestationError> {
         let signing_algo = signing_algo
             .map(|s| s.to_lowercase())
             .unwrap_or_else(|| "ecdsa".to_string());
 
-        self.repository
+        // Try to get signature from repository
+        match self
+            .repository
             .get_chat_signature(chat_id, &signing_algo)
             .await
+        {
+            Ok(signature) => Ok(SignatureLookupResult::Found(signature)),
+            Err(AttestationError::SignatureNotFound(_)) => {
+                // Check if the response was stopped due to client disconnect
+                self.check_fallback_conditions(chat_id, &signing_algo).await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn store_chat_signature_from_provider(
@@ -409,22 +595,19 @@ impl ports::AttestationServiceTrait for AttestationService {
         // Resolve model name (could be an alias) and get model details
         let mut model_attestations = vec![];
         // Create a nonce if none was provided
-        let nonce = match nonce {
-            Some(n) => n,
-            None => {
-                let mut nonce_bytes = [0u8; 32];
-                OsRng.fill_bytes(&mut nonce_bytes);
-                let generated_nonce = nonce_bytes
-                    .into_iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>();
-                tracing::debug!(
-                    "No nonce provided for attestation report, generated nonce: {}",
-                    generated_nonce
-                );
+        let nonce = nonce.unwrap_or_else(|| {
+            let mut nonce_bytes = [0u8; 32];
+            OsRng.fill_bytes(&mut nonce_bytes);
+            let generated_nonce = nonce_bytes
+                .into_iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            tracing::debug!(
+                "No nonce provided for attestation report, generated nonce: {}",
                 generated_nonce
-            }
-        };
+            );
+            generated_nonce
+        });
 
         // Parse nonce: handle hex string or generate if needed
         let nonce_bytes = hex::decode(&nonce).map_err(|e| {

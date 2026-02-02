@@ -1,14 +1,17 @@
 use crate::common::encryption_headers;
+use config::ExternalProvidersConfig;
 use inference_providers::{
     models::{AttestationError, CompletionError, ListModelsError, ModelsResponse},
-    ChatCompletionParams, InferenceProvider, StreamingResult, StreamingResultExt, VLlmConfig,
-    VLlmProvider,
+    ChatCompletionParams, ExternalProvider, ExternalProviderConfig, ImageEditError,
+    ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponseWithBytes, InferenceProvider, ProviderConfig, StreamingResult,
+    StreamingResultExt, VLlmConfig, VLlmProvider,
 };
 use regex::Regex;
 use serde::Deserialize;
 use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
 
@@ -53,6 +56,10 @@ pub struct InferenceProviderPool {
     inference_timeout_secs: i64,
     /// Combined provider mappings (updated atomically to prevent race conditions)
     provider_mappings: Arc<RwLock<ProviderMappings>>,
+    /// External providers (keyed by model name, created from database config)
+    external_providers: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
+    /// Configuration for external providers (API keys, timeouts, etc.)
+    external_configs: ExternalProvidersConfig,
     /// Round-robin index for each model
     load_balancer_index: Arc<RwLock<HashMap<String, usize>>>,
     /// Map of chat_id -> provider for sticky routing
@@ -68,6 +75,7 @@ impl InferenceProviderPool {
         api_key: Option<String>,
         discovery_timeout_secs: i64,
         inference_timeout_secs: i64,
+        external_configs: ExternalProvidersConfig,
     ) -> Self {
         Self {
             discovery_url,
@@ -75,10 +83,154 @@ impl InferenceProviderPool {
             discovery_timeout: Duration::from_secs(discovery_timeout_secs as u64),
             inference_timeout_secs,
             provider_mappings: Arc::new(RwLock::new(ProviderMappings::new())),
+            external_providers: Arc::new(RwLock::new(HashMap::new())),
+            external_configs,
             load_balancer_index: Arc::new(RwLock::new(HashMap::new())),
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
             refresh_task_handle: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Register an external provider for a model
+    ///
+    /// External providers are third-party AI providers (OpenAI, Anthropic, Gemini)
+    /// that don't support TEE attestation.
+    ///
+    /// # Arguments
+    /// * `model_name` - The model name to register (e.g., "gpt-4o", "claude-3-opus")
+    /// * `provider_config` - The provider configuration from database
+    pub async fn register_external_provider(
+        &self,
+        model_name: String,
+        provider_config: serde_json::Value,
+    ) -> Result<(), String> {
+        // Parse the provider config
+        let config: ProviderConfig = serde_json::from_value(provider_config)
+            .map_err(|e| format!("Failed to parse provider config: {e}"))?;
+
+        // Get the backend type to look up the API key
+        let backend_type = match &config {
+            ProviderConfig::OpenAiCompatible { .. } => "openai_compatible",
+            ProviderConfig::Anthropic { .. } => "anthropic",
+            ProviderConfig::Gemini { .. } => "gemini",
+        };
+
+        // Get the API key for this backend
+        let api_key = self
+            .external_configs
+            .get_api_key(backend_type)
+            .ok_or_else(|| {
+                format!(
+                    "No API key configured for backend type '{}'. \
+                     Set the appropriate environment variable (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY)",
+                    backend_type
+                )
+            })?
+            .to_string();
+
+        // Create the external provider
+        let external_config = ExternalProviderConfig {
+            model_name: model_name.clone(),
+            provider_config: config,
+            api_key,
+            timeout_seconds: self.external_configs.timeout_seconds,
+        };
+
+        let provider =
+            Arc::new(ExternalProvider::new(external_config)) as Arc<InferenceProviderTrait>;
+
+        // Register the provider
+        let mut external = self.external_providers.write().await;
+        external.insert(model_name.clone(), provider);
+
+        info!(
+            model = %model_name,
+            backend = %backend_type,
+            "Registered external provider"
+        );
+
+        Ok(())
+    }
+
+    /// Load and register external providers from a list of model configurations
+    ///
+    /// This should be called during application startup after fetching external
+    /// models from the database.
+    ///
+    /// # Arguments
+    /// * `models` - List of (model_name, provider_config) tuples
+    pub async fn load_external_providers(
+        &self,
+        models: Vec<(String, serde_json::Value)>,
+    ) -> Result<(), String> {
+        let mut success_count = 0;
+        let mut error_count = 0;
+
+        for (model_name, provider_config) in models {
+            match self
+                .register_external_provider(model_name.clone(), provider_config)
+                .await
+            {
+                Ok(()) => success_count += 1,
+                Err(e) => {
+                    warn!(
+                        model = %model_name,
+                        error = %e,
+                        "Failed to register external provider"
+                    );
+                    error_count += 1;
+                }
+            }
+        }
+
+        info!(
+            success = success_count,
+            errors = error_count,
+            "Loaded external providers"
+        );
+
+        if error_count > 0 && success_count == 0 {
+            Err(format!(
+                "All {} external provider(s) failed to load",
+                error_count
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Get an external provider by model name
+    async fn get_external_provider(&self, model_name: &str) -> Option<Arc<InferenceProviderTrait>> {
+        let external = self.external_providers.read().await;
+        external.get(model_name).cloned()
+    }
+
+    /// Check if a model is an external provider
+    pub async fn is_external_provider(&self, model_name: &str) -> bool {
+        let external = self.external_providers.read().await;
+        external.contains_key(model_name)
+    }
+
+    /// Unregister an external provider by model name
+    ///
+    /// This removes the provider from the pool, preventing future requests to this model.
+    /// Should be called when a model is deleted or deactivated.
+    ///
+    /// # Arguments
+    /// * `model_name` - The model name to unregister
+    ///
+    /// # Returns
+    /// * `true` if the provider was found and removed
+    /// * `false` if the provider was not found (may have already been removed)
+    pub async fn unregister_external_provider(&self, model_name: &str) -> bool {
+        let mut external = self.external_providers.write().await;
+        let removed = external.remove(model_name).is_some();
+        if removed {
+            info!(model = %model_name, "Unregistered external provider");
+        } else {
+            debug!(model = %model_name, "External provider not found for unregistration (may be vLLM model)");
+        }
+        removed
     }
 
     /// Register a provider for a model manually (useful for testing with mock providers)
@@ -611,6 +763,36 @@ impl InferenceProviderPool {
         Some(ordered_providers)
     }
 
+    /// Sanitize a CompletionError by preserving its variant structure while sanitizing messages
+    fn sanitize_completion_error(error: CompletionError, model_id: &str) -> CompletionError {
+        // Helper to sanitize message and format with model_id context
+        let sanitize_and_format = |msg: &str| -> String {
+            let sanitized = Self::sanitize_error_message(msg);
+            format!("Provider failed for model '{}': {}", model_id, sanitized)
+        };
+
+        match error {
+            CompletionError::HttpError {
+                status_code,
+                message,
+            } => {
+                // For HttpError, sanitize the message and include model_id context
+                // Preserve status_code for proper error mapping (4xx vs 5xx)
+                CompletionError::HttpError {
+                    status_code,
+                    message: sanitize_and_format(&message),
+                }
+            }
+            CompletionError::CompletionError(msg) => {
+                CompletionError::CompletionError(sanitize_and_format(&msg))
+            }
+            CompletionError::InvalidResponse(msg) => {
+                CompletionError::InvalidResponse(sanitize_and_format(&msg))
+            }
+            CompletionError::Unknown(msg) => CompletionError::Unknown(sanitize_and_format(&msg)),
+        }
+    }
+
     /// Sanitize error message by removing sensitive information like IP addresses, URLs, and internal details
     fn sanitize_error_message(error: &str) -> String {
         let mut sanitized = error.to_string();
@@ -645,6 +827,10 @@ impl InferenceProviderPool {
     /// Generic retry helper that tries each provider in order with automatic fallback
     /// Returns both the result and the provider that succeeded (for chat_id mapping)
     /// If model_pub_key is provided, routes to the specific provider by signing public key first
+    ///
+    /// Provider resolution order:
+    /// 1. External providers (exact match by model name)
+    /// 2. vLLM providers (with model_pub_key routing if specified)
     async fn retry_with_fallback<T, F, Fut>(
         &self,
         model_id: &str,
@@ -656,10 +842,42 @@ impl InferenceProviderPool {
         F: Fn(Arc<InferenceProviderTrait>) -> Fut,
         Fut: std::future::Future<Output = Result<T, CompletionError>>,
     {
-        // Ensure models are discovered first
+        // Check external providers first (exact match)
+        if let Some(external_provider) = self.get_external_provider(model_id).await {
+            tracing::info!(
+                model_id = %model_id,
+                operation = operation_name,
+                "Using external provider"
+            );
+
+            // External providers don't support model_pub_key routing
+            if model_pub_key.is_some() {
+                return Err(CompletionError::CompletionError(format!(
+                    "Model '{}' is an external provider and does not support encryption. \
+                     External providers run outside of our Trusted Execution Environment.",
+                    model_id
+                )));
+            }
+
+            match provider_fn(external_provider.clone()).await {
+                Ok(result) => {
+                    tracing::info!(
+                        model_id = %model_id,
+                        operation = operation_name,
+                        "Successfully completed request with external provider"
+                    );
+                    return Ok((result, external_provider));
+                }
+                Err(e) => {
+                    return Err(Self::sanitize_completion_error(e, model_id));
+                }
+            }
+        }
+
+        // Ensure vLLM models are discovered
         self.ensure_models_discovered().await?;
 
-        // Get providers with load balancing (handles both model_id and model_pub_key cases)
+        // Get vLLM providers with load balancing (handles both model_id and model_pub_key cases)
         let providers = match self
             .get_providers_with_fallback(model_id, model_pub_key)
             .await
@@ -682,10 +900,13 @@ impl InferenceProviderPool {
                 } else {
                     let mappings = self.provider_mappings.read().await;
                     let available_models: Vec<_> = mappings.model_to_providers.keys().collect();
+                    let external = self.external_providers.read().await;
+                    let external_models: Vec<_> = external.keys().collect();
 
                     tracing::error!(
                         model_id = %model_id,
-                        available_models = ?available_models,
+                        available_vllm_models = ?available_models,
+                        available_external_models = ?external_models,
                         operation = operation_name,
                         "Model not found in provider pool"
                     );
@@ -932,6 +1153,102 @@ impl InferenceProviderPool {
         Ok(response)
     }
 
+    /// Generate images using the specified model
+    pub async fn image_generation(
+        &self,
+        mut params: ImageGenerationParams,
+        request_hash: String,
+    ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
+        let model_id = params.model.clone();
+
+        // Extract model_pub_key from params.extra for routing before any cloning.
+        // This ensures the key is removed from params.extra so it won't be passed to the provider,
+        // and we have a stable reference for routing even if retries occur.
+        let model_pub_key_str = params
+            .extra
+            .remove(encryption_headers::MODEL_PUB_KEY)
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
+        let model_pub_key = model_pub_key_str.as_deref();
+
+        tracing::debug!(
+            model = %model_id,
+            "Starting image generation request"
+        );
+
+        // Clone params once before retry loop to minimize memory operations with large image data.
+        // The provider interface requires ImageEditParams by value, so we must clone when calling
+        // the provider. We clone once here and reuse across retries rather than cloning on each attempt.
+        let cloned_params = params.clone();
+
+        let (response, provider) = self
+            .retry_with_fallback(&model_id, "image_generation", model_pub_key, |provider| {
+                let params = cloned_params.clone();
+                let request_hash = request_hash.clone();
+                async move {
+                    provider
+                        .image_generation(params, request_hash)
+                        .await
+                        .map_err(|e| CompletionError::CompletionError(e.to_string()))
+                }
+            })
+            .await
+            .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
+
+        // Store the chat_id mapping so attestation service can find the provider
+        // (same pattern as chat_completion)
+        let image_id = response.response.id.clone();
+        tracing::info!(
+            image_id = %image_id,
+            "Storing chat_id mapping for image generation"
+        );
+        self.store_chat_id_mapping(image_id, provider).await;
+
+        Ok(response)
+    }
+
+    pub async fn image_edit(
+        &self,
+        params: ImageEditParams,
+        request_hash: String,
+    ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
+        let model_id = params.model.clone();
+
+        tracing::debug!(
+            model = %model_id,
+            "Starting image edit request"
+        );
+
+        // Wrap params in Arc to enable cheap cloning across retries.
+        // Since image data is already Arc<Vec<u8>>, cloning the params struct is now O(1).
+        // Each retry clones the Arc pointer (8 bytes) instead of the entire struct.
+        let params = Arc::new(params);
+
+        let (response, provider) = self
+            .retry_with_fallback(&model_id, "image_edit", None, |provider| {
+                let params = params.clone();
+                let request_hash = request_hash.clone();
+                async move {
+                    provider
+                        .image_edit(params, request_hash)
+                        .await
+                        .map_err(|e| CompletionError::CompletionError(e.to_string()))
+                }
+            })
+            .await
+            .map_err(|e| ImageEditError::EditError(e.to_string()))?;
+
+        // Store the chat_id mapping so attestation service can find the provider
+        // (same pattern as image_generation)
+        let image_id = response.response.id.clone();
+        tracing::info!(
+            image_id = %image_id,
+            "Storing chat_id mapping for image edit"
+        );
+        self.store_chat_id_mapping(image_id, provider).await;
+
+        Ok(response)
+    }
+
     /// Start the periodic model discovery refresh task and store the handle
     pub async fn start_refresh_task(self: Arc<Self>, refresh_interval_secs: u64) {
         let handle = tokio::spawn({
@@ -986,6 +1303,14 @@ impl InferenceProviderPool {
         );
         drop(mappings);
 
+        // Step 2.5: Clear external providers
+        debug!("Step 2.5: Clearing external providers");
+        let mut external = self.external_providers.write().await;
+        let external_count = external.len();
+        external.clear();
+        debug!("Cleared {} external providers", external_count);
+        drop(external);
+
         // Step 3: Clear load balancer indices
         debug!("Step 3: Clearing load balancer indices");
         let mut lb_index = self.load_balancer_index.write().await;
@@ -1003,8 +1328,8 @@ impl InferenceProviderPool {
         drop(chat_mapping);
 
         info!(
-            "Inference provider pool shutdown completed. Cleaned up: {} models, {} pubkeys, {} load balancer indices, {} chat mappings",
-            model_count, pubkey_count, index_count, chat_count
+            "Inference provider pool shutdown completed. Cleaned up: {} models, {} pubkeys, {} external providers, {} load balancer indices, {} chat mappings",
+            model_count, pubkey_count, external_count, index_count, chat_count
         );
     }
 }
@@ -1093,8 +1418,13 @@ mod tests {
         use futures_util::StreamExt;
         use inference_providers::mock::MockProvider;
 
-        let pool =
-            InferenceProviderPool::new("http://localhost:8080/models".to_string(), None, 5, 30);
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig::default(),
+        );
 
         let mock_provider = Arc::new(MockProvider::new());
         let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
@@ -1105,7 +1435,7 @@ mod tests {
             model: model_id,
             messages: vec![inference_providers::ChatMessage {
                 role: inference_providers::MessageRole::User,
-                content: Some("Hello".to_string()),
+                content: Some(serde_json::Value::String("Hello".to_string())),
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
@@ -1130,6 +1460,7 @@ mod tests {
             metadata: None,
             store: None,
             stream_options: None,
+            modalities: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -1149,5 +1480,417 @@ mod tests {
 
         while stream.next().await.is_some() {}
         assert!(pool.get_provider_by_chat_id(&chat_id).await.is_some());
+    }
+
+    // ==================== External Provider Tests ====================
+
+    #[tokio::test]
+    async fn test_register_external_provider_openai() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test-key".to_string()),
+                anthropic_api_key: None,
+                gemini_api_key: None,
+                timeout_seconds: 60,
+            },
+        );
+
+        let config = serde_json::json!({
+            "backend": "openai_compatible",
+            "base_url": "https://api.openai.com/v1"
+        });
+
+        let result = pool
+            .register_external_provider("gpt-4".to_string(), config)
+            .await;
+
+        assert!(result.is_ok());
+        assert!(pool.is_external_provider("gpt-4").await);
+    }
+
+    #[tokio::test]
+    async fn test_register_external_provider_anthropic() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: None,
+                anthropic_api_key: Some("sk-ant-test".to_string()),
+                gemini_api_key: None,
+                timeout_seconds: 60,
+            },
+        );
+
+        let config = serde_json::json!({
+            "backend": "anthropic",
+            "base_url": "https://api.anthropic.com/v1"
+        });
+
+        let result = pool
+            .register_external_provider("claude-3-opus".to_string(), config)
+            .await;
+
+        assert!(result.is_ok());
+        assert!(pool.is_external_provider("claude-3-opus").await);
+    }
+
+    #[tokio::test]
+    async fn test_register_external_provider_gemini() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: None,
+                anthropic_api_key: None,
+                gemini_api_key: Some("AIza-test".to_string()),
+                timeout_seconds: 60,
+            },
+        );
+
+        let config = serde_json::json!({
+            "backend": "gemini",
+            "base_url": "https://generativelanguage.googleapis.com/v1beta"
+        });
+
+        let result = pool
+            .register_external_provider("gemini-1.5-pro".to_string(), config)
+            .await;
+
+        assert!(result.is_ok());
+        assert!(pool.is_external_provider("gemini-1.5-pro").await);
+    }
+
+    #[tokio::test]
+    async fn test_register_external_provider_missing_api_key() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig::default(), // No API keys configured
+        );
+
+        let config = serde_json::json!({
+            "backend": "openai_compatible",
+            "base_url": "https://api.openai.com/v1"
+        });
+
+        let result = pool
+            .register_external_provider("gpt-4".to_string(), config)
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("API key"));
+    }
+
+    #[tokio::test]
+    async fn test_register_external_provider_invalid_config() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test".to_string()),
+                anthropic_api_key: None,
+                gemini_api_key: None,
+                timeout_seconds: 60,
+            },
+        );
+
+        let config = serde_json::json!({
+            "backend": "unknown_backend",
+            "base_url": "https://example.com"
+        });
+
+        let result = pool
+            .register_external_provider("test-model".to_string(), config)
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_is_external_provider_false_for_vllm() {
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig::default(),
+        );
+
+        // Register a vLLM-style provider (via mock)
+        let mock_provider = Arc::new(MockProvider::new());
+        pool.register_provider("vllm-model".to_string(), mock_provider)
+            .await;
+
+        // vLLM providers should not be external
+        assert!(!pool.is_external_provider("vllm-model").await);
+    }
+
+    #[tokio::test]
+    async fn test_is_external_provider_false_for_unknown() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig::default(),
+        );
+
+        // Unknown model should not be external
+        assert!(!pool.is_external_provider("unknown-model").await);
+    }
+
+    #[tokio::test]
+    async fn test_load_external_providers_batch() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test".to_string()),
+                anthropic_api_key: Some("sk-ant-test".to_string()),
+                gemini_api_key: Some("AIza-test".to_string()),
+                timeout_seconds: 60,
+            },
+        );
+
+        let models = vec![
+            (
+                "gpt-4".to_string(),
+                serde_json::json!({
+                    "backend": "openai_compatible",
+                    "base_url": "https://api.openai.com/v1"
+                }),
+            ),
+            (
+                "claude-3".to_string(),
+                serde_json::json!({
+                    "backend": "anthropic",
+                    "base_url": "https://api.anthropic.com/v1"
+                }),
+            ),
+            (
+                "gemini-pro".to_string(),
+                serde_json::json!({
+                    "backend": "gemini",
+                    "base_url": "https://generativelanguage.googleapis.com/v1beta"
+                }),
+            ),
+        ];
+
+        let result = pool.load_external_providers(models).await;
+
+        assert!(result.is_ok());
+        assert!(pool.is_external_provider("gpt-4").await);
+        assert!(pool.is_external_provider("claude-3").await);
+        assert!(pool.is_external_provider("gemini-pro").await);
+    }
+
+    #[tokio::test]
+    async fn test_load_external_providers_partial_failure() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test".to_string()),
+                anthropic_api_key: None, // Missing Anthropic key
+                gemini_api_key: None,
+                timeout_seconds: 60,
+            },
+        );
+
+        let models = vec![
+            (
+                "gpt-4".to_string(),
+                serde_json::json!({
+                    "backend": "openai_compatible",
+                    "base_url": "https://api.openai.com/v1"
+                }),
+            ),
+            (
+                "claude-3".to_string(),
+                serde_json::json!({
+                    "backend": "anthropic",
+                    "base_url": "https://api.anthropic.com/v1"
+                }),
+            ),
+        ];
+
+        // Should still succeed (continues on individual failures)
+        let result = pool.load_external_providers(models).await;
+        assert!(result.is_ok());
+
+        // OpenAI should be registered
+        assert!(pool.is_external_provider("gpt-4").await);
+
+        // Anthropic should fail to register (missing API key)
+        assert!(!pool.is_external_provider("claude-3").await);
+    }
+
+    #[tokio::test]
+    async fn test_external_provider_config_from_env() {
+        // Test the ExternalProvidersConfig::from_env() behavior
+        let config = ExternalProvidersConfig::default();
+
+        // Default should have no API keys
+        assert!(config.openai_api_key.is_none());
+        assert!(config.anthropic_api_key.is_none());
+        assert!(config.gemini_api_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_external_provider_config_get_api_key() {
+        let config = ExternalProvidersConfig {
+            openai_api_key: Some("openai-key".to_string()),
+            anthropic_api_key: Some("anthropic-key".to_string()),
+            gemini_api_key: Some("gemini-key".to_string()),
+            timeout_seconds: 60,
+        };
+
+        assert_eq!(config.get_api_key("openai_compatible"), Some("openai-key"));
+        assert_eq!(config.get_api_key("anthropic"), Some("anthropic-key"));
+        assert_eq!(config.get_api_key("gemini"), Some("gemini-key"));
+        assert_eq!(config.get_api_key("unknown"), None);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_clears_external_providers() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test".to_string()),
+                anthropic_api_key: None,
+                gemini_api_key: None,
+                timeout_seconds: 60,
+            },
+        );
+
+        let config = serde_json::json!({
+            "backend": "openai_compatible",
+            "base_url": "https://api.openai.com/v1"
+        });
+
+        pool.register_external_provider("gpt-4".to_string(), config)
+            .await
+            .unwrap();
+
+        assert!(pool.is_external_provider("gpt-4").await);
+
+        pool.shutdown().await;
+
+        assert!(!pool.is_external_provider("gpt-4").await);
+    }
+
+    #[tokio::test]
+    async fn test_unregister_external_provider() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test".to_string()),
+                anthropic_api_key: None,
+                gemini_api_key: None,
+                timeout_seconds: 60,
+            },
+        );
+
+        let config = serde_json::json!({
+            "backend": "openai_compatible",
+            "base_url": "https://api.openai.com/v1"
+        });
+
+        // Register a provider
+        pool.register_external_provider("gpt-4".to_string(), config)
+            .await
+            .unwrap();
+        assert!(pool.is_external_provider("gpt-4").await);
+
+        // Unregister it
+        let removed = pool.unregister_external_provider("gpt-4").await;
+        assert!(removed);
+        assert!(!pool.is_external_provider("gpt-4").await);
+
+        // Unregistering again should return false
+        let removed_again = pool.unregister_external_provider("gpt-4").await;
+        assert!(!removed_again);
+    }
+
+    #[tokio::test]
+    async fn test_unregister_nonexistent_provider() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig::default(),
+        );
+
+        // Unregistering a provider that was never registered should return false
+        let removed = pool.unregister_external_provider("nonexistent-model").await;
+        assert!(!removed);
+    }
+
+    #[tokio::test]
+    async fn test_register_update_external_provider() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test".to_string()),
+                anthropic_api_key: None,
+                gemini_api_key: None,
+                timeout_seconds: 60,
+            },
+        );
+
+        let config1 = serde_json::json!({
+            "backend": "openai_compatible",
+            "base_url": "https://api.openai.com/v1"
+        });
+
+        let config2 = serde_json::json!({
+            "backend": "openai_compatible",
+            "base_url": "https://api.together.xyz/v1"
+        });
+
+        // Register initial config
+        pool.register_external_provider("my-model".to_string(), config1)
+            .await
+            .unwrap();
+        assert!(pool.is_external_provider("my-model").await);
+
+        // Re-register with updated config (should overwrite)
+        pool.register_external_provider("my-model".to_string(), config2)
+            .await
+            .unwrap();
+        assert!(pool.is_external_provider("my-model").await);
+
+        // Should still only have one entry (not duplicated)
+        let external = pool.external_providers.read().await;
+        assert_eq!(external.len(), 1);
     }
 }

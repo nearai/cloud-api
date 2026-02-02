@@ -1,5 +1,6 @@
 use crate::models::{
-    DecimalPrice, ErrorResponse, ModelListResponse, ModelMetadata, ModelWithPricing,
+    DecimalPrice, ErrorResponse, ModelArchitecture, ModelListResponse, ModelMetadata,
+    ModelWithPricing,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -83,6 +84,11 @@ pub async fn list_models(
                 scale: 9,
                 currency: "USD".to_string(),
             },
+            cost_per_image: DecimalPrice {
+                amount: model.cost_per_image,
+                scale: 9,
+                currency: "USD".to_string(),
+            },
             metadata: ModelMetadata {
                 verifiable: model.verifiable,
                 context_length: model.context_length,
@@ -91,6 +97,13 @@ pub async fn list_models(
                 model_icon: model.model_icon.clone(),
                 owned_by: model.owned_by.clone(),
                 aliases: model.aliases.clone(),
+                provider_type: model.provider_type.clone(),
+                provider_config: model.provider_config.clone(),
+                attestation_supported: model.attestation_supported,
+                architecture: ModelArchitecture::from_options(
+                    model.input_modalities.clone(),
+                    model.output_modalities.clone(),
+                ),
             },
         })
         .collect();
@@ -168,6 +181,11 @@ pub async fn get_model_by_name(
             scale: 9,
             currency: "USD".to_string(),
         },
+        cost_per_image: DecimalPrice {
+            amount: model.cost_per_image,
+            scale: 9,
+            currency: "USD".to_string(),
+        },
         metadata: ModelMetadata {
             verifiable: model.verifiable,
             context_length: model.context_length,
@@ -176,6 +194,13 @@ pub async fn get_model_by_name(
             model_icon: model.model_icon,
             owned_by: model.owned_by,
             aliases: model.aliases,
+            provider_type: model.provider_type,
+            provider_config: model.provider_config,
+            attestation_supported: model.attestation_supported,
+            architecture: ModelArchitecture::from_options(
+                model.input_modalities,
+                model.output_modalities,
+            ),
         },
     };
 

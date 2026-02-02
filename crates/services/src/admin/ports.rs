@@ -6,6 +6,7 @@ use async_trait::async_trait;
 pub struct UpdateModelAdminRequest {
     pub input_cost_per_token: Option<i64>,
     pub output_cost_per_token: Option<i64>,
+    pub cost_per_image: Option<i64>,
     pub model_display_name: Option<String>,
     pub model_description: Option<String>,
     pub model_icon: Option<String>,
@@ -14,6 +15,13 @@ pub struct UpdateModelAdminRequest {
     pub is_active: Option<bool>,
     pub aliases: Option<Vec<String>>,
     pub owned_by: Option<String>,
+    // Provider configuration
+    pub provider_type: Option<String>,
+    pub provider_config: Option<serde_json::Value>,
+    pub attestation_supported: Option<bool>,
+    // Architecture/modalities
+    pub input_modalities: Option<Vec<String>>,
+    pub output_modalities: Option<Vec<String>>,
     // User audit tracking for history
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<uuid::Uuid>,
@@ -35,11 +43,22 @@ pub struct ModelPricing {
     pub model_icon: Option<String>,
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
+    pub cost_per_image: i64,
     pub context_length: i32,
     pub verifiable: bool,
     pub is_active: bool,
     pub aliases: Vec<String>,
     pub owned_by: String,
+    // Provider configuration
+    /// Provider type: "vllm" (TEE-enabled) or "external" (3rd party)
+    pub provider_type: String,
+    /// JSON config for external providers (backend, base_url, etc.)
+    pub provider_config: Option<serde_json::Value>,
+    /// Whether this model supports TEE attestation
+    pub attestation_supported: bool,
+    // Architecture/modalities
+    pub input_modalities: Option<Vec<String>>,
+    pub output_modalities: Option<Vec<String>>,
 }
 
 /// Model history entry - includes pricing, context length, and other model attributes
@@ -50,6 +69,7 @@ pub struct ModelHistoryEntry {
     pub model_id: uuid::Uuid,
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
+    pub cost_per_image: i64,
     pub context_length: i32,
     pub model_name: String,
     pub model_display_name: String,
@@ -58,6 +78,8 @@ pub struct ModelHistoryEntry {
     pub verifiable: bool,
     pub is_active: bool,
     pub owned_by: String,
+    pub input_modalities: Option<Vec<String>>,
+    pub output_modalities: Option<Vec<String>>,
     pub effective_from: chrono::DateTime<chrono::Utc>,
     pub effective_until: Option<chrono::DateTime<chrono::Utc>>,
     pub changed_by_user_id: Option<uuid::Uuid>,
@@ -147,6 +169,7 @@ pub struct AdminModelInfo {
     pub model_icon: Option<String>,
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
+    pub cost_per_image: i64,
     pub context_length: i32,
     pub verifiable: bool,
     pub is_active: bool,
@@ -154,6 +177,29 @@ pub struct AdminModelInfo {
     pub aliases: Vec<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    // Provider configuration
+    /// Provider type: "vllm" (TEE-enabled) or "external" (3rd party)
+    pub provider_type: String,
+    /// JSON config for external providers (backend, base_url, etc.)
+    pub provider_config: Option<serde_json::Value>,
+    /// Whether this model supports TEE attestation
+    pub attestation_supported: bool,
+    // Architecture/modalities
+    pub input_modalities: Option<Vec<String>>,
+    pub output_modalities: Option<Vec<String>>,
+}
+
+/// Organization information for admin listing (includes spend limit and usage)
+#[derive(Debug, Clone)]
+pub struct AdminOrganizationInfo {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub spend_limit: Option<i64>, // Amount in nano-dollars (scale 9)
+    pub total_spent: Option<i64>, // Amount in nano-dollars (scale 9)
+    pub total_requests: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -230,11 +276,14 @@ pub trait AdminRepository: Send + Sync {
     async fn list_users(&self, limit: i64, offset: i64) -> Result<Vec<UserInfo>, anyhow::Error>;
 
     /// List all users with their earliest organization and spend limit (admin only)
+    /// If search_by_name is provided, filters users by organization name (case-insensitive partial match)
+    /// Returns a tuple of (users, total_count) where total_count is the count of filtered users
     async fn list_users_with_organizations(
         &self,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<(UserInfo, Option<UserOrganizationInfo>)>, anyhow::Error>;
+        search_by_name: Option<String>,
+    ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64), anyhow::Error>;
 
     /// Get the count of active users (admin only)
     async fn get_active_user_count(&self) -> Result<i64, anyhow::Error>;
@@ -262,6 +311,16 @@ pub trait AdminRepository: Send + Sync {
         &self,
         organization_id: uuid::Uuid,
     ) -> Result<Option<u32>, anyhow::Error>;
+
+    /// List all organizations with pagination (admin only)
+    async fn list_all_organizations(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AdminOrganizationInfo>, anyhow::Error>;
+
+    /// Count all active organizations (admin only)
+    async fn count_all_organizations(&self) -> Result<i64, anyhow::Error>;
 }
 
 /// Admin service trait for managing platform configuration
@@ -310,10 +369,12 @@ pub trait AdminService: Send + Sync {
         -> Result<(Vec<UserInfo>, i64), AdminError>;
 
     /// List all users with their earliest organization and spend limit (admin only)
+    /// If search_by_name is provided, filters users by organization name (case-insensitive partial match)
     async fn list_users_with_organizations(
         &self,
         limit: i64,
         offset: i64,
+        search_by_name: Option<String>,
     ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64), AdminError>;
 
     /// List all models with pagination (admin only)
@@ -339,4 +400,11 @@ pub trait AdminService: Send + Sync {
         &self,
         organization_id: uuid::Uuid,
     ) -> Result<Option<u32>, AdminError>;
+
+    /// List all organizations with pagination (admin only)
+    async fn list_organizations(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError>;
 }

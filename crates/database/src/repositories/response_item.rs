@@ -189,21 +189,23 @@ impl PgResponseItemsRepository {
         Ok(item)
     }
 
-    /// Helper method to extract UUID from item ID string (e.g., "msg_abc123" -> "abc123")
-    /// If the item_id is already a valid UUID, use it directly.
-    /// Otherwise, try to extract the UUID portion after an underscore prefix.
-    fn extract_uuid_from_item_id(item_id: &str) -> Result<Uuid> {
+    /// Helper method to extract or generate UUID from item ID string
+    /// If the item_id is already a valid UUID or contains one (e.g., "msg_abc123"), use it.
+    /// Otherwise, generate a new UUID (for external provider IDs like OpenAI's "call_xxx").
+    fn extract_uuid_from_item_id(item_id: &str) -> Uuid {
         // First try parsing as a UUID directly
         if let Ok(uuid) = Uuid::parse_str(item_id) {
-            return Ok(uuid);
+            return uuid;
         }
 
         // Item IDs may be in format like "msg_abc123", "web_search_xyz789", etc.
         let parts: Vec<&str> = item_id.split('_').collect();
+        if let Ok(uuid) = Uuid::parse_str(parts[parts.len() - 1]) {
+            return uuid;
+        }
 
-        let uuid = Uuid::parse_str(parts[parts.len() - 1])
-            .with_context(|| format!("Failed to parse UUID from item ID: {item_id}"))?;
-        Ok(uuid)
+        // Generate a new UUID for external provider IDs
+        Uuid::new_v4()
     }
 
     /// Helper to create a response item ID from a UUID
@@ -222,9 +224,9 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
         conversation_id: Option<ConversationId>,
         item: ResponseOutputItem,
     ) -> Result<ResponseOutputItem> {
-        // Extract UUID from the item's ID string
+        // Extract or generate UUID from the item's ID string
         let item_id = item.id();
-        let id = Self::extract_uuid_from_item_id(item_id)?;
+        let id = Self::extract_uuid_from_item_id(item_id);
 
         // Serialize the item to JSON for storage
         let item_json = serde_json::to_value(&item).context("Failed to serialize response item")?;
@@ -435,12 +437,8 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
         after: Option<String>,
         limit: i64,
     ) -> Result<Vec<ResponseOutputItem>> {
-        // Extract UUID from the after item ID if provided (validation happens outside retry block)
-        let after_uuid = if let Some(ref after_id) = after {
-            Some(Self::extract_uuid_from_item_id(after_id)?)
-        } else {
-            None
-        };
+        // Extract UUID from the after item ID if provided
+        let after_uuid = after.as_ref().map(|id| Self::extract_uuid_from_item_id(id));
 
         let rows = retry_db!("list_response_items_by_conversation", {
             let client = self

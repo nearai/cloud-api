@@ -1347,17 +1347,37 @@ fn convert_domain_conversation_to_http(
         .cloned()
         .unwrap_or_default();
 
+    // Update pinned_at in metadata based on database field
     if let Some(pinned_at) = domain_conversation.pinned_at {
         metadata.insert(
             "pinned_at".to_string(),
             serde_json::json!(pinned_at.timestamp()),
         );
+    } else {
+        // Remove pinned_at from metadata if it's not pinned
+        metadata.remove("pinned_at");
     }
+
+    // Update archived_at in metadata based on database field
     if let Some(archived_at) = domain_conversation.archived_at {
         metadata.insert(
             "archived_at".to_string(),
             serde_json::json!(archived_at.timestamp()),
         );
+    } else {
+        // Remove archived_at from metadata if it's not archived
+        metadata.remove("archived_at");
+    }
+
+    // Update cloned_from_id in metadata based on database field
+    if let Some(cloned_from_id) = domain_conversation.cloned_from_id {
+        metadata.insert(
+            "cloned_from_id".to_string(),
+            serde_json::json!(cloned_from_id.to_string()),
+        );
+    } else {
+        // Remove cloned_from_id from metadata if it's an original conversation
+        metadata.remove("cloned_from_id");
     }
 
     ConversationObject {

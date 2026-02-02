@@ -19,20 +19,14 @@ impl PgResponseRepository {
         Self { pool }
     }
 
-    /// Internal helper: find or create the hidden structural root response
-    /// ("root_response") for a given conversation.
-    ///
-    /// - Root responses are marked with metadata: { "root_response": true }
-    ///   and model "root_response".
-    /// - They never have response_items attached; they're purely structural.
-    async fn get_or_create_root(
+    /// Fetch the ID of the structural root response for a conversation, if it exists.
+    /// Root rows are identified by metadata->>'root_response' = 'true'.
+    async fn fetch_root_id_opt(
         &self,
         conversation_uuid: Uuid,
         workspace_id: &WorkspaceId,
-        api_key_id: &uuid::Uuid,
-    ) -> Result<Uuid, RepositoryError> {
-        // First, try to find an existing root for this conversation
-        let existing_row = retry_db!("get_root_response", {
+    ) -> Result<Option<Uuid>, RepositoryError> {
+        let row = retry_db!("get_root_response", {
             let client = self
                 .pool
                 .get()
@@ -57,9 +51,26 @@ impl PgResponseRepository {
                 .map_err(map_db_error)
         })?;
 
-        if let Some(row) = existing_row {
-            let root_id: Uuid = row.get("id");
-            return Ok(root_id);
+        Ok(row.map(|r| r.get("id")))
+    }
+
+    /// Internal helper: find or create the hidden structural root response
+    /// ("root_response") for a given conversation.
+    ///
+    /// - Root responses are marked with metadata: { "root_response": true }
+    ///   and model "root_response".
+    /// - They never have response_items attached; they're purely structural.
+    async fn get_or_create_root(
+        &self,
+        conversation_uuid: Uuid,
+        workspace_id: &WorkspaceId,
+        api_key_id: &uuid::Uuid,
+    ) -> Result<Uuid, RepositoryError> {
+        if let Some(id) = self
+            .fetch_root_id_opt(conversation_uuid, workspace_id)
+            .await?
+        {
+            return Ok(id);
         }
 
         // No root yet - create one.
@@ -76,7 +87,7 @@ impl PgResponseRepository {
         });
         let next_response_ids_json = serde_json::json!([]);
 
-        let row = retry_db!("insert_conversation_root", {
+        let inserted_row_opt = retry_db!("insert_conversation_root", {
             let client = self
                 .pool
                 .get()
@@ -87,7 +98,7 @@ impl PgResponseRepository {
             // Try to insert the root response. If another concurrent request has already
             // created it, the unique index on (conversation_id) for root responses will
             // cause a conflict; in that case we do nothing and re-query the existing root.
-            let inserted_row_opt = client
+            client
                 .query_opt(
                     r#"
                     INSERT INTO responses (
@@ -113,32 +124,19 @@ impl PgResponseRepository {
                     ],
                 )
                 .await
-                .map_err(map_db_error)?;
-
-            if let Some(row) = inserted_row_opt {
-                Ok(row)
-            } else {
-                // Another request created the root concurrently; fetch and return it.
-                client
-                    .query_one(
-                        r#"
-                        SELECT id
-                        FROM responses
-                        WHERE conversation_id = $1
-                          AND workspace_id = $2
-                          AND metadata->>'root_response' = 'true'
-                        ORDER BY created_at ASC
-                        LIMIT 1
-                        "#,
-                        &[&conversation_uuid, &workspace_id.0],
-                    )
-                    .await
-                    .map_err(map_db_error)
-            }
+                .map_err(map_db_error)
         })?;
 
-        let root_id: Uuid = row.get("id");
-        Ok(root_id)
+        if let Some(row) = inserted_row_opt {
+            return Ok(row.get("id"));
+        }
+
+        // Another request created the root concurrently; fetch and return it.
+        self.fetch_root_id_opt(conversation_uuid, workspace_id)
+            .await?
+            .ok_or_else(|| {
+                RepositoryError::NotFound("root_response after concurrent insert".to_string())
+            })
     }
 }
 

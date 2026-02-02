@@ -2885,8 +2885,23 @@ async fn test_conversation_metadata_limits() {
     assert_eq!(create_response.status_code(), 201);
     let conversation = create_response.json::<api::models::ConversationObject>();
 
-    // Verify all metadata keys are present
-    assert_eq!(conversation.metadata.as_object().unwrap().len(), 16);
+    let meta = conversation.metadata.as_object().unwrap();
+    // All 16 user-provided keys must be present (OpenAI limit)
+    for i in 0..16 {
+        let key = format!("key{i}");
+        let expected = format!("value{i}");
+        assert_eq!(
+            meta.get(&key).and_then(|v| v.as_str()),
+            Some(expected.as_str()),
+            "key{i} missing or wrong value"
+        );
+    }
+    // Response may include system keys (e.g. root_response_id for new conversations)
+    assert!(
+        meta.len() >= 16,
+        "metadata must contain at least the 16 user keys, got {}",
+        meta.len()
+    );
     println!("✅ Conversation created with 16 metadata keys (OpenAI limit)");
 
     // Note: OpenAI spec allows max 16 key-value pairs

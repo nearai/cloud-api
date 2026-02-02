@@ -53,66 +53,6 @@ impl ConversationServiceImpl {
             response_items_repo,
         }
     }
-
-    async fn ensure_root_response_persisted_in_metadata(
-        &self,
-        conversation: models::Conversation,
-    ) -> Result<models::Conversation, errors::ConversationError> {
-        // Fast path: if metadata already contains root_response_id, don't write.
-        if let Some(obj) = conversation.metadata.as_object() {
-            if let Some(existing) = obj.get("root_response_id").and_then(|v| v.as_str()) {
-                return Ok(models::Conversation {
-                    root_response_id: Some(existing.to_string()),
-                    ..conversation
-                });
-            }
-        }
-
-        let root_response_id = self
-            .resp_repo
-            .ensure_root_response(
-                conversation.id,
-                conversation.workspace_id.clone(),
-                conversation.api_key_id,
-            )
-            .await
-            .map_err(|e| {
-                errors::ConversationError::InternalError(format!(
-                    "Failed to ensure root response for conversation: {e}"
-                ))
-            })?;
-
-        // Persist into metadata for retrieval endpoints without extra joins.
-        let mut metadata = conversation.metadata.clone();
-        if let Some(obj) = metadata.as_object_mut() {
-            obj.insert(
-                "root_response_id".to_string(),
-                serde_json::Value::String(root_response_id.clone()),
-            );
-        } else {
-            // If metadata isn't an object (shouldn't happen), replace with an object.
-            metadata = serde_json::json!({ "root_response_id": root_response_id.clone() });
-        }
-
-        // Update conversation metadata in DB (best-effort; still return the value even if update fails).
-        let updated = self
-            .conv_repo
-            .update(conversation.id, conversation.workspace_id.clone(), metadata)
-            .await
-            .map_err(|e| {
-                errors::ConversationError::InternalError(format!(
-                    "Failed to persist root_response_id in conversation metadata: {e}"
-                ))
-            })?;
-
-        // conv_repo.update returns Option; it should exist since we just created it.
-        let conversation = updated.unwrap_or(conversation);
-
-        Ok(models::Conversation {
-            root_response_id: Some(root_response_id),
-            ..conversation
-        })
-    }
 }
 
 #[async_trait]
@@ -141,24 +81,37 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
 
         tracing::info!("Created conversation: {}", db_conversation.id);
 
+        // Create the hidden structural root response for this conversation so clients can
+        // use root_response_id for first-turn parallel responses (multiple models).
+        let root_response_id = self
+            .resp_repo
+            .get_or_create_root_response(
+                db_conversation.id,
+                request.workspace_id.clone(),
+                request.api_key_id,
+            )
+            .await
+            .map_err(|e| {
+                errors::ConversationError::InternalError(format!(
+                    "Failed to create root response for conversation: {e}"
+                ))
+            })?;
+
         let conversation = models::Conversation {
             id: db_conversation.id,
             workspace_id: db_conversation.workspace_id,
             api_key_id: db_conversation.api_key_id,
-            root_response_id: None,
             pinned_at: db_conversation.pinned_at,
             archived_at: db_conversation.archived_at,
             deleted_at: db_conversation.deleted_at,
             cloned_from_id: db_conversation.cloned_from_id,
+            root_response_id: Some(root_response_id),
             metadata: db_conversation.metadata,
             created_at: db_conversation.created_at,
             updated_at: db_conversation.updated_at,
         };
 
-        // Ensure root_response exists and persist root_response_id into metadata.
-        Ok(self
-            .ensure_root_response_persisted_in_metadata(conversation)
-            .await?)
+        Ok(conversation)
     }
 
     /// Get a conversation by ID
@@ -179,11 +132,11 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             id: c.id,
             workspace_id: c.workspace_id,
             api_key_id: c.api_key_id,
-            root_response_id: None,
             pinned_at: c.pinned_at,
             archived_at: c.archived_at,
             deleted_at: c.deleted_at,
             cloned_from_id: c.cloned_from_id,
+            root_response_id: None,
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,
@@ -191,9 +144,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             return Ok(None);
         };
 
-        Ok(Some(
-            self.ensure_root_response_persisted_in_metadata(c).await?,
-        ))
+        Ok(Some(c))
     }
 
     /// Update a conversation
@@ -217,11 +168,11 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             id: c.id,
             workspace_id: c.workspace_id,
             api_key_id: c.api_key_id,
-            root_response_id: None,
             pinned_at: c.pinned_at,
             archived_at: c.archived_at,
             deleted_at: c.deleted_at,
             cloned_from_id: c.cloned_from_id,
+            root_response_id: None,
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,
@@ -229,9 +180,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             return Ok(None);
         };
 
-        Ok(Some(
-            self.ensure_root_response_persisted_in_metadata(c).await?,
-        ))
+        Ok(Some(c))
     }
 
     /// Pin or unpin a conversation
@@ -255,11 +204,11 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             id: c.id,
             workspace_id: c.workspace_id,
             api_key_id: c.api_key_id,
-            root_response_id: None,
             pinned_at: c.pinned_at,
             archived_at: c.archived_at,
             deleted_at: c.deleted_at,
             cloned_from_id: c.cloned_from_id,
+            root_response_id: None,
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,
@@ -267,9 +216,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             return Ok(None);
         };
 
-        Ok(Some(
-            self.ensure_root_response_persisted_in_metadata(c).await?,
-        ))
+        Ok(Some(c))
     }
 
     /// Archive or unarchive a conversation
@@ -293,11 +240,11 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             id: c.id,
             workspace_id: c.workspace_id,
             api_key_id: c.api_key_id,
-            root_response_id: None,
             pinned_at: c.pinned_at,
             archived_at: c.archived_at,
             deleted_at: c.deleted_at,
             cloned_from_id: c.cloned_from_id,
+            root_response_id: None,
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,
@@ -305,9 +252,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             return Ok(None);
         };
 
-        Ok(Some(
-            self.ensure_root_response_persisted_in_metadata(c).await?,
-        ))
+        Ok(Some(c))
     }
 
     /// Clone a conversation
@@ -331,11 +276,11 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             id: c.id,
             workspace_id: c.workspace_id,
             api_key_id: c.api_key_id,
-            root_response_id: None,
             pinned_at: c.pinned_at,
             archived_at: c.archived_at,
             deleted_at: c.deleted_at,
             cloned_from_id: c.cloned_from_id,
+            root_response_id: None,
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,
@@ -343,9 +288,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             return Ok(None);
         };
 
-        Ok(Some(
-            self.ensure_root_response_persisted_in_metadata(c).await?,
-        ))
+        Ok(Some(c))
     }
 
     /// Delete a conversation
@@ -634,19 +577,16 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
                 id: c.id,
                 workspace_id: c.workspace_id,
                 api_key_id: c.api_key_id,
-                root_response_id: None,
                 pinned_at: c.pinned_at,
                 archived_at: c.archived_at,
                 deleted_at: c.deleted_at,
                 cloned_from_id: c.cloned_from_id,
+                root_response_id: None,
                 metadata: c.metadata,
                 created_at: c.created_at,
                 updated_at: c.updated_at,
             };
-            conversations.push(
-                self.ensure_root_response_persisted_in_metadata(conv)
-                    .await?,
-            );
+            conversations.push(conv);
         }
 
         tracing::debug!(

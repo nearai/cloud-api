@@ -847,7 +847,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         Ok(Some(response_obj))
     }
 
-    async fn ensure_root_response(
+    async fn get_or_create_root_response(
         &self,
         conversation_id: services::conversations::models::ConversationId,
         workspace_id: WorkspaceId,

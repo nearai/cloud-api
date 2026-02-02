@@ -70,11 +70,12 @@ pub trait ResponseRepositoryTrait: Send + Sync {
         workspace_id: WorkspaceId,
     ) -> anyhow::Result<Option<models::ResponseObject>>;
 
-    /// Ensure the structural "root_response" exists for a conversation and return its ID.
+    /// Get or create the structural "root_response" for a conversation and return its ID.
     ///
-    /// This is used to support first-turn parallel responses (multiple models starting from
-    /// the same parent) without racing on implicit "latest response" selection.
-    async fn ensure_root_response(
+    /// If a root already exists (e.g. metadata.root_response = true), returns its ID;
+    /// otherwise creates one. Used for first-turn parallel responses (multiple models
+    /// sharing the same parent) without racing on implicit "latest response" selection.
+    async fn get_or_create_root_response(
         &self,
         conversation_id: ConversationId,
         workspace_id: WorkspaceId,

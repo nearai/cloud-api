@@ -427,6 +427,7 @@ pub enum UsageError {
     LimitExceeded(String),
     Unauthorized(String),
     NotFound(String),
+    CostCalculationOverflow(String),
 }
 
 impl std::fmt::Display for UsageError {
@@ -437,6 +438,9 @@ impl std::fmt::Display for UsageError {
             UsageError::LimitExceeded(msg) => write!(f, "Limit exceeded: {msg}"),
             UsageError::Unauthorized(msg) => write!(f, "Unauthorized: {msg}"),
             UsageError::NotFound(msg) => write!(f, "Not found: {msg}"),
+            UsageError::CostCalculationOverflow(msg) => {
+                write!(f, "Cost calculation overflow: {msg}")
+            }
         }
     }
 }

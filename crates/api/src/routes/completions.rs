@@ -1567,6 +1567,19 @@ pub async fn rerank(
                 );
                 token_anomaly_detected = true;
 
+                // Record metrics for monitoring and alerting
+                let model_tag = format!("model:{}", request.model);
+                let reason_tag = format!(
+                    "reason:{}",
+                    services::metrics::consts::REASON_TOKEN_OVERFLOW
+                );
+                let anomaly_tags = [model_tag.as_str(), reason_tag.as_str()];
+                app_state.metrics_service.record_count(
+                    services::metrics::consts::METRIC_PROVIDER_TOKEN_ANOMALIES,
+                    1,
+                    &anomaly_tags,
+                );
+
                 // Cap to maximum to prevent billing errors
                 token_count = MAX_REASONABLE_TOKENS;
             }
@@ -1579,6 +1592,19 @@ pub async fn rerank(
                     "Provider returned zero tokens for rerank - no cost will be charged. This may indicate provider misconfiguration or incomplete response."
                 );
                 token_anomaly_detected = true;
+
+                // Record metrics for monitoring and alerting on missing usage data
+                let model_tag = format!("model:{}", request.model);
+                let reason_tag = format!(
+                    "reason:{}",
+                    services::metrics::consts::REASON_MISSING_USAGE
+                );
+                let zero_tokens_tags = [model_tag.as_str(), reason_tag.as_str()];
+                app_state.metrics_service.record_count(
+                    services::metrics::consts::METRIC_PROVIDER_ZERO_TOKENS,
+                    1,
+                    &zero_tokens_tags,
+                );
             }
 
             // If anomaly detected, log additional context for debugging

@@ -16,7 +16,6 @@ use crate::{
             StateStore,
         },
         billing::{get_billing_costs, BillingRouteState},
-<<<<<<< HEAD
         completions::{chat_completions, image_edits, image_generations, models, rerank},
         conversations,
         health::health_check,
@@ -649,6 +648,7 @@ pub fn build_app_with_config(
         user_service: domain_services.user_service.clone(),
         files_service: domain_services.files_service.clone(),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
+        metrics_service: domain_services.metrics_service.clone(),
         config: config.clone(),
     };
 

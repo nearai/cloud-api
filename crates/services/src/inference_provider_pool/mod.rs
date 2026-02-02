@@ -2,8 +2,8 @@ use crate::common::encryption_headers;
 use config::ExternalProvidersConfig;
 use inference_providers::{
     models::{AttestationError, CompletionError, ListModelsError, ModelsResponse},
-    ChatCompletionParams, ExternalProvider, ExternalProviderConfig, ImageEditError, ImageEditParams,
-    ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
+    ChatCompletionParams, ExternalProvider, ExternalProviderConfig, ImageEditError,
+    ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
     ImageGenerationResponseWithBytes, InferenceProvider, ProviderConfig, RerankError, RerankParams,
     RerankResponse, StreamingResult, StreamingResultExt, VLlmConfig, VLlmProvider,
 };

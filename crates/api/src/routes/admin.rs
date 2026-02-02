@@ -2,7 +2,7 @@ use crate::middleware::AdminUser;
 use crate::models::{
     AdminAccessTokenResponse, AdminModelListResponse, AdminModelWithPricing,
     AdminOrganizationResponse, AdminUserOrganizationDetails, AdminUserResponse,
-    BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, DecimalPrice,
+    BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, CreditType, DecimalPrice,
     DeleteAdminAccessTokenRequest, DeleteModelRequest, ErrorResponse,
     GetOrganizationConcurrentLimitResponse, ListOrganizationsAdminResponse, ListUsersResponse,
     ModelArchitecture, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
@@ -520,18 +520,6 @@ pub async fn update_organization_limits(
         )
     })?;
 
-    // Validate credit_type
-    let credit_type = request.credit_type.to_lowercase();
-    if credit_type != "grant" && credit_type != "payment" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                "Invalid credit type. Must be 'grant' or 'payment'.".to_string(),
-                "invalid_credit_type".to_string(),
-            )),
-        ));
-    }
-
     // Extract admin user ID and email from authenticated user
     let admin_user_id = admin_user.0.id;
     let admin_user_email = admin_user.0.email.clone();
@@ -539,7 +527,7 @@ pub async fn update_organization_limits(
     // Convert API request to service request
     let service_request = services::admin::OrganizationLimitsUpdate {
         spend_limit: request.spend_limit.amount,
-        credit_type,
+        credit_type: request.credit_type.to_string(),
         source: request.source,
         currency: request.spend_limit.currency.to_uppercase(),
         changed_by: request.changed_by,
@@ -582,9 +570,15 @@ pub async fn update_organization_limits(
         })?;
 
     // Convert service response to API response
+    let credit_type_enum = match updated_limits.credit_type.to_lowercase().as_str() {
+        "grant" => CreditType::Grant,
+        "payment" => CreditType::Payment,
+        _ => CreditType::Payment, // Default fallback (should not happen)
+    };
+
     let response = UpdateOrganizationLimitsResponse {
         organization_id: updated_limits.organization_id.to_string(),
-        credit_type: updated_limits.credit_type,
+        credit_type: credit_type_enum,
         source: updated_limits.source,
         spend_limit: SpendLimit {
             amount: updated_limits.spend_limit,
@@ -678,23 +672,30 @@ pub async fn get_organization_limits_history(
 
     let entries: Vec<OrgLimitsHistoryEntry> = history
         .into_iter()
-        .map(|h| OrgLimitsHistoryEntry {
-            id: h.id.to_string(),
-            organization_id: h.organization_id.to_string(),
-            credit_type: h.credit_type,
-            source: h.source,
-            spend_limit: SpendLimit {
-                amount: h.spend_limit,
-                scale: 9,
-                currency: h.currency,
-            },
-            effective_from: h.effective_from.to_rfc3339(),
-            effective_until: h.effective_until.map(|dt| dt.to_rfc3339()),
-            changed_by: h.changed_by,
-            change_reason: h.change_reason,
-            changed_by_user_id: h.changed_by_user_id.map(|id| id.to_string()),
-            changed_by_user_email: h.changed_by_user_email,
-            created_at: h.created_at.to_rfc3339(),
+        .map(|h| {
+            let credit_type_enum = match h.credit_type.to_lowercase().as_str() {
+                "grant" => CreditType::Grant,
+                "payment" => CreditType::Payment,
+                _ => CreditType::Payment,
+            };
+            OrgLimitsHistoryEntry {
+                id: h.id.to_string(),
+                organization_id: h.organization_id.to_string(),
+                credit_type: credit_type_enum,
+                source: h.source,
+                spend_limit: SpendLimit {
+                    amount: h.spend_limit,
+                    scale: 9,
+                    currency: h.currency,
+                },
+                effective_from: h.effective_from.to_rfc3339(),
+                effective_until: h.effective_until.map(|dt| dt.to_rfc3339()),
+                changed_by: h.changed_by,
+                change_reason: h.change_reason,
+                changed_by_user_id: h.changed_by_user_id.map(|id| id.to_string()),
+                changed_by_user_email: h.changed_by_user_email,
+                created_at: h.created_at.to_rfc3339(),
+            }
         })
         .collect();
 

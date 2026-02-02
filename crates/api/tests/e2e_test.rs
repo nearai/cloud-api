@@ -481,7 +481,7 @@ async fn test_admin_update_organization_limits() {
 
     // Verify the response
     assert_eq!(update_response.organization_id, org.id);
-    assert_eq!(update_response.credit_type, "payment");
+    assert_eq!(update_response.credit_type.as_str(), "payment");
     assert_eq!(update_response.spend_limit.amount, 100000000000i64);
     assert_eq!(update_response.spend_limit.scale, 9); // Scale is always 9 (nano-dollars)
     assert_eq!(update_response.spend_limit.currency, "USD");

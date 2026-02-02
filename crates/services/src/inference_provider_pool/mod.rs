@@ -114,13 +114,15 @@ impl InferenceProviderPool {
         model_name: String,
         provider_config: serde_json::Value,
     ) -> Result<(), String> {
-        let provider = self.create_external_provider(&model_name, provider_config)?;
+        let (provider, backend_type) =
+            self.create_external_provider(&model_name, provider_config)?;
 
         let mut external = self.external_providers.write().await;
         external.insert(model_name.clone(), provider);
 
         info!(
             model = %model_name,
+            backend = %backend_type,
             "Registered external provider"
         );
 
@@ -1225,24 +1227,24 @@ impl InferenceProviderPool {
     }
 
     /// Create an external provider from a model name and provider config JSON.
-    /// Returns the provider Arc without inserting it into any map.
+    /// Returns a tuple of (provider Arc, backend_type string) without inserting it into any map.
     fn create_external_provider(
         &self,
         model_name: &str,
         provider_config: serde_json::Value,
-    ) -> Result<Arc<InferenceProviderTrait>, String> {
+    ) -> Result<(Arc<InferenceProviderTrait>, String), String> {
         let config: ProviderConfig = serde_json::from_value(provider_config)
             .map_err(|e| format!("Failed to parse provider config: {e}"))?;
 
         let backend_type = match &config {
-            ProviderConfig::OpenAiCompatible { .. } => "openai_compatible",
-            ProviderConfig::Anthropic { .. } => "anthropic",
-            ProviderConfig::Gemini { .. } => "gemini",
+            ProviderConfig::OpenAiCompatible { .. } => "openai_compatible".to_string(),
+            ProviderConfig::Anthropic { .. } => "anthropic".to_string(),
+            ProviderConfig::Gemini { .. } => "gemini".to_string(),
         };
 
         let api_key = self
             .external_configs
-            .get_api_key(backend_type)
+            .get_api_key(&backend_type)
             .ok_or_else(|| {
                 format!(
                     "No API key configured for backend type '{}'. \
@@ -1259,7 +1261,9 @@ impl InferenceProviderPool {
             timeout_seconds: self.external_configs.timeout_seconds,
         };
 
-        Ok(Arc::new(ExternalProvider::new(external_config)) as Arc<InferenceProviderTrait>)
+        let provider =
+            Arc::new(ExternalProvider::new(external_config)) as Arc<InferenceProviderTrait>;
+        Ok((provider, backend_type))
     }
 
     /// Atomically replace all external providers with a new set built from the given models.
@@ -1273,9 +1277,14 @@ impl InferenceProviderPool {
 
         for (model_name, provider_config) in models {
             match self.create_external_provider(&model_name, provider_config) {
-                Ok(provider) => {
-                    new_map.insert(model_name, provider);
+                Ok((provider, backend_type)) => {
+                    new_map.insert(model_name.clone(), provider);
                     success_count += 1;
+                    info!(
+                        model = %model_name,
+                        backend = %backend_type,
+                        "Registered external provider during sync"
+                    );
                 }
                 Err(e) => {
                     warn!(

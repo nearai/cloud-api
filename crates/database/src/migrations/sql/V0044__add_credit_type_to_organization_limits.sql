@@ -1,4 +1,4 @@
--- V37: Add credit type, source, and currency to organization limits history
+-- V44: Add credit type, source, and currency to organization limits history
 -- This migration adds support for tracking different types of credits (grant vs payment)
 -- with optional source tracking and multi-currency support.
 

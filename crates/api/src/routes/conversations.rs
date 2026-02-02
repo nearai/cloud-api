@@ -1382,11 +1382,14 @@ fn convert_domain_conversation_to_http(
 
     // Expose root_response_id via metadata (instead of adding a top-level field).
     // This enables first-turn parallel responses to share the same structural parent.
-    if let Some(root_response_id) = domain_conversation.root_response_id.as_ref() {
+    if let Some(root_response_id) = domain_conversation.root_response_id {
         metadata.insert(
             "root_response_id".to_string(),
-            serde_json::Value::String(root_response_id.clone()),
+            serde_json::Value::String(root_response_id),
         );
+    } else {
+        // Remove root_response_id from metadata if it's a legacy conversation
+        metadata.remove("root_response_id");
     }
 
     ConversationObject {

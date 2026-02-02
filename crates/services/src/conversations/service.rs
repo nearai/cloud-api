@@ -272,7 +272,23 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
                 ))
             })?;
 
-        let Some(c) = db_conversation.map(|c| models::Conversation {
+        let Some(c) = db_conversation else {
+            return Ok(None);
+        };
+
+        // Clone copies all responses including the root; fetch its ID so clients can use
+        // root_response_id for first-turn parallel responses (same as create_conversation).
+        let root_response_id = self
+            .resp_repo
+            .get_or_create_root_response(c.id, workspace_id.clone(), api_key_id)
+            .await
+            .map_err(|e| {
+                errors::ConversationError::InternalError(format!(
+                    "Failed to get root response for cloned conversation: {e}"
+                ))
+            })?;
+
+        let conversation = models::Conversation {
             id: c.id,
             workspace_id: c.workspace_id,
             api_key_id: c.api_key_id,
@@ -280,15 +296,13 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             archived_at: c.archived_at,
             deleted_at: c.deleted_at,
             cloned_from_id: c.cloned_from_id,
-            root_response_id: None,
+            root_response_id: Some(root_response_id),
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,
-        }) else {
-            return Ok(None);
         };
 
-        Ok(Some(c))
+        Ok(Some(conversation))
     }
 
     /// Delete a conversation

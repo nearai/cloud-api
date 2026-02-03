@@ -315,6 +315,17 @@ pub async fn init_domain_services_with_pool(
         }
     }
 
+    // Start periodic external provider refresh task
+    let refresh_interval = config.external_providers.refresh_interval_secs;
+    if refresh_interval > 0 {
+        let external_source =
+            models_repo.clone() as Arc<dyn services::inference_provider_pool::ExternalModelsSource>;
+        inference_provider_pool
+            .clone()
+            .start_external_refresh_task(external_source, refresh_interval)
+            .await;
+    }
+
     // Create conversation service
     let conversation_service = Arc::new(services::ConversationService::new(
         conversation_repo.clone(),

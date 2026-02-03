@@ -1380,6 +1380,18 @@ fn convert_domain_conversation_to_http(
         metadata.remove("cloned_from_id");
     }
 
+    // Expose root_response_id via metadata (instead of adding a top-level field).
+    // This enables first-turn parallel responses to share the same structural parent.
+    if let Some(root_response_id) = domain_conversation.root_response_id {
+        metadata.insert(
+            "root_response_id".to_string(),
+            serde_json::Value::String(root_response_id),
+        );
+    } else {
+        // Remove root_response_id from metadata if it's a legacy conversation
+        metadata.remove("root_response_id");
+    }
+
     ConversationObject {
         id: domain_conversation.id.to_string(),
         object: "conversation".to_string(),

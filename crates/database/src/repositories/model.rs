@@ -1151,6 +1151,26 @@ impl ModelRepository {
     }
 }
 
+// Implement ExternalModelsSource trait for periodic refresh of external providers
+#[async_trait]
+impl services::inference_provider_pool::ExternalModelsSource for ModelRepository {
+    async fn fetch_external_models(&self) -> Result<Vec<(String, serde_json::Value)>, String> {
+        let models = self
+            .get_external_models()
+            .await
+            .map_err(|e| format!("Failed to fetch external models: {e}"))?;
+
+        Ok(models
+            .into_iter()
+            .filter_map(|model| {
+                model
+                    .provider_config
+                    .map(|config| (model.model_name, config))
+            })
+            .collect())
+    }
+}
+
 // Implement ModelsRepository trait from services
 #[async_trait]
 impl services::models::ModelsRepository for ModelRepository {

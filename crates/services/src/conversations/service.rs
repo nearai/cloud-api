@@ -81,6 +81,22 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
 
         tracing::info!("Created conversation: {}", db_conversation.id);
 
+        // Create the hidden structural root response for this conversation so clients can
+        // use root_response_id for first-turn parallel responses (multiple models).
+        let root_response_id = self
+            .resp_repo
+            .get_or_create_root_response(
+                db_conversation.id,
+                request.workspace_id.clone(),
+                request.api_key_id,
+            )
+            .await
+            .map_err(|e| {
+                errors::ConversationError::InternalError(format!(
+                    "Failed to create root response for conversation: {e}"
+                ))
+            })?;
+
         let conversation = models::Conversation {
             id: db_conversation.id,
             workspace_id: db_conversation.workspace_id,
@@ -89,6 +105,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             archived_at: db_conversation.archived_at,
             deleted_at: db_conversation.deleted_at,
             cloned_from_id: db_conversation.cloned_from_id,
+            root_response_id: Some(root_response_id),
             metadata: db_conversation.metadata,
             created_at: db_conversation.created_at,
             updated_at: db_conversation.updated_at,
@@ -111,7 +128,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
                 errors::ConversationError::InternalError(format!("Failed to get conversation: {e}"))
             })?;
 
-        Ok(db_conversation.map(|c| models::Conversation {
+        let Some(c) = db_conversation.map(|c| models::Conversation {
             id: c.id,
             workspace_id: c.workspace_id,
             api_key_id: c.api_key_id,
@@ -119,10 +136,15 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             archived_at: c.archived_at,
             deleted_at: c.deleted_at,
             cloned_from_id: c.cloned_from_id,
+            root_response_id: None,
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,
-        }))
+        }) else {
+            return Ok(None);
+        };
+
+        Ok(Some(c))
     }
 
     /// Update a conversation
@@ -142,7 +164,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
                 ))
             })?;
 
-        Ok(db_conversation.map(|c| models::Conversation {
+        let Some(c) = db_conversation.map(|c| models::Conversation {
             id: c.id,
             workspace_id: c.workspace_id,
             api_key_id: c.api_key_id,
@@ -150,10 +172,15 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             archived_at: c.archived_at,
             deleted_at: c.deleted_at,
             cloned_from_id: c.cloned_from_id,
+            root_response_id: None,
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,
-        }))
+        }) else {
+            return Ok(None);
+        };
+
+        Ok(Some(c))
     }
 
     /// Pin or unpin a conversation
@@ -173,7 +200,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
                 ))
             })?;
 
-        Ok(db_conversation.map(|c| models::Conversation {
+        let Some(c) = db_conversation.map(|c| models::Conversation {
             id: c.id,
             workspace_id: c.workspace_id,
             api_key_id: c.api_key_id,
@@ -181,10 +208,15 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             archived_at: c.archived_at,
             deleted_at: c.deleted_at,
             cloned_from_id: c.cloned_from_id,
+            root_response_id: None,
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,
-        }))
+        }) else {
+            return Ok(None);
+        };
+
+        Ok(Some(c))
     }
 
     /// Archive or unarchive a conversation
@@ -204,7 +236,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
                 ))
             })?;
 
-        Ok(db_conversation.map(|c| models::Conversation {
+        let Some(c) = db_conversation.map(|c| models::Conversation {
             id: c.id,
             workspace_id: c.workspace_id,
             api_key_id: c.api_key_id,
@@ -212,10 +244,15 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             archived_at: c.archived_at,
             deleted_at: c.deleted_at,
             cloned_from_id: c.cloned_from_id,
+            root_response_id: None,
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,
-        }))
+        }) else {
+            return Ok(None);
+        };
+
+        Ok(Some(c))
     }
 
     /// Clone a conversation
@@ -235,7 +272,23 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
                 ))
             })?;
 
-        Ok(db_conversation.map(|c| models::Conversation {
+        let Some(c) = db_conversation else {
+            return Ok(None);
+        };
+
+        // Clone copies all responses including the root; fetch its ID so clients can use
+        // root_response_id for first-turn parallel responses (same as create_conversation).
+        let root_response_id = self
+            .resp_repo
+            .get_or_create_root_response(c.id, workspace_id.clone(), api_key_id)
+            .await
+            .map_err(|e| {
+                errors::ConversationError::InternalError(format!(
+                    "Failed to get root response for cloned conversation: {e}"
+                ))
+            })?;
+
+        let conversation = models::Conversation {
             id: c.id,
             workspace_id: c.workspace_id,
             api_key_id: c.api_key_id,
@@ -243,10 +296,13 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             archived_at: c.archived_at,
             deleted_at: c.deleted_at,
             cloned_from_id: c.cloned_from_id,
+            root_response_id: Some(root_response_id),
             metadata: c.metadata,
             created_at: c.created_at,
             updated_at: c.updated_at,
-        }))
+        };
+
+        Ok(Some(conversation))
     }
 
     /// Delete a conversation
@@ -529,9 +585,9 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
 
         let num_conversations = db_conversations.len();
 
-        let conversations = db_conversations
-            .into_iter()
-            .map(|c| models::Conversation {
+        let mut conversations = Vec::with_capacity(db_conversations.len());
+        for c in db_conversations {
+            let conv = models::Conversation {
                 id: c.id,
                 workspace_id: c.workspace_id,
                 api_key_id: c.api_key_id,
@@ -539,11 +595,13 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
                 archived_at: c.archived_at,
                 deleted_at: c.deleted_at,
                 cloned_from_id: c.cloned_from_id,
+                root_response_id: None,
                 metadata: c.metadata,
                 created_at: c.created_at,
                 updated_at: c.updated_at,
-            })
-            .collect();
+            };
+            conversations.push(conv);
+        }
 
         tracing::debug!(
             "Batch retrieved {} conversations for workspace: {}",
@@ -605,6 +663,7 @@ mod tests {
             id,
             workspace_id: workspace_id.clone(),
             api_key_id,
+            root_response_id: None,
             pinned_at: None,
             archived_at: None,
             deleted_at: None,

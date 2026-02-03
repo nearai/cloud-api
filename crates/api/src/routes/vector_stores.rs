@@ -177,7 +177,7 @@ fn to_file_batch_object(batch: &VectorStoreFileBatch) -> VectorStoreFileBatchObj
 
     VectorStoreFileBatchObject {
         id: format!("{PREFIX_VSFB}{}", batch.id),
-        object: "vector_store.files_batch".to_string(),
+        object: "vector_store.file_batch".to_string(),
         created_at: batch.created_at.timestamp(),
         vector_store_id: format!("{PREFIX_VS}{}", batch.vector_store_id),
         status,

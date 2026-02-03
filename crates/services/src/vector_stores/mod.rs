@@ -234,7 +234,10 @@ impl VectorStoreServiceTrait for VectorStoreServiceImpl {
         self.file_service
             .get_file(params.file_id, params.workspace_id)
             .await
-            .map_err(|_| VectorStoreServiceError::FileNotAccessible(params.file_id))?;
+            .map_err(|e| match e {
+                crate::files::FileServiceError::NotFound => VectorStoreServiceError::FileNotFound,
+                _ => VectorStoreServiceError::FileNotAccessible(params.file_id),
+            })?;
 
         let vsf = match self.file_repo.create(params.clone()).await {
             Ok(f) => f,
@@ -346,7 +349,12 @@ impl VectorStoreServiceTrait for VectorStoreServiceImpl {
             self.file_service
                 .get_file(*file_id, params.workspace_id)
                 .await
-                .map_err(|_| VectorStoreServiceError::FileNotAccessible(*file_id))?;
+                .map_err(|e| match e {
+                    crate::files::FileServiceError::NotFound => {
+                        VectorStoreServiceError::FileNotFound
+                    }
+                    _ => VectorStoreServiceError::FileNotAccessible(*file_id),
+                })?;
         }
 
         let batch = self.batch_repo.create(params.clone()).await?;

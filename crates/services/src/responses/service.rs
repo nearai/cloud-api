@@ -1015,6 +1015,50 @@ impl ResponseServiceImpl {
             }
         }
 
+        // When the agent loop failed and we have no output/usage, create a failed response item, update status, then send response.failed
+        // (e.g. completion service error, model unavailable, vLLM unreachable)
+        if let Err(e) = agent_loop_result {
+            if final_response.output.is_empty() && final_response.usage.total_tokens == 0 {
+                let failed_item = models::ResponseOutputItem::Message {
+                    id: format!("msg_{}", Uuid::new_v4().simple()),
+                    response_id: ctx.response_id_str.clone(),
+                    previous_response_id: ctx.previous_response_id.clone(),
+                    next_response_ids: vec![],
+                    created_at: ctx.created_at,
+                    status: models::ResponseItemStatus::Failed,
+                    role: "assistant".to_string(),
+                    content: vec![],
+                    model: ctx.model.clone(),
+                };
+                if let Err(create_err) = context
+                    .response_items_repository
+                    .create(
+                        ctx.response_id.clone(),
+                        ctx.api_key_id,
+                        ctx.conversation_id,
+                        failed_item,
+                    )
+                    .await
+                {
+                    tracing::warn!("Failed to store failed response item: {}", create_err);
+                }
+                if let Err(update_err) = context
+                    .response_repository
+                    .update(
+                        ctx.response_id.clone(),
+                        workspace_id_domain.clone(),
+                        None,
+                        models::ResponseStatus::Failed,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!("Failed to update response status to failed: {}", update_err);
+                }
+                return Err(e);
+            }
+        }
+
         // Event: response.completed
         emitter.emit_completed(&mut ctx, final_response).await?;
 

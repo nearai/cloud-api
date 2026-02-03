@@ -2930,7 +2930,10 @@ async fn test_create_and_clone_conversation_return_root_response_id() {
         root_id.starts_with("resp_"),
         "root_response_id must be a response ID (resp_*), got {root_id}"
     );
-    println!("✅ Create conversation returns root_response_id: {}", root_id);
+    println!(
+        "✅ Create conversation returns root_response_id: {}",
+        root_id
+    );
 
     // Clone conversation: response metadata must include root_response_id (cloned conversation has its own root)
     let clone_response = server
@@ -2952,7 +2955,10 @@ async fn test_create_and_clone_conversation_return_root_response_id() {
         cloned_root_id, root_id,
         "cloned conversation must have a different root_response_id than the original"
     );
-    println!("✅ Clone conversation returns root_response_id: {}", cloned_root_id);
+    println!(
+        "✅ Clone conversation returns root_response_id: {}",
+        cloned_root_id
+    );
 }
 
 #[tokio::test]

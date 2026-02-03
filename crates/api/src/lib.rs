@@ -787,14 +787,6 @@ pub fn build_app_with_config(
     // Build health check route (public, no auth required)
     let health_routes = Router::new().route("/health", get(health_check));
 
-    // Build dev/testing routes (public, no auth required)
-    let dev_state = routes::dev::DevState {
-        rag_service_base_url: config.rag_service.as_ref().map(|r| r.base_url.clone()),
-    };
-    let dev_routes = Router::new()
-        .route("/dev/test-rag", get(routes::dev::test_rag_connectivity))
-        .with_state(dev_state);
-
     // Create metrics state for HTTP metrics middleware
     let metrics_state = middleware::MetricsState {
         metrics_service: domain_services.metrics_service.clone(),
@@ -834,8 +826,7 @@ pub fn build_app_with_config(
                 .merge(files_routes)
                 .merge(vector_store_routes)
                 .merge(billing_routes)
-                .merge(health_routes)
-                .merge(dev_routes),
+                .merge(health_routes),
         )
         .merge(openapi_routes)
         .layer(cors)

@@ -7,7 +7,6 @@ pub mod billing;
 pub mod common;
 pub mod completions;
 pub mod conversations;
-pub mod dev;
 pub mod files;
 pub mod health;
 pub mod models;

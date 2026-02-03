@@ -27,7 +27,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 utoipa = "5.3"
 # OAuth2 authentication
 oauth2 = { version = "5", features = ["reqwest"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 url = "2.5"
 bytes = "1.11"
 tokio-stream = "0.1"

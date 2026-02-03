@@ -403,6 +403,30 @@ pub async fn init_domain_services_with_pool(
     let web_search_provider =
         Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
 
+    // Create RAG service client and file search provider (if configured)
+    let file_search_provider: Option<Arc<dyn services::responses::tools::FileSearchProviderTrait>> =
+        if let Some(ref rag_config) = config.rag_service {
+            match services::rag::RagServiceClient::new(
+                rag_config.base_url.clone(),
+                rag_config.auth_token_file.as_deref(),
+                rag_config.timeout_seconds,
+            ) {
+                Ok(rag_client) => {
+                    let rag_service: Arc<dyn services::rag::RagServiceTrait> =
+                        Arc::new(rag_client);
+                    Some(Arc::new(
+                        services::responses::tools::RagFileSearchProvider::new(rag_service),
+                    ))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to initialize RAG service client, file search disabled");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     // Create session repository for user service
     let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
         as Arc<dyn services::auth::SessionRepository>;
@@ -466,7 +490,7 @@ pub async fn init_domain_services_with_pool(
         conversation_service.clone(),
         completion_service.clone(),
         Some(web_search_provider), // web_search_provider
-        None,                      // file_search_provider
+        file_search_provider,      // file_search_provider (RAG-backed if configured)
         files_service.clone(),     // file_service
         organization_service.clone(),
     ));
@@ -520,6 +544,9 @@ pub async fn init_domain_services_with_mcp_factory(
     let web_search_provider =
         Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
 
+    // Preserve file_search_provider from the base domain services
+    let file_search_provider = domain_services.response_service.file_search_provider.clone();
+
     let response_service = Arc::new(services::ResponseService::with_mcp_client_factory(
         response_repo,
         response_items_repo,
@@ -527,7 +554,7 @@ pub async fn init_domain_services_with_mcp_factory(
         domain_services.conversation_service.clone(),
         domain_services.completion_service.clone(),
         Some(web_search_provider),
-        None,
+        file_search_provider,
         domain_services.files_service.clone(), // Reuse files_service from base
         organization_service,
         mcp_client_factory,
@@ -760,6 +787,14 @@ pub fn build_app_with_config(
     // Build health check route (public, no auth required)
     let health_routes = Router::new().route("/health", get(health_check));
 
+    // Build dev/testing routes (public, no auth required)
+    let dev_state = routes::dev::DevState {
+        rag_service_base_url: config.rag_service.as_ref().map(|r| r.base_url.clone()),
+    };
+    let dev_routes = Router::new()
+        .route("/dev/test-rag", get(routes::dev::test_rag_connectivity))
+        .with_state(dev_state);
+
     // Create metrics state for HTTP metrics middleware
     let metrics_state = middleware::MetricsState {
         metrics_service: domain_services.metrics_service.clone(),
@@ -799,7 +834,8 @@ pub fn build_app_with_config(
                 .merge(files_routes)
                 .merge(vector_store_routes)
                 .merge(billing_routes)
-                .merge(health_routes),
+                .merge(health_routes)
+                .merge(dev_routes),
         )
         .merge(openapi_routes)
         .layer(cors)
@@ -1466,6 +1502,7 @@ mod tests {
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),
+            rag_service: None,
         };
 
         // Initialize services
@@ -1570,6 +1607,7 @@ mod tests {
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),
+            rag_service: None,
         };
 
         let auth_components = init_auth_services(database.clone(), &config);

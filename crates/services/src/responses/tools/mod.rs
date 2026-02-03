@@ -3,6 +3,7 @@ pub mod executor;
 pub mod file_search;
 pub mod mcp;
 pub mod ports;
+pub mod rag_file_search;
 pub mod tool_config;
 pub mod web_search;
 
@@ -38,3 +39,6 @@ pub use ports::{
     FileSearchProviderTrait, FileSearchResult, WebSearchError, WebSearchParams,
     WebSearchProviderTrait, WebSearchResult,
 };
+
+// RAG-backed file search provider
+pub use rag_file_search::RagFileSearchProvider;

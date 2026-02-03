@@ -11,6 +11,7 @@ pub mod mcp;
 pub mod metrics;
 pub mod models;
 pub mod organization;
+pub mod rag;
 pub mod responses;
 pub mod usage;
 pub mod user;

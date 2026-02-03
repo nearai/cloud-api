@@ -2909,6 +2909,53 @@ async fn test_conversation_metadata_limits() {
 }
 
 #[tokio::test]
+async fn test_create_and_clone_conversation_return_root_response_id() {
+    let (server, _guard) = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    // Create conversation: response metadata must include root_response_id for first-turn parallel responses
+    let create_response = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({ "metadata": {} }))
+        .await;
+    assert_eq!(create_response.status_code(), 201);
+    let created = create_response.json::<api::models::ConversationObject>();
+    let meta = created.metadata.as_object().unwrap();
+    let root_id = meta
+        .get("root_response_id")
+        .and_then(|v| v.as_str())
+        .expect("create conversation response must include metadata.root_response_id");
+    assert!(
+        root_id.starts_with("resp_"),
+        "root_response_id must be a response ID (resp_*), got {root_id}"
+    );
+    println!("✅ Create conversation returns root_response_id: {}", root_id);
+
+    // Clone conversation: response metadata must include root_response_id (cloned conversation has its own root)
+    let clone_response = server
+        .post(format!("/v1/conversations/{}/clone", created.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(clone_response.status_code(), 201);
+    let cloned = clone_response.json::<api::models::ConversationObject>();
+    let cloned_meta = cloned.metadata.as_object().unwrap();
+    let cloned_root_id = cloned_meta
+        .get("root_response_id")
+        .and_then(|v| v.as_str())
+        .expect("clone conversation response must include metadata.root_response_id");
+    assert!(
+        cloned_root_id.starts_with("resp_"),
+        "cloned root_response_id must be resp_*, got {cloned_root_id}"
+    );
+    assert_ne!(
+        cloned_root_id, root_id,
+        "cloned conversation must have a different root_response_id than the original"
+    );
+    println!("✅ Clone conversation returns root_response_id: {}", cloned_root_id);
+}
+
+#[tokio::test]
 async fn test_conversation_operations_with_invalid_id_format() {
     let (server, _guard) = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;

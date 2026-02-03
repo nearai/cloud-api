@@ -35,6 +35,7 @@ impl PgConversationRepository {
             archived_at: row.try_get("archived_at")?,
             deleted_at: row.try_get("deleted_at")?,
             cloned_from_id: cloned_from_id.map(|id| id.into()),
+            root_response_id: None,
             metadata: row.try_get("metadata")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,

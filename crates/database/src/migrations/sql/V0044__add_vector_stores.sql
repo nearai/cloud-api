@@ -59,7 +59,7 @@ CREATE TRIGGER set_vector_stores_updated_at
 -- =============================================================================
 CREATE TABLE vector_store_file_batches (
     id                          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    vector_store_id             UUID NOT NULL REFERENCES vector_stores(id) ON DELETE CASCADE,
+    vector_store_id             UUID NOT NULL REFERENCES vector_stores(id) ON DELETE RESTRICT,
     workspace_id                UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     status                      VARCHAR(50) NOT NULL DEFAULT 'in_progress',
     file_counts_in_progress     INTEGER NOT NULL DEFAULT 0,
@@ -103,7 +103,7 @@ CREATE TRIGGER set_vsfb_updated_at
 -- =============================================================================
 CREATE TABLE vector_store_files (
     id                          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    vector_store_id             UUID NOT NULL REFERENCES vector_stores(id) ON DELETE CASCADE,
+    vector_store_id             UUID NOT NULL REFERENCES vector_stores(id) ON DELETE RESTRICT,
     file_id                     UUID NOT NULL REFERENCES files(id) ON DELETE CASCADE,
     workspace_id                UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     batch_id                    UUID REFERENCES vector_store_file_batches(id) ON DELETE SET NULL,

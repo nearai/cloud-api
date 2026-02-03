@@ -75,13 +75,21 @@ impl AnthropicBackend {
         let tools = params.tools.as_ref().map(|t| convert_tools(t));
         let tool_choice = params.tool_choice.as_ref().and_then(convert_tool_choice);
 
+        // Anthropic doesn't allow both temperature and top_p - prefer temperature if both are set.
+        // Also clamp temperature to Anthropic's valid range [0.0, 1.0] (OpenAI allows up to 2.0).
+        let (temperature, top_p) = if let Some(temp) = params.temperature {
+            (Some(temp.clamp(0.0, 1.0)), None)
+        } else {
+            (None, params.top_p)
+        };
+
         AnthropicRequest {
             model: model.to_string(),
             messages,
             max_tokens,
             system,
-            temperature: params.temperature,
-            top_p: params.top_p,
+            temperature,
+            top_p,
             stop_sequences: params.stop.clone(),
             tools,
             tool_choice,
@@ -161,6 +169,7 @@ impl ExternalBackend for AnthropicBackend {
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
         let url = format!("{}/messages", config.base_url);
         let request = self.build_request(model, &params, false);
+
         let headers = self
             .build_headers(config)
             .map_err(CompletionError::CompletionError)?;
@@ -294,6 +303,101 @@ mod tests {
             headers.get("anthropic-version").unwrap().to_str().unwrap(),
             "2024-01-01"
         );
+    }
+
+    fn make_params(temperature: Option<f32>, top_p: Option<f32>) -> ChatCompletionParams {
+        ChatCompletionParams {
+            model: "claude-sonnet-4-5-20250514".to_string(),
+            messages: vec![crate::ChatMessage {
+                role: MessageRole::User,
+                content: Some(serde_json::Value::String("Hello".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            max_completion_tokens: None,
+            max_tokens: None,
+            temperature,
+            top_p,
+            n: None,
+            stream: None,
+            stop: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            user: None,
+            seed: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            metadata: None,
+            store: None,
+            stream_options: None,
+            modalities: None,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_build_request_temperature_only() {
+        let backend = AnthropicBackend::new();
+        let params = make_params(Some(0.7), None);
+        let request = backend.build_request("claude-sonnet-4-5-20250514", &params, false);
+
+        assert_eq!(request.temperature, Some(0.7));
+        assert_eq!(request.top_p, None);
+    }
+
+    #[test]
+    fn test_build_request_top_p_only() {
+        let backend = AnthropicBackend::new();
+        let params = make_params(None, Some(0.9));
+        let request = backend.build_request("claude-sonnet-4-5-20250514", &params, false);
+
+        assert_eq!(request.temperature, None);
+        assert_eq!(request.top_p, Some(0.9));
+    }
+
+    #[test]
+    fn test_build_request_both_temperature_and_top_p_prefers_temperature() {
+        let backend = AnthropicBackend::new();
+        let params = make_params(Some(0.5), Some(0.9));
+        let request = backend.build_request("claude-sonnet-4-5-20250514", &params, false);
+
+        // Anthropic doesn't allow both; temperature takes precedence
+        assert_eq!(request.temperature, Some(0.5));
+        assert_eq!(request.top_p, None);
+    }
+
+    #[test]
+    fn test_build_request_neither_temperature_nor_top_p() {
+        let backend = AnthropicBackend::new();
+        let params = make_params(None, None);
+        let request = backend.build_request("claude-sonnet-4-5-20250514", &params, false);
+
+        assert_eq!(request.temperature, None);
+        assert_eq!(request.top_p, None);
+    }
+
+    #[test]
+    fn test_build_request_clamps_temperature_to_anthropic_range() {
+        let backend = AnthropicBackend::new();
+        // OpenAI allows temperature up to 2.0, Anthropic only allows up to 1.0
+        let params = make_params(Some(1.5), None);
+        let request = backend.build_request("claude-sonnet-4-5-20250514", &params, false);
+
+        assert_eq!(request.temperature, Some(1.0));
+    }
+
+    #[test]
+    fn test_build_request_default_max_tokens() {
+        let backend = AnthropicBackend::new();
+        let params = make_params(None, None);
+        let request = backend.build_request("claude-sonnet-4-5-20250514", &params, false);
+
+        assert_eq!(request.max_tokens, 4096);
     }
 
     #[tokio::test]

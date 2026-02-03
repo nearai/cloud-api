@@ -980,20 +980,27 @@ impl ResponseServiceImpl {
             errors::ResponseError::InternalError(format!("Failed to serialize usage: {e}"))
         })?;
 
+        let is_initial_failure = agent_loop_result.is_err()
+            && final_response.output.is_empty()
+            && final_response.usage.total_tokens == 0;
+
         // Update the response in the database with usage, status, and output message
-        if let Err(e) = context
-            .response_repository
-            .update(
-                ctx.response_id.clone(),
-                workspace_id_domain.clone(),
-                Some(final_response_text.clone()),
-                final_response.status.clone(),
-                Some(usage_json),
-            )
-            .await
-        {
-            tracing::warn!("Failed to update response with usage: {}", e);
-            // Continue even if update fails - the response was already created
+        // Skip for initial failure: we will perform a single update to Failed below
+        if !is_initial_failure {
+            if let Err(e) = context
+                .response_repository
+                .update(
+                    ctx.response_id.clone(),
+                    workspace_id_domain.clone(),
+                    Some(final_response_text.clone()),
+                    final_response.status.clone(),
+                    Some(usage_json),
+                )
+                .await
+            {
+                tracing::warn!("Failed to update response with usage: {}", e);
+                // Continue even if update fails - the response was already created
+            }
         }
 
         // Wait for title generation with a timeout (2 seconds)
@@ -1018,7 +1025,7 @@ impl ResponseServiceImpl {
         // When the agent loop failed and we have no output/usage, create a failed response item, update status, then send response.failed
         // (e.g. completion service error, model unavailable, vLLM unreachable)
         if let Err(e) = agent_loop_result {
-            if final_response.output.is_empty() && final_response.usage.total_tokens == 0 {
+            if is_initial_failure {
                 let failed_item = models::ResponseOutputItem::Message {
                     id: format!("msg_{}", Uuid::new_v4().simple()),
                     response_id: ctx.response_id_str.clone(),

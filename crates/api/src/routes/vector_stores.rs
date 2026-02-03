@@ -53,6 +53,9 @@ fn map_service_error(e: VectorStoreServiceError) -> (StatusCode, Json<ErrorRespo
             (StatusCode::BAD_REQUEST, "invalid_request_error")
         }
         VectorStoreServiceError::FileAlreadyExists => (StatusCode::CONFLICT, "conflict"),
+        VectorStoreServiceError::FileNotAccessible(_) => {
+            (StatusCode::BAD_REQUEST, "invalid_request_error")
+        }
         VectorStoreServiceError::RepositoryError(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "server_error")
         }
@@ -64,9 +67,17 @@ fn map_service_error(e: VectorStoreServiceError) -> (StatusCode, Json<ErrorRespo
         tracing::error!("Vector store operation failed: {}", e);
     }
 
+    // Sanitize error messages for internal server errors to avoid leaking
+    // database schema details or internal state to the client
+    let message = if status.is_server_error() {
+        "An internal error occurred".to_string()
+    } else {
+        e.to_string()
+    };
+
     (
         status,
-        Json(ErrorResponse::new(e.to_string(), error_type.to_string())),
+        Json(ErrorResponse::new(message, error_type.to_string())),
     )
 }
 
@@ -568,6 +579,12 @@ pub async fn list_vector_store_files(
         .map(|s| parse_uuid_with_prefix(s, PREFIX_VSF))
         .transpose()?;
 
+    let before = params
+        .before
+        .as_deref()
+        .map(|s| parse_uuid_with_prefix(s, PREFIX_VSF))
+        .transpose()?;
+
     let files = app_state
         .vector_store_service
         .list_vector_store_files(
@@ -578,7 +595,7 @@ pub async fn list_vector_store_files(
                 limit: limit + 1,
                 order,
                 after,
-                before: None,
+                before,
                 filter: None,
             },
         )
@@ -874,6 +891,12 @@ pub async fn list_vector_store_file_batch_files(
         .map(|s| parse_uuid_with_prefix(s, PREFIX_VSF))
         .transpose()?;
 
+    let before = params
+        .before
+        .as_deref()
+        .map(|s| parse_uuid_with_prefix(s, PREFIX_VSF))
+        .transpose()?;
+
     let files = app_state
         .vector_store_service
         .list_file_batch_files(
@@ -885,7 +908,7 @@ pub async fn list_vector_store_file_batch_files(
                 limit: limit + 1,
                 order,
                 after,
-                before: None,
+                before,
                 filter: params.filter.and_then(|f| {
                     serde_json::to_value(&f)
                         .ok()

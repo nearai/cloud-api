@@ -152,10 +152,23 @@ impl PgVectorStoreRepository {
     }
 
     pub async fn list(&self, params: &ListParams) -> Result<Vec<VectorStore>, RepositoryError> {
-        let order_clause = if params.order == "asc" { "ASC" } else { "DESC" };
-        let comparison = if params.order == "asc" { ">" } else { "<" };
+        let is_asc = params.order == "asc";
 
-        let query = match params.after {
+        // For `before` cursor, we query in reverse order and flip results after
+        let use_before = params.after.is_none() && params.before.is_some();
+        let cursor_id = params.after.or(params.before);
+
+        // When using `before`, reverse sort direction to fetch closest items first
+        let order_clause = match (is_asc, use_before) {
+            (true, false) | (false, true) => "ASC",
+            (false, false) | (true, true) => "DESC",
+        };
+        let comparison = match (is_asc, use_before) {
+            (true, false) | (false, true) => ">",
+            (false, false) | (true, true) => "<",
+        };
+
+        let query = match cursor_id {
             Some(_) => format!(
                 "SELECT * FROM vector_stores
                  WHERE workspace_id = $1
@@ -181,10 +194,10 @@ impl PgVectorStoreRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            match params.after {
-                Some(after_id) => {
+            match cursor_id {
+                Some(cid) => {
                     client
-                        .query(&query, &[&params.workspace_id, &after_id, &params.limit])
+                        .query(&query, &[&params.workspace_id, &cid, &params.limit])
                         .await
                 }
                 None => {
@@ -196,12 +209,20 @@ impl PgVectorStoreRepository {
             .map_err(map_db_error)
         })?;
 
-        rows.into_iter()
+        let mut results: Vec<VectorStore> = rows
+            .into_iter()
             .map(|row| {
                 self.row_to_model(row)
                     .map_err(RepositoryError::DataConversionError)
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Reverse results when using `before` cursor to restore original sort order
+        if use_before {
+            results.reverse();
+        }
+
+        Ok(results)
     }
 
     pub async fn update(
@@ -465,78 +486,76 @@ impl PgVectorStoreFileRepository {
         }
     }
 
+    /// Build a paginated query for vector_store_files with cursor, filter, and sort support.
+    ///
+    /// `base_conditions` are pre-existing WHERE clauses (e.g. "vector_store_id = $1 AND workspace_id = $2").
+    /// `base_params` are the corresponding parameter values.
+    /// Returns `(query_string, params, use_before)` where `use_before` indicates results need reversing.
+    fn build_file_list_query(
+        base_conditions: &str,
+        base_params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+        params: &ListParams,
+    ) -> (
+        String,
+        Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+        bool,
+    ) {
+        let is_asc = params.order == "asc";
+        let use_before = params.after.is_none() && params.before.is_some();
+        let cursor_id = params.after.or(params.before);
+
+        // When using `before`, reverse sort direction to fetch closest items first
+        let order_clause = match (is_asc, use_before) {
+            (true, false) | (false, true) => "ASC",
+            (false, false) | (true, true) => "DESC",
+        };
+        let comparison = match (is_asc, use_before) {
+            (true, false) | (false, true) => ">",
+            (false, false) | (true, true) => "<",
+        };
+
+        let mut query_params = base_params;
+        let mut extra_conditions = String::new();
+
+        if let Some(filter) = params.filter.as_ref() {
+            let idx = query_params.len() + 1;
+            extra_conditions.push_str(&format!(" AND status = ${idx}"));
+            query_params.push(Box::new(filter.clone()));
+        }
+
+        if let Some(cid) = cursor_id {
+            let idx = query_params.len() + 1;
+            extra_conditions.push_str(&format!(
+                " AND created_at {comparison} (SELECT created_at FROM vector_store_files WHERE id = ${idx})"
+            ));
+            query_params.push(Box::new(cid));
+        }
+
+        let limit_idx = query_params.len() + 1;
+        query_params.push(Box::new(params.limit));
+
+        let query = format!(
+            "SELECT * FROM vector_store_files WHERE {base_conditions}{extra_conditions} ORDER BY created_at {order_clause} LIMIT ${limit_idx}"
+        );
+
+        (query, query_params, use_before)
+    }
+
     pub async fn list(
         &self,
         vector_store_id: Uuid,
         workspace_id: Uuid,
         params: &ListParams,
     ) -> Result<Vec<VectorStoreFile>, RepositoryError> {
-        let order_clause = if params.order == "asc" { "ASC" } else { "DESC" };
-        let comparison = if params.order == "asc" { ">" } else { "<" };
-
-        let (query, query_params): (String, Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>) =
-            match (params.after, params.filter.as_ref()) {
-                (Some(after_id), Some(filter)) => (
-                    format!(
-                        "SELECT * FROM vector_store_files
-                         WHERE vector_store_id = $1 AND workspace_id = $2
-                           AND status = $3
-                           AND created_at {comparison} (SELECT created_at FROM vector_store_files WHERE id = $4)
-                         ORDER BY created_at {order_clause}
-                         LIMIT $5"
-                    ),
-                    vec![
-                        Box::new(vector_store_id),
-                        Box::new(workspace_id),
-                        Box::new(filter.clone()),
-                        Box::new(after_id),
-                        Box::new(params.limit),
-                    ],
-                ),
-                (Some(after_id), None) => (
-                    format!(
-                        "SELECT * FROM vector_store_files
-                         WHERE vector_store_id = $1 AND workspace_id = $2
-                           AND created_at {comparison} (SELECT created_at FROM vector_store_files WHERE id = $3)
-                         ORDER BY created_at {order_clause}
-                         LIMIT $4"
-                    ),
-                    vec![
-                        Box::new(vector_store_id),
-                        Box::new(workspace_id),
-                        Box::new(after_id),
-                        Box::new(params.limit),
-                    ],
-                ),
-                (None, Some(filter)) => (
-                    format!(
-                        "SELECT * FROM vector_store_files
-                         WHERE vector_store_id = $1 AND workspace_id = $2
-                           AND status = $3
-                         ORDER BY created_at {order_clause}
-                         LIMIT $4"
-                    ),
-                    vec![
-                        Box::new(vector_store_id),
-                        Box::new(workspace_id),
-                        Box::new(filter.clone()),
-                        Box::new(params.limit),
-                    ],
-                ),
-                (None, None) => (
-                    format!(
-                        "SELECT * FROM vector_store_files
-                         WHERE vector_store_id = $1 AND workspace_id = $2
-                         ORDER BY created_at {order_clause}
-                         LIMIT $3"
-                    ),
-                    vec![
-                        Box::new(vector_store_id),
-                        Box::new(workspace_id),
-                        Box::new(params.limit),
-                    ],
-                ),
-            };
+        let base_params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+            Box::new(vector_store_id),
+            Box::new(workspace_id),
+        ];
+        let (query, query_params, use_before) = Self::build_file_list_query(
+            "vector_store_id = $1 AND workspace_id = $2",
+            base_params,
+            params,
+        );
 
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = query_params
             .iter()
@@ -557,12 +576,19 @@ impl PgVectorStoreFileRepository {
                 .map_err(map_db_error)
         })?;
 
-        rows.into_iter()
+        let mut results: Vec<VectorStoreFile> = rows
+            .into_iter()
             .map(|row| {
                 self.row_to_model(row)
                     .map_err(RepositoryError::DataConversionError)
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if use_before {
+            results.reverse();
+        }
+
+        Ok(results)
     }
 
     pub async fn update_attributes(
@@ -635,76 +661,16 @@ impl PgVectorStoreFileRepository {
         workspace_id: Uuid,
         params: &ListParams,
     ) -> Result<Vec<VectorStoreFile>, RepositoryError> {
-        let order_clause = if params.order == "asc" { "ASC" } else { "DESC" };
-        let comparison = if params.order == "asc" { ">" } else { "<" };
-
-        let (query, query_params): (String, Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>) =
-            match (params.after, params.filter.as_ref()) {
-                (Some(after_id), Some(filter)) => (
-                    format!(
-                        "SELECT * FROM vector_store_files
-                         WHERE batch_id = $1 AND vector_store_id = $2 AND workspace_id = $3
-                           AND status = $4
-                           AND created_at {comparison} (SELECT created_at FROM vector_store_files WHERE id = $5)
-                         ORDER BY created_at {order_clause}
-                         LIMIT $6"
-                    ),
-                    vec![
-                        Box::new(batch_id),
-                        Box::new(vector_store_id),
-                        Box::new(workspace_id),
-                        Box::new(filter.clone()),
-                        Box::new(after_id),
-                        Box::new(params.limit),
-                    ],
-                ),
-                (Some(after_id), None) => (
-                    format!(
-                        "SELECT * FROM vector_store_files
-                         WHERE batch_id = $1 AND vector_store_id = $2 AND workspace_id = $3
-                           AND created_at {comparison} (SELECT created_at FROM vector_store_files WHERE id = $4)
-                         ORDER BY created_at {order_clause}
-                         LIMIT $5"
-                    ),
-                    vec![
-                        Box::new(batch_id),
-                        Box::new(vector_store_id),
-                        Box::new(workspace_id),
-                        Box::new(after_id),
-                        Box::new(params.limit),
-                    ],
-                ),
-                (None, Some(filter)) => (
-                    format!(
-                        "SELECT * FROM vector_store_files
-                         WHERE batch_id = $1 AND vector_store_id = $2 AND workspace_id = $3
-                           AND status = $4
-                         ORDER BY created_at {order_clause}
-                         LIMIT $5"
-                    ),
-                    vec![
-                        Box::new(batch_id),
-                        Box::new(vector_store_id),
-                        Box::new(workspace_id),
-                        Box::new(filter.clone()),
-                        Box::new(params.limit),
-                    ],
-                ),
-                (None, None) => (
-                    format!(
-                        "SELECT * FROM vector_store_files
-                         WHERE batch_id = $1 AND vector_store_id = $2 AND workspace_id = $3
-                         ORDER BY created_at {order_clause}
-                         LIMIT $4"
-                    ),
-                    vec![
-                        Box::new(batch_id),
-                        Box::new(vector_store_id),
-                        Box::new(workspace_id),
-                        Box::new(params.limit),
-                    ],
-                ),
-            };
+        let base_params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+            Box::new(batch_id),
+            Box::new(vector_store_id),
+            Box::new(workspace_id),
+        ];
+        let (query, query_params, use_before) = Self::build_file_list_query(
+            "batch_id = $1 AND vector_store_id = $2 AND workspace_id = $3",
+            base_params,
+            params,
+        );
 
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = query_params
             .iter()
@@ -725,12 +691,19 @@ impl PgVectorStoreFileRepository {
                 .map_err(map_db_error)
         })?;
 
-        rows.into_iter()
+        let mut results: Vec<VectorStoreFile> = rows
+            .into_iter()
             .map(|row| {
                 self.row_to_model(row)
                     .map_err(RepositoryError::DataConversionError)
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if use_before {
+            results.reverse();
+        }
+
+        Ok(results)
     }
 }
 

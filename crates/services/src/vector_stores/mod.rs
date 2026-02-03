@@ -28,6 +28,8 @@ pub enum VectorStoreServiceError {
     InvalidParams(String),
     #[error("File already exists in vector store")]
     FileAlreadyExists,
+    #[error("File not accessible: {0}")]
+    FileNotAccessible(Uuid),
     #[error("Repository error: {0}")]
     RepositoryError(#[from] RepositoryError),
 }
@@ -137,6 +139,7 @@ pub struct VectorStoreServiceImpl {
     store_repo: Arc<dyn VectorStoreRepository>,
     file_repo: Arc<dyn VectorStoreFileRepository>,
     batch_repo: Arc<dyn VectorStoreFileBatchRepository>,
+    file_service: Arc<dyn crate::files::FileServiceTrait>,
 }
 
 impl VectorStoreServiceImpl {
@@ -144,11 +147,13 @@ impl VectorStoreServiceImpl {
         store_repo: Arc<dyn VectorStoreRepository>,
         file_repo: Arc<dyn VectorStoreFileRepository>,
         batch_repo: Arc<dyn VectorStoreFileBatchRepository>,
+        file_service: Arc<dyn crate::files::FileServiceTrait>,
     ) -> Self {
         Self {
             store_repo,
             file_repo,
             batch_repo,
+            file_service,
         }
     }
 
@@ -225,6 +230,12 @@ impl VectorStoreServiceTrait for VectorStoreServiceImpl {
         self.verify_store_ownership(params.vector_store_id, params.workspace_id)
             .await?;
 
+        // Verify file belongs to the same workspace
+        self.file_service
+            .get_file(params.file_id, params.workspace_id)
+            .await
+            .map_err(|_| VectorStoreServiceError::FileNotAccessible(params.file_id))?;
+
         let vsf = match self.file_repo.create(params.clone()).await {
             Ok(f) => f,
             Err(RepositoryError::AlreadyExists) => {
@@ -234,10 +245,13 @@ impl VectorStoreServiceTrait for VectorStoreServiceImpl {
         };
 
         // Recalculate file counts on the parent vector store
-        let _ = self
+        if let Err(e) = self
             .store_repo
             .update_file_counts(params.vector_store_id)
-            .await;
+            .await
+        {
+            tracing::error!(vector_store_id = %params.vector_store_id, error = %e, "Failed to update file counts");
+        }
 
         Ok(vsf)
     }
@@ -307,7 +321,9 @@ impl VectorStoreServiceTrait for VectorStoreServiceImpl {
         }
 
         // Recalculate file counts
-        let _ = self.store_repo.update_file_counts(vector_store_id).await;
+        if let Err(e) = self.store_repo.update_file_counts(vector_store_id).await {
+            tracing::error!(vector_store_id = %vector_store_id, error = %e, "Failed to update file counts");
+        }
 
         Ok(true)
     }
@@ -325,13 +341,24 @@ impl VectorStoreServiceTrait for VectorStoreServiceImpl {
             ));
         }
 
+        // Verify all files belong to the same workspace
+        for file_id in &params.file_ids {
+            self.file_service
+                .get_file(*file_id, params.workspace_id)
+                .await
+                .map_err(|_| VectorStoreServiceError::FileNotAccessible(*file_id))?;
+        }
+
         let batch = self.batch_repo.create(params.clone()).await?;
 
         // Recalculate file counts on the parent vector store
-        let _ = self
+        if let Err(e) = self
             .store_repo
             .update_file_counts(params.vector_store_id)
-            .await;
+            .await
+        {
+            tracing::error!(vector_store_id = %params.vector_store_id, error = %e, "Failed to update file counts");
+        }
 
         Ok(batch)
     }
@@ -373,10 +400,8 @@ impl VectorStoreServiceTrait for VectorStoreServiceImpl {
         workspace_id: Uuid,
         params: &ListParams,
     ) -> Result<Vec<VectorStoreFile>, VectorStoreServiceError> {
-        self.verify_store_ownership(vector_store_id, workspace_id)
-            .await?;
-
-        // Verify batch exists
+        // Verify batch exists and belongs to the workspace/vector_store
+        // (this implicitly validates store ownership via workspace_id constraint)
         self.batch_repo
             .get(batch_id, vector_store_id, workspace_id)
             .await?

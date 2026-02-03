@@ -455,6 +455,7 @@ pub async fn init_domain_services_with_pool(
         vs_store_repo,
         vs_file_repo,
         vs_batch_repo,
+        files_service.clone(),
     ))
         as Arc<dyn services::vector_stores::VectorStoreServiceTrait + Send + Sync>;
 

@@ -73,4 +73,12 @@ pub trait FileRepositoryTrait: Send + Sync {
     async fn delete(&self, id: Uuid) -> Result<bool, RepositoryError>;
 
     async fn get_expired_files(&self) -> Result<Vec<File>, RepositoryError>;
+
+    /// Verify that ALL given file IDs belong to the specified workspace.
+    /// Returns true if all files exist and belong to the workspace, false otherwise.
+    async fn verify_workspace_ownership(
+        &self,
+        file_ids: &[Uuid],
+        workspace_id: Uuid,
+    ) -> Result<bool, RepositoryError>;
 }

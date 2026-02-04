@@ -113,6 +113,7 @@ pub fn test_config_with_db(db_name: &str) -> ApiConfig {
         },
         cors: config::CorsConfig::default(),
         external_providers: config::ExternalProvidersConfig::default(),
+        rag_service: None,
     }
 }
 

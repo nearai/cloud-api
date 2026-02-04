@@ -693,7 +693,9 @@ pub async fn setup_qwen_model(server: &axum_test::TestServer) -> String {
             "modelDescription": "Updated model description",
             "contextLength": 128000,
             "verifiable": true,
-            "isActive": true
+            "isActive": true,
+            "inputModalities": ["text"],
+            "outputModalities": ["text"]
         }))
         .unwrap(),
     );
@@ -813,7 +815,9 @@ pub async fn setup_qwen_image_model(server: &axum_test::TestServer) -> String {
             "modelDescription": "FLUX 2 Klein image generation model",
             "contextLength": 4096,
             "verifiable": true,
-            "isActive": true
+            "isActive": true,
+            "inputModalities": ["text"],
+            "outputModalities": ["image"]
         }))
         .unwrap(),
     );
@@ -1241,8 +1245,17 @@ pub fn extract_response_id_from_sse(sse_stream: &str) -> Option<String> {
         if event_type == "response.created" && !data.is_empty() {
             // Parse the JSON to extract the ID
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                if let Some(id) = json.get("id").and_then(|v| v.as_str()) {
+                // Try to extract ID from the response object (most common path)
+                if let Some(id) = json
+                    .get("response")
+                    .and_then(|r| r.get("id"))
+                    .and_then(|v| v.as_str())
+                {
                     // Strip "resp_" prefix if present
+                    return Some(id.strip_prefix("resp_").unwrap_or(id).to_string());
+                }
+                // Fallback: try to extract ID directly from the event
+                if let Some(id) = json.get("id").and_then(|v| v.as_str()) {
                     return Some(id.strip_prefix("resp_").unwrap_or(id).to_string());
                 }
             }

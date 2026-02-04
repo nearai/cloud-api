@@ -864,10 +864,13 @@ impl crate::InferenceProvider for MockProvider {
         let n = params.n.unwrap_or(1);
         let created = self.current_timestamp();
 
-        // Generate mock image data
+        // Generate mock image data - use valid base64-encoded PNG (1x1 pixel)
+        // This is a minimal valid PNG for testing purposes
+        let valid_base64_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
         let data: Vec<ImageData> = (0..n)
-            .map(|i| ImageData {
-                b64_json: Some(format!("mock_base64_image_data_{}", i)),
+            .map(|_| ImageData {
+                b64_json: Some(valid_base64_png.to_string()),
                 url: None,
                 revised_prompt: Some(params.prompt.clone()),
             })
@@ -905,8 +908,11 @@ impl crate::InferenceProvider for MockProvider {
         let created = self.current_timestamp();
 
         // Generate mock edited image data (always 1 image for edit)
+        // Use valid base64-encoded PNG (1x1 pixel) for testing purposes
+        let valid_base64_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
         let data = vec![ImageData {
-            b64_json: Some("mock_base64_edited_image_data_0".to_string()),
+            b64_json: Some(valid_base64_png.to_string()),
             url: None,
             revised_prompt: Some(params.prompt.clone()),
         }];

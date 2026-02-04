@@ -113,10 +113,10 @@ pub const ALLOWED_MIME_TYPES: &[(&str, bool)] = &[
     // INI / desktop / service files (common on Linux)
     ("text/x-ini", true), // .ini, .cfg, .conf
     // Image formats
-    ("image/png", false),   // .png
-    ("image/jpeg", false),  // .jpg, .jpeg
-    ("image/gif", false),   // .gif
-    ("image/webp", false),  // .webp
+    ("image/png", false),    // .png
+    ("image/jpeg", false),   // .jpg, .jpeg
+    ("image/gif", false),    // .gif
+    ("image/webp", false),   // .webp
     ("image/svg+xml", true), // .svg (XML-based)
 ];
 

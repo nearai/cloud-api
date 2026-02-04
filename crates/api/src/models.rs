@@ -954,6 +954,34 @@ pub enum ResponseOutputItem {
         arguments: String,
         model: String,
     },
+    /// External function call requiring client execution.
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        /// Unique identifier for this function call item.
+        id: String,
+        /// The response ID this item belongs to.
+        #[serde(default)]
+        response_id: String,
+        /// The previous response ID if this is a continuation.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        /// IDs of responses that follow this one.
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        /// Timestamp when this item was created.
+        #[serde(default)]
+        created_at: i64,
+        /// The tool call ID from the LLM, used to correlate with FunctionCallOutput.
+        call_id: String,
+        /// Name of the function to call.
+        name: String,
+        /// JSON-encoded arguments for the function.
+        arguments: String,
+        /// Status of the function call (typically "in_progress" when pending).
+        status: String,
+        /// The model that requested this function call.
+        model: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -1266,6 +1294,26 @@ pub enum ConversationItem {
         arguments: String,
         model: String,
     },
+    /// Function call requiring client execution
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        id: String,
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        created_at: i64,
+        /// The LLM's tool_call_id for correlation
+        call_id: String,
+        /// Function name
+        name: String,
+        /// JSON-encoded arguments
+        arguments: String,
+        /// Status: "in_progress" when pending client execution
+        status: String,
+        model: String,
+    },
 }
 
 impl ConversationItem {
@@ -1279,6 +1327,7 @@ impl ConversationItem {
             ConversationItem::McpListTools { id, .. } => id,
             ConversationItem::McpCall { id, .. } => id,
             ConversationItem::McpApprovalRequest { id, .. } => id,
+            ConversationItem::FunctionCall { id, .. } => id,
         }
     }
 

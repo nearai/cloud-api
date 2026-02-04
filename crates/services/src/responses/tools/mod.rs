@@ -1,6 +1,7 @@
 pub mod brave;
 pub mod executor;
 pub mod file_search;
+pub mod function;
 pub mod mcp;
 pub mod ports;
 pub mod tool_config;
@@ -8,9 +9,12 @@ pub mod web_search;
 
 // Executor framework
 pub use executor::{
-    ToolEventContext, ToolExecutionContext, ToolExecutionResult, ToolExecutor, ToolOutput,
-    ToolRegistry, MAX_CONSECUTIVE_TOOL_FAILURES,
+    FunctionCallInfo, ToolEventContext, ToolExecutionContext, ToolExecutionResult, ToolExecutor,
+    ToolOutput, ToolRegistry, MAX_CONSECUTIVE_TOOL_FAILURES,
 };
+
+// Function tools
+pub use function::FunctionToolExecutor;
 
 // Tool configuration helpers
 pub use tool_config::{

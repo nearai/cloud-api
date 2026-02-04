@@ -1312,6 +1312,29 @@ fn convert_output_item_to_conversation_item(
             arguments,
             model,
         },
+        ResponseOutputItem::FunctionCall {
+            id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
+            call_id,
+            name,
+            arguments,
+            status,
+            model,
+        } => ConversationItem::FunctionCall {
+            id,
+            response_id,
+            previous_response_id,
+            next_response_ids,
+            created_at,
+            call_id,
+            name,
+            arguments,
+            status,
+            model,
+        },
     }
 }
 
@@ -1409,6 +1432,7 @@ fn get_item_id(item: &ConversationItem) -> String {
         ConversationItem::McpListTools { id, .. } => id.clone(),
         ConversationItem::McpCall { id, .. } => id.clone(),
         ConversationItem::McpApprovalRequest { id, .. } => id.clone(),
+        ConversationItem::FunctionCall { id, .. } => id.clone(),
     }
 }
 

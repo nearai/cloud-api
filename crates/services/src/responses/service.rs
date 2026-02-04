@@ -22,6 +22,8 @@ enum AgentLoopResult {
     Completed,
     /// Agent loop paused due to MCP approval required
     ApprovalRequired,
+    /// Agent loop paused due to external function calls requiring client execution
+    FunctionCallsRequired(Vec<tools::FunctionCallInfo>),
 }
 
 /// Context for processing a response stream
@@ -895,6 +897,20 @@ impl ResponseServiceImpl {
             messages.extend(mcp_setup.approval_messages);
         }
 
+        // Set up Function tools: register executor and process any function call outputs
+        let function_executor = tools::FunctionToolExecutor::new(&context.request);
+        if !function_executor.is_empty() {
+            context.tool_registry.register(Arc::new(function_executor));
+        }
+
+        // Process function call outputs from input (client-provided results)
+        let function_output_messages = Self::process_function_call_outputs(
+            &context.request,
+            &context.response_items_repository,
+        )
+        .await?;
+        messages.extend(function_output_messages);
+
         let max_iterations = 10; // Prevent infinite loops
         let mut iteration = 0;
         let mut final_response_text = String::new();
@@ -921,6 +937,12 @@ impl ResponseServiceImpl {
                 models::ResponseStatus::Incomplete,
                 Some(models::ResponseIncompleteDetails {
                     reason: "mcp_approval_required".to_string(),
+                }),
+            ),
+            Ok(AgentLoopResult::FunctionCallsRequired(_)) => (
+                models::ResponseStatus::Incomplete,
+                Some(models::ResponseIncompleteDetails {
+                    reason: "function_call_required".to_string(),
                 }),
             ),
             Err(ref e) => {
@@ -1211,7 +1233,10 @@ impl ResponseServiceImpl {
             tracing::debug!("Executing {} tool calls", stream_result.tool_calls.len());
 
             // Execute each tool call, collecting any deferred instructions
+            // Also track pending function calls for batching
             let mut deferred_instructions: Vec<String> = Vec::new();
+            let mut pending_function_calls: Vec<tools::FunctionCallInfo> = Vec::new();
+
             for tool_call in stream_result.tool_calls {
                 match Self::execute_and_emit_tool_call(
                     ctx,
@@ -1238,7 +1263,27 @@ impl ResponseServiceImpl {
                         }
                         return Ok(AgentLoopResult::ApprovalRequired);
                     }
+                    tools::ToolExecutionResult::FunctionCallPending(info) => {
+                        // Collect pending function calls for batching
+                        pending_function_calls.push(info);
+                    }
                 }
+            }
+
+            // If there are pending function calls, return them all at once
+            // This supports parallel tool calls - we batch all function calls before pausing
+            if !pending_function_calls.is_empty() {
+                if !deferred_instructions.is_empty() {
+                    messages.push(CompletionMessage {
+                        role: "system".to_string(),
+                        content: std::mem::take(&mut deferred_instructions).join("\n\n"),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    });
+                }
+                return Ok(AgentLoopResult::FunctionCallsRequired(
+                    pending_function_calls,
+                ));
             }
 
             // Add deferred instructions AFTER all tool results (combined into one system message)
@@ -1323,6 +1368,24 @@ impl ResponseServiceImpl {
             Ok(output) => Some(output),
 
             Err(e) => {
+                // Check if this is a function call that needs client execution
+                let is_function_call =
+                    matches!(&e, errors::ResponseError::FunctionCallRequired { .. });
+                let function_call_info =
+                    if let errors::ResponseError::FunctionCallRequired { name, call_id } = &e {
+                        Some(tools::FunctionCallInfo {
+                            call_id: call_id.clone(),
+                            name: name.clone(),
+                            arguments: tool_call
+                                .params
+                                .as_ref()
+                                .map(|p| serde_json::to_string(p).unwrap_or_default())
+                                .unwrap_or_default(),
+                        })
+                    } else {
+                        None
+                    };
+
                 // Delegate error handling to the executor (e.g., MCP approval flow)
                 let mut event_ctx = tools::ToolEventContext {
                     stream_ctx: ctx,
@@ -1338,8 +1401,14 @@ impl ResponseServiceImpl {
                 {
                     Some(output) => Some(output),
                     None => {
-                        // None means special control flow (e.g., approval required)
-                        // The executor has already emitted appropriate events
+                        // None means special control flow
+                        // For function calls, return FunctionCallPending so we can batch them
+                        // For MCP approval, return ApprovalRequired
+                        if is_function_call {
+                            return Ok(tools::ToolExecutionResult::FunctionCallPending(
+                                function_call_info.expect("function_call_info should be set"),
+                            ));
+                        }
                         return Ok(tools::ToolExecutionResult::ApprovalRequired);
                     }
                 }
@@ -1423,6 +1492,99 @@ impl ResponseServiceImpl {
         Ok(tools::ToolExecutionResult::Success)
     }
 
+    /// Process function call outputs from the request input.
+    ///
+    /// When resuming a response after function calls, the client provides
+    /// FunctionCallOutput items with the results. This function:
+    /// 1. Extracts FunctionCallOutput items from the request input
+    /// 2. Fetches the stored FunctionCall items by call_id
+    /// 3. Creates tool result messages for the conversation context
+    ///
+    /// Returns messages to add to the conversation context.
+    async fn process_function_call_outputs(
+        request: &models::CreateResponseRequest,
+        response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
+    ) -> Result<Vec<crate::completions::ports::CompletionMessage>, errors::ResponseError> {
+        use crate::completions::ports::CompletionMessage;
+
+        let mut messages = Vec::new();
+
+        // Extract function call outputs from input
+        let function_outputs: Vec<_> = match &request.input {
+            Some(models::ResponseInput::Items(items)) => items
+                .iter()
+                .filter_map(|item| item.as_function_call_output())
+                .collect(),
+            _ => return Ok(messages),
+        };
+
+        if function_outputs.is_empty() {
+            return Ok(messages);
+        }
+
+        // Process each function call output
+        for (call_id, output) in function_outputs {
+            // Look up the FunctionCall item by call_id to verify it exists
+            // The call_id is the LLM's tool_call_id (e.g., "call_xxx")
+            // We need to find the FunctionCall item that has this call_id
+
+            // For now, we trust the client-provided call_id and create the tool result
+            // In a more robust implementation, we could look up the FunctionCall item
+            // to verify the call_id and get additional context
+
+            // Optionally verify the function call exists in previous response
+            if let Some(prev_response_id) = &request.previous_response_id {
+                // Parse the response ID
+                let uuid_str = prev_response_id
+                    .strip_prefix(crate::id_prefixes::PREFIX_RESP)
+                    .unwrap_or(prev_response_id);
+
+                if let Ok(uuid) = uuid::Uuid::parse_str(uuid_str) {
+                    let response_id = models::ResponseId(uuid);
+
+                    // List all items from the previous response
+                    let items = response_items_repository
+                        .list_by_response(response_id)
+                        .await
+                        .map_err(|e| {
+                            errors::ResponseError::InternalError(format!(
+                                "Failed to fetch response items: {e}"
+                            ))
+                        })?;
+
+                    // Find the matching FunctionCall item
+                    let found = items.iter().any(|item| {
+                        matches!(item, models::ResponseOutputItem::FunctionCall {
+                            call_id: item_call_id,
+                            ..
+                        } if item_call_id == call_id)
+                    });
+
+                    if !found {
+                        return Err(errors::ResponseError::FunctionCallNotFound(
+                            call_id.to_string(),
+                        ));
+                    }
+                }
+            }
+
+            // Create tool result message with the function output
+            messages.push(CompletionMessage {
+                role: "tool".to_string(),
+                content: output.to_string(),
+                tool_call_id: Some(call_id.to_string()),
+                tool_calls: None,
+            });
+        }
+
+        tracing::debug!(
+            "Processed {} function call outputs into tool result messages",
+            messages.len()
+        );
+
+        Ok(messages)
+    }
+
     /// Store user input messages as response_items
     async fn store_input_as_response_items(
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
@@ -1477,6 +1639,10 @@ impl ResponseServiceImpl {
                             continue;
                         }
                         models::ResponseInputItem::McpListTools { .. } => {
+                            continue;
+                        }
+                        models::ResponseInputItem::FunctionCallOutput { .. } => {
+                            // Function call outputs are processed separately
                             continue;
                         }
                     };
@@ -1771,6 +1937,10 @@ impl ResponseServiceImpl {
                                 continue;
                             }
                             models::ResponseInputItem::McpListTools { .. } => {
+                                continue;
+                            }
+                            models::ResponseInputItem::FunctionCallOutput { .. } => {
+                                // Function call outputs are processed separately
                                 continue;
                             }
                         };

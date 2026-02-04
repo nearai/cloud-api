@@ -1,7 +1,7 @@
 // Test utilities for services crate
 use crate::{
     attestation::{
-        models::{AttestationReport, ChatSignature},
+        models::{AttestationReport, SignatureLookupResult},
         ports::AttestationServiceTrait,
         AttestationError,
     },
@@ -21,7 +21,7 @@ impl AttestationServiceTrait for MockAttestationService {
         &self,
         _chat_id: &str,
         _signing_algo: Option<String>,
-    ) -> Result<ChatSignature, AttestationError> {
+    ) -> Result<SignatureLookupResult, AttestationError> {
         Err(AttestationError::InternalError(
             "Not implemented".to_string(),
         ))

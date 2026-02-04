@@ -184,19 +184,19 @@ pub struct ImageGenerationRequest {
     pub model: String,
     /// Text prompt describing the image to generate
     pub prompt: String,
-    /// Number of images to generate (default: 1)
+    /// Number of images to generate (1-10, default: 1)
     #[serde(default = "default_n_images")]
     pub n: Option<i32>,
-    /// Size of the generated images (e.g., "1024x1024", "512x512")
+    /// Size of the generated images in WxH format (e.g., "1024x1024", "512x512")
     #[serde(default)]
     pub size: Option<String>,
-    /// Response format: "url" or "b64_json"
+    /// Response format: "b64_json" or "url" (only "b64_json" is supported for verifiable models)
     #[serde(default)]
     pub response_format: Option<String>,
-    /// Quality of the generated image: "standard" or "hd"
+    /// Quality of the generated image: "standard" or "hd" ("quality" parameter is not supported for verifiable models)
     #[serde(default)]
     pub quality: Option<String>,
-    /// Style of the generated image: "vivid" or "natural"
+    /// Style of the generated image: "vivid" or "natural" ("style" parameter is not supported for verifiable models)
     #[serde(default)]
     pub style: Option<String>,
 }
@@ -228,14 +228,21 @@ impl ImageGenerationRequest {
             }
         }
 
-        // Validate size format if provided (should be "WxH")
+        // Validate size format if provided (should be "WxH" with numeric values)
+        // Dimension validation is delegated to the inference provider
         if let Some(ref size) = self.size {
             let parts: Vec<&str> = size.split('x').collect();
             if parts.len() != 2 {
                 return Err("size must be in format 'WIDTHxHEIGHT' (e.g., '1024x1024')".to_string());
             }
-            for part in parts {
-                if part.parse::<u32>().is_err() {
+            // Validate that both parts are numeric and greater than zero
+            match (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                (Ok(w), Ok(h)) => {
+                    if w == 0 || h == 0 {
+                        return Err("size dimensions must be greater than zero".to_string());
+                    }
+                }
+                _ => {
                     return Err(
                         "size must be in format 'WIDTHxHEIGHT' with numeric values".to_string()
                     );
@@ -261,6 +268,97 @@ impl ImageGenerationRequest {
         if let Some(ref style) = self.style {
             if style != "vivid" && style != "natural" {
                 return Err("style must be 'vivid' or 'natural'".to_string());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Request for image editing (internal - uses multipart form data)
+#[derive(Debug, Clone)]
+pub struct ImageEditRequest {
+    /// Model ID to use for editing
+    pub model: String,
+    /// Text prompt describing the edits to make
+    pub prompt: String,
+    /// Image bytes to edit (raw PNG/JPEG data)
+    pub image: Vec<u8>,
+    /// Size of the generated images in WxH format (e.g., "1024x1024", "512x512")
+    pub size: Option<String>,
+    /// Response format: "b64_json" or "url" (only "b64_json" is supported for verifiable models)
+    pub response_format: Option<String>,
+}
+
+/// Schema for image edit request documentation in OpenAPI
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImageEditRequestSchema {
+    /// Image file to edit (file upload)
+    #[schema(format = Binary)]
+    pub image: String,
+    /// Model ID to use for editing (e.g., "Qwen/Qwen-Image-2512")
+    pub model: String,
+    /// Text prompt describing the edits to make
+    pub prompt: String,
+    /// Image size in WxH format (e.g., "512x512")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// Response format ("b64_json" or "url")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+}
+
+impl ImageEditRequest {
+    /// Validate the image edit request
+    pub fn validate(&self) -> Result<(), String> {
+        // Model is required and must not be empty
+        if self.model.trim().is_empty() {
+            return Err("model is required".to_string());
+        }
+
+        // Prompt is required and must not be empty
+        if self.prompt.trim().is_empty() {
+            return Err("prompt is required".to_string());
+        }
+
+        // Image is required
+        if self.image.is_empty() {
+            return Err("image is required".to_string());
+        }
+
+        // Validate image is PNG or JPEG (magic bytes)
+        let is_png = self.image.len() >= 4 && &self.image[0..4] == b"\x89PNG";
+        let is_jpeg = self.image.len() >= 3 && &self.image[0..3] == b"\xFF\xD8\xFF";
+        if !is_png && !is_jpeg {
+            return Err("image must be a valid PNG or JPEG file".to_string());
+        }
+
+        // Validate size format if provided (should be "WxH" with numeric values)
+        // Dimension validation is delegated to the inference provider
+        if let Some(ref size) = self.size {
+            let parts: Vec<&str> = size.split('x').collect();
+            if parts.len() != 2 {
+                return Err("size must be in format 'WIDTHxHEIGHT' (e.g., '1024x1024')".to_string());
+            }
+            // Validate that both parts are numeric and greater than zero
+            match (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                (Ok(w), Ok(h)) => {
+                    if w == 0 || h == 0 {
+                        return Err("size dimensions must be greater than zero".to_string());
+                    }
+                }
+                _ => {
+                    return Err(
+                        "size must be in format 'WIDTHxHEIGHT' with numeric values".to_string()
+                    );
+                }
+            }
+        }
+
+        // Validate response_format if provided
+        if let Some(ref format) = self.response_format {
+            if format != "url" && format != "b64_json" {
+                return Err("response_format must be 'url' or 'b64_json'".to_string());
             }
         }
 
@@ -319,6 +417,9 @@ pub struct ModelInfo {
     /// Context length in tokens
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<i32>,
+    /// Model architecture (input/output modalities)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<ModelArchitecture>,
 }
 
 #[derive(Debug, Serialize)]
@@ -583,6 +684,8 @@ pub enum ResponseInput {
 pub struct ResponseInputItem {
     pub role: String,
     pub content: ResponseContent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Content can be text or array of content parts
@@ -2026,6 +2129,31 @@ pub struct DecimalPrice {
     pub currency: String,
 }
 
+/// Model architecture describing input/output modalities
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelArchitecture {
+    /// Input modalities the model accepts, e.g., ["text"], ["text", "image"]
+    #[serde(rename = "inputModalities")]
+    pub input_modalities: Vec<String>,
+    /// Output modalities the model produces, e.g., ["text"], ["image"]
+    #[serde(rename = "outputModalities")]
+    pub output_modalities: Vec<String>,
+}
+
+impl ModelArchitecture {
+    /// Create ModelArchitecture from optional modalities.
+    /// Returns Some only if both input and output modalities are present.
+    pub fn from_options(input: Option<Vec<String>>, output: Option<Vec<String>>) -> Option<Self> {
+        match (input, output) {
+            (Some(input_modalities), Some(output_modalities)) => Some(Self {
+                input_modalities,
+                output_modalities,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Model metadata
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelMetadata {
@@ -2053,6 +2181,10 @@ pub struct ModelMetadata {
     /// Whether this model supports TEE attestation
     #[serde(rename = "attestationSupported")]
     pub attestation_supported: bool,
+
+    /// Model architecture (input/output modalities)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<ModelArchitecture>,
 }
 
 /// Request to update model pricing (admin endpoint)
@@ -2090,6 +2222,12 @@ pub struct UpdateModelApiRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub attestation_supported: Option<bool>,
+    /// Input modalities the model accepts, e.g., ["text"], ["text", "image"]
+    #[serde(rename = "inputModalities", skip_serializing_if = "Option::is_none")]
+    pub input_modalities: Option<Vec<String>>,
+    /// Output modalities the model produces, e.g., ["text"], ["image"]
+    #[serde(rename = "outputModalities", skip_serializing_if = "Option::is_none")]
+    pub output_modalities: Option<Vec<String>>,
     #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
     pub change_reason: Option<String>,
 }
@@ -2143,6 +2281,12 @@ pub struct ModelHistoryEntry {
     pub change_reason: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
+    /// Input modalities the model accepts, e.g., ["text"], ["text", "image"]
+    #[serde(rename = "inputModalities", skip_serializing_if = "Option::is_none")]
+    pub input_modalities: Option<Vec<String>>,
+    /// Output modalities the model produces, e.g., ["text"], ["image"]
+    #[serde(rename = "outputModalities", skip_serializing_if = "Option::is_none")]
+    pub output_modalities: Option<Vec<String>>,
 }
 
 /// Model history response - complete history of model changes
@@ -2160,9 +2304,44 @@ pub struct ModelHistoryResponse {
 // Organization Limits API Models (Admin)
 // ============================================
 
+/// Credit type for organization limits
+/// - grant: Free credits provided by the platform
+/// - payment: Credits purchased by the organization
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CreditType {
+    #[serde(alias = "GRANT")]
+    Grant,
+    #[serde(alias = "PAYMENT")]
+    Payment,
+}
+
+impl std::fmt::Display for CreditType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CreditType::Grant => write!(f, "grant"),
+            CreditType::Payment => write!(f, "payment"),
+        }
+    }
+}
+
+impl CreditType {
+    /// Convert to string representation
+    pub fn as_str(&self) -> &str {
+        match self {
+            CreditType::Grant => "grant",
+            CreditType::Payment => "payment",
+        }
+    }
+}
+
 /// Request to update organization limits (Admin only)
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateOrganizationLimitsRequest {
+    #[serde(rename = "type")]
+    pub credit_type: CreditType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(rename = "spendLimit")]
     pub spend_limit: SpendLimitRequest,
     #[serde(rename = "changedBy", skip_serializing_if = "Option::is_none")]
@@ -2206,6 +2385,10 @@ pub struct SpendLimit {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateOrganizationLimitsResponse {
     pub organization_id: String,
+    #[serde(rename = "type")]
+    pub credit_type: CreditType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(rename = "spendLimit")]
     pub spend_limit: SpendLimit,
     pub updated_at: String,
@@ -2217,6 +2400,10 @@ pub struct OrgLimitsHistoryEntry {
     pub id: String,
     #[serde(rename = "organizationId")]
     pub organization_id: String,
+    #[serde(rename = "type")]
+    pub credit_type: CreditType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(rename = "spendLimit")]
     pub spend_limit: SpendLimit,
     #[serde(rename = "effectiveFrom")]

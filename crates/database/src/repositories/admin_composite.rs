@@ -58,6 +58,8 @@ impl AdminRepository for AdminCompositeRepository {
             provider_type: request.provider_type,
             provider_config: request.provider_config,
             attestation_supported: request.attestation_supported,
+            input_modalities: request.input_modalities,
+            output_modalities: request.output_modalities,
             change_reason: request.change_reason,
             changed_by_user_id: request.changed_by_user_id,
             changed_by_user_email: request.changed_by_user_email,
@@ -90,6 +92,8 @@ impl AdminRepository for AdminCompositeRepository {
             provider_type: model.provider_type,
             provider_config: model.provider_config,
             attestation_supported: model.attestation_supported,
+            input_modalities: model.input_modalities,
+            output_modalities: model.output_modalities,
         })
     }
 
@@ -125,6 +129,8 @@ impl AdminRepository for AdminCompositeRepository {
                 verifiable: h.verifiable,
                 is_active: h.is_active,
                 owned_by: h.owned_by,
+                input_modalities: h.input_modalities,
+                output_modalities: h.output_modalities,
                 effective_from: h.effective_from,
                 effective_until: h.effective_until,
                 changed_by_user_id: h.changed_by_user_id,
@@ -161,6 +167,9 @@ impl AdminRepository for AdminCompositeRepository {
     ) -> Result<OrganizationLimits> {
         let db_request = UpdateOrganizationLimitsDbRequest {
             spend_limit: limits.spend_limit,
+            credit_type: limits.credit_type,
+            source: limits.source,
+            currency: limits.currency,
             changed_by: limits.changed_by,
             change_reason: limits.change_reason,
             changed_by_user_id: limits.changed_by_user_id,
@@ -175,6 +184,9 @@ impl AdminRepository for AdminCompositeRepository {
         Ok(OrganizationLimits {
             organization_id: history.organization_id,
             spend_limit: history.spend_limit,
+            credit_type: history.credit_type,
+            source: history.source,
+            currency: history.currency,
             effective_from: history.effective_from,
         })
     }
@@ -182,14 +194,20 @@ impl AdminRepository for AdminCompositeRepository {
     async fn get_current_organization_limits(
         &self,
         organization_id: Uuid,
-    ) -> Result<Option<OrganizationLimits>> {
-        let limits_opt = self.limits_repo.get_current_limits(organization_id).await?;
+    ) -> Result<Vec<OrganizationLimits>> {
+        let limits = self.limits_repo.get_current_limits(organization_id).await?;
 
-        Ok(limits_opt.map(|h| OrganizationLimits {
-            organization_id: h.organization_id,
-            spend_limit: h.spend_limit,
-            effective_from: h.effective_from,
-        }))
+        Ok(limits
+            .into_iter()
+            .map(|h| OrganizationLimits {
+                organization_id: h.organization_id,
+                spend_limit: h.spend_limit,
+                credit_type: h.credit_type,
+                source: h.source,
+                currency: h.currency,
+                effective_from: h.effective_from,
+            })
+            .collect())
     }
 
     async fn count_organization_limits_history(&self, organization_id: Uuid) -> Result<i64> {
@@ -213,6 +231,9 @@ impl AdminRepository for AdminCompositeRepository {
                 id: h.id,
                 organization_id: h.organization_id,
                 spend_limit: h.spend_limit,
+                credit_type: h.credit_type,
+                source: h.source,
+                currency: h.currency,
                 effective_from: h.effective_from,
                 effective_until: h.effective_until,
                 changed_by: h.changed_by,
@@ -314,6 +335,8 @@ impl AdminRepository for AdminCompositeRepository {
                 provider_type: m.provider_type,
                 provider_config: m.provider_config,
                 attestation_supported: m.attestation_supported,
+                input_modalities: m.input_modalities,
+                output_modalities: m.output_modalities,
             })
             .collect();
 

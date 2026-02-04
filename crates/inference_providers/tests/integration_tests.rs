@@ -703,6 +703,7 @@ async fn test_image_generation_real() {
         response_format: Some("b64_json".to_string()),
         quality: None,
         style: None,
+        extra: std::collections::HashMap::new(),
     };
 
     println!("Starting image generation request...");
@@ -765,6 +766,7 @@ async fn test_image_generation_mock() {
         response_format: Some("b64_json".to_string()),
         quality: None,
         style: None,
+        extra: std::collections::HashMap::new(),
     };
 
     let result = provider

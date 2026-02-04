@@ -116,6 +116,7 @@ impl McpClient for RealMcpClient {
         let request = CallToolRequestParam {
             name: tool_name.to_string().into(),
             arguments: args,
+            task: None,
         };
 
         let client = self.client.lock().await;
@@ -925,6 +926,8 @@ pub async fn process_approval_responses(
             messages.push(crate::completions::ports::CompletionMessage {
                 role: "tool".to_string(),
                 content: result_message,
+                tool_call_id: None, // MCP approval responses don't have a tool_call_id
+                tool_calls: None,
             });
         }
     }

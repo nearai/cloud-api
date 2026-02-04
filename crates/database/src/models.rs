@@ -421,6 +421,12 @@ pub struct Model {
     /// Whether this model supports TEE attestation
     pub attestation_supported: bool,
 
+    // Architecture/modalities (nullable until all models are populated)
+    /// Input modalities the model accepts, e.g., ["text"], ["text", "image"]
+    pub input_modalities: Option<Vec<String>>,
+    /// Output modalities the model produces, e.g., ["text"], ["image"]
+    pub output_modalities: Option<Vec<String>>,
+
     // Tracking fields
     pub is_active: bool,
     pub owned_by: String,
@@ -447,6 +453,9 @@ pub struct UpdateModelPricingRequest {
     pub provider_type: Option<String>,
     pub provider_config: Option<serde_json::Value>,
     pub attestation_supported: Option<bool>,
+    // Architecture/modalities
+    pub input_modalities: Option<Vec<String>>,
+    pub output_modalities: Option<Vec<String>>,
     // User audit tracking for history
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<Uuid>,
@@ -480,6 +489,10 @@ pub struct ModelHistory {
     pub provider_config: Option<serde_json::Value>,
     pub attestation_supported: Option<bool>,
 
+    // Architecture/modalities snapshot
+    pub input_modalities: Option<Vec<String>>,
+    pub output_modalities: Option<Vec<String>>,
+
     // Temporal fields
     pub effective_from: DateTime<Utc>,
     pub effective_until: Option<DateTime<Utc>>,
@@ -509,14 +522,18 @@ pub struct ModelAlias {
 // ============================================
 
 /// Organization limits history - stores historical spending limit data for organizations
-/// All amounts use fixed scale of 9 (nano-dollars) and USD currency
+/// All amounts use fixed scale of 9 (nano-dollars)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrganizationLimitsHistory {
     pub id: Uuid,
     pub organization_id: Uuid,
 
-    // Spend limit (fixed scale 9 = nano-dollars, USD only)
+    // Spend limit (fixed scale 9 = nano-dollars)
     pub spend_limit: i64,
+
+    pub credit_type: String,
+    pub source: Option<String>,
+    pub currency: String,
 
     // Temporal fields
     pub effective_from: DateTime<Utc>,
@@ -531,10 +548,13 @@ pub struct OrganizationLimitsHistory {
 }
 
 /// Request to update organization limits
-/// All amounts use fixed scale of 9 (nano-dollars) and USD currency
+/// All amounts use fixed scale of 9 (nano-dollars)
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateOrganizationLimitsDbRequest {
     pub spend_limit: i64,
+    pub credit_type: String,
+    pub source: Option<String>,
+    pub currency: String,
     pub changed_by: Option<String>,
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<Uuid>, // The authenticated user ID who made the change

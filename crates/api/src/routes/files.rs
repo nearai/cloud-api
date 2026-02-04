@@ -46,93 +46,110 @@ pub async fn upload_file(
     let mut expires_after_seconds: Option<i64> = None;
 
     // Parse multipart form data
-    while let Ok(Some(field)) = multipart.next_field().await {
-        let field_name = field.name().unwrap_or("").to_string();
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(field)) => {
+                let field_name = field.name().unwrap_or("").to_string();
 
-        match field_name.as_str() {
-            "file" => {
-                filename = field.file_name().map(|s| s.to_string());
-                content_type = field.content_type().map(|s| s.to_string());
+                match field_name.as_str() {
+                    "file" => {
+                        filename = field.file_name().map(|s| s.to_string());
+                        content_type = field.content_type().map(|s| s.to_string());
 
-                // Read file data (size limit enforced by DefaultBodyLimit layer at framework level)
-                let data = field.bytes().await.map_err(|e| {
-                    tracing::warn!("Failed to read file data: {}", e);
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse::new(
-                            format!("Failed to read file data: {e}"),
-                            "invalid_request_error".to_string(),
-                        )),
-                    )
-                })?;
+                        // Read file data (size limit enforced by DefaultBodyLimit layer at framework level)
+                        let data = field.bytes().await.map_err(|e| {
+                            tracing::warn!("Failed to read file data: {}", e);
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse::new(
+                                    format!("Failed to read file data: {e}"),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                        })?;
 
-                // Defense-in-depth: verify size (should already be caught by DefaultBodyLimit layer)
-                if data.len() > MAX_FILE_SIZE {
-                    return Err((
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        Json(ErrorResponse::new(
-                            format!(
-                                "File too large: {} bytes (max: {} bytes)",
-                                data.len(),
-                                MAX_FILE_SIZE
-                            ),
-                            "invalid_request_error".to_string(),
-                        )),
-                    ));
+                        // Defense-in-depth: verify size (should already be caught by DefaultBodyLimit layer)
+                        if data.len() > MAX_FILE_SIZE {
+                            return Err((
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                Json(ErrorResponse::new(
+                                    format!(
+                                        "File too large: {} bytes (max: {} bytes)",
+                                        data.len(),
+                                        MAX_FILE_SIZE
+                                    ),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            ));
+                        }
+
+                        file_data = Some(data.to_vec());
+                    }
+                    "purpose" => {
+                        let text = field.text().await.map_err(|e| {
+                            tracing::warn!("Failed to read purpose: {}", e);
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse::new(
+                                    format!("Failed to read purpose: {e}"),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                        })?;
+                        purpose = Some(text);
+                    }
+                    "expires_after[anchor]" => {
+                        let text = field.text().await.map_err(|e| {
+                            tracing::warn!("Failed to read expires_after[anchor]: {}", e);
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse::new(
+                                    format!("Failed to read expires_after[anchor]: {e}"),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                        })?;
+                        expires_after_anchor = Some(text);
+                    }
+                    "expires_after[seconds]" => {
+                        let text = field.text().await.map_err(|e| {
+                            tracing::warn!("Failed to read expires_after[seconds]: {}", e);
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse::new(
+                                    format!("Failed to read expires_after[seconds]: {e}"),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                        })?;
+                        expires_after_seconds = Some(text.parse::<i64>().map_err(|e| {
+                            tracing::warn!("Failed to parse expires_after[seconds]: {}", e);
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse::new(
+                                    "Invalid expires_after[seconds]: must be an integer"
+                                        .to_string(),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                        })?);
+                    }
+                    _ => {
+                        debug!("Ignoring unknown field: {}", field_name);
+                    }
                 }
-
-                file_data = Some(data.to_vec());
             }
-            "purpose" => {
-                let text = field.text().await.map_err(|e| {
-                    tracing::warn!("Failed to read purpose: {}", e);
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse::new(
-                            format!("Failed to read purpose: {e}"),
-                            "invalid_request_error".to_string(),
-                        )),
-                    )
-                })?;
-                purpose = Some(text);
-            }
-            "expires_after[anchor]" => {
-                let text = field.text().await.map_err(|e| {
-                    tracing::warn!("Failed to read expires_after[anchor]: {}", e);
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse::new(
-                            format!("Failed to read expires_after[anchor]: {e}"),
-                            "invalid_request_error".to_string(),
-                        )),
-                    )
-                })?;
-                expires_after_anchor = Some(text);
-            }
-            "expires_after[seconds]" => {
-                let text = field.text().await.map_err(|e| {
-                    tracing::warn!("Failed to read expires_after[seconds]: {}", e);
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse::new(
-                            format!("Failed to read expires_after[seconds]: {e}"),
-                            "invalid_request_error".to_string(),
-                        )),
-                    )
-                })?;
-                expires_after_seconds = Some(text.parse::<i64>().map_err(|e| {
-                    tracing::warn!("Failed to parse expires_after[seconds]: {}", e);
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse::new(
-                            "Invalid expires_after[seconds]: must be an integer".to_string(),
-                            "invalid_request_error".to_string(),
-                        )),
-                    )
-                })?);
-            }
-            _ => {
-                debug!("Ignoring unknown field: {}", field_name);
+            Ok(None) => break, // All fields read successfully
+            Err(e) => {
+                // Multipart parsing error (malformed boundary, invalid encoding, etc.)
+                tracing::debug!(error = %e, "Multipart parsing error");
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(
+                        "Invalid multipart form data".to_string(),
+                        "invalid_request_error".to_string(),
+                    )),
+                ));
             }
         }
     }

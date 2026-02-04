@@ -1083,6 +1083,7 @@ impl ResponseServiceImpl {
                         url: None,
                     }],
                     model: context.request.model.clone(),
+                    metadata: None,
                 };
 
                 // Emit streaming event for image creation

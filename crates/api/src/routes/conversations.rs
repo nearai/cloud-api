@@ -1034,7 +1034,7 @@ fn convert_input_item_to_response_item(
             role,
             content,
             model,
-            ..
+            metadata,
         } => {
             // Convert ConversationContent to ResponseContentItem
             let response_content = match content {
@@ -1090,6 +1090,7 @@ fn convert_input_item_to_response_item(
                 role,
                 content: response_content,
                 model: model.unwrap_or_default(), // Will be enriched by repository if empty
+                metadata,
             })
         }
     }
@@ -1111,6 +1112,7 @@ fn convert_output_item_to_conversation_item(
             role,
             content,
             model,
+            metadata,
         } => {
             // Convert ResponseContentItem to ConversationContentPart
             // For user messages, preserve input types; for assistant/system, use output_text
@@ -1172,7 +1174,7 @@ fn convert_output_item_to_conversation_item(
                 status: convert_response_item_status(status),
                 role,
                 content: conv_content,
-                metadata: None,
+                metadata,
                 model,
             }
         }

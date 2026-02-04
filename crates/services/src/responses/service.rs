@@ -980,52 +980,12 @@ impl ResponseServiceImpl {
             errors::ResponseError::InternalError(format!("Failed to serialize usage: {e}"))
         })?;
 
-        let is_initial_failure = agent_loop_result.is_err()
-            && final_response.output.is_empty()
-            && final_response.usage.total_tokens == 0;
-
-        // Update the response in the database with usage, status, and output message
-        // Skip for initial failure: we will perform a single update to Failed below
-        if !is_initial_failure {
-            if let Err(e) = context
-                .response_repository
-                .update(
-                    ctx.response_id.clone(),
-                    workspace_id_domain.clone(),
-                    Some(final_response_text.clone()),
-                    final_response.status.clone(),
-                    Some(usage_json),
-                )
-                .await
+        // Initial failure: agent loop failed with no output/usage → create failed item, update status, return Err (client gets response.failed).
+        // Otherwise (Ok or Err with partial output): update DB with final response, then emit response.completed.
+        match agent_loop_result {
+            Err(e)
+                if final_response.output.is_empty() && final_response.usage.total_tokens == 0 =>
             {
-                tracing::warn!("Failed to update response with usage: {}", e);
-                // Continue even if update fails - the response was already created
-            }
-        }
-
-        // Wait for title generation with a timeout (2 seconds)
-        // This ensures the title event is sent before response.completed
-        if let Some(handle) = title_task_handle {
-            match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await {
-                Ok(Ok(Ok(()))) => {
-                    tracing::debug!("Title generation completed before response");
-                }
-                Ok(Ok(Err(e))) => {
-                    tracing::warn!("Title generation failed: {:?}", e);
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("Title generation task panicked: {:?}", e);
-                }
-                Err(_) => {
-                    tracing::debug!("Title generation timed out, continuing with response");
-                }
-            }
-        }
-
-        // When the agent loop failed and we have no output/usage, create a failed response item, update status, then send response.failed
-        // (e.g. completion service error, model unavailable, vLLM unreachable)
-        if let Err(e) = agent_loop_result {
-            if is_initial_failure {
                 let failed_item = models::ResponseOutputItem::Message {
                     id: format!("msg_{}", Uuid::new_v4().simple()),
                     response_id: ctx.response_id_str.clone(),
@@ -1063,6 +1023,40 @@ impl ResponseServiceImpl {
                     tracing::warn!("Failed to update response status to failed: {}", update_err);
                 }
                 return Err(e);
+            }
+            _ => {
+                if let Err(e) = context
+                    .response_repository
+                    .update(
+                        ctx.response_id.clone(),
+                        workspace_id_domain.clone(),
+                        Some(final_response_text.clone()),
+                        final_response.status.clone(),
+                        Some(usage_json),
+                    )
+                    .await
+                {
+                    tracing::warn!("Failed to update response with usage: {}", e);
+                }
+            }
+        }
+
+        // Wait for title generation with a timeout (2 seconds)
+        // This ensures the title event is sent before response.completed
+        if let Some(handle) = title_task_handle {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await {
+                Ok(Ok(Ok(()))) => {
+                    tracing::debug!("Title generation completed before response");
+                }
+                Ok(Ok(Err(e))) => {
+                    tracing::warn!("Title generation failed: {:?}", e);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Title generation task panicked: {:?}", e);
+                }
+                Err(_) => {
+                    tracing::debug!("Title generation timed out, continuing with response");
+                }
             }
         }
 

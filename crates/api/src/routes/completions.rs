@@ -121,6 +121,7 @@ fn convert_chat_request_to_service(
                 content: extract_text_from_content(&msg.content),
                 tool_call_id: None,
                 tool_calls: None,
+                multimodal_content: None,
             })
             .collect(),
         max_tokens: request.max_tokens,
@@ -157,6 +158,7 @@ fn convert_text_request_to_service(
             content: request.prompt.clone(),
             tool_call_id: None,
             tool_calls: None,
+            multimodal_content: None,
         }],
         max_tokens: request.max_tokens,
         temperature: request.temperature,

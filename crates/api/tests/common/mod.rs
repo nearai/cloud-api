@@ -753,7 +753,7 @@ pub async fn setup_qwen_omni_model(server: &axum_test::TestServer) -> String {
 pub async fn setup_qwen_image_model(server: &axum_test::TestServer) -> String {
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
-        "Qwen/Qwen-Image-2512".to_string(),
+        "black-forest-labs/FLUX.2-klein-4B".to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
                 "amount": 0,
@@ -767,8 +767,8 @@ pub async fn setup_qwen_image_model(server: &axum_test::TestServer) -> String {
                 "amount": 40000000,
                 "currency": "USD"
             },
-            "modelDisplayName": "Qwen-Image",
-            "modelDescription": "Qwen Image generation model",
+            "modelDisplayName": "FLUX 2 Klein",
+            "modelDescription": "FLUX 2 Klein image generation model",
             "contextLength": 4096,
             "verifiable": true,
             "isActive": true
@@ -778,7 +778,7 @@ pub async fn setup_qwen_image_model(server: &axum_test::TestServer) -> String {
     let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1, "Should have updated 1 model");
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    "Qwen/Qwen-Image-2512".to_string()
+    "black-forest-labs/FLUX.2-klein-4B".to_string()
 }
 
 /// Generate a minimal valid WAV audio file as base64

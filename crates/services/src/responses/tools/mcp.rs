@@ -928,6 +928,7 @@ pub async fn process_approval_responses(
                 content: result_message,
                 tool_call_id: None, // MCP approval responses don't have a tool_call_id
                 tool_calls: None,
+                multimodal_content: None,
             });
         }
     }

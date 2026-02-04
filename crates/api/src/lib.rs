@@ -585,13 +585,20 @@ pub async fn init_inference_providers_with_mocks(
 
     // Register providers for models commonly used in tests
     let test_models = vec![
+        // Text models
         "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
         "zai-org/GLM-4.6".to_string(),
+        "zai-org/GLM-4.7".to_string(),
         "nearai/gpt-oss-120b".to_string(),
+        "openai/gpt-oss-120b".to_string(),
         "dphn/Dolphin-Mistral-24B-Venice-Edition".to_string(),
         "deepseek-ai/DeepSeek-V3.1".to_string(),
+        // Multimodal (image analysis)
+        "Qwen/Qwen3-VL-30B-A3B-Instruct".to_string(),
+        // Audio (input/output)
         "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string(),
-        "Qwen/Qwen-Image-2512".to_string(),
+        // Image generation
+        "black-forest-labs/FLUX.2-klein-4B".to_string(),
     ];
 
     let providers: Vec<(

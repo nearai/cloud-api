@@ -2,6 +2,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::Engine;
 use futures::Stream;
 use uuid::Uuid;
 
@@ -12,7 +13,7 @@ use crate::conversations::ports::ConversationServiceTrait;
 use crate::files::FileServiceTrait;
 use crate::inference_provider_pool::InferenceProviderPool;
 use crate::responses::tools;
-use crate::responses::{citation_tracker, errors, models, ports};
+use crate::responses::{citation_tracker, errors, models, ports, service_helpers};
 
 use tools::{ERROR_TOOL_TYPE, MAX_CONSECUTIVE_TOOL_FAILURES};
 
@@ -345,6 +346,45 @@ impl ResponseServiceImpl {
         Ok(content_parts.join("\n\n"))
     }
 
+    /// Build multimodal content array (OpenAI format) from content parts
+    /// Returns JSON array with text and image_url objects
+    async fn build_multimodal_content(
+        parts: &[models::ResponseContentPart],
+    ) -> Result<serde_json::Value, errors::ResponseError> {
+        let mut content_array = Vec::new();
+
+        for part in parts {
+            match part {
+                models::ResponseContentPart::InputText { text } => {
+                    content_array.push(serde_json::json!({
+                        "type": "text",
+                        "text": text
+                    }));
+                }
+                models::ResponseContentPart::InputImage {
+                    image_url,
+                    detail: _,
+                } => {
+                    let url_str = match image_url {
+                        models::ResponseImageUrl::String(s) => s.clone(),
+                        models::ResponseImageUrl::Object { url } => url.clone(),
+                    };
+                    content_array.push(serde_json::json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": url_str
+                        }
+                    }));
+                }
+                _ => {
+                    // Skip file content for now in multimodal (would need separate handling)
+                }
+            }
+        }
+
+        Ok(serde_json::Value::Array(content_array))
+    }
+
     /// Extract response ID UUID from response object
     fn extract_response_uuid(
         response: &models::ResponseObject,
@@ -374,13 +414,13 @@ impl ResponseServiceImpl {
                     > + Send,
             >,
         >,
-        emitter: &mut crate::responses::service_helpers::EventEmitter,
-        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
+        emitter: &mut service_helpers::EventEmitter,
+        ctx: &mut service_helpers::ResponseStreamContext,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
         process_context: &ProcessStreamContext,
-    ) -> Result<crate::responses::service_helpers::ProcessStreamResult, errors::ResponseError> {
-        use crate::responses::service_helpers::ToolCallAccumulator;
+    ) -> Result<service_helpers::ProcessStreamResult, errors::ResponseError> {
         use futures::StreamExt;
+        use service_helpers::ToolCallAccumulator;
 
         let mut current_text = String::new();
         let mut tool_call_accumulator: ToolCallAccumulator = std::collections::HashMap::new();
@@ -460,7 +500,7 @@ impl ResponseServiceImpl {
                             }
 
                             let reasoning_token_count =
-                                crate::responses::service_helpers::ResponseStreamContext::estimate_tokens(
+                                service_helpers::ResponseStreamContext::estimate_tokens(
                                     &reasoning_buffer,
                                 );
                             ctx.add_reasoning_tokens(reasoning_token_count);
@@ -505,7 +545,9 @@ impl ResponseServiceImpl {
 
                                     // Count reasoning tokens
                                     let reasoning_token_count =
-                                        crate::responses::service_helpers::ResponseStreamContext::estimate_tokens(&reasoning_buffer);
+                                        service_helpers::ResponseStreamContext::estimate_tokens(
+                                            &reasoning_buffer,
+                                        );
                                     ctx.add_reasoning_tokens(reasoning_token_count);
 
                                     // Move to next output index
@@ -640,7 +682,7 @@ impl ResponseServiceImpl {
             &available_tool_names,
         );
 
-        Ok(crate::responses::service_helpers::ProcessStreamResult {
+        Ok(service_helpers::ProcessStreamResult {
             text: current_text,
             tool_calls: tool_calls_detected,
             stream_error,
@@ -649,8 +691,8 @@ impl ResponseServiceImpl {
 
     /// Emit events when a message starts streaming
     async fn emit_message_started(
-        emitter: &mut crate::responses::service_helpers::EventEmitter,
-        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
+        emitter: &mut service_helpers::EventEmitter,
+        ctx: &mut service_helpers::ResponseStreamContext,
         message_item_id: &str,
     ) -> Result<(), errors::ResponseError> {
         // Event: response.output_item.added (for message)
@@ -684,8 +726,8 @@ impl ResponseServiceImpl {
 
     /// Emit events when a message completes
     async fn emit_message_completed(
-        emitter: &mut crate::responses::service_helpers::EventEmitter,
-        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
+        emitter: &mut service_helpers::EventEmitter,
+        ctx: &mut service_helpers::ResponseStreamContext,
         message_item_id: &str,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
         context: &ProcessStreamContext,
@@ -840,7 +882,7 @@ impl ResponseServiceImpl {
         }
 
         // Initialize context and emitter
-        let mut ctx = crate::responses::service_helpers::ResponseStreamContext::new(
+        let mut ctx = service_helpers::ResponseStreamContext::new(
             response_id.clone(),
             api_key_uuid,
             conversation_id,
@@ -849,7 +891,7 @@ impl ResponseServiceImpl {
             initial_response.created_at,
             context.request.model.clone(),
         );
-        let mut emitter = crate::responses::service_helpers::EventEmitter::new(tx);
+        let mut emitter = service_helpers::EventEmitter::new(tx);
 
         // Event: response.created
         emitter
@@ -875,6 +917,163 @@ impl ResponseServiceImpl {
             context.signing_algo.clone(),
             context.client_pub_key.clone(),
         );
+
+        // Check if this is an image generation/edit request (for image generation models only)
+        // Image analysis (text output from image input) goes through normal text completion flow
+        if Self::is_image_generation_model(&context.request.model) {
+            tracing::info!("Image generation model detected, routing to image handler");
+
+            // Extract prompt
+            let prompt = Self::extract_prompt_from_request(&context.request)?;
+
+            // Build encryption headers
+            let mut extra_params = std::collections::HashMap::new();
+            if let Some(model_pub_key) = &context.model_pub_key {
+                extra_params.insert(
+                    encryption_headers::MODEL_PUB_KEY.to_string(),
+                    serde_json::json!(model_pub_key),
+                );
+            }
+
+            // Check if this is an edit request (has input image)
+            let is_edit = context.request.input.as_ref().is_some_and(|input| {
+                if let models::ResponseInput::Items(items) = input {
+                    items.iter().any(|item| {
+                        if let Some(models::ResponseContent::Parts(parts)) = item.content() {
+                            parts.iter().any(|p| {
+                                matches!(p, models::ResponseContentPart::InputImage { .. })
+                            })
+                        } else {
+                            false
+                        }
+                    })
+                } else {
+                    false
+                }
+            });
+
+            // Call the appropriate image API
+            let response = if is_edit {
+                let image_bytes = Self::extract_input_image_from_request(&context.request)?;
+                let params = inference_providers::ImageEditParams {
+                    model: context.request.model.clone(),
+                    image: std::sync::Arc::new(image_bytes),
+                    prompt,
+                    size: None,
+                    response_format: Some("b64_json".to_string()),
+                };
+
+                context
+                    .completion_service
+                    .get_inference_provider_pool()
+                    .image_edit(params, context.body_hash.clone())
+                    .await
+                    .map_err(|e| {
+                        errors::ResponseError::InvalidParams(format!("Image edit failed: {e}"))
+                    })?
+            } else {
+                let params = inference_providers::ImageGenerationParams {
+                    model: context.request.model.clone(),
+                    prompt,
+                    size: None,
+                    quality: None,
+                    style: None,
+                    n: Some(1),
+                    response_format: Some("b64_json".to_string()),
+                    extra: extra_params,
+                };
+
+                context
+                    .completion_service
+                    .get_inference_provider_pool()
+                    .image_generation(params, context.body_hash.clone())
+                    .await
+                    .map_err(|e| {
+                        errors::ResponseError::InvalidParams(format!(
+                            "Image generation failed: {e}"
+                        ))
+                    })?
+            };
+
+            // Convert response to ResponseOutputItem with OutputImage content
+            let image_data: Vec<models::ImageOutputData> = response
+                .response
+                .data
+                .iter()
+                .map(|img| models::ImageOutputData {
+                    b64_json: img.b64_json.clone(),
+                    url: img.url.clone(),
+                    revised_prompt: img.revised_prompt.clone(),
+                })
+                .collect();
+
+            // Create output item
+            let message_item = models::ResponseOutputItem::Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                response_id: ctx.response_id_str.clone(),
+                previous_response_id: ctx.previous_response_id.clone(),
+                next_response_ids: vec![],
+                created_at: ctx.created_at,
+                status: models::ResponseItemStatus::Completed,
+                role: "assistant".to_string(),
+                content: vec![models::ResponseContentItem::OutputImage {
+                    data: image_data.clone(),
+                    url: None,
+                }],
+                model: context.request.model.clone(),
+            };
+
+            // Emit streaming event for image creation
+            emitter
+                .emit_output_image_created(&mut ctx, &image_data)
+                .await?;
+
+            // Store in database
+            context
+                .response_items_repository
+                .create(
+                    ctx.response_id.clone(),
+                    ctx.api_key_id,
+                    ctx.conversation_id,
+                    message_item.clone(),
+                )
+                .await
+                .map_err(|e| {
+                    errors::ResponseError::InternalError(format!("Failed to store image item: {e}"))
+                })?;
+
+            // Build final response with image usage
+            let mut final_response = initial_response;
+            final_response.status = models::ResponseStatus::Completed;
+            final_response.usage = models::Usage::new_image_only(image_data.len() as i32);
+            final_response.output = vec![message_item];
+
+            // Emit completion event
+            emitter
+                .emit_completed(&mut ctx, final_response.clone())
+                .await?;
+
+            // Update response in database
+            let usage_json = serde_json::to_value(&final_response.usage).map_err(|e| {
+                errors::ResponseError::InternalError(format!("Failed to serialize usage: {e}"))
+            })?;
+
+            if let Err(e) = context
+                .response_repository
+                .update(
+                    ctx.response_id.clone(),
+                    workspace_id_domain.clone(),
+                    None, // No text output for images
+                    final_response.status.clone(),
+                    Some(usage_json),
+                )
+                .await
+            {
+                tracing::warn!("Failed to update response with image usage: {}", e);
+            }
+
+            return Ok(());
+        }
 
         let mut tools = tools::prepare_tools(&context.request);
         let tool_choice = tools::prepare_tool_choice(&context.request);
@@ -1025,8 +1224,8 @@ impl ResponseServiceImpl {
     /// Run the agent loop - repeatedly call completion API and execute tool calls
     #[allow(clippy::too_many_arguments)]
     async fn run_agent_loop(
-        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
-        emitter: &mut crate::responses::service_helpers::EventEmitter,
+        ctx: &mut service_helpers::ResponseStreamContext,
+        emitter: &mut service_helpers::EventEmitter,
         messages: &mut Vec<crate::completions::ports::CompletionMessage>,
         final_response_text: &mut String,
         process_context: &mut ProcessStreamContext,
@@ -1140,6 +1339,7 @@ impl ResponseServiceImpl {
                         content: stream_result.text.clone(),
                         tool_call_id: None,
                         tool_calls: None,
+                        multimodal_content: None,
                     });
                     ctx.next_output_index();
                 }
@@ -1184,6 +1384,7 @@ impl ResponseServiceImpl {
                 content: stream_result.text.clone(),
                 tool_call_id: None,
                 tool_calls,
+                multimodal_content: None,
             });
             if !stream_result.text.is_empty() {
                 ctx.next_output_index();
@@ -1234,6 +1435,7 @@ impl ResponseServiceImpl {
                                 content: std::mem::take(&mut deferred_instructions).join("\n\n"),
                                 tool_call_id: None,
                                 tool_calls: None,
+                                multimodal_content: None,
                             });
                         }
                         return Ok(AgentLoopResult::ApprovalRequired);
@@ -1249,6 +1451,7 @@ impl ResponseServiceImpl {
                     content: deferred_instructions.join("\n\n"),
                     tool_call_id: None,
                     tool_calls: None,
+                    multimodal_content: None,
                 });
             }
         }
@@ -1265,9 +1468,9 @@ impl ResponseServiceImpl {
     /// `deferred_instructions` to be added after all tool results. This ensures tool results
     /// are consecutive (required by OpenAI/Anthropic/Gemini for parallel tool calls).
     async fn execute_and_emit_tool_call(
-        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
-        emitter: &mut crate::responses::service_helpers::EventEmitter,
-        tool_call: &crate::responses::service_helpers::ToolCallInfo,
+        ctx: &mut service_helpers::ResponseStreamContext,
+        emitter: &mut service_helpers::EventEmitter,
+        tool_call: &service_helpers::ToolCallInfo,
         messages: &mut Vec<crate::completions::ports::CompletionMessage>,
         process_context: &mut ProcessStreamContext,
         deferred_instructions: &mut Vec<String>,
@@ -1293,6 +1496,7 @@ impl ResponseServiceImpl {
                 ),
                 tool_call_id: Some(tool_call_id),
                 tool_calls: None,
+                multimodal_content: None,
             });
             return Ok(tools::ToolExecutionResult::Success);
         }
@@ -1412,6 +1616,7 @@ impl ResponseServiceImpl {
             content: tool_content,
             tool_call_id: Some(tool_call_id),
             tool_calls: None,
+            multimodal_content: None,
         });
 
         // Defer citation instruction to be added after all tool results
@@ -1597,6 +1802,7 @@ impl ResponseServiceImpl {
                     content: prompt,
                     tool_call_id: None,
                     tool_calls: None,
+                    multimodal_content: None,
                 });
                 tracing::debug!("Prepended organization system prompt to messages");
             }
@@ -1622,6 +1828,7 @@ impl ResponseServiceImpl {
                 content: combined_instructions,
                 tool_call_id: None,
                 tool_calls: None,
+                multimodal_content: None,
             });
         } else {
             // Add language instruction and time context as a system message if no instructions provided
@@ -1631,6 +1838,7 @@ impl ResponseServiceImpl {
                 content: system_content,
                 tool_call_id: None,
                 tool_calls: None,
+                multimodal_content: None,
             });
         }
 
@@ -1734,6 +1942,7 @@ impl ResponseServiceImpl {
                             content: text,
                             tool_call_id: None,
                             tool_calls: None,
+                            multimodal_content: None,
                         });
                     }
                 }
@@ -1758,6 +1967,7 @@ impl ResponseServiceImpl {
                         content: text.clone(),
                         tool_call_id: None,
                         tool_calls: None,
+                        multimodal_content: None,
                     });
                 }
                 models::ResponseInput::Items(items) => {
@@ -1775,12 +1985,36 @@ impl ResponseServiceImpl {
                             }
                         };
 
-                        let content = match item_content {
-                            models::ResponseContent::Text(text) => text.clone(),
+                        let (content, multimodal_content) = match item_content {
+                            models::ResponseContent::Text(text) => (text.clone(), None),
                             models::ResponseContent::Parts(parts) => {
-                                // Extract text from parts and fetch file content if needed
-                                Self::extract_content_parts(parts, workspace_id.0, file_service)
-                                    .await?
+                                // Check if parts contain images (multimodal)
+                                let has_images = parts.iter().any(|p| {
+                                    matches!(p, models::ResponseContentPart::InputImage { .. })
+                                });
+
+                                if has_images {
+                                    // Build multimodal content array with text and images
+                                    let content_array =
+                                        Self::build_multimodal_content(parts).await?;
+                                    // Extract text for content field (fallback)
+                                    let text_content = Self::extract_content_parts(
+                                        parts,
+                                        workspace_id.0,
+                                        file_service,
+                                    )
+                                    .await?;
+                                    (text_content, Some(content_array))
+                                } else {
+                                    // Non-multimodal: extract text and files normally
+                                    let text_content = Self::extract_content_parts(
+                                        parts,
+                                        workspace_id.0,
+                                        file_service,
+                                    )
+                                    .await?;
+                                    (text_content, None)
+                                }
                             }
                         };
 
@@ -1789,6 +2023,7 @@ impl ResponseServiceImpl {
                             content,
                             tool_call_id: None,
                             tool_calls: None,
+                            multimodal_content,
                         });
                     }
                 }
@@ -2033,7 +2268,7 @@ impl ResponseServiceImpl {
     /// Usage typically comes in the final chunk from the provider
     fn extract_and_accumulate_usage(
         event: &inference_providers::SSEEvent,
-        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
+        ctx: &mut service_helpers::ResponseStreamContext,
     ) {
         use inference_providers::StreamChunk;
 
@@ -2052,7 +2287,7 @@ impl ResponseServiceImpl {
     /// Accumulate tool call fragments from streaming chunks
     fn accumulate_tool_calls(
         event: &inference_providers::SSEEvent,
-        accumulator: &mut crate::responses::service_helpers::ToolCallAccumulator,
+        accumulator: &mut service_helpers::ToolCallAccumulator,
     ) {
         use inference_providers::StreamChunk;
 
@@ -2239,6 +2474,7 @@ impl ResponseServiceImpl {
                 content: title_prompt,
                 tool_call_id: None,
                 tool_calls: None,
+                multimodal_content: None,
             }],
             max_tokens: Some(150),
             temperature: Some(1.0),
@@ -2349,6 +2585,84 @@ impl ResponseServiceImpl {
         let _ = tx.send(event).await;
 
         Ok(())
+    }
+
+    /// Check if this is an image generation model (dall-e, flux, sd)
+    /// Image analysis (text model + image input) goes through normal text completion
+    fn is_image_generation_model(model_name: &str) -> bool {
+        let model_lower = model_name.to_lowercase();
+        model_lower.contains("dall-e")
+            || model_lower.contains("flux")
+            || model_lower.contains("sd")
+            || model_lower.contains("stable-diffusion")
+    }
+
+    /// Extract text prompt from request input
+    fn extract_prompt_from_request(
+        request: &models::CreateResponseRequest,
+    ) -> Result<String, errors::ResponseError> {
+        match &request.input {
+            Some(models::ResponseInput::Text(text)) => Ok(text.clone()),
+            Some(models::ResponseInput::Items(items)) => {
+                for item in items {
+                    if let Some(models::ResponseContent::Parts(parts)) = item.content() {
+                        for part in parts {
+                            if let models::ResponseContentPart::InputText { text } = part {
+                                return Ok(text.clone());
+                            }
+                        }
+                    }
+                }
+                Err(errors::ResponseError::InvalidParams(
+                    "No text prompt found for image request".to_string(),
+                ))
+            }
+            None => Err(errors::ResponseError::InvalidParams(
+                "No input provided for image request".to_string(),
+            )),
+        }
+    }
+
+    /// Extract input image bytes for edit operations from request
+    fn extract_input_image_from_request(
+        request: &models::CreateResponseRequest,
+    ) -> Result<Vec<u8>, errors::ResponseError> {
+        if let Some(models::ResponseInput::Items(items)) = &request.input {
+            for item in items {
+                if let Some(models::ResponseContent::Parts(parts)) = item.content() {
+                    for part in parts {
+                        if let models::ResponseContentPart::InputImage {
+                            image_url,
+                            detail: _,
+                        } = part
+                        {
+                            // Extract URL from ResponseImageUrl enum
+                            let url_str = match image_url {
+                                models::ResponseImageUrl::String(s) => s.clone(),
+                                models::ResponseImageUrl::Object { url } => url.clone(),
+                            };
+
+                            if url_str.starts_with("data:") {
+                                // Parse base64 data URL
+                                if let Some(comma_pos) = url_str.find(',') {
+                                    let base64_str = &url_str[comma_pos + 1..];
+                                    return base64::engine::general_purpose::STANDARD
+                                        .decode(base64_str)
+                                        .map_err(|e| {
+                                            errors::ResponseError::InvalidParams(format!(
+                                                "Failed to decode base64 image: {e}"
+                                            ))
+                                        });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Err(errors::ResponseError::InvalidParams(
+            "No input image found for image edit request".to_string(),
+        ))
     }
 }
 
@@ -2513,7 +2827,7 @@ mod tests {
 
     #[test]
     fn test_estimate_tokens() {
-        use crate::responses::service_helpers::ResponseStreamContext;
+        use service_helpers::ResponseStreamContext;
 
         assert_eq!(ResponseStreamContext::estimate_tokens("test"), 1);
         assert_eq!(ResponseStreamContext::estimate_tokens("Hello world"), 2);

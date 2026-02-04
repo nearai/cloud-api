@@ -37,6 +37,7 @@ rmcp = { version = "0.13", features = [
     "transport-streamable-http-client-reqwest",
 ] }
 hex = "0.4"
+base64 = "0.22"
 # NEAR wallet authentication (NEP-413)
 near-api = "0.8.2"
 dstack-sdk = "0.1.2"

@@ -483,7 +483,7 @@ async fn test_image_generation() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "Qwen/Qwen-Image-2512",
+            "model": "black-forest-labs/FLUX.2-klein-4B",
             "prompt": "A beautiful sunset over mountains with orange and purple sky",
             "n": 1,
             "response_format": "b64_json"
@@ -601,7 +601,7 @@ async fn test_image_generation_multiple() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "Qwen/Qwen-Image-2512",
+            "model": "black-forest-labs/FLUX.2-klein-4B",
             "prompt": "A cute cat sitting on a windowsill",
             "n": 2,
             "response_format": "b64_json"
@@ -661,7 +661,7 @@ async fn test_image_generation_validation() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "Qwen/Qwen-Image-2512",
+            "model": "black-forest-labs/FLUX.2-klein-4B",
             "prompt": "A beautiful sunset",
             "n": 100,  // Too many images
             "response_format": "b64_json"
@@ -677,7 +677,7 @@ async fn test_image_generation_validation() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "Qwen/Qwen-Image-2512",
+            "model": "black-forest-labs/FLUX.2-klein-4B",
             "prompt": "",
             "response_format": "b64_json"
         }))
@@ -698,7 +698,7 @@ async fn test_verifiable_model_response_format_validation() {
     let (server, guard) = setup_test_server().await;
     let _guard = guard;
 
-    // Set up the verifiable image model (Qwen/Qwen-Image-2512 has verifiable=true and defaults to attestation_supported=true)
+    // Set up the verifiable image model (black-forest-labs/FLUX.2-klein-4B has verifiable=true and defaults to attestation_supported=true)
     setup_qwen_image_model(&server).await;
 
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -710,7 +710,7 @@ async fn test_verifiable_model_response_format_validation() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "Qwen/Qwen-Image-2512",
+            "model": "black-forest-labs/FLUX.2-klein-4B",
             "prompt": "A beautiful sunset",
             "response_format": "url"
         }))
@@ -744,7 +744,7 @@ async fn test_verifiable_model_response_format_validation() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "Qwen/Qwen-Image-2512",
+            "model": "black-forest-labs/FLUX.2-klein-4B",
             "prompt": "A beautiful sunset"
             // response_format omitted
         }))
@@ -773,7 +773,7 @@ async fn test_verifiable_model_response_format_validation() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "Qwen/Qwen-Image-2512",
+            "model": "black-forest-labs/FLUX.2-klein-4B",
             "prompt": "A beautiful sunset",
             "response_format": "b64_json"
         }))
@@ -802,7 +802,7 @@ async fn test_verifiable_model_response_format_validation() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "Qwen/Qwen-Image-2512",
+            "model": "black-forest-labs/FLUX.2-klein-4B",
             "prompt": "A beautiful sunset",
             "response_format": "invalid_format"
         }))
@@ -1545,7 +1545,7 @@ async fn test_image_edit() {
                         .file_name("image.png")
                         .mime_type("image/png"),
                 )
-                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("model", "black-forest-labs/FLUX.2-klein-4B")
                 .add_text("prompt", "Change the background to a sunny day"),
         )
         .await;
@@ -1644,7 +1644,7 @@ async fn test_image_edit_validation() {
         .add_header("User-Agent", MOCK_USER_AGENT)
         .multipart(
             axum_test::multipart::MultipartForm::new()
-                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("model", "black-forest-labs/FLUX.2-klein-4B")
                 .add_text("prompt", "Edit this image"),
         )
         .await;
@@ -1664,7 +1664,7 @@ async fn test_image_edit_validation() {
                         .file_name("image.png")
                         .mime_type("image/png"),
                 )
-                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("model", "black-forest-labs/FLUX.2-klein-4B")
                 .add_text("prompt", "Edit this image"),
         )
         .await;
@@ -1689,7 +1689,7 @@ async fn test_image_edit_validation() {
                         .file_name("image.png")
                         .mime_type("image/png"),
                 )
-                .add_text("model", "Qwen/Qwen-Image-2512"),
+                .add_text("model", "black-forest-labs/FLUX.2-klein-4B"),
         )
         .await;
 
@@ -1708,7 +1708,7 @@ async fn test_image_edit_validation() {
                         .file_name("image.png")
                         .mime_type("image/png"),
                 )
-                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("model", "black-forest-labs/FLUX.2-klein-4B")
                 .add_text("prompt", "Edit this")
                 .add_text("size", "invalid"),
         )
@@ -1733,7 +1733,7 @@ async fn test_image_edit_validation() {
                         .file_name("image.png")
                         .mime_type("image/png"),
                 )
-                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("model", "black-forest-labs/FLUX.2-klein-4B")
                 .add_text("prompt", "Edit this")
                 .add_text("size", "0x0"),
         )
@@ -1767,7 +1767,7 @@ async fn test_image_edit_verifiable_model_response_format() {
                         .file_name("image.png")
                         .mime_type("image/png"),
                 )
-                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("model", "black-forest-labs/FLUX.2-klein-4B")
                 .add_text("prompt", "Edit this")
                 .add_text("response_format", "url"),
         )
@@ -1792,7 +1792,7 @@ async fn test_image_edit_verifiable_model_response_format() {
                         .file_name("image.png")
                         .mime_type("image/png"),
                 )
-                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("model", "black-forest-labs/FLUX.2-klein-4B")
                 .add_text("prompt", "Edit this")
                 .add_text("response_format", "b64_json"),
         )
@@ -1817,7 +1817,7 @@ async fn test_image_edit_verifiable_model_response_format() {
                         .file_name("image.png")
                         .mime_type("image/png"),
                 )
-                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("model", "black-forest-labs/FLUX.2-klein-4B")
                 .add_text("prompt", "Edit this"),
         )
         .await;

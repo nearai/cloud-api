@@ -725,6 +725,25 @@ pub enum ResponseContentItem {
     ToolCalls {
         tool_calls: Vec<ResponseOutputToolCall>,
     },
+
+    #[serde(rename = "output_image")]
+    OutputImage {
+        /// Image data array (matches OpenAI format)
+        data: Vec<ImageOutputData>,
+        /// Optional URL (future support)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImageOutputData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub b64_json: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revised_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -779,7 +798,9 @@ impl ResponseContentItem {
     pub fn is_output(&self) -> bool {
         matches!(
             self,
-            ResponseContentItem::OutputText { .. } | ResponseContentItem::ToolCalls { .. }
+            ResponseContentItem::OutputText { .. }
+                | ResponseContentItem::ToolCalls { .. }
+                | ResponseContentItem::OutputImage { .. }
         )
     }
 
@@ -811,6 +832,15 @@ pub enum ResponseOutputContent {
     #[serde(rename = "tool_calls")]
     ToolCalls {
         tool_calls: Vec<ResponseOutputToolCall>,
+    },
+
+    #[serde(rename = "output_image")]
+    OutputImage {
+        /// Image data array (matches OpenAI format)
+        data: Vec<ImageOutputData>,
+        /// Optional URL (future support)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
     },
 }
 
@@ -987,6 +1017,9 @@ pub struct Usage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens_details: Option<OutputTokensDetails>,
     pub total_tokens: i32,
+    /// Number of images generated (for image models)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_count: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1054,6 +1087,7 @@ impl Usage {
                 reasoning_tokens: 0,
             }),
             total_tokens: input_tokens + output_tokens,
+            image_count: None,
         }
     }
 
@@ -1070,6 +1104,20 @@ impl Usage {
                 reasoning_tokens: reasoning_tokens as i64,
             }),
             total_tokens: input_tokens + output_tokens,
+            image_count: None,
+        }
+    }
+
+    pub fn new_image_only(image_count: i32) -> Self {
+        Self {
+            input_tokens: 0,
+            input_tokens_details: Some(InputTokensDetails { cached_tokens: 0 }),
+            output_tokens: 0,
+            output_tokens_details: Some(OutputTokensDetails {
+                reasoning_tokens: 0,
+            }),
+            total_tokens: 0,
+            image_count: Some(image_count),
         }
     }
 }

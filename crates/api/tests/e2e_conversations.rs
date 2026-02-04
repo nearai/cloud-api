@@ -251,7 +251,7 @@ async fn test_response_stream_fails_with_failed_event_when_inference_fails_at_st
         "response.failed event should have non-empty text (error message)"
     );
 
-    // Verify DB: latest response for this conversation has status=Failed and one assistant item with status=failed, content=[]
+    // Verify DB: latest response for this conversation has status=Failed and one assistant item with status=failed, content containing error message
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     let pool = database.pool();
     let client = pool.get().await.expect("db connection");
@@ -302,7 +302,46 @@ async fn test_response_stream_fails_with_failed_event_when_inference_fails_at_st
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    assert!(content.is_empty(), "Failed item content should be empty");
+
+    // Verify that the failed item contains the error message in its content
+    assert!(
+        !content.is_empty(),
+        "Failed item content should contain the error message"
+    );
+    assert_eq!(
+        content.len(),
+        1,
+        "Failed item should have exactly one content item"
+    );
+
+    let content_item = &content[0];
+    assert_eq!(
+        content_item.get("type").and_then(|v| v.as_str()),
+        Some("output_text"),
+        "Content item should be output_text"
+    );
+
+    let error_text_in_content = content_item
+        .get("text")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    assert!(
+        error_text_in_content
+            .as_deref()
+            .is_some_and(|s| !s.is_empty()),
+        "Failed item content should have non-empty error message text"
+    );
+
+    // Verify that the error message in content matches the error message from response.failed event
+    if let (Some(stream_error), Some(content_error)) =
+        (failed_text.as_ref(), error_text_in_content.as_ref())
+    {
+        assert_eq!(
+            stream_error, content_error,
+            "Error message in response.failed event should match error message in failed item content"
+        );
+    }
 }
 
 #[tokio::test]

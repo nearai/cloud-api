@@ -988,6 +988,8 @@ impl ResponseServiceImpl {
             Err(e)
                 if final_response.output.is_empty() && final_response.usage.total_tokens == 0 =>
             {
+                // Include error message in content so users can understand why it failed
+                let error_message = e.to_string();
                 let failed_item = models::ResponseOutputItem::Message {
                     id: format!("msg_{}", Uuid::new_v4().simple()),
                     response_id: ctx.response_id_str.clone(),
@@ -996,7 +998,11 @@ impl ResponseServiceImpl {
                     created_at: ctx.created_at,
                     status: models::ResponseItemStatus::Failed,
                     role: "assistant".to_string(),
-                    content: vec![],
+                    content: vec![models::ResponseContentItem::OutputText {
+                        text: error_message,
+                        annotations: vec![],
+                        logprobs: vec![],
+                    }],
                     model: ctx.model.clone(),
                     metadata: None,
                 };

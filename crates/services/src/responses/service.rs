@@ -998,6 +998,7 @@ impl ResponseServiceImpl {
                     role: "assistant".to_string(),
                     content: vec![],
                     model: ctx.model.clone(),
+                    metadata: None,
                 };
                 if let Err(create_err) = context
                     .response_items_repository

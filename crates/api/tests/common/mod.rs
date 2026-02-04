@@ -532,6 +532,7 @@ pub async fn setup_org_with_credits_and_session_and_email(
     let org = create_org_with_session(server, session_id).await;
 
     let update_request = serde_json::json!({
+        "type": "payment",
         "spendLimit": {
             "amount": amount_nano_dollars,
             "currency": "USD"
@@ -549,6 +550,47 @@ pub async fn setup_org_with_credits_and_session_and_email(
 
     assert_eq!(response.status_code(), 200, "Failed to set credits");
     org
+}
+
+/// Add credits with specific type and source to an organization
+pub async fn add_credits_with_type(
+    server: &axum_test::TestServer,
+    org_id: &str,
+    credit_type: &str,
+    source: Option<&str>,
+    amount_nano_dollars: i64,
+    currency: &str,
+    session_id: &str,
+) -> api::models::UpdateOrganizationLimitsResponse {
+    let mut update_request = serde_json::json!({
+        "type": credit_type,
+        "spendLimit": {
+            "amount": amount_nano_dollars,
+            "currency": currency
+        },
+        "changedBy": "admin@test.com",
+        "changeReason": format!("Test {} credits", credit_type)
+    });
+
+    if let Some(src) = source {
+        update_request["source"] = serde_json::Value::String(src.to_string());
+    }
+
+    let response = server
+        .patch(format!("/v1/admin/organizations/{}/limits", org_id).as_str())
+        .add_header("Authorization", format!("Bearer {session_id}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&update_request)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Failed to add {} credits: {}",
+        credit_type,
+        response.text()
+    );
+    response.json::<api::models::UpdateOrganizationLimitsResponse>()
 }
 
 pub async fn list_workspaces(

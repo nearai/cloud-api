@@ -144,4 +144,11 @@ pub trait CompletionServiceTrait: Send + Sync {
     fn get_inference_provider_pool(
         &self,
     ) -> std::sync::Arc<crate::inference_provider_pool::InferenceProviderPool>;
+
+    /// Get model details by name (canonical name or alias)
+    /// Returns None if the model is not found or not active
+    async fn get_model(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error>;
 }

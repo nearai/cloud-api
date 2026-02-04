@@ -182,14 +182,9 @@ async fn test_image_response_conversation_threading() {
     assert_eq!(first_response.status_code(), 200);
     let first_response_text = first_response.text();
 
-    // Extract first response ID from response.created event
-    let first_response_id = if let Some(start) = first_response_text.find("\"id\":\"resp_") {
-        let start_uuid = start + "\"id\":\"resp_".len();
-        let end = first_response_text[start_uuid..].find('"').unwrap();
-        &first_response_text[start_uuid..start_uuid + end]
-    } else {
-        panic!("Could not find response ID in first response");
-    };
+    // Extract first response ID from response.created event using proper SSE parsing
+    let first_response_id = extract_response_id_from_sse(&first_response_text)
+        .expect("Could not find response ID in first response");
 
     // Make second image generation response with previous_response_id
     let second_response = server
@@ -587,14 +582,9 @@ async fn test_image_analysis_conversation_threading() {
     assert_eq!(first_response.status_code(), 200);
     let first_response_text = first_response.text();
 
-    // Extract first response ID
-    let first_response_id = if let Some(start) = first_response_text.find("\"id\":\"resp_") {
-        let start_uuid = start + "\"id\":\"resp_".len();
-        let end = first_response_text[start_uuid..].find('"').unwrap();
-        &first_response_text[start_uuid..start_uuid + end]
-    } else {
-        panic!("Could not find response ID in first response");
-    };
+    // Extract first response ID using proper SSE parsing
+    let first_response_id = extract_response_id_from_sse(&first_response_text)
+        .expect("Could not find response ID in first response");
 
     // Second message: image analysis with multimodal content
     let base64_image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";

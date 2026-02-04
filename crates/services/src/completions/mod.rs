@@ -1087,6 +1087,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
     ) -> std::sync::Arc<crate::inference_provider_pool::InferenceProviderPool> {
         self.inference_provider_pool.clone()
     }
+
+    async fn get_model(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
+        self.models_repository.get_model_by_name(model_name).await
+    }
 }
 
 pub use ports::*;

@@ -1020,6 +1020,14 @@ pub struct Usage {
     /// Number of images generated (for image models)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_count: Option<i32>,
+    /// Image resolution (e.g., "1024x1024", "2048x2048") for billing differentiation
+    /// Different resolutions have different costs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_resolution: Option<String>,
+    /// Image operation type ("generation" or "edit") for billing differentiation
+    /// Generation and edits may have different pricing models
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_operation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1088,6 +1096,8 @@ impl Usage {
             }),
             total_tokens: input_tokens + output_tokens,
             image_count: None,
+            image_resolution: None,
+            image_operation: None,
         }
     }
 
@@ -1105,10 +1115,22 @@ impl Usage {
             }),
             total_tokens: input_tokens + output_tokens,
             image_count: None,
+            image_resolution: None,
+            image_operation: None,
         }
     }
 
-    pub fn new_image_only(image_count: i32) -> Self {
+    /// Create Usage record for image-only operations (generation or edit)
+    ///
+    /// # Arguments
+    /// * `image_count` - Number of images generated/edited
+    /// * `resolution` - Image resolution (e.g., "1024x1024", "2048x2048")
+    /// * `operation` - Type of operation ("generation" or "edit")
+    pub fn new_image_only(
+        image_count: i32,
+        resolution: Option<String>,
+        operation: Option<String>,
+    ) -> Self {
         Self {
             input_tokens: 0,
             input_tokens_details: Some(InputTokensDetails { cached_tokens: 0 }),
@@ -1118,6 +1140,8 @@ impl Usage {
             }),
             total_tokens: 0,
             image_count: Some(image_count),
+            image_resolution: resolution,
+            image_operation: operation,
         }
     }
 }

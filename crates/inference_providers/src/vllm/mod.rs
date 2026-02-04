@@ -480,13 +480,11 @@ impl InferenceProvider for VLlmProvider {
                 .map_err(|e| ImageEditError::EditError(format!("Invalid request hash: {e}")))?,
         );
 
-        // Dereference Arc<Vec<u8>> to get &[u8] for efficient handling
-        let image_data: &[u8] = &params.image;
-
         // Detect image MIME type based on magic bytes
-        let image_mime_type = if image_data.len() >= 3 && &image_data[0..3] == b"\xFF\xD8\xFF" {
+        // Work directly with Arc to avoid creating intermediate references
+        let image_mime_type = if params.image.len() >= 3 && &params.image[0..3] == b"\xFF\xD8\xFF" {
             "image/jpeg"
-        } else if image_data.len() >= 4 && &image_data[0..4] == b"\x89PNG" {
+        } else if params.image.len() >= 4 && &params.image[0..4] == b"\x89PNG" {
             "image/png"
         } else {
             "image/jpeg" // Default to jpeg
@@ -500,7 +498,10 @@ impl InferenceProvider for VLlmProvider {
         form = form.text("prompt", params.prompt.clone());
 
         // Add image as image[] field (vLLM expects array syntax)
-        let image_part = reqwest::multipart::Part::bytes(image_data.to_vec())
+        // Note: Vec<u8> requires cloning due to reqwest's multipart API constraints
+        // which requires owned data for async transmission. The Arc wrapping of the Vec
+        // minimizes the performance impact when params is cloned for retries.
+        let image_part = reqwest::multipart::Part::bytes((*params.image).clone())
             .file_name("image.bin")
             .mime_str(image_mime_type)
             .map_err(|e| ImageEditError::EditError(format!("Invalid image MIME type: {e}")))?;

@@ -1210,3 +1210,43 @@ pub async fn test_near_login(
         .json(&request_body)
         .await
 }
+
+/// Parse Server-Sent Events (SSE) stream and extract response ID from response.created event
+///
+/// Properly parses SSE format by splitting on \n\n, finding data: lines, and parsing JSON.
+/// This is more robust than string matching and resilient to formatting changes.
+///
+/// # Arguments
+/// * `sse_stream` - Raw SSE response text
+///
+/// # Returns
+/// * `Some(id)` - The response ID (without "resp_" prefix) if found
+/// * `None` - If no response.created event with ID is found
+pub fn extract_response_id_from_sse(sse_stream: &str) -> Option<String> {
+    // Split by \n\n to get event blocks
+    for event_block in sse_stream.split("\n\n") {
+        let mut event_type = "";
+        let mut data = "";
+
+        // Parse event block lines
+        for line in event_block.lines() {
+            if let Some(event_data) = line.strip_prefix("event:") {
+                event_type = event_data.trim();
+            } else if let Some(json_data) = line.strip_prefix("data:") {
+                data = json_data.trim();
+            }
+        }
+
+        // We're looking for response.created events
+        if event_type == "response.created" && !data.is_empty() {
+            // Parse the JSON to extract the ID
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(id) = json.get("id").and_then(|v| v.as_str()) {
+                    // Strip "resp_" prefix if present
+                    return Some(id.strip_prefix("resp_").unwrap_or(id).to_string());
+                }
+            }
+        }
+    }
+    None
+}

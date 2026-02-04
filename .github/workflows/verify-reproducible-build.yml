@@ -3,13 +3,6 @@ name: Verify Reproducible Build
 on:
   workflow_dispatch:
   pull_request:
-    paths:
-      - 'Dockerfile'
-      - 'build-image.sh'
-      - '.cargo/config.toml'
-      - 'Cargo.lock'
-      - 'pinned-packages-builder.txt'
-      - 'pinned-packages-runtime.txt'
   schedule:
     # Run weekly on Sunday at 00:00 UTC
     - cron: '0 0 * * 0'

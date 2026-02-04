@@ -89,32 +89,41 @@ pub struct ModelHistoryEntry {
 }
 
 /// Request to update organization limits
-/// All amounts use fixed scale of 9 (nano-dollars) and USD currency
+/// All amounts use fixed scale of 9 (nano-dollars)
 #[derive(Debug, Clone)]
 pub struct OrganizationLimitsUpdate {
     pub spend_limit: i64,
+    pub credit_type: String,
+    pub source: Option<String>,
+    pub currency: String,
     pub changed_by: Option<String>,
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<uuid::Uuid>, // The authenticated user ID who made the change
     pub changed_by_user_email: Option<String>, // The email of the authenticated user who made the change
 }
 
-/// Organization limits (current active limits)
-/// All amounts use fixed scale of 9 (nano-dollars) and USD currency
+/// Organization limits (current active limits for a specific credit type)
+/// All amounts use fixed scale of 9 (nano-dollars)
 #[derive(Debug, Clone)]
 pub struct OrganizationLimits {
     pub organization_id: uuid::Uuid,
     pub spend_limit: i64,
+    pub credit_type: String,
+    pub source: Option<String>,
+    pub currency: String,
     pub effective_from: chrono::DateTime<chrono::Utc>,
 }
 
 /// Organization limits history entry
-/// All amounts use fixed scale of 9 (nano-dollars) and USD currency
+/// All amounts use fixed scale of 9 (nano-dollars)
 #[derive(Debug, Clone)]
 pub struct OrganizationLimitsHistoryEntry {
     pub id: uuid::Uuid,
     pub organization_id: uuid::Uuid,
     pub spend_limit: i64,
+    pub credit_type: String,
+    pub source: Option<String>,
+    pub currency: String,
     pub effective_from: chrono::DateTime<chrono::Utc>,
     pub effective_until: Option<chrono::DateTime<chrono::Utc>>,
     pub changed_by: Option<String>,
@@ -243,11 +252,11 @@ pub trait AdminRepository: Send + Sync {
         limits: OrganizationLimitsUpdate,
     ) -> Result<OrganizationLimits, anyhow::Error>;
 
-    /// Get current active limits for an organization
+    /// Get all current active limits for an organization (one per credit type)
     async fn get_current_organization_limits(
         &self,
         organization_id: uuid::Uuid,
-    ) -> Result<Option<OrganizationLimits>, anyhow::Error>;
+    ) -> Result<Vec<OrganizationLimits>, anyhow::Error>;
 
     /// Count limits history for an organization
     async fn count_organization_limits_history(

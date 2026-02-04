@@ -15,4 +15,5 @@ pub mod organizations;
 pub mod responses;
 pub mod usage;
 pub mod users;
+pub mod vector_stores;
 pub mod workspaces;

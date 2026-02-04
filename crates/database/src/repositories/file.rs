@@ -434,4 +434,34 @@ impl FileRepositoryTrait for FileRepository {
     async fn get_expired_files(&self) -> Result<Vec<File>, RepositoryError> {
         self.get_expired_files().await
     }
+
+    async fn verify_workspace_ownership(
+        &self,
+        file_ids: &[Uuid],
+        workspace_id: Uuid,
+    ) -> Result<bool, RepositoryError> {
+        if file_ids.is_empty() {
+            return Ok(true);
+        }
+
+        let count: i64 = retry_db!("verify_file_workspace_ownership", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_one(
+                    "SELECT COUNT(*) AS cnt FROM files WHERE id = ANY($1) AND workspace_id = $2",
+                    &[&file_ids, &workspace_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?
+        .get("cnt");
+
+        Ok(count == file_ids.len() as i64)
+    }
 }

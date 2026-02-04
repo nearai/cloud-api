@@ -37,6 +37,7 @@ use utoipa::{Modify, OpenApi};
         (name = "Health", description = "Health check endpoints"),
         (name = "Attestation", description = "Attestation and verification endpoints"),
         (name = "Admin", description = "Administrative endpoints (admin access required)"),
+        (name = "Vector Stores", description = "Vector store management for file search"),
     ),
     paths(
         // Chat completion endpoints (most important for users)
@@ -139,6 +140,22 @@ use utoipa::{Modify, OpenApi};
         // Attestation endpoints
         crate::routes::attestation::get_signature,
         crate::routes::attestation::get_attestation_report,
+        // Vector Store endpoints
+        crate::routes::vector_stores::create_vector_store,
+        crate::routes::vector_stores::list_vector_stores,
+        crate::routes::vector_stores::get_vector_store,
+        crate::routes::vector_stores::modify_vector_store,
+        crate::routes::vector_stores::delete_vector_store,
+        crate::routes::vector_stores::search_vector_store,
+        crate::routes::vector_stores::create_vector_store_file,
+        crate::routes::vector_stores::list_vector_store_files,
+        crate::routes::vector_stores::get_vector_store_file,
+        crate::routes::vector_stores::update_vector_store_file,
+        crate::routes::vector_stores::delete_vector_store_file,
+        crate::routes::vector_stores::create_vector_store_file_batch,
+        crate::routes::vector_stores::get_vector_store_file_batch,
+        crate::routes::vector_stores::cancel_vector_store_file_batch,
+        crate::routes::vector_stores::list_vector_store_file_batch_files,
     ),
     components(
         schemas(
@@ -226,6 +243,18 @@ use utoipa::{Modify, OpenApi};
             crate::routes::billing::RequestCost,
             // File models
             FileUploadResponse, ExpiresAfter, FileListResponse, FileDeleteResponse,
+            // Vector Store models
+            VectorStoreObject, VectorStoreFileCounts, VectorStoreExpiresAfter, ExpiresAfterAnchor,
+            ChunkingStrategy, ChunkingStrategyType, StaticChunkingConfig,
+            VectorStoreStatus, VectorStoreFileStatus,
+            VectorStoreFileObject, VectorStoreFileError, VectorStoreFileErrorCode, VectorStoreFileBatchObject,
+            VectorStoreListResponse, VectorStoreFileListResponse,
+            VectorStoreDeleteResponse, VectorStoreFileDeleteResponse,
+            CreateVectorStoreRequest, ModifyVectorStoreRequest,
+            CreateVectorStoreFileRequest, UpdateVectorStoreFileAttributesRequest,
+            CreateVectorStoreFileBatchRequest,
+            VectorStoreSearchRequest, VectorStoreSearchResponse,
+            VectorStoreSearchResult, SearchResultContent,
         ),
     ),
     modifiers(&SecurityAddon)

@@ -449,6 +449,7 @@ async fn test_admin_update_organization_limits() {
 
     // Update organization limits (amount is in nano-dollars, scale 9 is implicit)
     let update_request = serde_json::json!({
+        "type": "payment",
         "spendLimit": {
             "amount": 100000000000i64,  // $100.00 USD (in nano-dollars)
             "currency": "USD"
@@ -480,6 +481,7 @@ async fn test_admin_update_organization_limits() {
 
     // Verify the response
     assert_eq!(update_response.organization_id, org.id);
+    assert_eq!(update_response.credit_type.as_str(), "payment");
     assert_eq!(update_response.spend_limit.amount, 100000000000i64);
     assert_eq!(update_response.spend_limit.scale, 9); // Scale is always 9 (nano-dollars)
     assert_eq!(update_response.spend_limit.currency, "USD");
@@ -493,6 +495,7 @@ async fn test_admin_update_organization_limits_invalid_org() {
     // Try to update limits for non-existent organization
     let fake_org_id = uuid::Uuid::new_v4().to_string();
     let update_request = serde_json::json!({
+        "type": "payment",
         "spendLimit": {
             "amount": 50000000000i64,
             "currency": "USD"
@@ -526,6 +529,7 @@ async fn test_admin_update_organization_limits_multiple_times() {
 
     // First update - set initial limit (scale 9 = nano-dollars)
     let first_update = serde_json::json!({
+        "type": "payment",
         "spendLimit": {
             "amount": 50000000000i64,  // $50.00 USD (in nano-dollars)
             "currency": "USD"
@@ -546,8 +550,9 @@ async fn test_admin_update_organization_limits_multiple_times() {
             .unwrap();
     assert_eq!(response1_data.spend_limit.amount, 50000000000i64);
 
-    // Second update - increase limit
+    // Second update - increase limit (same type replaces previous)
     let second_update = serde_json::json!({
+        "type": "payment",
         "spendLimit": {
             "amount": 150000000000i64,  // $150.00 USD (in nano-dollars)
             "currency": "USD"
@@ -586,6 +591,7 @@ async fn test_admin_update_organization_limits_usd_only() {
 
     // All currencies are USD now (fixed scale 9)
     let usd_update = serde_json::json!({
+        "type": "payment",
         "spendLimit": {
             "amount": 85000000000i64,  // $85.00 USD (in nano-dollars)
             "currency": "USD"
@@ -625,6 +631,7 @@ async fn test_admin_get_organization_limits_history() {
 
     for (amount, reason) in updates {
         let update_request = serde_json::json!({
+            "type": "payment",
             "spendLimit": {
                 "amount": amount,
                 "currency": "USD"
@@ -772,6 +779,7 @@ async fn test_admin_get_organization_limits_history_with_pagination() {
     for i in 1..=5 {
         let amount = i * 10000000000i64; // $10, $20, $30, $40, $50
         let update_request = serde_json::json!({
+            "type": "payment",
             "spendLimit": {
                 "amount": amount,
                 "currency": "USD"
@@ -2199,6 +2207,7 @@ async fn test_admin_access_token_use_created_token() {
     let org = create_org(&server).await;
 
     let update_request = serde_json::json!({
+        "type": "payment",
         "spendLimit": {
             "amount": 50000000000i64, // $50.00 USD
             "currency": "USD"
@@ -2246,6 +2255,7 @@ async fn test_admin_access_token_user_agent_match() {
 
     let org = create_org(&server).await;
     let update_request = serde_json::json!({
+        "type": "payment",
         "spendLimit": {
             "amount": 50000000000i64, // $50.00 USD
             "currency": "USD"
@@ -2291,6 +2301,7 @@ async fn test_admin_access_token_user_agent_mismatch() {
 
     let org = create_org(&server).await;
     let update_request = serde_json::json!({
+        "type": "payment",
         "spendLimit": {
             "amount": 50000000000i64, // $50.00 USD
             "currency": "USD"

@@ -36,7 +36,7 @@ async-trait = "0.1"
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = { version = "1.19", features = ["v4", "serde"] }
+uuid = { version = "1.20", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
@@ -53,7 +53,7 @@ sha2 = "0.10"
 rand = "0.9.2"
 
 # For User-Agent normalization
-regex = "1.10"
+regex = "1.12"
 
 # For Patroni discovery
 reqwest = { version = "0.12", features = ["json"] }

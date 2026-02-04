@@ -982,20 +982,72 @@ impl ResponseServiceImpl {
             errors::ResponseError::InternalError(format!("Failed to serialize usage: {e}"))
         })?;
 
-        // Update the response in the database with usage, status, and output message
-        if let Err(e) = context
-            .response_repository
-            .update(
-                ctx.response_id.clone(),
-                workspace_id_domain.clone(),
-                Some(final_response_text.clone()),
-                final_response.status.clone(),
-                Some(usage_json),
-            )
-            .await
-        {
-            tracing::warn!("Failed to update response with usage: {}", e);
-            // Continue even if update fails - the response was already created
+        // Initial failure: agent loop failed with no output/usage → create failed item, update status, return Err (client gets response.failed).
+        // Otherwise (Ok or Err with partial output): update DB with final response, then emit response.completed.
+        match agent_loop_result {
+            Err(e)
+                if final_response.output.is_empty() && final_response.usage.total_tokens == 0 =>
+            {
+                // Include error message in content so users can understand why it failed
+                let error_message = e.to_string();
+                let failed_item = models::ResponseOutputItem::Message {
+                    id: format!("msg_{}", Uuid::new_v4().simple()),
+                    response_id: ctx.response_id_str.clone(),
+                    previous_response_id: ctx.previous_response_id.clone(),
+                    next_response_ids: vec![],
+                    created_at: ctx.created_at,
+                    status: models::ResponseItemStatus::Failed,
+                    role: "assistant".to_string(),
+                    content: vec![models::ResponseContentItem::OutputText {
+                        text: error_message,
+                        annotations: vec![],
+                        logprobs: vec![],
+                    }],
+                    model: ctx.model.clone(),
+                    metadata: None,
+                };
+                if let Err(create_err) = context
+                    .response_items_repository
+                    .create(
+                        ctx.response_id.clone(),
+                        ctx.api_key_id,
+                        ctx.conversation_id,
+                        failed_item,
+                    )
+                    .await
+                {
+                    tracing::warn!("Failed to store failed response item: {}", create_err);
+                }
+                if let Err(update_err) = context
+                    .response_repository
+                    .update(
+                        ctx.response_id.clone(),
+                        workspace_id_domain.clone(),
+                        None,
+                        models::ResponseStatus::Failed,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!("Failed to update response status to failed: {}", update_err);
+                }
+                return Err(e);
+            }
+            _ => {
+                if let Err(e) = context
+                    .response_repository
+                    .update(
+                        ctx.response_id.clone(),
+                        workspace_id_domain.clone(),
+                        Some(final_response_text.clone()),
+                        final_response.status.clone(),
+                        Some(usage_json),
+                    )
+                    .await
+                {
+                    tracing::warn!("Failed to update response with usage: {}", e);
+                }
+            }
         }
 
         // Wait for title generation with a timeout (2 seconds)

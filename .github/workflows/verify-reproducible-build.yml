@@ -1,0 +1,266 @@
+name: Verify Reproducible Build
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - 'build-image.sh'
+      - '.cargo/config.toml'
+      - 'Cargo.lock'
+      - 'pinned-packages-builder.txt'
+      - 'pinned-packages-runtime.txt'
+  schedule:
+    # Run weekly on Sunday at 00:00 UTC
+    - cron: '0 0 * * 0'
+
+jobs:
+  # Build on multiple runners in parallel to test cross-machine reproducibility
+  build:
+    name: Build (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
+
+      - name: Build reproducible image
+        run: |
+          ./build-image.sh
+
+      - name: Extract digest
+        run: |
+          DIGEST=$(skopeo inspect oci-archive:./oci.tar | jq -r '.Digest')
+          if [ -z "${DIGEST}" ]; then
+            echo "Failed to get image digest from OCI archive" >&2
+            exit 1
+          fi
+          echo "Image digest: ${DIGEST}"
+
+          # Save digest to file for artifact upload
+          echo "${DIGEST}" > digest.txt
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.runner }}
+          path: digest.txt
+          retention-days: 1
+
+      - name: Upload OCI archive as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-tar-${{ matrix.runner }}
+          path: oci.tar
+          retention-days: 1
+
+  # Sequential builds on the same runner to test build-to-build reproducibility
+  sequential-builds:
+    name: Sequential Builds
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
+
+      - name: First build
+        run: |
+          echo "=== Starting first build ==="
+          ./build-image.sh
+
+          DIGEST=$(skopeo inspect oci-archive:./oci.tar | jq -r '.Digest')
+          if [ -z "${DIGEST}" ]; then
+            echo "Failed to get image digest from OCI archive" >&2
+            exit 1
+          fi
+          echo "First build digest: ${DIGEST}"
+          echo "${DIGEST}" > digest-first.txt
+
+          # Save first build artifact
+          mv oci.tar oci-first.tar
+
+      - name: Clean build environment
+        run: |
+          echo "=== Cleaning build environment ==="
+
+          # Remove the buildkit builder to force fresh state
+          docker buildx rm buildkit_20 || true
+
+          # Prune all docker resources
+          docker system prune -af --volumes || true
+
+          # Remove any cached layers
+          docker builder prune -af || true
+
+          echo "Build environment cleaned"
+
+      - name: Second build
+        run: |
+          echo "=== Starting second build ==="
+          ./build-image.sh
+
+          DIGEST=$(skopeo inspect oci-archive:./oci.tar | jq -r '.Digest')
+          if [ -z "${DIGEST}" ]; then
+            echo "Failed to get image digest from OCI archive" >&2
+            exit 1
+          fi
+          echo "Second build digest: ${DIGEST}"
+          echo "${DIGEST}" > digest-second.txt
+
+          # Save second build artifact
+          mv oci.tar oci-second.tar
+
+      - name: Upload digest artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-sequential
+          path: |
+            digest-first.txt
+            digest-second.txt
+          retention-days: 1
+
+      - name: Upload first build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-tar-sequential-first
+          path: oci-first.tar
+          retention-days: 1
+
+      - name: Upload second build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-tar-sequential-second
+          path: oci-second.tar
+          retention-days: 1
+
+  # Verify all builds produced identical digests
+  verify:
+    name: Verify Reproducibility
+    needs: [build, sequential-builds]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all digest artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          merge-multiple: false
+
+      - name: Collect and compare digests
+        id: verify
+        run: |
+          echo "=== Reproducibility Verification Results ==="
+          echo ""
+
+          # Read digests from artifact files
+          DIGEST_UBUNTU_LATEST=$(cat digest-ubuntu-latest/digest.txt)
+          DIGEST_UBUNTU_22=$(cat digest-ubuntu-22.04/digest.txt)
+          DIGEST_UBUNTU_24=$(cat digest-ubuntu-24.04/digest.txt)
+          DIGEST_SEQ_FIRST=$(cat digest-sequential/digest-first.txt)
+          DIGEST_SEQ_SECOND=$(cat digest-sequential/digest-second.txt)
+
+          # Export for summary step
+          echo "digest_ubuntu_latest=${DIGEST_UBUNTU_LATEST}" >> "$GITHUB_OUTPUT"
+          echo "digest_ubuntu_22=${DIGEST_UBUNTU_22}" >> "$GITHUB_OUTPUT"
+          echo "digest_ubuntu_24=${DIGEST_UBUNTU_24}" >> "$GITHUB_OUTPUT"
+          echo "digest_seq_first=${DIGEST_SEQ_FIRST}" >> "$GITHUB_OUTPUT"
+          echo "digest_seq_second=${DIGEST_SEQ_SECOND}" >> "$GITHUB_OUTPUT"
+
+          echo "Digests from parallel builds on different runners:"
+          echo "  ubuntu-latest:  ${DIGEST_UBUNTU_LATEST}"
+          echo "  ubuntu-22.04:   ${DIGEST_UBUNTU_22}"
+          echo "  ubuntu-24.04:   ${DIGEST_UBUNTU_24}"
+          echo ""
+          echo "Digests from sequential builds:"
+          echo "  First build:    ${DIGEST_SEQ_FIRST}"
+          echo "  Second build:   ${DIGEST_SEQ_SECOND}"
+          echo ""
+
+          # Verify all digests are non-empty
+          FAILED=false
+          for digest in "$DIGEST_UBUNTU_LATEST" "$DIGEST_UBUNTU_22" "$DIGEST_UBUNTU_24" "$DIGEST_SEQ_FIRST" "$DIGEST_SEQ_SECOND"; do
+            if [ -z "$digest" ]; then
+              echo "ERROR: One or more builds failed to produce a digest"
+              FAILED=true
+            fi
+          done
+
+          if [ "$FAILED" = true ]; then
+            exit 1
+          fi
+
+          # Compare all digests - they should all match
+          REFERENCE_DIGEST="$DIGEST_UBUNTU_LATEST"
+          MISMATCH=false
+
+          echo "=== Comparing all digests against reference (ubuntu-latest) ==="
+          echo ""
+
+          compare_digest() {
+            local name="$1"
+            local digest="$2"
+            if [ "$digest" = "$REFERENCE_DIGEST" ]; then
+              echo "[PASS] ${name}: MATCH"
+            else
+              echo "[FAIL] ${name}: MISMATCH"
+              echo "  Expected: ${REFERENCE_DIGEST}"
+              echo "  Got:      ${digest}"
+              MISMATCH=true
+            fi
+          }
+
+          compare_digest "ubuntu-22.04" "$DIGEST_UBUNTU_22"
+          compare_digest "ubuntu-24.04" "$DIGEST_UBUNTU_24"
+          compare_digest "Sequential first" "$DIGEST_SEQ_FIRST"
+          compare_digest "Sequential second" "$DIGEST_SEQ_SECOND"
+
+          echo ""
+
+          if [ "$MISMATCH" = true ]; then
+            echo "=== VERIFICATION FAILED ==="
+            echo "Build is NOT reproducible - digests do not match across environments"
+            echo "result=failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "=== VERIFICATION PASSED ==="
+            echo "Build is reproducible - all digests match: ${REFERENCE_DIGEST}"
+            echo "result=passed" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate summary
+        if: always()
+        run: |
+          {
+            echo "## Reproducible Build Verification"
+            echo ""
+            echo "### Digests"
+            echo ""
+            echo "| Environment | Digest |"
+            echo "|-------------|--------|"
+            echo "| ubuntu-latest | \`${{ steps.verify.outputs.digest_ubuntu_latest }}\` |"
+            echo "| ubuntu-22.04 | \`${{ steps.verify.outputs.digest_ubuntu_22 }}\` |"
+            echo "| ubuntu-24.04 | \`${{ steps.verify.outputs.digest_ubuntu_24 }}\` |"
+            echo "| Sequential (first) | \`${{ steps.verify.outputs.digest_seq_first }}\` |"
+            echo "| Sequential (second) | \`${{ steps.verify.outputs.digest_seq_second }}\` |"
+            echo ""
+
+            if [ "${{ steps.verify.outputs.result }}" = "passed" ]; then
+              echo "### Result: REPRODUCIBLE"
+              echo ""
+              echo "All builds produced identical digests."
+            else
+              echo "### Result: NOT REPRODUCIBLE"
+              echo ""
+              echo "Build digests do not match across environments."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

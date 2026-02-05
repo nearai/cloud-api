@@ -1488,9 +1488,6 @@ impl ResponseServiceImpl {
         model: &str,
         request_metadata: Option<&serde_json::Value>,
     ) -> Result<(), errors::ResponseError> {
-        // Use request metadata if present
-        let request_metadata_clone = request_metadata.cloned();
-
         match input {
             models::ResponseInput::Text(text) => {
                 // Create a message item for simple text input
@@ -1509,7 +1506,7 @@ impl ResponseServiceImpl {
                         text: trimmed_text.to_string(),
                     }],
                     model: model.to_string(),
-                    metadata: request_metadata_clone.clone(),
+                    metadata: request_metadata.cloned(),
                 };
 
                 response_items_repository
@@ -1584,7 +1581,7 @@ impl ResponseServiceImpl {
                     };
 
                     // Use item-level metadata if present, otherwise fall back to request metadata
-                    let item_metadata = metadata.or_else(|| request_metadata_clone.clone());
+                    let metadata = metadata.or_else(|| request_metadata.cloned());
 
                     let message_item = models::ResponseOutputItem::Message {
                         id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
@@ -1597,7 +1594,7 @@ impl ResponseServiceImpl {
                         role,
                         content,
                         model: model.to_string(),
-                        metadata: item_metadata,
+                        metadata,
                     };
 
                     response_items_repository

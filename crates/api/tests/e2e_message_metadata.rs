@@ -591,3 +591,106 @@ async fn test_conversation_items_without_metadata() {
         panic!("Expected Message item");
     }
 }
+
+/// Test that item-level metadata takes precedence over request-level metadata
+#[tokio::test]
+async fn test_conversation_items_metadata_precedence() {
+    let (server, _, _mock, _db, _guard) = setup_test_server_with_pool().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let model = setup_qwen_model(&server).await;
+
+    // Create a conversation
+    let conversation = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "name": "Test Conversation"
+        }))
+        .await;
+    assert_eq!(conversation.status_code(), 201);
+    let conversation: api::models::ConversationObject = conversation.json();
+
+    // Create a response with both request-level and item-level metadata
+    // Item-level metadata should take precedence
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": model,
+            "conversation": {
+                "id": conversation.id,
+            },
+            "metadata": {
+                "author_id": "request-author-id",
+                "author_name": "Request Author",
+                "request_field": "request-value"
+            },
+            "input": [{
+                "role": "user",
+                "content": "Hello",
+                "metadata": {
+                    "author_id": "item-author-id",
+                    "author_name": "Item Author",
+                    "item_field": "item-value"
+                }
+            }],
+            "stream": false,
+            "max_output_tokens": 10
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    let _response_obj: api::models::ResponseObject = response.json();
+
+    // List conversation items and verify metadata precedence
+    let items_response = server
+        .get(format!("/v1/conversations/{}/items", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+
+    assert_eq!(items_response.status_code(), 200);
+    let items: api::models::ConversationItemList = items_response.json();
+
+    // Find the user message
+    let user_message = items
+        .data
+        .iter()
+        .find(|item| {
+            if let api::models::ConversationItem::Message { role, .. } = item {
+                role == "user"
+            } else {
+                false
+            }
+        })
+        .expect("Should find user message in conversation items");
+
+    if let api::models::ConversationItem::Message { metadata, .. } = user_message {
+        // Item-level metadata should take precedence
+        let metadata = metadata.as_ref().expect("Metadata should be present");
+
+        // Item-level fields should be present
+        assert_eq!(
+            metadata["author_id"], "item-author-id",
+            "Item-level author_id should take precedence"
+        );
+        assert_eq!(
+            metadata["author_name"], "Item Author",
+            "Item-level author_name should take precedence"
+        );
+        assert_eq!(
+            metadata["item_field"], "item-value",
+            "Item-level field should be present"
+        );
+
+        // Request-level fields that don't conflict should NOT be present
+        // (because item-level metadata replaces the entire metadata object)
+        assert!(
+            metadata.get("request_field").is_none(),
+            "Request-level field should not be present when item-level metadata is provided"
+        );
+    } else {
+        panic!("Expected Message item");
+    }
+}

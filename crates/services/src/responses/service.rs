@@ -837,6 +837,7 @@ impl ResponseServiceImpl {
                 conversation_id,
                 input,
                 &context.request.model,
+                context.request.metadata.as_ref(),
             )
             .await?;
         }
@@ -1485,7 +1486,11 @@ impl ResponseServiceImpl {
         conversation_id: Option<ConversationId>,
         input: &models::ResponseInput,
         model: &str,
+        request_metadata: Option<&serde_json::Value>,
     ) -> Result<(), errors::ResponseError> {
+        // Use request metadata if present
+        let request_metadata_clone = request_metadata.cloned();
+
         match input {
             models::ResponseInput::Text(text) => {
                 // Create a message item for simple text input
@@ -1504,7 +1509,7 @@ impl ResponseServiceImpl {
                         text: trimmed_text.to_string(),
                     }],
                     model: model.to_string(),
-                    metadata: None,
+                    metadata: request_metadata_clone.clone(),
                 };
 
                 response_items_repository
@@ -1578,6 +1583,9 @@ impl ResponseServiceImpl {
                         }
                     };
 
+                    // Use item-level metadata if present, otherwise fall back to request metadata
+                    let item_metadata = metadata.or_else(|| request_metadata_clone.clone());
+
                     let message_item = models::ResponseOutputItem::Message {
                         id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
                         // These fields are placeholders - repository enriches them via JOIN when storing/retrieving
@@ -1589,7 +1597,7 @@ impl ResponseServiceImpl {
                         role,
                         content,
                         model: model.to_string(),
-                        metadata,
+                        metadata: item_metadata,
                     };
 
                     response_items_repository

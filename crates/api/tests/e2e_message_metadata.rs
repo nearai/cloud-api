@@ -410,22 +410,14 @@ async fn test_conversation_items_include_multiple_message_metadata() {
     let user_messages: Vec<_> = items
         .data
         .iter()
-        .filter_map(|item| {
-            if let api::models::ConversationItem::Message {
+        .filter_map(|item| match item {
+            api::models::ConversationItem::Message {
                 role,
                 metadata,
                 content,
                 ..
-            } = item
-            {
-                if role == "user" {
-                    Some((content, metadata))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+            } if role == "user" => Some((content, metadata)),
+            _ => None,
         })
         .collect();
 

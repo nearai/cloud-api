@@ -636,10 +636,12 @@ impl ResponseServiceImpl {
 
         // Convert accumulated tool calls to detected tool calls
         let available_tool_names = tools::get_tool_names(&process_context.request);
+        let function_tool_names = tools::get_function_tool_names(&process_context.request);
         let tool_calls_detected = tools::convert_tool_calls(
             tool_call_accumulator,
             &process_context.request.model,
             &available_tool_names,
+            &function_tool_names,
         );
 
         Ok(crate::responses::service_helpers::ProcessStreamResult {

@@ -34,14 +34,27 @@ pub struct FunctionToolExecutor {
 impl FunctionToolExecutor {
     /// Create a new FunctionToolExecutor from a request
     ///
-    /// Extracts all function tool names from the request's tools array.
+    /// Extracts all client-executed tool names from the request's tools array:
+    /// - Custom function tools (ResponseTool::Function)
+    /// - CodeInterpreter tool (client must execute, no server implementation)
+    /// - Computer tool (client must execute, no server implementation)
     pub fn new(request: &CreateResponseRequest) -> Self {
         let mut function_names = HashSet::new();
 
         if let Some(tools) = &request.tools {
             for tool in tools {
-                if let ResponseTool::Function { name, .. } = tool {
-                    function_names.insert(name.clone());
+                match tool {
+                    ResponseTool::Function { name, .. } => {
+                        function_names.insert(name.clone());
+                    }
+                    ResponseTool::CodeInterpreter {} => {
+                        function_names.insert(super::CODE_INTERPRETER_TOOL_NAME.to_string());
+                    }
+                    ResponseTool::Computer {} => {
+                        function_names.insert(super::COMPUTER_TOOL_NAME.to_string());
+                    }
+                    // Other tools are server-executed
+                    _ => {}
                 }
             }
         }
@@ -289,6 +302,130 @@ mod tests {
             ResponseError::FunctionCallRequired { name, call_id } => {
                 assert_eq!(name, "get_weather");
                 assert_eq!(call_id, ""); // Should be empty string, not None
+            }
+            other => panic!("Expected FunctionCallRequired, got: {:?}", other),
+        }
+    }
+
+    fn create_test_request_with_code_interpreter() -> CreateResponseRequest {
+        CreateResponseRequest {
+            model: "test".to_string(),
+            input: None,
+            instructions: None,
+            conversation: None,
+            previous_response_id: None,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            temperature: None,
+            top_p: None,
+            stream: None,
+            store: None,
+            background: None,
+            tools: Some(vec![ResponseTool::CodeInterpreter {}]),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            include: None,
+            metadata: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
+        }
+    }
+
+    fn create_test_request_with_computer() -> CreateResponseRequest {
+        CreateResponseRequest {
+            model: "test".to_string(),
+            input: None,
+            instructions: None,
+            conversation: None,
+            previous_response_id: None,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            temperature: None,
+            top_p: None,
+            stream: None,
+            store: None,
+            background: None,
+            tools: Some(vec![ResponseTool::Computer {}]),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            include: None,
+            metadata: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
+        }
+    }
+
+    #[test]
+    fn test_function_executor_handles_code_interpreter() {
+        let request = create_test_request_with_code_interpreter();
+        let executor = FunctionToolExecutor::new(&request);
+
+        // Should include code_interpreter as a client-executed tool
+        assert!(!executor.is_empty());
+        assert!(executor.can_handle("code_interpreter"));
+        assert!(!executor.can_handle("web_search")); // Built-in server-executed tool
+    }
+
+    #[test]
+    fn test_function_executor_handles_computer() {
+        let request = create_test_request_with_computer();
+        let executor = FunctionToolExecutor::new(&request);
+
+        // Should include computer as a client-executed tool
+        assert!(!executor.is_empty());
+        assert!(executor.can_handle("computer"));
+        assert!(!executor.can_handle("web_search")); // Built-in server-executed tool
+    }
+
+    #[tokio::test]
+    async fn test_code_interpreter_returns_function_call_required() {
+        let request = create_test_request_with_code_interpreter();
+        let executor = FunctionToolExecutor::new(&request);
+
+        let tool_call = ToolCallInfo {
+            id: Some("call_code_123".to_string()),
+            tool_type: "code_interpreter".to_string(),
+            query: "".to_string(),
+            params: Some(serde_json::json!({"code": "print('Hello')"})),
+            thought_signature: None,
+        };
+
+        let context = ToolExecutionContext { request: &request };
+        let result = executor.execute(&tool_call, &context).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ResponseError::FunctionCallRequired { name, call_id } => {
+                assert_eq!(name, "code_interpreter");
+                assert_eq!(call_id, "call_code_123");
+            }
+            other => panic!("Expected FunctionCallRequired, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_computer_returns_function_call_required() {
+        let request = create_test_request_with_computer();
+        let executor = FunctionToolExecutor::new(&request);
+
+        let tool_call = ToolCallInfo {
+            id: Some("call_computer_456".to_string()),
+            tool_type: "computer".to_string(),
+            query: "".to_string(),
+            params: Some(serde_json::json!({"action": "click", "x": 100, "y": 200})),
+            thought_signature: None,
+        };
+
+        let context = ToolExecutionContext { request: &request };
+        let result = executor.execute(&tool_call, &context).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ResponseError::FunctionCallRequired { name, call_id } => {
+                assert_eq!(name, "computer");
+                assert_eq!(call_id, "call_computer_456");
             }
             other => panic!("Expected FunctionCallRequired, got: {:?}", other),
         }

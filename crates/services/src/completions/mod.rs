@@ -411,6 +411,18 @@ where
     }
 }
 
+/// RAII guard for concurrent request slots
+/// Automatically releases the slot when dropped, ensuring proper cleanup even if the request panics
+struct ConcurrentSlotGuard {
+    counter: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl Drop for ConcurrentSlotGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Release);
+    }
+}
+
 pub struct CompletionServiceImpl {
     pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub attestation_service: Arc<dyn AttestationServiceTrait>,
@@ -1074,6 +1086,40 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         });
 
         Ok(response_with_bytes)
+    }
+
+    async fn try_rerank(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        params: inference_providers::RerankParams,
+    ) -> Result<inference_providers::RerankResponse, ports::CompletionError> {
+        // Acquire concurrent request slot to enforce organization limits
+        let counter = self
+            .try_acquire_concurrent_slot(organization_id, model_id, model_name)
+            .await?;
+
+        // Create RAII guard to ensure slot is released on drop (panic, error, or success)
+        let _guard = ConcurrentSlotGuard { counter };
+
+        // Call inference provider pool
+        // The guard will automatically release the slot when this function returns or panics
+        let result = self.inference_provider_pool.rerank(params).await;
+
+        // Map provider errors to service errors
+        result.map_err(|e| {
+            let error_msg = match e {
+                inference_providers::RerankError::GenerationError(msg) => msg,
+                inference_providers::RerankError::HttpError {
+                    status_code,
+                    message,
+                } => {
+                    format!("HTTP {}: {}", status_code, message)
+                }
+            };
+            ports::CompletionError::ProviderError(error_msg)
+        })
     }
 }
 

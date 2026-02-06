@@ -4,8 +4,8 @@ use inference_providers::{
     models::{AttestationError, CompletionError, ListModelsError, ModelsResponse},
     ChatCompletionParams, ExternalProvider, ExternalProviderConfig, ImageEditError,
     ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
-    ImageGenerationResponseWithBytes, InferenceProvider, ProviderConfig, StreamingResult,
-    StreamingResultExt, VLlmConfig, VLlmProvider,
+    ImageGenerationResponseWithBytes, InferenceProvider, ProviderConfig, RerankError, RerankParams,
+    RerankResponse, StreamingResult, StreamingResultExt, VLlmConfig, VLlmProvider,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -1226,6 +1226,82 @@ impl InferenceProviderPool {
         Ok(response)
     }
 
+    pub async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+        let model_id = params.model.clone();
+
+        tracing::debug!(
+            model = %model_id,
+            document_count = params.documents.len(),
+            "Starting rerank request"
+        );
+
+        // Check if this model exists as an external provider - reranking is not supported for external models
+        if self.get_external_provider(&model_id).await.is_some() {
+            return Err(RerankError::GenerationError(format!(
+                "Reranking is not supported for external provider models. \
+                 Model '{}' is configured as an external provider. \
+                 Reranking is only available for vLLM providers.",
+                model_id
+            )));
+        }
+
+        // Ensure vLLM models are discovered
+        self.ensure_models_discovered().await.map_err(|e| {
+            RerankError::GenerationError(Self::sanitize_error_message(&e.to_string()))
+        })?;
+
+        // Get vLLM providers with load balancing
+        let providers = match self.get_providers_with_fallback(&model_id, None).await {
+            Some(p) => p,
+            None => {
+                let mappings = self.provider_mappings.read().await;
+                let available_models: Vec<_> = mappings.model_to_providers.keys().collect();
+
+                tracing::error!(
+                    model_id = %model_id,
+                    available_models = ?available_models,
+                    operation = "rerank",
+                    "No vLLM provider found for model"
+                );
+
+                return Err(RerankError::GenerationError(format!(
+                    "Model '{}' not found in vLLM providers. Available models: {:?}",
+                    model_id, available_models
+                )));
+            }
+        };
+
+        // Try reranking with each provider (with fallback)
+        let mut last_error = None;
+        for provider in providers {
+            match provider.rerank(params.clone()).await {
+                Ok(response) => {
+                    tracing::info!(
+                        model = %model_id,
+                        result_count = response.results.len(),
+                        "Rerank completed successfully"
+                    );
+                    return Ok(response);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        model = %model_id,
+                        error = %e,
+                        "Rerank failed with provider, trying next"
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // All providers failed
+        let error_msg = last_error
+            .map(|e| Self::sanitize_error_message(&e.to_string()))
+            .unwrap_or_else(|| "No providers available for reranking".to_string());
+
+        Err(RerankError::GenerationError(error_msg))
+    }
+
     /// Create an external provider from a model name and provider config JSON.
     /// Returns a tuple of (provider Arc, backend_type string) without inserting it into any map.
     fn create_external_provider(
@@ -1530,6 +1606,27 @@ mod tests {
 
         // HTTP status should still be present (not sensitive)
         assert!(sanitized.contains("401 Unauthorized"));
+
+        // Test that "not found" keywords are preserved for error detection
+        // This is important because route handlers check for "not found" to return 404 errors
+        let error_not_found =
+            "Model 'Qwen/Qwen3-Reranker-0.6B' not found at http://192.168.0.1:8000";
+        let sanitized_not_found = InferenceProviderPool::sanitize_error_message(error_not_found);
+        assert!(
+            sanitized_not_found.contains("not found"),
+            "Keywords 'not found' must be preserved for error detection"
+        );
+        assert!(!sanitized_not_found.contains("http://"));
+        assert!(!sanitized_not_found.contains("192.168.0.1"));
+
+        let error_does_not_exist =
+            "Model 'gpt-4' does not exist on the server https://api.example.com";
+        let sanitized_exists = InferenceProviderPool::sanitize_error_message(error_does_not_exist);
+        assert!(
+            sanitized_exists.contains("does not exist"),
+            "Keywords 'does not exist' must be preserved for error detection"
+        );
+        assert!(!sanitized_exists.contains("https://api.example.com"));
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@
 use crate::{
     ChatCompletionParams, ChatCompletionResponseWithBytes, CompletionError, ImageEditError,
     ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
-    ImageGenerationResponseWithBytes, StreamingResult,
+    ImageGenerationResponseWithBytes, RerankError, RerankParams, RerankResponse, StreamingResult,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -108,6 +108,26 @@ pub trait ExternalBackend: Send + Sync {
     ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
         Err(ImageEditError::EditError(format!(
             "Image editing is not supported by the {} backend.",
+            self.backend_type()
+        )))
+    }
+
+    /// Performs a document reranking request
+    ///
+    /// The backend is responsible for:
+    /// - Translating RerankParams to provider-specific format
+    /// - Making the HTTP request
+    /// - Parsing the response and translating it back to our RerankResponse format
+    ///
+    /// Default implementation returns an error indicating reranking is not supported.
+    async fn rerank(
+        &self,
+        _config: &BackendConfig,
+        _model: &str,
+        _params: RerankParams,
+    ) -> Result<RerankResponse, RerankError> {
+        Err(RerankError::GenerationError(format!(
+            "Reranking is not supported by the {} backend.",
             self.backend_type()
         )))
     }

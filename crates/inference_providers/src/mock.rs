@@ -10,7 +10,8 @@ use crate::{
     CompletionParams, FinishReason, FunctionCallDelta, ImageData, ImageEditError, ImageEditParams,
     ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
     ImageGenerationResponse, ImageGenerationResponseWithBytes, ListModelsError, MessageRole,
-    ModelInfo, ModelsResponse, SSEEvent, StreamChunk, StreamingResult, TokenUsage, ToolCallDelta,
+    ModelInfo, ModelsResponse, RerankError, RerankParams, RerankResponse, RerankResult,
+    RerankUsage, SSEEvent, StreamChunk, StreamingResult, TokenUsage, ToolCallDelta,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -925,6 +926,45 @@ impl crate::InferenceProvider for MockProvider {
             response,
             raw_bytes,
         })
+    }
+
+    async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+        // Check for invalid model
+        if !self.is_valid_model(&params.model) {
+            return Err(RerankError::GenerationError(format!(
+                "The model `{}` does not exist.",
+                params.model
+            )));
+        }
+
+        // Generate mock reranked results with decreasing relevance scores
+        let mut results: Vec<RerankResult> = (0..params.documents.len())
+            .map(|i| {
+                // Generate decreasing relevance scores (1.0 for first, 0.0 for last)
+                let relevance_score =
+                    (params.documents.len() as f64 - i as f64) / params.documents.len() as f64;
+                RerankResult {
+                    index: i as i32,
+                    relevance_score,
+                    document: Some(serde_json::Value::String(params.documents[i].clone())),
+                }
+            })
+            .collect();
+
+        // Sort by relevance score descending
+        results.sort_by(|a, b| b.relevance_score.partial_cmp(&a.relevance_score).unwrap());
+
+        let response = RerankResponse {
+            id: format!("rerank-{}", self.generate_id()),
+            model: params.model.clone(),
+            results,
+            usage: Some(RerankUsage {
+                prompt_tokens: None,
+                total_tokens: Some(50),
+            }),
+        };
+
+        Ok(response)
     }
 
     async fn get_signature(

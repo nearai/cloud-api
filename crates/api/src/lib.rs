@@ -16,7 +16,7 @@ use crate::{
             StateStore,
         },
         billing::{get_billing_costs, BillingRouteState},
-        completions::{chat_completions, image_edits, image_generations, models},
+        completions::{chat_completions, image_edits, image_generations, models, rerank},
         conversations,
         health::health_check,
         models::{get_model_by_name, list_models, ModelsAppState},
@@ -592,6 +592,7 @@ pub async fn init_inference_providers_with_mocks(
         "deepseek-ai/DeepSeek-V3.1".to_string(),
         "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string(),
         "Qwen/Qwen-Image-2512".to_string(),
+        "Qwen/Qwen3-Reranker-0.6B".to_string(),
     ];
 
     let providers: Vec<(
@@ -658,6 +659,7 @@ pub fn build_app_with_config(
         user_service: domain_services.user_service.clone(),
         files_service: domain_services.files_service.clone(),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
+        metrics_service: domain_services.metrics_service.clone(),
         config: config.clone(),
     };
 
@@ -877,6 +879,7 @@ pub fn build_completion_routes(
     let text_inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
         .route("/images/generations", post(image_generations))
+        .route("/rerank", post(rerank))
         .with_state(app_state.clone())
         .layer(from_fn_with_state(
             usage_state.clone(),

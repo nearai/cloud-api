@@ -32,7 +32,8 @@ use crate::{
     AttestationError, ChatCompletionParams, ChatCompletionResponseWithBytes, ChatSignature,
     CompletionError, CompletionParams, ImageEditError, ImageEditParams, ImageEditResponseWithBytes,
     ImageGenerationError, ImageGenerationParams, ImageGenerationResponseWithBytes,
-    InferenceProvider, ListModelsError, ModelsResponse, StreamingResult,
+    InferenceProvider, ListModelsError, ModelsResponse, RerankError, RerankParams, RerankResponse,
+    StreamingResult,
 };
 use async_trait::async_trait;
 use backend::{BackendConfig, ExternalBackend};
@@ -307,6 +308,12 @@ impl InferenceProvider for ExternalProvider {
     ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
         self.backend
             .image_edit(&self.config, &self.model_name, params)
+            .await
+    }
+
+    async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+        self.backend
+            .rerank(&self.config, &self.model_name, params)
             .await
     }
 }

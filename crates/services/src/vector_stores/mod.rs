@@ -418,8 +418,7 @@ impl VectorStoreServiceImpl {
             .get_by_ids_and_workspace(file_uuids, workspace_id)
             .await?;
         if files.len() != file_uuids.len() {
-            let found_ids: std::collections::HashSet<Uuid> =
-                files.iter().map(|f| f.id).collect();
+            let found_ids: std::collections::HashSet<Uuid> = files.iter().map(|f| f.id).collect();
             let missing: Vec<String> = file_uuids
                 .iter()
                 .filter(|id| !found_ids.contains(id))

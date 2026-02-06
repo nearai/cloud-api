@@ -117,8 +117,15 @@ impl VectorStoreRefRepository for PgVectorStoreRefRepository {
         workspace_id: Uuid,
         params: &PaginationParams,
     ) -> Result<(Vec<VectorStoreRef>, bool), RepositoryError> {
-        enum OrderDir { Asc, Desc }
-        let dir = if params.order == "asc" { OrderDir::Asc } else { OrderDir::Desc };
+        enum OrderDir {
+            Asc,
+            Desc,
+        }
+        let dir = if params.order == "asc" {
+            OrderDir::Asc
+        } else {
+            OrderDir::Desc
+        };
         let use_before = params.after.is_none() && params.before.is_some();
         let cursor_id = params.after.or(params.before);
 

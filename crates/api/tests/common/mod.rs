@@ -427,6 +427,41 @@ pub async fn setup_test_server_with_mcp_factory(
     (server, inference_provider_pool, mock_provider, infra.guard)
 }
 
+/// Setup test server with RAG service injection (for vector store tests).
+pub async fn setup_test_server_with_rag(
+    rag_service: std::sync::Arc<dyn services::rag::RagServiceTrait>,
+) -> (axum_test::TestServer, TestDatabaseGuard) {
+    let infra = setup_test_infrastructure().await;
+
+    assert_mock_user_in_db(&infra.database).await;
+
+    let auth_components = init_auth_services(infra.database.clone(), &infra.config);
+
+    let (inference_provider_pool, _mock_provider) =
+        api::init_inference_providers_with_mocks(&infra.config).await;
+    let metrics_service = Arc::new(services::metrics::MockMetricsService);
+
+    let domain_services = api::init_domain_services_with_rag(
+        infra.database.clone(),
+        &infra.config,
+        auth_components.organization_service.clone(),
+        inference_provider_pool,
+        metrics_service,
+        rag_service,
+    )
+    .await;
+
+    let app = api::build_app_with_config(
+        infra.database.clone(),
+        auth_components,
+        domain_services,
+        Arc::new(infra.config),
+    );
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    (server, infra.guard)
+}
+
 pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, String) {
     let user_id = uuid::Uuid::new_v4();
     let user_id_str = user_id.to_string();

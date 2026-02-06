@@ -583,6 +583,45 @@ pub async fn init_domain_services_with_mcp_factory(
     domain_services
 }
 
+/// Initialize domain services with a custom RAG service (for testing vector stores)
+#[allow(clippy::too_many_arguments)]
+pub async fn init_domain_services_with_rag(
+    database: Arc<Database>,
+    config: &ApiConfig,
+    organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
+    inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+    metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
+    rag_service: Arc<dyn services::rag::RagServiceTrait>,
+) -> DomainServices {
+    // Get the base domain services (uses NotConfiguredRagService since config.rag_service is None)
+    let mut domain_services = init_domain_services_with_pool(
+        database.clone(),
+        config,
+        organization_service,
+        inference_provider_pool,
+        metrics_service,
+    )
+    .await;
+
+    // Replace vector_store_service with one using the injected RAG service
+    let vs_ref_repo = Arc::new(database::PgVectorStoreRefRepository::new(
+        database.pool().clone(),
+    )) as Arc<dyn services::vector_stores::VectorStoreRefRepository>;
+
+    let file_repository = Arc::new(database::repositories::FileRepository::new(
+        database.pool().clone(),
+    )) as Arc<dyn services::files::FileRepositoryTrait>;
+
+    domain_services.vector_store_service =
+        Arc::new(services::vector_stores::VectorStoreServiceImpl::new(
+            vs_ref_repo,
+            file_repository,
+            rag_service,
+        ));
+
+    domain_services
+}
+
 /// Initialize inference provider pool
 pub async fn init_inference_providers(
     config: &ApiConfig,

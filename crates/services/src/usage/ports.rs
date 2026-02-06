@@ -277,7 +277,7 @@ pub struct RecordUsageServiceRequest {
     pub model_id: Uuid,
     pub input_tokens: i32,
     pub output_tokens: i32,
-    pub inference_type: String, // 'chat_completion', 'chat_completion_stream', 'image_generation', etc.
+    pub inference_type: String, // 'chat_completion', 'chat_completion_stream', 'image_generation', 'image_edit', etc.
     /// Time to first token in milliseconds
     pub ttft_ms: Option<i32>,
     /// Average inter-token latency in milliseconds
@@ -427,6 +427,7 @@ pub enum UsageError {
     LimitExceeded(String),
     Unauthorized(String),
     NotFound(String),
+    CostCalculationOverflow(String),
 }
 
 impl std::fmt::Display for UsageError {
@@ -437,6 +438,9 @@ impl std::fmt::Display for UsageError {
             UsageError::LimitExceeded(msg) => write!(f, "Limit exceeded: {msg}"),
             UsageError::Unauthorized(msg) => write!(f, "Unauthorized: {msg}"),
             UsageError::NotFound(msg) => write!(f, "Not found: {msg}"),
+            UsageError::CostCalculationOverflow(msg) => {
+                write!(f, "Cost calculation overflow: {msg}")
+            }
         }
     }
 }

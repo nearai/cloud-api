@@ -5,9 +5,7 @@ use crate::inference_provider_pool::InferenceProviderPool;
 use crate::models::ModelsRepository;
 use crate::responses::models::ResponseId;
 use crate::usage::{RecordUsageServiceRequest, UsageServiceTrait};
-use inference_providers::{
-    ChatMessage, MessageRole, SSEEvent, ScoreError, StreamChunk, StreamingResult,
-};
+use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, StreamingResult};
 use moka::future::Cache;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -413,6 +411,18 @@ where
     }
 }
 
+/// RAII guard for concurrent request slots
+/// Automatically releases the slot when dropped, ensuring proper cleanup even if the request panics
+struct ConcurrentSlotGuard {
+    counter: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl Drop for ConcurrentSlotGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Release);
+    }
+}
+
 pub struct CompletionServiceImpl {
     pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub attestation_service: Arc<dyn AttestationServiceTrait>,
@@ -425,8 +435,6 @@ pub struct CompletionServiceImpl {
     org_concurrent_limits: Cache<Uuid, u32>,
     /// Repository for fetching organization concurrent limits
     organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
-    /// Inference timeout in seconds for service-level timeout protection
-    inference_timeout_secs: u64,
 }
 
 /// TTL for organization concurrent limit cache (5 minutes)
@@ -440,26 +448,6 @@ impl CompletionServiceImpl {
         metrics_service: Arc<dyn MetricsServiceTrait>,
         models_repository: Arc<dyn ModelsRepository>,
         organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
-    ) -> Self {
-        Self::with_timeout(
-            inference_provider_pool,
-            attestation_service,
-            usage_service,
-            metrics_service,
-            models_repository,
-            organization_limit_repository,
-            300, // Default 5 minutes
-        )
-    }
-
-    pub fn with_timeout(
-        inference_provider_pool: Arc<InferenceProviderPool>,
-        attestation_service: Arc<dyn AttestationServiceTrait>,
-        usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
-        metrics_service: Arc<dyn MetricsServiceTrait>,
-        models_repository: Arc<dyn ModelsRepository>,
-        organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
-        inference_timeout_secs: u64,
     ) -> Self {
         let concurrent_counts = Cache::builder().max_capacity(100_000).build();
 
@@ -479,8 +467,27 @@ impl CompletionServiceImpl {
             concurrent_limit: DEFAULT_CONCURRENT_LIMIT,
             org_concurrent_limits,
             organization_limit_repository,
-            inference_timeout_secs,
         }
+    }
+
+    /// Extract tools and tool_choice from extra HashMap if present.
+    /// This handles the case where the Responses API places tools in request.extra.
+    /// Returns (tools, tool_choice) and removes them from extra to avoid duplication.
+    fn extract_tools_from_extra(
+        extra: &mut std::collections::HashMap<String, serde_json::Value>,
+    ) -> (
+        Option<Vec<inference_providers::ToolDefinition>>,
+        Option<inference_providers::ToolChoice>,
+    ) {
+        let tools = extra.remove("tools").and_then(|v| {
+            serde_json::from_value::<Vec<inference_providers::ToolDefinition>>(v).ok()
+        });
+
+        let tool_choice = extra
+            .remove("tool_choice")
+            .and_then(|v| serde_json::from_value::<inference_providers::ToolChoice>(v).ok());
+
+        (tools, tool_choice)
     }
 
     /// Get the concurrent request limit for an organization (cached)
@@ -585,17 +592,36 @@ impl CompletionServiceImpl {
     fn prepare_chat_messages(messages: &[ports::CompletionMessage]) -> Vec<ChatMessage> {
         messages
             .iter()
-            .map(|msg| ChatMessage {
-                role: match msg.role.as_str() {
-                    "system" => MessageRole::System,
-                    "assistant" => MessageRole::Assistant,
-                    "tool" => MessageRole::Tool,
-                    _ => MessageRole::User,
-                },
-                content: Some(serde_json::Value::String(msg.content.clone())),
-                name: None,
-                tool_call_id: None,
-                tool_calls: None,
+            .map(|msg| {
+                // Convert tool_calls from CompletionToolCall to inference_providers::models::ToolCall
+                let tool_calls = msg.tool_calls.as_ref().map(|calls| {
+                    calls
+                        .iter()
+                        .map(|tc| inference_providers::models::ToolCall {
+                            id: Some(tc.id.clone()),
+                            type_: Some("function".to_string()),
+                            function: inference_providers::models::FunctionCall {
+                                name: Some(tc.name.clone()),
+                                arguments: Some(tc.arguments.clone()),
+                            },
+                            index: None,
+                            thought_signature: tc.thought_signature.clone(),
+                        })
+                        .collect()
+                });
+
+                ChatMessage {
+                    role: match msg.role.as_str() {
+                        "system" => MessageRole::System,
+                        "assistant" => MessageRole::Assistant,
+                        "tool" => MessageRole::Tool,
+                        _ => MessageRole::User,
+                    },
+                    content: Some(serde_json::Value::String(msg.content.clone())),
+                    name: None,
+                    tool_call_id: msg.tool_call_id.clone(),
+                    tool_calls,
+                }
             })
             .collect()
     }
@@ -723,6 +749,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         let chat_messages = Self::prepare_chat_messages(&request.messages);
 
+        // Extract tools from extra if present (Responses API puts them there)
+        let mut extra = request.extra.clone();
+        let (tools, tool_choice) = Self::extract_tools_from_extra(&mut extra);
+
         let mut chat_params = inference_providers::ChatCompletionParams {
             model: request.model.clone(),
             messages: chat_messages,
@@ -731,7 +761,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             top_p: request.top_p,
             stop: request.stop,
             stream: Some(true),
-            tools: None,
+            tools,
             max_completion_tokens: None,
             n: request.n,
             frequency_penalty: None,
@@ -741,13 +771,18 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             top_logprobs: None,
             user: Some(request.user_id.to_string()),
             seed: None,
-            tool_choice: None,
+            tool_choice,
             parallel_tool_calls: None,
-            metadata: request.metadata,
-            store: None,
+            // Drop metadata if store is not explicitly enabled (OpenAI requirement)
+            metadata: if request.store == Some(true) {
+                request.metadata.clone()
+            } else {
+                None
+            },
+            store: request.store,
             stream_options: None,
             modalities: None,
-            extra: request.extra.clone(),
+            extra,
         };
 
         // Resolve model name (could be an alias) and get model details in a single DB call
@@ -844,6 +879,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let service_start_time = Instant::now();
         let chat_messages = Self::prepare_chat_messages(&request.messages);
 
+        // Extract tools from extra if present (Responses API puts them there)
+        let mut extra = request.extra.clone();
+        let (tools, tool_choice) = Self::extract_tools_from_extra(&mut extra);
+
         let mut chat_params = inference_providers::ChatCompletionParams {
             model: request.model.clone(),
             messages: chat_messages,
@@ -852,7 +891,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             top_p: request.top_p,
             stop: request.stop,
             stream: Some(false),
-            tools: None,
+            tools,
             max_completion_tokens: None,
             n: request.n,
             frequency_penalty: None,
@@ -862,13 +901,18 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             top_logprobs: None,
             user: Some(request.user_id.to_string()),
             seed: None,
-            tool_choice: None,
+            tool_choice,
             parallel_tool_calls: None,
-            metadata: request.metadata,
-            store: None,
+            // Drop metadata if store is not explicitly enabled (OpenAI requirement)
+            metadata: if request.store == Some(true) {
+                request.metadata.clone()
+            } else {
+                None
+            },
+            store: request.store,
             stream_options: None,
             modalities: None,
-            extra: request.extra.clone(),
+            extra,
         };
 
         // Resolve model name (could be an alias) and get model details in a single DB call
@@ -1044,117 +1088,38 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         Ok(response_with_bytes)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn try_score(
+    async fn try_rerank(
         &self,
-        organization_id: uuid::Uuid,
-        workspace_id: uuid::Uuid,
-        model_id: uuid::Uuid,
+        organization_id: Uuid,
+        model_id: Uuid,
         model_name: &str,
-        api_key_id: Uuid,
-        params: inference_providers::ScoreParams,
-        request_hash: String,
-    ) -> Result<inference_providers::ScoreResponse, ports::CompletionError> {
+        params: inference_providers::RerankParams,
+    ) -> Result<inference_providers::RerankResponse, ports::CompletionError> {
         // Acquire concurrent request slot to enforce organization limits
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
             .await?;
 
-        // RAII guard to ensure slot is always released, even on panic or task cancellation
-        struct SlotGuard {
-            counter: Arc<AtomicU32>,
-        }
-        impl Drop for SlotGuard {
-            fn drop(&mut self) {
-                self.counter.fetch_sub(1, Ordering::Release);
-            }
-        }
-        let _guard = SlotGuard {
-            counter: counter.clone(),
-        };
+        // Create RAII guard to ensure slot is released on drop (panic, error, or success)
+        let _guard = ConcurrentSlotGuard { counter };
 
-        // Call inference provider pool with service-level timeout protection
-        // Defense-in-depth: even if backend timeout fails, we still protect the concurrent slot
-        let response = match tokio::time::timeout(
-            Duration::from_secs(self.inference_timeout_secs),
-            self.inference_provider_pool.score(params, request_hash),
-        )
-        .await
-        {
-            Ok(Ok(response)) => response,
-            Ok(Err(e)) => {
-                // Provider error - map ScoreError to CompletionError
-                let error_msg = match e {
-                    ScoreError::GenerationError(msg) => msg,
-                    ScoreError::HttpError {
-                        status_code,
-                        message,
-                    } => {
-                        format!("HTTP {}: {}", status_code, message)
-                    }
-                };
-                return Err(ports::CompletionError::ProviderError(error_msg));
-            }
-            Err(_) => {
-                // Timeout error
-                tracing::warn!(
-                    "Score request timeout after {} seconds",
-                    self.inference_timeout_secs
-                );
-                return Err(ports::CompletionError::ProviderError(format!(
-                    "Scoring request timed out after {} seconds",
-                    self.inference_timeout_secs
-                )));
-            }
-        };
+        // Call inference provider pool
+        // The guard will automatically release the slot when this function returns or panics
+        let result = self.inference_provider_pool.rerank(params).await;
 
-        // CRITICAL: Record usage BEFORE releasing the concurrent slot
-        // This prevents a race condition where:
-        // 1. Provider call succeeds
-        // 2. Slot is released (guard dropped)
-        // 3. Another request acquires the slot
-        // 4. Usage recording fails → returns 500 without billing
-        // 5. Organization bypasses concurrent limits without being charged
-        //
-        // By recording usage here (while holding the slot), we ensure
-        // atomicity: either the full request (inference + billing) succeeds,
-        // or the slot is released after an error is returned.
-        let token_count = response
-            .usage
-            .as_ref()
-            .and_then(|u| u.prompt_tokens)
-            .unwrap_or(0);
-
-        let inference_id = uuid::Uuid::new_v4();
-        let usage_request = RecordUsageServiceRequest {
-            organization_id,
-            workspace_id,
-            api_key_id,
-            model_id,
-            input_tokens: token_count,
-            output_tokens: 0,
-            inference_type: "score".to_string(),
-            ttft_ms: None,
-            avg_itl_ms: None,
-            inference_id: Some(inference_id),
-            provider_request_id: None,
-            stop_reason: Some(crate::usage::StopReason::Completed),
-            response_id: None,
-            image_count: None,
-        };
-
-        // Record usage synchronously - this is billing-critical and must succeed
-        // If this fails, we return an error while still holding the slot
-        // This ensures the organization is charged OR the request fails atomically
-        if let Err(e) = self.usage_service.record_usage(usage_request).await {
-            tracing::error!(error = %e, "Failed to record score usage - request will fail");
-            return Err(ports::CompletionError::InternalError(
-                "Failed to record usage - please retry".to_string(),
-            ));
-        }
-
-        // Slot is released here via Drop (after usage is recorded)
-        Ok(response)
+        // Map provider errors to service errors
+        result.map_err(|e| {
+            let error_msg = match e {
+                inference_providers::RerankError::GenerationError(msg) => msg,
+                inference_providers::RerankError::HttpError {
+                    status_code,
+                    message,
+                } => {
+                    format!("HTTP {}: {}", status_code, message)
+                }
+            };
+            ports::CompletionError::ProviderError(error_msg)
+        })
     }
 }
 

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,7 +36,7 @@ pub struct ChatDelta {
     pub reasoning: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
     System,
@@ -58,6 +59,10 @@ pub struct ToolCall {
     /// Index of the tool call in streaming responses (for tracking multiple parallel tool calls)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<i64>,
+    /// Thought signature for Gemini 3 models (required for tool calls to work correctly)
+    /// Only included if the model returned one - older models don't use this
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 /// Delta tool call in streaming chat completions
@@ -72,6 +77,9 @@ pub struct ToolCallDelta {
     pub index: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function: Option<FunctionCallDelta>,
+    /// Thought signature for Gemini 3 models (internal use only, not exposed to clients)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 /// Function call details
@@ -739,6 +747,102 @@ pub struct ImageGenerationResponseWithBytes {
 #[derive(Debug, Error, Clone, Serialize, Deserialize)]
 pub enum ImageGenerationError {
     #[error("Failed to generate image: {0}")]
+    GenerationError(String),
+    #[error("HTTP error {status_code}: {message}")]
+    HttpError { status_code: u16, message: String },
+}
+
+/// Parameters for image edit requests
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageEditParams {
+    /// Model ID to use for editing
+    pub model: String,
+    /// Text prompt describing the edits to make
+    pub prompt: String,
+    /// Image bytes to edit (raw PNG/JPEG data)
+    /// Wrapped in Arc to avoid cloning large data (up to 512MB) during retry attempts.
+    /// Cloning ImageEditParams is now cheap (clones only the Arc pointer, not the data).
+    pub image: Arc<Vec<u8>>,
+    /// Size of the generated images in WxH format (e.g., "1024x1024", "512x512")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// Response format: "b64_json" or "url" (only "b64_json" is supported for verifiable models)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+}
+
+/// Image edit response (reuses same structure as image generation)
+pub type ImageEditResponse = ImageGenerationResponse;
+
+/// Image edit response with raw bytes (for TEE verification)
+pub type ImageEditResponseWithBytes = ImageGenerationResponseWithBytes;
+
+/// Image edit errors
+#[derive(Debug, Error, Clone, Serialize, Deserialize)]
+pub enum ImageEditError {
+    #[error("Failed to edit image: {0}")]
+    EditError(String),
+    #[error("HTTP error {status_code}: {message}")]
+    HttpError { status_code: u16, message: String },
+}
+
+// ========== Rerank Models ==========
+
+/// Parameters for document reranking
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankParams {
+    /// Model ID to use for reranking
+    pub model: String,
+    /// Query to rerank documents against
+    pub query: String,
+    /// Documents to rerank
+    pub documents: Vec<String>,
+    /// Extra parameters for future extensions
+    #[serde(flatten, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Response from document reranking
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankResponse {
+    /// Unique identifier for the rerank request
+    pub id: String,
+    /// Model used for reranking
+    pub model: String,
+    /// Reranked results
+    pub results: Vec<RerankResult>,
+    /// Usage information (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<RerankUsage>,
+}
+
+/// Individual reranked result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankResult {
+    /// Index of the document in the original input
+    pub index: i32,
+    /// Relevance score (typically 0.0 to 1.0)
+    pub relevance_score: f64,
+    /// The document (can be string or object depending on provider)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document: Option<serde_json::Value>,
+}
+
+/// Usage information for rerank request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankUsage {
+    /// Input tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<i32>,
+    /// Total number of tokens used
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<i32>,
+}
+
+/// Reranking errors
+#[derive(Debug, Error, Clone, Serialize, Deserialize)]
+pub enum RerankError {
+    #[error("Failed to rerank documents: {0}")]
     GenerationError(String),
     #[error("HTTP error {status_code}: {message}")]
     HttpError { status_code: u16, message: String },

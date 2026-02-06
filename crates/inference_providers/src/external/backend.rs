@@ -5,12 +5,13 @@
 //! and the provider's native format.
 
 use crate::{
-    ChatCompletionParams, ChatCompletionResponseWithBytes, CompletionError, ImageGenerationError,
-    ImageGenerationParams, ImageGenerationResponseWithBytes, ScoreError, ScoreParams,
-    ScoreResponse, StreamingResult,
+    ChatCompletionParams, ChatCompletionResponseWithBytes, CompletionError, ImageEditError,
+    ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponseWithBytes, RerankError, RerankParams, ScoreError, ScoreParams, RerankResponse, ScoreResponse, StreamingResult,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Configuration for a backend connection
 #[derive(Debug, Clone)]
@@ -91,6 +92,26 @@ pub trait ExternalBackend: Send + Sync {
         )))
     }
 
+    /// Performs an image edit request
+    ///
+    /// The backend is responsible for:
+    /// - Translating ImageEditParams to provider-specific format
+    /// - Making the HTTP request
+    /// - Parsing the response and translating it back to our ImageEditResponse format
+    ///
+    /// Default implementation returns an error indicating image editing is not supported.
+    async fn image_edit(
+        &self,
+        _config: &BackendConfig,
+        _model: &str,
+        _params: Arc<ImageEditParams>,
+    ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
+        Err(ImageEditError::EditError(format!(
+            "Image editing is not supported by the {} backend.",
+            self.backend_type()
+        )))
+    }
+
     /// Performs a text similarity scoring request
     ///
     /// The backend is responsible for:
@@ -106,7 +127,27 @@ pub trait ExternalBackend: Send + Sync {
         _params: ScoreParams,
     ) -> Result<ScoreResponse, ScoreError> {
         Err(ScoreError::GenerationError(format!(
-            "Text similarity scoring is not supported by the {} backend.",
+            "Scoring is not supported by the {} backend.",
+            self.backend_type()
+        )))
+    }
+
+    /// Performs a document reranking request
+    ///
+    /// The backend is responsible for:
+    /// - Translating RerankParams to provider-specific format
+    /// - Making the HTTP request
+    /// - Parsing the response and translating it back to our RerankResponse format
+    ///
+    /// Default implementation returns an error indicating reranking is not supported.
+    async fn rerank(
+        &self,
+        _config: &BackendConfig,
+        _model: &str,
+        _params: RerankParams,
+    ) -> Result<RerankResponse, RerankError> {
+        Err(RerankError::GenerationError(format!(
+            "Reranking is not supported by the {} backend.",
             self.backend_type()
         )))
     }

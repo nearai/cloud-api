@@ -30,9 +30,10 @@ pub mod openai_compatible;
 
 use crate::{
     AttestationError, ChatCompletionParams, ChatCompletionResponseWithBytes, ChatSignature,
-    CompletionError, CompletionParams, ImageGenerationError, ImageGenerationParams,
-    ImageGenerationResponseWithBytes, InferenceProvider, ListModelsError, ModelsResponse,
-    ScoreError, ScoreParams, ScoreResponse, StreamingResult,
+    CompletionError, CompletionParams, ImageEditError, ImageEditParams, ImageEditResponseWithBytes,
+    ImageGenerationError, ImageGenerationParams, ImageGenerationResponseWithBytes,
+    InferenceProvider, ListModelsError, ModelsResponse, RerankError, RerankParams, RerankResponse, ScoreError, ScoreParams, ScoreResponse,
+    StreamingResult,
 };
 use async_trait::async_trait;
 use backend::{BackendConfig, ExternalBackend};
@@ -299,11 +300,17 @@ impl InferenceProvider for ExternalProvider {
             .await
     }
 
-    /// Text similarity scoring via external provider
-    ///
-    /// Delegates to the backend implementation. Supported by:
-    /// - OpenAI-compatible backends (reranker models, etc.)
-    /// - Not supported by other backends
+    /// Performs an image edit request through the appropriate backend
+    async fn image_edit(
+        &self,
+        params: Arc<ImageEditParams>,
+        _request_hash: String,
+    ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
+        self.backend
+            .image_edit(&self.config, &self.model_name, params)
+            .await
+    }
+
     async fn score(
         &self,
         params: ScoreParams,
@@ -311,6 +318,12 @@ impl InferenceProvider for ExternalProvider {
     ) -> Result<ScoreResponse, ScoreError> {
         self.backend
             .score(&self.config, &self.model_name, params)
+            .await
+    }
+
+    async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+        self.backend
+            .rerank(&self.config, &self.model_name, params)
             .await
     }
 }

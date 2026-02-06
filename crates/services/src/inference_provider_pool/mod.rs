@@ -2,10 +2,10 @@ use crate::common::encryption_headers;
 use config::ExternalProvidersConfig;
 use inference_providers::{
     models::{AttestationError, CompletionError, ListModelsError, ModelsResponse},
-    ChatCompletionParams, ExternalProvider, ExternalProviderConfig, ImageGenerationError,
-    ImageGenerationParams, ImageGenerationResponseWithBytes, InferenceProvider, ProviderConfig,
-    ScoreError, ScoreParams, ScoreResponse, StreamingResult, StreamingResultExt, VLlmConfig,
-    VLlmProvider,
+    ChatCompletionParams, ExternalProvider, ExternalProviderConfig, ImageEditError,
+    ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponseWithBytes, InferenceProvider, ProviderConfig, RerankError, RerankParams,
+    RerankResponse, StreamingResult, StreamingResultExt, VLlmConfig, VLlmProvider,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -14,6 +14,13 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
+
+/// Trait for fetching external model configurations from a data source (e.g., database).
+/// This decouples the InferenceProviderPool from the database crate (hexagonal architecture).
+#[async_trait::async_trait]
+pub trait ExternalModelsSource: Send + Sync {
+    async fn fetch_external_models(&self) -> Result<Vec<(String, serde_json::Value)>, String>;
+}
 
 /// Discovery entry returned by the discovery layer
 #[derive(Debug, Clone, Deserialize)]
@@ -66,6 +73,8 @@ pub struct InferenceProviderPool {
     chat_id_mapping: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
     /// Background task handle for periodic model discovery refresh
     refresh_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Background task handle for periodic external provider refresh
+    external_refresh_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl InferenceProviderPool {
@@ -88,6 +97,7 @@ impl InferenceProviderPool {
             load_balancer_index: Arc::new(RwLock::new(HashMap::new())),
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
             refresh_task_handle: Arc::new(Mutex::new(None)),
+            external_refresh_task_handle: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -104,42 +114,9 @@ impl InferenceProviderPool {
         model_name: String,
         provider_config: serde_json::Value,
     ) -> Result<(), String> {
-        // Parse the provider config
-        let config: ProviderConfig = serde_json::from_value(provider_config)
-            .map_err(|e| format!("Failed to parse provider config: {e}"))?;
+        let (provider, backend_type) =
+            self.create_external_provider(&model_name, provider_config)?;
 
-        // Get the backend type to look up the API key
-        let backend_type = match &config {
-            ProviderConfig::OpenAiCompatible { .. } => "openai_compatible",
-            ProviderConfig::Anthropic { .. } => "anthropic",
-            ProviderConfig::Gemini { .. } => "gemini",
-        };
-
-        // Get the API key for this backend
-        let api_key = self
-            .external_configs
-            .get_api_key(backend_type)
-            .ok_or_else(|| {
-                format!(
-                    "No API key configured for backend type '{}'. \
-                     Set the appropriate environment variable (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY)",
-                    backend_type
-                )
-            })?
-            .to_string();
-
-        // Create the external provider
-        let external_config = ExternalProviderConfig {
-            model_name: model_name.clone(),
-            provider_config: config,
-            api_key,
-            timeout_seconds: self.external_configs.timeout_seconds,
-        };
-
-        let provider =
-            Arc::new(ExternalProvider::new(external_config)) as Arc<InferenceProviderTrait>;
-
-        // Register the provider
         let mut external = self.external_providers.write().await;
         external.insert(model_name.clone(), provider);
 
@@ -763,6 +740,36 @@ impl InferenceProviderPool {
         Some(ordered_providers)
     }
 
+    /// Sanitize a CompletionError by preserving its variant structure while sanitizing messages
+    fn sanitize_completion_error(error: CompletionError, model_id: &str) -> CompletionError {
+        // Helper to sanitize message and format with model_id context
+        let sanitize_and_format = |msg: &str| -> String {
+            let sanitized = Self::sanitize_error_message(msg);
+            format!("Provider failed for model '{}': {}", model_id, sanitized)
+        };
+
+        match error {
+            CompletionError::HttpError {
+                status_code,
+                message,
+            } => {
+                // For HttpError, sanitize the message and include model_id context
+                // Preserve status_code for proper error mapping (4xx vs 5xx)
+                CompletionError::HttpError {
+                    status_code,
+                    message: sanitize_and_format(&message),
+                }
+            }
+            CompletionError::CompletionError(msg) => {
+                CompletionError::CompletionError(sanitize_and_format(&msg))
+            }
+            CompletionError::InvalidResponse(msg) => {
+                CompletionError::InvalidResponse(sanitize_and_format(&msg))
+            }
+            CompletionError::Unknown(msg) => CompletionError::Unknown(sanitize_and_format(&msg)),
+        }
+    }
+
     /// Sanitize error message by removing sensitive information like IP addresses, URLs, and internal details
     fn sanitize_error_message(error: &str) -> String {
         let mut sanitized = error.to_string();
@@ -839,12 +846,7 @@ impl InferenceProviderPool {
                     return Ok((result, external_provider));
                 }
                 Err(e) => {
-                    // External providers have no fallback
-                    let sanitized = Self::sanitize_error_message(&e.to_string());
-                    return Err(CompletionError::CompletionError(format!(
-                        "External provider failed for model '{}': {}",
-                        model_id, sanitized
-                    )));
+                    return Err(Self::sanitize_completion_error(e, model_id));
                 }
             }
         }
@@ -1150,12 +1152,14 @@ impl InferenceProviderPool {
             "Starting image generation request"
         );
 
-        // Clone params after removing model_pub_key to ensure it's not in the cloned version
-        let params_for_provider = params.clone();
+        // Clone params once before retry loop to minimize memory operations with large image data.
+        // The provider interface requires ImageEditParams by value, so we must clone when calling
+        // the provider. We clone once here and reuse across retries rather than cloning on each attempt.
+        let cloned_params = params.clone();
 
         let (response, provider) = self
             .retry_with_fallback(&model_id, "image_generation", model_pub_key, |provider| {
-                let params = params_for_provider.clone();
+                let params = cloned_params.clone();
                 let request_hash = request_hash.clone();
                 async move {
                     provider
@@ -1179,45 +1183,253 @@ impl InferenceProviderPool {
         Ok(response)
     }
 
-    pub async fn score(
+    pub async fn image_edit(
         &self,
-        params: ScoreParams,
+        params: ImageEditParams,
         request_hash: String,
-    ) -> Result<ScoreResponse, ScoreError> {
+    ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
         let model_id = params.model.clone();
 
         tracing::debug!(
             model = %model_id,
-            text_1_len = params.text_1.len(),
-            text_2_len = params.text_2.len(),
-            "Starting score request"
+            "Starting image edit request"
         );
 
-        let (response, _provider) = self
-            .retry_with_fallback(&model_id, "score", None, |provider| {
+        // Wrap params in Arc to enable cheap cloning across retries.
+        // Since image data is already Arc<Vec<u8>>, cloning the params struct is now O(1).
+        // Each retry clones the Arc pointer (8 bytes) instead of the entire struct.
+        let params = Arc::new(params);
+
+        let (response, provider) = self
+            .retry_with_fallback(&model_id, "image_edit", None, |provider| {
                 let params = params.clone();
                 let request_hash = request_hash.clone();
                 async move {
                     provider
-                        .score(params, request_hash)
+                        .image_edit(params, request_hash)
                         .await
                         .map_err(|e| CompletionError::CompletionError(e.to_string()))
                 }
             })
             .await
-            .map_err(|e| {
-                // Sanitize error messages to remove sensitive details (URLs, IPs)
-                // while preserving keywords like "not found" for proper error detection in route handlers
-                ScoreError::GenerationError(Self::sanitize_error_message(&e.to_string()))
-            })?;
+            .map_err(|e| ImageEditError::EditError(e.to_string()))?;
 
+        // Store the chat_id mapping so attestation service can find the provider
+        // (same pattern as image_generation)
+        let image_id = response.response.id.clone();
         tracing::info!(
-            model = %model_id,
-            score = response.data.first().map(|d| d.score),
-            "Score completed successfully"
+            image_id = %image_id,
+            "Storing chat_id mapping for image edit"
         );
+        self.store_chat_id_mapping(image_id, provider).await;
 
         Ok(response)
+    }
+
+    pub async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+        let model_id = params.model.clone();
+
+        tracing::debug!(
+            model = %model_id,
+            document_count = params.documents.len(),
+            "Starting rerank request"
+        );
+
+        // Check if this model exists as an external provider - reranking is not supported for external models
+        if self.get_external_provider(&model_id).await.is_some() {
+            return Err(RerankError::GenerationError(format!(
+                "Reranking is not supported for external provider models. \
+                 Model '{}' is configured as an external provider. \
+                 Reranking is only available for vLLM providers.",
+                model_id
+            )));
+        }
+
+        // Ensure vLLM models are discovered
+        self.ensure_models_discovered().await.map_err(|e| {
+            RerankError::GenerationError(Self::sanitize_error_message(&e.to_string()))
+        })?;
+
+        // Get vLLM providers with load balancing
+        let providers = match self.get_providers_with_fallback(&model_id, None).await {
+            Some(p) => p,
+            None => {
+                let mappings = self.provider_mappings.read().await;
+                let available_models: Vec<_> = mappings.model_to_providers.keys().collect();
+
+                tracing::error!(
+                    model_id = %model_id,
+                    available_models = ?available_models,
+                    operation = "rerank",
+                    "No vLLM provider found for model"
+                );
+
+                return Err(RerankError::GenerationError(format!(
+                    "Model '{}' not found in vLLM providers. Available models: {:?}",
+                    model_id, available_models
+                )));
+            }
+        };
+
+        // Try reranking with each provider (with fallback)
+        let mut last_error = None;
+        for provider in providers {
+            match provider.rerank(params.clone()).await {
+                Ok(response) => {
+                    tracing::info!(
+                        model = %model_id,
+                        result_count = response.results.len(),
+                        "Rerank completed successfully"
+                    );
+                    return Ok(response);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        model = %model_id,
+                        error = %e,
+                        "Rerank failed with provider, trying next"
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // All providers failed
+        let error_msg = last_error
+            .map(|e| Self::sanitize_error_message(&e.to_string()))
+            .unwrap_or_else(|| "No providers available for reranking".to_string());
+
+        Err(RerankError::GenerationError(error_msg))
+    }
+
+    /// Create an external provider from a model name and provider config JSON.
+    /// Returns a tuple of (provider Arc, backend_type string) without inserting it into any map.
+    fn create_external_provider(
+        &self,
+        model_name: &str,
+        provider_config: serde_json::Value,
+    ) -> Result<(Arc<InferenceProviderTrait>, String), String> {
+        let config: ProviderConfig = serde_json::from_value(provider_config)
+            .map_err(|e| format!("Failed to parse provider config: {e}"))?;
+
+        let backend_type = match &config {
+            ProviderConfig::OpenAiCompatible { .. } => "openai_compatible".to_string(),
+            ProviderConfig::Anthropic { .. } => "anthropic".to_string(),
+            ProviderConfig::Gemini { .. } => "gemini".to_string(),
+        };
+
+        let api_key = self
+            .external_configs
+            .get_api_key(&backend_type)
+            .ok_or_else(|| {
+                format!(
+                    "No API key configured for backend type '{}'. \
+                     Set the appropriate environment variable (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY)",
+                    backend_type
+                )
+            })?
+            .to_string();
+
+        let external_config = ExternalProviderConfig {
+            model_name: model_name.to_string(),
+            provider_config: config,
+            api_key,
+            timeout_seconds: self.external_configs.timeout_seconds,
+        };
+
+        let provider =
+            Arc::new(ExternalProvider::new(external_config)) as Arc<InferenceProviderTrait>;
+        Ok((provider, backend_type))
+    }
+
+    /// Atomically replace all external providers with a new set built from the given models.
+    ///
+    /// This is safe for in-flight requests because existing `Arc` references remain valid
+    /// until dropped. New requests will use the updated provider map.
+    async fn sync_external_providers(&self, models: Vec<(String, serde_json::Value)>) {
+        let mut new_map: HashMap<String, Arc<InferenceProviderTrait>> = HashMap::new();
+        let mut success_count = 0;
+        let mut error_count = 0;
+
+        for (model_name, provider_config) in models {
+            match self.create_external_provider(&model_name, provider_config) {
+                Ok((provider, backend_type)) => {
+                    new_map.insert(model_name.clone(), provider);
+                    success_count += 1;
+                    info!(
+                        model = %model_name,
+                        backend = %backend_type,
+                        "Registered external provider during sync"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        model = %model_name,
+                        error = %e,
+                        "Failed to create external provider during sync"
+                    );
+                    error_count += 1;
+                }
+            }
+        }
+
+        let mut external = self.external_providers.write().await;
+        let old_count = external.len();
+        *external = new_map;
+
+        info!(
+            old_count = old_count,
+            new_count = success_count,
+            errors = error_count,
+            "Synced external providers"
+        );
+    }
+
+    /// Start a periodic background task that refreshes external providers from a data source.
+    ///
+    /// The first tick is skipped because providers are already loaded at startup.
+    /// If `refresh_interval_secs` is 0, this is a no-op.
+    pub async fn start_external_refresh_task(
+        self: Arc<Self>,
+        source: Arc<dyn ExternalModelsSource>,
+        refresh_interval_secs: u64,
+    ) {
+        if refresh_interval_secs == 0 {
+            debug!("External provider refresh disabled (interval is 0)");
+            return;
+        }
+
+        let handle = tokio::spawn({
+            let pool = self.clone();
+            async move {
+                let mut interval =
+                    tokio::time::interval(tokio::time::Duration::from_secs(refresh_interval_secs));
+                // Skip the first immediate tick (providers already loaded at startup)
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    debug!("Running periodic external provider refresh");
+                    match source.fetch_external_models().await {
+                        Ok(models) => {
+                            pool.sync_external_providers(models).await;
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "Failed to fetch external models for refresh, will retry on next interval"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut task_handle = self.external_refresh_task_handle.lock().await;
+        *task_handle = Some(handle);
+        info!(
+            "External provider refresh task started with interval: {} seconds",
+            refresh_interval_secs
+        );
     }
 
     /// Start the periodic model discovery refresh task and store the handle
@@ -1250,8 +1462,8 @@ impl InferenceProviderPool {
     pub async fn shutdown(&self) {
         info!("Initiating inference provider pool shutdown");
 
-        // Step 1: Cancel the refresh task
-        debug!("Step 1: Cancelling model discovery refresh task");
+        // Step 1a: Cancel the model discovery refresh task
+        debug!("Step 1a: Cancelling model discovery refresh task");
         let mut task_handle = self.refresh_task_handle.lock().await;
         if let Some(handle) = task_handle.take() {
             debug!("Cancelling model discovery refresh task");
@@ -1261,6 +1473,18 @@ impl InferenceProviderPool {
             debug!("No active refresh task to cancel");
         }
         drop(task_handle); // Explicitly drop the lock
+
+        // Step 1b: Cancel the external provider refresh task
+        debug!("Step 1b: Cancelling external provider refresh task");
+        let mut ext_task_handle = self.external_refresh_task_handle.lock().await;
+        if let Some(handle) = ext_task_handle.take() {
+            debug!("Cancelling external provider refresh task");
+            handle.abort();
+            info!("External provider refresh task cancelled successfully");
+        } else {
+            debug!("No active external refresh task to cancel");
+        }
+        drop(ext_task_handle);
 
         // Step 2: Clear provider mappings (both model and pubkey mappings cleared atomically)
         debug!("Step 2: Clearing provider mappings");
@@ -1382,6 +1606,27 @@ mod tests {
 
         // HTTP status should still be present (not sensitive)
         assert!(sanitized.contains("401 Unauthorized"));
+
+        // Test that "not found" keywords are preserved for error detection
+        // This is important because route handlers check for "not found" to return 404 errors
+        let error_not_found =
+            "Model 'Qwen/Qwen3-Reranker-0.6B' not found at http://192.168.0.1:8000";
+        let sanitized_not_found = InferenceProviderPool::sanitize_error_message(error_not_found);
+        assert!(
+            sanitized_not_found.contains("not found"),
+            "Keywords 'not found' must be preserved for error detection"
+        );
+        assert!(!sanitized_not_found.contains("http://"));
+        assert!(!sanitized_not_found.contains("192.168.0.1"));
+
+        let error_does_not_exist =
+            "Model 'gpt-4' does not exist on the server https://api.example.com";
+        let sanitized_exists = InferenceProviderPool::sanitize_error_message(error_does_not_exist);
+        assert!(
+            sanitized_exists.contains("does not exist"),
+            "Keywords 'does not exist' must be preserved for error detection"
+        );
+        assert!(!sanitized_exists.contains("https://api.example.com"));
     }
 
     #[tokio::test]
@@ -1467,6 +1712,7 @@ mod tests {
                 anthropic_api_key: None,
                 gemini_api_key: None,
                 timeout_seconds: 60,
+                refresh_interval_secs: 0,
             },
         );
 
@@ -1495,6 +1741,7 @@ mod tests {
                 anthropic_api_key: Some("sk-ant-test".to_string()),
                 gemini_api_key: None,
                 timeout_seconds: 60,
+                refresh_interval_secs: 0,
             },
         );
 
@@ -1523,6 +1770,7 @@ mod tests {
                 anthropic_api_key: None,
                 gemini_api_key: Some("AIza-test".to_string()),
                 timeout_seconds: 60,
+                refresh_interval_secs: 0,
             },
         );
 
@@ -1575,6 +1823,7 @@ mod tests {
                 anthropic_api_key: None,
                 gemini_api_key: None,
                 timeout_seconds: 60,
+                refresh_interval_secs: 0,
             },
         );
 
@@ -1637,6 +1886,7 @@ mod tests {
                 anthropic_api_key: Some("sk-ant-test".to_string()),
                 gemini_api_key: Some("AIza-test".to_string()),
                 timeout_seconds: 60,
+                refresh_interval_secs: 0,
             },
         );
 
@@ -1684,6 +1934,7 @@ mod tests {
                 anthropic_api_key: None, // Missing Anthropic key
                 gemini_api_key: None,
                 timeout_seconds: 60,
+                refresh_interval_secs: 0,
             },
         );
 
@@ -1733,6 +1984,7 @@ mod tests {
             anthropic_api_key: Some("anthropic-key".to_string()),
             gemini_api_key: Some("gemini-key".to_string()),
             timeout_seconds: 60,
+            refresh_interval_secs: 0,
         };
 
         assert_eq!(config.get_api_key("openai_compatible"), Some("openai-key"));
@@ -1753,6 +2005,7 @@ mod tests {
                 anthropic_api_key: None,
                 gemini_api_key: None,
                 timeout_seconds: 60,
+                refresh_interval_secs: 0,
             },
         );
 
@@ -1784,6 +2037,7 @@ mod tests {
                 anthropic_api_key: None,
                 gemini_api_key: None,
                 timeout_seconds: 60,
+                refresh_interval_secs: 0,
             },
         );
 
@@ -1835,6 +2089,7 @@ mod tests {
                 anthropic_api_key: None,
                 gemini_api_key: None,
                 timeout_seconds: 60,
+                refresh_interval_secs: 0,
             },
         );
 
@@ -1861,6 +2116,158 @@ mod tests {
         assert!(pool.is_external_provider("my-model").await);
 
         // Should still only have one entry (not duplicated)
+        let external = pool.external_providers.read().await;
+        assert_eq!(external.len(), 1);
+    }
+
+    // ==================== Sync External Providers Tests ====================
+
+    #[tokio::test]
+    async fn test_sync_replaces_old_providers() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test".to_string()),
+                anthropic_api_key: Some("sk-ant-test".to_string()),
+                gemini_api_key: None,
+                timeout_seconds: 60,
+                refresh_interval_secs: 0,
+            },
+        );
+
+        // Load initial providers via register
+        pool.register_external_provider(
+            "gpt-4".to_string(),
+            serde_json::json!({
+                "backend": "openai_compatible",
+                "base_url": "https://api.openai.com/v1"
+            }),
+        )
+        .await
+        .unwrap();
+        pool.register_external_provider(
+            "claude-3".to_string(),
+            serde_json::json!({
+                "backend": "anthropic",
+                "base_url": "https://api.anthropic.com/v1"
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(pool.is_external_provider("gpt-4").await);
+        assert!(pool.is_external_provider("claude-3").await);
+
+        // Sync with a new set that removes claude-3 and adds gpt-4o
+        let new_models = vec![
+            (
+                "gpt-4".to_string(),
+                serde_json::json!({
+                    "backend": "openai_compatible",
+                    "base_url": "https://api.openai.com/v1"
+                }),
+            ),
+            (
+                "gpt-4o".to_string(),
+                serde_json::json!({
+                    "backend": "openai_compatible",
+                    "base_url": "https://api.openai.com/v1"
+                }),
+            ),
+        ];
+
+        pool.sync_external_providers(new_models).await;
+
+        // gpt-4 should still exist
+        assert!(pool.is_external_provider("gpt-4").await);
+        // gpt-4o should be added
+        assert!(pool.is_external_provider("gpt-4o").await);
+        // claude-3 should be gone (removed from DB)
+        assert!(!pool.is_external_provider("claude-3").await);
+
+        let external = pool.external_providers.read().await;
+        assert_eq!(external.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_empty_list_clears_providers() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test".to_string()),
+                anthropic_api_key: None,
+                gemini_api_key: None,
+                timeout_seconds: 60,
+                refresh_interval_secs: 0,
+            },
+        );
+
+        // Load an initial provider
+        pool.register_external_provider(
+            "gpt-4".to_string(),
+            serde_json::json!({
+                "backend": "openai_compatible",
+                "base_url": "https://api.openai.com/v1"
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(pool.is_external_provider("gpt-4").await);
+
+        // Sync with empty list should clear all external providers
+        pool.sync_external_providers(vec![]).await;
+
+        assert!(!pool.is_external_provider("gpt-4").await);
+        let external = pool.external_providers.read().await;
+        assert_eq!(external.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_partial_failures_keeps_successful() {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            30,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test".to_string()),
+                anthropic_api_key: None, // Missing Anthropic key
+                gemini_api_key: None,
+                timeout_seconds: 60,
+                refresh_interval_secs: 0,
+            },
+        );
+
+        let models = vec![
+            (
+                "gpt-4".to_string(),
+                serde_json::json!({
+                    "backend": "openai_compatible",
+                    "base_url": "https://api.openai.com/v1"
+                }),
+            ),
+            (
+                "claude-3".to_string(),
+                serde_json::json!({
+                    "backend": "anthropic",
+                    "base_url": "https://api.anthropic.com/v1"
+                }),
+            ),
+        ];
+
+        pool.sync_external_providers(models).await;
+
+        // gpt-4 should succeed (has OpenAI key)
+        assert!(pool.is_external_provider("gpt-4").await);
+        // claude-3 should fail (no Anthropic key)
+        assert!(!pool.is_external_provider("claude-3").await);
+
         let external = pool.external_providers.read().await;
         assert_eq!(external.len(), 1);
     }

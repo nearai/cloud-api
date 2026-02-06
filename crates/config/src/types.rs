@@ -636,6 +636,9 @@ pub struct ExternalProvidersConfig {
     pub gemini_api_key: Option<String>,
     /// Default timeout for external provider requests (seconds)
     pub timeout_seconds: i64,
+    /// Interval in seconds for refreshing external providers from the database.
+    /// Set to 0 to disable periodic refresh. Default: 900 (15 minutes) in production.
+    pub refresh_interval_secs: u64,
 }
 
 impl ExternalProvidersConfig {
@@ -675,11 +678,18 @@ impl ExternalProvidersConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(300);
 
+        // Refresh interval for external providers (default 15 minutes)
+        let refresh_interval_secs = env::var("EXTERNAL_PROVIDER_REFRESH_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(900);
+
         Self {
             openai_api_key,
             anthropic_api_key,
             gemini_api_key,
             timeout_seconds,
+            refresh_interval_secs,
         }
     }
 

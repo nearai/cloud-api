@@ -7,11 +7,11 @@ use crate::{
     AttestationError, ChatChoice, ChatCompletionChunk, ChatCompletionParams,
     ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseWithBytes,
     ChatDelta, ChatResponseMessage, ChatSignature, CompletionChunk, CompletionError,
-    CompletionParams, FinishReason, FunctionCallDelta, ImageData, ImageGenerationError,
-    ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes,
-    ListModelsError, MessageRole, ModelInfo, ModelsResponse, SSEEvent, ScoreError, ScoreParams,
-    ScoreResponse, ScoreResult, ScoreUsage, StreamChunk, StreamingResult, TokenUsage,
-    ToolCallDelta,
+    CompletionParams, FinishReason, FunctionCallDelta, ImageData, ImageEditError, ImageEditParams,
+    ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponse, ImageGenerationResponseWithBytes, ListModelsError, MessageRole,
+    ModelInfo, ModelsResponse, RerankError, RerankParams, RerankResponse, RerankResult,
+    RerankUsage, ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage, SSEEvent, StreamChunk, StreamingResult, TokenUsage, ToolCallDelta,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -213,6 +213,7 @@ impl ResponseTemplate {
                         name: Some(tc.name.clone()),
                         arguments: Some(tc.arguments.clone()),
                     },
+                    thought_signature: None,
                 })
                 .collect()
         });
@@ -382,6 +383,7 @@ impl ResponseTemplate {
                                     name: Some(tc.name.clone()),
                                     arguments: None,
                                 }),
+                                thought_signature: None,
                             }]),
                             reasoning_content: None,
                             reasoning: None,
@@ -431,6 +433,7 @@ impl ResponseTemplate {
                                         name: None,
                                         arguments: Some(part_with_space),
                                     }),
+                                    thought_signature: None,
                                 }]),
                                 reasoning_content: None,
                                 reasoning: None,
@@ -887,6 +890,44 @@ impl crate::InferenceProvider for MockProvider {
         })
     }
 
+    async fn image_edit(
+        &self,
+        params: Arc<ImageEditParams>,
+        _request_hash: String,
+    ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
+        // Check for invalid model
+        if !self.is_valid_model(&params.model) {
+            return Err(ImageEditError::EditError(format!(
+                "The model `{}` does not exist.",
+                params.model
+            )));
+        }
+
+        let created = self.current_timestamp();
+
+        // Generate mock edited image data (always 1 image for edit)
+        let data = vec![ImageData {
+            b64_json: Some("mock_base64_edited_image_data_0".to_string()),
+            url: None,
+            revised_prompt: Some(params.prompt.clone()),
+        }];
+
+        let response = ImageGenerationResponse {
+            id: format!("img-edit-{}", self.generate_id()),
+            created,
+            data,
+        };
+
+        // Serialize to raw bytes for TEE verification consistency
+        let raw_bytes =
+            serde_json::to_vec(&response).map_err(|e| ImageEditError::EditError(e.to_string()))?;
+
+        Ok(ImageEditResponseWithBytes {
+            response,
+            raw_bytes,
+        })
+    }
+
     async fn score(
         &self,
         params: ScoreParams,
@@ -895,7 +936,7 @@ impl crate::InferenceProvider for MockProvider {
         // Mock implementation returns a similarity score based on text length similarity
         let len_1 = params.text_1.len() as f64;
         let len_2 = params.text_2.len() as f64;
-        let mock_score = 1.0 - ((len_1 - len_2).abs() / len_1.max(len_2).max(1.0));
+        let mock_score: f64 = 1.0 - ((len_1 - len_2).abs() / len_1.max(len_2).max(1.0));
 
         Ok(ScoreResponse {
             id: format!("score-{}", uuid::Uuid::new_v4()),
@@ -914,6 +955,45 @@ impl crate::InferenceProvider for MockProvider {
                 prompt_tokens_details: None,
             }),
         })
+    }
+
+    async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+        // Check for invalid model
+        if !self.is_valid_model(&params.model) {
+            return Err(RerankError::GenerationError(format!(
+                "The model `{}` does not exist.",
+                params.model
+            )));
+        }
+
+        // Generate mock reranked results with decreasing relevance scores
+        let mut results: Vec<RerankResult> = (0..params.documents.len())
+            .map(|i| {
+                // Generate decreasing relevance scores (1.0 for first, 0.0 for last)
+                let relevance_score =
+                    (params.documents.len() as f64 - i as f64) / params.documents.len() as f64;
+                RerankResult {
+                    index: i as i32,
+                    relevance_score,
+                    document: Some(serde_json::Value::String(params.documents[i].clone())),
+                }
+            })
+            .collect();
+
+        // Sort by relevance score descending
+        results.sort_by(|a, b| b.relevance_score.partial_cmp(&a.relevance_score).unwrap());
+
+        let response = RerankResponse {
+            id: format!("rerank-{}", self.generate_id()),
+            model: params.model.clone(),
+            results,
+            usage: Some(RerankUsage {
+                prompt_tokens: None,
+                total_tokens: Some(50),
+            }),
+        };
+
+        Ok(response)
     }
 
     async fn get_signature(

@@ -8,7 +8,16 @@ use serde_json::Value;
 use url::form_urlencoded;
 use uuid::Uuid;
 
-use crate::{models::ErrorResponse, routes::api::AppState};
+use crate::{
+    models::{
+        CreateVectorStoreFileBatchRequest, CreateVectorStoreFileRequest, CreateVectorStoreRequest,
+        ErrorResponse, ModifyVectorStoreRequest, UpdateVectorStoreFileAttributesRequest,
+        VectorStoreDeleteResponse, VectorStoreFileDeleteResponse, VectorStoreFileListResponse,
+        VectorStoreFileObject, VectorStoreFileBatchObject, VectorStoreListResponse,
+        VectorStoreObject, VectorStoreSearchRequest, VectorStoreSearchResponse,
+    },
+    routes::api::AppState,
+};
 use services::{
     id_prefixes::{PREFIX_FILE, PREFIX_VS, PREFIX_VSFB},
     rag::RagError,
@@ -185,10 +194,10 @@ mod tests {
     post,
     path = "/v1/vector_stores",
     tag = "Vector Stores",
-    request_body = Value,
+    request_body = CreateVectorStoreRequest,
     responses(
-        (status = 200, body = Value),
-        (status = 400, body = ErrorResponse),
+        (status = 200, description = "Vector store created successfully", body = VectorStoreObject),
+        (status = 400, description = "Invalid request parameters", body = ErrorResponse),
     ),
     security(("api_key" = []))
 )]
@@ -214,8 +223,8 @@ pub async fn create_vector_store(
     tag = "Vector Stores",
     params(ListQueryParams),
     responses(
-        (status = 200, body = Value),
-        (status = 400, body = ErrorResponse),
+        (status = 200, description = "List of vector stores", body = VectorStoreListResponse),
+        (status = 400, description = "Invalid request parameters", body = ErrorResponse),
     ),
     security(("api_key" = []))
 )]
@@ -265,8 +274,8 @@ pub async fn list_vector_stores(
         ("vector_store_id" = String, Path, description = "The ID of the vector store to retrieve")
     ),
     responses(
-        (status = 200, body = Value),
-        (status = 404, body = ErrorResponse),
+        (status = 200, description = "Vector store retrieved successfully", body = VectorStoreObject),
+        (status = 404, description = "Vector store not found", body = ErrorResponse),
     ),
     security(("api_key" = []))
 )]
@@ -293,10 +302,10 @@ pub async fn get_vector_store(
     params(
         ("vector_store_id" = String, Path, description = "The ID of the vector store to modify")
     ),
-    request_body = Value,
+    request_body = ModifyVectorStoreRequest,
     responses(
-        (status = 200, body = Value),
-        (status = 404, body = ErrorResponse),
+        (status = 200, description = "Vector store modified successfully", body = VectorStoreObject),
+        (status = 404, description = "Vector store not found", body = ErrorResponse),
     ),
     security(("api_key" = []))
 )]
@@ -325,8 +334,8 @@ pub async fn modify_vector_store(
         ("vector_store_id" = String, Path, description = "The ID of the vector store to delete")
     ),
     responses(
-        (status = 200, body = Value),
-        (status = 404, body = ErrorResponse),
+        (status = 200, description = "Vector store deleted successfully", body = VectorStoreDeleteResponse),
+        (status = 404, description = "Vector store not found", body = ErrorResponse),
     ),
     security(("api_key" = []))
 )]
@@ -357,10 +366,10 @@ pub async fn delete_vector_store(
     params(
         ("vector_store_id" = String, Path, description = "The ID of the vector store to search")
     ),
-    request_body = Value,
+    request_body = VectorStoreSearchRequest,
     responses(
-        (status = 200, body = Value),
-        (status = 404, body = ErrorResponse),
+        (status = 200, description = "Search results", body = VectorStoreSearchResponse),
+        (status = 404, description = "Vector store not found", body = ErrorResponse),
     ),
     security(("api_key" = []))
 )]
@@ -392,10 +401,10 @@ pub async fn search_vector_store(
     params(
         ("vector_store_id" = String, Path, description = "The ID of the vector store")
     ),
-    request_body = Value,
+    request_body = CreateVectorStoreFileRequest,
     responses(
-        (status = 200, body = Value),
-        (status = 404, body = ErrorResponse),
+        (status = 200, description = "File attached to vector store", body = VectorStoreFileObject),
+        (status = 404, description = "Vector store not found", body = ErrorResponse),
     ),
     security(("api_key" = []))
 )]
@@ -440,8 +449,8 @@ pub async fn create_vector_store_file(
         FileListQueryParams,
     ),
     responses(
-        (status = 200, body = Value),
-        (status = 404, body = ErrorResponse),
+        (status = 200, description = "List of vector store files", body = VectorStoreFileListResponse),
+        (status = 404, description = "Vector store not found", body = ErrorResponse),
     ),
     security(("api_key" = []))
 )]
@@ -472,8 +481,8 @@ pub async fn list_vector_store_files(
         ("file_id" = String, Path, description = "The ID of the file")
     ),
     responses(
-        (status = 200, body = Value),
-        (status = 404, body = ErrorResponse),
+        (status = 200, description = "Vector store file retrieved successfully", body = VectorStoreFileObject),
+        (status = 404, description = "File not found", body = ErrorResponse),
     ),
     security(("api_key" = []))
 )]
@@ -502,10 +511,10 @@ pub async fn get_vector_store_file(
         ("vector_store_id" = String, Path, description = "The ID of the vector store"),
         ("file_id" = String, Path, description = "The ID of the file to update")
     ),
-    request_body = Value,
+    request_body = UpdateVectorStoreFileAttributesRequest,
     responses(
-        (status = 200, body = Value),
-        (status = 404, body = ErrorResponse),
+        (status = 200, description = "File updated successfully", body = VectorStoreFileObject),
+        (status = 404, description = "File not found", body = ErrorResponse),
     ),
     security(("api_key" = []))
 )]
@@ -536,8 +545,8 @@ pub async fn update_vector_store_file(
         ("file_id" = String, Path, description = "The ID of the file to delete")
     ),
     responses(
-        (status = 200, body = Value),
-        (status = 404, body = ErrorResponse),
+        (status = 200, description = "File deleted successfully", body = VectorStoreFileDeleteResponse),
+        (status = 404, description = "File not found", body = ErrorResponse),
     ),
     security(("api_key" = []))
 )]
@@ -569,11 +578,11 @@ pub async fn delete_vector_store_file(
     params(
         ("vector_store_id" = String, Path, description = "The ID of the vector store")
     ),
-    request_body = Value,
+    request_body = CreateVectorStoreFileBatchRequest,
     responses(
-        (status = 200, body = Value),
-        (status = 400, body = ErrorResponse),
-        (status = 404, body = ErrorResponse),
+        (status = 200, description = "File batch created successfully", body = VectorStoreFileBatchObject),
+        (status = 400, description = "Invalid request parameters", body = ErrorResponse),
+        (status = 404, description = "Vector store not found", body = ErrorResponse),
     ),
     security(("api_key" = []))
 )]
@@ -667,8 +676,8 @@ pub async fn create_vector_store_file_batch(
         ("batch_id" = String, Path, description = "The ID of the file batch")
     ),
     responses(
-        (status = 200, body = Value),
-        (status = 404, body = ErrorResponse),
+        (status = 200, description = "File batch retrieved successfully", body = VectorStoreFileBatchObject),
+        (status = 404, description = "File batch not found", body = ErrorResponse),
     ),
     security(("api_key" = []))
 )]
@@ -698,8 +707,8 @@ pub async fn get_vector_store_file_batch(
         ("batch_id" = String, Path, description = "The ID of the file batch to cancel")
     ),
     responses(
-        (status = 200, body = Value),
-        (status = 404, body = ErrorResponse),
+        (status = 200, description = "File batch cancelled successfully", body = VectorStoreFileBatchObject),
+        (status = 404, description = "File batch not found", body = ErrorResponse),
     ),
     security(("api_key" = []))
 )]
@@ -730,8 +739,8 @@ pub async fn cancel_vector_store_file_batch(
         FileListQueryParams,
     ),
     responses(
-        (status = 200, body = Value),
-        (status = 404, body = ErrorResponse),
+        (status = 200, description = "List of files in the batch", body = VectorStoreFileListResponse),
+        (status = 404, description = "File batch not found", body = ErrorResponse),
     ),
     security(("api_key" = []))
 )]

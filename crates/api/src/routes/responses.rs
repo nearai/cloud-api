@@ -67,6 +67,8 @@ fn map_response_error_to_status(error: &ServiceResponseError) -> StatusCode {
         ServiceResponseError::McpPrivateIpBlocked => StatusCode::BAD_REQUEST,
         ServiceResponseError::McpApprovalRequired { .. } => StatusCode::BAD_REQUEST,
         ServiceResponseError::McpApprovalRequestNotFound(_) => StatusCode::NOT_FOUND,
+        ServiceResponseError::FunctionCallRequired { .. } => StatusCode::BAD_REQUEST,
+        ServiceResponseError::FunctionCallNotFound(_) => StatusCode::NOT_FOUND,
     }
 }
 
@@ -136,6 +138,14 @@ impl From<ServiceResponseError> for ErrorResponse {
             ),
             ServiceResponseError::McpApprovalRequestNotFound(msg) => ErrorResponse::new(
                 format!("MCP approval request not found: {msg}"),
+                "not_found_error".to_string(),
+            ),
+            ServiceResponseError::FunctionCallRequired { name, call_id } => ErrorResponse::new(
+                format!("Function call required: {name} (call_id: {call_id})"),
+                "function_call_required".to_string(),
+            ),
+            ServiceResponseError::FunctionCallNotFound(msg) => ErrorResponse::new(
+                format!("Function call not found: {msg}"),
                 "not_found_error".to_string(),
             ),
         }

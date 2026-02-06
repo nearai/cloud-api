@@ -44,4 +44,13 @@ pub enum ResponseError {
 
     #[error("MCP approval request not found: {0}")]
     McpApprovalRequestNotFound(String),
+
+    // ============================================
+    // Function Tool Errors
+    // ============================================
+    #[error("Function call required: {name} (call_id: {call_id})")]
+    FunctionCallRequired { name: String, call_id: String },
+
+    #[error("Function call not found: {0}")]
+    FunctionCallNotFound(String),
 }

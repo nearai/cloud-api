@@ -105,6 +105,19 @@ pub enum ToolExecutionResult {
     Success,
     /// Tool requires approval, pause agent loop
     ApprovalRequired,
+    /// External function call pending client execution
+    FunctionCallPending(FunctionCallInfo),
+}
+
+/// Information about a pending external function call
+#[derive(Debug, Clone)]
+pub struct FunctionCallInfo {
+    /// The LLM's tool_call_id for correlation
+    pub call_id: String,
+    /// Function name
+    pub name: String,
+    /// JSON-encoded arguments
+    pub arguments: String,
 }
 
 /// Context for tool execution

@@ -24,6 +24,9 @@ pub const PREFIX_SK: &str = "sk-";
 /// Prefix for MCP approval request IDs
 pub const PREFIX_MCPR: &str = "mcpr_";
 
+/// Prefix for function call IDs
+pub const PREFIX_FC: &str = "fc_";
+
 /// All known ID prefixes (useful for path normalization in metrics)
 pub const ALL_PREFIXES: &[&str] = &[
     PREFIX_CHATCMPL,
@@ -33,4 +36,5 @@ pub const ALL_PREFIXES: &[&str] = &[
     PREFIX_CONV,
     PREFIX_SK,
     PREFIX_MCPR,
+    PREFIX_FC,
 ];

@@ -16,7 +16,7 @@ use crate::{
             StateStore,
         },
         billing::{get_billing_costs, BillingRouteState},
-        completions::{chat_completions, image_edits, image_generations, models, rerank},
+        completions::{chat_completions, image_edits, image_generations, models, rerank, score},
         conversations,
         health::health_check,
         models::{get_model_by_name, list_models, ModelsAppState},
@@ -537,7 +537,6 @@ pub async fn init_inference_providers(
             discovery_url,
             api_key,
             config.model_discovery.timeout,
-            config.model_discovery.inference_timeout,
             config.external_providers.clone(),
         ),
     );
@@ -573,7 +572,6 @@ pub async fn init_inference_providers_with_mocks(
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30 * 60,
             config::ExternalProvidersConfig::default(),
         ),
     );
@@ -880,6 +878,7 @@ pub fn build_completion_routes(
         .route("/chat/completions", post(chat_completions))
         .route("/images/generations", post(image_generations))
         .route("/rerank", post(rerank))
+        .route("/score", post(score))
         .with_state(app_state.clone())
         .layer(from_fn_with_state(
             usage_state.clone(),
@@ -1358,7 +1357,6 @@ mod tests {
                 api_key: Some("test-key".to_string()),
                 refresh_interval: 0,
                 timeout: 5,
-                inference_timeout: 30 * 60, // 30 minutes
             },
             logging: config::LoggingConfig {
                 level: "info".to_string(),
@@ -1462,7 +1460,6 @@ mod tests {
                 api_key: Some("test-key".to_string()),
                 refresh_interval: 0,
                 timeout: 5,
-                inference_timeout: 30 * 60, // 30 minutes
             },
             logging: config::LoggingConfig {
                 level: "info".to_string(),

@@ -983,3 +983,52 @@ mod tests {
         assert!(choice.message.content.is_some());
     }
 }
+
+// Score models for text similarity endpoint
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoreParams {
+    pub model: String,
+    pub text_1: String,
+    pub text_2: String,
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoreResponse {
+    pub id: String,
+    pub object: String,
+    pub created: i64,
+    pub model: String,
+    pub data: Vec<ScoreResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ScoreUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoreResult {
+    pub index: i32,
+    pub score: f64,
+    pub object: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoreUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<serde_json::Value>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ScoreError {
+    #[error("Generation error: {0}")]
+    GenerationError(String),
+
+    #[error("HTTP {status_code}: {message}")]
+    HttpError { status_code: u16, message: String },
+}

@@ -97,61 +97,63 @@ impl UsageServiceTrait for UsageServiceImpl {
             })?;
 
         // Calculate costs based on inference type
-        let (input_cost, output_cost, total_cost) = if request.inference_type == "image_generation"
-            || request.inference_type == "image_edit"
-        {
-            // For image-based operations: use image_count and cost_per_image
-            let image_count = request.image_count.unwrap_or(0);
-            // Use checked arithmetic to prevent integer overflow in billing-critical path
-            let image_cost = (image_count as i64)
-                .checked_mul(model.cost_per_image)
-                .ok_or_else(|| {
+        let (input_cost, output_cost, total_cost) = match request.inference_type {
+            ports::InferenceType::ImageGeneration | ports::InferenceType::ImageEdit => {
+                // For image-based operations: use image_count and cost_per_image
+                let image_count = request.image_count.unwrap_or(0);
+                // Use checked arithmetic to prevent integer overflow in billing-critical path
+                let image_cost = (image_count as i64)
+                    .checked_mul(model.cost_per_image)
+                    .ok_or_else(|| {
+                        UsageError::CostCalculationOverflow(format!(
+                            "Image cost calculation overflow: {} images * {} cost_per_image",
+                            image_count, model.cost_per_image
+                        ))
+                    })?;
+                (0, image_cost, image_cost)
+            }
+            ports::InferenceType::Rerank => {
+                // For rerank: use input tokens as the billing unit
+                // Rerank models should set their input_cost_per_token appropriately for the billing model
+                // (e.g., cost per token, cost per document, cost per query, etc.)
+                // Use checked arithmetic to prevent integer overflow in billing-critical path
+                let rerank_cost = (request.input_tokens as i64)
+                    .checked_mul(model.input_cost_per_token)
+                    .ok_or_else(|| {
+                        UsageError::CostCalculationOverflow(format!(
+                            "Rerank cost calculation overflow: {} tokens * {} cost_per_token",
+                            request.input_tokens, model.input_cost_per_token
+                        ))
+                    })?;
+                (rerank_cost, 0, rerank_cost)
+            }
+            _ => {
+                // For token-based models (chat completions, etc.)
+                // Use checked arithmetic to prevent integer overflow in billing-critical path
+                let input_cost = (request.input_tokens as i64)
+                    .checked_mul(model.input_cost_per_token)
+                    .ok_or_else(|| {
+                        UsageError::CostCalculationOverflow(format!(
+                            "Input cost calculation overflow: {} tokens * {} cost_per_token",
+                            request.input_tokens, model.input_cost_per_token
+                        ))
+                    })?;
+                let output_cost = (request.output_tokens as i64)
+                    .checked_mul(model.output_cost_per_token)
+                    .ok_or_else(|| {
+                        UsageError::CostCalculationOverflow(format!(
+                            "Output cost calculation overflow: {} tokens * {} cost_per_token",
+                            request.output_tokens, model.output_cost_per_token
+                        ))
+                    })?;
+                let total_cost = input_cost.checked_add(output_cost).ok_or_else(|| {
                     UsageError::CostCalculationOverflow(format!(
-                        "Image cost calculation overflow: {} images * {} cost_per_image",
-                        image_count, model.cost_per_image
+                        "Total cost calculation overflow: {} + {}",
+                        input_cost, output_cost
                     ))
                 })?;
-            (0, image_cost, image_cost)
-        } else if request.inference_type == "rerank" {
-            // For rerank: use input tokens as the billing unit
-            // Rerank models should set their input_cost_per_token appropriately for the billing model
-            // (e.g., cost per token, cost per document, cost per query, etc.)
-            // Use checked arithmetic to prevent integer overflow in billing-critical path
-            let rerank_cost = (request.input_tokens as i64)
-                .checked_mul(model.input_cost_per_token)
-                .ok_or_else(|| {
-                    UsageError::CostCalculationOverflow(format!(
-                        "Rerank cost calculation overflow: {} tokens * {} cost_per_token",
-                        request.input_tokens, model.input_cost_per_token
-                    ))
-                })?;
-            (rerank_cost, 0, rerank_cost)
-        } else {
-            // For token-based models (chat completions, etc.)
-            // Use checked arithmetic to prevent integer overflow in billing-critical path
-            let input_cost = (request.input_tokens as i64)
-                .checked_mul(model.input_cost_per_token)
-                .ok_or_else(|| {
-                    UsageError::CostCalculationOverflow(format!(
-                        "Input cost calculation overflow: {} tokens * {} cost_per_token",
-                        request.input_tokens, model.input_cost_per_token
-                    ))
-                })?;
-            let output_cost = (request.output_tokens as i64)
-                .checked_mul(model.output_cost_per_token)
-                .ok_or_else(|| {
-                    UsageError::CostCalculationOverflow(format!(
-                        "Output cost calculation overflow: {} tokens * {} cost_per_token",
-                        request.output_tokens, model.output_cost_per_token
-                    ))
-                })?;
-            let total_cost = input_cost.checked_add(output_cost).ok_or_else(|| {
-                UsageError::CostCalculationOverflow(format!(
-                    "Total cost calculation overflow: {} + {}",
-                    input_cost, output_cost
-                ))
-            })?;
-            (input_cost, output_cost, total_cost)
+                (input_cost, output_cost, total_cost)
+            }
         };
 
         // Create database request with model UUID and name (denormalized)

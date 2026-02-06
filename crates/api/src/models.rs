@@ -2955,3 +2955,102 @@ mod tests {
         assert!(!is_basic_valid_email("user@domain@example.com"));
     }
 }
+
+/// Maximum character length for score request texts (100k chars ≈ 25k tokens)
+/// Reranker models typically have token limits (512-8192 tokens)
+/// This limit provides a safety margin while allowing reasonable text lengths
+const MAX_SCORE_TEXT_LENGTH: usize = 100_000;
+
+/// Request for text similarity scoring
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ScoreRequest {
+    /// Model ID to use for scoring
+    pub model: String,
+    /// First text to compare
+    pub text_1: String,
+    /// Second text to compare
+    pub text_2: String,
+}
+
+impl ScoreRequest {
+    /// Validate the score request
+    pub fn validate(&self) -> Result<(), String> {
+        // Model is required and must not be empty
+        if self.model.trim().is_empty() {
+            return Err("model is required".to_string());
+        }
+
+        // Text 1 is required and must not be empty or whitespace-only
+        if self.text_1.trim().is_empty() {
+            return Err("text_1 is required and must not be empty".to_string());
+        }
+
+        // Text 2 is required and must not be empty or whitespace-only
+        if self.text_2.trim().is_empty() {
+            return Err("text_2 is required and must not be empty".to_string());
+        }
+
+        // Validate text lengths to prevent resource exhaustion
+        if self.text_1.len() > MAX_SCORE_TEXT_LENGTH {
+            return Err(format!(
+                "text_1 exceeds maximum length of {} characters",
+                MAX_SCORE_TEXT_LENGTH
+            ));
+        }
+
+        if self.text_2.len() > MAX_SCORE_TEXT_LENGTH {
+            return Err(format!(
+                "text_2 exceeds maximum length of {} characters",
+                MAX_SCORE_TEXT_LENGTH
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Individual score result
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ScoreResult {
+    /// Index of the result (always 0 for single score)
+    pub index: i32,
+    /// The similarity score between 0.0 and 1.0
+    pub score: f64,
+    /// Type of result
+    pub object: String,
+}
+
+/// Response from text similarity scoring
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ScoreResponse {
+    /// Unique identifier for the score request
+    pub id: String,
+    /// Object type
+    pub object: String,
+    /// Unix timestamp of when the score was created
+    pub created: i64,
+    /// Model used for scoring
+    pub model: String,
+    /// Score results
+    pub data: Vec<ScoreResult>,
+    /// Token usage information
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ScoreUsage>,
+}
+
+/// Token usage for score response
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ScoreUsage {
+    /// Number of tokens in the prompt
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<i32>,
+    /// Total number of tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<i32>,
+    /// Number of completion tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<i32>,
+    /// Prompt tokens details
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<serde_json::Value>,
+}

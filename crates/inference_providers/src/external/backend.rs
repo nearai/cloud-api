@@ -7,7 +7,8 @@
 use crate::{
     ChatCompletionParams, ChatCompletionResponseWithBytes, CompletionError, ImageEditError,
     ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
-    ImageGenerationResponseWithBytes, RerankError, RerankParams, RerankResponse, StreamingResult,
+    ImageGenerationResponseWithBytes, RerankError, RerankParams, RerankResponse, ScoreError,
+    ScoreParams, ScoreResponse, StreamingResult,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -108,6 +109,26 @@ pub trait ExternalBackend: Send + Sync {
     ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
         Err(ImageEditError::EditError(format!(
             "Image editing is not supported by the {} backend.",
+            self.backend_type()
+        )))
+    }
+
+    /// Performs a text similarity scoring request
+    ///
+    /// The backend is responsible for:
+    /// - Translating ScoreParams to provider-specific format
+    /// - Making the HTTP request
+    /// - Parsing the response and translating it back to our ScoreResponse format
+    ///
+    /// Default implementation returns an error indicating scoring is not supported.
+    async fn score(
+        &self,
+        _config: &BackendConfig,
+        _model: &str,
+        _params: ScoreParams,
+    ) -> Result<ScoreResponse, ScoreError> {
+        Err(ScoreError::GenerationError(format!(
+            "Scoring is not supported by the {} backend.",
             self.backend_type()
         )))
     }

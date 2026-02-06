@@ -59,8 +59,6 @@ pub struct InferenceProviderPool {
     api_key: Option<String>,
     /// HTTP timeout for discovery requests
     discovery_timeout: Duration,
-    /// HTTP timeout for model inference requests
-    inference_timeout_secs: i64,
     /// Combined provider mappings (updated atomically to prevent race conditions)
     provider_mappings: Arc<RwLock<ProviderMappings>>,
     /// External providers (keyed by model name, created from database config)
@@ -83,14 +81,12 @@ impl InferenceProviderPool {
         discovery_url: String,
         api_key: Option<String>,
         discovery_timeout_secs: i64,
-        inference_timeout_secs: i64,
         external_configs: ExternalProvidersConfig,
     ) -> Self {
         Self {
             discovery_url,
             api_key,
             discovery_timeout: Duration::from_secs(discovery_timeout_secs as u64),
-            inference_timeout_secs,
             provider_mappings: Arc::new(RwLock::new(ProviderMappings::new())),
             external_providers: Arc::new(RwLock::new(HashMap::new())),
             external_configs,
@@ -556,7 +552,7 @@ impl InferenceProviderPool {
                 let provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
                     url.clone(),
                     self.api_key.clone(),
-                    Some(self.inference_timeout_secs),
+                    None,
                 ))) as Arc<InferenceProviderTrait>;
 
                 // Fetch attestation report with retries to handle transient network failures
@@ -1302,6 +1298,86 @@ impl InferenceProviderPool {
         Err(RerankError::GenerationError(error_msg))
     }
 
+    pub async fn score(
+        &self,
+        params: inference_providers::ScoreParams,
+        request_hash: String,
+    ) -> Result<inference_providers::ScoreResponse, inference_providers::ScoreError> {
+        let model_id = params.model.clone();
+
+        tracing::debug!(
+            model = %model_id,
+            "Starting score request"
+        );
+
+        // Check if this model exists as an external provider - scoring is not supported for external models
+        if self.get_external_provider(&model_id).await.is_some() {
+            return Err(inference_providers::ScoreError::GenerationError(format!(
+                "Scoring is not supported for external provider models. \
+                 Model '{}' is configured as an external provider. \
+                 Scoring is only available for vLLM providers.",
+                model_id
+            )));
+        }
+
+        // Ensure vLLM models are discovered
+        self.ensure_models_discovered().await.map_err(|e| {
+            inference_providers::ScoreError::GenerationError(Self::sanitize_error_message(
+                &e.to_string(),
+            ))
+        })?;
+
+        // Get vLLM providers with load balancing
+        let providers = match self.get_providers_with_fallback(&model_id, None).await {
+            Some(p) => p,
+            None => {
+                let mappings = self.provider_mappings.read().await;
+                let available_models: Vec<_> = mappings.model_to_providers.keys().collect();
+
+                tracing::error!(
+                    model_id = %model_id,
+                    available_models = ?available_models,
+                    operation = "score",
+                    "No vLLM provider found for model"
+                );
+
+                return Err(inference_providers::ScoreError::GenerationError(format!(
+                    "Model '{}' not found in vLLM providers. Available models: {:?}",
+                    model_id, available_models
+                )));
+            }
+        };
+
+        // Try scoring with each provider (with fallback)
+        let mut last_error = None;
+        for provider in providers {
+            match provider.score(params.clone(), request_hash.clone()).await {
+                Ok(response) => {
+                    tracing::info!(
+                        model = %model_id,
+                        "Score completed successfully"
+                    );
+                    return Ok(response);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        model = %model_id,
+                        error = %e,
+                        "Score failed with provider, trying next"
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // All providers failed
+        let error_msg = last_error
+            .map(|e| Self::sanitize_error_message(&e.to_string()))
+            .unwrap_or_else(|| "No providers available for scoring".to_string());
+
+        Err(inference_providers::ScoreError::GenerationError(error_msg))
+    }
+
     /// Create an external provider from a model name and provider config JSON.
     /// Returns a tuple of (provider Arc, backend_type string) without inserting it into any map.
     fn create_external_provider(
@@ -1638,7 +1714,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig::default(),
         );
 
@@ -1706,7 +1781,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test-key".to_string()),
                 anthropic_api_key: None,
@@ -1735,7 +1809,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: None,
                 anthropic_api_key: Some("sk-ant-test".to_string()),
@@ -1764,7 +1837,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: None,
                 anthropic_api_key: None,
@@ -1793,7 +1865,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig::default(), // No API keys configured
         );
 
@@ -1817,7 +1888,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: None,
@@ -1847,7 +1917,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig::default(),
         );
 
@@ -1866,7 +1935,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig::default(),
         );
 
@@ -1880,7 +1948,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: Some("sk-ant-test".to_string()),
@@ -1928,7 +1995,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: None, // Missing Anthropic key
@@ -1999,7 +2065,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: None,
@@ -2031,7 +2096,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: None,
@@ -2068,7 +2132,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig::default(),
         );
 
@@ -2083,7 +2146,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: None,
@@ -2128,7 +2190,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: Some("sk-ant-test".to_string()),
@@ -2198,7 +2259,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: None,
@@ -2234,7 +2294,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: None, // Missing Anthropic key

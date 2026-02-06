@@ -1,6 +1,6 @@
 use crate::{
     models::StreamOptions, sse_parser::new_sse_parser, ImageEditError, ImageGenerationError,
-    RerankError, *,
+    RerankError, ScoreError, *,
 };
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
@@ -16,6 +16,11 @@ fn to_image_gen_error<E: std::fmt::Display>(e: E) -> ImageGenerationError {
 /// Convert any displayable error to RerankError::GenerationError
 fn to_rerank_error<E: std::fmt::Display>(e: E) -> RerankError {
     RerankError::GenerationError(e.to_string())
+}
+
+/// Convert any displayable error to ScoreError::GenerationError
+fn to_score_error<E: std::fmt::Display>(e: E) -> ScoreError {
+    ScoreError::GenerationError(e.to_string())
 }
 
 /// Encryption header keys used in params.extra for passing encryption information
@@ -562,6 +567,47 @@ impl InferenceProvider for VLlmProvider {
     }
 
     /// Performs a document reranking request
+    async fn score(
+        &self,
+        params: ScoreParams,
+        request_hash: String,
+    ) -> Result<ScoreResponse, ScoreError> {
+        let url = format!("{}/v1/score", self.config.base_url);
+
+        let mut headers = self.build_headers().map_err(to_score_error)?;
+        headers.insert(
+            "X-Request-Hash",
+            reqwest::header::HeaderValue::from_str(&request_hash).map_err(to_score_error)?,
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&params)
+            .timeout(std::time::Duration::from_secs(
+                self.config.timeout_seconds as u64,
+            ))
+            .send()
+            .await
+            .map_err(to_score_error)?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(ScoreError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        let score_response: ScoreResponse = response.json().await.map_err(to_score_error)?;
+        Ok(score_response)
+    }
+
     async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
         let url = format!("{}/v1/rerank", self.config.base_url);
 

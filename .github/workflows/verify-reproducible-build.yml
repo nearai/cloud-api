@@ -1,0 +1,288 @@
+name: Verify Reproducible Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'main'
+
+jobs:
+  # Build on multiple runners in parallel to test cross-machine reproducibility
+  build:
+    name: Build (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update || true
+          sudo apt-get install -y skopeo jq
+
+      - name: Build reproducible image
+        run: |
+          ./build-image.sh
+
+      - name: Extract digest
+        run: |
+          DIGEST=$(skopeo inspect oci-archive:./oci.tar | jq -r '.Digest')
+          if [ -z "${DIGEST}" ]; then
+            echo "Failed to get image digest from OCI archive" >&2
+            exit 1
+          fi
+          echo "Image digest: ${DIGEST}"
+
+          # Save digest to file for artifact upload
+          echo "${DIGEST}" > digest.txt
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.runner }}
+          path: digest.txt
+          retention-days: 1
+
+      # Clean up OCI tar to free disk space (not needed for verification)
+      - name: Clean up build artifacts
+        run: rm -f oci.tar
+
+  # Sequential builds on the same runner to test build-to-build reproducibility
+  sequential-builds:
+    name: Sequential Builds
+    runs-on: ubuntu-latest
+    outputs:
+      mismatch: ${{ steps.compare.outputs.mismatch }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update || true
+          sudo apt-get install -y skopeo jq
+
+      - name: First build
+        run: |
+          echo "=== Starting first build ==="
+          ./build-image.sh
+
+          DIGEST=$(skopeo inspect oci-archive:./oci.tar | jq -r '.Digest')
+          if [ -z "${DIGEST}" ]; then
+            echo "Failed to get image digest from OCI archive" >&2
+            exit 1
+          fi
+          echo "First build digest: ${DIGEST}"
+          echo "${DIGEST}" > digest-first.txt
+
+          # Save first build artifact
+          mv oci.tar oci-first.tar
+
+      - name: Clean build environment
+        run: |
+          echo "=== Cleaning build environment ==="
+
+          # Extract builder name from build-image.sh to stay in sync
+          BUILDER_NAME=$(grep -oP '(?<=--name )\w+' build-image.sh | head -1) || true
+          if [ -n "$BUILDER_NAME" ]; then
+            echo "Removing builder: ${BUILDER_NAME}"
+            docker buildx rm "${BUILDER_NAME}" || true
+          fi
+
+          # Prune all docker resources
+          docker system prune -af --volumes || true
+
+          # Remove any cached layers
+          docker builder prune -af || true
+
+          echo "Build environment cleaned"
+
+      - name: Second build
+        run: |
+          echo "=== Starting second build ==="
+          ./build-image.sh
+
+          DIGEST=$(skopeo inspect oci-archive:./oci.tar | jq -r '.Digest')
+          if [ -z "${DIGEST}" ]; then
+            echo "Failed to get image digest from OCI archive" >&2
+            exit 1
+          fi
+          echo "Second build digest: ${DIGEST}"
+          echo "${DIGEST}" > digest-second.txt
+
+          # Save second build artifact
+          mv oci.tar oci-second.tar
+
+      - name: Compare sequential digests
+        id: compare
+        run: |
+          FIRST=$(cat digest-first.txt)
+          SECOND=$(cat digest-second.txt)
+          if [ "$FIRST" != "$SECOND" ]; then
+            echo "mismatch=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mismatch=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload digest artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-sequential
+          path: |
+            digest-first.txt
+            digest-second.txt
+          retention-days: 1
+
+      # Only upload OCI tars on mismatch to save disk space
+      - name: Upload OCI archives on mismatch
+        if: steps.compare.outputs.mismatch == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-tar-sequential-debug
+          path: |
+            oci-first.tar
+            oci-second.tar
+          retention-days: 1
+
+  # Verify all builds produced identical digests
+  verify:
+    name: Verify Reproducibility
+    needs: [build, sequential-builds]
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.verify.outputs.result }}
+    steps:
+      - name: Download all digest artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          merge-multiple: false
+
+      - name: Collect and compare digests
+        id: verify
+        run: |
+          echo "=== Reproducibility Verification Results ==="
+          echo ""
+
+          # Initialize default values for outputs (in case of early failure)
+          echo "digest_ubuntu_latest=(not available)" >> "$GITHUB_OUTPUT"
+          echo "digest_ubuntu_22=(not available)" >> "$GITHUB_OUTPUT"
+          echo "digest_ubuntu_24=(not available)" >> "$GITHUB_OUTPUT"
+          echo "digest_seq_first=(not available)" >> "$GITHUB_OUTPUT"
+          echo "digest_seq_second=(not available)" >> "$GITHUB_OUTPUT"
+          echo "result=failed" >> "$GITHUB_OUTPUT"
+
+          # Read digests from artifact files
+          DIGEST_UBUNTU_LATEST=$(cat digest-ubuntu-latest/digest.txt 2>/dev/null || echo "")
+          DIGEST_UBUNTU_22=$(cat digest-ubuntu-22.04/digest.txt 2>/dev/null || echo "")
+          DIGEST_UBUNTU_24=$(cat digest-ubuntu-24.04/digest.txt 2>/dev/null || echo "")
+          DIGEST_SEQ_FIRST=$(cat digest-sequential/digest-first.txt 2>/dev/null || echo "")
+          DIGEST_SEQ_SECOND=$(cat digest-sequential/digest-second.txt 2>/dev/null || echo "")
+
+          # Export actual values for summary step (overwrite defaults)
+          {
+            echo "digest_ubuntu_latest=${DIGEST_UBUNTU_LATEST:-"(not available)"}"
+            echo "digest_ubuntu_22=${DIGEST_UBUNTU_22:-"(not available)"}"
+            echo "digest_ubuntu_24=${DIGEST_UBUNTU_24:-"(not available)"}"
+            echo "digest_seq_first=${DIGEST_SEQ_FIRST:-"(not available)"}"
+            echo "digest_seq_second=${DIGEST_SEQ_SECOND:-"(not available)"}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Digests from parallel builds on different runners:"
+          echo "  ubuntu-latest:  ${DIGEST_UBUNTU_LATEST:-(not available)}"
+          echo "  ubuntu-22.04:   ${DIGEST_UBUNTU_22:-(not available)}"
+          echo "  ubuntu-24.04:   ${DIGEST_UBUNTU_24:-(not available)}"
+          echo ""
+          echo "Digests from sequential builds:"
+          echo "  First build:    ${DIGEST_SEQ_FIRST:-(not available)}"
+          echo "  Second build:   ${DIGEST_SEQ_SECOND:-(not available)}"
+          echo ""
+
+          # Verify all digests are non-empty
+          FAILED=false
+          for digest in "$DIGEST_UBUNTU_LATEST" "$DIGEST_UBUNTU_22" "$DIGEST_UBUNTU_24" "$DIGEST_SEQ_FIRST" "$DIGEST_SEQ_SECOND"; do
+            if [ -z "$digest" ]; then
+              echo "ERROR: One or more builds failed to produce a digest"
+              FAILED=true
+            fi
+          done
+
+          if [ "$FAILED" = true ]; then
+            exit 1
+          fi
+
+          # Compare all digests - they should all match
+          REFERENCE_DIGEST="$DIGEST_UBUNTU_LATEST"
+          MISMATCH=false
+
+          echo "=== Comparing all digests against reference (ubuntu-latest) ==="
+          echo ""
+
+          compare_digest() {
+            local name="$1"
+            local digest="$2"
+            if [ "$digest" = "$REFERENCE_DIGEST" ]; then
+              echo "[PASS] ${name}: MATCH"
+            else
+              echo "[FAIL] ${name}: MISMATCH"
+              echo "  Expected: ${REFERENCE_DIGEST}"
+              echo "  Got:      ${digest}"
+              MISMATCH=true
+            fi
+          }
+
+          compare_digest "ubuntu-22.04" "$DIGEST_UBUNTU_22"
+          compare_digest "ubuntu-24.04" "$DIGEST_UBUNTU_24"
+          compare_digest "Sequential first" "$DIGEST_SEQ_FIRST"
+          compare_digest "Sequential second" "$DIGEST_SEQ_SECOND"
+
+          echo ""
+
+          if [ "$MISMATCH" = true ]; then
+            echo "=== VERIFICATION FAILED ==="
+            echo "Build is NOT reproducible - digests do not match across environments"
+            echo "result=failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "=== VERIFICATION PASSED ==="
+            echo "Build is reproducible - all digests match: ${REFERENCE_DIGEST}"
+            echo "result=passed" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate summary
+        if: always()
+        run: |
+          DIGEST_LATEST="${{ steps.verify.outputs.digest_ubuntu_latest }}"
+          DIGEST_22="${{ steps.verify.outputs.digest_ubuntu_22 }}"
+          DIGEST_24="${{ steps.verify.outputs.digest_ubuntu_24 }}"
+          DIGEST_FIRST="${{ steps.verify.outputs.digest_seq_first }}"
+          DIGEST_SECOND="${{ steps.verify.outputs.digest_seq_second }}"
+          RESULT="${{ steps.verify.outputs.result }}"
+
+          {
+            echo "## Reproducible Build Verification"
+            echo ""
+            echo "### Digests"
+            echo ""
+            echo "| Environment | Digest |"
+            echo "|-------------|--------|"
+            echo "| ubuntu-latest | \`${DIGEST_LATEST:-"(not available)"}\` |"
+            echo "| ubuntu-22.04 | \`${DIGEST_22:-"(not available)"}\` |"
+            echo "| ubuntu-24.04 | \`${DIGEST_24:-"(not available)"}\` |"
+            echo "| Sequential (first) | \`${DIGEST_FIRST:-"(not available)"}\` |"
+            echo "| Sequential (second) | \`${DIGEST_SECOND:-"(not available)"}\` |"
+            echo ""
+
+            if [ "$RESULT" = "passed" ]; then
+              echo "### Result: REPRODUCIBLE"
+              echo ""
+              echo "All builds produced identical digests."
+            else
+              echo "### Result: NOT REPRODUCIBLE"
+              echo ""
+              echo "Build digests do not match across environments or verification failed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -177,6 +177,41 @@ pub struct RagFileMetadataEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Typed filter structs for RAG passthrough (prevents mass assignment)
+// ---------------------------------------------------------------------------
+
+/// Allowed fields for POST /v1/vector_stores/{id} (modify).
+#[derive(Debug, Serialize, Deserialize)]
+struct ModifyVectorStoreFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_after: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<HashMap<String, Value>>,
+}
+
+/// Allowed fields for POST /v1/vector_stores/{id}/search.
+#[derive(Debug, Serialize, Deserialize)]
+struct SearchVectorStoreFilter {
+    query: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_num_results: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filters: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ranking_options: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rewrite_query: Option<bool>,
+}
+
+/// Allowed fields for POST /v1/vector_stores/{id}/files/{file_id} (update attributes).
+#[derive(Debug, Serialize, Deserialize)]
+struct UpdateFileAttributesFilter {
+    attributes: HashMap<String, Value>,
+}
+
+// ---------------------------------------------------------------------------
 // Service Error
 // ---------------------------------------------------------------------------
 
@@ -530,9 +565,15 @@ impl VectorStoreServiceTrait for VectorStoreServiceImpl {
     ) -> Result<Value, VectorStoreServiceError> {
         self.verify_vs(vs_uuid, workspace_id).await?;
 
+        // Filter to allowed fields only (prevents mass assignment)
+        let typed: ModifyVectorStoreFilter = serde_json::from_value(body)
+            .map_err(|e| VectorStoreServiceError::InvalidParams(e.to_string()))?;
+        let filtered_body = serde_json::to_value(&typed)
+            .map_err(|e| VectorStoreServiceError::InvalidParams(e.to_string()))?;
+
         let mut response = self
             .rag
-            .update_vector_store(&vs_uuid.to_string(), body)
+            .update_vector_store(&vs_uuid.to_string(), filtered_body)
             .await?;
         add_id_prefixes(&mut response);
         Ok(response)
@@ -563,9 +604,15 @@ impl VectorStoreServiceTrait for VectorStoreServiceImpl {
     ) -> Result<Value, VectorStoreServiceError> {
         self.verify_vs(vs_uuid, workspace_id).await?;
 
+        // Filter to allowed fields only (prevents mass assignment)
+        let typed: SearchVectorStoreFilter = serde_json::from_value(body)
+            .map_err(|e| VectorStoreServiceError::InvalidParams(e.to_string()))?;
+        let filtered_body = serde_json::to_value(&typed)
+            .map_err(|e| VectorStoreServiceError::InvalidParams(e.to_string()))?;
+
         let mut response = self
             .rag
-            .search_vector_store(&vs_uuid.to_string(), body)
+            .search_vector_store(&vs_uuid.to_string(), filtered_body)
             .await?;
         add_id_prefixes(&mut response);
         Ok(response)
@@ -642,9 +689,15 @@ impl VectorStoreServiceTrait for VectorStoreServiceImpl {
         self.verify_vs(vs_uuid, workspace_id).await?;
         self.verify_file(file_uuid, workspace_id).await?;
 
+        // Filter to allowed fields only (prevents mass assignment)
+        let typed: UpdateFileAttributesFilter = serde_json::from_value(body)
+            .map_err(|e| VectorStoreServiceError::InvalidParams(e.to_string()))?;
+        let filtered_body = serde_json::to_value(&typed)
+            .map_err(|e| VectorStoreServiceError::InvalidParams(e.to_string()))?;
+
         let mut response = self
             .rag
-            .update_vs_file(&vs_uuid.to_string(), &file_uuid.to_string(), body)
+            .update_vs_file(&vs_uuid.to_string(), &file_uuid.to_string(), filtered_body)
             .await?;
         add_id_prefixes(&mut response);
         Ok(response)
@@ -684,6 +737,9 @@ impl VectorStoreServiceTrait for VectorStoreServiceImpl {
             .map_err(|e| VectorStoreServiceError::InvalidParams(e.to_string()))?;
 
         if let Some(obj) = rag_body.as_object_mut() {
+            // Remove unverified files field — only verified file_ids should reach RAG
+            obj.remove("files");
+
             // Replace file_ids with raw UUIDs
             let uuid_strings: Vec<Value> = file_uuids
                 .iter()

@@ -12,8 +12,8 @@ use crate::{
     models::{
         CreateVectorStoreFileBatchRequest, CreateVectorStoreFileRequest, CreateVectorStoreRequest,
         ErrorResponse, ModifyVectorStoreRequest, UpdateVectorStoreFileAttributesRequest,
-        VectorStoreDeleteResponse, VectorStoreFileDeleteResponse, VectorStoreFileListResponse,
-        VectorStoreFileObject, VectorStoreFileBatchObject, VectorStoreListResponse,
+        VectorStoreDeleteResponse, VectorStoreFileBatchObject, VectorStoreFileDeleteResponse,
+        VectorStoreFileListResponse, VectorStoreFileObject, VectorStoreListResponse,
         VectorStoreObject, VectorStoreSearchRequest, VectorStoreSearchResponse,
     },
     routes::api::AppState,
@@ -594,13 +594,24 @@ pub async fn create_vector_store_file_batch(
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     let vs_uuid = parse_uuid_with_prefix(&vector_store_id, PREFIX_VS)?;
 
-    // Try file_ids first, then files as fallback
+    // Enforce mutual exclusivity: only one of file_ids or files is allowed
+    let has_file_ids = body.get("file_ids").and_then(|v| v.as_array()).is_some();
+    let has_files = body.get("files").and_then(|v| v.as_array()).is_some();
+
+    if has_file_ids && has_files {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "file_ids and files are mutually exclusive; provide only one".to_string(),
+                "invalid_request_error".to_string(),
+            )),
+        ));
+    }
+
     let file_id_strs: Vec<&Value> =
         if let Some(file_ids) = body.get("file_ids").and_then(|v| v.as_array()) {
-            // Use file_ids array directly
             file_ids.iter().collect()
         } else if let Some(files) = body.get("files").and_then(|v| v.as_array()) {
-            // Extract file_id from each file spec in files array
             files.iter().collect()
         } else {
             return Err((

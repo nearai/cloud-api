@@ -37,22 +37,24 @@ impl ApiConfig {
 /// RAG service configuration for VPC-internal communication
 #[derive(Debug, Clone)]
 pub struct RagServiceConfig {
-    pub base_url: String,
+    pub app_id: String,
+    pub gateway_subdomain: String,
     pub auth_token_file: Option<String>,
     pub timeout_seconds: u64,
 }
 
 impl RagServiceConfig {
-    /// Load from environment variables. Returns None if RAG_SERVICE_BASE_URL is not set.
+    /// Load from environment variables. Returns None if RAG_SERVICE_APP_ID is not set.
     pub fn from_env() -> Option<Self> {
-        let base_url = env::var("RAG_SERVICE_BASE_URL").ok()?;
+        let app_id = env::var("RAG_SERVICE_APP_ID").ok()?;
         Some(Self {
-            base_url,
+            app_id,
+            gateway_subdomain: env::var("GATEWAY_SUBDOMAIN").ok()?,
             auth_token_file: env::var("VPC_SHARED_SECRET_FILE").ok(),
             timeout_seconds: env::var("RAG_SERVICE_TIMEOUT")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(30),
+                .unwrap_or(10),
         })
     }
 }

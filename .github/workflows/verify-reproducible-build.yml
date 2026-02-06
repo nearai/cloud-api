@@ -2,10 +2,9 @@ name: Verify Reproducible Build
 
 on:
   workflow_dispatch:
-  pull_request:
-  schedule:
-    # Run weekly on Sunday at 00:00 UTC
-    - cron: '0 0 * * 0'
+  push:
+    branches:
+      - 'main'
 
 jobs:
   # Build on multiple runners in parallel to test cross-machine reproducibility
@@ -21,7 +20,7 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo apt-get update
+          sudo apt-get update || true
           sudo apt-get install -y skopeo jq
 
       - name: Build reproducible image
@@ -47,24 +46,23 @@ jobs:
           path: digest.txt
           retention-days: 1
 
-      - name: Upload OCI archive as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: oci-tar-${{ matrix.runner }}
-          path: oci.tar
-          retention-days: 1
+      # Clean up OCI tar to free disk space (not needed for verification)
+      - name: Clean up build artifacts
+        run: rm -f oci.tar
 
   # Sequential builds on the same runner to test build-to-build reproducibility
   sequential-builds:
     name: Sequential Builds
     runs-on: ubuntu-latest
+    outputs:
+      mismatch: ${{ steps.compare.outputs.mismatch }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
       - name: Install build dependencies
         run: |
-          sudo apt-get update
+          sudo apt-get update || true
           sudo apt-get install -y skopeo jq
 
       - name: First build
@@ -87,8 +85,12 @@ jobs:
         run: |
           echo "=== Cleaning build environment ==="
 
-          # Remove the buildkit builder to force fresh state
-          docker buildx rm buildkit_20 || true
+          # Extract builder name from build-image.sh to stay in sync
+          BUILDER_NAME=$(grep -oP '(?<=--name )\w+' build-image.sh | head -1) || true
+          if [ -n "$BUILDER_NAME" ]; then
+            echo "Removing builder: ${BUILDER_NAME}"
+            docker buildx rm "${BUILDER_NAME}" || true
+          fi
 
           # Prune all docker resources
           docker system prune -af --volumes || true
@@ -114,6 +116,17 @@ jobs:
           # Save second build artifact
           mv oci.tar oci-second.tar
 
+      - name: Compare sequential digests
+        id: compare
+        run: |
+          FIRST=$(cat digest-first.txt)
+          SECOND=$(cat digest-second.txt)
+          if [ "$FIRST" != "$SECOND" ]; then
+            echo "mismatch=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mismatch=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Upload digest artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -123,18 +136,15 @@ jobs:
             digest-second.txt
           retention-days: 1
 
-      - name: Upload first build artifact
+      # Only upload OCI tars on mismatch to save disk space
+      - name: Upload OCI archives on mismatch
+        if: steps.compare.outputs.mismatch == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: oci-tar-sequential-first
-          path: oci-first.tar
-          retention-days: 1
-
-      - name: Upload second build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: oci-tar-sequential-second
-          path: oci-second.tar
+          name: oci-tar-sequential-debug
+          path: |
+            oci-first.tar
+            oci-second.tar
           retention-days: 1
 
   # Verify all builds produced identical digests
@@ -142,6 +152,8 @@ jobs:
     name: Verify Reproducibility
     needs: [build, sequential-builds]
     runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.verify.outputs.result }}
     steps:
       - name: Download all digest artifacts
         uses: actions/download-artifact@v4
@@ -155,28 +167,38 @@ jobs:
           echo "=== Reproducibility Verification Results ==="
           echo ""
 
-          # Read digests from artifact files
-          DIGEST_UBUNTU_LATEST=$(cat digest-ubuntu-latest/digest.txt)
-          DIGEST_UBUNTU_22=$(cat digest-ubuntu-22.04/digest.txt)
-          DIGEST_UBUNTU_24=$(cat digest-ubuntu-24.04/digest.txt)
-          DIGEST_SEQ_FIRST=$(cat digest-sequential/digest-first.txt)
-          DIGEST_SEQ_SECOND=$(cat digest-sequential/digest-second.txt)
+          # Initialize default values for outputs (in case of early failure)
+          echo "digest_ubuntu_latest=(not available)" >> "$GITHUB_OUTPUT"
+          echo "digest_ubuntu_22=(not available)" >> "$GITHUB_OUTPUT"
+          echo "digest_ubuntu_24=(not available)" >> "$GITHUB_OUTPUT"
+          echo "digest_seq_first=(not available)" >> "$GITHUB_OUTPUT"
+          echo "digest_seq_second=(not available)" >> "$GITHUB_OUTPUT"
+          echo "result=failed" >> "$GITHUB_OUTPUT"
 
-          # Export for summary step
-          echo "digest_ubuntu_latest=${DIGEST_UBUNTU_LATEST}" >> "$GITHUB_OUTPUT"
-          echo "digest_ubuntu_22=${DIGEST_UBUNTU_22}" >> "$GITHUB_OUTPUT"
-          echo "digest_ubuntu_24=${DIGEST_UBUNTU_24}" >> "$GITHUB_OUTPUT"
-          echo "digest_seq_first=${DIGEST_SEQ_FIRST}" >> "$GITHUB_OUTPUT"
-          echo "digest_seq_second=${DIGEST_SEQ_SECOND}" >> "$GITHUB_OUTPUT"
+          # Read digests from artifact files
+          DIGEST_UBUNTU_LATEST=$(cat digest-ubuntu-latest/digest.txt 2>/dev/null || echo "")
+          DIGEST_UBUNTU_22=$(cat digest-ubuntu-22.04/digest.txt 2>/dev/null || echo "")
+          DIGEST_UBUNTU_24=$(cat digest-ubuntu-24.04/digest.txt 2>/dev/null || echo "")
+          DIGEST_SEQ_FIRST=$(cat digest-sequential/digest-first.txt 2>/dev/null || echo "")
+          DIGEST_SEQ_SECOND=$(cat digest-sequential/digest-second.txt 2>/dev/null || echo "")
+
+          # Export actual values for summary step (overwrite defaults)
+          {
+            echo "digest_ubuntu_latest=${DIGEST_UBUNTU_LATEST:-"(not available)"}"
+            echo "digest_ubuntu_22=${DIGEST_UBUNTU_22:-"(not available)"}"
+            echo "digest_ubuntu_24=${DIGEST_UBUNTU_24:-"(not available)"}"
+            echo "digest_seq_first=${DIGEST_SEQ_FIRST:-"(not available)"}"
+            echo "digest_seq_second=${DIGEST_SEQ_SECOND:-"(not available)"}"
+          } >> "$GITHUB_OUTPUT"
 
           echo "Digests from parallel builds on different runners:"
-          echo "  ubuntu-latest:  ${DIGEST_UBUNTU_LATEST}"
-          echo "  ubuntu-22.04:   ${DIGEST_UBUNTU_22}"
-          echo "  ubuntu-24.04:   ${DIGEST_UBUNTU_24}"
+          echo "  ubuntu-latest:  ${DIGEST_UBUNTU_LATEST:-(not available)}"
+          echo "  ubuntu-22.04:   ${DIGEST_UBUNTU_22:-(not available)}"
+          echo "  ubuntu-24.04:   ${DIGEST_UBUNTU_24:-(not available)}"
           echo ""
           echo "Digests from sequential builds:"
-          echo "  First build:    ${DIGEST_SEQ_FIRST}"
-          echo "  Second build:   ${DIGEST_SEQ_SECOND}"
+          echo "  First build:    ${DIGEST_SEQ_FIRST:-(not available)}"
+          echo "  Second build:   ${DIGEST_SEQ_SECOND:-(not available)}"
           echo ""
 
           # Verify all digests are non-empty
@@ -233,6 +255,13 @@ jobs:
       - name: Generate summary
         if: always()
         run: |
+          DIGEST_LATEST="${{ steps.verify.outputs.digest_ubuntu_latest }}"
+          DIGEST_22="${{ steps.verify.outputs.digest_ubuntu_22 }}"
+          DIGEST_24="${{ steps.verify.outputs.digest_ubuntu_24 }}"
+          DIGEST_FIRST="${{ steps.verify.outputs.digest_seq_first }}"
+          DIGEST_SECOND="${{ steps.verify.outputs.digest_seq_second }}"
+          RESULT="${{ steps.verify.outputs.result }}"
+
           {
             echo "## Reproducible Build Verification"
             echo ""
@@ -240,20 +269,20 @@ jobs:
             echo ""
             echo "| Environment | Digest |"
             echo "|-------------|--------|"
-            echo "| ubuntu-latest | \`${{ steps.verify.outputs.digest_ubuntu_latest }}\` |"
-            echo "| ubuntu-22.04 | \`${{ steps.verify.outputs.digest_ubuntu_22 }}\` |"
-            echo "| ubuntu-24.04 | \`${{ steps.verify.outputs.digest_ubuntu_24 }}\` |"
-            echo "| Sequential (first) | \`${{ steps.verify.outputs.digest_seq_first }}\` |"
-            echo "| Sequential (second) | \`${{ steps.verify.outputs.digest_seq_second }}\` |"
+            echo "| ubuntu-latest | \`${DIGEST_LATEST:-"(not available)"}\` |"
+            echo "| ubuntu-22.04 | \`${DIGEST_22:-"(not available)"}\` |"
+            echo "| ubuntu-24.04 | \`${DIGEST_24:-"(not available)"}\` |"
+            echo "| Sequential (first) | \`${DIGEST_FIRST:-"(not available)"}\` |"
+            echo "| Sequential (second) | \`${DIGEST_SECOND:-"(not available)"}\` |"
             echo ""
 
-            if [ "${{ steps.verify.outputs.result }}" = "passed" ]; then
+            if [ "$RESULT" = "passed" ]; then
               echo "### Result: REPRODUCIBLE"
               echo ""
               echo "All builds produced identical digests."
             else
               echo "### Result: NOT REPRODUCIBLE"
               echo ""
-              echo "Build digests do not match across environments."
+              echo "Build digests do not match across environments or verification failed."
             fi
           } >> "$GITHUB_STEP_SUMMARY"

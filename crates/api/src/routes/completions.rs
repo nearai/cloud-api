@@ -1595,10 +1595,8 @@ pub async fn rerank(
 
                 // Record metrics for monitoring and alerting on missing usage data
                 let model_tag = format!("model:{}", request.model);
-                let reason_tag = format!(
-                    "reason:{}",
-                    services::metrics::consts::REASON_MISSING_USAGE
-                );
+                let reason_tag =
+                    format!("reason:{}", services::metrics::consts::REASON_MISSING_USAGE);
                 let zero_tokens_tags = [model_tag.as_str(), reason_tag.as_str()];
                 app_state.metrics_service.record_count(
                     services::metrics::consts::METRIC_PROVIDER_ZERO_TOKENS,

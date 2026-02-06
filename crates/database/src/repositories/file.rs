@@ -357,6 +357,41 @@ impl FileRepository {
             .collect()
     }
 
+    /// Fetch multiple files by IDs within a workspace
+    pub async fn get_by_ids_and_workspace(
+        &self,
+        ids: &[Uuid],
+        workspace_id: Uuid,
+    ) -> Result<Vec<File>, RepositoryError> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let rows = retry_db!("get_files_by_ids_and_workspace", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query(
+                    "SELECT * FROM files WHERE id = ANY($1) AND workspace_id = $2",
+                    &[&ids, &workspace_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        rows.into_iter()
+            .map(|row| {
+                self.row_to_file(row)
+                    .map_err(RepositoryError::DataConversionError)
+            })
+            .collect()
+    }
+
     /// Helper function to convert database row to File
     fn row_to_file(&self, row: tokio_postgres::Row) -> Result<File> {
         Ok(File {
@@ -433,5 +468,13 @@ impl FileRepositoryTrait for FileRepository {
 
     async fn get_expired_files(&self) -> Result<Vec<File>, RepositoryError> {
         self.get_expired_files().await
+    }
+
+    async fn get_by_ids_and_workspace(
+        &self,
+        ids: &[Uuid],
+        workspace_id: Uuid,
+    ) -> Result<Vec<File>, RepositoryError> {
+        self.get_by_ids_and_workspace(ids, workspace_id).await
     }
 }

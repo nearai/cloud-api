@@ -73,4 +73,12 @@ pub trait FileRepositoryTrait: Send + Sync {
     async fn delete(&self, id: Uuid) -> Result<bool, RepositoryError>;
 
     async fn get_expired_files(&self) -> Result<Vec<File>, RepositoryError>;
+
+    /// Fetch multiple files by IDs within a workspace (for batch verification + metadata).
+    /// Returns only files that exist AND belong to the workspace.
+    async fn get_by_ids_and_workspace(
+        &self,
+        ids: &[Uuid],
+        workspace_id: Uuid,
+    ) -> Result<Vec<File>, RepositoryError>;
 }

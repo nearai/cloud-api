@@ -23,6 +23,7 @@ pub mod session;
 pub mod usage_repository_impl;
 pub mod user;
 pub mod utils;
+pub mod vector_store;
 pub mod workspace;
 
 pub use admin_access_token::AdminAccessTokenRepository;
@@ -45,4 +46,5 @@ pub use response::PgResponseRepository;
 pub use response_item::PgResponseItemsRepository;
 pub use session::SessionRepository;
 pub use user::UserRepository;
+pub use vector_store::PgVectorStoreRefRepository;
 pub use workspace::WorkspaceRepository;

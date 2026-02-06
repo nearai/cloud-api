@@ -2871,6 +2871,9 @@ pub struct VectorStoreObject {
     /// The Unix timestamp (in seconds) for when the vector store was last active.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_active_at: Option<i64>,
+    /// The Unix timestamp (in seconds) for when the vector store was last used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<i64>,
     /// The name of the vector store.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -3062,12 +3065,28 @@ pub struct UpdateVectorStoreFileAttributesRequest {
     pub attributes: HashMap<String, Value>,
 }
 
+/// Per-file specification for batch file creation with optional per-file overrides.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FileBatchFileSpec {
+    /// The ID of the file to add to the vector store.
+    pub file_id: String,
+    /// Per-file chunking strategy override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunking_strategy: Option<ChunkingStrategy>,
+    /// Per-file attributes override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<HashMap<String, Value>>,
+}
+
 /// Request to create a vector store file batch
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateVectorStoreFileBatchRequest {
-    /// A list of file IDs to add to the vector store.
+    /// A list of file IDs to add to the vector store. Mutually exclusive with `files`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_ids: Option<Vec<String>>,
+    /// A list of file specs with per-file overrides. Mutually exclusive with `file_ids`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<FileBatchFileSpec>>,
     /// The chunking strategy used to chunk the file(s).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunking_strategy: Option<ChunkingStrategy>,
@@ -3083,8 +3102,8 @@ pub struct CreateVectorStoreFileBatchRequest {
 /// Request to search a vector store
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct VectorStoreSearchRequest {
-    /// The search query string.
-    pub query: String,
+    /// The search query — a string or an array of strings.
+    pub query: Value,
     /// The maximum number of results to return (1-50, default 10).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_num_results: Option<u32>,
@@ -3110,6 +3129,9 @@ pub struct VectorStoreSearchResponse {
     pub data: Vec<VectorStoreSearchResult>,
     /// Whether there are more results available.
     pub has_more: bool,
+    /// Pagination token for the next page of results, or null if no more pages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_page: Option<String>,
 }
 
 /// A single search result from a vector store

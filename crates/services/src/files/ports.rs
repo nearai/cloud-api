@@ -74,6 +74,14 @@ pub trait FileRepositoryTrait: Send + Sync {
 
     async fn get_expired_files(&self) -> Result<Vec<File>, RepositoryError>;
 
+    /// Fetch multiple files by IDs within a workspace (for batch verification + metadata).
+    /// Returns only files that exist AND belong to the workspace.
+    async fn get_by_ids_and_workspace(
+        &self,
+        ids: &[Uuid],
+        workspace_id: Uuid,
+    ) -> Result<Vec<File>, RepositoryError>;
+
     /// Verify that ALL given file IDs belong to the specified workspace.
     /// Returns true if all files exist and belong to the workspace, false otherwise.
     async fn verify_workspace_ownership(

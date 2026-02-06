@@ -5,6 +5,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::{models::ErrorResponse, routes::api::AppState};
@@ -131,25 +132,48 @@ impl FileListQueryParams {
     /// Build a query string for proxying to the RAG service.
     /// Strips ID prefixes from cursor values.
     fn to_rag_query_string(&self, file_prefix: &str) -> String {
-        let mut parts = Vec::new();
+        let mut serializer = form_urlencoded::Serializer::new(String::new());
         if let Some(limit) = self.limit {
-            parts.push(format!("limit={}", limit.clamp(1, 100)));
+            serializer.append_pair("limit", &limit.clamp(1, 100).to_string());
         }
         if let Some(ref order) = self.order {
-            parts.push(format!("order={order}"));
+            serializer.append_pair("order", order);
         }
         if let Some(ref after) = self.after {
             let raw = after.strip_prefix(file_prefix).unwrap_or(after);
-            parts.push(format!("after={raw}"));
+            serializer.append_pair("after", raw);
         }
         if let Some(ref before) = self.before {
             let raw = before.strip_prefix(file_prefix).unwrap_or(before);
-            parts.push(format!("before={raw}"));
+            serializer.append_pair("before", raw);
         }
         if let Some(ref filter) = self.filter {
-            parts.push(format!("filter={filter}"));
+            serializer.append_pair("filter", filter);
         }
-        parts.join("&")
+        serializer.finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FileListQueryParams;
+
+    #[test]
+    fn to_rag_query_string_encodes_and_strips_prefixes() {
+        let params = FileListQueryParams {
+            limit: Some(150),
+            order: Some("asc&limit=1000".to_string()),
+            after: Some("file-abc123".to_string()),
+            before: Some("file-def456".to_string()),
+            filter: Some("status=completed&x=y".to_string()),
+        };
+
+        let query = params.to_rag_query_string("file-");
+
+        assert_eq!(
+            query,
+            "limit=100&order=asc%26limit%3D1000&after=abc123&before=def456&filter=status%3Dcompleted%26x%3Dy"
+        );
     }
 }
 
@@ -561,25 +585,29 @@ pub async fn create_vector_store_file_batch(
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     let vs_uuid = parse_uuid_with_prefix(&vector_store_id, PREFIX_VS)?;
 
-    // Extract and parse file_ids from body
-    let file_id_strs = body
-        .get("file_ids")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| {
-            (
+    // Try file_ids first, then files as fallback
+    let file_id_strs: Vec<&Value> =
+        if let Some(file_ids) = body.get("file_ids").and_then(|v| v.as_array()) {
+            // Use file_ids array directly
+            file_ids.iter().collect()
+        } else if let Some(files) = body.get("files").and_then(|v| v.as_array()) {
+            // Extract file_id from each file spec in files array
+            files.iter().collect()
+        } else {
+            return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(
-                    "file_ids is required and must be an array".to_string(),
+                    "Either file_ids or files is required".to_string(),
                     "invalid_request_error".to_string(),
                 )),
-            )
-        })?;
+            ));
+        };
 
     if file_id_strs.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
-                "file_ids must not be empty".to_string(),
+                "file_ids or files must not be empty".to_string(),
                 "invalid_request_error".to_string(),
             )),
         ));
@@ -587,17 +615,37 @@ pub async fn create_vector_store_file_batch(
 
     let parsed_file_ids: Vec<Uuid> = file_id_strs
         .iter()
-        .map(|v| {
-            let s = v.as_str().ok_or_else(|| {
-                (
+        .enumerate()
+        .map(|(i, v)| {
+            // If this is from file_ids, the value is a string ID
+            // If this is from files, the value is an object with file_id field
+            let id_str = if let Some(s) = v.as_str() {
+                // Direct file_id from file_ids array
+                s
+            } else if let Some(file_spec) = v.as_object() {
+                // Extract file_id from file spec object
+                file_spec
+                    .get("file_id")
+                    .and_then(|fid| fid.as_str())
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse::new(
+                                format!("files[{i}].file_id must be a string"),
+                                "invalid_request_error".to_string(),
+                            )),
+                        )
+                    })?
+            } else {
+                return Err((
                     StatusCode::BAD_REQUEST,
                     Json(ErrorResponse::new(
-                        "file_ids must contain strings".to_string(),
+                        "file_ids must contain strings or files must contain objects".to_string(),
                         "invalid_request_error".to_string(),
                     )),
-                )
-            })?;
-            parse_uuid_with_prefix(s, PREFIX_FILE)
+                ));
+            };
+            parse_uuid_with_prefix(id_str, PREFIX_FILE)
         })
         .collect::<Result<Vec<_>, _>>()?;
 

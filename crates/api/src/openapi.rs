@@ -252,7 +252,7 @@ use utoipa::{Modify, OpenApi};
             VectorStoreDeleteResponse, VectorStoreFileDeleteResponse,
             CreateVectorStoreRequest, ModifyVectorStoreRequest,
             CreateVectorStoreFileRequest, UpdateVectorStoreFileAttributesRequest,
-            CreateVectorStoreFileBatchRequest,
+            CreateVectorStoreFileBatchRequest, FileBatchFileSpec,
             VectorStoreSearchRequest, VectorStoreSearchResponse,
             VectorStoreSearchResult, SearchResultContent,
         ),

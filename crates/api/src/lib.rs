@@ -424,7 +424,8 @@ pub async fn init_domain_services_with_pool(
     let rag_service: Option<Arc<dyn services::rag::RagServiceTrait>> =
         if let Some(ref rag_config) = config.rag_service {
             match services::rag::RagServiceClient::new(
-                rag_config.base_url.clone(),
+                rag_config.app_id.clone(),
+                rag_config.gateway_subdomain.clone(),
                 rag_config.auth_token_file.as_deref(),
                 rag_config.timeout_seconds,
             ) {

@@ -7,7 +7,8 @@ use super::ports::{RagError, RagServiceTrait};
 /// HTTP client for communicating with the RAG service over VPC
 pub struct RagServiceClient {
     client: reqwest::Client,
-    base_url: String,
+    app_id: String,
+    gateway_subdomain: String,
     auth_token: Option<String>,
 }
 
@@ -15,11 +16,13 @@ impl RagServiceClient {
     /// Create a new RAG service client
     ///
     /// # Arguments
-    /// * `base_url` - Base URL of the RAG service (e.g. "http://rag-service:8000")
+    /// * `app_id` - App ID of the RAG service
+    /// * `gateway_subdomain` - Gateway subdomain (e.g. "cvm1.near.ai")
     /// * `auth_token_file` - Optional path to file containing the bearer token
     /// * `timeout_seconds` - Request timeout in seconds
     pub fn new(
-        base_url: String,
+        app_id: String,
+        gateway_subdomain: String,
         auth_token_file: Option<&str>,
         timeout_seconds: u64,
     ) -> Result<Self, RagError> {
@@ -46,21 +49,26 @@ impl RagServiceClient {
             .map_err(|e| RagError::RequestFailed(format!("Failed to build HTTP client: {e}")))?;
 
         tracing::info!(
-            base_url = %base_url,
+            app_id = %app_id,
+            gateway_subdomain = %gateway_subdomain,
             auth_configured = auth_token.is_some(),
             "RAG service client initialized"
         );
 
         Ok(Self {
             client,
-            base_url,
+            app_id,
+            gateway_subdomain,
             auth_token,
         })
     }
 
     /// Build a request with auth header if configured
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let url = format!("{}{}", self.base_url, path);
+        let url = format!(
+            "https://{}-8080.{}{}",
+            self.app_id, self.gateway_subdomain, path
+        );
         let mut builder = self.client.request(method, &url);
         if let Some(ref token) = self.auth_token {
             builder = builder.bearer_auth(token);

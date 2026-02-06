@@ -4,6 +4,9 @@ pub mod ports;
 pub use client::RagServiceClient;
 pub use ports::{RagError, RagServiceTrait};
 
+#[cfg(any(test, feature = "test-mocks"))]
+pub use ports::MockRagServiceTrait;
+
 /// Stub implementation that returns `NotConfigured` for all methods.
 /// Used when the RAG service URL is not set in configuration.
 pub struct NotConfiguredRagService;

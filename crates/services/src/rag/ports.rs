@@ -1,5 +1,8 @@
 use async_trait::async_trait;
 
+#[cfg(any(test, feature = "test-mocks"))]
+use mockall::automock;
+
 /// Error type for RAG service operations
 #[derive(Debug, thiserror::Error)]
 pub enum RagError {
@@ -17,6 +20,7 @@ pub enum RagError {
 ///
 /// All methods use `serde_json::Value` passthrough for forward-compatibility.
 /// Cloud-api only adds/strips ID prefixes. All other fields flow through untouched.
+#[cfg_attr(any(test, feature = "test-mocks"), automock)]
 #[async_trait]
 pub trait RagServiceTrait: Send + Sync {
     // -----------------------------------------------------------------------

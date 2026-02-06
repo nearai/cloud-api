@@ -125,9 +125,8 @@ impl ServerConfig {
 pub struct ModelDiscoveryConfig {
     pub discovery_server_url: String,
     pub api_key: Option<String>,
-    pub refresh_interval: i64,  // seconds
-    pub timeout: i64,           // seconds (for discovery requests)
-    pub inference_timeout: i64, // seconds (for model inference requests)
+    pub refresh_interval: i64, // seconds
+    pub timeout: i64,          // seconds (for discovery requests)
 }
 
 impl ModelDiscoveryConfig {
@@ -145,10 +144,6 @@ impl ModelDiscoveryConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30), // 30 seconds
-            inference_timeout: env::var("MODEL_INFERENCE_TIMEOUT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(300), // 5 minutes
         };
         config.validate()?;
         Ok(config)
@@ -157,14 +152,6 @@ impl ModelDiscoveryConfig {
     /// Validate that all timeout values are positive
     /// Called at startup to catch invalid configuration early
     pub fn validate(&self) -> Result<(), String> {
-        if self.inference_timeout <= 0 {
-            return Err(format!(
-                "MODEL_INFERENCE_TIMEOUT must be positive (got: {}). \
-                 If set to 0 or negative, all inference requests will timeout immediately.",
-                self.inference_timeout
-            ));
-        }
-
         if self.timeout <= 0 {
             return Err(format!(
                 "MODEL_DISCOVERY_TIMEOUT must be positive (got: {}). \
@@ -198,10 +185,6 @@ impl Default for ModelDiscoveryConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30), // 30 seconds
-            inference_timeout: env::var("MODEL_INFERENCE_TIMEOUT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(300), // 5 minutes
         };
         config.validate().expect("Invalid ModelDiscoveryConfig");
         config

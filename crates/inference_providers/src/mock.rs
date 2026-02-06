@@ -11,7 +11,8 @@ use crate::{
     ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
     ImageGenerationResponse, ImageGenerationResponseWithBytes, ListModelsError, MessageRole,
     ModelInfo, ModelsResponse, RerankError, RerankParams, RerankResponse, RerankResult,
-    RerankUsage, ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage, SSEEvent, StreamChunk, StreamingResult, TokenUsage, ToolCallDelta,
+    RerankUsage, SSEEvent, ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage,
+    StreamChunk, StreamingResult, TokenUsage, ToolCallDelta,
 };
 use async_trait::async_trait;
 use bytes::Bytes;

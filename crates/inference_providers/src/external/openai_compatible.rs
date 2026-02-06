@@ -13,8 +13,8 @@ use super::backend::{BackendConfig, ExternalBackend};
 use crate::{
     models::StreamOptions, sse_parser::new_sse_parser, ChatCompletionParams,
     ChatCompletionResponse, ChatCompletionResponseWithBytes, CompletionError, ImageGenerationError,
-    ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes, ScoreError,
-    ScoreParams, ScoreResponse, StreamingResult,
+    ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes,
+    StreamingResult,
 };
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
@@ -261,51 +261,6 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             response: image_response,
             raw_bytes,
         })
-    }
-
-    async fn score(
-        &self,
-        config: &BackendConfig,
-        _model: &str,
-        params: ScoreParams,
-    ) -> Result<ScoreResponse, ScoreError> {
-        let url = format!("{}/v1/score", config.base_url);
-
-        let mut headers = self
-            .build_headers(config)
-            .map_err(ScoreError::GenerationError)?;
-        headers.insert("Content-Type", HeaderValue::from_static("application/json"));
-
-        let timeout = std::time::Duration::from_secs(config.timeout_seconds as u64);
-
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .timeout(timeout)
-            .json(&params)
-            .send()
-            .await
-            .map_err(|e| ScoreError::GenerationError(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status_code = response.status().as_u16();
-            let message = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(ScoreError::HttpError {
-                status_code,
-                message,
-            });
-        }
-
-        let score_response: ScoreResponse = response
-            .json()
-            .await
-            .map_err(|e| ScoreError::GenerationError(e.to_string()))?;
-
-        Ok(score_response)
     }
 }
 

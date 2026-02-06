@@ -7,7 +7,8 @@
 use crate::{
     ChatCompletionParams, ChatCompletionResponseWithBytes, CompletionError, ImageEditError,
     ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
-    ImageGenerationResponseWithBytes, RerankError, RerankParams, ScoreError, ScoreParams, RerankResponse, ScoreResponse, StreamingResult,
+    ImageGenerationResponseWithBytes, RerankError, RerankParams, RerankResponse, ScoreError,
+    ScoreParams, ScoreResponse, StreamingResult,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;

@@ -77,8 +77,8 @@ pub use models::{
     ImageEditError, ImageEditParams, ImageEditResponse, ImageEditResponseWithBytes,
     ImageGenerationError, ImageGenerationParams, ImageGenerationResponse,
     ImageGenerationResponseWithBytes, MessageRole, ModelInfo, RerankError, RerankParams,
-    RerankResponse, RerankResult, RerankUsage, ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage, StreamChunk, StreamOptions, TokenUsage, ToolChoice,
-    ToolDefinition,
+    RerankResponse, RerankResult, RerankUsage, ScoreError, ScoreParams, ScoreResponse, ScoreResult,
+    ScoreUsage, StreamChunk, StreamOptions, TokenUsage, ToolChoice, ToolDefinition,
 };
 pub use sse_parser::{new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser};
 pub use vllm::{VLlmConfig, VLlmProvider};
@@ -181,7 +181,6 @@ pub trait InferenceProvider {
         params: ScoreParams,
         request_hash: String,
     ) -> Result<ScoreResponse, ScoreError>;
-
 
     async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError>;
 

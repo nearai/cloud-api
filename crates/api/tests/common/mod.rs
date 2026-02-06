@@ -79,10 +79,6 @@ pub fn test_config_with_db(db_name: &str) -> ApiConfig {
                 .ok()
                 .and_then(|t| t.parse().ok())
                 .unwrap_or(5),
-            inference_timeout: std::env::var("MODEL_INFERENCE_TIMEOUT")
-                .ok()
-                .and_then(|t| t.parse().ok())
-                .unwrap_or(30 * 60), // 30 minutes
         },
         logging: config::LoggingConfig {
             level: "debug".to_string(),
@@ -372,7 +368,6 @@ async fn setup_test_infrastructure_for_real_providers() -> TestInfrastructure {
     let mut config = test_config_with_db(&db_name);
     config.model_discovery.discovery_server_url = get_real_discovery_server_url();
     config.model_discovery.timeout = 30;
-    config.model_discovery.inference_timeout = 5 * 60;
 
     let db_config = config.database.clone();
 

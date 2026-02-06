@@ -117,17 +117,14 @@ impl VectorStoreRefRepository for PgVectorStoreRefRepository {
         workspace_id: Uuid,
         params: &PaginationParams,
     ) -> Result<(Vec<VectorStoreRef>, bool), RepositoryError> {
-        let is_asc = params.order == "asc";
+        enum OrderDir { Asc, Desc }
+        let dir = if params.order == "asc" { OrderDir::Asc } else { OrderDir::Desc };
         let use_before = params.after.is_none() && params.before.is_some();
         let cursor_id = params.after.or(params.before);
 
-        let order_clause = match (is_asc, use_before) {
-            (true, false) | (false, true) => "ASC",
-            (false, false) | (true, true) => "DESC",
-        };
-        let comparison = match (is_asc, use_before) {
-            (true, false) | (false, true) => ">",
-            (false, false) | (true, true) => "<",
+        let (order_clause, comparison) = match (dir, use_before) {
+            (OrderDir::Asc, false) | (OrderDir::Desc, true) => ("ASC", ">"),
+            (OrderDir::Desc, false) | (OrderDir::Asc, true) => ("DESC", "<"),
         };
 
         // Fetch limit+1 to determine has_more

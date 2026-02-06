@@ -236,6 +236,15 @@ pub async fn list_vector_stores(
     let workspace_id = api_key.workspace_id.0;
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let order = params.order.unwrap_or_else(|| "desc".to_string());
+    if order != "asc" && order != "desc" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "order must be 'asc' or 'desc'".to_string(),
+                "invalid_request_error".to_string(),
+            )),
+        ));
+    }
 
     let after = params
         .after

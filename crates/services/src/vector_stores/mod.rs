@@ -180,6 +180,21 @@ pub struct RagFileMetadataEntry {
 // Typed filter structs for RAG passthrough (prevents mass assignment)
 // ---------------------------------------------------------------------------
 
+/// Allowed fields for POST /v1/vector_stores (create).
+#[derive(Debug, Serialize, Deserialize)]
+struct CreateVectorStoreFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_after: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<HashMap<String, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chunking_strategy: Option<Value>,
+}
+
 /// Allowed fields for POST /v1/vector_stores/{id} (modify).
 #[derive(Debug, Serialize, Deserialize)]
 struct ModifyVectorStoreFilter {
@@ -403,7 +418,17 @@ impl VectorStoreServiceImpl {
             .get_by_ids_and_workspace(file_uuids, workspace_id)
             .await?;
         if files.len() != file_uuids.len() {
-            return Err(VectorStoreServiceError::FileNotFound);
+            let found_ids: std::collections::HashSet<Uuid> =
+                files.iter().map(|f| f.id).collect();
+            let missing: Vec<String> = file_uuids
+                .iter()
+                .filter(|id| !found_ids.contains(id))
+                .map(|id| format!("{PREFIX_FILE}{id}"))
+                .collect();
+            return Err(VectorStoreServiceError::InvalidParams(format!(
+                "Files not found or not accessible: {}",
+                missing.join(", ")
+            )));
         }
         Ok(files)
     }
@@ -414,8 +439,14 @@ impl VectorStoreServiceTrait for VectorStoreServiceImpl {
     async fn create_vector_store(
         &self,
         workspace_id: Uuid,
-        mut body: Value,
+        body: Value,
     ) -> Result<Value, VectorStoreServiceError> {
+        // Filter to allowed fields only (prevents mass assignment)
+        let typed: CreateVectorStoreFilter = serde_json::from_value(body)
+            .map_err(|e| VectorStoreServiceError::InvalidParams(e.to_string()))?;
+        let mut body = serde_json::to_value(&typed)
+            .map_err(|e| VectorStoreServiceError::InvalidParams(e.to_string()))?;
+
         // If file_ids present in body, verify ALL belong to workspace and get metadata
         if let Some(file_ids) = body.get("file_ids").and_then(|v| v.as_array()) {
             let uuids: Vec<Uuid> = file_ids
@@ -470,8 +501,11 @@ impl VectorStoreServiceTrait for VectorStoreServiceImpl {
                 )
             })?;
 
-        // Local: create ref (RAG succeeded, safe to create local ref)
-        self.ref_repo.create(rag_id, workspace_id).await?;
+        // Local ref — if this fails, compensate by deleting from RAG
+        if let Err(e) = self.ref_repo.create(rag_id, workspace_id).await {
+            let _ = self.rag.delete_vector_store(&rag_id.to_string()).await;
+            return Err(e.into());
+        }
 
         // Add prefixes to response
         add_id_prefixes(&mut response);
@@ -586,11 +620,12 @@ impl VectorStoreServiceTrait for VectorStoreServiceImpl {
     ) -> Result<Value, VectorStoreServiceError> {
         self.verify_vs(vs_uuid, workspace_id).await?;
 
-        // RAG first — delete the vector store
-        let mut response = self.rag.delete_vector_store(&vs_uuid.to_string()).await?;
-
-        // Local: soft-delete ref
+        // Local soft-delete first — if RAG delete later fails, the ref is
+        // already hidden which is acceptable (eventual consistency).
         self.ref_repo.soft_delete(vs_uuid, workspace_id).await?;
+
+        // RAG: delete the vector store
+        let mut response = self.rag.delete_vector_store(&vs_uuid.to_string()).await?;
 
         add_id_prefixes(&mut response);
         Ok(response)

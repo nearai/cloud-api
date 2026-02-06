@@ -693,7 +693,9 @@ pub async fn setup_qwen_model(server: &axum_test::TestServer) -> String {
             "modelDescription": "Updated model description",
             "contextLength": 128000,
             "verifiable": true,
-            "isActive": true
+            "isActive": true,
+            "inputModalities": ["text"],
+            "outputModalities": ["text"]
         }))
         .unwrap(),
     );
@@ -795,7 +797,7 @@ pub async fn setup_qwen_omni_model(server: &axum_test::TestServer) -> String {
 pub async fn setup_qwen_image_model(server: &axum_test::TestServer) -> String {
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
-        "Qwen/Qwen-Image-2512".to_string(),
+        "black-forest-labs/FLUX.2-klein-4B".to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
                 "amount": 0,
@@ -809,18 +811,20 @@ pub async fn setup_qwen_image_model(server: &axum_test::TestServer) -> String {
                 "amount": 40000000,
                 "currency": "USD"
             },
-            "modelDisplayName": "Qwen-Image",
-            "modelDescription": "Qwen Image generation model",
+            "modelDisplayName": "FLUX 2 Klein",
+            "modelDescription": "FLUX 2 Klein image generation model",
             "contextLength": 4096,
             "verifiable": true,
-            "isActive": true
+            "isActive": true,
+            "inputModalities": ["text"],
+            "outputModalities": ["image"]
         }))
         .unwrap(),
     );
     let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1, "Should have updated 1 model");
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    "Qwen/Qwen-Image-2512".to_string()
+    "black-forest-labs/FLUX.2-klein-4B".to_string()
 }
 
 /// Generate a minimal valid WAV audio file as base64
@@ -1209,4 +1213,53 @@ pub async fn test_near_login(
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&request_body)
         .await
+}
+
+/// Parse Server-Sent Events (SSE) stream and extract response ID from response.created event
+///
+/// Properly parses SSE format by splitting on \n\n, finding data: lines, and parsing JSON.
+/// This is more robust than string matching and resilient to formatting changes.
+///
+/// # Arguments
+/// * `sse_stream` - Raw SSE response text
+///
+/// # Returns
+/// * `Some(id)` - The response ID (without "resp_" prefix) if found
+/// * `None` - If no response.created event with ID is found
+pub fn extract_response_id_from_sse(sse_stream: &str) -> Option<String> {
+    // Split by \n\n to get event blocks
+    for event_block in sse_stream.split("\n\n") {
+        let mut event_type = "";
+        let mut data = "";
+
+        // Parse event block lines
+        for line in event_block.lines() {
+            if let Some(event_data) = line.strip_prefix("event:") {
+                event_type = event_data.trim();
+            } else if let Some(json_data) = line.strip_prefix("data:") {
+                data = json_data.trim();
+            }
+        }
+
+        // We're looking for response.created events
+        if event_type == "response.created" && !data.is_empty() {
+            // Parse the JSON to extract the ID
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                // Try to extract ID from the response object (most common path)
+                if let Some(id) = json
+                    .get("response")
+                    .and_then(|r| r.get("id"))
+                    .and_then(|v| v.as_str())
+                {
+                    // Strip "resp_" prefix if present
+                    return Some(id.strip_prefix("resp_").unwrap_or(id).to_string());
+                }
+                // Fallback: try to extract ID directly from the event
+                if let Some(id) = json.get("id").and_then(|v| v.as_str()) {
+                    return Some(id.strip_prefix("resp_").unwrap_or(id).to_string());
+                }
+            }
+        }
+    }
+    None
 }

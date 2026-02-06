@@ -9,6 +9,7 @@ use axum::{
     http::{header, StatusCode},
     response::{IntoResponse, Json as ResponseJson, Response},
 };
+use base64::Engine;
 use futures::stream::StreamExt;
 use services::common::encryption_headers as service_encryption_headers;
 use services::completions::{
@@ -100,6 +101,13 @@ fn extract_text_from_content(content: &Option<MessageContent>) -> String {
                 .join("\n")
         }
     }
+}
+
+// Helper function to check if model has vision capability (input_modalities contains "image")
+fn has_vision_capability(input_modalities: &Option<Vec<String>>) -> bool {
+    input_modalities
+        .as_ref()
+        .is_some_and(|modalities| modalities.contains(&"image".to_string()))
 }
 
 // Convert HTTP ChatCompletionRequest to service CompletionRequest
@@ -1444,4 +1452,483 @@ pub async fn image_edits(
                 .into_response()
         }
     }
+}
+
+/// Helper function to perform image analysis
+/// Shared logic between JSON and multipart endpoints
+async fn perform_image_analysis(
+    app_state: &AppState,
+    api_key: &AuthenticatedApiKey,
+    body_hash: String,
+    headers: &axum::http::HeaderMap,
+    model_name: String,
+    prompt: String,
+    image_url: String,
+    max_tokens: Option<i32>,
+    temperature: Option<f32>,
+) -> axum::response::Response {
+    // Log request (IDs only, per CLAUDE.md privacy rules)
+    tracing::info!(
+        model = %model_name,
+        org_id = %api_key.organization.id,
+        workspace_id = %api_key.workspace.id,
+        "Image analysis request"
+    );
+
+    // Resolve model and validate it's a vision model
+    let model = match app_state.models_service.get_model_by_name(&model_name).await {
+        Ok(model) => model,
+        Err(services::models::ModelsError::NotFound(_)) => {
+            tracing::warn!(model = %model_name, "Model not found for image analysis");
+            return (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    format!("Model '{}' not found", model_name),
+                    "invalid_request_error".to_string(),
+                )),
+            )
+            .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to resolve model for image analysis");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to resolve model".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+            .into_response();
+        }
+    };
+
+    // Validate model has vision capability
+    if !has_vision_capability(&model.input_modalities) {
+        tracing::warn!(
+            model = %model_name,
+            input_modalities = ?model.input_modalities,
+            "Model does not support image analysis"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                format!("Model '{}' does not support image analysis. Model must have input_modalities including 'image'.", model_name),
+                "invalid_request_error".to_string(),
+            )),
+        )
+        .into_response();
+    }
+
+    // Build multimodal message content (OpenAI format)
+    let message_content = serde_json::json!([
+        {
+            "type": "text",
+            "text": prompt
+        },
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": image_url
+            }
+        }
+    ]);
+
+    let messages = vec![inference_providers::ChatMessage {
+        role: inference_providers::MessageRole::User,
+        content: Some(message_content),
+        name: None,
+        tool_call_id: None,
+        tool_calls: None,
+    }];
+
+    // Extract encryption headers if present (for TEE attestation)
+    let encryption_headers = match crate::routes::common::validate_encryption_headers(headers) {
+        Ok(headers) => headers,
+        Err(err) => return err.into_response(),
+    };
+
+    let mut extra = std::collections::HashMap::new();
+    if let Some(ref signing_algo) = encryption_headers.signing_algo {
+        extra.insert(
+            service_encryption_headers::SIGNING_ALGO.to_string(),
+            serde_json::Value::String(signing_algo.clone()),
+        );
+    }
+    if let Some(ref client_pub_key) = encryption_headers.client_pub_key {
+        extra.insert(
+            service_encryption_headers::CLIENT_PUB_KEY.to_string(),
+            serde_json::Value::String(client_pub_key.clone()),
+        );
+    }
+    if let Some(ref model_pub_key) = encryption_headers.model_pub_key {
+        extra.insert(
+            service_encryption_headers::MODEL_PUB_KEY.to_string(),
+            serde_json::Value::String(model_pub_key.clone()),
+        );
+    }
+
+    let params = inference_providers::ChatCompletionParams {
+        model: model_name,
+        messages,
+        max_completion_tokens: max_tokens.map(|t| t as i64),
+        temperature,
+        stream: Some(false), // For MVP, only non-streaming
+        extra,
+        max_tokens: None,
+        top_p: None,
+        n: None,
+        stop: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        logit_bias: None,
+        logprobs: None,
+        top_logprobs: None,
+        user: None,
+        seed: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        metadata: None,
+        store: None,
+        stream_options: None,
+        modalities: None,
+    };
+
+    // Call inference provider (non-streaming for MVP)
+    match app_state
+        .inference_provider_pool
+        .chat_completion(params, body_hash)
+        .await
+    {
+        Ok(response) => {
+            // Extract analysis text from first choice
+            let analysis = response
+                .response
+                .choices
+                .first()
+                .and_then(|c| c.message.content.as_ref())
+                .cloned()
+                .unwrap_or_default();
+
+            let usage = crate::models::ImageAnalysisUsage {
+                prompt_tokens: response.response.usage.prompt_tokens,
+                completion_tokens: response.response.usage.completion_tokens,
+                total_tokens: response.response.usage.total_tokens,
+            };
+
+            let analysis_response = crate::models::ImageAnalysisResponse {
+                id: response.response.id,
+                object: "image.analysis".to_string(),
+                created: response.response.created,
+                model: model.model_name,
+                analysis,
+                usage: Some(usage),
+            };
+
+            tracing::info!("Image analysis completed successfully");
+            (StatusCode::OK, ResponseJson(analysis_response)).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Image analysis inference failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Image analysis failed".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+            .into_response()
+        }
+    }
+}
+
+/// Analyze an image and return text description (JSON with data URL or file ID)
+///
+/// Use a vision model to analyze an image and answer a question about it.
+/// OpenAI-compatible endpoint for image analysis.
+#[utoipa::path(
+    post,
+    path = "/v1/images/analyses",
+    tag = "Images",
+    request_body = ImageAnalysisRequest,
+    responses(
+        (status = 200, description = "Image analysis successful", body = ImageAnalysisResponse),
+        (status = 400, description = "Invalid request parameters", body = ErrorResponse),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn image_analyses(
+    State(app_state): State<AppState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(body_hash): Extension<RequestBodyHash>,
+    headers: header::HeaderMap,
+    Json(request): Json<crate::models::ImageAnalysisRequest>,
+) -> axum::response::Response {
+    // Validate request
+    if let Err(error) = request.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(error, "invalid_request_error".to_string())),
+        )
+        .into_response();
+    }
+
+    // Convert image input to URL format
+    let image_url = match &request.image {
+        crate::models::ImageInput::DataUrl(data_url) => {
+            // Validate data URL format
+            if !data_url.starts_with("data:image/") {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        "Image must be a valid data URL starting with 'data:image/'".to_string(),
+                        "invalid_request_error".to_string(),
+                    )),
+                )
+                .into_response();
+            }
+            data_url.clone()
+        }
+        crate::models::ImageInput::FileId { file_id } => format!("/v1/files/{}", file_id),
+    };
+
+    perform_image_analysis(
+        &app_state,
+        &api_key,
+        body_hash.hash.clone(),
+        &headers,
+        request.model,
+        request.prompt,
+        image_url,
+        request.max_tokens,
+        request.temperature,
+    )
+    .await
+}
+
+/// Analyze an image and return text description (multipart form data with file upload)
+///
+/// Use a vision model to analyze an image file and answer a question about it.
+/// Accepts file uploads via multipart/form-data.
+///
+/// **Request Body (multipart/form-data):**
+/// - `model` (text, required): Model ID (e.g., "Qwen/Qwen3-VL-30B-A3B-Instruct")
+/// - `image` (file, required): Image file (PNG or JPEG)
+/// - `prompt` (text, required): Question or description of what to analyze
+/// - `max_tokens` (text, optional): Maximum tokens in response
+/// - `temperature` (text, optional): Sampling temperature (0.0-2.0)
+#[utoipa::path(
+    post,
+    path = "/v1/images/analyses/upload",
+    tag = "Images",
+    request_body(content = ImageEditRequestSchema, content_type = "multipart/form-data"),
+    responses(
+        (status = 200, description = "Image analysis successful", body = ImageAnalysisResponse),
+        (status = 400, description = "Invalid request parameters", body = ErrorResponse),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 413, description = "Payload too large", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn image_analyses_multipart(
+    State(app_state): State<AppState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(body_hash): Extension<RequestBodyHash>,
+    headers: header::HeaderMap,
+    mut multipart: axum::extract::Multipart,
+) -> axum::response::Response {
+    debug!("Image analysis request (multipart) from api key");
+
+    let mut model = String::new();
+    let mut prompt = String::new();
+    let mut image_bytes: Option<Vec<u8>> = None;
+    let mut max_tokens: Option<i32> = None;
+    let mut temperature: Option<f32> = None;
+
+    // Parse multipart form data
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(mut field)) => {
+                match field.name().unwrap_or("") {
+                    "image" => {
+                        // Use streaming validation to detect oversized payloads before buffering
+                        let mut bytes = Vec::new();
+                        let mut size = 0usize;
+
+                        loop {
+                            match field.chunk().await {
+                                Ok(Some(chunk)) => {
+                                    size += chunk.len();
+                                    if size > MAX_FILE_SIZE {
+                                        return (
+                                            StatusCode::PAYLOAD_TOO_LARGE,
+                                            ResponseJson(ErrorResponse::new(
+                                                "Image size exceeds maximum of 512 MB".to_string(),
+                                                "invalid_request_error".to_string(),
+                                            )),
+                                        )
+                                        .into_response();
+                                    }
+                                    bytes.extend_from_slice(&chunk);
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    return (
+                                        StatusCode::BAD_REQUEST,
+                                        ResponseJson(ErrorResponse::new(
+                                            format!("Failed to read image: {}", e),
+                                            "invalid_request_error".to_string(),
+                                        )),
+                                    )
+                                    .into_response();
+                                }
+                            }
+                        }
+
+                        // Validate image format (PNG or JPEG)
+                        let is_png = bytes.len() >= 4 && &bytes[0..4] == b"\x89PNG";
+                        let is_jpeg = bytes.len() >= 3 && &bytes[0..3] == b"\xFF\xD8\xFF";
+                        if !is_png && !is_jpeg {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                ResponseJson(ErrorResponse::new(
+                                    "Image must be a valid PNG or JPEG file".to_string(),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                            .into_response();
+                        }
+
+                        image_bytes = Some(bytes);
+                    }
+                    "model" => match field.text().await {
+                        Ok(text) => model = text,
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                ResponseJson(ErrorResponse::new(
+                                    format!("Failed to read model: {}", e),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                            .into_response();
+                        }
+                    },
+                    "prompt" => match field.text().await {
+                        Ok(text) => prompt = text,
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                ResponseJson(ErrorResponse::new(
+                                    format!("Failed to read prompt: {}", e),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                            .into_response();
+                        }
+                    },
+                    "max_tokens" => match field.text().await {
+                        Ok(text) => {
+                            max_tokens = text.parse::<i32>().ok();
+                        }
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                ResponseJson(ErrorResponse::new(
+                                    format!("Failed to read max_tokens: {}", e),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                            .into_response();
+                        }
+                    },
+                    "temperature" => match field.text().await {
+                        Ok(text) => {
+                            temperature = text.parse::<f32>().ok();
+                        }
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                ResponseJson(ErrorResponse::new(
+                                    format!("Failed to read temperature: {}", e),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                            .into_response();
+                        }
+                    },
+                    _ => {} // Ignore unknown fields
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                let (status, message) = analyze_multipart_error(&e);
+                return (status, ResponseJson(ErrorResponse::new(message, "invalid_request_error".to_string())))
+                    .into_response();
+            }
+        }
+    }
+
+    // Validate required fields
+    if model.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "model is required".to_string(),
+                "invalid_request_error".to_string(),
+            )),
+        )
+        .into_response();
+    }
+
+    if prompt.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "prompt is required".to_string(),
+                "invalid_request_error".to_string(),
+            )),
+        )
+        .into_response();
+    }
+
+    let image_bytes = match image_bytes {
+        Some(bytes) => bytes,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "image is required".to_string(),
+                    "invalid_request_error".to_string(),
+                )),
+            )
+            .into_response();
+        }
+    };
+
+    // Convert image bytes to base64 data URL
+    let base64_image = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
+    let image_url = format!("data:image/png;base64,{}", base64_image);
+
+    perform_image_analysis(
+        &app_state,
+        &api_key,
+        body_hash.hash.clone(),
+        &headers,
+        model,
+        prompt,
+        image_url,
+        max_tokens,
+        temperature,
+    )
+    .await
 }

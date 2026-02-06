@@ -954,18 +954,17 @@ impl ResponseServiceImpl {
                     );
                 }
 
-                // Determine if this is image editing or image analysis
-                // Image Edit: input contains only image (or image with minimal text instructions)
-                // Image Analysis: input contains image + substantive text query (e.g., "what's in this image?")
+                // Determine if this is image editing or image generation
+                // Image Edit: input contains an image (with optional text instructions)
                 // Image Generation: no input image (pure text-to-image)
-                let (has_input_image, has_input_text) =
+                // Note: Image analysis (image + question for text output) goes to text completion via fallthrough at line 939
+                let (has_input_image, _has_input_text) =
                     Self::analyze_input_content(&context.request);
 
                 // Routing logic:
-                // 1. Only treat as EDIT if input has image AND minimal text instructions
-                // 2. If input has image + substantive query text → falls back to text completion (analysis)
-                // 3. If no input image → pure generation (text-to-image)
-                let is_edit = has_input_image && !has_input_text;
+                // - If input has an image → use image edit (text is instruction for what to edit)
+                // - If no input image → use image generation (text-to-image)
+                let is_edit = has_input_image;
 
                 // Call the appropriate image API
                 let response = if is_edit {
@@ -1011,60 +1010,14 @@ impl ResponseServiceImpl {
                         })?
                 };
 
-                // Upload generated images to S3 and store only URLs in database
-                let mut image_urls: Vec<String> = vec![];
-                let api_key_uuid = Uuid::parse_str(&context.api_key_id).map_err(|e| {
-                    errors::ResponseError::InternalError(format!("Invalid API key ID format: {e}"))
-                })?;
-
-                for (idx, img) in response.response.data.iter().enumerate() {
-                    if let Some(b64_data) = &img.b64_json {
-                        // PRIVACY: Decode base64 to bytes for upload to S3
-                        // CRITICAL: Do NOT log b64_data or image_bytes (per CLAUDE.md)
-                        // Base64 image data is large and should never be included in logs
-                        let image_bytes = base64::engine::general_purpose::STANDARD
-                            .decode(b64_data)
-                            .map_err(|e| {
-                                // Only log the error message, never the data
-                                errors::ResponseError::InternalError(format!(
-                                    "Failed to decode generated image: {e}"
-                                ))
-                            })?;
-
-                        // Upload to S3 via file service
-                        let filename = format!("generated-image-{}.png", idx);
-                        let file = context
-                            .file_service
-                            .upload_file(crate::files::UploadFileParams {
-                                filename,
-                                file_data: image_bytes,
-                                content_type: "image/png".to_string(),
-                                purpose: "vision".to_string(),
-                                workspace_id: context.workspace_id,
-                                uploaded_by_api_key_id: api_key_uuid,
-                                expires_at: None,
-                            })
-                            .await
-                            .map_err(|e| {
-                                errors::ResponseError::InternalError(format!(
-                                    "Failed to upload generated image: {e}"
-                                ))
-                            })?;
-
-                        // Store file URL instead of base64 data
-                        image_urls.push(format!("/v1/files/{}", file.id));
-                    }
-                }
-
-                // Create output item with empty image data and URLs pointing to S3
+                // Create output item with base64 image data (no S3 upload for response data)
                 let image_data: Vec<models::ImageOutputData> = response
                     .response
                     .data
                     .iter()
-                    .enumerate()
-                    .map(|(idx, img)| models::ImageOutputData {
-                        b64_json: None, // Empty - data is in S3 now
-                        url: image_urls.get(idx).cloned(),
+                    .map(|img| models::ImageOutputData {
+                        b64_json: img.b64_json.clone(), // Return base64 data directly
+                        url: None,
                         revised_prompt: img.revised_prompt.clone(),
                     })
                     .collect();

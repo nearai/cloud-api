@@ -16,7 +16,7 @@ use crate::{
             StateStore,
         },
         billing::{get_billing_costs, BillingRouteState},
-        completions::{chat_completions, image_edits, image_generations, models},
+        completions::{chat_completions, image_analyses, image_analyses_multipart, image_edits, image_generations, models},
         conversations,
         health::health_check,
         models::{get_model_by_name, list_models, ModelsAppState},
@@ -879,11 +879,12 @@ pub fn build_completion_routes(
 ) -> Router {
     use crate::routes::files::MAX_FILE_SIZE;
 
-    // Text-based inference routes (chat/completions, image generation)
+    // Text-based inference routes (chat/completions, image generation, image analysis)
     // Use default body limit (~2 MB) since they only accept JSON
     let text_inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
         .route("/images/generations", post(image_generations))
+        .route("/images/analyses", post(image_analyses))
         .with_state(app_state.clone())
         .layer(from_fn_with_state(
             usage_state.clone(),
@@ -899,12 +900,13 @@ pub fn build_completion_routes(
         ))
         .layer(from_fn(middleware::body_hash_middleware));
 
-    // File-based inference routes (image edits)
+    // File-based inference routes (image edits, image analysis with file uploads)
     // Apply 512 MB limit only to endpoints that accept file uploads
     // IMPORTANT: body_hash_middleware is placed AFTER auth to prevent buffering
     // unauthenticated requests. Auth failures prevent memory exhaustion DoS attacks.
     let file_inference_routes = Router::new()
         .route("/images/edits", post(image_edits))
+        .route("/images/analyses/upload", post(image_analyses_multipart))
         .with_state(app_state.clone())
         .layer(from_fn_with_state(
             usage_state,

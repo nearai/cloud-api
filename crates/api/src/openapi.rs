@@ -40,6 +40,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::completions::chat_completions,
         crate::routes::completions::image_generations,
         crate::routes::completions::image_edits,
+        crate::routes::completions::image_analyses,
+        crate::routes::completions::image_analyses_multipart,
         // crate::routes::completions::completions,
         crate::routes::completions::models,
         // Model endpoints (public model catalog)
@@ -144,6 +146,8 @@ use utoipa::{Modify, OpenApi};
             ImageGenerationRequest, ImageGenerationResponse, ImageData,
             // Image edit models
             ImageEditRequestSchema,
+            // Image analysis models
+            ImageAnalysisRequest, ImageAnalysisResponse, ImageAnalysisUsage, ImageInput,
             // Organization models
             CreateOrganizationRequest, OrganizationResponse,
             UpdateOrganizationRequest, CreateApiKeyRequest, ApiKeyResponse,

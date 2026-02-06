@@ -389,6 +389,72 @@ pub struct ImageData {
     pub revised_prompt: Option<String>,
 }
 
+/// Request for image analysis (vision)
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ImageAnalysisRequest {
+    /// Model ID (must be a vision model with input_modalities containing "image")
+    pub model: String,
+
+    /// Image to analyze (base64 data URL or file reference)
+    pub image: ImageInput,
+
+    /// Question or prompt about the image
+    pub prompt: String,
+
+    /// Maximum tokens in response (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<i32>,
+
+    /// Temperature for sampling (optional, 0.0-2.0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+
+    /// Whether to stream the response (default: false)
+    #[serde(default)]
+    pub stream: bool,
+}
+
+/// Image input variants for analysis
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum ImageInput {
+    /// Base64-encoded data URL (e.g., "data:image/png;base64,...")
+    DataUrl(String),
+    /// File ID from /v1/files upload
+    FileId { file_id: String },
+}
+
+/// Response from image analysis
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ImageAnalysisResponse {
+    pub id: String,
+    pub object: String, // Always "image.analysis"
+    pub created: i64,
+    pub model: String,
+    pub analysis: String, // The text analysis result
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ImageAnalysisUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImageAnalysisUsage {
+    pub prompt_tokens: i32,
+    pub completion_tokens: i32,
+    pub total_tokens: i32,
+}
+
+impl ImageAnalysisRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.model.trim().is_empty() {
+            return Err("model is required".to_string());
+        }
+        if self.prompt.trim().is_empty() {
+            return Err("prompt is required".to_string());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelsResponse {
     pub object: String,

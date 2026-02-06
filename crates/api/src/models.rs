@@ -771,6 +771,8 @@ pub enum ResponseInput {
 pub struct ResponseInputItem {
     pub role: String,
     pub content: ResponseContent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Content can be text or array of content parts
@@ -2389,9 +2391,44 @@ pub struct ModelHistoryResponse {
 // Organization Limits API Models (Admin)
 // ============================================
 
+/// Credit type for organization limits
+/// - grant: Free credits provided by the platform
+/// - payment: Credits purchased by the organization
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CreditType {
+    #[serde(alias = "GRANT")]
+    Grant,
+    #[serde(alias = "PAYMENT")]
+    Payment,
+}
+
+impl std::fmt::Display for CreditType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CreditType::Grant => write!(f, "grant"),
+            CreditType::Payment => write!(f, "payment"),
+        }
+    }
+}
+
+impl CreditType {
+    /// Convert to string representation
+    pub fn as_str(&self) -> &str {
+        match self {
+            CreditType::Grant => "grant",
+            CreditType::Payment => "payment",
+        }
+    }
+}
+
 /// Request to update organization limits (Admin only)
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateOrganizationLimitsRequest {
+    #[serde(rename = "type")]
+    pub credit_type: CreditType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(rename = "spendLimit")]
     pub spend_limit: SpendLimitRequest,
     #[serde(rename = "changedBy", skip_serializing_if = "Option::is_none")]
@@ -2435,6 +2472,10 @@ pub struct SpendLimit {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateOrganizationLimitsResponse {
     pub organization_id: String,
+    #[serde(rename = "type")]
+    pub credit_type: CreditType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(rename = "spendLimit")]
     pub spend_limit: SpendLimit,
     pub updated_at: String,
@@ -2446,6 +2487,10 @@ pub struct OrgLimitsHistoryEntry {
     pub id: String,
     #[serde(rename = "organizationId")]
     pub organization_id: String,
+    #[serde(rename = "type")]
+    pub credit_type: CreditType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(rename = "spendLimit")]
     pub spend_limit: SpendLimit,
     #[serde(rename = "effectiveFrom")]

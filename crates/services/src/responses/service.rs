@@ -664,6 +664,7 @@ impl ResponseServiceImpl {
             role: "assistant".to_string(),
             content: vec![],
             model: ctx.model.clone(),
+            metadata: None,
         };
         emitter
             .emit_item_added(ctx, item, message_item_id.to_string())
@@ -728,6 +729,7 @@ impl ResponseServiceImpl {
                 logprobs: vec![],
             }],
             model: ctx.model.clone(),
+            metadata: None,
         };
 
         // CRITICAL: Store to database FIRST before emitting events
@@ -835,6 +837,7 @@ impl ResponseServiceImpl {
                 conversation_id,
                 input,
                 &context.request.model,
+                context.request.metadata.as_ref(),
             )
             .await?;
         }
@@ -980,20 +983,72 @@ impl ResponseServiceImpl {
             errors::ResponseError::InternalError(format!("Failed to serialize usage: {e}"))
         })?;
 
-        // Update the response in the database with usage, status, and output message
-        if let Err(e) = context
-            .response_repository
-            .update(
-                ctx.response_id.clone(),
-                workspace_id_domain.clone(),
-                Some(final_response_text.clone()),
-                final_response.status.clone(),
-                Some(usage_json),
-            )
-            .await
-        {
-            tracing::warn!("Failed to update response with usage: {}", e);
-            // Continue even if update fails - the response was already created
+        // Initial failure: agent loop failed with no output/usage → create failed item, update status, return Err (client gets response.failed).
+        // Otherwise (Ok or Err with partial output): update DB with final response, then emit response.completed.
+        match agent_loop_result {
+            Err(e)
+                if final_response.output.is_empty() && final_response.usage.total_tokens == 0 =>
+            {
+                // Include error message in content so users can understand why it failed
+                let error_message = e.to_string();
+                let failed_item = models::ResponseOutputItem::Message {
+                    id: format!("msg_{}", Uuid::new_v4().simple()),
+                    response_id: ctx.response_id_str.clone(),
+                    previous_response_id: ctx.previous_response_id.clone(),
+                    next_response_ids: vec![],
+                    created_at: ctx.created_at,
+                    status: models::ResponseItemStatus::Failed,
+                    role: "assistant".to_string(),
+                    content: vec![models::ResponseContentItem::OutputText {
+                        text: error_message,
+                        annotations: vec![],
+                        logprobs: vec![],
+                    }],
+                    model: ctx.model.clone(),
+                    metadata: None,
+                };
+                if let Err(create_err) = context
+                    .response_items_repository
+                    .create(
+                        ctx.response_id.clone(),
+                        ctx.api_key_id,
+                        ctx.conversation_id,
+                        failed_item,
+                    )
+                    .await
+                {
+                    tracing::warn!("Failed to store failed response item: {}", create_err);
+                }
+                if let Err(update_err) = context
+                    .response_repository
+                    .update(
+                        ctx.response_id.clone(),
+                        workspace_id_domain.clone(),
+                        None,
+                        models::ResponseStatus::Failed,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!("Failed to update response status to failed: {}", update_err);
+                }
+                return Err(e);
+            }
+            _ => {
+                if let Err(e) = context
+                    .response_repository
+                    .update(
+                        ctx.response_id.clone(),
+                        workspace_id_domain.clone(),
+                        Some(final_response_text.clone()),
+                        final_response.status.clone(),
+                        Some(usage_json),
+                    )
+                    .await
+                {
+                    tracing::warn!("Failed to update response with usage: {}", e);
+                }
+            }
         }
 
         // Wait for title generation with a timeout (2 seconds)
@@ -1431,6 +1486,7 @@ impl ResponseServiceImpl {
         conversation_id: Option<ConversationId>,
         input: &models::ResponseInput,
         model: &str,
+        request_metadata: Option<&serde_json::Value>,
     ) -> Result<(), errors::ResponseError> {
         match input {
             models::ResponseInput::Text(text) => {
@@ -1450,6 +1506,7 @@ impl ResponseServiceImpl {
                         text: trimmed_text.to_string(),
                     }],
                     model: model.to_string(),
+                    metadata: request_metadata.cloned(),
                 };
 
                 response_items_repository
@@ -1469,10 +1526,12 @@ impl ResponseServiceImpl {
             models::ResponseInput::Items(items) => {
                 // Store each input item as a response_item
                 for input_item in items {
-                    let (role, input_content) = match &input_item {
-                        models::ResponseInputItem::Message { role, content } => {
-                            (role.clone(), content)
-                        }
+                    let (role, input_content, metadata) = match &input_item {
+                        models::ResponseInputItem::Message {
+                            role,
+                            content,
+                            metadata,
+                        } => (role.clone(), content, metadata.clone()),
                         models::ResponseInputItem::McpApprovalResponse { .. } => {
                             continue;
                         }
@@ -1521,6 +1580,9 @@ impl ResponseServiceImpl {
                         }
                     };
 
+                    // Use item-level metadata if present, otherwise fall back to request metadata
+                    let metadata = metadata.or_else(|| request_metadata.cloned());
+
                     let message_item = models::ResponseOutputItem::Message {
                         id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
                         // These fields are placeholders - repository enriches them via JOIN when storing/retrieving
@@ -1532,6 +1594,7 @@ impl ResponseServiceImpl {
                         role,
                         content,
                         model: model.to_string(),
+                        metadata,
                     };
 
                     response_items_repository
@@ -1764,7 +1827,7 @@ impl ResponseServiceImpl {
                     for item in items {
                         // Only process message input items
                         let (role, item_content) = match item {
-                            models::ResponseInputItem::Message { role, content } => {
+                            models::ResponseInputItem::Message { role, content, .. } => {
                                 (role.clone(), content)
                             }
                             models::ResponseInputItem::McpApprovalResponse { .. } => {
@@ -2120,7 +2183,9 @@ impl ResponseServiceImpl {
                 items
                     .iter()
                     .filter_map(|item| match item {
-                        models::ResponseInputItem::Message { role, content } if role == "user" => {
+                        models::ResponseInputItem::Message { role, content, .. }
+                            if role == "user" =>
+                        {
                             Some(content)
                         }
                         _ => None,
@@ -3086,6 +3151,7 @@ mod tests {
                 content: vec![],
                 status: models::ResponseItemStatus::Completed,
                 model: "test-model".to_string(),
+                metadata: None,
             },
             models::ResponseOutputItem::Message {
                 id: "msg_2".to_string(),
@@ -3097,6 +3163,7 @@ mod tests {
                 content: vec![],
                 status: models::ResponseItemStatus::Completed,
                 model: "test-model".to_string(),
+                metadata: None,
             },
         ];
 
@@ -3127,6 +3194,7 @@ mod tests {
                 content: vec![],
                 status: models::ResponseItemStatus::Completed,
                 model: "test-model".to_string(),
+                metadata: None,
             },
             // resp_b has a message
             models::ResponseOutputItem::Message {
@@ -3139,6 +3207,7 @@ mod tests {
                 content: vec![],
                 status: models::ResponseItemStatus::Completed,
                 model: "test-model".to_string(),
+                metadata: None,
             },
             // resp_b also has a tool call (same response_id, multiple items)
             models::ResponseOutputItem::ToolCall {
@@ -3165,6 +3234,7 @@ mod tests {
                 content: vec![],
                 status: models::ResponseItemStatus::Completed,
                 model: "test-model".to_string(),
+                metadata: None,
             },
             models::ResponseOutputItem::Message {
                 id: "msg_d".to_string(),
@@ -3176,6 +3246,7 @@ mod tests {
                 content: vec![],
                 status: models::ResponseItemStatus::Completed,
                 model: "test-model".to_string(),
+                metadata: None,
             },
         ];
 
@@ -3223,6 +3294,7 @@ mod tests {
             content: vec![],
             status: models::ResponseItemStatus::Completed,
             model: "test-model".to_string(),
+            metadata: None,
         }];
 
         let result = ResponseServiceImpl::filter_to_ancestor_branch(
@@ -3245,6 +3317,7 @@ mod tests {
             content: vec![],
             status: models::ResponseItemStatus::Completed,
             model: "test-model".to_string(),
+            metadata: None,
         }];
 
         // Target "resp_z" doesn't exist - should return only items for "resp_z" (none)

@@ -9,10 +9,15 @@ impl services::usage::ports::OrganizationLimitsRepository for OrganizationLimits
         &self,
         organization_id: Uuid,
     ) -> anyhow::Result<Option<OrganizationLimit>> {
-        let limit = self.get_current_limits(organization_id).await?;
+        let limits = self.get_current_limits(organization_id).await?;
 
-        Ok(limit.map(|l| OrganizationLimit {
-            spend_limit: l.spend_limit,
+        if limits.is_empty() {
+            return Ok(None);
+        }
+
+        let total_spend_limit: i64 = limits.iter().map(|l| l.spend_limit).sum();
+        Ok(Some(OrganizationLimit {
+            spend_limit: total_spend_limit,
         }))
     }
 }

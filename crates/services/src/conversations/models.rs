@@ -50,6 +50,7 @@ pub struct Conversation {
     pub archived_at: Option<DateTime<Utc>>, // Timestamp when archived, NULL if not archived
     pub deleted_at: Option<DateTime<Utc>>, // Timestamp when soft-deleted, NULL if not deleted
     pub cloned_from_id: Option<ConversationId>, // ID of conversation this was cloned from
+    pub root_response_id: Option<String>, // ID of hidden structural root response
     pub metadata: serde_json::Value, // JSONB storing conversation metadata (includes title/name)
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

@@ -1235,30 +1235,71 @@ impl InferenceProviderPool {
             "Starting rerank request"
         );
 
-        let (response, _provider) = self
-            .retry_with_fallback(&model_id, "rerank", None, |provider| {
-                let params = params.clone();
-                async move {
-                    provider
-                        .rerank(params)
-                        .await
-                        .map_err(|e| CompletionError::CompletionError(e.to_string()))
+        // Check if this model exists as an external provider - reranking is not supported for external models
+        if self.get_external_provider(&model_id).await.is_some() {
+            return Err(RerankError::GenerationError(format!(
+                "Reranking is not supported for external provider models. \
+                 Model '{}' is configured as an external provider. \
+                 Reranking is only available for vLLM providers.",
+                model_id
+            )));
+        }
+
+        // Ensure vLLM models are discovered
+        self.ensure_models_discovered().await.map_err(|e| {
+            RerankError::GenerationError(Self::sanitize_error_message(&e.to_string()))
+        })?;
+
+        // Get vLLM providers with load balancing
+        let providers = match self.get_providers_with_fallback(&model_id, None).await {
+            Some(p) => p,
+            None => {
+                let mappings = self.provider_mappings.read().await;
+                let available_models: Vec<_> = mappings.model_to_providers.keys().collect();
+
+                tracing::error!(
+                    model_id = %model_id,
+                    available_models = ?available_models,
+                    operation = "rerank",
+                    "No vLLM provider found for model"
+                );
+
+                return Err(RerankError::GenerationError(format!(
+                    "Model '{}' not found in vLLM providers. Available models: {:?}",
+                    model_id, available_models
+                )));
+            }
+        };
+
+        // Try reranking with each provider (with fallback)
+        let mut last_error = None;
+        for provider in providers {
+            match provider.rerank(params.clone()).await {
+                Ok(response) => {
+                    tracing::info!(
+                        model = %model_id,
+                        result_count = response.results.len(),
+                        "Rerank completed successfully"
+                    );
+                    return Ok(response);
                 }
-            })
-            .await
-            .map_err(|e| {
-                // Sanitize error messages to remove sensitive details (URLs, IPs)
-                // while preserving keywords like "not found" for proper error detection in route handlers
-                RerankError::GenerationError(Self::sanitize_error_message(&e.to_string()))
-            })?;
+                Err(e) => {
+                    tracing::warn!(
+                        model = %model_id,
+                        error = %e,
+                        "Rerank failed with provider, trying next"
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
 
-        tracing::info!(
-            model = %model_id,
-            result_count = response.results.len(),
-            "Rerank completed successfully"
-        );
+        // All providers failed
+        let error_msg = last_error
+            .map(|e| Self::sanitize_error_message(&e.to_string()))
+            .unwrap_or_else(|| "No providers available for reranking".to_string());
 
-        Ok(response)
+        Err(RerankError::GenerationError(error_msg))
     }
 
     /// Create an external provider from a model name and provider config JSON.

@@ -993,16 +993,13 @@ pub async fn image_generations(
     }
 }
 
-/// Edit images from a text prompt and image
-///
-/// Edit images using an AI model from an image and text description. OpenAI-compatible endpoint.
-///
-/// **Request Body (multipart/form-data):**
-/// All fields should be provided as text values or files as indicated in the schema.
 /// Audio transcription endpoint
 ///
 /// Transcribe audio files using Whisper models. Accepts audio file uploads via multipart/form-data.
 /// Supports MP3, WAV, WEBM, FLAC, OGG, and M4A formats. Maximum file size: 25 MB.
+///
+/// **Request Body (multipart/form-data):**
+/// All fields should be provided as text values or files as indicated in the schema.
 #[utoipa::path(
     post,
     path = "/v1/audio/transcriptions",
@@ -1310,6 +1307,13 @@ pub async fn audio_transcriptions(
         }
     }
 }
+
+/// Edit images from a text prompt and image
+///
+/// Edit images using an AI model from an image and text description. OpenAI-compatible endpoint.
+///
+/// **Request Body (multipart/form-data):**
+/// All fields should be provided as text values or files as indicated in the schema.
 #[utoipa::path(
     post,
     path = "/v1/images/edits",

@@ -16,7 +16,10 @@ use crate::{
             StateStore,
         },
         billing::{get_billing_costs, BillingRouteState},
-        completions::{audio_transcriptions, chat_completions, image_edits, image_generations, models, rerank, score},
+        completions::{
+            audio_transcriptions, chat_completions, image_edits, image_generations, models, rerank,
+            score,
+        },
         conversations,
         health::health_check,
         models::{get_model_by_name, list_models, ModelsAppState},

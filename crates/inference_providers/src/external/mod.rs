@@ -31,9 +31,11 @@ pub mod openai_compatible;
 use crate::{
     AttestationError, AudioTranscriptionError, AudioTranscriptionParams,
     AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponseWithBytes,
-    ChatSignature, CompletionError, CompletionParams, ImageEditError, ImageEditParams, ImageEditResponseWithBytes,
-    ImageGenerationError, ImageGenerationParams, ImageGenerationResponseWithBytes, InferenceProvider, ListModelsError, ModelsResponse,
-    RerankError, RerankParams, RerankResponse, ScoreError, ScoreParams, ScoreResponse, StreamingResult,
+    ChatSignature, CompletionError, CompletionParams, ImageEditError, ImageEditParams,
+    ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponseWithBytes, InferenceProvider, ListModelsError, ModelsResponse,
+    RerankError, RerankParams, RerankResponse, ScoreError, ScoreParams, ScoreResponse,
+    StreamingResult,
 };
 use async_trait::async_trait;
 use backend::{BackendConfig, ExternalBackend};

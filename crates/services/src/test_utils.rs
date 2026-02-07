@@ -6,8 +6,9 @@ use crate::{
         AttestationError,
     },
     usage::{
-        CostBreakdown, OrganizationBalanceInfo, OrganizationLimit, RecordUsageServiceRequest,
-        UsageCheckResult, UsageError, UsageLogEntry, UsageServiceTrait,
+        CostBreakdown, OrganizationBalanceInfo, OrganizationLimit, RecordUsageApiRequest,
+        RecordUsageServiceRequest, UsageCheckResult, UsageError, UsageLogEntry,
+        UsageServiceTrait,
     },
 };
 use async_trait::async_trait;
@@ -81,8 +82,90 @@ impl UsageServiceTrait for MockUsageService {
         })
     }
 
-    async fn record_usage(&self, _request: RecordUsageServiceRequest) -> Result<(), UsageError> {
-        Ok(())
+    async fn record_usage(
+        &self,
+        _request: RecordUsageServiceRequest,
+    ) -> Result<UsageLogEntry, UsageError> {
+        Ok(UsageLogEntry {
+            id: Uuid::new_v4(),
+            organization_id: _request.organization_id,
+            workspace_id: _request.workspace_id,
+            api_key_id: _request.api_key_id,
+            model_id: _request.model_id,
+            model: String::new(),
+            input_tokens: _request.input_tokens,
+            output_tokens: _request.output_tokens,
+            total_tokens: _request.input_tokens + _request.output_tokens,
+            input_cost: 0,
+            output_cost: 0,
+            total_cost: 0,
+            inference_type: _request.inference_type,
+            created_at: chrono::Utc::now(),
+            ttft_ms: _request.ttft_ms,
+            avg_itl_ms: _request.avg_itl_ms,
+            inference_id: _request.inference_id,
+            provider_request_id: _request.provider_request_id,
+            stop_reason: _request.stop_reason,
+            response_id: _request.response_id,
+            image_count: _request.image_count,
+        })
+    }
+
+    async fn record_usage_from_api(
+        &self,
+        organization_id: Uuid,
+        workspace_id: Uuid,
+        api_key_id: Uuid,
+        request: RecordUsageApiRequest,
+    ) -> Result<UsageLogEntry, UsageError> {
+        let (model, input_tokens, output_tokens, image_count, inference_type) = match &request {
+            RecordUsageApiRequest::ChatCompletion {
+                model,
+                input_tokens,
+                output_tokens,
+                ..
+            } => (
+                model.clone(),
+                input_tokens.unwrap_or(0),
+                output_tokens.unwrap_or(0),
+                None,
+                "chat_completion".to_string(),
+            ),
+            RecordUsageApiRequest::ImageGeneration {
+                model,
+                image_count,
+                ..
+            } => (
+                model.clone(),
+                0,
+                0,
+                Some(*image_count),
+                "image_generation".to_string(),
+            ),
+        };
+        Ok(UsageLogEntry {
+            id: Uuid::new_v4(),
+            organization_id,
+            workspace_id,
+            api_key_id,
+            model_id: Uuid::nil(),
+            model,
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens + output_tokens,
+            input_cost: 0,
+            output_cost: 0,
+            total_cost: 0,
+            inference_type,
+            created_at: chrono::Utc::now(),
+            ttft_ms: None,
+            avg_itl_ms: None,
+            inference_id: None,
+            provider_request_id: None,
+            stop_reason: None,
+            response_id: None,
+            image_count,
+        })
     }
 
     async fn check_can_use(&self, _organization_id: Uuid) -> Result<UsageCheckResult, UsageError> {
@@ -173,9 +256,92 @@ impl UsageServiceTrait for CapturingUsageService {
         })
     }
 
-    async fn record_usage(&self, request: RecordUsageServiceRequest) -> Result<(), UsageError> {
+    async fn record_usage(
+        &self,
+        request: RecordUsageServiceRequest,
+    ) -> Result<UsageLogEntry, UsageError> {
+        let entry = UsageLogEntry {
+            id: Uuid::new_v4(),
+            organization_id: request.organization_id,
+            workspace_id: request.workspace_id,
+            api_key_id: request.api_key_id,
+            model_id: request.model_id,
+            model: String::new(),
+            input_tokens: request.input_tokens,
+            output_tokens: request.output_tokens,
+            total_tokens: request.input_tokens + request.output_tokens,
+            input_cost: 0,
+            output_cost: 0,
+            total_cost: 0,
+            inference_type: request.inference_type.clone(),
+            created_at: chrono::Utc::now(),
+            ttft_ms: request.ttft_ms,
+            avg_itl_ms: request.avg_itl_ms,
+            inference_id: request.inference_id,
+            provider_request_id: request.provider_request_id.clone(),
+            stop_reason: request.stop_reason.clone(),
+            response_id: request.response_id.clone(),
+            image_count: request.image_count,
+        };
         self.requests.lock().unwrap().push(request);
-        Ok(())
+        Ok(entry)
+    }
+
+    async fn record_usage_from_api(
+        &self,
+        organization_id: Uuid,
+        workspace_id: Uuid,
+        api_key_id: Uuid,
+        request: RecordUsageApiRequest,
+    ) -> Result<UsageLogEntry, UsageError> {
+        let (model, input_tokens, output_tokens, image_count, inference_type) = match &request {
+            RecordUsageApiRequest::ChatCompletion {
+                model,
+                input_tokens,
+                output_tokens,
+                ..
+            } => (
+                model.clone(),
+                input_tokens.unwrap_or(0),
+                output_tokens.unwrap_or(0),
+                None,
+                "chat_completion".to_string(),
+            ),
+            RecordUsageApiRequest::ImageGeneration {
+                model,
+                image_count,
+                ..
+            } => (
+                model.clone(),
+                0,
+                0,
+                Some(*image_count),
+                "image_generation".to_string(),
+            ),
+        };
+        Ok(UsageLogEntry {
+            id: Uuid::new_v4(),
+            organization_id,
+            workspace_id,
+            api_key_id,
+            model_id: Uuid::nil(),
+            model,
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens + output_tokens,
+            input_cost: 0,
+            output_cost: 0,
+            total_cost: 0,
+            inference_type,
+            created_at: chrono::Utc::now(),
+            ttft_ms: None,
+            avg_itl_ms: None,
+            inference_id: None,
+            provider_request_id: None,
+            stop_reason: None,
+            response_id: None,
+            image_count,
+        })
     }
 
     async fn check_can_use(&self, _organization_id: Uuid) -> Result<UsageCheckResult, UsageError> {

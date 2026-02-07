@@ -185,7 +185,20 @@ pub trait UsageServiceTrait: Send + Sync {
     ) -> Result<CostBreakdown, UsageError>;
 
     /// Record usage after an API call completes
-    async fn record_usage(&self, request: RecordUsageServiceRequest) -> Result<(), UsageError>;
+    async fn record_usage(
+        &self,
+        request: RecordUsageServiceRequest,
+    ) -> Result<UsageLogEntry, UsageError>;
+
+    /// Record usage from the public API endpoint.
+    /// Resolves model by name, validates per-variant fields, and delegates to `record_usage`.
+    async fn record_usage_from_api(
+        &self,
+        organization_id: Uuid,
+        workspace_id: Uuid,
+        api_key_id: Uuid,
+        request: RecordUsageApiRequest,
+    ) -> Result<UsageLogEntry, UsageError>;
 
     /// Check if organization can make an API call (pre-flight check)
     async fn check_can_use(&self, organization_id: Uuid) -> Result<UsageCheckResult, UsageError>;
@@ -321,6 +334,42 @@ pub trait OrganizationLimitsRepository: Send + Sync {
 // ============================================
 // Service Data Structures
 // ============================================
+
+/// Request to record usage from the public API.
+/// Uses a tagged union (`#[serde(tag = "type")]`) so each usage kind
+/// carries only its relevant fields and the set is extensible.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RecordUsageApiRequest {
+    /// Token-based chat completion usage
+    ChatCompletion {
+        /// Model name to look up pricing
+        model: String,
+        /// Number of input/prompt tokens
+        input_tokens: Option<i32>,
+        /// Number of output/completion tokens
+        output_tokens: Option<i32>,
+        /// Optional external identifier (e.g., provider request ID).
+        /// When provided, stored as `provider_request_id` and hashed
+        /// to a deterministic UUID v5 for `inference_id`.
+        /// When omitted, the usage log row's primary key is used instead.
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Image generation or editing
+    ImageGeneration {
+        /// Model name to look up pricing
+        model: String,
+        /// Number of images generated
+        image_count: i32,
+        /// Optional external identifier (e.g., provider request ID).
+        /// When provided, stored as `provider_request_id` and hashed
+        /// to a deterministic UUID v5 for `inference_id`.
+        /// When omitted, the usage log row's primary key is used instead.
+        #[serde(default)]
+        id: Option<String>,
+    },
+}
 
 /// Request to record usage (service layer)
 #[derive(Debug, Clone)]
@@ -482,6 +531,7 @@ pub enum UsageError {
     Unauthorized(String),
     NotFound(String),
     CostCalculationOverflow(String),
+    ValidationError(String),
 }
 
 impl std::fmt::Display for UsageError {
@@ -495,6 +545,7 @@ impl std::fmt::Display for UsageError {
             UsageError::CostCalculationOverflow(msg) => {
                 write!(f, "Cost calculation overflow: {msg}")
             }
+            UsageError::ValidationError(msg) => write!(f, "Validation error: {msg}"),
         }
     }
 }

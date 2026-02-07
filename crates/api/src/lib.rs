@@ -691,6 +691,13 @@ pub fn build_app_with_config(
         rate_limit_state.clone(),
     );
 
+    let usage_recording_routes = build_usage_recording_routes(
+        app_state.clone(),
+        &auth_components.auth_state_middleware,
+        usage_state.clone(),
+        rate_limit_state.clone(),
+    );
+
     let response_routes = build_response_routes(
         domain_services.response_service,
         domain_services.attestation_service.clone(),
@@ -781,6 +788,7 @@ pub fn build_app_with_config(
                 .merge(auth_vpc_routes)
                 .merge(files_routes)
                 .merge(billing_routes)
+                .merge(usage_recording_routes)
                 .merge(health_routes),
         )
         .merge(openapi_routes)
@@ -1133,6 +1141,34 @@ pub fn build_billing_routes(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
+}
+
+/// Build usage recording routes with auth and usage check
+pub fn build_usage_recording_routes(
+    app_state: AppState,
+    auth_state_middleware: &AuthState,
+    usage_state: middleware::UsageState,
+    rate_limit_state: middleware::RateLimitState,
+) -> Router {
+    Router::new()
+        .route(
+            "/usage",
+            post(crate::routes::usage::record_usage),
+        )
+        .with_state(app_state)
+        .layer(from_fn_with_state(
+            usage_state,
+            middleware::usage_check_middleware,
+        ))
+        .layer(from_fn_with_state(
+            rate_limit_state,
+            middleware::api_key_rate_limit_middleware,
+        ))
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::auth_middleware_with_workspace_context,
+        ))
+        .layer(from_fn(middleware::body_hash_middleware))
 }
 
 pub fn build_model_routes(models_service: Arc<dyn ModelsServiceTrait>) -> Router {

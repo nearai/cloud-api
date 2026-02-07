@@ -6,8 +6,9 @@ use crate::{
         AttestationError,
     },
     usage::{
-        CostBreakdown, OrganizationBalanceInfo, OrganizationLimit, RecordUsageApiRequest,
-        RecordUsageServiceRequest, UsageCheckResult, UsageError, UsageLogEntry, UsageServiceTrait,
+        CostBreakdown, InferenceType, OrganizationBalanceInfo, OrganizationLimit,
+        RecordUsageApiRequest, RecordUsageServiceRequest, UsageCheckResult, UsageError,
+        UsageLogEntry, UsageServiceTrait,
     },
 };
 use async_trait::async_trait;
@@ -128,7 +129,7 @@ impl UsageServiceTrait for MockUsageService {
                 input_tokens.unwrap_or(0),
                 output_tokens.unwrap_or(0),
                 None,
-                "chat_completion".to_string(),
+                InferenceType::ChatCompletion,
             ),
             RecordUsageApiRequest::ImageGeneration {
                 model, image_count, ..
@@ -137,7 +138,7 @@ impl UsageServiceTrait for MockUsageService {
                 0,
                 0,
                 Some(*image_count),
-                "image_generation".to_string(),
+                InferenceType::ImageGeneration,
             ),
         };
         Ok(UsageLogEntry {
@@ -270,7 +271,7 @@ impl UsageServiceTrait for CapturingUsageService {
             input_cost: 0,
             output_cost: 0,
             total_cost: 0,
-            inference_type: request.inference_type.clone(),
+            inference_type: request.inference_type,
             created_at: chrono::Utc::now(),
             ttft_ms: request.ttft_ms,
             avg_itl_ms: request.avg_itl_ms,
@@ -302,7 +303,7 @@ impl UsageServiceTrait for CapturingUsageService {
                 input_tokens.unwrap_or(0),
                 output_tokens.unwrap_or(0),
                 None,
-                "chat_completion".to_string(),
+                InferenceType::ChatCompletion,
             ),
             RecordUsageApiRequest::ImageGeneration {
                 model, image_count, ..
@@ -311,7 +312,7 @@ impl UsageServiceTrait for CapturingUsageService {
                 0,
                 0,
                 Some(*image_count),
-                "image_generation".to_string(),
+                InferenceType::ImageGeneration,
             ),
         };
         Ok(UsageLogEntry {

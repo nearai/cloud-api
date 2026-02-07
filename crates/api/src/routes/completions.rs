@@ -36,7 +36,7 @@ fn build_image_usage_request(
     model_id: Uuid,
     provider_request_id: &str,
     image_count: i32,
-    inference_type: &str,
+    inference_type: services::usage::InferenceType,
 ) -> services::usage::RecordUsageServiceRequest {
     services::usage::RecordUsageServiceRequest {
         organization_id,
@@ -45,7 +45,7 @@ fn build_image_usage_request(
         model_id,
         input_tokens: 0,
         output_tokens: 0,
-        inference_type: inference_type.to_string(),
+        inference_type,
         ttft_ms: None,
         avg_itl_ms: None,
         inference_id: Some(hash_inference_id_to_uuid(provider_request_id)),
@@ -960,7 +960,7 @@ pub async fn image_generations(
                 model_id,
                 &provider_request_id,
                 image_count,
-                "image_generation",
+                services::usage::InferenceType::ImageGeneration,
             );
             record_usage_with_sync_fallback(usage_service, usage_request, "Image generation").await;
 
@@ -1345,7 +1345,7 @@ pub async fn image_edits(
                 model_id,
                 &provider_request_id,
                 image_count,
-                "image_edit",
+                services::usage::InferenceType::ImageEdit,
             );
             record_usage_with_sync_fallback(usage_service, usage_request, "Image edit").await;
 
@@ -1810,7 +1810,7 @@ pub async fn score(
             )
             .await
             {
-                Ok(Ok(())) => ResponseJson(response).into_response(),
+                Ok(Ok(_)) => ResponseJson(response).into_response(),
                 Ok(Err(e)) => {
                     tracing::warn!(
                         error = %e,

@@ -237,7 +237,7 @@ impl UsageServiceTrait for UsageServiceImpl {
                         input,
                         output,
                         None,
-                        "chat_completion".to_string(),
+                        InferenceType::ChatCompletion,
                         id.clone(),
                     )
                 }
@@ -256,7 +256,7 @@ impl UsageServiceTrait for UsageServiceImpl {
                         0,
                         0,
                         Some(*image_count),
-                        "image_generation".to_string(),
+                        InferenceType::ImageGeneration,
                         id.clone(),
                     )
                 }

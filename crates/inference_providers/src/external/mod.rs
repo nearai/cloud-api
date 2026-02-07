@@ -31,9 +31,9 @@ pub mod openai_compatible;
 use crate::{
     AttestationError, AudioTranscriptionError, AudioTranscriptionParams,
     AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponseWithBytes,
-    ChatSignature, CompletionError, CompletionParams, ImageGenerationError, ImageGenerationParams,
-    ImageGenerationResponseWithBytes, InferenceProvider, ListModelsError, ModelsResponse,
-    StreamingResult,
+    ChatSignature, CompletionError, CompletionParams, ImageEditError, ImageEditParams, ImageEditResponseWithBytes,
+    ImageGenerationError, ImageGenerationParams, ImageGenerationResponseWithBytes, InferenceProvider, ListModelsError, ModelsResponse,
+    RerankError, RerankParams, RerankResponse, ScoreError, ScoreParams, ScoreResponse, StreamingResult,
 };
 use async_trait::async_trait;
 use backend::{BackendConfig, ExternalBackend};
@@ -312,6 +312,33 @@ impl InferenceProvider for ExternalProvider {
     ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
         self.backend
             .audio_transcription(&self.config, &self.model_name, params)
+            .await
+    }
+
+    /// Performs an image edit request through the appropriate backend
+    async fn image_edit(
+        &self,
+        params: Arc<ImageEditParams>,
+        _request_hash: String,
+    ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
+        self.backend
+            .image_edit(&self.config, &self.model_name, params)
+            .await
+    }
+
+    async fn score(
+        &self,
+        params: ScoreParams,
+        _request_hash: String,
+    ) -> Result<ScoreResponse, ScoreError> {
+        self.backend
+            .score(&self.config, &self.model_name, params)
+            .await
+    }
+
+    async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+        self.backend
+            .rerank(&self.config, &self.model_name, params)
             .await
     }
 }

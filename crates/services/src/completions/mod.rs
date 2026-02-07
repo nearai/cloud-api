@@ -63,7 +63,7 @@ where
     model_id: Uuid,
     #[allow(dead_code)] // Kept for potential debugging/logging use
     model_name: String,
-    inference_type: String,
+    inference_type: crate::usage::ports::InferenceType,
     service_start_time: Instant,
     provider_start_time: Instant,
     first_token_received: bool,
@@ -147,7 +147,7 @@ where
         let workspace_id = self.workspace_id;
         let api_key_id = self.api_key_id;
         let model_id = self.model_id;
-        let inference_type = self.inference_type.clone();
+        let inference_type = self.inference_type;
 
         // Create span with context BEFORE any early returns so all error logs have context
         let _span = tracing::error_span!(
@@ -411,6 +411,18 @@ where
     }
 }
 
+/// RAII guard for concurrent request slots
+/// Automatically releases the slot when dropped, ensuring proper cleanup even if the request panics
+struct ConcurrentSlotGuard {
+    counter: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl Drop for ConcurrentSlotGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Release);
+    }
+}
+
 pub struct CompletionServiceImpl {
     pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub attestation_service: Arc<dyn AttestationServiceTrait>,
@@ -456,6 +468,26 @@ impl CompletionServiceImpl {
             org_concurrent_limits,
             organization_limit_repository,
         }
+    }
+
+    /// Extract tools and tool_choice from extra HashMap if present.
+    /// This handles the case where the Responses API places tools in request.extra.
+    /// Returns (tools, tool_choice) and removes them from extra to avoid duplication.
+    fn extract_tools_from_extra(
+        extra: &mut std::collections::HashMap<String, serde_json::Value>,
+    ) -> (
+        Option<Vec<inference_providers::ToolDefinition>>,
+        Option<inference_providers::ToolChoice>,
+    ) {
+        let tools = extra.remove("tools").and_then(|v| {
+            serde_json::from_value::<Vec<inference_providers::ToolDefinition>>(v).ok()
+        });
+
+        let tool_choice = extra
+            .remove("tool_choice")
+            .and_then(|v| serde_json::from_value::<inference_providers::ToolChoice>(v).ok());
+
+        (tools, tool_choice)
     }
 
     /// Get the concurrent request limit for an organization (cached)
@@ -560,17 +592,36 @@ impl CompletionServiceImpl {
     fn prepare_chat_messages(messages: &[ports::CompletionMessage]) -> Vec<ChatMessage> {
         messages
             .iter()
-            .map(|msg| ChatMessage {
-                role: match msg.role.as_str() {
-                    "system" => MessageRole::System,
-                    "assistant" => MessageRole::Assistant,
-                    "tool" => MessageRole::Tool,
-                    _ => MessageRole::User,
-                },
-                content: Some(serde_json::Value::String(msg.content.clone())),
-                name: None,
-                tool_call_id: None,
-                tool_calls: None,
+            .map(|msg| {
+                // Convert tool_calls from CompletionToolCall to inference_providers::models::ToolCall
+                let tool_calls = msg.tool_calls.as_ref().map(|calls| {
+                    calls
+                        .iter()
+                        .map(|tc| inference_providers::models::ToolCall {
+                            id: Some(tc.id.clone()),
+                            type_: Some("function".to_string()),
+                            function: inference_providers::models::FunctionCall {
+                                name: Some(tc.name.clone()),
+                                arguments: Some(tc.arguments.clone()),
+                            },
+                            index: None,
+                            thought_signature: tc.thought_signature.clone(),
+                        })
+                        .collect()
+                });
+
+                ChatMessage {
+                    role: match msg.role.as_str() {
+                        "system" => MessageRole::System,
+                        "assistant" => MessageRole::Assistant,
+                        "tool" => MessageRole::Tool,
+                        _ => MessageRole::User,
+                    },
+                    content: Some(serde_json::Value::String(msg.content.clone())),
+                    name: None,
+                    tool_call_id: msg.tool_call_id.clone(),
+                    tool_calls,
+                }
             })
             .collect()
     }
@@ -623,7 +674,7 @@ impl CompletionServiceImpl {
         api_key_id: Uuid,
         model_id: Uuid,
         model_name: String,
-        inference_type: &str,
+        inference_type: crate::usage::ports::InferenceType,
         service_start_time: Instant,
         provider_start_time: Instant,
         concurrent_counter: Option<Arc<AtomicU32>>,
@@ -651,7 +702,7 @@ impl CompletionServiceImpl {
             api_key_id,
             model_id,
             model_name,
-            inference_type: inference_type.to_string(),
+            inference_type,
             service_start_time,
             provider_start_time,
             first_token_received: false,
@@ -698,6 +749,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         let chat_messages = Self::prepare_chat_messages(&request.messages);
 
+        // Extract tools from extra if present (Responses API puts them there)
+        let mut extra = request.extra.clone();
+        let (tools, tool_choice) = Self::extract_tools_from_extra(&mut extra);
+
         let mut chat_params = inference_providers::ChatCompletionParams {
             model: request.model.clone(),
             messages: chat_messages,
@@ -706,7 +761,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             top_p: request.top_p,
             stop: request.stop,
             stream: Some(true),
-            tools: None,
+            tools,
             max_completion_tokens: None,
             n: request.n,
             frequency_penalty: None,
@@ -716,13 +771,18 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             top_logprobs: None,
             user: Some(request.user_id.to_string()),
             seed: None,
-            tool_choice: None,
+            tool_choice,
             parallel_tool_calls: None,
-            metadata: request.metadata,
-            store: None,
+            // Drop metadata if store is not explicitly enabled (OpenAI requirement)
+            metadata: if request.store == Some(true) {
+                request.metadata.clone()
+            } else {
+                None
+            },
+            store: request.store,
             stream_options: None,
             modalities: None,
-            extra: request.extra.clone(),
+            extra,
         };
 
         // Resolve model name (could be an alias) and get model details in a single DB call
@@ -785,9 +845,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         };
 
         let inference_type = if is_streaming {
-            "chat_completion_stream"
+            crate::usage::ports::InferenceType::ChatCompletionStream
         } else {
-            "chat_completion"
+            crate::usage::ports::InferenceType::ChatCompletion
         };
 
         // Create the completion event stream with usage tracking
@@ -819,6 +879,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let service_start_time = Instant::now();
         let chat_messages = Self::prepare_chat_messages(&request.messages);
 
+        // Extract tools from extra if present (Responses API puts them there)
+        let mut extra = request.extra.clone();
+        let (tools, tool_choice) = Self::extract_tools_from_extra(&mut extra);
+
         let mut chat_params = inference_providers::ChatCompletionParams {
             model: request.model.clone(),
             messages: chat_messages,
@@ -827,7 +891,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             top_p: request.top_p,
             stop: request.stop,
             stream: Some(false),
-            tools: None,
+            tools,
             max_completion_tokens: None,
             n: request.n,
             frequency_penalty: None,
@@ -837,13 +901,18 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             top_logprobs: None,
             user: Some(request.user_id.to_string()),
             seed: None,
-            tool_choice: None,
+            tool_choice,
             parallel_tool_calls: None,
-            metadata: request.metadata,
-            store: None,
+            // Drop metadata if store is not explicitly enabled (OpenAI requirement)
+            metadata: if request.store == Some(true) {
+                request.metadata.clone()
+            } else {
+                None
+            },
+            store: request.store,
             stream_options: None,
             modalities: None,
-            extra: request.extra.clone(),
+            extra,
         };
 
         // Resolve model name (could be an alias) and get model details in a single DB call
@@ -992,7 +1061,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     model_id,
                     input_tokens,
                     output_tokens,
-                    inference_type: "chat_completion".to_string(),
+                    inference_type: crate::usage::ports::InferenceType::ChatCompletion,
                     ttft_ms: None,    // N/A for non-streaming
                     avg_itl_ms: None, // N/A for non-streaming
                     inference_id: Some(inference_id),
@@ -1063,6 +1132,78 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 "Audio transcription request timed out".to_string(),
             )),
         }
+    }
+
+    async fn try_rerank(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        params: inference_providers::RerankParams,
+    ) -> Result<inference_providers::RerankResponse, ports::CompletionError> {
+        // Acquire concurrent request slot to enforce organization limits
+        let counter = self
+            .try_acquire_concurrent_slot(organization_id, model_id, model_name)
+            .await?;
+
+        // Create RAII guard to ensure slot is released on drop (panic, error, or success)
+        let _guard = ConcurrentSlotGuard { counter };
+
+        // Call inference provider pool
+        // The guard will automatically release the slot when this function returns or panics
+        let result = self.inference_provider_pool.rerank(params).await;
+
+        // Map provider errors to service errors
+        result.map_err(|e| {
+            let error_msg = match e {
+                inference_providers::RerankError::GenerationError(msg) => msg,
+                inference_providers::RerankError::HttpError {
+                    status_code,
+                    message,
+                } => {
+                    format!("HTTP {}: {}", status_code, message)
+                }
+            };
+            ports::CompletionError::ProviderError(error_msg)
+        })
+    }
+
+    async fn try_score(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        request_hash: String,
+        params: inference_providers::ScoreParams,
+    ) -> Result<inference_providers::ScoreResponse, ports::CompletionError> {
+        // Acquire concurrent request slot to enforce organization limits
+        let counter = self
+            .try_acquire_concurrent_slot(organization_id, model_id, model_name)
+            .await?;
+
+        // Create RAII guard to ensure slot is released on drop (panic, error, or success)
+        let _guard = ConcurrentSlotGuard { counter };
+
+        // Call inference provider pool
+        // The guard will automatically release the slot when this function returns or panics
+        let result = self
+            .inference_provider_pool
+            .score(params, request_hash)
+            .await;
+
+        // Map provider errors to service errors
+        result.map_err(|e| {
+            let error_msg = match e {
+                inference_providers::ScoreError::GenerationError(msg) => msg,
+                inference_providers::ScoreError::HttpError {
+                    status_code,
+                    message,
+                } => {
+                    format!("HTTP {}: {}", status_code, message)
+                }
+            };
+            ports::CompletionError::ProviderError(error_msg)
+        })
     }
 }
 
@@ -1146,7 +1287,7 @@ mod tests {
             api_key_id,
             model_id,
             model_name: "test-model".to_string(),
-            inference_type: "chat_completion_stream".to_string(),
+            inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
             service_start_time: now,
             provider_start_time: now,
             first_token_received: false,
@@ -1302,7 +1443,7 @@ mod tests {
             api_key_id,
             model_id,
             model_name: "test-model".to_string(),
-            inference_type: "chat_completion_stream".to_string(),
+            inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
             service_start_time,
             provider_start_time,
             first_token_received: false,
@@ -1419,7 +1560,7 @@ mod tests {
             api_key_id,
             model_id,
             model_name: "test-model".to_string(),
-            inference_type: "chat_completion_stream".to_string(),
+            inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
             service_start_time: now,
             provider_start_time: now,
             first_token_received: false,
@@ -1583,7 +1724,7 @@ mod tests {
                 api_key_id: Uuid::new_v4(),
                 model_id: Uuid::new_v4(),
                 model_name: "test-model".to_string(),
-                inference_type: "chat_completion_stream".to_string(),
+                inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
                 service_start_time: Instant::now(),
                 provider_start_time: Instant::now(),
                 first_token_received: false,

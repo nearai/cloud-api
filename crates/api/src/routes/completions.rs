@@ -1,7 +1,7 @@
 use crate::{
     middleware::{auth::AuthenticatedApiKey, RequestBodyHash},
     models::*,
-    routes::{api::AppState, common::map_domain_error_to_status},
+    routes::{api::AppState, common::map_domain_error_to_status, files::MAX_FILE_SIZE},
 };
 use axum::{
     body::{Body, Bytes},
@@ -17,12 +17,56 @@ use services::completions::{
 };
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::debug;
 use utoipa;
 use uuid::Uuid;
 
+// Timeout for synchronous usage recording before response is returned
+const USAGE_RECORDING_TIMEOUT_SECS: u64 = 5;
+
 // Custom header for exposing the inference ID as a UUID
 const HEADER_INFERENCE_ID: &str = "Inference-Id";
+
+// Helper function to provide detailed error context for multipart parsing failures
+fn analyze_multipart_error(e: &axum::extract::multipart::MultipartError) -> (StatusCode, String) {
+    let error_str = e.to_string();
+
+    // Match against known multipart error patterns to provide specific guidance
+    let (status, message) = if error_str.contains("boundary") {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid Content-Type boundary in multipart request. Ensure the boundary parameter in the Content-Type header matches the actual boundary markers in the message body.".to_string(),
+        )
+    } else if error_str.contains("unexpected end") || error_str.contains("unexpected EOF") {
+        (
+            StatusCode::BAD_REQUEST,
+            "Request body ended unexpectedly. The multipart message may be truncated or missing the final boundary marker.".to_string(),
+        )
+    } else if error_str.contains("field") && error_str.contains("size") {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Individual form field size exceeded. A single field in the multipart request is too large.".to_string(),
+        )
+    } else if error_str.contains("field") {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid form field in multipart request. Check field encoding and format.".to_string(),
+        )
+    } else if error_str.contains("content") {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid Content-Type or content encoding in multipart request.".to_string(),
+        )
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid multipart form data. The request does not conform to multipart/form-data format.".to_string(),
+        )
+    };
+
+    (status, message)
+}
 
 // Helper function to extract inference ID from first SSE chunk
 fn extract_inference_id_from_sse(raw_bytes: &[u8]) -> Option<Uuid> {
@@ -75,6 +119,8 @@ fn convert_chat_request_to_service(
             .map(|msg| CompletionMessage {
                 role: msg.role.clone(),
                 content: extract_text_from_content(&msg.content),
+                tool_call_id: None,
+                tool_calls: None,
             })
             .collect(),
         max_tokens: request.max_tokens,
@@ -88,6 +134,7 @@ fn convert_chat_request_to_service(
         organization_id,
         workspace_id,
         metadata: None,
+        store: None,
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct chat completions API calls don't have a response_id
         extra: request.extra.clone(),
@@ -108,6 +155,8 @@ fn convert_text_request_to_service(
         messages: vec![CompletionMessage {
             role: "user".to_string(),
             content: request.prompt.clone(),
+            tool_call_id: None,
+            tool_calls: None,
         }],
         max_tokens: request.max_tokens,
         temperature: request.temperature,
@@ -120,6 +169,7 @@ fn convert_text_request_to_service(
         organization_id,
         workspace_id,
         metadata: None,
+        store: None,
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct text completions API calls don't have a response_id
         extra: request.extra.clone(),
@@ -158,12 +208,8 @@ pub async fn chat_completions(
         api_key.api_key.id
     );
     debug!(
-        "Request model: {}, stream: {:?}, messages: {}, org: {}, workspace: {}",
-        request.model,
-        request.stream,
-        request.messages.len(),
-        api_key.organization.id,
-        api_key.workspace.id.0
+        "Request model: {}, stream: {:?}, org: {}, workspace: {}",
+        request.model, request.stream, api_key.organization.id, api_key.workspace.id.0
     );
     // Validate the request
     if let Err(error) = request.validate() {
@@ -686,7 +732,8 @@ pub async fn image_generations(
                 .into_response();
         }
         Err(e) => {
-            tracing::error!(error = %e, "Failed to resolve model for image generation");
+            tracing::debug!(error = %e, "Failed to resolve model for image generation");
+            tracing::warn!("Image generation: model resolution failed");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -772,7 +819,8 @@ pub async fn image_generations(
                     .store_chat_signature_from_provider(&image_id_for_sig)
                     .await
                 {
-                    tracing::error!(error = %e, "Failed to store image generation signature");
+                    tracing::debug!(error = %e, "Failed to store image generation signature");
+                    tracing::warn!("Image generation: signature storage failed");
                 } else {
                     tracing::debug!(image_id = %image_id_for_sig, "Stored signature for image generation");
                 }
@@ -783,51 +831,112 @@ pub async fn image_generations(
             let workspace_id = api_key.workspace.id.0;
             let api_key_id_str = api_key.api_key.id.0.clone();
             let model_id = model.id;
-            let image_count = response_with_bytes.response.data.len() as i32;
+            let image_count = match i32::try_from(response_with_bytes.response.data.len()) {
+                Ok(count) => count,
+                Err(_) => {
+                    tracing::error!("Too many images in provider response, cannot fit in i32 for usage tracking");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse::new(
+                            "Internal error: too many images in provider response".to_string(),
+                            "server_error".to_string(),
+                        )),
+                    )
+                        .into_response();
+                }
+            };
             let provider_request_id = response_with_bytes.response.id.clone();
             let usage_service = app_state.usage_service.clone();
 
-            // Spawn async task to record usage (fire-and-forget like chat completions)
-            tokio::spawn(async move {
-                // Parse API key ID to UUID
-                let api_key_id = match Uuid::parse_str(&api_key_id_str) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        tracing::error!(error = %e, "Invalid API key ID for usage tracking");
-                        return;
-                    }
-                };
+            // Parse API key ID early for usage recording
+            let api_key_id = match Uuid::parse_str(&api_key_id_str) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::error!(error = %e, "Invalid API key ID for usage tracking");
+                    // Still return response but log error
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(response_with_bytes.raw_bytes))
+                        .unwrap();
+                }
+            };
 
-                // Hash the provider request ID to UUID for storage
-                let inference_id = Some(hash_inference_id_to_uuid(&provider_request_id));
+            // Hash the provider request ID to UUID for storage
+            let inference_id = Some(hash_inference_id_to_uuid(&provider_request_id));
 
-                let usage_request = services::usage::RecordUsageServiceRequest {
-                    organization_id,
-                    workspace_id,
-                    api_key_id,
-                    model_id,
-                    // Image generation doesn't have traditional token counts
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    inference_type: "image_generation".to_string(),
-                    ttft_ms: None,
-                    avg_itl_ms: None,
-                    inference_id,
-                    provider_request_id: Some(provider_request_id),
-                    stop_reason: Some(services::usage::StopReason::Completed),
-                    response_id: None,
-                    image_count: Some(image_count),
-                };
+            let usage_request = services::usage::RecordUsageServiceRequest {
+                organization_id,
+                workspace_id,
+                api_key_id,
+                model_id,
+                // Image generation doesn't have traditional token counts
+                input_tokens: 0,
+                output_tokens: 0,
+                inference_type: services::usage::ports::InferenceType::ImageGeneration,
+                ttft_ms: None,
+                avg_itl_ms: None,
+                inference_id,
+                provider_request_id: Some(provider_request_id.clone()),
+                stop_reason: Some(services::usage::StopReason::Completed),
+                response_id: None,
+                image_count: Some(image_count),
+            };
 
-                if let Err(e) = usage_service.record_usage(usage_request).await {
-                    tracing::error!(
-                        error = %e,
+            // Attempt synchronous usage recording with timeout before returning response.
+            // This ensures usage is persisted to the database before the client considers the request complete.
+            // If recording times out (>5s), fall back to fire-and-forget async task with retry logic.
+            let timeout_duration = Duration::from_secs(USAGE_RECORDING_TIMEOUT_SECS);
+            match tokio::time::timeout(
+                timeout_duration,
+                usage_service.record_usage(usage_request.clone()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    // Usage recorded successfully before response returned
+                    tracing::debug!(
+                        image_id = %provider_request_id,
                         %organization_id,
-                        %workspace_id,
-                        "Failed to record image generation usage"
+                        "Image generation usage recorded synchronously"
                     );
                 }
-            });
+                Ok(Err(e)) => {
+                    // Recording failed, fall back to async retry
+                    tracing::warn!(
+                        error = %e,
+                        image_id = %provider_request_id,
+                        "Failed to record usage synchronously, retrying async"
+                    );
+                    let usage_service_clone = usage_service.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = usage_service_clone.record_usage(usage_request).await {
+                            tracing::error!(
+                                error = %e,
+                                image_id = %provider_request_id,
+                                "Failed to record image generation usage in async retry"
+                            );
+                        }
+                    });
+                }
+                Err(_timeout) => {
+                    // Recording timed out, fall back to async retry to avoid blocking client
+                    tracing::warn!(
+                        image_id = %provider_request_id,
+                        "Usage recording timed out ({USAGE_RECORDING_TIMEOUT_SECS}s), retrying async"
+                    );
+                    let usage_service_clone = usage_service.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = usage_service_clone.record_usage(usage_request).await {
+                            tracing::error!(
+                                error = %e,
+                                image_id = %provider_request_id,
+                                "Failed to record image generation usage in async retry after timeout"
+                            );
+                        }
+                    });
+                }
+            }
 
             // Return the exact bytes from the provider for hash verification
             // This ensures clients can hash the response and compare with attestation endpoints
@@ -838,8 +947,8 @@ pub async fn image_generations(
                 .unwrap()
         }
         Err(e) => {
-            // Log the full error internally but return a sanitized message to the client
-            tracing::error!(error = %e, "Image generation failed");
+            // Log provider errors at debug level to avoid exposing infrastructure details in production
+            tracing::debug!(error = %e, "Image generation failed");
 
             // Map error to appropriate status code and sanitized message
             let (status_code, message) = match &e {
@@ -848,6 +957,7 @@ pub async fn image_generations(
                     if msg.contains("not found") || msg.contains("does not exist") {
                         (StatusCode::NOT_FOUND, "Model not found".to_string())
                     } else {
+                        tracing::warn!("Image generation error: service unavailable");
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "Image generation failed".to_string(),
@@ -862,7 +972,13 @@ pub async fn image_generations(
                         StatusCode::NOT_FOUND => "Model not found".to_string(),
                         StatusCode::BAD_REQUEST => "Invalid request".to_string(),
                         StatusCode::TOO_MANY_REQUESTS => "Rate limit exceeded".to_string(),
-                        _ => "Image generation failed".to_string(),
+                        _ => {
+                            tracing::warn!(
+                                http_status = *status_code,
+                                "Image generation HTTP error"
+                            );
+                            "Image generation failed".to_string()
+                        }
                     };
                     (code, msg)
                 }
@@ -877,6 +993,12 @@ pub async fn image_generations(
     }
 }
 
+/// Edit images from a text prompt and image
+///
+/// Edit images using an AI model from an image and text description. OpenAI-compatible endpoint.
+///
+/// **Request Body (multipart/form-data):**
+/// All fields should be provided as text values or files as indicated in the schema.
 /// Audio transcription endpoint
 ///
 /// Transcribe audio files using Whisper models. Accepts audio file uploads via multipart/form-data.
@@ -1113,7 +1235,7 @@ pub async fn audio_transcriptions(
                 model_id,
                 input_tokens: duration_seconds, // Bill by duration in seconds
                 output_tokens: 0,
-                inference_type: "audio_transcription".to_string(),
+                inference_type: services::usage::ports::InferenceType::AudioTranscription,
                 ttft_ms: None,
                 avg_itl_ms: None,
                 inference_id: Some(inference_id),
@@ -1176,6 +1298,974 @@ pub async fn audio_transcriptions(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "server_error",
                         "Audio transcription failed".to_string(),
+                    )
+                }
+            };
+
+            (
+                status_code,
+                ResponseJson(ErrorResponse::new(message, error_type.to_string())),
+            )
+                .into_response()
+        }
+    }
+}
+#[utoipa::path(
+    post,
+    path = "/v1/images/edits",
+    tag = "Images",
+    request_body(content = ImageEditRequestSchema, content_type = "multipart/form-data"),
+    responses(
+        (status = 200, description = "Image edited successfully", body = ImageGenerationResponse),
+        (status = 400, description = "Invalid request parameters", body = ErrorResponse),
+        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 413, description = "Payload too large", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn image_edits(
+    State(app_state): State<AppState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(body_hash): Extension<RequestBodyHash>,
+    mut multipart: axum::extract::Multipart,
+) -> axum::response::Response {
+    debug!("Image edit request from api key: {:?}", api_key.api_key.id);
+
+    let mut model = String::new();
+    let mut prompt = String::new();
+    let mut image: Option<Vec<u8>> = None;
+    let mut size: Option<String> = None;
+    let mut response_format: Option<String> = None;
+
+    // Parse multipart form data
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(mut field)) => {
+                match field.name().unwrap_or("") {
+                    "image" => {
+                        // Use streaming validation to detect oversized payloads before buffering entirely in memory.
+                        // This prevents memory exhaustion DoS attacks where attackers send payloads larger than MAX_FILE_SIZE.
+                        let mut bytes = Vec::new();
+                        let mut size = 0usize;
+
+                        loop {
+                            match field.chunk().await {
+                                Ok(Some(chunk)) => {
+                                    size += chunk.len();
+                                    // Reject early if size exceeds limit, before allocating memory
+                                    if size > MAX_FILE_SIZE {
+                                        return (
+                                            StatusCode::PAYLOAD_TOO_LARGE,
+                                            ResponseJson(ErrorResponse::new(
+                                                "Image size exceeds maximum of 512 MB".to_string(),
+                                                "invalid_request_error".to_string(),
+                                            )),
+                                        )
+                                            .into_response();
+                                    }
+                                    bytes.extend_from_slice(&chunk);
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    return (
+                                        StatusCode::BAD_REQUEST,
+                                        ResponseJson(ErrorResponse::new(
+                                            format!("Failed to read image: {}", e),
+                                            "invalid_request_error".to_string(),
+                                        )),
+                                    )
+                                        .into_response();
+                                }
+                            }
+                        }
+
+                        image = Some(bytes);
+                    }
+                    "model" => match field.text().await {
+                        Ok(text) => model = text,
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                ResponseJson(ErrorResponse::new(
+                                    format!("Failed to read model: {}", e),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                                .into_response();
+                        }
+                    },
+                    "prompt" => match field.text().await {
+                        Ok(text) => prompt = text,
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                ResponseJson(ErrorResponse::new(
+                                    format!("Failed to read prompt: {}", e),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                                .into_response();
+                        }
+                    },
+                    "size" => match field.text().await {
+                        Ok(text) => size = Some(text),
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                ResponseJson(ErrorResponse::new(
+                                    format!("Failed to read size: {}", e),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                                .into_response();
+                        }
+                    },
+                    "response_format" => match field.text().await {
+                        Ok(text) => response_format = Some(text),
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                ResponseJson(ErrorResponse::new(
+                                    format!("Failed to read response_format: {}", e),
+                                    "invalid_request_error".to_string(),
+                                )),
+                            )
+                                .into_response();
+                        }
+                    },
+                    _ => {
+                        // Ignore unknown fields
+                    }
+                }
+            }
+            Ok(None) => break, // All fields read successfully
+            Err(e) => {
+                // Multipart parsing error (malformed boundary, invalid encoding, etc.)
+                let (status, error_message) = analyze_multipart_error(&e);
+                tracing::debug!(error = %e, message = %error_message, "Multipart parsing error");
+                return (
+                    status,
+                    ResponseJson(ErrorResponse::new(
+                        error_message,
+                        "invalid_request_error".to_string(),
+                    )),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Fail fast if image is missing
+    let image = match image {
+        Some(img) => img,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "Missing required field: image".to_string(),
+                    "invalid_request_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    // Build the request
+    let request = crate::models::ImageEditRequest {
+        model,
+        prompt,
+        image,
+        size,
+        response_format,
+    };
+
+    debug!(
+        "Image edit request: model={}, org={}, workspace={}",
+        request.model, api_key.organization.id, api_key.workspace.id.0
+    );
+
+    // Validate the request
+    if let Err(error) = request.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                error,
+                "invalid_request_error".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
+    // Resolve model to get UUID for usage tracking
+    let model = match app_state
+        .models_service
+        .get_model_by_name(&request.model)
+        .await
+    {
+        Ok(model) => model,
+        Err(services::models::ModelsError::NotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    format!("Model '{}' not found", request.model),
+                    "invalid_request_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "Failed to resolve model for image edit");
+            tracing::warn!("Image edit: model resolution failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to resolve model".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    // Validate and enforce response_format for verifiable models
+    // Verifiable models (attestation_supported = true) only support "b64_json" format
+    // Default to "b64_json" if not specified to prevent downstream server from applying "url" default
+    let response_format = if model.attestation_supported {
+        match &request.response_format {
+            Some(format) if format == "b64_json" => Some(format.clone()),
+            Some(format) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        format!(
+                            "response_format '{}' is not supported for verifiable models. Only 'b64_json' is supported.",
+                            format
+                        ),
+                        "invalid_request_error".to_string(),
+                    )),
+                )
+                    .into_response();
+            }
+            None => Some("b64_json".to_string()), // Default to b64_json for verifiable models
+        }
+    } else {
+        request.response_format.clone()
+    };
+
+    // Convert API request to provider params
+    let params = inference_providers::ImageEditParams {
+        model: request.model.clone(),
+        prompt: request.prompt.clone(),
+        image: Arc::new(request.image),
+        size: request.size,
+        response_format,
+    };
+
+    // Call the inference provider pool
+    match app_state
+        .inference_provider_pool
+        .image_edit(params, body_hash.hash.clone())
+        .await
+    {
+        Ok(response_with_bytes) => {
+            // Store attestation signature for image edit (same pattern as image generation)
+            let attestation_service = app_state.attestation_service.clone();
+            let image_id_for_sig = response_with_bytes.response.id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = attestation_service
+                    .store_chat_signature_from_provider(&image_id_for_sig)
+                    .await
+                {
+                    tracing::debug!(error = %e, "Failed to store image edit signature");
+                    tracing::warn!("Image edit: signature storage failed");
+                } else {
+                    tracing::debug!(image_id = %image_id_for_sig, "Stored signature for image edit");
+                }
+            });
+
+            // Record usage for image edit
+            let organization_id = api_key.organization.id.0;
+            let workspace_id = api_key.workspace.id.0;
+            let api_key_id_str = api_key.api_key.id.0.clone();
+            let model_id = model.id;
+            let image_count = match i32::try_from(response_with_bytes.response.data.len()) {
+                Ok(count) => count,
+                Err(_) => {
+                    tracing::error!("Too many images in provider response, cannot fit in i32 for usage tracking");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse::new(
+                            "Internal error: too many images in provider response".to_string(),
+                            "server_error".to_string(),
+                        )),
+                    )
+                        .into_response();
+                }
+            };
+            let provider_request_id = response_with_bytes.response.id.clone();
+            let usage_service = app_state.usage_service.clone();
+
+            // Parse API key ID early for usage recording
+            let api_key_id = match Uuid::parse_str(&api_key_id_str) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::error!(error = %e, "Invalid API key ID for usage tracking");
+                    // Still return response but log error
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(response_with_bytes.raw_bytes))
+                        .unwrap();
+                }
+            };
+
+            // Hash the provider request ID to UUID for storage
+            let inference_id = Some(hash_inference_id_to_uuid(&provider_request_id));
+
+            let usage_request = services::usage::RecordUsageServiceRequest {
+                organization_id,
+                workspace_id,
+                api_key_id,
+                model_id,
+                // Image edit doesn't have traditional token counts
+                input_tokens: 0,
+                output_tokens: 0,
+                inference_type: services::usage::ports::InferenceType::ImageEdit,
+                ttft_ms: None,
+                avg_itl_ms: None,
+                inference_id,
+                provider_request_id: Some(provider_request_id.clone()),
+                stop_reason: Some(services::usage::StopReason::Completed),
+                response_id: None,
+                image_count: Some(image_count),
+            };
+
+            // Attempt synchronous usage recording with timeout before returning response.
+            // This ensures usage is persisted to the database before the client considers the request complete.
+            // If recording times out (>5s), fall back to fire-and-forget async task with retry logic.
+            let timeout_duration = Duration::from_secs(USAGE_RECORDING_TIMEOUT_SECS);
+            match tokio::time::timeout(
+                timeout_duration,
+                usage_service.record_usage(usage_request.clone()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    // Usage recorded successfully before response returned
+                    tracing::debug!(
+                        image_id = %provider_request_id,
+                        %organization_id,
+                        "Image edit usage recorded synchronously"
+                    );
+                }
+                Ok(Err(e)) => {
+                    // Recording failed, fall back to async retry
+                    tracing::warn!(
+                        error = %e,
+                        image_id = %provider_request_id,
+                        "Failed to record usage synchronously, retrying async"
+                    );
+                    let usage_service_clone = usage_service.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = usage_service_clone.record_usage(usage_request).await {
+                            tracing::error!(
+                                error = %e,
+                                image_id = %provider_request_id,
+                                "Failed to record image edit usage in async retry"
+                            );
+                        }
+                    });
+                }
+                Err(_timeout) => {
+                    // Recording timed out, fall back to async retry to avoid blocking client
+                    tracing::warn!(
+                        image_id = %provider_request_id,
+                        "Usage recording timed out ({USAGE_RECORDING_TIMEOUT_SECS}s), retrying async"
+                    );
+                    let usage_service_clone = usage_service.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = usage_service_clone.record_usage(usage_request).await {
+                            tracing::error!(
+                                error = %e,
+                                image_id = %provider_request_id,
+                                "Failed to record image edit usage in async retry after timeout"
+                            );
+                        }
+                    });
+                }
+            }
+
+            // Return the exact bytes from the provider for hash verification
+            // This ensures clients can hash the response and compare with attestation endpoints
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(response_with_bytes.raw_bytes))
+                .unwrap()
+        }
+        Err(e) => {
+            // Log provider errors at debug level to avoid exposing infrastructure details in production
+            tracing::debug!(error = %e, "Image edit failed");
+
+            // Map error to appropriate status code and sanitized message
+            let (status_code, message) = match &e {
+                inference_providers::ImageEditError::EditError(msg) => {
+                    // Check if it's a model not found error
+                    if msg.contains("not found") || msg.contains("does not exist") {
+                        (StatusCode::NOT_FOUND, "Model not found".to_string())
+                    } else {
+                        tracing::warn!("Image edit error: service unavailable");
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Image edit failed".to_string(),
+                        )
+                    }
+                }
+                inference_providers::ImageEditError::HttpError { status_code, .. } => {
+                    // Map HTTP status codes appropriately
+                    let code = StatusCode::from_u16(*status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let msg = match code {
+                        StatusCode::NOT_FOUND => "Model not found".to_string(),
+                        StatusCode::BAD_REQUEST => "Invalid request".to_string(),
+                        StatusCode::TOO_MANY_REQUESTS => "Rate limit exceeded".to_string(),
+                        _ => {
+                            tracing::warn!(http_status = *status_code, "Image edit HTTP error");
+                            "Image edit failed".to_string()
+                        }
+                    };
+                    (code, msg)
+                }
+            };
+
+            (
+                status_code,
+                ResponseJson(ErrorResponse::new(message, "server_error".to_string())),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Document reranking endpoint
+///
+/// Ranks documents by relevance to a query using a reranker model.
+///
+/// **Concurrent Request Limits:** Each organization has a per-model concurrent request limit (default: 64).
+/// When the limit is reached, new requests will fail with 429 status code. Wait for in-flight requests to complete before retrying.
+#[utoipa::path(
+    post,
+    path = "/v1/rerank",
+    tag = "Rerank",
+    request_body = crate::models::RerankRequest,
+    responses(
+        (status = 200, description = "Successful rerank", body = crate::models::RerankResponse),
+        (status = 400, description = "Invalid request (empty documents, invalid model, etc.)", body = ErrorResponse),
+        (status = 401, description = "Unauthorized (missing or invalid API key)", body = ErrorResponse),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 429, description = "Concurrent request limit exceeded for the organization. Max concurrent requests per model: 64 (configurable)", body = ErrorResponse),
+        (status = 500, description = "Server error (billing failure, provider error)", body = ErrorResponse),
+    ),
+    security(("ApiKeyAuth" = []))
+)]
+pub async fn rerank(
+    State(app_state): State<AppState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(_body_hash): Extension<RequestBodyHash>,
+    Json(request): Json<crate::models::RerankRequest>,
+) -> axum::response::Response {
+    debug!(
+        "Rerank request: model={}, org={}, workspace={}",
+        request.model, api_key.organization.id, api_key.workspace.id.0
+    );
+
+    // Validate the request
+    if let Err(error) = request.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                error,
+                "invalid_request_error".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
+    // Resolve model to get UUID for usage tracking - fail fast if not found
+    // Models must be registered in the database to be available for use
+    let model = match app_state
+        .models_service
+        .get_model_by_name(&request.model)
+        .await
+    {
+        Ok(model) => model,
+        Err(services::models::ModelsError::NotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    format!("Model '{}' not found", request.model),
+                    "not_found_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to resolve model for rerank");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to resolve model".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+    let model_id = model.id;
+    let organization_id = api_key.organization.id.0;
+
+    // Convert API request to provider params
+    let params = inference_providers::RerankParams {
+        model: request.model.clone(),
+        query: request.query.clone(),
+        documents: request.documents.clone(),
+        extra: std::collections::HashMap::new(),
+    };
+
+    // Call completion service which handles concurrent request limiting
+    // Each organization has a per-model concurrent request limit (default: 64 concurrent requests).
+    // This prevents resource exhaustion and ensures fair usage. Returns 429 if limit exceeded.
+    match app_state
+        .completion_service
+        .try_rerank(organization_id, model_id, &request.model, params)
+        .await
+    {
+        Ok(response) => {
+            // Record usage for rerank SYNCHRONOUSLY to ensure billing accuracy
+            // This is critical for revenue tracking and must complete before returning response
+            let organization_id = api_key.organization.id.0;
+            let workspace_id = api_key.workspace.id.0;
+            let mut token_count = response
+                .usage
+                .as_ref()
+                .and_then(|u| u.total_tokens)
+                .unwrap_or(0);
+
+            // Validate token count is reasonable (prevent provider misreporting)
+            const MAX_REASONABLE_TOKENS: i32 = 1_000_000; // 1M tokens max
+            let mut token_anomaly_detected = false;
+
+            if token_count > MAX_REASONABLE_TOKENS {
+                // Log at ERROR level with full context for monitoring/alerting
+                // This indicates a provider bug that needs investigation
+                tracing::error!(
+                    token_count = token_count,
+                    max_expected = MAX_REASONABLE_TOKENS,
+                    model = %request.model,
+                    organization_id = %organization_id,
+                    "Provider returned unreasonable token count - capping to prevent billing errors. This may indicate provider misconfiguration or a bug."
+                );
+                token_anomaly_detected = true;
+
+                // Record metrics for monitoring and alerting
+                let model_tag = format!("model:{}", request.model);
+                let reason_tag = format!(
+                    "reason:{}",
+                    services::metrics::consts::REASON_TOKEN_OVERFLOW
+                );
+                let anomaly_tags = [model_tag.as_str(), reason_tag.as_str()];
+                app_state.metrics_service.record_count(
+                    services::metrics::consts::METRIC_PROVIDER_TOKEN_ANOMALIES,
+                    1,
+                    &anomaly_tags,
+                );
+
+                // Cap to maximum to prevent billing errors
+                token_count = MAX_REASONABLE_TOKENS;
+            }
+
+            // Warn if provider didn't return usage data
+            if token_count == 0 {
+                tracing::warn!(
+                    model = %request.model,
+                    organization_id = %organization_id,
+                    "Provider returned zero tokens for rerank - no cost will be charged. This may indicate provider misconfiguration or incomplete response."
+                );
+                token_anomaly_detected = true;
+
+                // Record metrics for monitoring and alerting on missing usage data
+                let model_tag = format!("model:{}", request.model);
+                let reason_tag =
+                    format!("reason:{}", services::metrics::consts::REASON_MISSING_USAGE);
+                let zero_tokens_tags = [model_tag.as_str(), reason_tag.as_str()];
+                app_state.metrics_service.record_count(
+                    services::metrics::consts::METRIC_PROVIDER_ZERO_TOKENS,
+                    1,
+                    &zero_tokens_tags,
+                );
+            }
+
+            // If anomaly detected, log additional context for debugging
+            if token_anomaly_detected {
+                tracing::info!(
+                    model = %request.model,
+                    organization_id = %organization_id,
+                    final_token_count = token_count,
+                    "Token count anomaly: Provider data quality issue detected. Recommendation: Check provider logs and configuration."
+                );
+            }
+
+            // Parse API key ID to UUID
+            let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::error!(error = %e, "Invalid API key ID for usage tracking");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse::new(
+                            "Failed to record usage".to_string(),
+                            "server_error".to_string(),
+                        )),
+                    )
+                        .into_response();
+                }
+            };
+
+            let inference_id = uuid::Uuid::new_v4();
+            let usage_request = services::usage::RecordUsageServiceRequest {
+                organization_id,
+                workspace_id,
+                api_key_id,
+                model_id,
+                input_tokens: token_count,
+                output_tokens: 0,
+                inference_type: services::usage::ports::InferenceType::Rerank,
+                ttft_ms: None,
+                avg_itl_ms: None,
+                inference_id: Some(inference_id),
+                provider_request_id: None,
+                stop_reason: Some(services::usage::StopReason::Completed),
+                response_id: None,
+                image_count: None,
+            };
+
+            // Record usage synchronously - this is billing-critical and must succeed
+            // If usage recording fails, we must fail the request to prevent revenue loss
+            if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
+                tracing::error!(error = %e, "Failed to record rerank usage - blocking request to ensure billing accuracy");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to record usage - please retry".to_string(),
+                        "server_error".to_string(),
+                    )),
+                )
+                    .into_response();
+            }
+
+            (StatusCode::OK, ResponseJson(response)).into_response()
+        }
+        Err(e) => {
+            let (status_code, error_type, message) = match e {
+                services::completions::ports::CompletionError::RateLimitExceeded => {
+                    tracing::warn!("Concurrent request limit exceeded for rerank");
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "rate_limit_error",
+                        "Too many concurrent rerank requests. Organization limit: 64 concurrent requests per model. Please wait for in-flight requests to complete before retrying.".to_string(),
+                    )
+                }
+                services::completions::ports::CompletionError::ProviderError(msg) => {
+                    tracing::error!(error = %msg, "Rerank provider error");
+                    // Check if it's a model not found error
+                    if msg.contains("not found") || msg.contains("does not exist") {
+                        (
+                            StatusCode::NOT_FOUND,
+                            "not_found_error",
+                            "Model not found".to_string(),
+                        )
+                    } else {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "server_error",
+                            "Reranking failed".to_string(),
+                        )
+                    }
+                }
+                _ => {
+                    tracing::error!(error = %e, "Unexpected rerank error");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "Reranking failed".to_string(),
+                    )
+                }
+            };
+
+            (
+                status_code,
+                ResponseJson(ErrorResponse::new(message, error_type.to_string())),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Text similarity scoring endpoint
+///
+/// Scores the similarity between two texts using a scoring/ranking model.
+///
+/// **Concurrent Request Limits:** Each organization has a per-model concurrent request limit (default: 64).
+/// When the limit is reached, new requests will fail with 429 status code. Wait for in-flight requests to complete before retrying.
+#[utoipa::path(
+    post,
+    path = "/v1/score",
+    tag = "Score",
+    request_body = crate::models::ScoreRequest,
+    responses(
+        (status = 200, description = "Successful score", body = crate::models::ScoreResponse),
+        (status = 400, description = "Invalid request (empty texts, invalid model, etc.)", body = ErrorResponse),
+        (status = 401, description = "Unauthorized (missing or invalid API key)", body = ErrorResponse),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 429, description = "Concurrent request limit exceeded for the organization. Max concurrent requests per model: 64 (configurable)", body = ErrorResponse),
+        (status = 500, description = "Server error (billing failure, provider error)", body = ErrorResponse),
+    ),
+    security(("ApiKeyAuth" = []))
+)]
+pub async fn score(
+    State(app_state): State<AppState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(body_hash): Extension<RequestBodyHash>,
+    Json(request): Json<crate::models::ScoreRequest>,
+) -> axum::response::Response {
+    debug!(
+        "Score request: model={}, org={}, workspace={}",
+        request.model, api_key.organization.id, api_key.workspace.id.0
+    );
+
+    // Validate the request
+    if let Err(error) = request.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                error,
+                "invalid_request_error".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
+    // Resolve model to get UUID for usage tracking - fail fast if not found
+    // Models must be registered in the database to be available for use
+    let model = match app_state
+        .models_service
+        .get_model_by_name(&request.model)
+        .await
+    {
+        Ok(model) => model,
+        Err(services::models::ModelsError::NotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    format!("Model '{}' not found", request.model),
+                    "not_found_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to resolve model for score");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to resolve model".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+    let model_id = model.id;
+    let organization_id = api_key.organization.id.0;
+
+    // Call completion service which handles concurrent request limiting
+    // Each organization has a per-model concurrent request limit (default: 64 concurrent requests).
+    // This prevents resource exhaustion and ensures fair usage. Returns 429 if limit exceeded.
+    match app_state
+        .completion_service
+        .try_score(
+            organization_id,
+            model_id,
+            &request.model,
+            body_hash.hash.clone(),
+            inference_providers::ScoreParams {
+                model: request.model.clone(),
+                text_1: request.text_1.clone(),
+                text_2: request.text_2.clone(),
+                extra: std::collections::HashMap::new(),
+            },
+        )
+        .await
+    {
+        Ok(response) => {
+            // Record usage for score SYNCHRONOUSLY to ensure billing accuracy
+            // This is critical for revenue tracking and must complete before returning response
+            let organization_id = api_key.organization.id.0;
+            let workspace_id = api_key.workspace.id.0;
+
+            // Parse API key ID to UUID
+            let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::error!(error = %e, "Invalid API key ID for usage tracking");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse::new(
+                            "Failed to record usage".to_string(),
+                            "server_error".to_string(),
+                        )),
+                    )
+                        .into_response();
+                }
+            };
+
+            let inference_id = hash_inference_id_to_uuid(&response.id);
+
+            // Score requests don't have traditional token counts - use input token count as 1
+            let usage_request = services::usage::ports::RecordUsageServiceRequest {
+                organization_id,
+                workspace_id,
+                api_key_id,
+                model_id,
+                input_tokens: 1,
+                output_tokens: 0,
+                inference_type: services::usage::ports::InferenceType::Score,
+                ttft_ms: None,
+                avg_itl_ms: None,
+                inference_id: Some(inference_id),
+                provider_request_id: None,
+                stop_reason: Some(services::usage::StopReason::Completed),
+                response_id: None,
+                image_count: None,
+            };
+
+            // Record usage with timeout to prevent blocking responses
+            match tokio::time::timeout(
+                Duration::from_secs(USAGE_RECORDING_TIMEOUT_SECS),
+                app_state.usage_service.record_usage(usage_request),
+            )
+            .await
+            {
+                Ok(Ok(())) => ResponseJson(response).into_response(),
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        model_id = %model_id,
+                        "Failed to record usage synchronously, retrying async"
+                    );
+                    let usage_service_clone = app_state.usage_service.clone();
+                    let usage_request_retry = services::usage::ports::RecordUsageServiceRequest {
+                        organization_id,
+                        workspace_id,
+                        api_key_id,
+                        model_id,
+                        input_tokens: 1,
+                        output_tokens: 0,
+                        inference_type: services::usage::ports::InferenceType::Score,
+                        ttft_ms: None,
+                        avg_itl_ms: None,
+                        inference_id: Some(inference_id),
+                        provider_request_id: None,
+                        stop_reason: Some(services::usage::StopReason::Completed),
+                        response_id: None,
+                        image_count: None,
+                    };
+                    tokio::spawn(async move {
+                        if let Err(e) = usage_service_clone.record_usage(usage_request_retry).await
+                        {
+                            tracing::error!(
+                                error = %e,
+                                model_id = %model_id,
+                                "Failed to record score usage in async retry"
+                            );
+                        }
+                    });
+                    ResponseJson(response).into_response()
+                }
+                Err(_timeout) => {
+                    // Recording timed out, fall back to async retry to avoid blocking client
+                    tracing::warn!(
+                        model_id = %model_id,
+                        "Score usage recording timed out, retrying async"
+                    );
+                    let usage_service_clone = app_state.usage_service.clone();
+                    let usage_request_retry = services::usage::ports::RecordUsageServiceRequest {
+                        organization_id,
+                        workspace_id,
+                        api_key_id,
+                        model_id,
+                        input_tokens: 1,
+                        output_tokens: 0,
+                        inference_type: services::usage::ports::InferenceType::Score,
+                        ttft_ms: None,
+                        avg_itl_ms: None,
+                        inference_id: Some(inference_id),
+                        provider_request_id: None,
+                        stop_reason: Some(services::usage::StopReason::Completed),
+                        response_id: None,
+                        image_count: None,
+                    };
+                    tokio::spawn(async move {
+                        if let Err(e) = usage_service_clone.record_usage(usage_request_retry).await
+                        {
+                            tracing::error!(
+                                error = %e,
+                                model_id = %model_id,
+                                "Failed to record score usage in async retry"
+                            );
+                        }
+                    });
+                    ResponseJson(response).into_response()
+                }
+            }
+        }
+        Err(e) => {
+            let (status_code, error_type, message) = match e {
+                services::completions::ports::CompletionError::RateLimitExceeded => {
+                    tracing::warn!("Concurrent request limit exceeded for score");
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "rate_limit_error",
+                        "Too many concurrent score requests. Organization limit: 64 concurrent requests per model. Please wait for in-flight requests to complete before retrying.".to_string(),
+                    )
+                }
+                services::completions::ports::CompletionError::ProviderError(msg) => {
+                    tracing::error!(error = %msg, "Score provider error");
+                    // Check if it's a model not found error
+                    if msg.contains("not found") || msg.contains("does not exist") {
+                        (
+                            StatusCode::NOT_FOUND,
+                            "not_found_error",
+                            "Model not found".to_string(),
+                        )
+                    } else {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "server_error",
+                            "Scoring failed".to_string(),
+                        )
+                    }
+                }
+                _ => {
+                    tracing::error!(error = %e, "Unexpected score error");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "Scoring failed".to_string(),
                     )
                 }
             };

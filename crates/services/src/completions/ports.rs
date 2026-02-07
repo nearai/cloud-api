@@ -62,6 +62,8 @@ pub struct CompletionRequest {
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
     pub metadata: Option<serde_json::Value>,
+    /// Whether to store the output (required for metadata to be sent to OpenAI)
+    pub store: Option<bool>,
     pub body_hash: String,
     /// Response ID when called from Responses API (for usage tracking FK)
     pub response_id: Option<ResponseId>,
@@ -69,10 +71,30 @@ pub struct CompletionRequest {
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
+/// Tool call information for completion messages
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionToolCall {
+    /// Tool call ID (e.g., "toolu_xxx" for Anthropic, "call_xxx" for OpenAI)
+    pub id: String,
+    /// Tool name (e.g., "web_search")
+    pub name: String,
+    /// JSON-encoded arguments for the tool
+    pub arguments: String,
+    /// Thought signature for Gemini 3 models (internal use only, not exposed to clients)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionMessage {
     pub role: String,
     pub content: String,
+    /// Tool call ID - required for tool role messages to match with assistant's tool_calls
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Tool calls made by the assistant - required for assistant messages that invoke tools
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<CompletionToolCall>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,4 +145,33 @@ pub trait CompletionServiceTrait: Send + Sync {
         params: inference_providers::AudioTranscriptionParams,
         request_hash: String,
     ) -> Result<inference_providers::AudioTranscriptionResponse, CompletionError>;
+
+    /// Execute a rerank request with proper concurrent request limiting.
+    ///
+    /// Each organization has a per-model concurrent request limit (default: 64).
+    /// This method acquires a concurrent slot before calling the inference provider.
+    /// If the limit is exceeded, returns CompletionError::RateLimitExceeded (429 HTTP status).
+    /// Slots are automatically released after the provider call (success or error).
+    async fn try_rerank(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        params: inference_providers::RerankParams,
+    ) -> Result<inference_providers::RerankResponse, CompletionError>;
+
+    /// Execute a score request with proper concurrent request limiting.
+    ///
+    /// Each organization has a per-model concurrent request limit (default: 64).
+    /// This method acquires a concurrent slot before calling the inference provider.
+    /// If the limit is exceeded, returns CompletionError::RateLimitExceeded (429 HTTP status).
+    /// Slots are automatically released after the provider call (success or error).
+    async fn try_score(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        request_hash: String,
+        params: inference_providers::ScoreParams,
+    ) -> Result<inference_providers::ScoreResponse, CompletionError>;
 }

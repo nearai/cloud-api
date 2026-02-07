@@ -17,7 +17,7 @@ use super::executor::{ToolEventContext, ToolExecutionContext, ToolExecutor, Tool
 use async_trait::async_trait;
 use inference_providers::{FunctionDefinition, ToolDefinition};
 use rmcp::{
-    model::{CallToolRequestParam, CallToolResult},
+    model::{CallToolRequestParams, CallToolResult},
     service::{RoleClient, RunningService},
     transport::{
         streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
@@ -113,10 +113,11 @@ impl McpClient for RealMcpClient {
         arguments: serde_json::Value,
     ) -> Result<String, ResponseError> {
         let args = arguments.as_object().cloned();
-        let request = CallToolRequestParam {
+        let request = CallToolRequestParams {
             name: tool_name.to_string().into(),
             arguments: args,
             task: None,
+            meta: None,
         };
 
         let client = self.client.lock().await;
@@ -926,6 +927,8 @@ pub async fn process_approval_responses(
             messages.push(crate::completions::ports::CompletionMessage {
                 role: "tool".to_string(),
                 content: result_message,
+                tool_call_id: None, // MCP approval responses don't have a tool_call_id
+                tool_calls: None,
             });
         }
     }

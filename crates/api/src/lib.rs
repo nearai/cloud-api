@@ -16,7 +16,7 @@ use crate::{
             StateStore,
         },
         billing::{get_billing_costs, BillingRouteState},
-        completions::{audio_transcriptions, chat_completions, image_generations, models},
+        completions::{audio_transcriptions, chat_completions, image_edits, image_generations, models, rerank, score},
         conversations,
         health::health_check,
         models::{get_model_by_name, list_models, ModelsAppState},
@@ -318,6 +318,17 @@ pub async fn init_domain_services_with_pool(
         }
     }
 
+    // Start periodic external provider refresh task
+    let refresh_interval = config.external_providers.refresh_interval_secs;
+    if refresh_interval > 0 {
+        let external_source =
+            models_repo.clone() as Arc<dyn services::inference_provider_pool::ExternalModelsSource>;
+        inference_provider_pool
+            .clone()
+            .start_external_refresh_task(external_source, refresh_interval)
+            .await;
+    }
+
     // Create conversation service
     let conversation_service = Arc::new(services::ConversationService::new(
         conversation_repo.clone(),
@@ -529,7 +540,6 @@ pub async fn init_inference_providers(
             discovery_url,
             api_key,
             config.model_discovery.timeout,
-            config.model_discovery.inference_timeout,
             config.external_providers.clone(),
         ),
     );
@@ -565,7 +575,6 @@ pub async fn init_inference_providers_with_mocks(
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30 * 60,
             config::ExternalProvidersConfig::default(),
         ),
     );
@@ -584,6 +593,7 @@ pub async fn init_inference_providers_with_mocks(
         "deepseek-ai/DeepSeek-V3.1".to_string(),
         "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string(),
         "Qwen/Qwen-Image-2512".to_string(),
+        "Qwen/Qwen3-Reranker-0.6B".to_string(),
     ];
 
     let providers: Vec<(
@@ -650,6 +660,7 @@ pub fn build_app_with_config(
         user_service: domain_services.user_service.clone(),
         files_service: domain_services.files_service.clone(),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
+        metrics_service: domain_services.metrics_service.clone(),
         config: config.clone(),
     };
 
@@ -862,11 +873,38 @@ pub fn build_completion_routes(
     usage_state: middleware::UsageState,
     rate_limit_state: middleware::RateLimitState,
 ) -> Router {
-    let inference_routes = Router::new()
+    use crate::routes::files::MAX_FILE_SIZE;
+
+    // Text-based inference routes (chat/completions, image generation, audio transcription, rerank, score)
+    // Use default body limit (~2 MB) since they only accept JSON
+    let text_inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
         .route("/images/generations", post(image_generations))
         .route("/audio/transcriptions", post(audio_transcriptions))
+        .route("/rerank", post(rerank))
+        .route("/score", post(score))
         .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
+        .with_state(app_state.clone())
+        .layer(from_fn_with_state(
+            usage_state.clone(),
+            middleware::usage_check_middleware,
+        ))
+        .layer(from_fn_with_state(
+            rate_limit_state.clone(),
+            middleware::api_key_rate_limit_middleware,
+        ))
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::auth_middleware_with_workspace_context,
+        ))
+        .layer(from_fn(middleware::body_hash_middleware));
+
+    // File-based inference routes (image edits)
+    // Apply 512 MB limit only to endpoints that accept file uploads
+    // IMPORTANT: body_hash_middleware is placed AFTER auth to prevent buffering
+    // unauthenticated requests. Auth failures prevent memory exhaustion DoS attacks.
+    let file_inference_routes = Router::new()
+        .route("/images/edits", post(image_edits))
         .with_state(app_state.clone())
         .layer(from_fn_with_state(
             usage_state,
@@ -880,7 +918,8 @@ pub fn build_completion_routes(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
-        .layer(from_fn(middleware::body_hash_middleware));
+        .layer(from_fn(middleware::body_hash_middleware))
+        .layer(DefaultBodyLimit::max(MAX_FILE_SIZE));
 
     let metadata_routes = Router::new()
         .route("/models", get(models))
@@ -894,7 +933,10 @@ pub fn build_completion_routes(
             auth_middleware_with_api_key,
         ));
 
-    Router::new().merge(inference_routes).merge(metadata_routes)
+    Router::new()
+        .merge(text_inference_routes)
+        .merge(file_inference_routes)
+        .merge(metadata_routes)
 }
 
 /// Build response routes with auth
@@ -1320,7 +1362,6 @@ mod tests {
                 api_key: Some("test-key".to_string()),
                 refresh_interval: 0,
                 timeout: 5,
-                inference_timeout: 30 * 60, // 30 minutes
             },
             logging: config::LoggingConfig {
                 level: "info".to_string(),
@@ -1424,7 +1465,6 @@ mod tests {
                 api_key: Some("test-key".to_string()),
                 refresh_interval: 0,
                 timeout: 5,
-                inference_timeout: 30 * 60, // 30 minutes
             },
             logging: config::LoggingConfig {
                 level: "info".to_string(),

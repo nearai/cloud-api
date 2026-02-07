@@ -275,9 +275,11 @@ mod tests {
 
         let executor = WebSearchToolExecutor::new(provider);
         let tool_call = ToolCallInfo {
+            id: None,
             tool_type: WEB_SEARCH_TOOL_NAME.to_string(),
             query: "test query".to_string(),
             params: None,
+            thought_signature: None,
         };
 
         let request = create_test_request();
@@ -301,6 +303,7 @@ mod tests {
         let executor = WebSearchToolExecutor::new(provider);
 
         let tool_call = ToolCallInfo {
+            id: None,
             tool_type: WEB_SEARCH_TOOL_NAME.to_string(),
             query: "test query".to_string(),
             params: Some(serde_json::json!({
@@ -308,6 +311,7 @@ mod tests {
                 "count": 10,
                 "safesearch": "moderate"
             })),
+            thought_signature: None,
         };
 
         let request = create_test_request();

@@ -1,11 +1,26 @@
-use crate::{models::StreamOptions, sse_parser::new_sse_parser, ImageGenerationError, *};
+use crate::{
+    models::StreamOptions, sse_parser::new_sse_parser, ImageEditError, ImageGenerationError,
+    RerankError, ScoreError, *,
+};
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Convert any displayable error to ImageGenerationError::GenerationError
 fn to_image_gen_error<E: std::fmt::Display>(e: E) -> ImageGenerationError {
     ImageGenerationError::GenerationError(e.to_string())
+}
+
+/// Convert any displayable error to RerankError::GenerationError
+fn to_rerank_error<E: std::fmt::Display>(e: E) -> RerankError {
+    RerankError::GenerationError(e.to_string())
+}
+
+/// Convert any displayable error to ScoreError::GenerationError
+fn to_score_error<E: std::fmt::Display>(e: E) -> ScoreError {
+    ScoreError::GenerationError(e.to_string())
 }
 
 /// Encryption header keys used in params.extra for passing encryption information
@@ -424,6 +439,7 @@ impl InferenceProvider for VLlmProvider {
             .post(&url)
             .headers(headers)
             .json(&params)
+            .timeout(Duration::from_secs(180))
             .send()
             .await
             .map_err(to_image_gen_error)?;
@@ -533,6 +549,178 @@ impl InferenceProvider for VLlmProvider {
             .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
 
         Ok(transcription_response)
+    }
+
+    /// Performs an image edit request
+    async fn image_edit(
+        &self,
+        params: Arc<ImageEditParams>,
+        request_hash: String,
+    ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
+        let url = format!("{}/v1/images/edits", self.config.base_url);
+
+        // Build headers without Content-Type (let reqwest set multipart boundary)
+        let mut headers = reqwest::header::HeaderMap::new();
+
+        if let Some(ref api_key) = self.config.api_key {
+            let auth_value = format!("Bearer {api_key}");
+            let header_value = HeaderValue::from_str(&auth_value)
+                .map_err(|e| ImageEditError::EditError(format!("Invalid API key format: {e}")))?;
+            headers.insert("Authorization", header_value);
+        }
+
+        headers.insert(
+            "X-Request-Hash",
+            HeaderValue::from_str(&request_hash)
+                .map_err(|e| ImageEditError::EditError(format!("Invalid request hash: {e}")))?,
+        );
+
+        // Dereference Arc<Vec<u8>> to get &[u8] for efficient handling
+        let image_data: &[u8] = &params.image;
+
+        // Detect image MIME type based on magic bytes
+        let image_mime_type = if image_data.len() >= 3 && &image_data[0..3] == b"\xFF\xD8\xFF" {
+            "image/jpeg"
+        } else if image_data.len() >= 4 && &image_data[0..4] == b"\x89PNG" {
+            "image/png"
+        } else {
+            "image/jpeg" // Default to jpeg
+        };
+
+        // Build multipart form data
+        let mut form = reqwest::multipart::Form::new();
+
+        // Add text fields first (clone strings since Arc doesn't allow moving)
+        form = form.text("model", params.model.clone());
+        form = form.text("prompt", params.prompt.clone());
+
+        // Add image as image[] field (vLLM expects array syntax)
+        let image_part = reqwest::multipart::Part::bytes(image_data.to_vec())
+            .file_name("image.bin")
+            .mime_str(image_mime_type)
+            .map_err(|e| ImageEditError::EditError(format!("Invalid image MIME type: {e}")))?;
+        form = form.part("image[]", image_part);
+
+        // Add optional text parameters
+        if let Some(size) = params.size.as_ref() {
+            form = form.text("size", size.clone());
+        }
+        if let Some(response_format) = params.response_format.as_ref() {
+            form = form.text("response_format", response_format.clone());
+        }
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .multipart(form)
+            .timeout(Duration::from_secs(180))
+            .send()
+            .await
+            .map_err(|e| ImageEditError::EditError(format!("Request failed: {e}")))?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(ImageEditError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        // Get raw bytes first for exact hash verification (same pattern as image_generation)
+        let raw_bytes = response
+            .bytes()
+            .await
+            .map_err(|e| ImageEditError::EditError(format!("Failed to read response body: {e}")))?
+            .to_vec();
+
+        // Parse the response from the raw bytes
+        let edit_response: ImageGenerationResponse = serde_json::from_slice(&raw_bytes)
+            .map_err(|e| ImageEditError::EditError(format!("Failed to parse response: {e}")))?;
+
+        Ok(ImageEditResponseWithBytes {
+            response: edit_response,
+            raw_bytes,
+        })
+    }
+
+    /// Performs a document reranking request
+    async fn score(
+        &self,
+        params: ScoreParams,
+        request_hash: String,
+    ) -> Result<ScoreResponse, ScoreError> {
+        let url = format!("{}/v1/score", self.config.base_url);
+
+        let mut headers = self.build_headers().map_err(to_score_error)?;
+        headers.insert(
+            "X-Request-Hash",
+            reqwest::header::HeaderValue::from_str(&request_hash).map_err(to_score_error)?,
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&params)
+            .timeout(std::time::Duration::from_secs(
+                self.config.timeout_seconds as u64,
+            ))
+            .send()
+            .await
+            .map_err(to_score_error)?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(ScoreError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        let score_response: ScoreResponse = response.json().await.map_err(to_score_error)?;
+        Ok(score_response)
+    }
+
+    async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+        let url = format!("{}/v1/rerank", self.config.base_url);
+
+        let headers = self.build_headers().map_err(to_rerank_error)?;
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&params)
+            .timeout(std::time::Duration::from_secs(
+                self.config.timeout_seconds as u64,
+            ))
+            .send()
+            .await
+            .map_err(to_rerank_error)?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(RerankError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        let rerank_response: RerankResponse = response.json().await.map_err(to_rerank_error)?;
+        Ok(rerank_response)
     }
 }
 

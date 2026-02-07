@@ -2,13 +2,9 @@ name: Security audit
 
 on:
   push:
-    paths:
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
+    branches:
+      - 'main'
   pull_request:
-    paths:
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
   schedule:
     - cron: '0 0 * * *'  # Run daily at midnight UTC
 

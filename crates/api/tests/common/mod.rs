@@ -79,10 +79,6 @@ pub fn test_config_with_db(db_name: &str) -> ApiConfig {
                 .ok()
                 .and_then(|t| t.parse().ok())
                 .unwrap_or(5),
-            inference_timeout: std::env::var("MODEL_INFERENCE_TIMEOUT")
-                .ok()
-                .and_then(|t| t.parse().ok())
-                .unwrap_or(30 * 60), // 30 minutes
         },
         logging: config::LoggingConfig {
             level: "debug".to_string(),
@@ -372,7 +368,6 @@ async fn setup_test_infrastructure_for_real_providers() -> TestInfrastructure {
     let mut config = test_config_with_db(&db_name);
     config.model_discovery.discovery_server_url = get_real_discovery_server_url();
     config.model_discovery.timeout = 30;
-    config.model_discovery.inference_timeout = 5 * 60;
 
     let db_config = config.database.clone();
 
@@ -532,6 +527,7 @@ pub async fn setup_org_with_credits_and_session_and_email(
     let org = create_org_with_session(server, session_id).await;
 
     let update_request = serde_json::json!({
+        "type": "payment",
         "spendLimit": {
             "amount": amount_nano_dollars,
             "currency": "USD"
@@ -549,6 +545,47 @@ pub async fn setup_org_with_credits_and_session_and_email(
 
     assert_eq!(response.status_code(), 200, "Failed to set credits");
     org
+}
+
+/// Add credits with specific type and source to an organization
+pub async fn add_credits_with_type(
+    server: &axum_test::TestServer,
+    org_id: &str,
+    credit_type: &str,
+    source: Option<&str>,
+    amount_nano_dollars: i64,
+    currency: &str,
+    session_id: &str,
+) -> api::models::UpdateOrganizationLimitsResponse {
+    let mut update_request = serde_json::json!({
+        "type": credit_type,
+        "spendLimit": {
+            "amount": amount_nano_dollars,
+            "currency": currency
+        },
+        "changedBy": "admin@test.com",
+        "changeReason": format!("Test {} credits", credit_type)
+    });
+
+    if let Some(src) = source {
+        update_request["source"] = serde_json::Value::String(src.to_string());
+    }
+
+    let response = server
+        .patch(format!("/v1/admin/organizations/{}/limits", org_id).as_str())
+        .add_header("Authorization", format!("Bearer {session_id}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&update_request)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Failed to add {} credits: {}",
+        credit_type,
+        response.text()
+    );
+    response.json::<api::models::UpdateOrganizationLimitsResponse>()
 }
 
 pub async fn list_workspaces(
@@ -779,6 +816,64 @@ pub async fn setup_qwen_image_model(server: &axum_test::TestServer) -> String {
     assert_eq!(updated.len(), 1, "Should have updated 1 model");
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     "Qwen/Qwen-Image-2512".to_string()
+}
+
+pub async fn setup_qwen_reranker_model(server: &axum_test::TestServer) -> String {
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        "Qwen/Qwen3-Reranker-0.6B".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 100000,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 0,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Qwen3-Reranker 0.6B",
+            "modelDescription": "Qwen3 Text Similarity Scoring (Reranker) model",
+            "contextLength": 8192,
+            "verifiable": true,
+            "isActive": true
+        }))
+        .unwrap(),
+    );
+    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    assert_eq!(updated.len(), 1, "Should have updated 1 model");
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    "Qwen/Qwen3-Reranker-0.6B".to_string()
+}
+
+pub async fn setup_rerank_model(server: &axum_test::TestServer) -> String {
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        "Qwen/Qwen3-Reranker-0.6B".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 1000000,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 0,
+                "currency": "USD"
+            },
+            "costPerImage": {
+                "amount": 0,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Qwen3 Reranker",
+            "modelDescription": "Qwen3 document reranking model",
+            "contextLength": 32768,
+            "verifiable": false,
+            "isActive": true
+        }))
+        .unwrap(),
+    );
+    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    assert_eq!(updated.len(), 1, "Should have updated 1 model");
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    "Qwen/Qwen3-Reranker-0.6B".to_string()
 }
 
 /// Generate a minimal valid WAV audio file as base64

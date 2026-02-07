@@ -57,7 +57,10 @@ async fn test_record_chat_completion_usage() {
 
     // Verify id and created_at are present
     assert!(body["id"].is_string(), "id should be present");
-    assert!(body["created_at"].is_string(), "created_at should be present");
+    assert!(
+        body["created_at"].is_string(),
+        "created_at should be present"
+    );
 
     // Verify total_cost_display is human-readable
     assert!(
@@ -112,11 +115,20 @@ async fn test_record_image_generation_usage() {
 
     // Verify id and created_at are present
     assert!(body["id"].is_string(), "id should be present");
-    assert!(body["created_at"].is_string(), "created_at should be present");
+    assert!(
+        body["created_at"].is_string(),
+        "created_at should be present"
+    );
 
     // Image generation response should NOT contain token fields
-    assert!(body.get("input_tokens").is_none(), "input_tokens should not be in image_generation response");
-    assert!(body.get("output_tokens").is_none(), "output_tokens should not be in image_generation response");
+    assert!(
+        body.get("input_tokens").is_none(),
+        "input_tokens should not be in image_generation response"
+    );
+    assert!(
+        body.get("output_tokens").is_none(),
+        "output_tokens should not be in image_generation response"
+    );
 }
 
 /// Test that the optional `id` field is accepted and does not affect the response shape.

@@ -1151,10 +1151,7 @@ pub fn build_usage_recording_routes(
     rate_limit_state: middleware::RateLimitState,
 ) -> Router {
     Router::new()
-        .route(
-            "/usage",
-            post(crate::routes::usage::record_usage),
-        )
+        .route("/usage", post(crate::routes::usage::record_usage))
         .with_state(app_state)
         .layer(from_fn_with_state(
             usage_state,

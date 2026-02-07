@@ -7,8 +7,7 @@ use crate::{
     },
     usage::{
         CostBreakdown, OrganizationBalanceInfo, OrganizationLimit, RecordUsageApiRequest,
-        RecordUsageServiceRequest, UsageCheckResult, UsageError, UsageLogEntry,
-        UsageServiceTrait,
+        RecordUsageServiceRequest, UsageCheckResult, UsageError, UsageLogEntry, UsageServiceTrait,
     },
 };
 use async_trait::async_trait;
@@ -132,9 +131,7 @@ impl UsageServiceTrait for MockUsageService {
                 "chat_completion".to_string(),
             ),
             RecordUsageApiRequest::ImageGeneration {
-                model,
-                image_count,
-                ..
+                model, image_count, ..
             } => (
                 model.clone(),
                 0,
@@ -308,9 +305,7 @@ impl UsageServiceTrait for CapturingUsageService {
                 "chat_completion".to_string(),
             ),
             RecordUsageApiRequest::ImageGeneration {
-                model,
-                image_count,
-                ..
+                model, image_count, ..
             } => (
                 model.clone(),
                 0,

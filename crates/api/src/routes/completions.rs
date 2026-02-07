@@ -68,7 +68,11 @@ async fn record_usage_with_sync_fallback(
     let organization_id = request.organization_id;
     let timeout_duration = Duration::from_secs(USAGE_RECORDING_TIMEOUT_SECS);
 
-    match tokio::time::timeout(timeout_duration, usage_service.record_usage(request.clone())).await
+    match tokio::time::timeout(
+        timeout_duration,
+        usage_service.record_usage(request.clone()),
+    )
+    .await
     {
         Ok(Ok(_)) => {
             tracing::debug!(
@@ -958,12 +962,7 @@ pub async fn image_generations(
                 image_count,
                 "image_generation",
             );
-            record_usage_with_sync_fallback(
-                usage_service,
-                usage_request,
-                "Image generation",
-            )
-            .await;
+            record_usage_with_sync_fallback(usage_service, usage_request, "Image generation").await;
 
             // Return the exact bytes from the provider for hash verification
             // This ensures clients can hash the response and compare with attestation endpoints
@@ -1348,12 +1347,7 @@ pub async fn image_edits(
                 image_count,
                 "image_edit",
             );
-            record_usage_with_sync_fallback(
-                usage_service,
-                usage_request,
-                "Image edit",
-            )
-            .await;
+            record_usage_with_sync_fallback(usage_service, usage_request, "Image edit").await;
 
             // Return the exact bytes from the provider for hash verification
             // This ensures clients can hash the response and compare with attestation endpoints

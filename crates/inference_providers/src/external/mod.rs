@@ -29,11 +29,13 @@ pub mod gemini;
 pub mod openai_compatible;
 
 use crate::{
-    AttestationError, ChatCompletionParams, ChatCompletionResponseWithBytes, ChatSignature,
-    CompletionError, CompletionParams, ImageEditError, ImageEditParams, ImageEditResponseWithBytes,
-    ImageGenerationError, ImageGenerationParams, ImageGenerationResponseWithBytes,
-    InferenceProvider, ListModelsError, ModelsResponse, RerankError, RerankParams, RerankResponse,
-    ScoreError, ScoreParams, ScoreResponse, StreamingResult,
+    AttestationError, AudioTranscriptionError, AudioTranscriptionParams,
+    AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponseWithBytes,
+    ChatSignature, CompletionError, CompletionParams, ImageEditError, ImageEditParams,
+    ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponseWithBytes, InferenceProvider, ListModelsError, ModelsResponse,
+    RerankError, RerankParams, RerankResponse, ScoreError, ScoreParams, ScoreResponse,
+    StreamingResult,
 };
 use async_trait::async_trait;
 use backend::{BackendConfig, ExternalBackend};
@@ -297,6 +299,21 @@ impl InferenceProvider for ExternalProvider {
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
         self.backend
             .image_generation(&self.config, &self.model_name, params)
+            .await
+    }
+
+    /// Audio transcription via external provider
+    ///
+    /// Delegates to the backend implementation. Supported by:
+    /// - OpenAI-compatible backends (Whisper, etc.)
+    /// - Not supported by Anthropic or Gemini (will return error)
+    async fn audio_transcription(
+        &self,
+        params: AudioTranscriptionParams,
+        _request_hash: String,
+    ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
+        self.backend
+            .audio_transcription(&self.config, &self.model_name, params)
             .await
     }
 

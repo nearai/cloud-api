@@ -112,6 +112,19 @@ impl UsageServiceTrait for UsageServiceImpl {
                     })?;
                 (0, image_cost, image_cost)
             }
+            ports::InferenceType::AudioTranscription => {
+                // For audio transcription: bill by duration in seconds (stored in input_tokens)
+                // input_tokens contains the audio duration rounded up to nearest second
+                let duration_cost = (request.input_tokens as i64)
+                    .checked_mul(model.input_cost_per_token)
+                    .ok_or_else(|| {
+                        UsageError::CostCalculationOverflow(format!(
+                            "Audio transcription cost calculation overflow: {} seconds * {} cost_per_token",
+                            request.input_tokens, model.input_cost_per_token
+                        ))
+                    })?;
+                (duration_cost, 0, duration_cost)
+            }
             ports::InferenceType::Rerank => {
                 // For rerank: use input tokens as the billing unit
                 // Rerank models should set their input_cost_per_token appropriately for the billing model

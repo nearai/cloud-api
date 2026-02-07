@@ -2,6 +2,7 @@ use crate::common::encryption_headers;
 use config::ExternalProvidersConfig;
 use inference_providers::{
     models::{AttestationError, CompletionError, ListModelsError, ModelsResponse},
+    AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
     ChatCompletionParams, ExternalProvider, ExternalProviderConfig, ImageEditError,
     ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
     ImageGenerationResponseWithBytes, InferenceProvider, ProviderConfig, RerankError, RerankParams,
@@ -1175,6 +1176,48 @@ impl InferenceProviderPool {
             "Storing chat_id mapping for image generation"
         );
         self.store_chat_id_mapping(image_id, provider).await;
+
+        Ok(response)
+    }
+
+    pub async fn audio_transcription(
+        &self,
+        params: AudioTranscriptionParams,
+        request_hash: String,
+    ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
+        let model_id = params.model.clone();
+        let file_size_kb = params.file_bytes.len() / 1024;
+
+        tracing::debug!(
+            model = %model_id,
+            filename = %params.filename,
+            file_size_kb = file_size_kb,
+            "Starting audio transcription request"
+        );
+
+        let (response, _provider) = self
+            .retry_with_fallback(&model_id, "audio_transcription", None, |provider| {
+                let params = params.clone();
+                let request_hash = request_hash.clone();
+                async move {
+                    provider
+                        .audio_transcription(params, request_hash)
+                        .await
+                        .map_err(|e| CompletionError::CompletionError(e.to_string()))
+                }
+            })
+            .await
+            .map_err(|e| {
+                AudioTranscriptionError::TranscriptionError(Self::sanitize_error_message(
+                    &e.to_string(),
+                ))
+            })?;
+
+        tracing::info!(
+            model = %model_id,
+            duration = ?response.duration,
+            "Audio transcription completed successfully"
+        );
 
         Ok(response)
     }

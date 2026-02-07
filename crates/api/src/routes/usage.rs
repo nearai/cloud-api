@@ -602,7 +602,7 @@ pub async fn record_usage(
 
     // Remember the request variant before moving it into the service call
     let is_image = matches!(
-        request,
+        &request,
         services::usage::RecordUsageApiRequest::ImageGeneration { .. }
     );
 

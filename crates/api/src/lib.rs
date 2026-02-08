@@ -1143,7 +1143,8 @@ pub fn build_billing_routes(
         ))
 }
 
-/// Build usage recording routes with auth and usage check
+/// Build usage recording routes with auth, rate limiting, and usage check.
+/// No body_hash_middleware — attestation/signing is not applicable to usage records.
 pub fn build_usage_recording_routes(
     app_state: AppState,
     auth_state_middleware: &AuthState,
@@ -1165,7 +1166,6 @@ pub fn build_usage_recording_routes(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
-        .layer(from_fn(middleware::body_hash_middleware))
 }
 
 pub fn build_model_routes(models_service: Arc<dyn ModelsServiceTrait>) -> Router {

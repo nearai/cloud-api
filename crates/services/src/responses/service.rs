@@ -23,7 +23,7 @@ enum AgentLoopResult {
     /// Agent loop paused due to MCP approval required
     ApprovalRequired,
     /// Agent loop paused due to external function calls requiring client execution
-    FunctionCallsRequired(Vec<tools::FunctionCallInfo>),
+    FunctionCallsRequired,
 }
 
 /// Context for processing a response stream
@@ -147,6 +147,19 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
     > {
         use futures::channel::mpsc;
         use futures::SinkExt;
+
+        // Validate: function_call_output items require a previous_response_id
+        let has_function_outputs = match &request.input {
+            Some(models::ResponseInput::Items(items)) => {
+                items.iter().any(|item| item.is_function_call_output())
+            }
+            _ => false,
+        };
+        if has_function_outputs && request.previous_response_id.is_none() {
+            return Err(errors::ResponseError::FunctionCallNotFound(
+                "function_call_output requires previous_response_id".to_string(),
+            ));
+        }
 
         // Create a channel for streaming events
         let (mut tx, rx) = mpsc::unbounded::<models::ResponseStreamEvent>();
@@ -941,7 +954,7 @@ impl ResponseServiceImpl {
                     reason: "mcp_approval_required".to_string(),
                 }),
             ),
-            Ok(AgentLoopResult::FunctionCallsRequired(_)) => (
+            Ok(AgentLoopResult::FunctionCallsRequired) => (
                 models::ResponseStatus::Incomplete,
                 Some(models::ResponseIncompleteDetails {
                     reason: "function_call_required".to_string(),
@@ -1283,9 +1296,7 @@ impl ResponseServiceImpl {
                         tool_calls: None,
                     });
                 }
-                return Ok(AgentLoopResult::FunctionCallsRequired(
-                    pending_function_calls,
-                ));
+                return Ok(AgentLoopResult::FunctionCallsRequired);
             }
 
             // Add deferred instructions AFTER all tool results (combined into one system message)
@@ -1524,50 +1535,43 @@ impl ResponseServiceImpl {
             return Ok(messages);
         }
 
-        // Process each function call output
+        // Function call outputs require a previous_response_id so we can verify
+        // the call_id matches a real FunctionCall from that response.
+        let prev_response_id = request.previous_response_id.as_ref().ok_or_else(|| {
+            errors::ResponseError::FunctionCallNotFound(
+                "function_call_output requires previous_response_id".to_string(),
+            )
+        })?;
+
+        let uuid_str = prev_response_id
+            .strip_prefix(crate::id_prefixes::PREFIX_RESP)
+            .unwrap_or(prev_response_id);
+
+        let response_uuid = uuid::Uuid::parse_str(uuid_str).map_err(|e| {
+            errors::ResponseError::FunctionCallNotFound(format!(
+                "invalid previous_response_id: {e}"
+            ))
+        })?;
+
+        let prev_items = response_items_repository
+            .list_by_response(models::ResponseId(response_uuid))
+            .await
+            .map_err(|e| {
+                errors::ResponseError::InternalError(format!("Failed to fetch response items: {e}"))
+            })?;
+
         for (call_id, output) in function_outputs {
-            // Look up the FunctionCall item by call_id to verify it exists
-            // The call_id is the LLM's tool_call_id (e.g., "call_xxx")
-            // We need to find the FunctionCall item that has this call_id
+            let found = prev_items.iter().any(|item| {
+                matches!(item, models::ResponseOutputItem::FunctionCall {
+                    call_id: item_call_id,
+                    ..
+                } if item_call_id == call_id)
+            });
 
-            // For now, we trust the client-provided call_id and create the tool result
-            // In a more robust implementation, we could look up the FunctionCall item
-            // to verify the call_id and get additional context
-
-            // Optionally verify the function call exists in previous response
-            if let Some(prev_response_id) = &request.previous_response_id {
-                // Parse the response ID
-                let uuid_str = prev_response_id
-                    .strip_prefix(crate::id_prefixes::PREFIX_RESP)
-                    .unwrap_or(prev_response_id);
-
-                if let Ok(uuid) = uuid::Uuid::parse_str(uuid_str) {
-                    let response_id = models::ResponseId(uuid);
-
-                    // List all items from the previous response
-                    let items = response_items_repository
-                        .list_by_response(response_id)
-                        .await
-                        .map_err(|e| {
-                            errors::ResponseError::InternalError(format!(
-                                "Failed to fetch response items: {e}"
-                            ))
-                        })?;
-
-                    // Find the matching FunctionCall item
-                    let found = items.iter().any(|item| {
-                        matches!(item, models::ResponseOutputItem::FunctionCall {
-                            call_id: item_call_id,
-                            ..
-                        } if item_call_id == call_id)
-                    });
-
-                    if !found {
-                        return Err(errors::ResponseError::FunctionCallNotFound(
-                            call_id.to_string(),
-                        ));
-                    }
-                }
+            if !found {
+                return Err(errors::ResponseError::FunctionCallNotFound(
+                    call_id.to_string(),
+                ));
             }
 
             // Create tool result message with the function output
@@ -1643,8 +1647,27 @@ impl ResponseServiceImpl {
                         models::ResponseInputItem::McpListTools { .. } => {
                             continue;
                         }
-                        models::ResponseInputItem::FunctionCallOutput { .. } => {
-                            // Function call outputs are processed separately
+                        models::ResponseInputItem::FunctionCallOutput {
+                            call_id, output, ..
+                        } => {
+                            // Store function call output as a response item for conversation history
+                            let fco_item = models::ResponseOutputItem::FunctionCallOutput {
+                                id: format!("fco_{}", uuid::Uuid::new_v4().simple()),
+                                response_id: String::new(),
+                                previous_response_id: None,
+                                next_response_ids: vec![],
+                                created_at: 0,
+                                call_id: call_id.clone(),
+                                output: output.clone(),
+                            };
+                            response_items_repository
+                                .create(response_id.clone(), api_key_id, conversation_id, fco_item)
+                                .await
+                                .map_err(|e| {
+                                    errors::ResponseError::InternalError(format!(
+                                        "Failed to store function call output: {e}"
+                                    ))
+                                })?;
                             continue;
                         }
                     };
@@ -1844,70 +1867,237 @@ impl ResponseServiceImpl {
             let conversation_items =
                 Self::filter_to_ancestor_branch(conversation_items, &request.previous_response_id);
 
-            // Convert response items to completion messages
+            // Convert response items to completion messages.
+            //
+            // Items come in chronological order. We need to reconstruct the full
+            // message history including assistant messages with tool_calls and
+            // tool result messages. The structure LLM providers expect is:
+            //
+            //   [user] -> [assistant with tool_calls] -> [tool results...] -> [assistant]
+            //
+            // FunctionCall/McpCall/ToolCall items from the same response represent
+            // tool_calls on a single assistant message. We collect them and emit the
+            // assistant message when we encounter the next non-tool-call item (or
+            // reach the end of items).
             let messages_before = messages.len();
-            for item in conversation_items {
-                if let models::ResponseOutputItem::Message { role, content, .. } = item {
-                    // Extract text from content parts (handles InputText, OutputText, and InputFile)
-                    let mut text_parts = Vec::new();
 
-                    type ContentFuture = std::pin::Pin<
-                        Box<
-                            dyn std::future::Future<Output = Result<String, errors::ResponseError>>
-                                + Send,
-                        >,
-                    >;
-                    let mut results: Vec<ContentFuture> = Vec::new();
+            // Accumulator for consecutive tool call items from the same response
+            let mut pending_tool_calls: Vec<crate::completions::ports::CompletionToolCall> =
+                Vec::new();
+            let mut pending_tool_calls_response_id: Option<String> = None;
 
-                    for part in &content {
-                        match part {
-                            models::ResponseContentItem::InputText { text } => {
-                                results.push(Box::pin(futures::future::ready(Ok(text.clone()))));
-                            }
-                            models::ResponseContentItem::OutputText { text, .. } => {
-                                results.push(Box::pin(futures::future::ready(Ok(text.clone()))));
-                            }
-                            models::ResponseContentItem::InputFile { file_id, .. } => {
-                                // Process input file and add to context
-                                let file_id = file_id.clone();
-                                let workspace_id = workspace_id.0;
-                                let file_service = file_service.clone();
-                                results.push(Box::pin(async move {
-                                    Self::process_input_file(&file_id, workspace_id, &file_service)
-                                        .await
-                                }));
-                            }
-                            _ => {
-                                // Skip other content types for now (images, etc.)
-                            }
-                        }
-                    }
-
-                    for result in futures::future::join_all(results).await {
-                        match result {
-                            Ok(text) => {
-                                text_parts.push(text);
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to process content part: {}", e);
-                            }
-                        }
-                    }
-
-                    let text = text_parts.join("\n");
-
-                    if !text.is_empty() {
-                        messages.push(CompletionMessage {
-                            role: role.clone(),
-                            content: text,
+            // Helper closure: flush pending tool calls as an assistant message
+            let flush_tool_calls =
+                |pending: &mut Vec<crate::completions::ports::CompletionToolCall>,
+                 pending_resp_id: &mut Option<String>,
+                 msgs: &mut Vec<CompletionMessage>| {
+                    if !pending.is_empty() {
+                        msgs.push(CompletionMessage {
+                            role: "assistant".to_string(),
+                            content: String::new(),
                             tool_call_id: None,
+                            tool_calls: Some(std::mem::take(pending)),
+                        });
+                        *pending_resp_id = None;
+                    }
+                };
+
+            for item in conversation_items {
+                match item {
+                    models::ResponseOutputItem::Message { role, content, .. } => {
+                        // Flush any pending tool calls before processing this message
+                        flush_tool_calls(
+                            &mut pending_tool_calls,
+                            &mut pending_tool_calls_response_id,
+                            &mut messages,
+                        );
+
+                        // Extract text from content parts
+                        let mut text_parts = Vec::new();
+
+                        type ContentFuture = std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<
+                                        Output = Result<String, errors::ResponseError>,
+                                    > + Send,
+                            >,
+                        >;
+                        let mut results: Vec<ContentFuture> = Vec::new();
+
+                        for part in &content {
+                            match part {
+                                models::ResponseContentItem::InputText { text } => {
+                                    results
+                                        .push(Box::pin(futures::future::ready(Ok(text.clone()))));
+                                }
+                                models::ResponseContentItem::OutputText { text, .. } => {
+                                    results
+                                        .push(Box::pin(futures::future::ready(Ok(text.clone()))));
+                                }
+                                models::ResponseContentItem::InputFile { file_id, .. } => {
+                                    let file_id = file_id.clone();
+                                    let workspace_id = workspace_id.0;
+                                    let file_service = file_service.clone();
+                                    results.push(Box::pin(async move {
+                                        Self::process_input_file(
+                                            &file_id,
+                                            workspace_id,
+                                            &file_service,
+                                        )
+                                        .await
+                                    }));
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        for result in futures::future::join_all(results).await {
+                            match result {
+                                Ok(text) => text_parts.push(text),
+                                Err(e) => {
+                                    tracing::error!("Failed to process content part: {}", e);
+                                }
+                            }
+                        }
+
+                        let text = text_parts.join("\n");
+                        if !text.is_empty() {
+                            messages.push(CompletionMessage {
+                                role: role.clone(),
+                                content: text,
+                                tool_call_id: None,
+                                tool_calls: None,
+                            });
+                        }
+                    }
+                    models::ResponseOutputItem::FunctionCall {
+                        response_id,
+                        call_id,
+                        name,
+                        arguments,
+                        ..
+                    } => {
+                        // If this is from a different response than pending, flush first
+                        if pending_tool_calls_response_id.as_ref() != Some(&response_id)
+                            && !pending_tool_calls.is_empty()
+                        {
+                            flush_tool_calls(
+                                &mut pending_tool_calls,
+                                &mut pending_tool_calls_response_id,
+                                &mut messages,
+                            );
+                        }
+                        pending_tool_calls_response_id = Some(response_id);
+                        pending_tool_calls.push(crate::completions::ports::CompletionToolCall {
+                            id: call_id,
+                            name,
+                            arguments,
+                            thought_signature: None,
+                        });
+                    }
+                    models::ResponseOutputItem::FunctionCallOutput {
+                        call_id, output, ..
+                    } => {
+                        // Flush pending tool calls first (the assistant message must precede tool results)
+                        flush_tool_calls(
+                            &mut pending_tool_calls,
+                            &mut pending_tool_calls_response_id,
+                            &mut messages,
+                        );
+                        messages.push(CompletionMessage {
+                            role: "tool".to_string(),
+                            content: output,
+                            tool_call_id: Some(call_id),
                             tool_calls: None,
                         });
                     }
+                    models::ResponseOutputItem::McpCall {
+                        response_id,
+                        name,
+                        arguments,
+                        output,
+                        id,
+                        ..
+                    } => {
+                        // MCP calls are server-executed: both the tool_call and result are stored.
+                        // If this has output, we emit an assistant message with a tool_call and
+                        // a tool result message. If no output (pending approval), skip.
+                        if let Some(tool_output) = output {
+                            // If from a different response, flush first
+                            if pending_tool_calls_response_id.as_ref() != Some(&response_id)
+                                && !pending_tool_calls.is_empty()
+                            {
+                                flush_tool_calls(
+                                    &mut pending_tool_calls,
+                                    &mut pending_tool_calls_response_id,
+                                    &mut messages,
+                                );
+                            }
+
+                            // Use the item id as the tool_call_id for correlation
+                            let tool_call_id = id;
+                            pending_tool_calls_response_id = Some(response_id);
+                            pending_tool_calls.push(
+                                crate::completions::ports::CompletionToolCall {
+                                    id: tool_call_id.clone(),
+                                    name,
+                                    arguments,
+                                    thought_signature: None,
+                                },
+                            );
+
+                            // Immediately flush and add the tool result since we have it
+                            flush_tool_calls(
+                                &mut pending_tool_calls,
+                                &mut pending_tool_calls_response_id,
+                                &mut messages,
+                            );
+                            messages.push(CompletionMessage {
+                                role: "tool".to_string(),
+                                content: tool_output,
+                                tool_call_id: Some(tool_call_id),
+                                tool_calls: None,
+                            });
+                        }
+                    }
+                    models::ResponseOutputItem::ToolCall {
+                        response_id,
+                        id: tool_call_id,
+                        function,
+                        ..
+                    } => {
+                        // Reconstruct from the legacy ToolCall variant
+                        if pending_tool_calls_response_id.as_ref() != Some(&response_id)
+                            && !pending_tool_calls.is_empty()
+                        {
+                            flush_tool_calls(
+                                &mut pending_tool_calls,
+                                &mut pending_tool_calls_response_id,
+                                &mut messages,
+                            );
+                        }
+                        pending_tool_calls_response_id = Some(response_id);
+                        pending_tool_calls.push(crate::completions::ports::CompletionToolCall {
+                            id: tool_call_id,
+                            name: function.name,
+                            arguments: function.arguments,
+                            thought_signature: None,
+                        });
+                    }
+                    // Skip items that don't contribute to conversation context
+                    models::ResponseOutputItem::WebSearchCall { .. }
+                    | models::ResponseOutputItem::Reasoning { .. }
+                    | models::ResponseOutputItem::McpListTools { .. }
+                    | models::ResponseOutputItem::McpApprovalRequest { .. } => {}
                 }
-                // For now, we only process message items
-                // TODO: Handle other item types (tool calls, web searches, etc.) if needed
             }
+
+            // Flush any remaining pending tool calls at end of items
+            flush_tool_calls(
+                &mut pending_tool_calls,
+                &mut pending_tool_calls_response_id,
+                &mut messages,
+            );
 
             let loaded_count = messages.len() - messages_before;
             tracing::info!(

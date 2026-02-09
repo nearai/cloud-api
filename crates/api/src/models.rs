@@ -982,6 +982,23 @@ pub enum ResponseOutputItem {
         /// The model that requested this function call.
         model: String,
     },
+    /// Result of a client-executed function call.
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput {
+        id: String,
+        #[serde(default)]
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        #[serde(default)]
+        created_at: i64,
+        /// The call_id from the FunctionCall this is a response to.
+        call_id: String,
+        /// Result of the function execution.
+        output: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -1314,6 +1331,21 @@ pub enum ConversationItem {
         status: String,
         model: String,
     },
+    /// Result of a client-executed function call
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput {
+        id: String,
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        created_at: i64,
+        /// The call_id from the FunctionCall this is a response to
+        call_id: String,
+        /// Result of the function execution
+        output: String,
+    },
 }
 
 impl ConversationItem {
@@ -1328,6 +1360,7 @@ impl ConversationItem {
             ConversationItem::McpCall { id, .. } => id,
             ConversationItem::McpApprovalRequest { id, .. } => id,
             ConversationItem::FunctionCall { id, .. } => id,
+            ConversationItem::FunctionCallOutput { id, .. } => id,
         }
     }
 

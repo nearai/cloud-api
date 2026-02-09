@@ -1246,6 +1246,7 @@ async fn test_conversation_items_pagination() {
             ConversationItem::McpCall { id, .. } => id.clone(),
             ConversationItem::McpApprovalRequest { id, .. } => id.clone(),
             ConversationItem::FunctionCall { id, .. } => id.clone(),
+            ConversationItem::FunctionCallOutput { id, .. } => id.clone(),
         })
         .collect();
 
@@ -1892,6 +1893,9 @@ async fn test_conversation_items_include_response_metadata() {
             api::models::ConversationItem::WebSearchCall { created_at, .. } => Some(*created_at),
             api::models::ConversationItem::Reasoning { created_at, .. } => Some(*created_at),
             api::models::ConversationItem::FunctionCall { created_at, .. } => Some(*created_at),
+            api::models::ConversationItem::FunctionCallOutput { created_at, .. } => {
+                Some(*created_at)
+            }
             // MCP items don't have created_at field in the API model
             api::models::ConversationItem::McpListTools { .. } => None,
             api::models::ConversationItem::McpCall { .. } => None,
@@ -3141,6 +3145,10 @@ async fn test_conversation_items_include_model() {
             api::models::ConversationItem::McpApprovalRequest { id, .. } => {
                 println!("  McpApprovalRequest item {id}");
                 assert!(!id.is_empty(), "McpApprovalRequest id should not be empty");
+            }
+            api::models::ConversationItem::FunctionCallOutput { id, .. } => {
+                println!("  FunctionCallOutput item {id}");
+                assert!(!id.is_empty(), "FunctionCallOutput id should not be empty");
             }
         }
     }

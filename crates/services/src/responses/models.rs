@@ -613,6 +613,24 @@ pub enum ResponseOutputItem {
         status: String,
         model: String,
     },
+    /// Result of a client-executed function call.
+    /// Stored when the client submits a FunctionCallOutput input item.
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput {
+        id: String,
+        #[serde(default)]
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        #[serde(default)]
+        created_at: i64,
+        /// The call_id from the FunctionCall this is a response to
+        call_id: String,
+        /// Result of the function execution
+        output: String,
+    },
 }
 
 impl ResponseOutputItem {
@@ -627,6 +645,7 @@ impl ResponseOutputItem {
             ResponseOutputItem::McpCall { id, .. } => id,
             ResponseOutputItem::McpApprovalRequest { id, .. } => id,
             ResponseOutputItem::FunctionCall { id, .. } => id,
+            ResponseOutputItem::FunctionCallOutput { id, .. } => id,
         }
     }
 
@@ -641,6 +660,7 @@ impl ResponseOutputItem {
             ResponseOutputItem::McpCall { .. } => ResponseItemStatus::Completed,
             ResponseOutputItem::McpApprovalRequest { .. } => ResponseItemStatus::InProgress,
             ResponseOutputItem::FunctionCall { .. } => ResponseItemStatus::InProgress,
+            ResponseOutputItem::FunctionCallOutput { .. } => ResponseItemStatus::Completed,
         }
     }
 
@@ -655,6 +675,7 @@ impl ResponseOutputItem {
             ResponseOutputItem::McpCall { model, .. } => Some(model),
             ResponseOutputItem::McpApprovalRequest { model, .. } => Some(model),
             ResponseOutputItem::FunctionCall { model, .. } => Some(model),
+            ResponseOutputItem::FunctionCallOutput { .. } => None,
         }
     }
 
@@ -669,6 +690,7 @@ impl ResponseOutputItem {
             ResponseOutputItem::McpCall { response_id, .. } => Some(response_id),
             ResponseOutputItem::McpApprovalRequest { response_id, .. } => Some(response_id),
             ResponseOutputItem::FunctionCall { response_id, .. } => Some(response_id),
+            ResponseOutputItem::FunctionCallOutput { response_id, .. } => Some(response_id),
         }
     }
 
@@ -701,6 +723,10 @@ impl ResponseOutputItem {
                 ..
             } => previous_response_id.as_deref(),
             ResponseOutputItem::FunctionCall {
+                previous_response_id,
+                ..
+            } => previous_response_id.as_deref(),
+            ResponseOutputItem::FunctionCallOutput {
                 previous_response_id,
                 ..
             } => previous_response_id.as_deref(),

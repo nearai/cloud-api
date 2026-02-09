@@ -17,8 +17,8 @@ use crate::{
         },
         billing::{get_billing_costs, BillingRouteState},
         completions::{
-            audio_transcriptions, chat_completions, image_analyses, image_edits_json,
-            image_generations, models, rerank, score,
+            audio_transcriptions, chat_completions, image_edits_json, image_generations, models,
+            rerank, score,
         },
         conversations,
         health::health_check,
@@ -892,7 +892,6 @@ pub fn build_completion_routes(
     let text_inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
         .route("/images/generations", post(image_generations))
-        .route("/images/analyses", post(image_analyses))
         .route("/images/edits", post(image_edits_json))
         .route("/audio/transcriptions", post(audio_transcriptions))
         .route("/rerank", post(rerank))

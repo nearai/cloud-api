@@ -600,6 +600,7 @@ pub struct OrganizationUsageLog {
     pub response_id: Option<ResponseId>,
     /// Number of images generated (for image generation requests)
     pub image_count: Option<i32>,
+    pub was_inserted: bool,
 }
 
 /// Organization balance summary - cached aggregate spending

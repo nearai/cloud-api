@@ -108,6 +108,7 @@ impl UsageServiceTrait for MockUsageService {
             stop_reason: _request.stop_reason,
             response_id: _request.response_id,
             image_count: _request.image_count,
+            was_inserted: true,
         })
     }
 
@@ -163,6 +164,7 @@ impl UsageServiceTrait for MockUsageService {
             stop_reason: None,
             response_id: None,
             image_count,
+            was_inserted: true,
         })
     }
 
@@ -280,6 +282,7 @@ impl UsageServiceTrait for CapturingUsageService {
             stop_reason: request.stop_reason.clone(),
             response_id: request.response_id.clone(),
             image_count: request.image_count,
+            was_inserted: true,
         };
         self.requests.lock().unwrap().push(request);
         Ok(entry)
@@ -337,6 +340,7 @@ impl UsageServiceTrait for CapturingUsageService {
             stop_reason: None,
             response_id: None,
             image_count,
+            was_inserted: true,
         })
     }
 

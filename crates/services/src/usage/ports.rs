@@ -521,6 +521,12 @@ pub struct UsageLogEntry {
     pub response_id: Option<ResponseId>,
     /// Number of images generated (for image generation requests)
     pub image_count: Option<i32>,
+    /// True if this was a newly inserted record, false if it was a duplicate.
+    /// This flag is used internally to prevent double-counting cost metrics
+    /// when idempotent requests are retried with the same inference_id.
+    /// The database balance is correctly updated only for new inserts,
+    /// and this flag ensures metrics tracking follows the same pattern.
+    pub was_inserted: bool,
 }
 
 // ============================================

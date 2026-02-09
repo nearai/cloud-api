@@ -58,6 +58,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             stop_reason: log.stop_reason,
             response_id: log.response_id,
             image_count: log.image_count,
+            was_inserted: log.was_inserted,
         })
     }
 
@@ -116,6 +117,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 stop_reason: log.stop_reason,
                 response_id: log.response_id,
                 image_count: log.image_count,
+                was_inserted: true,
             })
             .collect();
 
@@ -161,6 +163,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 stop_reason: log.stop_reason,
                 response_id: log.response_id,
                 image_count: log.image_count,
+                was_inserted: true,
             })
             .collect();
 

@@ -53,7 +53,7 @@ impl OrganizationUsageRepository {
     /// same `(organization_id, inference_id)` skip the INSERT and balance update,
     /// returning the existing record instead.
     pub async fn record_usage(&self, request: RecordUsageRequest) -> Result<OrganizationUsageLog> {
-        let row = retry_db!("record_organization_usage", {
+        let result = retry_db!("record_organization_usage", {
             let mut client = self
                 .pool
                 .get()
@@ -112,7 +112,7 @@ impl OrganizationUsageRepository {
                 .await
                 .map_err(map_db_error)?;
 
-            let row = match maybe_row {
+            let (row, was_inserted) = match maybe_row {
                 Some(row) => {
                     // New insert succeeded — update organization balance
                     transaction
@@ -145,7 +145,7 @@ impl OrganizationUsageRepository {
                         .map_err(map_db_error)?;
 
                     transaction.commit().await.map_err(map_db_error)?;
-                    row
+                    (row, true)
                 }
                 None => {
                     // Duplicate — inference_id already exists for this org.
@@ -168,14 +168,15 @@ impl OrganizationUsageRepository {
                         )
                         .await
                         .map_err(map_db_error)?;
-                    existing
+                    (existing, false)
                 }
             };
 
-            Ok::<tokio_postgres::Row, RepositoryError>(row)
+            Ok::<(tokio_postgres::Row, bool), RepositoryError>((row, was_inserted))
         })?;
 
-        self.row_to_usage_log(&row)
+        let (row, was_inserted) = result;
+        self.row_to_usage_log(&row, was_inserted)
     }
 
     /// Get current balance for an organization
@@ -269,7 +270,9 @@ impl OrganizationUsageRepository {
                 .map_err(map_db_error)
         })?;
 
-        rows.iter().map(|row| self.row_to_usage_log(row)).collect()
+        rows.iter()
+            .map(|row| self.row_to_usage_log(row, true))
+            .collect()
     }
 
     /// Count total usage history records for an API key
@@ -336,7 +339,9 @@ impl OrganizationUsageRepository {
                 .map_err(map_db_error)
         })?;
 
-        rows.iter().map(|row| self.row_to_usage_log(row)).collect()
+        rows.iter()
+            .map(|row| self.row_to_usage_log(row, true))
+            .collect()
     }
 
     /// Get usage statistics for a time period
@@ -379,7 +384,7 @@ impl OrganizationUsageRepository {
         })
     }
 
-    fn row_to_usage_log(&self, row: &Row) -> Result<OrganizationUsageLog> {
+    fn row_to_usage_log(&self, row: &Row, was_inserted: bool) -> Result<OrganizationUsageLog> {
         // Parse stop_reason from string to enum
         let stop_reason_str: Option<String> = row.get("stop_reason");
         let stop_reason = stop_reason_str.as_deref().map(StopReason::parse);
@@ -410,6 +415,7 @@ impl OrganizationUsageRepository {
             stop_reason,
             response_id,
             image_count: row.get("image_count"),
+            was_inserted,
         })
     }
 

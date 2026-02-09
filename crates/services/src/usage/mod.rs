@@ -201,8 +201,9 @@ impl UsageServiceTrait for UsageServiceImpl {
             .await
             .map_err(|e| UsageError::InternalError(format!("Failed to record usage: {e}")))?;
 
-        // Record cost metric (low-cardinality: model + environment only)
-        if total_cost > 0 {
+        // Record cost metric ONLY for new inserts (not duplicates)
+        // This prevents metric inflation when idempotent requests are retried
+        if log.was_inserted && total_cost > 0 {
             let environment = get_environment();
             let tags = [
                 format!("{}:{}", TAG_MODEL, model.model_name),
@@ -211,6 +212,13 @@ impl UsageServiceTrait for UsageServiceImpl {
             let tags_str: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
             self.metrics_service
                 .record_count(METRIC_COST_USD, total_cost, &tags_str);
+        } else if !log.was_inserted {
+            // Log when we skip metrics for a duplicate (aids debugging)
+            tracing::debug!(
+                organization_id = %log.organization_id,
+                inference_id = ?log.inference_id,
+                "Skipping metrics recording for duplicate usage record"
+            );
         }
 
         Ok(log)

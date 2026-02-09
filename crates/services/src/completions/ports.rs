@@ -136,6 +136,16 @@ pub trait CompletionServiceTrait: Send + Sync {
         request: CompletionRequest,
     ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError>;
 
+    /// Execute an audio transcription request with concurrent request limiting
+    async fn audio_transcription(
+        &self,
+        organization_id: uuid::Uuid,
+        model_id: uuid::Uuid,
+        model_name: &str,
+        params: inference_providers::AudioTranscriptionParams,
+        request_hash: String,
+    ) -> Result<inference_providers::AudioTranscriptionResponse, CompletionError>;
+
     /// Execute a rerank request with proper concurrent request limiting.
     ///
     /// Each organization has a per-model concurrent request limit (default: 64).

@@ -20,6 +20,7 @@ use utoipa::{Modify, OpenApi};
     tags(
         (name = "Chat", description = "Chat completion endpoints for AI model inference"),
         (name = "Images", description = "Image generation endpoints"),
+        (name = "Audio", description = "Audio transcription endpoints"),
         (name = "Rerank", description = "Document reranking endpoints"),
         (name = "Score", description = "Text similarity scoring endpoints"),
         (name = "Models", description = "Public model catalog and information"),
@@ -41,6 +42,7 @@ use utoipa::{Modify, OpenApi};
         // Chat completion endpoints (most important for users)
         crate::routes::completions::chat_completions,
         crate::routes::completions::image_generations,
+        crate::routes::completions::audio_transcriptions,
         crate::routes::completions::image_edits,
         crate::routes::completions::rerank,
         crate::routes::completions::score,
@@ -146,6 +148,8 @@ use utoipa::{Modify, OpenApi};
             CompletionRequest, ModelsResponse, ModelInfo, ModelPricing, ErrorResponse,
             // Image generation models
             ImageGenerationRequest, ImageGenerationResponse, ImageData,
+            // Audio transcription models
+            AudioTranscriptionRequestSchema, AudioTranscriptionResponse, TranscriptionSegment, TranscriptionWord,
             // Image edit models
             ImageEditRequestSchema,
             // Rerank models

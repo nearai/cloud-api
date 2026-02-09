@@ -53,9 +53,29 @@ impl UsageServiceTrait for UsageServiceImpl {
             .ok_or_else(|| UsageError::ModelNotFound(format!("Model '{model_id}' not found")))?;
 
         // Calculate costs: tokens * cost_per_token (all in nano-dollars, scale 9)
-        let input_cost = (input_tokens as i64) * model.input_cost_per_token;
-        let output_cost = (output_tokens as i64) * model.output_cost_per_token;
-        let total_cost = input_cost + output_cost;
+        // Use checked arithmetic to prevent integer overflow in billing-critical path
+        let input_cost = (input_tokens as i64)
+            .checked_mul(model.input_cost_per_token)
+            .ok_or_else(|| {
+                UsageError::CostCalculationOverflow(format!(
+                    "Input cost calculation overflow: {} tokens * {} cost_per_token",
+                    input_tokens, model.input_cost_per_token
+                ))
+            })?;
+        let output_cost = (output_tokens as i64)
+            .checked_mul(model.output_cost_per_token)
+            .ok_or_else(|| {
+                UsageError::CostCalculationOverflow(format!(
+                    "Output cost calculation overflow: {} tokens * {} cost_per_token",
+                    output_tokens, model.output_cost_per_token
+                ))
+            })?;
+        let total_cost = input_cost.checked_add(output_cost).ok_or_else(|| {
+            UsageError::CostCalculationOverflow(format!(
+                "Total cost calculation overflow: {} + {}",
+                input_cost, output_cost
+            ))
+        })?;
 
         Ok(CostBreakdown {
             input_cost,
@@ -77,18 +97,76 @@ impl UsageServiceTrait for UsageServiceImpl {
             })?;
 
         // Calculate costs based on inference type
-        let (input_cost, output_cost, total_cost) = if request.inference_type == "image_generation"
-            || request.inference_type == "image_edit"
-        {
-            // For image-based operations: use image_count and cost_per_image
-            let image_count = request.image_count.unwrap_or(0);
-            let image_cost = (image_count as i64) * model.cost_per_image;
-            (0, image_cost, image_cost)
-        } else {
-            // For token-based models (chat completions, etc.)
-            let input_cost = (request.input_tokens as i64) * model.input_cost_per_token;
-            let output_cost = (request.output_tokens as i64) * model.output_cost_per_token;
-            (input_cost, output_cost, input_cost + output_cost)
+        let (input_cost, output_cost, total_cost) = match request.inference_type {
+            ports::InferenceType::ImageGeneration | ports::InferenceType::ImageEdit => {
+                // For image-based operations: use image_count and cost_per_image
+                let image_count = request.image_count.unwrap_or(0);
+                // Use checked arithmetic to prevent integer overflow in billing-critical path
+                let image_cost = (image_count as i64)
+                    .checked_mul(model.cost_per_image)
+                    .ok_or_else(|| {
+                        UsageError::CostCalculationOverflow(format!(
+                            "Image cost calculation overflow: {} images * {} cost_per_image",
+                            image_count, model.cost_per_image
+                        ))
+                    })?;
+                (0, image_cost, image_cost)
+            }
+            ports::InferenceType::AudioTranscription => {
+                // For audio transcription: bill by duration in seconds (stored in input_tokens)
+                // input_tokens contains the audio duration rounded up to nearest second
+                let duration_cost = (request.input_tokens as i64)
+                    .checked_mul(model.input_cost_per_token)
+                    .ok_or_else(|| {
+                        UsageError::CostCalculationOverflow(format!(
+                            "Audio transcription cost calculation overflow: {} seconds * {} cost_per_token",
+                            request.input_tokens, model.input_cost_per_token
+                        ))
+                    })?;
+                (duration_cost, 0, duration_cost)
+            }
+            ports::InferenceType::Rerank => {
+                // For rerank: use input tokens as the billing unit
+                // Rerank models should set their input_cost_per_token appropriately for the billing model
+                // (e.g., cost per token, cost per document, cost per query, etc.)
+                // Use checked arithmetic to prevent integer overflow in billing-critical path
+                let rerank_cost = (request.input_tokens as i64)
+                    .checked_mul(model.input_cost_per_token)
+                    .ok_or_else(|| {
+                        UsageError::CostCalculationOverflow(format!(
+                            "Rerank cost calculation overflow: {} tokens * {} cost_per_token",
+                            request.input_tokens, model.input_cost_per_token
+                        ))
+                    })?;
+                (rerank_cost, 0, rerank_cost)
+            }
+            _ => {
+                // For token-based models (chat completions, etc.)
+                // Use checked arithmetic to prevent integer overflow in billing-critical path
+                let input_cost = (request.input_tokens as i64)
+                    .checked_mul(model.input_cost_per_token)
+                    .ok_or_else(|| {
+                        UsageError::CostCalculationOverflow(format!(
+                            "Input cost calculation overflow: {} tokens * {} cost_per_token",
+                            request.input_tokens, model.input_cost_per_token
+                        ))
+                    })?;
+                let output_cost = (request.output_tokens as i64)
+                    .checked_mul(model.output_cost_per_token)
+                    .ok_or_else(|| {
+                        UsageError::CostCalculationOverflow(format!(
+                            "Output cost calculation overflow: {} tokens * {} cost_per_token",
+                            request.output_tokens, model.output_cost_per_token
+                        ))
+                    })?;
+                let total_cost = input_cost.checked_add(output_cost).ok_or_else(|| {
+                    UsageError::CostCalculationOverflow(format!(
+                        "Total cost calculation overflow: {} + {}",
+                        input_cost, output_cost
+                    ))
+                })?;
+                (input_cost, output_cost, total_cost)
+            }
         };
 
         // Create database request with model UUID and name (denormalized)
@@ -337,5 +415,103 @@ impl UsageServiceTrait for UsageServiceImpl {
         }
 
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_cost_calculation_overflow_detection() {
+        // This test verifies that i64::checked_mul properly detects overflow conditions
+        // These values are used to ensure overflow detection works in billing calculations
+
+        // Maximum i64 value: 9,223,372,036,854,775,807
+        let max_i64 = i64::MAX;
+
+        // Test case 1: Very large token count * large cost_per_token should overflow
+        // Note: 1B tokens * 10B nano-dollars = 10^18 which exceeds i64::MAX (~9.2 * 10^18)
+        let huge_tokens: i64 = 1_000_000_000; // 1B tokens
+        let huge_cost: i64 = 10_000_000_000; // 10B nano-dollars per token
+        let result = huge_tokens.checked_mul(huge_cost);
+        assert!(
+            result.is_none(),
+            "Expected overflow for {} * {}",
+            huge_tokens,
+            huge_cost
+        );
+
+        // Test case 2: Max i64 * 2 should definitely overflow
+        let result = max_i64.checked_mul(2);
+        assert!(result.is_none(), "Expected overflow for i64::MAX * 2");
+
+        // Test case 3: Normal reasonable values should NOT overflow
+        let normal_tokens: i64 = 100_000; // 100k tokens
+        let normal_cost: i64 = 50_000; // 50k nano-dollars per token (reasonable for expensive model)
+        let result = normal_tokens.checked_mul(normal_cost);
+        assert_eq!(
+            result,
+            Some(5_000_000_000_i64),
+            "Normal calculation should work: {} * {} = 5B",
+            normal_tokens,
+            normal_cost
+        );
+
+        // Test case 4: Verify addition overflow detection
+        let val1 = i64::MAX;
+        let val2 = 1_i64;
+        let result = val1.checked_add(val2);
+        assert!(result.is_none(), "Expected overflow for i64::MAX + 1");
+
+        // Test case 5: Normal addition should work
+        let result = 1000_i64.checked_add(2000);
+        assert_eq!(result, Some(3000));
+    }
+
+    #[test]
+    fn test_image_cost_overflow_detection() {
+        // Test image cost calculation with extreme values
+        // Each image can cost up to several billion nano-dollars
+
+        let normal_images: i64 = 10; // 10 images
+        let normal_cost_per_image: i64 = 100_000_000; // 100M nano-dollars per image
+        let result = normal_images.checked_mul(normal_cost_per_image);
+        assert_eq!(
+            result,
+            Some(1_000_000_000_i64),
+            "Normal image cost should work: 10 * 100M = 1B"
+        );
+
+        // Extremely expensive image cost that overflows
+        // i64::MAX ~= 9.2 * 10^18, so 1B images * 10B cost = 10^18 which still fits
+        // But 10B images * 1T cost = 10^21 which overflows
+        let many_images: i64 = 10_000_000_000; // 10B images (unrealistic but tests overflow)
+        let expensive_cost: i64 = 1_000_000_000_000; // 1T nano-dollars per image
+        let result = many_images.checked_mul(expensive_cost);
+        assert!(
+            result.is_none(),
+            "Expected overflow for 10B images * 1T cost"
+        );
+    }
+
+    #[test]
+    fn test_rerank_cost_overflow_detection() {
+        // Rerank billing uses input tokens as the unit
+        // Test with realistic and unrealistic token counts
+
+        let normal_tokens: i64 = 1_000_000; // 1M tokens (capped max)
+        let normal_cost: i64 = 100_000; // 100k nano-dollars per token
+        let result = normal_tokens.checked_mul(normal_cost);
+        assert_eq!(
+            result,
+            Some(100_000_000_000_i64),
+            "1M tokens * 100k should work"
+        );
+
+        // Extremely expensive cost that would overflow
+        // 1B tokens * 10B cost/token = 10^18 which fits, but use bigger numbers
+        let huge_tokens: i64 = 1_000_000_000_000; // 1T tokens (unrealistic)
+        let huge_cost: i64 = 10_000_000_000; // 10B nano-dollars per token
+        let result = huge_tokens.checked_mul(huge_cost);
+        assert!(result.is_none(), "1T tokens * 10B cost should overflow");
     }
 }

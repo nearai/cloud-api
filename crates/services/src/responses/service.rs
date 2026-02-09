@@ -883,6 +883,7 @@ impl ResponseServiceImpl {
                 conversation_id,
                 input,
                 &context.request.model,
+                context.request.metadata.as_ref(),
             )
             .await?;
         }
@@ -1725,6 +1726,7 @@ impl ResponseServiceImpl {
         conversation_id: Option<ConversationId>,
         input: &models::ResponseInput,
         model: &str,
+        request_metadata: Option<&serde_json::Value>,
     ) -> Result<(), errors::ResponseError> {
         match input {
             models::ResponseInput::Text(text) => {
@@ -1744,7 +1746,7 @@ impl ResponseServiceImpl {
                         text: trimmed_text.to_string(),
                     }],
                     model: model.to_string(),
-                    metadata: None,
+                    metadata: request_metadata.cloned(),
                 };
 
                 response_items_repository
@@ -1817,6 +1819,9 @@ impl ResponseServiceImpl {
                                 .collect()
                         }
                     };
+
+                    // Use item-level metadata if present, otherwise fall back to request metadata
+                    let metadata = metadata.or_else(|| request_metadata.cloned());
 
                     let message_item = models::ResponseOutputItem::Message {
                         id: format!("msg_{}", uuid::Uuid::new_v4().simple()),

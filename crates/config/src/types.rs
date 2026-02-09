@@ -125,15 +125,14 @@ impl ServerConfig {
 pub struct ModelDiscoveryConfig {
     pub discovery_server_url: String,
     pub api_key: Option<String>,
-    pub refresh_interval: i64,  // seconds
-    pub timeout: i64,           // seconds (for discovery requests)
-    pub inference_timeout: i64, // seconds (for model inference requests)
+    pub refresh_interval: i64, // seconds
+    pub timeout: i64,          // seconds (for discovery requests)
 }
 
 impl ModelDiscoveryConfig {
     /// Load from environment variables
     pub fn from_env() -> Result<Self, String> {
-        Ok(Self {
+        let config = Self {
             discovery_server_url: env::var("MODEL_DISCOVERY_SERVER_URL")
                 .map_err(|_| "MODEL_DISCOVERY_SERVER_URL not set")?,
             api_key: env::var("MODEL_DISCOVERY_API_KEY").ok(),
@@ -145,17 +144,36 @@ impl ModelDiscoveryConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30), // 30 seconds
-            inference_timeout: env::var("MODEL_INFERENCE_TIMEOUT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(300), // 5 minutes
-        })
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validate that all timeout values are positive
+    /// Called at startup to catch invalid configuration early
+    pub fn validate(&self) -> Result<(), String> {
+        if self.timeout <= 0 {
+            return Err(format!(
+                "MODEL_DISCOVERY_TIMEOUT must be positive (got: {}). \
+                 If set to 0 or negative, all discovery requests will timeout immediately.",
+                self.timeout
+            ));
+        }
+
+        if self.refresh_interval <= 0 {
+            return Err(format!(
+                "MODEL_DISCOVERY_REFRESH_INTERVAL must be positive (got: {})",
+                self.refresh_interval
+            ));
+        }
+
+        Ok(())
     }
 }
 
 impl Default for ModelDiscoveryConfig {
     fn default() -> Self {
-        Self {
+        let config = Self {
             discovery_server_url: env::var("MODEL_DISCOVERY_SERVER_URL")
                 .expect("MODEL_DISCOVERY_SERVER_URL environment variable is required"),
             api_key: env::var("MODEL_DISCOVERY_API_KEY").ok(),
@@ -167,11 +185,9 @@ impl Default for ModelDiscoveryConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30), // 30 seconds
-            inference_timeout: env::var("MODEL_INFERENCE_TIMEOUT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(300), // 5 minutes
-        }
+        };
+        config.validate().expect("Invalid ModelDiscoveryConfig");
+        config
     }
 }
 

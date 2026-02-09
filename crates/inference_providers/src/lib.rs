@@ -71,13 +71,16 @@ use tokio_stream::StreamExt;
 // Re-export commonly used types for convenience
 pub use mock::MockProvider;
 pub use models::{
-    AudioOutput, ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
+    AudioOutput, AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
+    ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionResponseWithBytes, ChatDelta, ChatMessage, ChatResponseMessage, ChatSignature,
     CompletionError, CompletionParams, FinishReason, FunctionChoice, FunctionDefinition, ImageData,
     ImageEditError, ImageEditParams, ImageEditResponse, ImageEditResponseWithBytes,
     ImageGenerationError, ImageGenerationParams, ImageGenerationResponse,
-    ImageGenerationResponseWithBytes, MessageRole, ModelInfo, StreamChunk, StreamOptions,
-    TokenUsage, ToolChoice, ToolDefinition,
+    ImageGenerationResponseWithBytes, MessageRole, ModelInfo, RerankError, RerankParams,
+    RerankResponse, RerankResult, RerankUsage, ScoreError, ScoreParams, ScoreResponse, ScoreResult,
+    ScoreUsage, StreamChunk, StreamOptions, TokenUsage, ToolChoice, ToolDefinition,
+    TranscriptionSegment, TranscriptionWord,
 };
 pub use sse_parser::{new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser};
 pub use vllm::{VLlmConfig, VLlmProvider};
@@ -168,6 +171,21 @@ pub trait InferenceProvider {
         request_hash: String,
     ) -> Result<ImageEditResponseWithBytes, ImageEditError>;
 
+    /// Performs a document reranking request
+    ///
+    /// Returns documents reranked by relevance to the provided query.
+    /// Returns scored and ranked results.
+    /// Performs a text similarity scoring request
+    ///
+    /// Compares two texts and returns a similarity score using a reranker model.
+    async fn score(
+        &self,
+        params: ScoreParams,
+        request_hash: String,
+    ) -> Result<ScoreResponse, ScoreError>;
+
+    async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError>;
+
     async fn get_signature(
         &self,
         chat_id: &str,
@@ -181,4 +199,14 @@ pub trait InferenceProvider {
         nonce: Option<String>,
         signing_address: Option<String>,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError>;
+
+    /// Performs an audio transcription request
+    ///
+    /// Accepts audio file bytes and returns transcription with word-level timing,
+    /// segments, and metadata using Whisper models.
+    async fn audio_transcription(
+        &self,
+        params: AudioTranscriptionParams,
+        request_hash: String,
+    ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError>;
 }

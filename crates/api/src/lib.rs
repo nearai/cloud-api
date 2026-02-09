@@ -16,7 +16,11 @@ use crate::{
             StateStore,
         },
         billing::{get_billing_costs, BillingRouteState},
-        completions::{chat_completions, image_analyses, image_analyses_multipart, image_edits, image_generations, models},
+<<<<<<< HEAD
+        completions::{
+            audio_transcriptions, chat_completions, image_analyses, image_analyses_multipart,
+            image_edits, image_generations, models, rerank, score,
+        },
         conversations,
         health::health_check,
         models::{get_model_by_name, list_models, ModelsAppState},
@@ -46,6 +50,9 @@ use services::{
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use utoipa::OpenApi;
+
+// Audio transcription file size limit (25 MB for OpenAI Whisper API compatibility)
+const AUDIO_TRANSCRIPTION_MAX_BODY_SIZE: usize = 25 * 1024 * 1024; // 25 MB
 
 /// Service initialization components
 #[derive(Clone)]
@@ -537,7 +544,6 @@ pub async fn init_inference_providers(
             discovery_url,
             api_key,
             config.model_discovery.timeout,
-            config.model_discovery.inference_timeout,
             config.external_providers.clone(),
         ),
     );
@@ -573,7 +579,6 @@ pub async fn init_inference_providers_with_mocks(
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30 * 60,
             config::ExternalProvidersConfig::default(),
         ),
     );
@@ -597,8 +602,12 @@ pub async fn init_inference_providers_with_mocks(
         "Qwen/Qwen3-VL-30B-A3B-Instruct".to_string(),
         // Audio (input/output)
         "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string(),
+<<<<<<< HEAD
         // Image generation
         "black-forest-labs/FLUX.2-klein-4B".to_string(),
+        "Qwen/Qwen-Image-2512".to_string(),
+        // Reranking
+        "Qwen/Qwen3-Reranker-0.6B".to_string(),
     ];
 
     let providers: Vec<(
@@ -665,6 +674,7 @@ pub fn build_app_with_config(
         user_service: domain_services.user_service.clone(),
         files_service: domain_services.files_service.clone(),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
+        metrics_service: domain_services.metrics_service.clone(),
         config: config.clone(),
     };
 
@@ -879,12 +889,16 @@ pub fn build_completion_routes(
 ) -> Router {
     use crate::routes::files::MAX_FILE_SIZE;
 
-    // Text-based inference routes (chat/completions, image generation, image analysis)
+    // Text-based inference routes (chat/completions, image generation, image analysis, audio transcription, rerank, score)
     // Use default body limit (~2 MB) since they only accept JSON
     let text_inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
         .route("/images/generations", post(image_generations))
         .route("/images/analyses", post(image_analyses))
+        .route("/audio/transcriptions", post(audio_transcriptions))
+        .route("/rerank", post(rerank))
+        .route("/score", post(score))
+        .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
         .with_state(app_state.clone())
         .layer(from_fn_with_state(
             usage_state.clone(),
@@ -1364,7 +1378,6 @@ mod tests {
                 api_key: Some("test-key".to_string()),
                 refresh_interval: 0,
                 timeout: 5,
-                inference_timeout: 30 * 60, // 30 minutes
             },
             logging: config::LoggingConfig {
                 level: "info".to_string(),
@@ -1468,7 +1481,6 @@ mod tests {
                 api_key: Some("test-key".to_string()),
                 refresh_interval: 0,
                 timeout: 5,
-                inference_timeout: 30 * 60, // 30 minutes
             },
             logging: config::LoggingConfig {
                 level: "info".to_string(),

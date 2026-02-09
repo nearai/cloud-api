@@ -151,4 +151,43 @@ pub trait CompletionServiceTrait: Send + Sync {
         &self,
         model_name: &str,
     ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error>;
+
+    /// Execute an audio transcription request with concurrent request limiting
+    async fn audio_transcription(
+        &self,
+        organization_id: uuid::Uuid,
+        model_id: uuid::Uuid,
+        model_name: &str,
+        params: inference_providers::AudioTranscriptionParams,
+        request_hash: String,
+    ) -> Result<inference_providers::AudioTranscriptionResponse, CompletionError>;
+
+    /// Execute a rerank request with proper concurrent request limiting.
+    ///
+    /// Each organization has a per-model concurrent request limit (default: 64).
+    /// This method acquires a concurrent slot before calling the inference provider.
+    /// If the limit is exceeded, returns CompletionError::RateLimitExceeded (429 HTTP status).
+    /// Slots are automatically released after the provider call (success or error).
+    async fn try_rerank(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        params: inference_providers::RerankParams,
+    ) -> Result<inference_providers::RerankResponse, CompletionError>;
+
+    /// Execute a score request with proper concurrent request limiting.
+    ///
+    /// Each organization has a per-model concurrent request limit (default: 64).
+    /// This method acquires a concurrent slot before calling the inference provider.
+    /// If the limit is exceeded, returns CompletionError::RateLimitExceeded (429 HTTP status).
+    /// Slots are automatically released after the provider call (success or error).
+    async fn try_score(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        request_hash: String,
+        params: inference_providers::ScoreParams,
+    ) -> Result<inference_providers::ScoreResponse, CompletionError>;
 }

@@ -20,6 +20,9 @@ use utoipa::{Modify, OpenApi};
     tags(
         (name = "Chat", description = "Chat completion endpoints for AI model inference"),
         (name = "Images", description = "Image generation endpoints"),
+        (name = "Audio", description = "Audio transcription endpoints"),
+        (name = "Rerank", description = "Document reranking endpoints"),
+        (name = "Score", description = "Text similarity scoring endpoints"),
         (name = "Models", description = "Public model catalog and information"),
         (name = "Conversations", description = "Conversation management"),
         (name = "Responses", description = "Response handling and streaming"),
@@ -39,9 +42,12 @@ use utoipa::{Modify, OpenApi};
         // Chat completion endpoints (most important for users)
         crate::routes::completions::chat_completions,
         crate::routes::completions::image_generations,
+        crate::routes::completions::audio_transcriptions,
         crate::routes::completions::image_edits,
         crate::routes::completions::image_analyses,
         crate::routes::completions::image_analyses_multipart,
+        crate::routes::completions::rerank,
+        crate::routes::completions::score,
         // crate::routes::completions::completions,
         crate::routes::completions::models,
         // Model endpoints (public model catalog)
@@ -144,10 +150,16 @@ use utoipa::{Modify, OpenApi};
             CompletionRequest, ModelsResponse, ModelInfo, ModelPricing, ErrorResponse,
             // Image generation models
             ImageGenerationRequest, ImageGenerationResponse, ImageData,
+            // Audio transcription models
+            AudioTranscriptionRequestSchema, AudioTranscriptionResponse, TranscriptionSegment, TranscriptionWord,
             // Image edit models
             ImageEditRequestSchema,
             // Image analysis models
             ImageAnalysisRequest, ImageAnalysisResponse, ImageAnalysisUsage, ImageInput,
+            // Rerank models
+            RerankRequest, RerankResponse, RerankResult, RerankUsage,
+            // Score models
+            ScoreRequest, ScoreResponse,
             // Organization models
             CreateOrganizationRequest, OrganizationResponse,
             UpdateOrganizationRequest, CreateApiKeyRequest, ApiKeyResponse,

@@ -1,4 +1,7 @@
-use crate::{models::StreamOptions, sse_parser::new_sse_parser, ImageGenerationError, *};
+use crate::{
+    models::StreamOptions, sse_parser::new_sse_parser, ImageEditError, ImageGenerationError,
+    RerankError, ScoreError, *,
+};
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
@@ -8,6 +11,16 @@ use std::time::Duration;
 /// Convert any displayable error to ImageGenerationError::GenerationError
 fn to_image_gen_error<E: std::fmt::Display>(e: E) -> ImageGenerationError {
     ImageGenerationError::GenerationError(e.to_string())
+}
+
+/// Convert any displayable error to RerankError::GenerationError
+fn to_rerank_error<E: std::fmt::Display>(e: E) -> RerankError {
+    RerankError::GenerationError(e.to_string())
+}
+
+/// Convert any displayable error to ScoreError::GenerationError
+fn to_score_error<E: std::fmt::Display>(e: E) -> ScoreError {
+    ScoreError::GenerationError(e.to_string())
 }
 
 /// Encryption header keys used in params.extra for passing encryption information
@@ -456,6 +469,88 @@ impl InferenceProvider for VLlmProvider {
         })
     }
 
+    async fn audio_transcription(
+        &self,
+        params: AudioTranscriptionParams,
+        request_hash: String,
+    ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
+        let url = format!("{}/v1/audio/transcriptions", self.config.base_url);
+
+        // Detect content type from filename
+        let content_type = crate::models::detect_audio_content_type(&params.filename);
+
+        // Build multipart form
+        let file_part = reqwest::multipart::Part::bytes(params.file_bytes)
+            .file_name(params.filename.clone())
+            .mime_str(&content_type)
+            .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
+
+        let mut form = reqwest::multipart::Form::new()
+            .part("file", file_part)
+            .text("model", params.model.clone());
+
+        if let Some(language) = params.language {
+            form = form.text("language", language);
+        }
+
+        if let Some(response_format) = params.response_format {
+            form = form.text("response_format", response_format);
+        }
+
+        if let Some(temperature) = params.temperature {
+            form = form.text("temperature", temperature.to_string());
+        }
+
+        if let Some(granularities) = params.timestamp_granularities {
+            // Send as JSON array string
+            form = form.text("timestamp_granularities[]", granularities.join(","));
+        }
+
+        // Build headers (no Content-Type - reqwest sets it automatically for multipart)
+        let mut headers = self
+            .build_headers()
+            .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
+        // Remove Content-Type header - reqwest will set it automatically for multipart
+        headers.remove("Content-Type");
+        headers.insert(
+            "X-Request-Hash",
+            HeaderValue::from_str(&request_hash)
+                .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?,
+        );
+
+        // Send request with timeout
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .multipart(form)
+            .timeout(std::time::Duration::from_secs(
+                self.config.timeout_seconds as u64,
+            ))
+            .send()
+            .await
+            .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AudioTranscriptionError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        let transcription_response: AudioTranscriptionResponse = response
+            .json()
+            .await
+            .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
+
+        Ok(transcription_response)
+    }
+
     /// Performs an image edit request
     async fn image_edit(
         &self,
@@ -552,6 +647,81 @@ impl InferenceProvider for VLlmProvider {
             response: edit_response,
             raw_bytes,
         })
+    }
+
+    /// Performs a document reranking request
+    async fn score(
+        &self,
+        params: ScoreParams,
+        request_hash: String,
+    ) -> Result<ScoreResponse, ScoreError> {
+        let url = format!("{}/v1/score", self.config.base_url);
+
+        let mut headers = self.build_headers().map_err(to_score_error)?;
+        headers.insert(
+            "X-Request-Hash",
+            reqwest::header::HeaderValue::from_str(&request_hash).map_err(to_score_error)?,
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&params)
+            .timeout(std::time::Duration::from_secs(
+                self.config.timeout_seconds as u64,
+            ))
+            .send()
+            .await
+            .map_err(to_score_error)?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(ScoreError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        let score_response: ScoreResponse = response.json().await.map_err(to_score_error)?;
+        Ok(score_response)
+    }
+
+    async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+        let url = format!("{}/v1/rerank", self.config.base_url);
+
+        let headers = self.build_headers().map_err(to_rerank_error)?;
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&params)
+            .timeout(std::time::Duration::from_secs(
+                self.config.timeout_seconds as u64,
+            ))
+            .send()
+            .await
+            .map_err(to_rerank_error)?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(RerankError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        let rerank_response: RerankResponse = response.json().await.map_err(to_rerank_error)?;
+        Ok(rerank_response)
     }
 }
 

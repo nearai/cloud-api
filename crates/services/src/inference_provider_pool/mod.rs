@@ -2,10 +2,11 @@ use crate::common::encryption_headers;
 use config::ExternalProvidersConfig;
 use inference_providers::{
     models::{AttestationError, CompletionError, ListModelsError, ModelsResponse},
+    AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
     ChatCompletionParams, ExternalProvider, ExternalProviderConfig, ImageEditError,
     ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
-    ImageGenerationResponseWithBytes, InferenceProvider, ProviderConfig, StreamingResult,
-    StreamingResultExt, VLlmConfig, VLlmProvider,
+    ImageGenerationResponseWithBytes, InferenceProvider, ProviderConfig, RerankError, RerankParams,
+    RerankResponse, StreamingResult, StreamingResultExt, VLlmConfig, VLlmProvider,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -59,8 +60,6 @@ pub struct InferenceProviderPool {
     api_key: Option<String>,
     /// HTTP timeout for discovery requests
     discovery_timeout: Duration,
-    /// HTTP timeout for model inference requests
-    inference_timeout_secs: i64,
     /// Combined provider mappings (updated atomically to prevent race conditions)
     provider_mappings: Arc<RwLock<ProviderMappings>>,
     /// External providers (keyed by model name, created from database config)
@@ -83,14 +82,12 @@ impl InferenceProviderPool {
         discovery_url: String,
         api_key: Option<String>,
         discovery_timeout_secs: i64,
-        inference_timeout_secs: i64,
         external_configs: ExternalProvidersConfig,
     ) -> Self {
         Self {
             discovery_url,
             api_key,
             discovery_timeout: Duration::from_secs(discovery_timeout_secs as u64),
-            inference_timeout_secs,
             provider_mappings: Arc::new(RwLock::new(ProviderMappings::new())),
             external_providers: Arc::new(RwLock::new(HashMap::new())),
             external_configs,
@@ -556,7 +553,7 @@ impl InferenceProviderPool {
                 let provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
                     url.clone(),
                     self.api_key.clone(),
-                    Some(self.inference_timeout_secs),
+                    None,
                 ))) as Arc<InferenceProviderTrait>;
 
                 // Fetch attestation report with retries to handle transient network failures
@@ -1183,6 +1180,48 @@ impl InferenceProviderPool {
         Ok(response)
     }
 
+    pub async fn audio_transcription(
+        &self,
+        params: AudioTranscriptionParams,
+        request_hash: String,
+    ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
+        let model_id = params.model.clone();
+        let file_size_kb = params.file_bytes.len() / 1024;
+
+        tracing::debug!(
+            model = %model_id,
+            filename = %params.filename,
+            file_size_kb = file_size_kb,
+            "Starting audio transcription request"
+        );
+
+        let (response, _provider) = self
+            .retry_with_fallback(&model_id, "audio_transcription", None, |provider| {
+                let params = params.clone();
+                let request_hash = request_hash.clone();
+                async move {
+                    provider
+                        .audio_transcription(params, request_hash)
+                        .await
+                        .map_err(|e| CompletionError::CompletionError(e.to_string()))
+                }
+            })
+            .await
+            .map_err(|e| {
+                AudioTranscriptionError::TranscriptionError(Self::sanitize_error_message(
+                    &e.to_string(),
+                ))
+            })?;
+
+        tracing::info!(
+            model = %model_id,
+            duration = ?response.duration,
+            "Audio transcription completed successfully"
+        );
+
+        Ok(response)
+    }
+
     pub async fn image_edit(
         &self,
         params: ImageEditParams,
@@ -1224,6 +1263,162 @@ impl InferenceProviderPool {
         self.store_chat_id_mapping(image_id, provider).await;
 
         Ok(response)
+    }
+
+    pub async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+        let model_id = params.model.clone();
+
+        tracing::debug!(
+            model = %model_id,
+            document_count = params.documents.len(),
+            "Starting rerank request"
+        );
+
+        // Check if this model exists as an external provider - reranking is not supported for external models
+        if self.get_external_provider(&model_id).await.is_some() {
+            return Err(RerankError::GenerationError(format!(
+                "Reranking is not supported for external provider models. \
+                 Model '{}' is configured as an external provider. \
+                 Reranking is only available for vLLM providers.",
+                model_id
+            )));
+        }
+
+        // Ensure vLLM models are discovered
+        self.ensure_models_discovered().await.map_err(|e| {
+            RerankError::GenerationError(Self::sanitize_error_message(&e.to_string()))
+        })?;
+
+        // Get vLLM providers with load balancing
+        let providers = match self.get_providers_with_fallback(&model_id, None).await {
+            Some(p) => p,
+            None => {
+                let mappings = self.provider_mappings.read().await;
+                let available_models: Vec<_> = mappings.model_to_providers.keys().collect();
+
+                tracing::error!(
+                    model_id = %model_id,
+                    available_models = ?available_models,
+                    operation = "rerank",
+                    "No vLLM provider found for model"
+                );
+
+                return Err(RerankError::GenerationError(format!(
+                    "Model '{}' not found in vLLM providers. Available models: {:?}",
+                    model_id, available_models
+                )));
+            }
+        };
+
+        // Try reranking with each provider (with fallback)
+        let mut last_error = None;
+        for provider in providers {
+            match provider.rerank(params.clone()).await {
+                Ok(response) => {
+                    tracing::info!(
+                        model = %model_id,
+                        result_count = response.results.len(),
+                        "Rerank completed successfully"
+                    );
+                    return Ok(response);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        model = %model_id,
+                        error = %e,
+                        "Rerank failed with provider, trying next"
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // All providers failed
+        let error_msg = last_error
+            .map(|e| Self::sanitize_error_message(&e.to_string()))
+            .unwrap_or_else(|| "No providers available for reranking".to_string());
+
+        Err(RerankError::GenerationError(error_msg))
+    }
+
+    pub async fn score(
+        &self,
+        params: inference_providers::ScoreParams,
+        request_hash: String,
+    ) -> Result<inference_providers::ScoreResponse, inference_providers::ScoreError> {
+        let model_id = params.model.clone();
+
+        tracing::debug!(
+            model = %model_id,
+            "Starting score request"
+        );
+
+        // Check if this model exists as an external provider - scoring is not supported for external models
+        if self.get_external_provider(&model_id).await.is_some() {
+            return Err(inference_providers::ScoreError::GenerationError(format!(
+                "Scoring is not supported for external provider models. \
+                 Model '{}' is configured as an external provider. \
+                 Scoring is only available for vLLM providers.",
+                model_id
+            )));
+        }
+
+        // Ensure vLLM models are discovered
+        self.ensure_models_discovered().await.map_err(|e| {
+            inference_providers::ScoreError::GenerationError(Self::sanitize_error_message(
+                &e.to_string(),
+            ))
+        })?;
+
+        // Get vLLM providers with load balancing
+        let providers = match self.get_providers_with_fallback(&model_id, None).await {
+            Some(p) => p,
+            None => {
+                let mappings = self.provider_mappings.read().await;
+                let available_models: Vec<_> = mappings.model_to_providers.keys().collect();
+
+                tracing::error!(
+                    model_id = %model_id,
+                    available_models = ?available_models,
+                    operation = "score",
+                    "No vLLM provider found for model"
+                );
+
+                return Err(inference_providers::ScoreError::GenerationError(format!(
+                    "Model '{}' not found in vLLM providers. Available models: {:?}",
+                    model_id, available_models
+                )));
+            }
+        };
+
+        // Try scoring with each provider (with fallback)
+        let mut last_error = None;
+        for provider in providers {
+            match provider.score(params.clone(), request_hash.clone()).await {
+                Ok(response) => {
+                    tracing::info!(
+                        model = %model_id,
+                        "Score completed successfully"
+                    );
+                    return Ok(response);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        model = %model_id,
+                        error = %e,
+                        "Score failed with provider, trying next"
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // All providers failed
+        let error_msg = last_error
+            .map(|e| Self::sanitize_error_message(&e.to_string()))
+            .unwrap_or_else(|| "No providers available for scoring".to_string());
+
+        Err(inference_providers::ScoreError::GenerationError(error_msg))
     }
 
     /// Create an external provider from a model name and provider config JSON.
@@ -1530,6 +1725,27 @@ mod tests {
 
         // HTTP status should still be present (not sensitive)
         assert!(sanitized.contains("401 Unauthorized"));
+
+        // Test that "not found" keywords are preserved for error detection
+        // This is important because route handlers check for "not found" to return 404 errors
+        let error_not_found =
+            "Model 'Qwen/Qwen3-Reranker-0.6B' not found at http://192.168.0.1:8000";
+        let sanitized_not_found = InferenceProviderPool::sanitize_error_message(error_not_found);
+        assert!(
+            sanitized_not_found.contains("not found"),
+            "Keywords 'not found' must be preserved for error detection"
+        );
+        assert!(!sanitized_not_found.contains("http://"));
+        assert!(!sanitized_not_found.contains("192.168.0.1"));
+
+        let error_does_not_exist =
+            "Model 'gpt-4' does not exist on the server https://api.example.com";
+        let sanitized_exists = InferenceProviderPool::sanitize_error_message(error_does_not_exist);
+        assert!(
+            sanitized_exists.contains("does not exist"),
+            "Keywords 'does not exist' must be preserved for error detection"
+        );
+        assert!(!sanitized_exists.contains("https://api.example.com"));
     }
 
     #[tokio::test]
@@ -1541,7 +1757,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig::default(),
         );
 
@@ -1609,7 +1824,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test-key".to_string()),
                 anthropic_api_key: None,
@@ -1638,7 +1852,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: None,
                 anthropic_api_key: Some("sk-ant-test".to_string()),
@@ -1667,7 +1880,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: None,
                 anthropic_api_key: None,
@@ -1696,7 +1908,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig::default(), // No API keys configured
         );
 
@@ -1720,7 +1931,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: None,
@@ -1750,7 +1960,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig::default(),
         );
 
@@ -1769,7 +1978,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig::default(),
         );
 
@@ -1783,7 +1991,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: Some("sk-ant-test".to_string()),
@@ -1831,7 +2038,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: None, // Missing Anthropic key
@@ -1902,7 +2108,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: None,
@@ -1934,7 +2139,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: None,
@@ -1971,7 +2175,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig::default(),
         );
 
@@ -1986,7 +2189,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: None,
@@ -2031,7 +2233,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: Some("sk-ant-test".to_string()),
@@ -2101,7 +2302,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: None,
@@ -2137,7 +2337,6 @@ mod tests {
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: None, // Missing Anthropic key

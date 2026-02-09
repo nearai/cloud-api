@@ -98,6 +98,12 @@ impl MetricsServiceTrait for OtlpMetricsService {
                 }
                 consts::METRIC_REQUEST_ERRORS => "API request errors by error type",
                 consts::METRIC_COST_USD => "Total cost in nano-dollars (USD) by model",
+                consts::METRIC_PROVIDER_TOKEN_ANOMALIES => {
+                    "Count of provider token count anomalies (capped values)"
+                }
+                consts::METRIC_PROVIDER_ZERO_TOKENS => {
+                    "Count of requests with zero token reports from provider"
+                }
                 _ => "Count",
             };
 

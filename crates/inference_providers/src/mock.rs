@@ -4,13 +4,17 @@
 //! without requiring external dependencies like VLLM.
 
 use crate::{
-    AttestationError, ChatChoice, ChatCompletionChunk, ChatCompletionParams,
+    AttestationError, AudioTranscriptionError, AudioTranscriptionParams,
+    AudioTranscriptionResponse, ChatChoice, ChatCompletionChunk, ChatCompletionParams,
     ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseWithBytes,
     ChatDelta, ChatResponseMessage, ChatSignature, CompletionChunk, CompletionError,
     CompletionParams, FinishReason, FunctionCallDelta, ImageData, ImageEditError, ImageEditParams,
     ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
     ImageGenerationResponse, ImageGenerationResponseWithBytes, ListModelsError, MessageRole,
-    ModelInfo, ModelsResponse, SSEEvent, StreamChunk, StreamingResult, TokenUsage, ToolCallDelta,
+    ModelInfo, ModelsResponse, RerankError, RerankParams, RerankResponse, RerankResult,
+    RerankUsage, SSEEvent, ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage,
+    StreamChunk, StreamingResult, TokenUsage, ToolCallDelta, TranscriptionSegment,
+    TranscriptionWord,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -933,6 +937,74 @@ impl crate::InferenceProvider for MockProvider {
         })
     }
 
+    async fn score(
+        &self,
+        params: ScoreParams,
+        _request_hash: String,
+    ) -> Result<ScoreResponse, ScoreError> {
+        // Mock implementation returns a similarity score based on text length similarity
+        let len_1 = params.text_1.len() as f64;
+        let len_2 = params.text_2.len() as f64;
+        let mock_score: f64 = 1.0 - ((len_1 - len_2).abs() / len_1.max(len_2).max(1.0));
+
+        Ok(ScoreResponse {
+            id: format!("score-{}", uuid::Uuid::new_v4()),
+            object: "list".to_string(),
+            created: self.current_timestamp(),
+            model: params.model.clone(),
+            data: vec![ScoreResult {
+                index: 0,
+                score: mock_score.clamp(0.0, 1.0),
+                object: "score".to_string(),
+            }],
+            usage: Some(ScoreUsage {
+                prompt_tokens: Some((len_1 + len_2) as i32 / 4),
+                total_tokens: Some((len_1 + len_2) as i32 / 4),
+                completion_tokens: Some(0),
+                prompt_tokens_details: None,
+            }),
+        })
+    }
+
+    async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+        // Check for invalid model
+        if !self.is_valid_model(&params.model) {
+            return Err(RerankError::GenerationError(format!(
+                "The model `{}` does not exist.",
+                params.model
+            )));
+        }
+
+        // Generate mock reranked results with decreasing relevance scores
+        let mut results: Vec<RerankResult> = (0..params.documents.len())
+            .map(|i| {
+                // Generate decreasing relevance scores (1.0 for first, 0.0 for last)
+                let relevance_score =
+                    (params.documents.len() as f64 - i as f64) / params.documents.len() as f64;
+                RerankResult {
+                    index: i as i32,
+                    relevance_score,
+                    document: Some(serde_json::Value::String(params.documents[i].clone())),
+                }
+            })
+            .collect();
+
+        // Sort by relevance score descending
+        results.sort_by(|a, b| b.relevance_score.partial_cmp(&a.relevance_score).unwrap());
+
+        let response = RerankResponse {
+            id: format!("rerank-{}", self.generate_id()),
+            model: params.model.clone(),
+            results,
+            usage: Some(RerankUsage {
+                prompt_tokens: None,
+                total_tokens: Some(50),
+            }),
+        };
+
+        Ok(response)
+    }
+
     async fn get_signature(
         &self,
         chat_id: &str,
@@ -999,6 +1071,47 @@ impl crate::InferenceProvider for MockProvider {
         );
 
         Ok(report)
+    }
+
+    async fn audio_transcription(
+        &self,
+        params: AudioTranscriptionParams,
+        _request_hash: String,
+    ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
+        // Mock implementation returns simple transcription with mock timing
+        let file_size_kb = params.file_bytes.len() / 1024;
+        let mock_duration = (file_size_kb as f64) * 0.1; // Assume ~0.1s per KB
+
+        Ok(AudioTranscriptionResponse {
+            text: format!("Mock transcription for file: {}", params.filename),
+            duration: Some(mock_duration),
+            language: params.language.or(Some("en".to_string())),
+            segments: Some(vec![TranscriptionSegment {
+                id: 0,
+                seek: 0,
+                start: 0.0,
+                end: mock_duration,
+                text: format!("Mock transcription for file: {}", params.filename),
+                tokens: vec![50364, 15947],
+                temperature: 0.0,
+                avg_logprob: Some(-0.5),
+                compression_ratio: Some(1.0),
+                no_speech_prob: Some(0.0),
+            }]),
+            words: Some(vec![
+                TranscriptionWord {
+                    word: "Mock".to_string(),
+                    start: 0.0,
+                    end: 0.5,
+                },
+                TranscriptionWord {
+                    word: "transcription".to_string(),
+                    start: 0.5,
+                    end: 1.5,
+                },
+            ]),
+            id: None,
+        })
     }
 }
 

@@ -15,6 +15,8 @@ pub enum InferenceType {
     ImageGeneration,
     /// Image editing/inpainting
     ImageEdit,
+    /// Audio transcription
+    AudioTranscription,
     /// Document reranking
     Rerank,
     /// Text similarity scoring
@@ -29,6 +31,7 @@ impl InferenceType {
             InferenceType::ChatCompletionStream => "chat_completion_stream",
             InferenceType::ImageGeneration => "image_generation",
             InferenceType::ImageEdit => "image_edit",
+            InferenceType::AudioTranscription => "audio_transcription",
             InferenceType::Rerank => "rerank",
             InferenceType::Score => "score",
         }
@@ -50,6 +53,7 @@ impl std::str::FromStr for InferenceType {
             "chat_completion_stream" => Ok(InferenceType::ChatCompletionStream),
             "image_generation" => Ok(InferenceType::ImageGeneration),
             "image_edit" => Ok(InferenceType::ImageEdit),
+            "audio_transcription" => Ok(InferenceType::AudioTranscription),
             "rerank" => Ok(InferenceType::Rerank),
             "score" => Ok(InferenceType::Score),
             _ => Err(format!("Unknown inference type: {}", s)),

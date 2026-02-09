@@ -16,7 +16,10 @@ use crate::{
             StateStore,
         },
         billing::{get_billing_costs, BillingRouteState},
-        completions::{chat_completions, image_edits, image_generations, models, rerank, score},
+        completions::{
+            audio_transcriptions, chat_completions, image_edits, image_generations, models, rerank,
+            score,
+        },
         conversations,
         health::health_check,
         models::{get_model_by_name, list_models, ModelsAppState},
@@ -46,6 +49,9 @@ use services::{
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use utoipa::OpenApi;
+
+// Audio transcription file size limit (25 MB for OpenAI Whisper API compatibility)
+const AUDIO_TRANSCRIPTION_MAX_BODY_SIZE: usize = 25 * 1024 * 1024; // 25 MB
 
 /// Service initialization components
 #[derive(Clone)]
@@ -880,13 +886,15 @@ pub fn build_completion_routes(
 ) -> Router {
     use crate::routes::files::MAX_FILE_SIZE;
 
-    // Text-based inference routes (chat/completions, image generation)
+    // Text-based inference routes (chat/completions, image generation, audio transcription, rerank, score)
     // Use default body limit (~2 MB) since they only accept JSON
     let text_inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
         .route("/images/generations", post(image_generations))
+        .route("/audio/transcriptions", post(audio_transcriptions))
         .route("/rerank", post(rerank))
         .route("/score", post(score))
+        .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
         .with_state(app_state.clone())
         .layer(from_fn_with_state(
             usage_state.clone(),

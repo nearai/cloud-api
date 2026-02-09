@@ -17,7 +17,7 @@ use crate::{
         },
         billing::{get_billing_costs, BillingRouteState},
         completions::{
-            audio_transcriptions, chat_completions, image_edits_json, image_generations, models,
+            audio_transcriptions, chat_completions, image_edits, image_generations, models,
             rerank, score,
         },
         conversations,
@@ -463,7 +463,6 @@ pub async fn init_domain_services_with_pool(
         None,                      // file_search_provider
         files_service.clone(),     // file_service
         organization_service.clone(),
-        usage_service.clone(), // usage_service for billing
     ));
 
     DomainServices {
@@ -524,7 +523,6 @@ pub async fn init_domain_services_with_mcp_factory(
         None,
         domain_services.files_service.clone(), // Reuse files_service from base
         organization_service,
-        domain_services.usage_service.clone(), // usage_service for billing
         mcp_client_factory,
     ));
 
@@ -713,6 +711,13 @@ pub fn build_app_with_config(
         rate_limit_state.clone(),
     );
 
+    let usage_recording_routes = build_usage_recording_routes(
+        app_state.clone(),
+        &auth_components.auth_state_middleware,
+        usage_state.clone(),
+        rate_limit_state.clone(),
+    );
+
     let response_routes = build_response_routes(
         domain_services.response_service,
         domain_services.attestation_service.clone(),
@@ -803,6 +808,7 @@ pub fn build_app_with_config(
                 .merge(auth_vpc_routes)
                 .merge(files_routes)
                 .merge(billing_routes)
+                .merge(usage_recording_routes)
                 .merge(health_routes),
         )
         .merge(openapi_routes)
@@ -899,7 +905,7 @@ pub fn build_completion_routes(
     let text_inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
         .route("/images/generations", post(image_generations))
-        .route("/images/edits", post(image_edits_json))
+        .route("/images/edits", post(image_edits))
         .route("/audio/transcriptions", post(audio_transcriptions))
         .route("/rerank", post(rerank))
         .route("/score", post(score))
@@ -1132,6 +1138,31 @@ pub fn build_billing_routes(
     Router::new()
         .route("/billing/costs", post(get_billing_costs))
         .with_state(billing_state)
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::auth_middleware_with_workspace_context,
+        ))
+}
+
+/// Build usage recording routes with auth, rate limiting, and usage check.
+/// No body_hash_middleware — attestation/signing is not applicable to usage records.
+pub fn build_usage_recording_routes(
+    app_state: AppState,
+    auth_state_middleware: &AuthState,
+    usage_state: middleware::UsageState,
+    rate_limit_state: middleware::RateLimitState,
+) -> Router {
+    Router::new()
+        .route("/usage", post(crate::routes::usage::record_usage))
+        .with_state(app_state)
+        .layer(from_fn_with_state(
+            usage_state,
+            middleware::usage_check_middleware,
+        ))
+        .layer(from_fn_with_state(
+            rate_limit_state,
+            middleware::api_key_rate_limit_middleware,
+        ))
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,

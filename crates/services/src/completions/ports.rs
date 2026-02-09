@@ -95,10 +95,6 @@ pub struct CompletionMessage {
     /// Tool calls made by the assistant - required for assistant messages that invoke tools
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<CompletionToolCall>>,
-    /// Multimodal content (images, etc.) for supporting image analysis and other multimodal tasks
-    /// Serialized as JSON array of content objects compatible with OpenAI format
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub multimodal_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,18 +135,6 @@ pub trait CompletionServiceTrait: Send + Sync {
         &self,
         request: CompletionRequest,
     ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError>;
-
-    /// Get reference to inference provider pool for image operations
-    fn get_inference_provider_pool(
-        &self,
-    ) -> std::sync::Arc<crate::inference_provider_pool::InferenceProviderPool>;
-
-    /// Get model details by name (canonical name or alias)
-    /// Returns None if the model is not found or not active
-    async fn get_model(
-        &self,
-        model_name: &str,
-    ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error>;
 
     /// Execute an audio transcription request with concurrent request limiting
     async fn audio_transcription(

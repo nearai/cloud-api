@@ -43,7 +43,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::completions::chat_completions,
         crate::routes::completions::image_generations,
         crate::routes::completions::audio_transcriptions,
-        crate::routes::completions::image_edits_json,
+        crate::routes::completions::image_edits,
         crate::routes::completions::rerank,
         crate::routes::completions::score,
         // crate::routes::completions::completions,
@@ -115,6 +115,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::usage::get_organization_balance,
         crate::routes::usage::get_organization_usage_history,
         crate::routes::usage::get_api_key_usage_history,
+        crate::routes::usage::record_usage,
         // Billing endpoints (HuggingFace integration)
         crate::routes::billing::get_billing_costs,
         // Admin endpoints (less frequently used)
@@ -218,6 +219,7 @@ use utoipa::{Modify, OpenApi};
             crate::routes::usage::OrganizationBalanceResponse,
             crate::routes::usage::UsageHistoryResponse,
             crate::routes::usage::UsageHistoryEntryResponse,
+            crate::routes::usage::RecordUsageResponse,
             // Billing models (HuggingFace integration)
             crate::routes::billing::BillingCostsRequest,
             crate::routes::billing::BillingCostsResponse,

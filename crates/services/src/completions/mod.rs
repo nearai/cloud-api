@@ -610,11 +610,8 @@ impl CompletionServiceImpl {
                         .collect()
                 });
 
-                // Use multimodal_content (array with text+images) if available, otherwise fallback to text
-                let content = msg
-                    .multimodal_content
-                    .clone()
-                    .or_else(|| Some(serde_json::Value::String(msg.content.clone())));
+                // Use text content
+                let content = Some(serde_json::Value::String(msg.content.clone()));
 
                 ChatMessage {
                     role: match msg.role.as_str() {
@@ -1092,19 +1089,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         });
 
         Ok(response_with_bytes)
-    }
-
-    fn get_inference_provider_pool(
-        &self,
-    ) -> std::sync::Arc<crate::inference_provider_pool::InferenceProviderPool> {
-        self.inference_provider_pool.clone()
-    }
-
-    async fn get_model(
-        &self,
-        model_name: &str,
-    ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
-        self.models_repository.get_model_by_name(model_name).await
     }
 
     async fn audio_transcription(

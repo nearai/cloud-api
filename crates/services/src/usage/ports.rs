@@ -189,7 +189,20 @@ pub trait UsageServiceTrait: Send + Sync {
     ) -> Result<CostBreakdown, UsageError>;
 
     /// Record usage after an API call completes
-    async fn record_usage(&self, request: RecordUsageServiceRequest) -> Result<(), UsageError>;
+    async fn record_usage(
+        &self,
+        request: RecordUsageServiceRequest,
+    ) -> Result<UsageLogEntry, UsageError>;
+
+    /// Record usage from the public API endpoint.
+    /// Resolves model by name, validates per-variant fields, and delegates to `record_usage`.
+    async fn record_usage_from_api(
+        &self,
+        organization_id: Uuid,
+        workspace_id: Uuid,
+        api_key_id: Uuid,
+        request: RecordUsageApiRequest,
+    ) -> Result<UsageLogEntry, UsageError>;
 
     /// Check if organization can make an API call (pre-flight check)
     async fn check_can_use(&self, organization_id: Uuid) -> Result<UsageCheckResult, UsageError>;
@@ -325,6 +338,42 @@ pub trait OrganizationLimitsRepository: Send + Sync {
 // ============================================
 // Service Data Structures
 // ============================================
+
+/// Request to record usage from the public API.
+/// Uses a tagged union (`#[serde(tag = "type")]`) so each usage kind
+/// carries only its relevant fields and the set is extensible.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RecordUsageApiRequest {
+    /// Token-based chat completion usage
+    ChatCompletion {
+        /// Model name to look up pricing
+        model: String,
+        /// Number of input/prompt tokens
+        input_tokens: Option<i32>,
+        /// Number of output/completion tokens
+        output_tokens: Option<i32>,
+        /// External identifier (e.g., provider request ID) used as
+        /// an idempotency key. Stored as `provider_request_id` and
+        /// hashed to a deterministic UUID v5 for `inference_id`.
+        /// Duplicate calls with the same id within the same org
+        /// return the existing record without double-charging.
+        id: String,
+    },
+    /// Image generation or editing
+    ImageGeneration {
+        /// Model name to look up pricing
+        model: String,
+        /// Number of images generated
+        image_count: i32,
+        /// External identifier (e.g., provider request ID) used as
+        /// an idempotency key. Stored as `provider_request_id` and
+        /// hashed to a deterministic UUID v5 for `inference_id`.
+        /// Duplicate calls with the same id within the same org
+        /// return the existing record without double-charging.
+        id: String,
+    },
+}
 
 /// Request to record usage (service layer)
 #[derive(Debug, Clone)]
@@ -472,6 +521,12 @@ pub struct UsageLogEntry {
     pub response_id: Option<ResponseId>,
     /// Number of images generated (for image generation requests)
     pub image_count: Option<i32>,
+    /// True if this was a newly inserted record, false if it was a duplicate.
+    /// This flag is used internally to prevent double-counting cost metrics
+    /// when idempotent requests are retried with the same inference_id.
+    /// The database balance is correctly updated only for new inserts,
+    /// and this flag ensures metrics tracking follows the same pattern.
+    pub was_inserted: bool,
 }
 
 // ============================================
@@ -486,6 +541,7 @@ pub enum UsageError {
     Unauthorized(String),
     NotFound(String),
     CostCalculationOverflow(String),
+    ValidationError(String),
 }
 
 impl std::fmt::Display for UsageError {
@@ -499,6 +555,7 @@ impl std::fmt::Display for UsageError {
             UsageError::CostCalculationOverflow(msg) => {
                 write!(f, "Cost calculation overflow: {msg}")
             }
+            UsageError::ValidationError(msg) => write!(f, "Validation error: {msg}"),
         }
     }
 }

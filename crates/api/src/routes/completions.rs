@@ -28,6 +28,96 @@ const USAGE_RECORDING_TIMEOUT_SECS: u64 = 5;
 // Custom header for exposing the inference ID as a UUID
 const HEADER_INFERENCE_ID: &str = "Inference-Id";
 
+/// Build a `RecordUsageServiceRequest` for image operations (generation or editing).
+fn build_image_usage_request(
+    organization_id: Uuid,
+    workspace_id: Uuid,
+    api_key_id: Uuid,
+    model_id: Uuid,
+    provider_request_id: &str,
+    image_count: i32,
+    inference_type: services::usage::InferenceType,
+) -> services::usage::RecordUsageServiceRequest {
+    services::usage::RecordUsageServiceRequest {
+        organization_id,
+        workspace_id,
+        api_key_id,
+        model_id,
+        input_tokens: 0,
+        output_tokens: 0,
+        inference_type,
+        ttft_ms: None,
+        avg_itl_ms: None,
+        inference_id: Some(hash_inference_id_to_uuid(provider_request_id)),
+        provider_request_id: Some(provider_request_id.to_string()),
+        stop_reason: Some(services::usage::StopReason::Completed),
+        response_id: None,
+        image_count: Some(image_count),
+    }
+}
+
+/// Record usage synchronously with timeout, falling back to async retry.
+/// Used for non-streaming operations (image gen/edit) where usage should be
+/// persisted before the HTTP response is returned.
+async fn record_usage_with_sync_fallback(
+    usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
+    request: services::usage::RecordUsageServiceRequest,
+    operation_label: &str,
+) {
+    let provider_request_id = request.provider_request_id.clone().unwrap_or_default();
+    let organization_id = request.organization_id;
+    let timeout_duration = Duration::from_secs(USAGE_RECORDING_TIMEOUT_SECS);
+
+    match tokio::time::timeout(
+        timeout_duration,
+        usage_service.record_usage(request.clone()),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {
+            tracing::debug!(
+                image_id = %provider_request_id,
+                %organization_id,
+                "{operation_label} usage recorded synchronously"
+            );
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                error = %e,
+                image_id = %provider_request_id,
+                "Failed to record usage synchronously, retrying async"
+            );
+            spawn_async_usage_retry(usage_service, request, provider_request_id, operation_label);
+        }
+        Err(_timeout) => {
+            tracing::warn!(
+                image_id = %provider_request_id,
+                "Usage recording timed out ({USAGE_RECORDING_TIMEOUT_SECS}s), retrying async"
+            );
+            spawn_async_usage_retry(usage_service, request, provider_request_id, operation_label);
+        }
+    }
+}
+
+/// Spawn an async retry for usage recording after a sync attempt fails or times out.
+fn spawn_async_usage_retry(
+    usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
+    request: services::usage::RecordUsageServiceRequest,
+    provider_request_id: String,
+    operation_label: &str,
+) {
+    let label = operation_label.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = usage_service.record_usage(request).await {
+            tracing::error!(
+                error = %e,
+                image_id = %provider_request_id,
+                "Failed to record {label} usage in async retry"
+            );
+        }
+    });
+}
+
 // Helper function to provide detailed error context for multipart parsing failures
 fn analyze_multipart_error(e: &axum::extract::multipart::MultipartError) -> (StatusCode, String) {
     let error_str = e.to_string();
@@ -862,81 +952,16 @@ pub async fn image_generations(
                 }
             };
 
-            // Hash the provider request ID to UUID for storage
-            let inference_id = Some(hash_inference_id_to_uuid(&provider_request_id));
-
-            let usage_request = services::usage::RecordUsageServiceRequest {
+            let usage_request = build_image_usage_request(
                 organization_id,
                 workspace_id,
                 api_key_id,
                 model_id,
-                // Image generation doesn't have traditional token counts
-                input_tokens: 0,
-                output_tokens: 0,
-                inference_type: services::usage::ports::InferenceType::ImageGeneration,
-                ttft_ms: None,
-                avg_itl_ms: None,
-                inference_id,
-                provider_request_id: Some(provider_request_id.clone()),
-                stop_reason: Some(services::usage::StopReason::Completed),
-                response_id: None,
-                image_count: Some(image_count),
-            };
-
-            // Attempt synchronous usage recording with timeout before returning response.
-            // This ensures usage is persisted to the database before the client considers the request complete.
-            // If recording times out (>5s), fall back to fire-and-forget async task with retry logic.
-            let timeout_duration = Duration::from_secs(USAGE_RECORDING_TIMEOUT_SECS);
-            match tokio::time::timeout(
-                timeout_duration,
-                usage_service.record_usage(usage_request.clone()),
-            )
-            .await
-            {
-                Ok(Ok(())) => {
-                    // Usage recorded successfully before response returned
-                    tracing::debug!(
-                        image_id = %provider_request_id,
-                        %organization_id,
-                        "Image generation usage recorded synchronously"
-                    );
-                }
-                Ok(Err(e)) => {
-                    // Recording failed, fall back to async retry
-                    tracing::warn!(
-                        error = %e,
-                        image_id = %provider_request_id,
-                        "Failed to record usage synchronously, retrying async"
-                    );
-                    let usage_service_clone = usage_service.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = usage_service_clone.record_usage(usage_request).await {
-                            tracing::error!(
-                                error = %e,
-                                image_id = %provider_request_id,
-                                "Failed to record image generation usage in async retry"
-                            );
-                        }
-                    });
-                }
-                Err(_timeout) => {
-                    // Recording timed out, fall back to async retry to avoid blocking client
-                    tracing::warn!(
-                        image_id = %provider_request_id,
-                        "Usage recording timed out ({USAGE_RECORDING_TIMEOUT_SECS}s), retrying async"
-                    );
-                    let usage_service_clone = usage_service.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = usage_service_clone.record_usage(usage_request).await {
-                            tracing::error!(
-                                error = %e,
-                                image_id = %provider_request_id,
-                                "Failed to record image generation usage in async retry after timeout"
-                            );
-                        }
-                    });
-                }
-            }
+                &provider_request_id,
+                image_count,
+                services::usage::InferenceType::ImageGeneration,
+            );
+            record_usage_with_sync_fallback(usage_service, usage_request, "Image generation").await;
 
             // Return the exact bytes from the provider for hash verification
             // This ensures clients can hash the response and compare with attestation endpoints
@@ -1627,81 +1652,16 @@ pub async fn image_edits(
                 }
             };
 
-            // Hash the provider request ID to UUID for storage
-            let inference_id = Some(hash_inference_id_to_uuid(&provider_request_id));
-
-            let usage_request = services::usage::RecordUsageServiceRequest {
+            let usage_request = build_image_usage_request(
                 organization_id,
                 workspace_id,
                 api_key_id,
                 model_id,
-                // Image edit doesn't have traditional token counts
-                input_tokens: 0,
-                output_tokens: 0,
-                inference_type: services::usage::ports::InferenceType::ImageEdit,
-                ttft_ms: None,
-                avg_itl_ms: None,
-                inference_id,
-                provider_request_id: Some(provider_request_id.clone()),
-                stop_reason: Some(services::usage::StopReason::Completed),
-                response_id: None,
-                image_count: Some(image_count),
-            };
-
-            // Attempt synchronous usage recording with timeout before returning response.
-            // This ensures usage is persisted to the database before the client considers the request complete.
-            // If recording times out (>5s), fall back to fire-and-forget async task with retry logic.
-            let timeout_duration = Duration::from_secs(USAGE_RECORDING_TIMEOUT_SECS);
-            match tokio::time::timeout(
-                timeout_duration,
-                usage_service.record_usage(usage_request.clone()),
-            )
-            .await
-            {
-                Ok(Ok(())) => {
-                    // Usage recorded successfully before response returned
-                    tracing::debug!(
-                        image_id = %provider_request_id,
-                        %organization_id,
-                        "Image edit usage recorded synchronously"
-                    );
-                }
-                Ok(Err(e)) => {
-                    // Recording failed, fall back to async retry
-                    tracing::warn!(
-                        error = %e,
-                        image_id = %provider_request_id,
-                        "Failed to record usage synchronously, retrying async"
-                    );
-                    let usage_service_clone = usage_service.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = usage_service_clone.record_usage(usage_request).await {
-                            tracing::error!(
-                                error = %e,
-                                image_id = %provider_request_id,
-                                "Failed to record image edit usage in async retry"
-                            );
-                        }
-                    });
-                }
-                Err(_timeout) => {
-                    // Recording timed out, fall back to async retry to avoid blocking client
-                    tracing::warn!(
-                        image_id = %provider_request_id,
-                        "Usage recording timed out ({USAGE_RECORDING_TIMEOUT_SECS}s), retrying async"
-                    );
-                    let usage_service_clone = usage_service.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = usage_service_clone.record_usage(usage_request).await {
-                            tracing::error!(
-                                error = %e,
-                                image_id = %provider_request_id,
-                                "Failed to record image edit usage in async retry after timeout"
-                            );
-                        }
-                    });
-                }
-            }
+                &provider_request_id,
+                image_count,
+                services::usage::InferenceType::ImageEdit,
+            );
+            record_usage_with_sync_fallback(usage_service, usage_request, "Image edit").await;
 
             // Return the exact bytes from the provider for hash verification
             // This ensures clients can hash the response and compare with attestation endpoints
@@ -2164,7 +2124,7 @@ pub async fn score(
             )
             .await
             {
-                Ok(Ok(())) => ResponseJson(response).into_response(),
+                Ok(Ok(_)) => ResponseJson(response).into_response(),
                 Ok(Err(e)) => {
                     tracing::warn!(
                         error = %e,

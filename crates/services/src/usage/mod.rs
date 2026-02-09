@@ -85,7 +85,10 @@ impl UsageServiceTrait for UsageServiceImpl {
     }
 
     /// Record usage after an API call completes
-    async fn record_usage(&self, request: RecordUsageServiceRequest) -> Result<(), UsageError> {
+    async fn record_usage(
+        &self,
+        request: RecordUsageServiceRequest,
+    ) -> Result<UsageLogEntry, UsageError> {
         // Look up the model to get pricing (model_id is already a UUID)
         let model = self
             .model_repository
@@ -192,14 +195,15 @@ impl UsageServiceTrait for UsageServiceImpl {
         };
 
         // Record in database
-        let _log = self
+        let log = self
             .usage_repository
             .record_usage(db_request)
             .await
             .map_err(|e| UsageError::InternalError(format!("Failed to record usage: {e}")))?;
 
-        // Record cost metric (low-cardinality: model + environment only)
-        if total_cost > 0 {
+        // Record cost metric ONLY for new inserts (not duplicates)
+        // This prevents metric inflation when idempotent requests are retried
+        if log.was_inserted && total_cost > 0 {
             let environment = get_environment();
             let tags = [
                 format!("{}:{}", TAG_MODEL, model.model_name),
@@ -208,9 +212,126 @@ impl UsageServiceTrait for UsageServiceImpl {
             let tags_str: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
             self.metrics_service
                 .record_count(METRIC_COST_USD, total_cost, &tags_str);
+        } else if !log.was_inserted {
+            // Log when we skip metrics for a duplicate (aids debugging)
+            tracing::debug!(
+                organization_id = %log.organization_id,
+                inference_id = ?log.inference_id,
+                "Skipping metrics recording for duplicate usage record"
+            );
         }
 
-        Ok(())
+        Ok(log)
+    }
+
+    /// Record usage from the public API endpoint.
+    /// Resolves model by name, validates per-variant fields, and delegates to `record_usage`.
+    async fn record_usage_from_api(
+        &self,
+        organization_id: Uuid,
+        workspace_id: Uuid,
+        api_key_id: Uuid,
+        request: RecordUsageApiRequest,
+    ) -> Result<UsageLogEntry, UsageError> {
+        let (model_name, input_tokens, output_tokens, image_count, inference_type, external_id) =
+            match &request {
+                RecordUsageApiRequest::ChatCompletion {
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    id,
+                } => {
+                    if id.trim().is_empty() {
+                        return Err(UsageError::ValidationError(
+                            "id must be a non-empty string".into(),
+                        ));
+                    }
+                    let input = input_tokens.unwrap_or(0);
+                    let output = output_tokens.unwrap_or(0);
+                    if input < 0 || output < 0 {
+                        return Err(UsageError::ValidationError(
+                            "token counts must be non-negative".into(),
+                        ));
+                    }
+                    if input == 0 && output == 0 {
+                        return Err(UsageError::ValidationError(
+                            "at least one of input_tokens or output_tokens must be positive".into(),
+                        ));
+                    }
+                    (
+                        model.clone(),
+                        input,
+                        output,
+                        None,
+                        InferenceType::ChatCompletion,
+                        id.clone(),
+                    )
+                }
+                RecordUsageApiRequest::ImageGeneration {
+                    model,
+                    image_count,
+                    id,
+                } => {
+                    if id.trim().is_empty() {
+                        return Err(UsageError::ValidationError(
+                            "id must be a non-empty string".into(),
+                        ));
+                    }
+                    if *image_count <= 0 {
+                        return Err(UsageError::ValidationError(
+                            "image_count must be positive".into(),
+                        ));
+                    }
+                    (
+                        model.clone(),
+                        0,
+                        0,
+                        Some(*image_count),
+                        InferenceType::ImageGeneration,
+                        id.clone(),
+                    )
+                }
+            };
+
+        // Look up model by name to get pricing and UUID
+        let model = self
+            .model_repository
+            .get_model_by_name(&model_name)
+            .await
+            .map_err(|e| UsageError::InternalError(format!("Failed to look up model: {e}")))?
+            .ok_or_else(|| {
+                UsageError::ModelNotFound(format!("Model '{}' not found", model_name))
+            })?;
+
+        // Derive inference tracking fields from the required external `id`.
+        // Stored as provider_request_id and hashed to a deterministic UUID v5
+        // for inference_id (same logic as the inference pipeline).
+        // The inference_id serves as the idempotency key: duplicate calls with
+        // the same id within the same org return the existing record.
+        let provider_request_id = Some(external_id.clone());
+        let inference_id = Some(crate::completions::hash_inference_id_to_uuid(&external_id));
+
+        // Build internal request and delegate.
+        // Internal metrics (ttft_ms, avg_itl_ms, stop_reason) are not exposed
+        // via the public API — they are populated only by the inference pipeline.
+        let service_request = RecordUsageServiceRequest {
+            organization_id,
+            workspace_id,
+            api_key_id,
+            model_id: model.id,
+            input_tokens,
+            output_tokens,
+            inference_type,
+            ttft_ms: None,
+            avg_itl_ms: None,
+            inference_id,
+            provider_request_id,
+            stop_reason: None,
+            response_id: None,
+            image_count,
+        };
+
+        self.record_usage(service_request).await
     }
 
     /// Check if organization can make an API call (pre-flight check)

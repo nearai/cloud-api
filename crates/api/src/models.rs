@@ -366,6 +366,66 @@ impl ImageEditRequest {
     }
 }
 
+/// Request for image editing with JSON (supports base64 and file URLs)
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ImageEditJsonRequest {
+    /// Model ID to use for editing (e.g., "Qwen/Qwen-Image-2512")
+    pub model: String,
+
+    /// Image to edit (base64 data URL or file reference)
+    pub image: ImageInput,
+
+    /// Text prompt describing the edits to make
+    pub prompt: String,
+
+    /// Image size in WxH format (e.g., "512x512")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+
+    /// Response format ("b64_json" or "url")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+}
+
+impl ImageEditJsonRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.model.trim().is_empty() {
+            return Err("model is required".to_string());
+        }
+        if self.prompt.trim().is_empty() {
+            return Err("prompt is required".to_string());
+        }
+
+        // Validate size format if provided
+        if let Some(ref size) = self.size {
+            let parts: Vec<&str> = size.split('x').collect();
+            if parts.len() != 2 {
+                return Err("size must be in format 'WIDTHxHEIGHT' (e.g., '1024x1024')".to_string());
+            }
+            match (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                (Ok(w), Ok(h)) => {
+                    if w == 0 || h == 0 {
+                        return Err("size dimensions must be greater than zero".to_string());
+                    }
+                }
+                _ => {
+                    return Err(
+                        "size must be in format 'WIDTHxHEIGHT' with numeric values".to_string()
+                    );
+                }
+            }
+        }
+
+        if let Some(ref format) = self.response_format {
+            if format != "url" && format != "b64_json" {
+                return Err("response_format must be 'url' or 'b64_json'".to_string());
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Response from image generation
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ImageGenerationResponse {

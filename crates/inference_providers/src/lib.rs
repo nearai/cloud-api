@@ -71,16 +71,16 @@ use tokio_stream::StreamExt;
 // Re-export commonly used types for convenience
 pub use mock::MockProvider;
 pub use models::{
-    AudioOutput, AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
-    ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
-    ChatCompletionResponseWithBytes, ChatDelta, ChatMessage, ChatResponseMessage, ChatSignature,
-    CompletionError, CompletionParams, FinishReason, FunctionChoice, FunctionDefinition, ImageData,
-    ImageEditError, ImageEditParams, ImageEditResponse, ImageEditResponseWithBytes,
-    ImageGenerationError, ImageGenerationParams, ImageGenerationResponse,
-    ImageGenerationResponseWithBytes, MessageRole, ModelInfo, RerankError, RerankParams,
-    RerankResponse, RerankResult, RerankUsage, ScoreError, ScoreParams, ScoreResponse, ScoreResult,
-    ScoreUsage, StreamChunk, StreamOptions, TokenUsage, ToolChoice, ToolDefinition,
-    TranscriptionSegment, TranscriptionWord,
+    detect_audio_content_type, AudioOutput, AudioTranscriptionError, AudioTranscriptionParams,
+    AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponse,
+    ChatCompletionResponseChoice, ChatCompletionResponseWithBytes, ChatDelta, ChatMessage,
+    ChatResponseMessage, ChatSignature, CompletionError, CompletionParams, FinishReason,
+    FunctionChoice, FunctionDefinition, ImageData, ImageEditError, ImageEditParams,
+    ImageEditResponse, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponse, ImageGenerationResponseWithBytes, MessageRole, ModelInfo, RerankError,
+    RerankParams, RerankResponse, RerankResult, RerankUsage, ScoreError, ScoreParams,
+    ScoreResponse, ScoreResult, ScoreUsage, StreamChunk, StreamOptions, TokenUsage, ToolChoice,
+    ToolDefinition, TranscriptionSegment, TranscriptionWord,
 };
 pub use sse_parser::{new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser};
 pub use vllm::{VLlmConfig, VLlmProvider};

@@ -1,7 +1,7 @@
 use crate::{
     middleware::{auth::AuthenticatedApiKey, RequestBodyHash},
     models::*,
-    routes::{api::AppState, common::map_domain_error_to_status, files::MAX_FILE_SIZE},
+    routes::{api::AppState, common::map_domain_error_to_status},
 };
 use axum::{
     body::{Body, Bytes},
@@ -28,46 +28,6 @@ const USAGE_RECORDING_TIMEOUT_SECS: u64 = 5;
 
 // Custom header for exposing the inference ID as a UUID
 const HEADER_INFERENCE_ID: &str = "Inference-Id";
-
-// Helper function to provide detailed error context for multipart parsing failures
-fn analyze_multipart_error(e: &axum::extract::multipart::MultipartError) -> (StatusCode, String) {
-    let error_str = e.to_string();
-
-    // Match against known multipart error patterns to provide specific guidance
-    let (status, message) = if error_str.contains("boundary") {
-        (
-            StatusCode::BAD_REQUEST,
-            "Invalid Content-Type boundary in multipart request. Ensure the boundary parameter in the Content-Type header matches the actual boundary markers in the message body.".to_string(),
-        )
-    } else if error_str.contains("unexpected end") || error_str.contains("unexpected EOF") {
-        (
-            StatusCode::BAD_REQUEST,
-            "Request body ended unexpectedly. The multipart message may be truncated or missing the final boundary marker.".to_string(),
-        )
-    } else if error_str.contains("field") && error_str.contains("size") {
-        (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "Individual form field size exceeded. A single field in the multipart request is too large.".to_string(),
-        )
-    } else if error_str.contains("field") {
-        (
-            StatusCode::BAD_REQUEST,
-            "Invalid form field in multipart request. Check field encoding and format.".to_string(),
-        )
-    } else if error_str.contains("content") {
-        (
-            StatusCode::BAD_REQUEST,
-            "Invalid Content-Type or content encoding in multipart request.".to_string(),
-        )
-    } else {
-        (
-            StatusCode::BAD_REQUEST,
-            "Invalid multipart form data. The request does not conform to multipart/form-data format.".to_string(),
-        )
-    };
-
-    (status, message)
-}
 
 // Helper function to extract inference ID from first SSE chunk
 fn extract_inference_id_from_sse(raw_bytes: &[u8]) -> Option<Uuid> {
@@ -108,6 +68,16 @@ fn has_vision_capability(input_modalities: &Option<Vec<String>>) -> bool {
     input_modalities
         .as_ref()
         .is_some_and(|modalities| modalities.contains(&"image".to_string()))
+}
+
+// Struct to encapsulate image analysis parameters
+struct ImageAnalysisParams {
+    model_name: String,
+    prompt: String,
+    image_url: String,
+    max_tokens: Option<i32>,
+    temperature: Option<f32>,
+    body_hash: String,
 }
 
 // Convert HTTP ChatCompletionRequest to service CompletionRequest
@@ -1318,169 +1288,78 @@ pub async fn audio_transcriptions(
     }
 }
 
-/// Edit images from a text prompt and image
+/// Edit images from a text prompt and image (JSON with base64)
 ///
-/// Edit images using an AI model from an image and text description. OpenAI-compatible endpoint.
-///
-/// **Request Body (multipart/form-data):**
-/// All fields should be provided as text values or files as indicated in the schema.
+/// Edit images using an AI model from an image and text description. Supports base64 data URLs.
+/// JSON request body format.
 #[utoipa::path(
     post,
     path = "/v1/images/edits",
     tag = "Images",
-    request_body(content = ImageEditRequestSchema, content_type = "multipart/form-data"),
+    request_body = ImageEditJsonRequest,
     responses(
         (status = 200, description = "Image edited successfully", body = ImageGenerationResponse),
         (status = 400, description = "Invalid request parameters", body = ErrorResponse),
         (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
-        (status = 413, description = "Payload too large", body = ErrorResponse),
         (status = 500, description = "Server error", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
     )
 )]
-pub async fn image_edits(
+pub async fn image_edits_json(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
-    mut multipart: axum::extract::Multipart,
+    Json(request): Json<ImageEditJsonRequest>,
 ) -> axum::response::Response {
-    debug!("Image edit request from api key: {:?}", api_key.api_key.id);
+    // Validate request
+    if let Err(e) = request.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(e, "invalid_request_error".to_string())),
+        )
+            .into_response();
+    }
 
-    let mut model = String::new();
-    let mut prompt = String::new();
-    let mut image: Option<Vec<u8>> = None;
-    let mut size: Option<String> = None;
-    let mut response_format: Option<String> = None;
-
-    // Parse multipart form data
-    loop {
-        match multipart.next_field().await {
-            Ok(Some(mut field)) => {
-                match field.name().unwrap_or("") {
-                    "image" => {
-                        // Use streaming validation to detect oversized payloads before buffering entirely in memory.
-                        // This prevents memory exhaustion DoS attacks where attackers send payloads larger than MAX_FILE_SIZE.
-                        let mut bytes = Vec::new();
-                        let mut size = 0usize;
-
-                        loop {
-                            match field.chunk().await {
-                                Ok(Some(chunk)) => {
-                                    size += chunk.len();
-                                    // Reject early if size exceeds limit, before allocating memory
-                                    if size > MAX_FILE_SIZE {
-                                        return (
-                                            StatusCode::PAYLOAD_TOO_LARGE,
-                                            ResponseJson(ErrorResponse::new(
-                                                "Image size exceeds maximum of 512 MB".to_string(),
-                                                "invalid_request_error".to_string(),
-                                            )),
-                                        )
-                                            .into_response();
-                                    }
-                                    bytes.extend_from_slice(&chunk);
-                                }
-                                Ok(None) => break,
-                                Err(e) => {
-                                    return (
-                                        StatusCode::BAD_REQUEST,
-                                        ResponseJson(ErrorResponse::new(
-                                            format!("Failed to read image: {}", e),
-                                            "invalid_request_error".to_string(),
-                                        )),
-                                    )
-                                        .into_response();
-                                }
-                            }
-                        }
-
-                        image = Some(bytes);
-                    }
-                    "model" => match field.text().await {
-                        Ok(text) => model = text,
-                        Err(e) => {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                ResponseJson(ErrorResponse::new(
-                                    format!("Failed to read model: {}", e),
-                                    "invalid_request_error".to_string(),
-                                )),
-                            )
-                                .into_response();
-                        }
-                    },
-                    "prompt" => match field.text().await {
-                        Ok(text) => prompt = text,
-                        Err(e) => {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                ResponseJson(ErrorResponse::new(
-                                    format!("Failed to read prompt: {}", e),
-                                    "invalid_request_error".to_string(),
-                                )),
-                            )
-                                .into_response();
-                        }
-                    },
-                    "size" => match field.text().await {
-                        Ok(text) => size = Some(text),
-                        Err(e) => {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                ResponseJson(ErrorResponse::new(
-                                    format!("Failed to read size: {}", e),
-                                    "invalid_request_error".to_string(),
-                                )),
-                            )
-                                .into_response();
-                        }
-                    },
-                    "response_format" => match field.text().await {
-                        Ok(text) => response_format = Some(text),
-                        Err(e) => {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                ResponseJson(ErrorResponse::new(
-                                    format!("Failed to read response_format: {}", e),
-                                    "invalid_request_error".to_string(),
-                                )),
-                            )
-                                .into_response();
-                        }
-                    },
-                    _ => {
-                        // Ignore unknown fields
-                    }
-                }
-            }
-            Ok(None) => break, // All fields read successfully
-            Err(e) => {
-                // Multipart parsing error (malformed boundary, invalid encoding, etc.)
-                let (status, error_message) = analyze_multipart_error(&e);
-                tracing::debug!(error = %e, message = %error_message, "Multipart parsing error");
+    // Extract image bytes from ImageInput - parse base64 data URL
+    let image_bytes = match &request.image {
+        ImageInput::DataUrl(data_url) => {
+            // Parse data URL: data:image/png;base64,{base64_string}
+            let base64_part = if let Some(idx) = data_url.rfind(',') {
+                &data_url[idx + 1..]
+            } else {
                 return (
-                    status,
+                    StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(
-                        error_message,
+                        "Invalid image data URL format. Expected: data:image/{type};base64,{base64_string}".to_string(),
                         "invalid_request_error".to_string(),
                     )),
                 )
                     .into_response();
+            };
+
+            match base64::engine::general_purpose::STANDARD.decode(base64_part) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            "Invalid base64 encoding in image data URL".to_string(),
+                            "invalid_request_error".to_string(),
+                        )),
+                    )
+                        .into_response();
+                }
             }
         }
-    }
-
-    // Fail fast if image is missing
-    let image = match image {
-        Some(img) => img,
-        None => {
+        ImageInput::FileId { file_id: _ } => {
+            // TODO: Implement file_id support to fetch from file storage
             return (
                 StatusCode::BAD_REQUEST,
                 ResponseJson(ErrorResponse::new(
-                    "Missing required field: image".to_string(),
+                    "File ID support for image edit not yet implemented. Use base64 data URLs instead.".to_string(),
                     "invalid_request_error".to_string(),
                 )),
             )
@@ -1488,22 +1367,17 @@ pub async fn image_edits(
         }
     };
 
-    // Build the request
-    let request = crate::models::ImageEditRequest {
-        model,
-        prompt,
-        image,
-        size,
-        response_format,
+    // Build the image edit request
+    let edit_request = ImageEditRequest {
+        model: request.model,
+        prompt: request.prompt,
+        image: image_bytes,
+        size: request.size,
+        response_format: request.response_format,
     };
 
-    debug!(
-        "Image edit request: model={}, org={}, workspace={}",
-        request.model, api_key.organization.id, api_key.workspace.id.0
-    );
-
-    // Validate the request
-    if let Err(error) = request.validate() {
+    // Validate the image edit request (checks file format, size format, etc.)
+    if let Err(error) = edit_request.validate() {
         return (
             StatusCode::BAD_REQUEST,
             ResponseJson(ErrorResponse::new(
@@ -1517,7 +1391,7 @@ pub async fn image_edits(
     // Resolve model to get UUID for usage tracking
     let model = match app_state
         .models_service
-        .get_model_by_name(&request.model)
+        .get_model_by_name(&edit_request.model)
         .await
     {
         Ok(model) => model,
@@ -1525,7 +1399,7 @@ pub async fn image_edits(
             return (
                 StatusCode::NOT_FOUND,
                 ResponseJson(ErrorResponse::new(
-                    format!("Model '{}' not found", request.model),
+                    format!("Model '{}' not found", edit_request.model),
                     "invalid_request_error".to_string(),
                 )),
             )
@@ -1545,11 +1419,9 @@ pub async fn image_edits(
         }
     };
 
-    // Validate and enforce response_format for verifiable models
-    // Verifiable models (attestation_supported = true) only support "b64_json" format
-    // Default to "b64_json" if not specified to prevent downstream server from applying "url" default
+    // Validate response_format for verifiable models
     let response_format = if model.attestation_supported {
-        match &request.response_format {
+        match &edit_request.response_format {
             Some(format) if format == "b64_json" => Some(format.clone()),
             Some(format) => {
                 return (
@@ -1564,18 +1436,18 @@ pub async fn image_edits(
                 )
                     .into_response();
             }
-            None => Some("b64_json".to_string()), // Default to b64_json for verifiable models
+            None => Some("b64_json".to_string()),
         }
     } else {
-        request.response_format.clone()
+        edit_request.response_format.clone()
     };
 
     // Convert API request to provider params
     let params = inference_providers::ImageEditParams {
-        model: request.model.clone(),
-        prompt: request.prompt.clone(),
-        image: Arc::new(request.image),
-        size: request.size,
+        model: edit_request.model.clone(),
+        prompt: edit_request.prompt.clone(),
+        image: Arc::new(edit_request.image),
+        size: edit_request.size,
         response_format,
     };
 
@@ -1586,7 +1458,7 @@ pub async fn image_edits(
         .await
     {
         Ok(response_with_bytes) => {
-            // Store attestation signature for image edit (same pattern as image generation)
+            // Store attestation signature
             let attestation_service = app_state.attestation_service.clone();
             let image_id_for_sig = response_with_bytes.response.id.clone();
             tokio::spawn(async move {
@@ -1595,13 +1467,10 @@ pub async fn image_edits(
                     .await
                 {
                     tracing::debug!(error = %e, "Failed to store image edit signature");
-                    tracing::warn!("Image edit: signature storage failed");
-                } else {
-                    tracing::debug!(image_id = %image_id_for_sig, "Stored signature for image edit");
                 }
             });
 
-            // Record usage for image edit
+            // Record usage (same pattern as multipart endpoint)
             let organization_id = api_key.organization.id.0;
             let workspace_id = api_key.workspace.id.0;
             let api_key_id_str = api_key.api_key.id.0.clone();
@@ -1609,7 +1478,6 @@ pub async fn image_edits(
             let image_count = match i32::try_from(response_with_bytes.response.data.len()) {
                 Ok(count) => count,
                 Err(_) => {
-                    tracing::error!("Too many images in provider response, cannot fit in i32 for usage tracking");
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         ResponseJson(ErrorResponse::new(
@@ -1620,15 +1488,12 @@ pub async fn image_edits(
                         .into_response();
                 }
             };
-            let provider_request_id = response_with_bytes.response.id.clone();
-            let usage_service = app_state.usage_service.clone();
 
-            // Parse API key ID early for usage recording
+            let provider_request_id = response_with_bytes.response.id.clone();
             let api_key_id = match Uuid::parse_str(&api_key_id_str) {
                 Ok(id) => id,
                 Err(e) => {
                     tracing::error!(error = %e, "Invalid API key ID for usage tracking");
-                    // Still return response but log error
                     return Response::builder()
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "application/json")
@@ -1637,30 +1502,27 @@ pub async fn image_edits(
                 }
             };
 
-            // Hash the provider request ID to UUID for storage
             let inference_id = Some(hash_inference_id_to_uuid(&provider_request_id));
+            let usage_service = app_state.usage_service.clone();
 
             let usage_request = services::usage::RecordUsageServiceRequest {
                 organization_id,
                 workspace_id,
                 api_key_id,
                 model_id,
-                // Image edit doesn't have traditional token counts
                 input_tokens: 0,
                 output_tokens: 0,
                 inference_type: services::usage::ports::InferenceType::ImageEdit,
                 ttft_ms: None,
                 avg_itl_ms: None,
                 inference_id,
-                provider_request_id: Some(provider_request_id.clone()),
+                provider_request_id: Some(provider_request_id),
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: Some(image_count),
             };
 
-            // Attempt synchronous usage recording with timeout before returning response.
-            // This ensures usage is persisted to the database before the client considers the request complete.
-            // If recording times out (>5s), fall back to fire-and-forget async task with retry logic.
+            // Attempt synchronous usage recording with timeout
             let timeout_duration = Duration::from_secs(USAGE_RECORDING_TIMEOUT_SECS);
             match tokio::time::timeout(
                 timeout_duration,
@@ -1669,52 +1531,56 @@ pub async fn image_edits(
             .await
             {
                 Ok(Ok(())) => {
-                    // Usage recorded successfully before response returned
-                    tracing::debug!(
-                        image_id = %provider_request_id,
-                        %organization_id,
-                        "Image edit usage recorded synchronously"
-                    );
+                    tracing::debug!("Image edit usage recorded successfully");
                 }
                 Ok(Err(e)) => {
-                    // Recording failed, fall back to async retry
-                    tracing::warn!(
-                        error = %e,
-                        image_id = %provider_request_id,
-                        "Failed to record usage synchronously, retrying async"
-                    );
-                    let usage_service_clone = usage_service.clone();
+                    tracing::warn!(error = %e, "Failed to record image edit usage, spawning async retry");
                     tokio::spawn(async move {
-                        if let Err(e) = usage_service_clone.record_usage(usage_request).await {
-                            tracing::error!(
-                                error = %e,
-                                image_id = %provider_request_id,
-                                "Failed to record image edit usage in async retry"
-                            );
+                        let mut retry_count = 0;
+                        while retry_count < 3 {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            match usage_service.record_usage(usage_request.clone()).await {
+                                Ok(()) => {
+                                    tracing::debug!("Image edit usage recorded in async retry");
+                                    return;
+                                }
+                                Err(e) => {
+                                    tracing::debug!(error = %e, retry_count, "Retrying usage recording");
+                                    retry_count += 1;
+                                }
+                            }
                         }
+                        tracing::error!("Failed to record image edit usage after 3 retries");
                     });
                 }
-                Err(_timeout) => {
-                    // Recording timed out, fall back to async retry to avoid blocking client
-                    tracing::warn!(
-                        image_id = %provider_request_id,
-                        "Usage recording timed out ({USAGE_RECORDING_TIMEOUT_SECS}s), retrying async"
-                    );
-                    let usage_service_clone = usage_service.clone();
+                Err(_) => {
+                    tracing::warn!("Usage recording timed out, spawning async retry");
                     tokio::spawn(async move {
-                        if let Err(e) = usage_service_clone.record_usage(usage_request).await {
-                            tracing::error!(
-                                error = %e,
-                                image_id = %provider_request_id,
-                                "Failed to record image edit usage in async retry after timeout"
-                            );
+                        let mut retry_count = 0;
+                        while retry_count < 3 {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            match tokio::time::timeout(
+                                Duration::from_secs(5),
+                                usage_service.record_usage(usage_request.clone()),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {
+                                    tracing::debug!("Image edit usage recorded in async retry");
+                                    return;
+                                }
+                                _ => {
+                                    tracing::debug!(retry_count, "Retrying usage recording");
+                                    retry_count += 1;
+                                }
+                            }
                         }
+                        tracing::error!("Failed to record image edit usage after 3 retries");
                     });
                 }
             }
 
-            // Return the exact bytes from the provider for hash verification
-            // This ensures clients can hash the response and compare with attestation endpoints
+            // Return response
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -1722,43 +1588,13 @@ pub async fn image_edits(
                 .unwrap()
         }
         Err(e) => {
-            // Log provider errors at debug level to avoid exposing infrastructure details in production
-            tracing::debug!(error = %e, "Image edit failed");
-
-            // Map error to appropriate status code and sanitized message
-            let (status_code, message) = match &e {
-                inference_providers::ImageEditError::EditError(msg) => {
-                    // Check if it's a model not found error
-                    if msg.contains("not found") || msg.contains("does not exist") {
-                        (StatusCode::NOT_FOUND, "Model not found".to_string())
-                    } else {
-                        tracing::warn!("Image edit error: service unavailable");
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "Image edit failed".to_string(),
-                        )
-                    }
-                }
-                inference_providers::ImageEditError::HttpError { status_code, .. } => {
-                    // Map HTTP status codes appropriately
-                    let code = StatusCode::from_u16(*status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    let msg = match code {
-                        StatusCode::NOT_FOUND => "Model not found".to_string(),
-                        StatusCode::BAD_REQUEST => "Invalid request".to_string(),
-                        StatusCode::TOO_MANY_REQUESTS => "Rate limit exceeded".to_string(),
-                        _ => {
-                            tracing::warn!(http_status = *status_code, "Image edit HTTP error");
-                            "Image edit failed".to_string()
-                        }
-                    };
-                    (code, msg)
-                }
-            };
-
+            tracing::error!(error = %e, "Image edit provider error");
             (
-                status_code,
-                ResponseJson(ErrorResponse::new(message, "server_error".to_string())),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Provider error: {}", e),
+                    "server_error".to_string(),
+                )),
             )
                 .into_response()
         }
@@ -1770,35 +1606,34 @@ pub async fn image_edits(
 async fn perform_image_analysis(
     app_state: &AppState,
     api_key: &AuthenticatedApiKey,
-    body_hash: String,
     headers: &axum::http::HeaderMap,
-    model_name: String,
-    prompt: String,
-    image_url: String,
-    max_tokens: Option<i32>,
-    temperature: Option<f32>,
+    params: ImageAnalysisParams,
 ) -> axum::response::Response {
     // Log request (IDs only, per CLAUDE.md privacy rules)
     tracing::info!(
-        model = %model_name,
+        model = %params.model_name,
         org_id = %api_key.organization.id,
         workspace_id = %api_key.workspace.id,
         "Image analysis request"
     );
 
     // Resolve model and validate it's a vision model
-    let model = match app_state.models_service.get_model_by_name(&model_name).await {
+    let model = match app_state
+        .models_service
+        .get_model_by_name(&params.model_name)
+        .await
+    {
         Ok(model) => model,
         Err(services::models::ModelsError::NotFound(_)) => {
-            tracing::warn!(model = %model_name, "Model not found for image analysis");
+            tracing::warn!(model = %params.model_name, "Model not found for image analysis");
             return (
                 StatusCode::NOT_FOUND,
                 ResponseJson(ErrorResponse::new(
-                    format!("Model '{}' not found", model_name),
+                    format!("Model '{}' not found", params.model_name),
                     "invalid_request_error".to_string(),
                 )),
             )
-            .into_response();
+                .into_response();
         }
         Err(e) => {
             tracing::error!(error = %e, "Failed to resolve model for image analysis");
@@ -1809,21 +1644,21 @@ async fn perform_image_analysis(
                     "server_error".to_string(),
                 )),
             )
-            .into_response();
+                .into_response();
         }
     };
 
     // Validate model has vision capability
     if !has_vision_capability(&model.input_modalities) {
         tracing::warn!(
-            model = %model_name,
+            model = %params.model_name,
             input_modalities = ?model.input_modalities,
             "Model does not support image analysis"
         );
         return (
             StatusCode::BAD_REQUEST,
             ResponseJson(ErrorResponse::new(
-                format!("Model '{}' does not support image analysis. Model must have input_modalities including 'image'.", model_name),
+                format!("Model '{}' does not support image analysis. Model must have input_modalities including 'image'.", params.model_name),
                 "invalid_request_error".to_string(),
             )),
         )
@@ -1834,12 +1669,12 @@ async fn perform_image_analysis(
     let message_content = serde_json::json!([
         {
             "type": "text",
-            "text": prompt
+            "text": params.prompt
         },
         {
             "type": "image_url",
             "image_url": {
-                "url": image_url
+                "url": params.image_url
             }
         }
     ]);
@@ -1878,11 +1713,11 @@ async fn perform_image_analysis(
         );
     }
 
-    let params = inference_providers::ChatCompletionParams {
-        model: model_name,
+    let completion_params = inference_providers::ChatCompletionParams {
+        model: params.model_name,
         messages,
-        max_completion_tokens: max_tokens.map(|t| t as i64),
-        temperature,
+        max_completion_tokens: params.max_tokens.map(|t| t as i64),
+        temperature: params.temperature,
         stream: Some(false), // For MVP, only non-streaming
         extra,
         max_tokens: None,
@@ -1908,7 +1743,7 @@ async fn perform_image_analysis(
     // Call inference provider (non-streaming for MVP)
     match app_state
         .inference_provider_pool
-        .chat_completion(params, body_hash)
+        .chat_completion(completion_params, params.body_hash)
         .await
     {
         Ok(response) => {
@@ -1948,7 +1783,7 @@ async fn perform_image_analysis(
                     "server_error".to_string(),
                 )),
             )
-            .into_response()
+                .into_response()
         }
     }
 }
@@ -2248,9 +2083,12 @@ pub async fn image_analyses(
     if let Err(error) = request.validate() {
         return (
             StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(error, "invalid_request_error".to_string())),
+            ResponseJson(ErrorResponse::new(
+                error,
+                "invalid_request_error".to_string(),
+            )),
         )
-        .into_response();
+            .into_response();
     }
 
     // Convert image input to URL format
@@ -2265,7 +2103,7 @@ pub async fn image_analyses(
                         "invalid_request_error".to_string(),
                     )),
                 )
-                .into_response();
+                    .into_response();
             }
             data_url.clone()
         }
@@ -2275,235 +2113,15 @@ pub async fn image_analyses(
     perform_image_analysis(
         &app_state,
         &api_key,
-        body_hash.hash.clone(),
         &headers,
-        request.model,
-        request.prompt,
-        image_url,
-        request.max_tokens,
-        request.temperature,
-    )
-    .await
-}
-
-/// Analyze an image and return text description (multipart form data with file upload)
-///
-/// Use a vision model to analyze an image file and answer a question about it.
-/// Accepts file uploads via multipart/form-data.
-///
-/// **Request Body (multipart/form-data):**
-/// - `model` (text, required): Model ID (e.g., "Qwen/Qwen3-VL-30B-A3B-Instruct")
-/// - `image` (file, required): Image file (PNG or JPEG)
-/// - `prompt` (text, required): Question or description of what to analyze
-/// - `max_tokens` (text, optional): Maximum tokens in response
-/// - `temperature` (text, optional): Sampling temperature (0.0-2.0)
-#[utoipa::path(
-    post,
-    path = "/v1/images/analyses/upload",
-    tag = "Images",
-    request_body(content = ImageEditRequestSchema, content_type = "multipart/form-data"),
-    responses(
-        (status = 200, description = "Image analysis successful", body = ImageAnalysisResponse),
-        (status = 400, description = "Invalid request parameters", body = ErrorResponse),
-        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
-        (status = 404, description = "Model not found", body = ErrorResponse),
-        (status = 413, description = "Payload too large", body = ErrorResponse),
-        (status = 500, description = "Server error", body = ErrorResponse)
-    ),
-    security(
-        ("api_key" = [])
-    )
-)]
-pub async fn image_analyses_multipart(
-    State(app_state): State<AppState>,
-    Extension(api_key): Extension<AuthenticatedApiKey>,
-    Extension(body_hash): Extension<RequestBodyHash>,
-    headers: header::HeaderMap,
-    mut multipart: axum::extract::Multipart,
-) -> axum::response::Response {
-    debug!("Image analysis request (multipart) from api key");
-
-    let mut model = String::new();
-    let mut prompt = String::new();
-    let mut image_bytes: Option<Vec<u8>> = None;
-    let mut max_tokens: Option<i32> = None;
-    let mut temperature: Option<f32> = None;
-
-    // Parse multipart form data
-    loop {
-        match multipart.next_field().await {
-            Ok(Some(mut field)) => {
-                match field.name().unwrap_or("") {
-                    "image" => {
-                        // Use streaming validation to detect oversized payloads before buffering
-                        let mut bytes = Vec::new();
-                        let mut size = 0usize;
-
-                        loop {
-                            match field.chunk().await {
-                                Ok(Some(chunk)) => {
-                                    size += chunk.len();
-                                    if size > MAX_FILE_SIZE {
-                                        return (
-                                            StatusCode::PAYLOAD_TOO_LARGE,
-                                            ResponseJson(ErrorResponse::new(
-                                                "Image size exceeds maximum of 512 MB".to_string(),
-                                                "invalid_request_error".to_string(),
-                                            )),
-                                        )
-                                        .into_response();
-                                    }
-                                    bytes.extend_from_slice(&chunk);
-                                }
-                                Ok(None) => break,
-                                Err(e) => {
-                                    return (
-                                        StatusCode::BAD_REQUEST,
-                                        ResponseJson(ErrorResponse::new(
-                                            format!("Failed to read image: {}", e),
-                                            "invalid_request_error".to_string(),
-                                        )),
-                                    )
-                                    .into_response();
-                                }
-                            }
-                        }
-
-                        // Validate image format (PNG or JPEG)
-                        let is_png = bytes.len() >= 4 && &bytes[0..4] == b"\x89PNG";
-                        let is_jpeg = bytes.len() >= 3 && &bytes[0..3] == b"\xFF\xD8\xFF";
-                        if !is_png && !is_jpeg {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                ResponseJson(ErrorResponse::new(
-                                    "Image must be a valid PNG or JPEG file".to_string(),
-                                    "invalid_request_error".to_string(),
-                                )),
-                            )
-                            .into_response();
-                        }
-
-                        image_bytes = Some(bytes);
-                    }
-                    "model" => match field.text().await {
-                        Ok(text) => model = text,
-                        Err(e) => {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                ResponseJson(ErrorResponse::new(
-                                    format!("Failed to read model: {}", e),
-                                    "invalid_request_error".to_string(),
-                                )),
-                            )
-                            .into_response();
-                        }
-                    },
-                    "prompt" => match field.text().await {
-                        Ok(text) => prompt = text,
-                        Err(e) => {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                ResponseJson(ErrorResponse::new(
-                                    format!("Failed to read prompt: {}", e),
-                                    "invalid_request_error".to_string(),
-                                )),
-                            )
-                            .into_response();
-                        }
-                    },
-                    "max_tokens" => match field.text().await {
-                        Ok(text) => {
-                            max_tokens = text.parse::<i32>().ok();
-                        }
-                        Err(e) => {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                ResponseJson(ErrorResponse::new(
-                                    format!("Failed to read max_tokens: {}", e),
-                                    "invalid_request_error".to_string(),
-                                )),
-                            )
-                            .into_response();
-                        }
-                    },
-                    "temperature" => match field.text().await {
-                        Ok(text) => {
-                            temperature = text.parse::<f32>().ok();
-                        }
-                        Err(e) => {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                ResponseJson(ErrorResponse::new(
-                                    format!("Failed to read temperature: {}", e),
-                                    "invalid_request_error".to_string(),
-                                )),
-                            )
-                            .into_response();
-                        }
-                    },
-                    _ => {} // Ignore unknown fields
-                }
-            }
-            Ok(None) => break,
-            Err(e) => {
-                let (status, message) = analyze_multipart_error(&e);
-                return (status, ResponseJson(ErrorResponse::new(message, "invalid_request_error".to_string())))
-                    .into_response();
-            }
-        }
-    }
-
-    // Validate required fields
-    if model.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                "model is required".to_string(),
-                "invalid_request_error".to_string(),
-            )),
-        )
-        .into_response();
-    }
-
-    if prompt.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                "prompt is required".to_string(),
-                "invalid_request_error".to_string(),
-            )),
-        )
-        .into_response();
-    }
-
-    let image_bytes = match image_bytes {
-        Some(bytes) => bytes,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                ResponseJson(ErrorResponse::new(
-                    "image is required".to_string(),
-                    "invalid_request_error".to_string(),
-                )),
-            )
-            .into_response();
-        }
-    };
-
-    // Convert image bytes to base64 data URL
-    let base64_image = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
-    let image_url = format!("data:image/png;base64,{}", base64_image);
-
-    perform_image_analysis(
-        &app_state,
-        &api_key,
-        body_hash.hash.clone(),
-        &headers,
-        model,
-        prompt,
-        image_url,
-        max_tokens,
-        temperature,
+        ImageAnalysisParams {
+            model_name: request.model,
+            prompt: request.prompt,
+            image_url,
+            max_tokens: request.max_tokens,
+            temperature: request.temperature,
+            body_hash: body_hash.hash.clone(),
+        },
     )
     .await
 }

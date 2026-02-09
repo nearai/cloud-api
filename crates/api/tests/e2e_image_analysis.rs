@@ -162,6 +162,19 @@ async fn test_image_analysis_validation() {
 
     assert_eq!(response.status_code(), 400);
 
+    // Test missing image (JSON deserialization error)
+    let response = server
+        .post("/v1/images/analyses")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": vision_model,
+            "prompt": "What is this?"
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 422);
+
     // Test invalid image format
     let response = server
         .post("/v1/images/analyses")
@@ -207,39 +220,75 @@ async fn test_image_analysis_with_file_id() {
     assert!(data["analysis"].is_string());
 }
 
-/// Test image analysis with multipart file upload
+/// Test image analysis with different detail levels
 #[tokio::test]
-async fn test_image_analysis_multipart_upload() {
+async fn test_image_analysis_detail_levels() {
     let (server, _guard) = setup_test_server().await;
     let vision_model = setup_vision_model(&server).await;
     let org = setup_org_with_credits(&server, 100_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
-    // 1x1 red pixel PNG (binary)
-    let png_binary = vec![
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-        0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
-        0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
-        0x99, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
-        0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-    ];
+    let base64_image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
 
+    // Test with detail: "low"
     let response = server
-        .post("/v1/images/analyses/upload")
+        .post("/v1/images/analyses")
         .add_header("Authorization", format!("Bearer {}", api_key))
         .add_header("User-Agent", MOCK_USER_AGENT)
-        .multipart(
-            axum_test::multipart::MultipartForm::new()
-                .add_text("model", &vision_model)
-                .add_text("prompt", "What color is this image?")
-                .add_text("max_tokens", "100")
-                .add_part(
-                    "image",
-                    axum_test::multipart::Part::bytes(png_binary)
-                        .file_name("test.png")
-                        .mime_type("image/png"),
-                ),
-        )
+        .json(&serde_json::json!({
+            "model": vision_model,
+            "image": format!("data:image/png;base64,{}", base64_image),
+            "prompt": "What color is this?",
+            "detail": "low"
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    let data: serde_json::Value = serde_json::from_str(&response.text()).expect("Valid JSON");
+    assert_eq!(data["object"], "image.analysis");
+    assert!(data["analysis"].is_string());
+
+    // Test with detail: "high"
+    let response = server
+        .post("/v1/images/analyses")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": vision_model,
+            "image": format!("data:image/png;base64,{}", base64_image),
+            "prompt": "Analyze this image in detail",
+            "detail": "high"
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    let data: serde_json::Value = serde_json::from_str(&response.text()).expect("Valid JSON");
+    assert_eq!(data["object"], "image.analysis");
+    assert!(data["analysis"].is_string());
+}
+
+/// Test image analysis with file_id reference (future extension)
+#[tokio::test]
+async fn test_image_analysis_with_size_and_detail() {
+    let (server, _guard) = setup_test_server().await;
+    let vision_model = setup_vision_model(&server).await;
+    let org = setup_org_with_credits(&server, 100_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // 1x1 red pixel PNG (base64)
+    let base64_image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
+
+    let response = server
+        .post("/v1/images/analyses")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": vision_model,
+            "image": format!("data:image/png;base64,{}", base64_image),
+            "prompt": "Analyze this image in detail",
+            "detail": "high",
+            "max_tokens": 100
+        }))
         .await;
 
     println!("Response status: {}", response.status_code());

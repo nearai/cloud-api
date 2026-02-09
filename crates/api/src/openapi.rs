@@ -43,9 +43,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::completions::chat_completions,
         crate::routes::completions::image_generations,
         crate::routes::completions::audio_transcriptions,
-        crate::routes::completions::image_edits,
+        crate::routes::completions::image_edits_json,
         crate::routes::completions::image_analyses,
-        crate::routes::completions::image_analyses_multipart,
         crate::routes::completions::rerank,
         crate::routes::completions::score,
         // crate::routes::completions::completions,
@@ -153,7 +152,7 @@ use utoipa::{Modify, OpenApi};
             // Audio transcription models
             AudioTranscriptionRequestSchema, AudioTranscriptionResponse, TranscriptionSegment, TranscriptionWord,
             // Image edit models
-            ImageEditRequestSchema,
+            ImageEditJsonRequest,
             // Image analysis models
             ImageAnalysisRequest, ImageAnalysisResponse, ImageAnalysisUsage, ImageInput,
             // Rerank models

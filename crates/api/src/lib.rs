@@ -16,10 +16,9 @@ use crate::{
             StateStore,
         },
         billing::{get_billing_costs, BillingRouteState},
-<<<<<<< HEAD
         completions::{
-            audio_transcriptions, chat_completions, image_analyses, image_analyses_multipart,
-            image_edits, image_generations, models, rerank, score,
+            audio_transcriptions, chat_completions, image_analyses, image_edits_json,
+            image_generations, models, rerank, score,
         },
         conversations,
         health::health_check,
@@ -602,7 +601,6 @@ pub async fn init_inference_providers_with_mocks(
         "Qwen/Qwen3-VL-30B-A3B-Instruct".to_string(),
         // Audio (input/output)
         "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string(),
-<<<<<<< HEAD
         // Image generation
         "black-forest-labs/FLUX.2-klein-4B".to_string(),
         "Qwen/Qwen-Image-2512".to_string(),
@@ -889,38 +887,17 @@ pub fn build_completion_routes(
 ) -> Router {
     use crate::routes::files::MAX_FILE_SIZE;
 
-    // Text-based inference routes (chat/completions, image generation, image analysis, audio transcription, rerank, score)
+    // Text-based inference routes (JSON with base64 images and text)
     // Use default body limit (~2 MB) since they only accept JSON
     let text_inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
         .route("/images/generations", post(image_generations))
         .route("/images/analyses", post(image_analyses))
+        .route("/images/edits", post(image_edits_json))
         .route("/audio/transcriptions", post(audio_transcriptions))
         .route("/rerank", post(rerank))
         .route("/score", post(score))
         .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
-        .with_state(app_state.clone())
-        .layer(from_fn_with_state(
-            usage_state.clone(),
-            middleware::usage_check_middleware,
-        ))
-        .layer(from_fn_with_state(
-            rate_limit_state.clone(),
-            middleware::api_key_rate_limit_middleware,
-        ))
-        .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            middleware::auth::auth_middleware_with_workspace_context,
-        ))
-        .layer(from_fn(middleware::body_hash_middleware));
-
-    // File-based inference routes (image edits, image analysis with file uploads)
-    // Apply 512 MB limit only to endpoints that accept file uploads
-    // IMPORTANT: body_hash_middleware is placed AFTER auth to prevent buffering
-    // unauthenticated requests. Auth failures prevent memory exhaustion DoS attacks.
-    let file_inference_routes = Router::new()
-        .route("/images/edits", post(image_edits))
-        .route("/images/analyses/upload", post(image_analyses_multipart))
         .with_state(app_state.clone())
         .layer(from_fn_with_state(
             usage_state,
@@ -951,7 +928,6 @@ pub fn build_completion_routes(
 
     Router::new()
         .merge(text_inference_routes)
-        .merge(file_inference_routes)
         .merge(metadata_routes)
 }
 

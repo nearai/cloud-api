@@ -600,12 +600,6 @@ pub async fn record_usage(
         )
     })?;
 
-    // Remember the request variant before moving it into the service call
-    let is_image = matches!(
-        &request,
-        services::usage::RecordUsageApiRequest::ImageGeneration { .. }
-    );
-
     let entry = app_state
         .usage_service
         .record_usage_from_api(
@@ -639,8 +633,12 @@ pub async fn record_usage(
             }
         })?;
 
-    let response = if is_image {
-        RecordUsageResponse::ImageGeneration {
+    // Use the *returned entry's* inference_type to determine response format,
+    // not the incoming request type. When idempotency returns an existing record
+    // the request type may differ from the stored record's actual type.
+    let response = match entry.inference_type {
+        services::usage::InferenceType::ImageGeneration
+        | services::usage::InferenceType::ImageEdit => RecordUsageResponse::ImageGeneration {
             id: entry.id.to_string(),
             model: entry.model,
             image_count: entry.image_count.unwrap_or_else(|| {
@@ -653,9 +651,8 @@ pub async fn record_usage(
             total_cost: entry.total_cost,
             total_cost_display: format_amount(entry.total_cost),
             created_at: entry.created_at.to_rfc3339(),
-        }
-    } else {
-        RecordUsageResponse::ChatCompletion {
+        },
+        _ => RecordUsageResponse::ChatCompletion {
             id: entry.id.to_string(),
             model: entry.model,
             input_tokens: entry.input_tokens,
@@ -666,7 +663,7 @@ pub async fn record_usage(
             total_cost: entry.total_cost,
             total_cost_display: format_amount(entry.total_cost),
             created_at: entry.created_at.to_rfc3339(),
-        }
+        },
     };
 
     Ok(ResponseJson(response))

@@ -220,6 +220,11 @@ impl UsageServiceTrait for UsageServiceImpl {
                     output_tokens,
                     id,
                 } => {
+                    if id.trim().is_empty() {
+                        return Err(UsageError::ValidationError(
+                            "id must be a non-empty string".into(),
+                        ));
+                    }
                     let input = input_tokens.unwrap_or(0);
                     let output = output_tokens.unwrap_or(0);
                     if input < 0 || output < 0 {
@@ -246,6 +251,11 @@ impl UsageServiceTrait for UsageServiceImpl {
                     image_count,
                     id,
                 } => {
+                    if id.trim().is_empty() {
+                        return Err(UsageError::ValidationError(
+                            "id must be a non-empty string".into(),
+                        ));
+                    }
                     if *image_count <= 0 {
                         return Err(UsageError::ValidationError(
                             "image_count must be positive".into(),
@@ -272,18 +282,13 @@ impl UsageServiceTrait for UsageServiceImpl {
                 UsageError::ModelNotFound(format!("Model '{}' not found", model_name))
             })?;
 
-        // Derive inference tracking fields from the optional external `id`.
-        // When provided: store as provider_request_id and hash to a deterministic
-        // UUID v5 for inference_id (same logic as the inference pipeline).
-        // When omitted: both are None; the usage log row's primary key serves
-        // as the canonical identifier for external callers.
-        let (provider_request_id, inference_id) = match external_id {
-            Some(ref ext_id) => (
-                Some(ext_id.clone()),
-                Some(crate::completions::hash_inference_id_to_uuid(ext_id)),
-            ),
-            None => (None, None),
-        };
+        // Derive inference tracking fields from the required external `id`.
+        // Stored as provider_request_id and hashed to a deterministic UUID v5
+        // for inference_id (same logic as the inference pipeline).
+        // The inference_id serves as the idempotency key: duplicate calls with
+        // the same id within the same org return the existing record.
+        let provider_request_id = Some(external_id.clone());
+        let inference_id = Some(crate::completions::hash_inference_id_to_uuid(&external_id));
 
         // Build internal request and delegate.
         // Internal metrics (ttft_ms, avg_itl_ms, stop_reason) are not exposed

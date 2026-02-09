@@ -349,12 +349,12 @@ pub enum RecordUsageApiRequest {
         input_tokens: Option<i32>,
         /// Number of output/completion tokens
         output_tokens: Option<i32>,
-        /// Optional external identifier (e.g., provider request ID).
-        /// When provided, stored as `provider_request_id` and hashed
-        /// to a deterministic UUID v5 for `inference_id`.
-        /// When omitted, the usage log row's primary key is used instead.
-        #[serde(default)]
-        id: Option<String>,
+        /// External identifier (e.g., provider request ID) used as
+        /// an idempotency key. Stored as `provider_request_id` and
+        /// hashed to a deterministic UUID v5 for `inference_id`.
+        /// Duplicate calls with the same id within the same org
+        /// return the existing record without double-charging.
+        id: String,
     },
     /// Image generation or editing
     ImageGeneration {
@@ -362,12 +362,12 @@ pub enum RecordUsageApiRequest {
         model: String,
         /// Number of images generated
         image_count: i32,
-        /// Optional external identifier (e.g., provider request ID).
-        /// When provided, stored as `provider_request_id` and hashed
-        /// to a deterministic UUID v5 for `inference_id`.
-        /// When omitted, the usage log row's primary key is used instead.
-        #[serde(default)]
-        id: Option<String>,
+        /// External identifier (e.g., provider request ID) used as
+        /// an idempotency key. Stored as `provider_request_id` and
+        /// hashed to a deterministic UUID v5 for `inference_id`.
+        /// Duplicate calls with the same id within the same org
+        /// return the existing record without double-charging.
+        id: String,
     },
 }
 

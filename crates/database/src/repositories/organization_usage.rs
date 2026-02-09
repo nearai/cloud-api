@@ -47,7 +47,11 @@ impl OrganizationUsageRepository {
         Ok(total_spend)
     }
 
-    /// Record usage and update balance atomically
+    /// Record usage and update balance atomically.
+    ///
+    /// When `inference_id` is set, this is idempotent: duplicate inserts for the
+    /// same `(organization_id, inference_id)` skip the INSERT and balance update,
+    /// returning the existing record instead.
     pub async fn record_usage(&self, request: RecordUsageRequest) -> Result<OrganizationUsageLog> {
         let row = retry_db!("record_organization_usage", {
             let mut client = self
@@ -63,11 +67,13 @@ impl OrganizationUsageRepository {
             let now = Utc::now();
             let total_tokens = request.input_tokens + request.output_tokens;
 
-            // Insert usage log entry (model_name is denormalized for performance)
+            // Insert usage log entry (model_name is denormalized for performance).
+            // ON CONFLICT DO NOTHING: if inference_id already exists for this org,
+            // the INSERT is skipped (no row returned) and we fetch the existing record.
             let stop_reason_str = request.stop_reason.as_ref().map(|r| r.as_str());
             let response_id_uuid = request.response_id.as_ref().map(|r| r.as_uuid());
-            let row = transaction
-                .query_one(
+            let maybe_row = transaction
+                .query_opt(
                     r#"
                     INSERT INTO organization_usage_log (
                         id, organization_id, workspace_id, api_key_id,
@@ -76,6 +82,7 @@ impl OrganizationUsageRepository {
                         inference_type, created_at, ttft_ms, avg_itl_ms, inference_id,
                         provider_request_id, stop_reason, response_id, image_count
                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+                    ON CONFLICT (organization_id, inference_id) WHERE inference_id IS NOT NULL DO NOTHING
                     RETURNING *
                     "#,
                     &[
@@ -105,37 +112,65 @@ impl OrganizationUsageRepository {
                 .await
                 .map_err(map_db_error)?;
 
-            // Update organization balance (all costs use fixed scale 9)
-            transaction
-                .execute(
-                    r#"
-                    INSERT INTO organization_balance (
-                        organization_id,
-                        total_spent,
-                        last_usage_at,
-                        total_requests,
-                        total_tokens,
-                        updated_at
-                    ) VALUES ($1, $2, $3, 1, $4, $5)
-                    ON CONFLICT (organization_id) DO UPDATE SET
-                        total_spent = organization_balance.total_spent + $2,
-                        total_requests = organization_balance.total_requests + 1,
-                        total_tokens = organization_balance.total_tokens + $4,
-                        last_usage_at = $3,
-                        updated_at = $5
-                    "#,
-                    &[
-                        &request.organization_id,
-                        &request.total_cost,
-                        &now,
-                        &(total_tokens as i64),
-                        &now,
-                    ],
-                )
-                .await
-                .map_err(map_db_error)?;
+            let row = match maybe_row {
+                Some(row) => {
+                    // New insert succeeded — update organization balance
+                    transaction
+                        .execute(
+                            r#"
+                            INSERT INTO organization_balance (
+                                organization_id,
+                                total_spent,
+                                last_usage_at,
+                                total_requests,
+                                total_tokens,
+                                updated_at
+                            ) VALUES ($1, $2, $3, 1, $4, $5)
+                            ON CONFLICT (organization_id) DO UPDATE SET
+                                total_spent = organization_balance.total_spent + $2,
+                                total_requests = organization_balance.total_requests + 1,
+                                total_tokens = organization_balance.total_tokens + $4,
+                                last_usage_at = $3,
+                                updated_at = $5
+                            "#,
+                            &[
+                                &request.organization_id,
+                                &request.total_cost,
+                                &now,
+                                &(total_tokens as i64),
+                                &now,
+                            ],
+                        )
+                        .await
+                        .map_err(map_db_error)?;
 
-            transaction.commit().await.map_err(map_db_error)?;
+                    transaction.commit().await.map_err(map_db_error)?;
+                    row
+                }
+                None => {
+                    // Duplicate — inference_id already exists for this org.
+                    // Roll back (nothing was written) and fetch the existing record.
+                    transaction.rollback().await.map_err(map_db_error)?;
+
+                    tracing::debug!(
+                        organization_id = %request.organization_id,
+                        "Duplicate usage recording detected, returning existing record"
+                    );
+
+                    let existing = client
+                        .query_one(
+                            r#"
+                            SELECT *
+                            FROM organization_usage_log
+                            WHERE organization_id = $1 AND inference_id = $2
+                            "#,
+                            &[&request.organization_id, &request.inference_id],
+                        )
+                        .await
+                        .map_err(map_db_error)?;
+                    existing
+                }
+            };
 
             Ok::<tokio_postgres::Row, RepositoryError>(row)
         })?;

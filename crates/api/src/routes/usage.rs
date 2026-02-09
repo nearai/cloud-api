@@ -554,19 +554,19 @@ pub enum RecordUsageResponse {
 /// Record a usage event. The server calculates costs based on the model's pricing.
 /// Uses a tagged union on the `type` field to distinguish usage kinds.
 ///
-/// An optional `id` field can be supplied as an external identifier (e.g., a
-/// provider request ID). When present it is stored as `provider_request_id` and
-/// hashed to a deterministic UUID v5 for `inference_id`. When omitted the usage
-/// log row's primary key serves as the canonical identifier.
+/// A required `id` field serves as an **idempotency key**. It is stored as
+/// `provider_request_id` and hashed to a deterministic UUID v5 for `inference_id`.
+/// If a record with the same `id` already exists within the same organization,
+/// the existing record is returned without double-charging.
 ///
 /// ## Chat completion example
 /// ```json
-/// { "type": "chat_completion", "model": "Qwen/Qwen3-30B-A3B-Instruct-2507", "input_tokens": 100, "output_tokens": 50 }
+/// { "type": "chat_completion", "model": "Qwen/Qwen3-30B-A3B-Instruct-2507", "input_tokens": 100, "output_tokens": 50, "id": "req-abc-123" }
 /// ```
 ///
 /// ## Image generation example
 /// ```json
-/// { "type": "image_generation", "model": "black-forest-labs/FLUX.1", "image_count": 2 }
+/// { "type": "image_generation", "model": "black-forest-labs/FLUX.1", "image_count": 2, "id": "req-img-456" }
 /// ```
 #[utoipa::path(
     post,

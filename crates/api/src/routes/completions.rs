@@ -87,36 +87,35 @@ async fn record_usage_with_sync_fallback(
                 image_id = %provider_request_id,
                 "Failed to record usage synchronously, retrying async"
             );
-            let usage_service_clone = usage_service.clone();
-            let label = operation_label.to_string();
-            tokio::spawn(async move {
-                if let Err(e) = usage_service_clone.record_usage(request).await {
-                    tracing::error!(
-                        error = %e,
-                        image_id = %provider_request_id,
-                        "Failed to record {label} usage in async retry"
-                    );
-                }
-            });
+            spawn_async_usage_retry(usage_service, request, provider_request_id, operation_label);
         }
         Err(_timeout) => {
             tracing::warn!(
                 image_id = %provider_request_id,
                 "Usage recording timed out ({USAGE_RECORDING_TIMEOUT_SECS}s), retrying async"
             );
-            let usage_service_clone = usage_service.clone();
-            let label = operation_label.to_string();
-            tokio::spawn(async move {
-                if let Err(e) = usage_service_clone.record_usage(request).await {
-                    tracing::error!(
-                        error = %e,
-                        image_id = %provider_request_id,
-                        "Failed to record {label} usage in async retry after timeout"
-                    );
-                }
-            });
+            spawn_async_usage_retry(usage_service, request, provider_request_id, operation_label);
         }
     }
+}
+
+/// Spawn an async retry for usage recording after a sync attempt fails or times out.
+fn spawn_async_usage_retry(
+    usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
+    request: services::usage::RecordUsageServiceRequest,
+    provider_request_id: String,
+    operation_label: &str,
+) {
+    let label = operation_label.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = usage_service.record_usage(request).await {
+            tracing::error!(
+                error = %e,
+                image_id = %provider_request_id,
+                "Failed to record {label} usage in async retry"
+            );
+        }
+    });
 }
 
 // Helper function to provide detailed error context for multipart parsing failures

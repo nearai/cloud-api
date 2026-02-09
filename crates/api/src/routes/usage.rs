@@ -643,7 +643,13 @@ pub async fn record_usage(
         RecordUsageResponse::ImageGeneration {
             id: entry.id.to_string(),
             model: entry.model,
-            image_count: entry.image_count.unwrap_or(0),
+            image_count: entry.image_count.unwrap_or_else(|| {
+                tracing::error!(
+                    entry_id = %entry.id,
+                    "image_count unexpectedly missing for image generation usage record"
+                );
+                0
+            }),
             total_cost: entry.total_cost,
             total_cost_display: format_amount(entry.total_cost),
             created_at: entry.created_at.to_rfc3339(),

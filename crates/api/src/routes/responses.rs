@@ -46,10 +46,6 @@ fn convert_to_input_part(
                 Ok(None) | Err(_) => Some(crate::models::ResponseContentPart::InputText { text }),
             }
         }
-        ResponseContentItem::OutputImage { .. } => {
-            // Images are not converted to input parts
-            None
-        }
         ResponseContentItem::ToolCalls { .. } => None,
     }
 }

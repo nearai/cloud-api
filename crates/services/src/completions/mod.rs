@@ -610,9 +610,6 @@ impl CompletionServiceImpl {
                         .collect()
                 });
 
-                // Use text content
-                let content = Some(serde_json::Value::String(msg.content.clone()));
-
                 ChatMessage {
                     role: match msg.role.as_str() {
                         "system" => MessageRole::System,
@@ -620,7 +617,7 @@ impl CompletionServiceImpl {
                         "tool" => MessageRole::Tool,
                         _ => MessageRole::User,
                     },
-                    content,
+                    content: Some(serde_json::Value::String(msg.content.clone())),
                     name: None,
                     tool_call_id: msg.tool_call_id.clone(),
                     tool_calls,

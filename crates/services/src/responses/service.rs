@@ -2,7 +2,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use base64::Engine;
 use futures::Stream;
 use uuid::Uuid;
 
@@ -13,8 +12,7 @@ use crate::conversations::ports::ConversationServiceTrait;
 use crate::files::FileServiceTrait;
 use crate::inference_provider_pool::InferenceProviderPool;
 use crate::responses::tools;
-use crate::responses::{citation_tracker, errors, models, ports, service_helpers};
-use crate::usage::{InferenceType, RecordUsageServiceRequest};
+use crate::responses::{citation_tracker, errors, models, ports};
 
 use tools::{ERROR_TOOL_TYPE, MAX_CONSECUTIVE_TOOL_FAILURES};
 
@@ -347,8 +345,6 @@ impl ResponseServiceImpl {
         Ok(content_parts.join("\n\n"))
     }
 
-    /// Build multimodal content array (OpenAI format) from content parts
-    /// Returns JSON array with text and image_url objects
     /// Extract response ID UUID from response object
     fn extract_response_uuid(
         response: &models::ResponseObject,
@@ -378,13 +374,13 @@ impl ResponseServiceImpl {
                     > + Send,
             >,
         >,
-        emitter: &mut service_helpers::EventEmitter,
-        ctx: &mut service_helpers::ResponseStreamContext,
+        emitter: &mut crate::responses::service_helpers::EventEmitter,
+        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
         process_context: &ProcessStreamContext,
-    ) -> Result<service_helpers::ProcessStreamResult, errors::ResponseError> {
+    ) -> Result<crate::responses::service_helpers::ProcessStreamResult, errors::ResponseError> {
+        use crate::responses::service_helpers::ToolCallAccumulator;
         use futures::StreamExt;
-        use service_helpers::ToolCallAccumulator;
 
         let mut current_text = String::new();
         let mut tool_call_accumulator: ToolCallAccumulator = std::collections::HashMap::new();
@@ -464,7 +460,7 @@ impl ResponseServiceImpl {
                             }
 
                             let reasoning_token_count =
-                                service_helpers::ResponseStreamContext::estimate_tokens(
+                                crate::responses::service_helpers::ResponseStreamContext::estimate_tokens(
                                     &reasoning_buffer,
                                 );
                             ctx.add_reasoning_tokens(reasoning_token_count);
@@ -509,9 +505,7 @@ impl ResponseServiceImpl {
 
                                     // Count reasoning tokens
                                     let reasoning_token_count =
-                                        service_helpers::ResponseStreamContext::estimate_tokens(
-                                            &reasoning_buffer,
-                                        );
+                                        crate::responses::service_helpers::ResponseStreamContext::estimate_tokens(&reasoning_buffer);
                                     ctx.add_reasoning_tokens(reasoning_token_count);
 
                                     // Move to next output index
@@ -646,7 +640,7 @@ impl ResponseServiceImpl {
             &available_tool_names,
         );
 
-        Ok(service_helpers::ProcessStreamResult {
+        Ok(crate::responses::service_helpers::ProcessStreamResult {
             text: current_text,
             tool_calls: tool_calls_detected,
             stream_error,
@@ -655,8 +649,8 @@ impl ResponseServiceImpl {
 
     /// Emit events when a message starts streaming
     async fn emit_message_started(
-        emitter: &mut service_helpers::EventEmitter,
-        ctx: &mut service_helpers::ResponseStreamContext,
+        emitter: &mut crate::responses::service_helpers::EventEmitter,
+        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
         message_item_id: &str,
     ) -> Result<(), errors::ResponseError> {
         // Event: response.output_item.added (for message)
@@ -691,8 +685,8 @@ impl ResponseServiceImpl {
 
     /// Emit events when a message completes
     async fn emit_message_completed(
-        emitter: &mut service_helpers::EventEmitter,
-        ctx: &mut service_helpers::ResponseStreamContext,
+        emitter: &mut crate::responses::service_helpers::EventEmitter,
+        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
         message_item_id: &str,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
         context: &ProcessStreamContext,
@@ -849,7 +843,7 @@ impl ResponseServiceImpl {
         }
 
         // Initialize context and emitter
-        let mut ctx = service_helpers::ResponseStreamContext::new(
+        let mut ctx = crate::responses::service_helpers::ResponseStreamContext::new(
             response_id.clone(),
             api_key_uuid,
             conversation_id,
@@ -858,7 +852,7 @@ impl ResponseServiceImpl {
             initial_response.created_at,
             context.request.model.clone(),
         );
-        let mut emitter = service_helpers::EventEmitter::new(tx);
+        let mut emitter = crate::responses::service_helpers::EventEmitter::new(tx);
 
         // Event: response.created
         emitter
@@ -1086,8 +1080,8 @@ impl ResponseServiceImpl {
     /// Run the agent loop - repeatedly call completion API and execute tool calls
     #[allow(clippy::too_many_arguments)]
     async fn run_agent_loop(
-        ctx: &mut service_helpers::ResponseStreamContext,
-        emitter: &mut service_helpers::EventEmitter,
+        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
+        emitter: &mut crate::responses::service_helpers::EventEmitter,
         messages: &mut Vec<crate::completions::ports::CompletionMessage>,
         final_response_text: &mut String,
         process_context: &mut ProcessStreamContext,
@@ -1295,7 +1289,7 @@ impl ResponseServiceImpl {
                                 content: std::mem::take(&mut deferred_instructions).join("\n\n"),
                                 tool_call_id: None,
                                 tool_calls: None,
-                                    });
+                            });
                         }
                         return Ok(AgentLoopResult::ApprovalRequired);
                     }
@@ -1310,7 +1304,7 @@ impl ResponseServiceImpl {
                     content: deferred_instructions.join("\n\n"),
                     tool_call_id: None,
                     tool_calls: None,
-                    });
+                });
             }
         }
 
@@ -1326,9 +1320,9 @@ impl ResponseServiceImpl {
     /// `deferred_instructions` to be added after all tool results. This ensures tool results
     /// are consecutive (required by OpenAI/Anthropic/Gemini for parallel tool calls).
     async fn execute_and_emit_tool_call(
-        ctx: &mut service_helpers::ResponseStreamContext,
-        emitter: &mut service_helpers::EventEmitter,
-        tool_call: &service_helpers::ToolCallInfo,
+        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
+        emitter: &mut crate::responses::service_helpers::EventEmitter,
+        tool_call: &crate::responses::service_helpers::ToolCallInfo,
         messages: &mut Vec<crate::completions::ports::CompletionMessage>,
         process_context: &mut ProcessStreamContext,
         deferred_instructions: &mut Vec<String>,
@@ -1666,7 +1660,7 @@ impl ResponseServiceImpl {
                     content: prompt,
                     tool_call_id: None,
                     tool_calls: None,
-                    });
+                });
                 tracing::debug!("Prepended organization system prompt to messages");
             }
         }
@@ -1803,7 +1797,7 @@ impl ResponseServiceImpl {
                             content: text,
                             tool_call_id: None,
                             tool_calls: None,
-                            });
+                        });
                     }
                 }
                 // For now, we only process message items
@@ -1847,13 +1841,9 @@ impl ResponseServiceImpl {
                         let content = match item_content {
                             models::ResponseContent::Text(text) => text.clone(),
                             models::ResponseContent::Parts(parts) => {
-                                // Extract text content from parts
-                                Self::extract_content_parts(
-                                    parts,
-                                    workspace_id.0,
-                                    file_service,
-                                )
-                                .await?
+                                // Extract text from parts and fetch file content if needed
+                                Self::extract_content_parts(parts, workspace_id.0, file_service)
+                                    .await?
                             }
                         };
 
@@ -2106,7 +2096,7 @@ impl ResponseServiceImpl {
     /// Usage typically comes in the final chunk from the provider
     fn extract_and_accumulate_usage(
         event: &inference_providers::SSEEvent,
-        ctx: &mut service_helpers::ResponseStreamContext,
+        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
     ) {
         use inference_providers::StreamChunk;
 
@@ -2125,7 +2115,7 @@ impl ResponseServiceImpl {
     /// Accumulate tool call fragments from streaming chunks
     fn accumulate_tool_calls(
         event: &inference_providers::SSEEvent,
-        accumulator: &mut service_helpers::ToolCallAccumulator,
+        accumulator: &mut crate::responses::service_helpers::ToolCallAccumulator,
     ) {
         use inference_providers::StreamChunk;
 
@@ -2588,7 +2578,7 @@ mod tests {
 
     #[test]
     fn test_estimate_tokens() {
-        use service_helpers::ResponseStreamContext;
+        use crate::responses::service_helpers::ResponseStreamContext;
 
         assert_eq!(ResponseStreamContext::estimate_tokens("test"), 1);
         assert_eq!(ResponseStreamContext::estimate_tokens("Hello world"), 2);

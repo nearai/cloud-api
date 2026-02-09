@@ -452,35 +452,6 @@ impl EventEmitter {
         Ok(())
     }
 
-    /// Emit output_image.created event for image generation
-    pub async fn emit_output_image_created(
-        &mut self,
-        ctx: &mut ResponseStreamContext,
-        image_data: &[models::ImageOutputData],
-    ) -> Result<(), errors::ResponseError> {
-        let event = models::ResponseStreamEvent {
-            event_type: "response.output_image.created".to_string(),
-            sequence_number: Some(ctx.next_sequence()),
-            response: None,
-            output_index: Some(ctx.output_item_index),
-            content_index: Some(0),
-            item: None,
-            item_id: None,
-            part: Some(models::ResponseOutputContent::OutputImage {
-                data: image_data.to_vec(),
-                url: None,
-            }),
-            delta: None,
-            text: None,
-            logprobs: None,
-            obfuscation: None,
-            annotation_index: None,
-            annotation: None,
-            conversation_title: None,
-        };
-        self.send(event).await
-    }
-
     /// Send an event to the stream
     async fn send(
         &mut self,

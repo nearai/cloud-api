@@ -152,7 +152,7 @@ use utoipa::{Modify, OpenApi};
             // Audio transcription models
             AudioTranscriptionRequestSchema, AudioTranscriptionResponse, TranscriptionSegment, TranscriptionWord,
             // Image edit models
-            ImageEditJsonRequest, ImageInput,
+            ImageEditRequestSchema,
             // Rerank models
             RerankRequest, RerankResponse, RerankResult, RerankUsage,
             // Score models

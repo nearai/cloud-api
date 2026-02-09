@@ -13,5 +13,5 @@ pub mod usage;
 pub use auth::{admin_middleware, auth_middleware, AdminUser, AuthState, AuthenticatedUser};
 pub use body_hash::{body_hash_middleware, RequestBodyHash};
 pub use metrics::{http_metrics_middleware, MetricsState};
-pub use rate_limit::{api_key_rate_limit_middleware, RateLimitState, RequestModelMetadata};
+pub use rate_limit::{api_key_rate_limit_middleware, RateLimitState};
 pub use usage::{usage_check_middleware, UsageState};

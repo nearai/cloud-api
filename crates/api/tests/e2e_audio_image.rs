@@ -6,7 +6,6 @@
 
 mod common;
 
-use base64::Engine;
 use common::*;
 
 /// Test audio input in chat completions (sending audio data to the model)
@@ -484,7 +483,7 @@ async fn test_image_generation() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "black-forest-labs/FLUX.2-klein-4B",
+            "model": "Qwen/Qwen-Image-2512",
             "prompt": "A beautiful sunset over mountains with orange and purple sky",
             "n": 1,
             "response_format": "b64_json"
@@ -602,7 +601,7 @@ async fn test_image_generation_multiple() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "black-forest-labs/FLUX.2-klein-4B",
+            "model": "Qwen/Qwen-Image-2512",
             "prompt": "A cute cat sitting on a windowsill",
             "n": 2,
             "response_format": "b64_json"
@@ -662,7 +661,7 @@ async fn test_image_generation_validation() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "black-forest-labs/FLUX.2-klein-4B",
+            "model": "Qwen/Qwen-Image-2512",
             "prompt": "A beautiful sunset",
             "n": 100,  // Too many images
             "response_format": "b64_json"
@@ -678,7 +677,7 @@ async fn test_image_generation_validation() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "black-forest-labs/FLUX.2-klein-4B",
+            "model": "Qwen/Qwen-Image-2512",
             "prompt": "",
             "response_format": "b64_json"
         }))
@@ -699,7 +698,7 @@ async fn test_verifiable_model_response_format_validation() {
     let (server, guard) = setup_test_server().await;
     let _guard = guard;
 
-    // Set up the verifiable image model (black-forest-labs/FLUX.2-klein-4B has verifiable=true and defaults to attestation_supported=true)
+    // Set up the verifiable image model (Qwen/Qwen-Image-2512 has verifiable=true and defaults to attestation_supported=true)
     setup_qwen_image_model(&server).await;
 
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -711,7 +710,7 @@ async fn test_verifiable_model_response_format_validation() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "black-forest-labs/FLUX.2-klein-4B",
+            "model": "Qwen/Qwen-Image-2512",
             "prompt": "A beautiful sunset",
             "response_format": "url"
         }))
@@ -745,7 +744,7 @@ async fn test_verifiable_model_response_format_validation() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "black-forest-labs/FLUX.2-klein-4B",
+            "model": "Qwen/Qwen-Image-2512",
             "prompt": "A beautiful sunset"
             // response_format omitted
         }))
@@ -774,7 +773,7 @@ async fn test_verifiable_model_response_format_validation() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "black-forest-labs/FLUX.2-klein-4B",
+            "model": "Qwen/Qwen-Image-2512",
             "prompt": "A beautiful sunset",
             "response_format": "b64_json"
         }))
@@ -803,7 +802,7 @@ async fn test_verifiable_model_response_format_validation() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({
-            "model": "black-forest-labs/FLUX.2-klein-4B",
+            "model": "Qwen/Qwen-Image-2512",
             "prompt": "A beautiful sunset",
             "response_format": "invalid_format"
         }))
@@ -1508,7 +1507,7 @@ fn create_test_png_image() -> Vec<u8> {
     ]
 }
 
-/// Test image edit with JSON base64 format
+/// Test image edit with basic parameters
 #[tokio::test]
 async fn test_image_edit() {
     let use_real = use_real_providers();
@@ -1532,19 +1531,23 @@ async fn test_image_edit() {
     };
 
     let image_data = create_test_png_image();
-    let base64_image = base64::engine::general_purpose::STANDARD.encode(&image_data);
 
-    // Send image edit request with JSON base64 format
+    // Send image edit request
     let response = server
         .post("/v1/images/edits")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({
-            "model": "black-forest-labs/FLUX.2-klein-4B",
-            "image": format!("data:image/png;base64,{}", base64_image),
-            "prompt": "Change the background to a sunny day",
-            "response_format": "b64_json"
-        }))
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "image",
+                    axum_test::multipart::Part::bytes(image_data.clone())
+                        .file_name("image.png")
+                        .mime_type("image/png"),
+                )
+                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("prompt", "Change the background to a sunny day"),
+        )
         .await;
 
     println!("Image edit response status: {}", response.status_code());
@@ -1624,7 +1627,7 @@ async fn test_image_edit() {
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 }
 
-/// Test image edit validation with JSON base64 format
+/// Test image edit validation
 #[tokio::test]
 async fn test_image_edit_validation() {
     let (server, guard) = setup_test_server().await;
@@ -1634,78 +1637,81 @@ async fn test_image_edit_validation() {
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
-    let image_data = create_test_png_image();
-    let base64_image = base64::engine::general_purpose::STANDARD.encode(&image_data);
-
-    // Test 1: Missing image (JSON deserialization error)
+    // Test 1: Missing image
     let response = server
         .post("/v1/images/edits")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({
-            "model": "black-forest-labs/FLUX.2-klein-4B",
-            "prompt": "Edit this image"
-        }))
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("prompt", "Edit this image"),
+        )
         .await;
 
-    assert_eq!(response.status_code(), 422, "Should reject missing image");
+    assert_eq!(response.status_code(), 400, "Should reject missing image");
 
-    // Test 2: Invalid image format (missing data:image/ prefix)
+    // Test 2: Invalid PNG format
     let response = server
         .post("/v1/images/edits")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({
-            "model": "black-forest-labs/FLUX.2-klein-4B",
-            "image": "not-a-data-url",
-            "prompt": "Edit this image"
-        }))
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "image",
+                    axum_test::multipart::Part::bytes(b"not a png".to_vec())
+                        .file_name("image.png")
+                        .mime_type("image/png"),
+                )
+                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("prompt", "Edit this image"),
+        )
         .await;
 
     assert_eq!(
         response.status_code(),
         400,
-        "Should reject invalid data URL format"
+        "Should reject invalid PNG format"
     );
 
-    // Test 3: Missing prompt (JSON deserialization error)
+    // Test 3: Missing prompt
+    let image_data = create_test_png_image();
     let response = server
         .post("/v1/images/edits")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({
-            "model": "black-forest-labs/FLUX.2-klein-4B",
-            "image": format!("data:image/png;base64,{}", base64_image)
-        }))
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "image",
+                    axum_test::multipart::Part::bytes(image_data.clone())
+                        .file_name("image.png")
+                        .mime_type("image/png"),
+                )
+                .add_text("model", "Qwen/Qwen-Image-2512"),
+        )
         .await;
 
-    assert_eq!(response.status_code(), 422, "Should reject missing prompt");
+    assert_eq!(response.status_code(), 400, "Should reject missing prompt");
 
-    // Test 4: Empty prompt
+    // Test 4: Invalid size format
     let response = server
         .post("/v1/images/edits")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({
-            "model": "black-forest-labs/FLUX.2-klein-4B",
-            "image": format!("data:image/png;base64,{}", base64_image),
-            "prompt": ""
-        }))
-        .await;
-
-    assert_eq!(response.status_code(), 400, "Should reject empty prompt");
-
-    // Test 5: Invalid size format
-    let response = server
-        .post("/v1/images/edits")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({
-            "model": "black-forest-labs/FLUX.2-klein-4B",
-            "image": format!("data:image/png;base64,{}", base64_image),
-            "prompt": "Edit this",
-            "size": "invalid"
-        }))
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "image",
+                    axum_test::multipart::Part::bytes(image_data.clone())
+                        .file_name("image.png")
+                        .mime_type("image/png"),
+                )
+                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("prompt", "Edit this")
+                .add_text("size", "invalid"),
+        )
         .await;
 
     assert_eq!(
@@ -1714,17 +1720,23 @@ async fn test_image_edit_validation() {
         "Should reject invalid size format"
     );
 
-    // Test 6: Invalid dimension (0x0)
+    // Test 5: Invalid dimension (0x0)
     let response = server
         .post("/v1/images/edits")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({
-            "model": "black-forest-labs/FLUX.2-klein-4B",
-            "image": format!("data:image/png;base64,{}", base64_image),
-            "prompt": "Edit this",
-            "size": "0x0"
-        }))
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "image",
+                    axum_test::multipart::Part::bytes(image_data.clone())
+                        .file_name("image.png")
+                        .mime_type("image/png"),
+                )
+                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("prompt", "Edit this")
+                .add_text("size", "0x0"),
+        )
         .await;
 
     assert_eq!(response.status_code(), 400, "Should reject zero dimensions");
@@ -1741,20 +1753,24 @@ async fn test_image_edit_verifiable_model_response_format() {
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     let image_data = create_test_png_image();
-    let base64_image = base64::engine::general_purpose::STANDARD.encode(&image_data);
-    let data_url = format!("data:image/png;base64,{}", base64_image);
 
     // Test 1: response_format "url" should be rejected for verifiable models
     let response = server
         .post("/v1/images/edits")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({
-            "model": "black-forest-labs/FLUX.2-klein-4B",
-            "image": &data_url,
-            "prompt": "Edit this",
-            "response_format": "url"
-        }))
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "image",
+                    axum_test::multipart::Part::bytes(image_data.clone())
+                        .file_name("image.png")
+                        .mime_type("image/png"),
+                )
+                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("prompt", "Edit this")
+                .add_text("response_format", "url"),
+        )
         .await;
 
     assert_eq!(
@@ -1763,26 +1779,23 @@ async fn test_image_edit_verifiable_model_response_format() {
         "Should reject 'url' format for verifiable models"
     );
 
-    let error_json: serde_json::Value = response.json();
-    assert!(
-        error_json["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("not supported for verifiable models"),
-        "Error should mention verifiable models"
-    );
-
     // Test 2: response_format "b64_json" should work
     let response = server
         .post("/v1/images/edits")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({
-            "model": "black-forest-labs/FLUX.2-klein-4B",
-            "image": &data_url,
-            "prompt": "Edit this",
-            "response_format": "b64_json"
-        }))
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "image",
+                    axum_test::multipart::Part::bytes(image_data.clone())
+                        .file_name("image.png")
+                        .mime_type("image/png"),
+                )
+                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("prompt", "Edit this")
+                .add_text("response_format", "b64_json"),
+        )
         .await;
 
     assert_eq!(
@@ -1791,65 +1804,28 @@ async fn test_image_edit_verifiable_model_response_format() {
         "Should accept 'b64_json' format for verifiable models"
     );
 
-    let response_json: serde_json::Value = response.json();
-    assert!(
-        response_json.get("data").is_some(),
-        "Should have data array"
-    );
-    let data = response_json.get("data").unwrap().as_array().unwrap();
-    assert!(!data.is_empty(), "Should have at least one image");
-    assert!(
-        data[0].get("b64_json").is_some(),
-        "Should have b64_json field"
-    );
-
     // Test 3: No response_format should default to "b64_json" (no error)
     let response = server
         .post("/v1/images/edits")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({
-            "model": "black-forest-labs/FLUX.2-klein-4B",
-            "image": &data_url,
-            "prompt": "Edit this"
-        }))
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "image",
+                    axum_test::multipart::Part::bytes(image_data.clone())
+                        .file_name("image.png")
+                        .mime_type("image/png"),
+                )
+                .add_text("model", "Qwen/Qwen-Image-2512")
+                .add_text("prompt", "Edit this"),
+        )
         .await;
 
     assert_eq!(
         response.status_code(),
         200,
         "Should default to 'b64_json' format for verifiable models"
-    );
-
-    let response_json: serde_json::Value = response.json();
-    assert!(
-        response_json.get("data").is_some(),
-        "Should have data array"
-    );
-    let data = response_json.get("data").unwrap().as_array().unwrap();
-    assert!(!data.is_empty(), "Should have at least one image");
-    assert!(
-        data[0].get("b64_json").is_some(),
-        "Should default to b64_json field"
-    );
-
-    // Test 4: Invalid response_format should be rejected
-    let response = server
-        .post("/v1/images/edits")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({
-            "model": "black-forest-labs/FLUX.2-klein-4B",
-            "image": &data_url,
-            "prompt": "Edit this",
-            "response_format": "invalid_format"
-        }))
-        .await;
-
-    assert_eq!(
-        response.status_code(),
-        400,
-        "Should reject invalid response_format"
     );
 
     // Allow background tasks to complete

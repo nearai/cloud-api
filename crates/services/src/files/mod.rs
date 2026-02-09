@@ -112,12 +112,6 @@ pub const ALLOWED_MIME_TYPES: &[(&str, bool)] = &[
     ("text/x-dockerfile", true), // Dockerfile
     // INI / desktop / service files (common on Linux)
     ("text/x-ini", true), // .ini, .cfg, .conf
-    // Image formats
-    ("image/png", false),    // .png
-    ("image/jpeg", false),   // .jpg, .jpeg
-    ("image/gif", false),    // .gif
-    ("image/webp", false),   // .webp
-    ("image/svg+xml", true), // .svg (XML-based)
 ];
 
 pub fn validate_mime_type(content_type: &str) -> Result<(), FileServiceError> {

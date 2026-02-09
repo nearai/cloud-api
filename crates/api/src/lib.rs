@@ -17,8 +17,8 @@ use crate::{
         },
         billing::{get_billing_costs, BillingRouteState},
         completions::{
-            audio_transcriptions, chat_completions, image_edits, image_generations, models,
-            rerank, score,
+            audio_transcriptions, chat_completions, image_edits, image_generations, models, rerank,
+            score,
         },
         conversations,
         health::health_check,
@@ -589,22 +589,13 @@ pub async fn init_inference_providers_with_mocks(
 
     // Register providers for models commonly used in tests
     let test_models = vec![
-        // Text models
         "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
         "zai-org/GLM-4.6".to_string(),
-        "zai-org/GLM-4.7".to_string(),
         "nearai/gpt-oss-120b".to_string(),
-        "openai/gpt-oss-120b".to_string(),
         "dphn/Dolphin-Mistral-24B-Venice-Edition".to_string(),
         "deepseek-ai/DeepSeek-V3.1".to_string(),
-        // Multimodal (image analysis)
-        "Qwen/Qwen3-VL-30B-A3B-Instruct".to_string(),
-        // Audio (input/output)
         "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string(),
-        // Image generation
-        "black-forest-labs/FLUX.2-klein-4B".to_string(),
         "Qwen/Qwen-Image-2512".to_string(),
-        // Reranking
         "Qwen/Qwen3-Reranker-0.6B".to_string(),
     ];
 
@@ -690,12 +681,7 @@ pub fn build_app_with_config(
         api_key_repository,
     };
 
-    // Rate limits: 1000 req/min for general, 10 ops/min for images (100x more expensive)
-    let rate_limit_state = middleware::RateLimitState::new(
-        1000, // general rate limit
-        10,   // image rate limit
-        domain_services.models_service.clone(),
-    );
+    let rate_limit_state = middleware::RateLimitState::default();
 
     // Build individual route groups
     let auth_routes = build_auth_routes(
@@ -900,16 +886,36 @@ pub fn build_completion_routes(
 ) -> Router {
     use crate::routes::files::MAX_FILE_SIZE;
 
-    // Text-based inference routes (JSON with base64 images and text)
+    // Text-based inference routes (chat/completions, image generation, audio transcription, rerank, score)
     // Use default body limit (~2 MB) since they only accept JSON
     let text_inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
         .route("/images/generations", post(image_generations))
-        .route("/images/edits", post(image_edits))
         .route("/audio/transcriptions", post(audio_transcriptions))
         .route("/rerank", post(rerank))
         .route("/score", post(score))
         .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
+        .with_state(app_state.clone())
+        .layer(from_fn_with_state(
+            usage_state.clone(),
+            middleware::usage_check_middleware,
+        ))
+        .layer(from_fn_with_state(
+            rate_limit_state.clone(),
+            middleware::api_key_rate_limit_middleware,
+        ))
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::auth_middleware_with_workspace_context,
+        ))
+        .layer(from_fn(middleware::body_hash_middleware));
+
+    // File-based inference routes (image edits)
+    // Apply 512 MB limit only to endpoints that accept file uploads
+    // IMPORTANT: body_hash_middleware is placed AFTER auth to prevent buffering
+    // unauthenticated requests. Auth failures prevent memory exhaustion DoS attacks.
+    let file_inference_routes = Router::new()
+        .route("/images/edits", post(image_edits))
         .with_state(app_state.clone())
         .layer(from_fn_with_state(
             usage_state,
@@ -940,6 +946,7 @@ pub fn build_completion_routes(
 
     Router::new()
         .merge(text_inference_routes)
+        .merge(file_inference_routes)
         .merge(metadata_routes)
 }
 

@@ -366,66 +366,6 @@ impl ImageEditRequest {
     }
 }
 
-/// Request for image editing with JSON (supports base64 and file URLs)
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct ImageEditJsonRequest {
-    /// Model ID to use for editing (e.g., "Qwen/Qwen-Image-2512")
-    pub model: String,
-
-    /// Image to edit (base64 data URL or file reference)
-    pub image: ImageInput,
-
-    /// Text prompt describing the edits to make
-    pub prompt: String,
-
-    /// Image size in WxH format (e.g., "512x512")
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub size: Option<String>,
-
-    /// Response format ("b64_json" or "url")
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response_format: Option<String>,
-}
-
-impl ImageEditJsonRequest {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.model.trim().is_empty() {
-            return Err("model is required".to_string());
-        }
-        if self.prompt.trim().is_empty() {
-            return Err("prompt is required".to_string());
-        }
-
-        // Validate size format if provided
-        if let Some(ref size) = self.size {
-            let parts: Vec<&str> = size.split('x').collect();
-            if parts.len() != 2 {
-                return Err("size must be in format 'WIDTHxHEIGHT' (e.g., '1024x1024')".to_string());
-            }
-            match (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-                (Ok(w), Ok(h)) => {
-                    if w == 0 || h == 0 {
-                        return Err("size dimensions must be greater than zero".to_string());
-                    }
-                }
-                _ => {
-                    return Err(
-                        "size must be in format 'WIDTHxHEIGHT' with numeric values".to_string()
-                    );
-                }
-            }
-        }
-
-        if let Some(ref format) = self.response_format {
-            if format != "url" && format != "b64_json" {
-                return Err("response_format must be 'url' or 'b64_json'".to_string());
-            }
-        }
-
-        Ok(())
-    }
-}
-
 /// Response from image generation
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ImageGenerationResponse {
@@ -447,16 +387,6 @@ pub struct ImageData {
     /// Revised prompt used for generation (if model modified it)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revised_prompt: Option<String>,
-}
-
-/// Image input variants (used by /v1/images/edits)
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum ImageInput {
-    /// Base64-encoded data URL (e.g., "data:image/png;base64,...")
-    DataUrl(String),
-    /// File ID from /v1/files upload
-    FileId { file_id: String },
 }
 
 // ========================================
@@ -597,7 +527,55 @@ impl AudioTranscriptionRequest {
     }
 }
 
-// ========== Audio Transcription Response ==========
+// ========== Rerank Models ==========
+
+/// Request for document reranking
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RerankRequest {
+    /// Model ID to use for reranking
+    pub model: String,
+    /// Query to rerank documents against
+    pub query: String,
+    /// Documents to rerank
+    pub documents: Vec<String>,
+}
+
+impl RerankRequest {
+    /// Validate the rerank request
+    pub fn validate(&self) -> Result<(), String> {
+        // Model is required and must not be empty
+        if self.model.trim().is_empty() {
+            return Err("model is required".to_string());
+        }
+
+        // Query is required and must not be empty
+        if self.query.trim().is_empty() {
+            return Err("query is required".to_string());
+        }
+
+        // Documents must have at least 1 item
+        if self.documents.is_empty() {
+            return Err("documents must contain at least 1 item".to_string());
+        }
+
+        // Documents must not exceed 1000 items
+        if self.documents.len() > 1000 {
+            return Err("documents must contain at most 1000 items".to_string());
+        }
+
+        // Each document must not be empty or whitespace-only
+        for (idx, doc) in self.documents.iter().enumerate() {
+            if doc.trim().is_empty() {
+                return Err(format!(
+                    "document at index {} is empty or contains only whitespace",
+                    idx
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
 
 /// Audio transcription response (with OpenAPI schema)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -652,56 +630,6 @@ pub struct TranscriptionWord {
     pub end: f64,
 }
 
-// ========== Rerank Models ==========
-
-/// Request for document reranking
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct RerankRequest {
-    /// Model ID to use for reranking
-    pub model: String,
-    /// Query to rerank documents against
-    pub query: String,
-    /// Documents to rerank
-    pub documents: Vec<String>,
-}
-
-impl RerankRequest {
-    /// Validate the rerank request
-    pub fn validate(&self) -> Result<(), String> {
-        // Model is required and must not be empty
-        if self.model.trim().is_empty() {
-            return Err("model is required".to_string());
-        }
-
-        // Query is required and must not be empty
-        if self.query.trim().is_empty() {
-            return Err("query is required".to_string());
-        }
-
-        // Documents must have at least 1 item
-        if self.documents.is_empty() {
-            return Err("documents must contain at least 1 item".to_string());
-        }
-
-        // Documents must not exceed 1000 items
-        if self.documents.len() > 1000 {
-            return Err("documents must contain at most 1000 items".to_string());
-        }
-
-        // Each document must not be empty or whitespace-only
-        for (idx, doc) in self.documents.iter().enumerate() {
-            if doc.trim().is_empty() {
-                return Err(format!(
-                    "document at index {} is empty or contains only whitespace",
-                    idx
-                ));
-            }
-        }
-
-        Ok(())
-    }
-}
-
 /// Response from document reranking
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct RerankResponse {
@@ -738,6 +666,7 @@ pub struct RerankUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<i32>,
 }
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelsResponse {
     pub object: String,

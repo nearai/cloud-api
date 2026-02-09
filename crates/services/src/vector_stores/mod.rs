@@ -169,13 +169,6 @@ pub struct CreateFileBatchRequest {
     pub chunking_strategy: Option<Value>,
 }
 
-/// Internal struct for RAG file_metadata map entries
-#[derive(Debug, Serialize)]
-pub struct RagFileMetadataEntry {
-    pub file_id: String,
-    pub filename: String,
-}
-
 // ---------------------------------------------------------------------------
 // Typed filter structs for RAG passthrough (prevents mass assignment)
 // ---------------------------------------------------------------------------
@@ -185,6 +178,8 @@ pub struct RagFileMetadataEntry {
 struct CreateVectorStoreFilter {
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     file_ids: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -767,6 +762,21 @@ impl VectorStoreServiceTrait for VectorStoreServiceImpl {
         // Type-safe parsing of client request
         let req: CreateFileBatchRequest = serde_json::from_value(body)
             .map_err(|e| VectorStoreServiceError::InvalidParams(e.to_string()))?;
+
+        // Build per-file overrides lookup from files[] specs (keyed by raw UUID).
+        // file_uuids[i] corresponds to req.files[i] (route handler extracts IDs in order).
+        let per_file_overrides: HashMap<Uuid, &FileSpec> = req
+            .files
+            .as_ref()
+            .map(|specs| {
+                file_uuids
+                    .iter()
+                    .zip(specs.iter())
+                    .map(|(uuid, spec)| (*uuid, spec))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let mut rag_body = serde_json::to_value(&req)
             .map_err(|e| VectorStoreServiceError::InvalidParams(e.to_string()))?;
 
@@ -786,10 +796,21 @@ impl VectorStoreServiceTrait for VectorStoreServiceImpl {
                 .iter()
                 .map(|f| {
                     let id_str = f.id.to_string();
-                    (
-                        id_str.clone(),
-                        serde_json::json!({ "file_id": id_str, "filename": f.filename, "storage_key": f.storage_key }),
-                    )
+                    let mut entry = serde_json::json!({
+                        "file_id": id_str,
+                        "filename": f.filename,
+                        "storage_key": f.storage_key,
+                    });
+                    // Merge per-file overrides from files[] spec if present
+                    if let Some(spec) = per_file_overrides.get(&f.id) {
+                        if let Some(attrs) = &spec.attributes {
+                            entry["attributes"] = serde_json::to_value(attrs).unwrap_or_default();
+                        }
+                        if let Some(cs) = &spec.chunking_strategy {
+                            entry["chunking_strategy"] = cs.clone();
+                        }
+                    }
+                    (id_str, entry)
                 })
                 .collect();
             obj.insert("file_metadata".to_string(), Value::Object(metadata));

@@ -748,3 +748,70 @@ async fn test_text_only_multimodal_input() {
 
     println!("Text-only Items input test passed!");
 }
+
+/// Test that image operations through /v1/responses are subject to image rate limits
+/// Verifies that the rate limit bypass vulnerability is fixed
+#[tokio::test]
+async fn test_responses_image_rate_limit_enforcement() {
+    let (server, _guard) = setup_test_server().await;
+    let image_model = setup_qwen_image_model(&server).await;
+
+    // Create an org with sufficient credits for many image generation attempts
+    let org = setup_org_with_credits(&server, 100_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Image rate limit is 10 operations per minute (configured in rate_limit.rs)
+    // Send 11 image generation requests through /v1/responses to exceed the limit
+    for i in 1..=11 {
+        let response = server
+            .post("/v1/responses")
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .json(&json!({
+                "model": image_model,
+                "input": format!("Generate image {}", i),
+                "stream": false
+            }))
+            .await;
+
+        if i <= 10 {
+            // First 10 should succeed (image rate limit is 10/min)
+            assert_eq!(
+                response.status_code(),
+                200,
+                "Request {} should succeed with status 200, got {}",
+                i,
+                response.status_code()
+            );
+        } else {
+            // 11th should hit rate limit (429 Too Many Requests)
+            assert_eq!(
+                response.status_code(),
+                429,
+                "Request 11 should be rate limited with 429, got {}",
+                response.status_code()
+            );
+
+            let error: serde_json::Value = response.json();
+            let error_msg = error["error"]["message"]
+                .as_str()
+                .expect("Expected error message in response");
+
+            // Verify the error message mentions image rate limit, not general rate limit
+            assert!(
+                error_msg.contains("Image generation/edit rate limit exceeded"),
+                "Error message should mention image rate limit, got: {}",
+                error_msg
+            );
+
+            // Verify it shows the correct image limit (10)
+            assert!(
+                error_msg.contains("10") || error_msg.contains("image operations/min"),
+                "Error message should mention image limit, got: {}",
+                error_msg
+            );
+        }
+    }
+
+    println!("Image rate limit enforcement test passed!");
+}

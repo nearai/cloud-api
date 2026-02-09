@@ -463,6 +463,7 @@ pub async fn init_domain_services_with_pool(
         None,                      // file_search_provider
         files_service.clone(),     // file_service
         organization_service.clone(),
+        usage_service.clone(), // usage_service for billing
     ));
 
     DomainServices {
@@ -523,6 +524,7 @@ pub async fn init_domain_services_with_mcp_factory(
         None,
         domain_services.files_service.clone(), // Reuse files_service from base
         organization_service,
+        domain_services.usage_service.clone(), // usage_service for billing
         mcp_client_factory,
     ));
 
@@ -690,7 +692,12 @@ pub fn build_app_with_config(
         api_key_repository,
     };
 
-    let rate_limit_state = middleware::RateLimitState::default();
+    // Rate limits: 1000 req/min for general, 10 ops/min for images (100x more expensive)
+    let rate_limit_state = middleware::RateLimitState::new(
+        1000, // general rate limit
+        10,   // image rate limit
+        domain_services.models_service.clone(),
+    );
 
     // Build individual route groups
     let auth_routes = build_auth_routes(

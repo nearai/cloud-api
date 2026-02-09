@@ -14,6 +14,7 @@ use crate::files::FileServiceTrait;
 use crate::inference_provider_pool::InferenceProviderPool;
 use crate::responses::tools;
 use crate::responses::{citation_tracker, errors, models, ports, service_helpers};
+use crate::usage::{InferenceType, RecordUsageServiceRequest};
 
 use tools::{ERROR_TOOL_TYPE, MAX_CONSECUTIVE_TOOL_FAILURES};
 
@@ -46,6 +47,7 @@ struct ProcessStreamContext {
     conversation_service: Arc<dyn ConversationServiceTrait>,
     file_service: Arc<dyn FileServiceTrait>,
     organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
+    usage_service: Arc<dyn crate::usage::UsageServiceTrait>,
     source_registry: Option<models::SourceRegistry>,
     web_search_failure_count: u32,
     mcp_executor: Option<Arc<tools::McpToolExecutor>>,
@@ -63,6 +65,7 @@ pub struct ResponseServiceImpl {
     pub file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
     pub file_service: Arc<dyn FileServiceTrait>,
     pub organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
+    pub usage_service: Arc<dyn crate::usage::UsageServiceTrait>,
     /// Optional MCP client factory for testing (if None, uses RealMcpClientFactory)
     pub mcp_client_factory: Option<Arc<dyn tools::McpClientFactory>>,
 }
@@ -87,6 +90,7 @@ impl ResponseServiceImpl {
         file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
         file_service: Arc<dyn FileServiceTrait>,
         organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
+        usage_service: Arc<dyn crate::usage::UsageServiceTrait>,
     ) -> Self {
         Self {
             response_repository,
@@ -98,6 +102,7 @@ impl ResponseServiceImpl {
             file_search_provider,
             file_service,
             organization_service,
+            usage_service,
             mcp_client_factory: None,
         }
     }
@@ -114,6 +119,7 @@ impl ResponseServiceImpl {
         file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
         file_service: Arc<dyn FileServiceTrait>,
         organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
+        usage_service: Arc<dyn crate::usage::UsageServiceTrait>,
         mcp_client_factory: Arc<dyn tools::McpClientFactory>,
     ) -> Self {
         Self {
@@ -126,6 +132,7 @@ impl ResponseServiceImpl {
             file_search_provider,
             file_service,
             organization_service,
+            usage_service,
             mcp_client_factory: Some(mcp_client_factory),
         }
     }
@@ -163,6 +170,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let file_search_provider = self.file_search_provider.clone();
         let file_service = self.file_service.clone();
         let organization_service = self.organization_service.clone();
+        let usage_service = self.usage_service.clone();
         let mcp_client_factory = self.mcp_client_factory.clone();
         let signing_algo_clone = signing_algo.clone();
         let client_pub_key_clone = client_pub_key.clone();
@@ -194,6 +202,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 conversation_service,
                 file_service,
                 organization_service,
+                usage_service,
                 source_registry: None,
                 web_search_failure_count: 0,
                 mcp_executor: None,
@@ -985,7 +994,10 @@ impl ResponseServiceImpl {
                         .image_edit(params, context.body_hash.clone())
                         .await
                         .map_err(|e| {
-                            errors::ResponseError::InvalidParams(format!("Image edit failed: {e}"))
+                            tracing::error!(error = %e, "Image edit request failed");
+                            errors::ResponseError::InternalError(
+                                "Image edit processing failed. Please try again later.".to_string(),
+                            )
                         })?
                 } else {
                     let params = inference_providers::ImageGenerationParams {
@@ -1005,9 +1017,11 @@ impl ResponseServiceImpl {
                         .image_generation(params, context.body_hash.clone())
                         .await
                         .map_err(|e| {
-                            errors::ResponseError::InvalidParams(format!(
-                                "Image generation failed: {e}"
-                            ))
+                            tracing::error!(error = %e, "Image generation request failed");
+                            errors::ResponseError::InternalError(
+                                "Image generation processing failed. Please try again later."
+                                    .to_string(),
+                            )
                         })?
                 };
 
@@ -1107,6 +1121,41 @@ impl ResponseServiceImpl {
                     .await
                 {
                     tracing::warn!("Failed to update response with image usage: {}", e);
+                }
+
+                // Record usage for billing
+                let inference_type = if is_edit {
+                    InferenceType::ImageEdit
+                } else {
+                    InferenceType::ImageGeneration
+                };
+
+                let usage_request = RecordUsageServiceRequest {
+                    organization_id: context.organization_id,
+                    workspace_id: context.workspace_id,
+                    api_key_id: Uuid::parse_str(&context.api_key_id)
+                        .unwrap_or_else(|_| Uuid::nil()),
+                    model_id: model_info.id,
+                    input_tokens: 0, // Image operations don't use token-based billing
+                    output_tokens: 0,
+                    inference_type,
+                    ttft_ms: None,
+                    avg_itl_ms: None,
+                    inference_id: None,
+                    provider_request_id: None,
+                    stop_reason: None,
+                    response_id: Some(ctx.response_id.clone()),
+                    image_count: Some(image_data.len() as i32),
+                };
+
+                // Record usage synchronously; log but don't fail request if recording fails
+                if let Err(e) = context.usage_service.record_usage(usage_request).await {
+                    tracing::error!(
+                        response_id = %ctx.response_id,
+                        "Failed to record image {} usage: {}",
+                        if is_edit { "edit" } else { "generation" },
+                        e
+                    );
                 }
 
                 return Ok(());
@@ -2711,25 +2760,35 @@ impl ResponseServiceImpl {
         } else if let Some(models::ResponseInput::Items(items)) = &request.input {
             // Multi-part input → check for both image and text
             for item in items {
-                if let Some(models::ResponseContent::Parts(parts)) = item.content() {
-                    for part in parts {
-                        match part {
-                            models::ResponseContentPart::InputImage { .. } => {
-                                has_image = true;
-                            }
-                            models::ResponseContentPart::InputText { text } => {
-                                // Only consider it "substantive text" if non-empty
-                                // Short instructions like "remove background" are common for edits
-                                if !text.trim().is_empty() {
+                match item.content() {
+                    Some(models::ResponseContent::Text(text)) => {
+                        // Direct text content in item
+                        if !text.trim().is_empty() {
+                            has_text = true;
+                        }
+                    }
+                    Some(models::ResponseContent::Parts(parts)) => {
+                        // Parts-based content
+                        for part in parts {
+                            match part {
+                                models::ResponseContentPart::InputImage { .. } => {
+                                    has_image = true;
+                                }
+                                models::ResponseContentPart::InputText { text } => {
+                                    // Only consider it "substantive text" if non-empty
+                                    // Short instructions like "remove background" are common for edits
+                                    if !text.trim().is_empty() {
+                                        has_text = true;
+                                    }
+                                }
+                                models::ResponseContentPart::InputFile { .. } => {
+                                    // Files count as additional content
                                     has_text = true;
                                 }
                             }
-                            models::ResponseContentPart::InputFile { .. } => {
-                                // Files count as additional content
-                                has_text = true;
-                            }
                         }
                     }
+                    None => {} // No content in this item
                 }
             }
         }
@@ -2781,12 +2840,20 @@ impl ResponseServiceImpl {
             Some(models::ResponseInput::Text(text)) => Ok(text.clone()),
             Some(models::ResponseInput::Items(items)) => {
                 for item in items {
-                    if let Some(models::ResponseContent::Parts(parts)) = item.content() {
-                        for part in parts {
-                            if let models::ResponseContentPart::InputText { text } = part {
-                                return Ok(text.clone());
+                    match item.content() {
+                        Some(models::ResponseContent::Text(text)) => {
+                            // Direct text content found
+                            return Ok(text.clone());
+                        }
+                        Some(models::ResponseContent::Parts(parts)) => {
+                            // Search through parts for text content
+                            for part in parts {
+                                if let models::ResponseContentPart::InputText { text } = part {
+                                    return Ok(text.clone());
+                                }
                             }
                         }
+                        None => {} // No content in this item, continue to next
                     }
                 }
                 Err(errors::ResponseError::InvalidParams(

@@ -182,12 +182,12 @@ impl VectorStoreRefRepository for PgVectorStoreRefRepository {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let has_more = results.len() > params.limit as usize;
+        results.truncate(params.limit as usize);
+
         if use_before {
             results.reverse();
         }
-
-        let has_more = results.len() > params.limit as usize;
-        results.truncate(params.limit as usize);
 
         Ok((results, has_more))
     }

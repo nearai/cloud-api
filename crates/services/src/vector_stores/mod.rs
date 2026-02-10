@@ -614,12 +614,12 @@ impl VectorStoreServiceTrait for VectorStoreServiceImpl {
     ) -> Result<Value, VectorStoreServiceError> {
         self.verify_vs(vs_uuid, workspace_id).await?;
 
-        // Local soft-delete first — if RAG delete later fails, the ref is
-        // already hidden which is acceptable (eventual consistency).
-        self.ref_repo.soft_delete(vs_uuid, workspace_id).await?;
-
-        // RAG: delete the vector store
+        // RAG first — if this fails, nothing changes locally and the client can retry.
         let mut response = self.rag.delete_vector_store(&vs_uuid.to_string()).await?;
+
+        // Local soft-delete second — RAG is already deleted so the store is gone
+        // even if this fails (stale ref is harmless, filtered out on next list).
+        self.ref_repo.soft_delete(vs_uuid, workspace_id).await?;
 
         add_id_prefixes(&mut response);
         Ok(response)

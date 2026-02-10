@@ -81,6 +81,11 @@ fn map_service_error(e: VectorStoreServiceError) -> (StatusCode, Json<ErrorRespo
                 "RAG service unavailable".to_string(),
             ),
         },
+        VectorStoreServiceError::InternalError(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "An internal error occurred".to_string(),
+        ),
         VectorStoreServiceError::RepositoryError(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "server_error",

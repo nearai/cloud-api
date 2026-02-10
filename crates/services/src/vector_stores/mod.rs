@@ -233,6 +233,8 @@ pub enum VectorStoreServiceError {
     FileNotFound,
     #[error("Invalid parameters: {0}")]
     InvalidParams(String),
+    #[error("Internal error: {0}")]
+    InternalError(String),
     #[error("RAG service error: {0}")]
     RagError(#[from] RagError),
     #[error("Repository error: {0}")]
@@ -485,15 +487,22 @@ impl VectorStoreServiceTrait for VectorStoreServiceImpl {
         let mut response = self.rag.create_vector_store(body).await?;
 
         // Extract the RAG-generated UUID from response
-        let rag_id = response
+        let rag_id = match response
             .get("id")
             .and_then(|v| v.as_str())
             .and_then(|s| Uuid::parse_str(s).ok())
-            .ok_or_else(|| {
-                VectorStoreServiceError::InvalidParams(
+        {
+            Some(id) => id,
+            None => {
+                // RAG returned a malformed response — attempt to clean up the orphan
+                if let Some(id_str) = response.get("id").and_then(|v| v.as_str()) {
+                    let _ = self.rag.delete_vector_store(id_str).await;
+                }
+                return Err(VectorStoreServiceError::InternalError(
                     "RAG service did not return a valid id".to_string(),
-                )
-            })?;
+                ));
+            }
+        };
 
         // Local ref — if this fails, compensate by deleting from RAG
         if let Err(e) = self.ref_repo.create(rag_id, workspace_id).await {
@@ -564,6 +573,10 @@ impl VectorStoreServiceTrait for VectorStoreServiceImpl {
                 data.push(item);
             }
         }
+
+        // If all local refs were missing from RAG, override has_more to false
+        // to prevent clients from looping forever on empty pages with no cursor.
+        let has_more = if data.is_empty() { false } else { has_more };
 
         let first_id = data
             .first()

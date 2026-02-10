@@ -610,6 +610,19 @@ impl CompletionServiceImpl {
                         .collect()
                 });
 
+                // Parse content to detect multimodal JSON arrays (for vision models)
+                // If content is a valid JSON array, use it directly; otherwise wrap as string
+                let content = if msg.content.trim().starts_with('[') {
+                    // Try to parse as JSON array for multimodal content
+                    serde_json::from_str::<serde_json::Value>(&msg.content)
+                        .ok()
+                        .and_then(|v| if v.is_array() { Some(v) } else { None })
+                        .unwrap_or_else(|| serde_json::Value::String(msg.content.clone()))
+                } else {
+                    // Regular text content wrapped as string
+                    serde_json::Value::String(msg.content.clone())
+                };
+
                 ChatMessage {
                     role: match msg.role.as_str() {
                         "system" => MessageRole::System,
@@ -617,7 +630,7 @@ impl CompletionServiceImpl {
                         "tool" => MessageRole::Tool,
                         _ => MessageRole::User,
                     },
-                    content: Some(serde_json::Value::String(msg.content.clone())),
+                    content: Some(content),
                     name: None,
                     tool_call_id: msg.tool_call_id.clone(),
                     tool_calls,
@@ -1204,6 +1217,19 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             };
             ports::CompletionError::ProviderError(error_msg)
         })
+    }
+
+    async fn get_model(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
+        self.models_repository.get_model_by_name(model_name).await
+    }
+
+    fn get_inference_provider_pool(
+        &self,
+    ) -> std::sync::Arc<crate::inference_provider_pool::InferenceProviderPool> {
+        self.inference_provider_pool.clone()
     }
 }
 

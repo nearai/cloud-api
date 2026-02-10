@@ -1162,6 +1162,7 @@ fn convert_output_item_to_conversation_item(
                         }
                     }
                     services::responses::models::ResponseContentItem::ToolCalls { .. } => None,
+                    services::responses::models::ResponseContentItem::OutputImage { .. } => None,
                 })
                 .collect();
 

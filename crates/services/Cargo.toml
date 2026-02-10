@@ -57,6 +57,7 @@ sha2 = "0.10"
 moka = { version = "0.12.13", features = ["future"] }
 bloomfilter = "3.0.1"
 mockall = { version = "0.14", optional = true }
+base64 = "0.22"
 
 [features]
 default = []

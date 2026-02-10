@@ -326,23 +326,99 @@ impl ResponseServiceImpl {
         workspace_id: uuid::Uuid,
         file_service: &Arc<dyn FileServiceTrait>,
     ) -> Result<String, errors::ResponseError> {
-        let mut content_parts = Vec::new();
+        // Check if there are any images in the parts
+        let has_images = parts
+            .iter()
+            .any(|part| matches!(part, models::ResponseContentPart::InputImage { .. }));
+
+        if has_images {
+            // Build multimodal content array for vision models
+            Self::extract_multimodal_content(parts, workspace_id, file_service).await
+        } else {
+            // Build simple text content
+            let mut content_parts = Vec::new();
+            for part in parts {
+                match part {
+                    models::ResponseContentPart::InputText { text } => {
+                        content_parts.push(text.clone());
+                    }
+                    models::ResponseContentPart::InputFile { file_id, .. } => {
+                        let file_content =
+                            Self::process_input_file(file_id, workspace_id, file_service).await?;
+                        content_parts.push(file_content);
+                    }
+                    _ => {
+                        // Skip other content types
+                    }
+                }
+            }
+            Ok(content_parts.join("\n\n"))
+        }
+    }
+
+    /// Build multimodal content array with text and images in OpenAI format
+    async fn extract_multimodal_content(
+        parts: &[models::ResponseContentPart],
+        workspace_id: uuid::Uuid,
+        file_service: &Arc<dyn FileServiceTrait>,
+    ) -> Result<String, errors::ResponseError> {
+        let mut content_items = Vec::new();
+
         for part in parts {
             match part {
                 models::ResponseContentPart::InputText { text } => {
-                    content_parts.push(text.clone());
+                    // Add text as OpenAI-compatible content object
+                    content_items.push(serde_json::json!({
+                        "type": "text",
+                        "text": text
+                    }));
                 }
-                models::ResponseContentPart::InputFile { file_id, .. } => {
+                models::ResponseContentPart::InputImage { image_url, detail } => {
+                    // Extract the URL string (handle both String and Object variants)
+                    let url = match image_url {
+                        models::ResponseImageUrl::String(s) => s.clone(),
+                        models::ResponseImageUrl::Object { url } => url.clone(),
+                    };
+
+                    // Build image_url object with optional detail parameter
+                    let mut image_url_obj = serde_json::json!({
+                        "url": url
+                    });
+                    if let Some(detail_level) = detail {
+                        image_url_obj["detail"] = serde_json::Value::String(detail_level.clone());
+                    }
+
+                    content_items.push(serde_json::json!({
+                        "type": "image_url",
+                        "image_url": image_url_obj
+                    }));
+                }
+                models::ResponseContentPart::InputFile { file_id, detail } => {
+                    // Process file to get its content
                     let file_content =
                         Self::process_input_file(file_id, workspace_id, file_service).await?;
-                    content_parts.push(file_content);
-                }
-                _ => {
-                    // Skip other content types for now (images, etc.)
+                    // For files, treat as text content
+                    content_items.push(serde_json::json!({
+                        "type": "text",
+                        "text": file_content
+                    }));
+                    if let Some(detail_level) = detail {
+                        // If detail was specified, add it to the previous item
+                        if let Some(last) = content_items.last_mut() {
+                            last["detail"] = serde_json::Value::String(detail_level.clone());
+                        }
+                    }
                 }
             }
         }
-        Ok(content_parts.join("\n\n"))
+
+        // Serialize the content array as JSON string
+        serde_json::to_string(&content_items).map_err(|e| {
+            errors::ResponseError::InternalError(format!(
+                "Failed to serialize multimodal content: {}",
+                e
+            ))
+        })
     }
 
     /// Extract response ID UUID from response object
@@ -896,6 +972,30 @@ impl ResponseServiceImpl {
             context.tool_registry.register(mcp_setup.executor.clone());
             context.mcp_executor = Some(mcp_setup.executor);
             messages.extend(mcp_setup.approval_messages);
+        }
+
+        // Check if this is an image model and handle it specially
+        if let Ok(Some(model)) = context
+            .completion_service
+            .get_model(&context.request.model)
+            .await
+        {
+            if Self::has_image_generation_capability(&model.output_modalities) {
+                tracing::info!(
+                    "Image generation model detected, handling image operation: {}",
+                    model.model_name
+                );
+
+                // Handle image generation/editing and return early
+                return Self::process_image_operation(
+                    &mut ctx,
+                    &mut emitter,
+                    &mut context,
+                    &initial_response,
+                    workspace_id_domain.clone(),
+                )
+                .await;
+            }
         }
 
         let max_iterations = 10; // Prevent infinite loops
@@ -2414,6 +2514,368 @@ impl ResponseServiceImpl {
         let _ = tx.send(event).await;
 
         Ok(())
+    }
+
+    /// Check if a model has image generation capability based on output_modalities
+    fn has_image_generation_capability(output_modalities: &Option<Vec<String>>) -> bool {
+        output_modalities
+            .as_ref()
+            .map(|modalities| modalities.contains(&"image".to_string()))
+            .unwrap_or(false)
+    }
+
+    /// Process image generation or editing operations
+    async fn process_image_operation(
+        ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
+        emitter: &mut crate::responses::service_helpers::EventEmitter,
+        process_context: &mut ProcessStreamContext,
+        initial_response: &models::ResponseObject,
+        workspace_id_domain: crate::workspace::WorkspaceId,
+    ) -> Result<(), errors::ResponseError> {
+        // Extract text prompt from request
+        let prompt = Self::extract_prompt_from_request(&process_context.request)?;
+
+        // Determine if this is image editing or generation
+        let (has_input_image, _has_input_text) =
+            Self::analyze_input_content(&process_context.request);
+
+        // Build encryption headers
+        let mut extra_params = std::collections::HashMap::new();
+        if let Some(model_pub_key) = &process_context.model_pub_key {
+            extra_params.insert(
+                crate::common::encryption_headers::MODEL_PUB_KEY.to_string(),
+                serde_json::json!(model_pub_key),
+            );
+        }
+
+        // Call the appropriate image API
+        let response = if has_input_image {
+            let image_bytes =
+                Self::extract_input_image_from_request(&process_context.request).await?;
+            let params = inference_providers::ImageEditParams {
+                model: process_context.request.model.clone(),
+                image: std::sync::Arc::new(image_bytes),
+                prompt,
+                size: None,
+                response_format: Some("b64_json".to_string()),
+            };
+
+            process_context
+                .completion_service
+                .get_inference_provider_pool()
+                .image_edit(params, process_context.body_hash.clone())
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "Image edit request failed");
+                    errors::ResponseError::InternalError(
+                        "Image edit processing failed. Please try again later.".to_string(),
+                    )
+                })?
+        } else {
+            let params = inference_providers::ImageGenerationParams {
+                model: process_context.request.model.clone(),
+                prompt,
+                size: None,
+                quality: None,
+                style: None,
+                n: Some(1),
+                response_format: Some("b64_json".to_string()),
+                extra: extra_params,
+            };
+
+            process_context
+                .completion_service
+                .get_inference_provider_pool()
+                .image_generation(params, process_context.body_hash.clone())
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "Image generation request failed");
+                    errors::ResponseError::InternalError(
+                        "Image generation processing failed. Please try again later.".to_string(),
+                    )
+                })?
+        };
+
+        // Extract base64 images from response
+        let image_data: Vec<models::ImageOutputData> = response
+            .response
+            .data
+            .iter()
+            .filter_map(|img| {
+                img.b64_json.as_ref().map(|b64| models::ImageOutputData {
+                    b64_json: Some(b64.clone()),
+                    url: None,
+                    revised_prompt: None,
+                })
+            })
+            .collect();
+
+        if image_data.is_empty() {
+            return Err(errors::ResponseError::InternalError(
+                "Image generation returned no results".to_string(),
+            ));
+        }
+
+        // Create message item with image output
+        let message_item = models::ResponseOutputItem::Message {
+            id: format!(
+                "{}_{}",
+                crate::id_prefixes::PREFIX_MSG,
+                uuid::Uuid::new_v4()
+            ),
+            response_id: ctx.response_id.to_string(),
+            previous_response_id: None,
+            next_response_ids: vec![],
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            status: models::ResponseItemStatus::Completed,
+            role: "assistant".to_string(),
+            content: vec![models::ResponseContentItem::OutputImage {
+                data: image_data.clone(),
+                url: None,
+            }],
+            model: process_context.request.model.clone(),
+            metadata: None,
+        };
+
+        // Store the image message item in database
+        process_context
+            .response_items_repository
+            .create(
+                ctx.response_id.clone(),
+                ctx.api_key_id,
+                ctx.conversation_id,
+                message_item.clone(),
+            )
+            .await
+            .map_err(|e| {
+                errors::ResponseError::InternalError(format!(
+                    "Failed to store image response item: {e}"
+                ))
+            })?;
+
+        // Emit image output item event
+        let event = models::ResponseStreamEvent {
+            event_type: "response.output_item.added".to_string(),
+            sequence_number: None,
+            response: None,
+            output_index: Some(0),
+            content_index: None,
+            item: Some(message_item.clone()),
+            item_id: None,
+            part: None,
+            delta: None,
+            text: None,
+            logprobs: None,
+            obfuscation: None,
+            annotation_index: None,
+            annotation: None,
+            conversation_title: None,
+        };
+        use futures_util::SinkExt;
+        let _ = emitter.tx.clone().send(event).await;
+
+        // Update response status and usage
+        let mut final_response = initial_response.clone();
+        final_response.status = models::ResponseStatus::Completed;
+        // For image operations, report image count as output tokens
+        final_response.usage = models::Usage::new(0, image_data.len() as i32);
+        // Include the message item with image in the output
+        final_response.output = vec![message_item.clone()];
+
+        // Emit completion event
+        let completion_event = models::ResponseStreamEvent {
+            event_type: "response.completed".to_string(),
+            sequence_number: None,
+            response: Some(final_response.clone()),
+            output_index: None,
+            content_index: None,
+            item: None,
+            item_id: None,
+            part: None,
+            delta: None,
+            text: None,
+            logprobs: None,
+            obfuscation: None,
+            annotation_index: None,
+            annotation: None,
+            conversation_title: None,
+        };
+        let _ = emitter.tx.clone().send(completion_event).await;
+
+        // Update response in database
+        let usage_json = serde_json::to_value(&final_response.usage).map_err(|e| {
+            errors::ResponseError::InternalError(format!("Failed to serialize usage: {e}"))
+        })?;
+
+        process_context
+            .response_repository
+            .update(
+                ctx.response_id.clone(),
+                workspace_id_domain,
+                None,
+                final_response.status.clone(),
+                Some(usage_json),
+            )
+            .await
+            .map_err(|e| {
+                errors::ResponseError::InternalError(format!(
+                    "Failed to update response with image usage: {e}"
+                ))
+            })?;
+
+        ctx.total_output_tokens += image_data.len() as i32;
+
+        Ok(())
+    }
+
+    /// Analyze input content to determine if it contains images or text
+    fn analyze_input_content(request: &models::CreateResponseRequest) -> (bool, bool) {
+        let mut has_image = false;
+        let mut has_text = false;
+
+        if let Some(models::ResponseInput::Text(text)) = &request.input {
+            has_text = !text.trim().is_empty();
+        } else if let Some(models::ResponseInput::Items(items)) = &request.input {
+            for item in items {
+                match item.content() {
+                    Some(models::ResponseContent::Text(text)) => {
+                        if !text.trim().is_empty() {
+                            has_text = true;
+                        }
+                    }
+                    Some(models::ResponseContent::Parts(parts)) => {
+                        for part in parts {
+                            match part {
+                                models::ResponseContentPart::InputImage { .. } => {
+                                    has_image = true;
+                                }
+                                models::ResponseContentPart::InputText { text } => {
+                                    if !text.trim().is_empty() {
+                                        has_text = true;
+                                    }
+                                }
+                                models::ResponseContentPart::InputFile { .. } => {
+                                    has_text = true;
+                                }
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        (has_image, has_text)
+    }
+
+    /// Validate image format by checking magic bytes
+    fn validate_image_format(data: &[u8]) -> Result<(), errors::ResponseError> {
+        if data.len() < 3 {
+            return Err(errors::ResponseError::InvalidParams(
+                "Image data too small".to_string(),
+            ));
+        }
+
+        // Check for JPEG (FF D8 FF) or PNG (89 50 4E 47)
+        if (data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF)
+            || (data.len() >= 4
+                && data[0] == 0x89
+                && data[1] == 0x50
+                && data[2] == 0x4E
+                && data[3] == 0x47)
+        {
+            Ok(())
+        } else {
+            Err(errors::ResponseError::InvalidParams(
+                "Invalid image format (must be PNG or JPEG)".to_string(),
+            ))
+        }
+    }
+
+    /// Extract text prompt from request
+    fn extract_prompt_from_request(
+        request: &models::CreateResponseRequest,
+    ) -> Result<String, errors::ResponseError> {
+        match &request.input {
+            Some(models::ResponseInput::Text(text)) => Ok(text.clone()),
+            Some(models::ResponseInput::Items(items)) => {
+                for item in items {
+                    match item.content() {
+                        Some(models::ResponseContent::Text(text)) => return Ok(text.clone()),
+                        Some(models::ResponseContent::Parts(parts)) => {
+                            for part in parts {
+                                if let models::ResponseContentPart::InputText { text } = part {
+                                    return Ok(text.clone());
+                                }
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                Err(errors::ResponseError::InvalidParams(
+                    "No text prompt found".to_string(),
+                ))
+            }
+            None => Err(errors::ResponseError::InvalidParams(
+                "No input provided".to_string(),
+            )),
+        }
+    }
+
+    /// Extract image from request (for edit operations)
+    async fn extract_input_image_from_request(
+        request: &models::CreateResponseRequest,
+    ) -> Result<Vec<u8>, errors::ResponseError> {
+        use base64::Engine;
+
+        if let Some(models::ResponseInput::Items(items)) = &request.input {
+            for item in items {
+                if let Some(models::ResponseContent::Parts(parts)) = item.content() {
+                    for part in parts {
+                        if let models::ResponseContentPart::InputImage {
+                            image_url,
+                            detail: _,
+                        } = part
+                        {
+                            let url_str = match image_url {
+                                models::ResponseImageUrl::String(s) => s.clone(),
+                                models::ResponseImageUrl::Object { url } => url.clone(),
+                            };
+
+                            if let Some(comma_pos) = url_str.find(',') {
+                                let base64_str = &url_str[comma_pos + 1..];
+                                let base64_str_owned = base64_str.to_string();
+
+                                let decoded = tokio::task::spawn_blocking(move || {
+                                    base64::engine::general_purpose::STANDARD
+                                        .decode(&base64_str_owned)
+                                })
+                                .await
+                                .map_err(|e| {
+                                    errors::ResponseError::InternalError(format!(
+                                        "Base64 decode failed: {e}"
+                                    ))
+                                })?
+                                .map_err(|e| {
+                                    errors::ResponseError::InvalidParams(format!(
+                                        "Failed to decode base64: {e}"
+                                    ))
+                                })?;
+
+                                Self::validate_image_format(&decoded)?;
+                                return Ok(decoded);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Err(errors::ResponseError::InvalidParams(
+            "No input image found".to_string(),
+        ))
     }
 }
 

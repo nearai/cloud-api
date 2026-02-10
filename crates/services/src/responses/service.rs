@@ -320,7 +320,10 @@ impl ResponseServiceImpl {
     }
 
     /// Extract content from a vector of content parts, handling text and files
-    /// Returns a string with all parts joined by "\n\n"
+    ///
+    /// Returns different formats depending on content:
+    /// - Plain text: Text parts joined by "\n\n" (for text-only requests)
+    /// - JSON array string: OpenAI-compatible multimodal format `[{"type":"text",...}, {"type":"image_url",...}]` (for requests with images)
     async fn extract_content_parts(
         parts: &[models::ResponseContentPart],
         workspace_id: uuid::Uuid,
@@ -2867,12 +2870,18 @@ impl ResponseServiceImpl {
 
                                 Self::validate_image_format(&decoded)?;
                                 return Ok(decoded);
+                            } else {
+                                // Found an image but it's not in data URL format
+                                return Err(errors::ResponseError::InvalidParams(
+                                    "Unsupported image URL format: expected data URL with base64 encoding (e.g., 'data:image/png;base64,...')".to_string(),
+                                ));
                             }
                         }
                     }
                 }
             }
         }
+
         Err(errors::ResponseError::InvalidParams(
             "No input image found".to_string(),
         ))

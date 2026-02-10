@@ -142,7 +142,7 @@ impl VectorStoreRefRepository for PgVectorStoreRefRepository {
                 "SELECT * FROM vector_stores
                  WHERE workspace_id = $1
                    AND deleted_at IS NULL
-                   AND (created_at, id) {comparison} (SELECT created_at, id FROM vector_stores WHERE id = $2)
+                   AND (created_at, id) {comparison} (SELECT created_at, id FROM vector_stores WHERE id = $2 AND workspace_id = $1 AND deleted_at IS NULL)
                  ORDER BY created_at {order_clause}, id {order_clause}
                  LIMIT $3"
             ),

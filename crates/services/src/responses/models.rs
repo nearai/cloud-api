@@ -737,6 +737,25 @@ pub enum ResponseContentItem {
     ToolCalls {
         tool_calls: Vec<ResponseOutputToolCall>,
     },
+
+    #[serde(rename = "output_image")]
+    OutputImage {
+        /// Image data array (matches OpenAI format)
+        data: Vec<ImageOutputData>,
+        /// Optional URL (future support)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImageOutputData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub b64_json: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revised_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -791,7 +810,9 @@ impl ResponseContentItem {
     pub fn is_output(&self) -> bool {
         matches!(
             self,
-            ResponseContentItem::OutputText { .. } | ResponseContentItem::ToolCalls { .. }
+            ResponseContentItem::OutputText { .. }
+                | ResponseContentItem::ToolCalls { .. }
+                | ResponseContentItem::OutputImage { .. }
         )
     }
 
@@ -823,6 +844,12 @@ pub enum ResponseOutputContent {
     #[serde(rename = "tool_calls")]
     ToolCalls {
         tool_calls: Vec<ResponseOutputToolCall>,
+    },
+    #[serde(rename = "output_image")]
+    OutputImage {
+        data: Vec<ImageOutputData>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
     },
 }
 

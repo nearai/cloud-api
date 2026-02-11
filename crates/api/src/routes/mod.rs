@@ -8,6 +8,7 @@ pub mod common;
 pub mod completions;
 pub mod conversations;
 pub mod files;
+pub mod gateway;
 pub mod health;
 pub mod models;
 pub mod organization_members;

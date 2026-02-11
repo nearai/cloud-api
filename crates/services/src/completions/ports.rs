@@ -174,4 +174,15 @@ pub trait CompletionServiceTrait: Send + Sync {
         request_hash: String,
         params: inference_providers::ScoreParams,
     ) -> Result<inference_providers::ScoreResponse, CompletionError>;
+
+    /// Get model information by name (for checking output_modalities, etc.)
+    async fn get_model(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error>;
+
+    /// Get the inference provider pool for direct access
+    fn get_inference_provider_pool(
+        &self,
+    ) -> std::sync::Arc<crate::inference_provider_pool::InferenceProviderPool>;
 }

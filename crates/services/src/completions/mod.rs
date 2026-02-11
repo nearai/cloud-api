@@ -610,6 +610,19 @@ impl CompletionServiceImpl {
                         .collect()
                 });
 
+                // Parse content to detect multimodal JSON arrays (for vision models)
+                // Only parse as multimodal content if it's a proper OpenAI-format array
+                // with objects containing "type" fields (e.g., {"type": "text"}, {"type": "image_url"})
+                let content = if msg.content.trim().starts_with('[')
+                    && Self::is_valid_multimodal_content(&msg.content)
+                {
+                    serde_json::from_str::<serde_json::Value>(&msg.content)
+                        .unwrap_or_else(|_| serde_json::Value::String(msg.content.clone()))
+                } else {
+                    // Regular text content wrapped as string
+                    serde_json::Value::String(msg.content.clone())
+                };
+
                 ChatMessage {
                     role: match msg.role.as_str() {
                         "system" => MessageRole::System,
@@ -617,13 +630,31 @@ impl CompletionServiceImpl {
                         "tool" => MessageRole::Tool,
                         _ => MessageRole::User,
                     },
-                    content: Some(serde_json::Value::String(msg.content.clone())),
+                    content: Some(content),
                     name: None,
                     tool_call_id: msg.tool_call_id.clone(),
                     tool_calls,
                 }
             })
             .collect()
+    }
+
+    /// Check if content is a valid multimodal content array (OpenAI format)
+    /// Valid multimodal arrays have objects with "type" field (e.g., "text", "image_url")
+    fn is_valid_multimodal_content(content: &str) -> bool {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
+            if let Some(array) = value.as_array() {
+                // Must be a non-empty array
+                if array.is_empty() {
+                    return false;
+                }
+                // All elements must be objects with a "type" field
+                return array
+                    .iter()
+                    .all(|item| item.is_object() && item.get("type").is_some());
+            }
+        }
+        false
     }
 
     async fn try_acquire_concurrent_slot(
@@ -1204,6 +1235,19 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             };
             ports::CompletionError::ProviderError(error_msg)
         })
+    }
+
+    async fn get_model(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
+        self.models_repository.get_model_by_name(model_name).await
+    }
+
+    fn get_inference_provider_pool(
+        &self,
+    ) -> std::sync::Arc<crate::inference_provider_pool::InferenceProviderPool> {
+        self.inference_provider_pool.clone()
     }
 }
 

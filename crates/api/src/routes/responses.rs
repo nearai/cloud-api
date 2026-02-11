@@ -47,6 +47,7 @@ fn convert_to_input_part(
             }
         }
         ResponseContentItem::ToolCalls { .. } => None,
+        ResponseContentItem::OutputImage { .. } => None,
     }
 }
 

@@ -65,6 +65,6 @@ sha3 = "0.10"
 hmac = "0.12"
 tokio-postgres = "0.7"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-rand = "0.9"
+rand = "0.10"
 services = { path = "../services", features = ["test-mocks"] }
 async-trait = "0.1"

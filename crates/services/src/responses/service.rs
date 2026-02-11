@@ -990,7 +990,7 @@ impl ResponseServiceImpl {
                 );
 
                 // Handle image generation/editing and return early
-                return Self::process_image_operation(
+                let image_result = Self::process_image_operation(
                     &mut ctx,
                     &mut emitter,
                     &mut context,
@@ -998,6 +998,60 @@ impl ResponseServiceImpl {
                     workspace_id_domain.clone(),
                 )
                 .await;
+
+                // Handle errors by updating response status to Failed
+                if let Err(e) = image_result {
+                    let error_message = e.to_string();
+                    let failed_item = models::ResponseOutputItem::Message {
+                        id: format!("msg_{}", Uuid::new_v4().simple()),
+                        response_id: ctx.response_id_str.clone(),
+                        previous_response_id: ctx.previous_response_id.clone(),
+                        next_response_ids: vec![],
+                        created_at: ctx.created_at,
+                        status: models::ResponseItemStatus::Failed,
+                        role: "assistant".to_string(),
+                        content: vec![models::ResponseContentItem::OutputText {
+                            text: error_message.clone(),
+                            annotations: vec![],
+                            logprobs: vec![],
+                        }],
+                        model: ctx.model.clone(),
+                        metadata: None,
+                    };
+                    if let Err(create_err) = context
+                        .response_items_repository
+                        .create(
+                            ctx.response_id.clone(),
+                            ctx.api_key_id,
+                            ctx.conversation_id,
+                            failed_item,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to store failed image response item: {}",
+                            create_err
+                        );
+                    }
+                    if let Err(update_err) = context
+                        .response_repository
+                        .update(
+                            ctx.response_id.clone(),
+                            workspace_id_domain.clone(),
+                            None,
+                            models::ResponseStatus::Failed,
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to update response status to failed: {}",
+                            update_err
+                        );
+                    }
+                    return Err(e);
+                }
+                return Ok(());
             }
         }
 
@@ -2621,18 +2675,11 @@ impl ResponseServiceImpl {
 
         // Create message item with image output
         let message_item = models::ResponseOutputItem::Message {
-            id: format!(
-                "{}_{}",
-                crate::id_prefixes::PREFIX_MSG,
-                uuid::Uuid::new_v4()
-            ),
-            response_id: ctx.response_id.to_string(),
-            previous_response_id: None,
+            id: format!("msg_{}", Uuid::new_v4().simple()),
+            response_id: ctx.response_id_str.clone(),
+            previous_response_id: ctx.previous_response_id.clone(),
             next_response_ids: vec![],
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
+            created_at: ctx.created_at,
             status: models::ResponseItemStatus::Completed,
             role: "assistant".to_string(),
             content: vec![models::ResponseContentItem::OutputImage {
@@ -2805,22 +2852,28 @@ impl ResponseServiceImpl {
         match &request.input {
             Some(models::ResponseInput::Text(text)) => Ok(text.clone()),
             Some(models::ResponseInput::Items(items)) => {
+                let mut text_parts = Vec::new();
                 for item in items {
                     match item.content() {
-                        Some(models::ResponseContent::Text(text)) => return Ok(text.clone()),
+                        Some(models::ResponseContent::Text(text)) => {
+                            text_parts.push(text.clone());
+                        }
                         Some(models::ResponseContent::Parts(parts)) => {
                             for part in parts {
                                 if let models::ResponseContentPart::InputText { text } = part {
-                                    return Ok(text.clone());
+                                    text_parts.push(text.clone());
                                 }
                             }
                         }
                         None => {}
                     }
                 }
-                Err(errors::ResponseError::InvalidParams(
-                    "No text prompt found".to_string(),
-                ))
+                if text_parts.is_empty() {
+                    return Err(errors::ResponseError::InvalidParams(
+                        "No text prompt found".to_string(),
+                    ));
+                }
+                Ok(text_parts.join(" "))
             }
             None => Err(errors::ResponseError::InvalidParams(
                 "No input provided".to_string(),

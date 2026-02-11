@@ -611,13 +611,13 @@ impl CompletionServiceImpl {
                 });
 
                 // Parse content to detect multimodal JSON arrays (for vision models)
-                // If content is a valid JSON array, use it directly; otherwise wrap as string
-                let content = if msg.content.trim().starts_with('[') {
-                    // Try to parse as JSON array for multimodal content
+                // Only parse as multimodal content if it's a proper OpenAI-format array
+                // with objects containing "type" fields (e.g., {"type": "text"}, {"type": "image_url"})
+                let content = if msg.content.trim().starts_with('[')
+                    && Self::is_valid_multimodal_content(&msg.content)
+                {
                     serde_json::from_str::<serde_json::Value>(&msg.content)
-                        .ok()
-                        .and_then(|v| if v.is_array() { Some(v) } else { None })
-                        .unwrap_or_else(|| serde_json::Value::String(msg.content.clone()))
+                        .unwrap_or_else(|_| serde_json::Value::String(msg.content.clone()))
                 } else {
                     // Regular text content wrapped as string
                     serde_json::Value::String(msg.content.clone())
@@ -637,6 +637,24 @@ impl CompletionServiceImpl {
                 }
             })
             .collect()
+    }
+
+    /// Check if content is a valid multimodal content array (OpenAI format)
+    /// Valid multimodal arrays have objects with "type" field (e.g., "text", "image_url")
+    fn is_valid_multimodal_content(content: &str) -> bool {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
+            if let Some(array) = value.as_array() {
+                // Must be a non-empty array
+                if array.is_empty() {
+                    return false;
+                }
+                // All elements must be objects with a "type" field
+                return array
+                    .iter()
+                    .all(|item| item.is_object() && item.get("type").is_some());
+            }
+        }
+        false
     }
 
     async fn try_acquire_concurrent_slot(

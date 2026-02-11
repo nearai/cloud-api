@@ -16,14 +16,17 @@
 
 -- Step 1: Remove duplicate (organization_id, inference_id) rows, keeping only
 -- the most recent record (largest created_at) per group.
+-- Uses DELETE ... USING with a window function instead of NOT IN subquery
+-- to avoid materializing a large ID list and reduce lock duration.
 DELETE FROM organization_usage_log
-WHERE inference_id IS NOT NULL
-  AND id NOT IN (
-      SELECT DISTINCT ON (organization_id, inference_id) id
-      FROM organization_usage_log
-      WHERE inference_id IS NOT NULL
-      ORDER BY organization_id, inference_id, created_at DESC
-  );
+USING (
+    SELECT id,
+           row_number() OVER (PARTITION BY organization_id, inference_id ORDER BY created_at DESC) AS rn
+    FROM organization_usage_log
+    WHERE inference_id IS NOT NULL
+) AS duplicates
+WHERE organization_usage_log.id = duplicates.id
+  AND duplicates.rn > 1;
 
 -- Step 2: Now that duplicates are gone, create the unique index.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_org_usage_org_inference_unique

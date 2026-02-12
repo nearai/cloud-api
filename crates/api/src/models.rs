@@ -780,7 +780,9 @@ impl ChatCompletionRequest {
             if message.role.is_empty() {
                 return Err("message role is required".to_string());
             }
-            if !["system", "user", "assistant", "tool"].contains(&message.role.as_str()) {
+            if !["system", "developer", "user", "assistant", "tool"]
+                .contains(&message.role.as_str())
+            {
                 return Err(format!("invalid message role: {}", message.role));
             }
             // Validate message content can be serialized (catches malformed multimodal content)

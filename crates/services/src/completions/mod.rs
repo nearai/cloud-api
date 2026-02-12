@@ -625,7 +625,7 @@ impl CompletionServiceImpl {
 
                 ChatMessage {
                     role: match msg.role.as_str() {
-                        "system" => MessageRole::System,
+                        "system" | "developer" => MessageRole::System,
                         "assistant" => MessageRole::Assistant,
                         "tool" => MessageRole::Tool,
                         _ => MessageRole::User,

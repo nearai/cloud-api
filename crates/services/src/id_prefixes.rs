@@ -27,6 +27,9 @@ pub const PREFIX_MCPR: &str = "mcpr_";
 /// Prefix for function call IDs
 pub const PREFIX_FC: &str = "fc_";
 
+/// Prefix for function call output IDs
+pub const PREFIX_FCO: &str = "fco_";
+
 /// All known ID prefixes (useful for path normalization in metrics)
 pub const ALL_PREFIXES: &[&str] = &[
     PREFIX_CHATCMPL,
@@ -37,4 +40,5 @@ pub const ALL_PREFIXES: &[&str] = &[
     PREFIX_SK,
     PREFIX_MCPR,
     PREFIX_FC,
+    PREFIX_FCO,
 ];

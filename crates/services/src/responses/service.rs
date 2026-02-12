@@ -156,8 +156,9 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
             _ => false,
         };
         if has_function_outputs && request.previous_response_id.is_none() {
-            return Err(errors::ResponseError::FunctionCallNotFound(
-                "function_call_output requires previous_response_id".to_string(),
+            return Err(errors::ResponseError::InvalidParams(
+                "function_call_output requires previous_response_id to resume a response"
+                    .to_string(),
             ));
         }
 
@@ -924,7 +925,17 @@ impl ResponseServiceImpl {
             Uuid::parse_str(uuid_str).ok().map(ConversationId)
         });
 
-        // Store user input messages as response_items
+        // Validate function call outputs before storing anything, so invalid
+        // FunctionCallOutput items never get persisted to the database.
+        let function_output_messages = Self::process_function_call_outputs(
+            &context.request,
+            &context.response_items_repository,
+            &context.response_repository,
+            context.workspace_id,
+        )
+        .await?;
+
+        // Store user input messages as response_items (after validation above)
         if let Some(input) = &context.request.input {
             Self::store_input_as_response_items(
                 &context.response_items_repository,
@@ -1000,14 +1011,7 @@ impl ResponseServiceImpl {
             context.tool_registry.register(Arc::new(function_executor));
         }
 
-        // Process function call outputs from input (client-provided results)
-        let function_output_messages = Self::process_function_call_outputs(
-            &context.request,
-            &context.response_items_repository,
-            &context.response_repository,
-            context.workspace_id,
-        )
-        .await?;
+        // Add the pre-validated function output messages to conversation context
         messages.extend(function_output_messages);
 
         // Check if this is an image model and handle it specially
@@ -1770,9 +1774,7 @@ impl ResponseServiceImpl {
             .unwrap_or(prev_response_id);
 
         let response_uuid = uuid::Uuid::parse_str(uuid_str).map_err(|e| {
-            errors::ResponseError::FunctionCallNotFound(format!(
-                "invalid previous_response_id: {e}"
-            ))
+            errors::ResponseError::InvalidParams(format!("invalid previous_response_id: {e}"))
         })?;
 
         // Verify the previous response belongs to this workspace (prevents IDOR)
@@ -1905,7 +1907,11 @@ impl ResponseServiceImpl {
                         } => {
                             // Store function call output as a response item for conversation history
                             let fco_item = models::ResponseOutputItem::FunctionCallOutput {
-                                id: format!("fco_{}", uuid::Uuid::new_v4().simple()),
+                                id: format!(
+                                    "{}{}",
+                                    crate::id_prefixes::PREFIX_FCO,
+                                    uuid::Uuid::new_v4().simple()
+                                ),
                                 response_id: String::new(),
                                 previous_response_id: None,
                                 next_response_ids: vec![],
@@ -2323,7 +2329,10 @@ impl ResponseServiceImpl {
                         function,
                         ..
                     } => {
-                        // Reconstruct from the legacy ToolCall variant
+                        // Legacy ToolCall: server-executed tool calls (e.g. web search)
+                        // that stored the call but not the result as a separate item.
+                        // Emit the assistant tool_call and a synthetic tool result so
+                        // the message sequence stays valid for LLM providers.
                         if pending_tool_calls_response_id.as_ref() != Some(&response_id)
                             && !pending_tool_calls.is_empty()
                         {
@@ -2334,11 +2343,25 @@ impl ResponseServiceImpl {
                             );
                         }
                         pending_tool_calls_response_id = Some(response_id);
+                        let tc_id = tool_call_id.clone();
                         pending_tool_calls.push(crate::completions::ports::CompletionToolCall {
                             id: tool_call_id,
                             name: function.name,
                             arguments: function.arguments,
                             thought_signature: None,
+                        });
+                        // Immediately flush and add a synthetic result (the actual output
+                        // was consumed in the original turn but never stored separately)
+                        flush_tool_calls(
+                            &mut pending_tool_calls,
+                            &mut pending_tool_calls_response_id,
+                            &mut messages,
+                        );
+                        messages.push(CompletionMessage {
+                            role: "tool".to_string(),
+                            content: "[tool result not stored]".to_string(),
+                            tool_call_id: Some(tc_id),
+                            tool_calls: None,
                         });
                     }
                     // Skip items that don't contribute to conversation context

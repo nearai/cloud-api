@@ -1827,7 +1827,7 @@ impl ResponseServiceImpl {
                 ));
             }
             if match_count > 1 {
-                return Err(errors::ResponseError::FunctionCallNotFound(format!(
+                return Err(errors::ResponseError::InvalidParams(format!(
                     "ambiguous call_id '{}' matches {} function calls",
                     call_id, match_count
                 )));

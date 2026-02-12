@@ -417,6 +417,128 @@ async fn test_function_tool_parallel_calls() {
     println!("\n✅ Function tool parallel calls test passed!");
 }
 
+/// Regression test: FunctionCallOutput + Message in same input must preserve order.
+/// Tool results must immediately follow the assistant message with tool_calls;
+/// a user message in between violates the LLM provider contract.
+/// With the fix: [assistant+tool_calls, tool_result, user_message]
+/// Bug: [assistant+tool_calls, user_message, tool_result] - wrong
+#[tokio::test]
+async fn test_function_output_and_message_ordering() {
+    let (server, _, mock, _, _guard) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let conv_resp = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({"name": "Function Output + Message Ordering Test"}))
+        .await;
+    assert_eq!(conv_resp.status_code(), 201);
+    let conversation = conv_resp.json::<api::models::ConversationObject>();
+
+    let function_tool = serde_json::json!({
+        "type": "function",
+        "name": "get_weather",
+        "description": "Get weather",
+        "parameters": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}
+    });
+
+    // Turn 1: LLM requests function call
+    let turn1_user = "What's the weather in Paris?";
+    use common::mock_prompts;
+    mock.when(inference_providers::mock::RequestMatcher::ExactPrompt(
+        mock_prompts::build_prompt(turn1_user),
+    ))
+    .respond_with(
+        inference_providers::mock::ResponseTemplate::new("").with_tool_calls(vec![
+            inference_providers::mock::ToolCall::new("get_weather", r#"{"location": "Paris"}"#),
+        ]),
+    )
+    .await;
+
+    let resp1 = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "conversation": {"id": conversation.id},
+            "input": turn1_user,
+            "stream": false,
+            "tools": [function_tool.clone()]
+        }))
+        .await;
+
+    assert_eq!(resp1.status_code(), 200, "Turn 1 failed: {}", resp1.text());
+    let resp1_obj = resp1.json::<api::models::ResponseObject>();
+    assert_eq!(
+        resp1_obj.status,
+        api::models::ResponseStatus::Incomplete,
+        "Turn 1 should be incomplete"
+    );
+
+    let function_call = resp1_obj
+        .output
+        .iter()
+        .find_map(|item| {
+            if let api::models::ResponseOutputItem::FunctionCall { call_id, .. } = item {
+                Some(call_id.clone())
+            } else {
+                None
+            }
+        })
+        .expect("Turn 1 should return FunctionCall");
+
+    let function_output = r#"{"temperature": 15, "conditions": "cloudy"}"#;
+    let follow_up_message = "Thanks! Is it going to rain tomorrow?";
+
+    // Correct order: tool_result before user message (LLM provider contract)
+    // build_prompt concatenates text in message order: turn1, tool_output, follow_up
+    let expected_prompt = mock_prompts::build_prompt(&format!(
+        "{} {} {}",
+        turn1_user, function_output, follow_up_message
+    ));
+    mock.when(inference_providers::mock::RequestMatcher::ExactPrompt(
+        expected_prompt,
+    ))
+    .respond_with(inference_providers::mock::ResponseTemplate::new(
+        "Based on the current cloudy conditions, there's a 60% chance of rain tomorrow.",
+    ))
+    .await;
+
+    // Turn 2: BOTH FunctionCallOutput AND Message - order matters
+    let resp2 = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "conversation": {"id": conversation.id},
+            "previous_response_id": resp1_obj.id,
+            "input": [
+                {"type": "function_call_output", "call_id": function_call, "output": function_output},
+                {"type": "message", "role": "user", "content": follow_up_message}
+            ],
+            "stream": false,
+            "tools": [function_tool.clone()]
+        }))
+        .await;
+
+    assert_eq!(resp2.status_code(), 200, "Turn 2 failed: {}", resp2.text());
+    let resp2_obj = resp2.json::<api::models::ResponseObject>();
+    assert_eq!(
+        resp2_obj.status,
+        api::models::ResponseStatus::Completed,
+        "Turn 2 should complete - wrong message ordering may cause provider errors"
+    );
+
+    let final_message = resp2_obj
+        .output
+        .iter()
+        .find(|item| matches!(item, api::models::ResponseOutputItem::Message { .. }));
+    assert!(final_message.is_some(), "Turn 2 should have message output");
+    println!("✅ FunctionCallOutput + Message ordering test passed!");
+}
+
 /// Test function tool with no previous_response_id (first turn with function output).
 /// This tests the edge case where a client might try to submit function output
 /// without a previous response context.

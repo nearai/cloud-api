@@ -884,6 +884,18 @@ impl ResponseServiceImpl {
         tracing::info!("Starting response stream processing");
 
         let workspace_id_domain = crate::workspace::WorkspaceId(context.workspace_id);
+
+        // Validate function call outputs early (before creating response) so invalid
+        // FunctionCallOutput items never get persisted. Required before load_conversation_context
+        // so we can pass validated tool messages for correct ordering.
+        let function_output_messages = Self::process_function_call_outputs(
+            &context.request,
+            &context.response_items_repository,
+            &context.response_repository,
+            context.workspace_id,
+        )
+        .await?;
+
         let mut messages = Self::load_conversation_context(
             &context.request,
             &context.conversation_service,
@@ -893,6 +905,7 @@ impl ResponseServiceImpl {
             context.organization_id,
             context.user_id.clone(),
             &context.organization_service,
+            &function_output_messages,
         )
         .await?;
 
@@ -925,17 +938,7 @@ impl ResponseServiceImpl {
             Uuid::parse_str(uuid_str).ok().map(ConversationId)
         });
 
-        // Validate function call outputs before storing anything, so invalid
-        // FunctionCallOutput items never get persisted to the database.
-        let function_output_messages = Self::process_function_call_outputs(
-            &context.request,
-            &context.response_items_repository,
-            &context.response_repository,
-            context.workspace_id,
-        )
-        .await?;
-
-        // Store user input messages as response_items (after validation above)
+        // Store user input messages as response_items
         if let Some(input) = &context.request.input {
             Self::store_input_as_response_items(
                 &context.response_items_repository,
@@ -1005,14 +1008,11 @@ impl ResponseServiceImpl {
             messages.extend(mcp_setup.approval_messages);
         }
 
-        // Set up Function tools: register executor and process any function call outputs
+        // Set up Function tools: register executor
         let function_executor = tools::FunctionToolExecutor::new(&context.request);
         if !function_executor.is_empty() {
             context.tool_registry.register(Arc::new(function_executor));
         }
-
-        // Add the pre-validated function output messages to conversation context
-        messages.extend(function_output_messages);
 
         // Check if this is an image model and handle it specially
         if let Ok(Some(model)) = context
@@ -2012,7 +2012,11 @@ impl ResponseServiceImpl {
         Ok(())
     }
 
-    /// Load conversation context based on conversation_id or previous_response_id
+    /// Load conversation context based on conversation_id or previous_response_id.
+    ///
+    /// When `function_output_messages` is provided (resume with FunctionCallOutput), they are
+    /// interleaved with Message input items in request order so tool results immediately follow
+    /// the assistant message containing tool_calls, as required by LLM providers.
     #[allow(clippy::too_many_arguments)]
     async fn load_conversation_context(
         request: &models::CreateResponseRequest,
@@ -2023,6 +2027,7 @@ impl ResponseServiceImpl {
         organization_id: uuid::Uuid,
         user_id: crate::UserId,
         organization_service: &Arc<dyn crate::organization::OrganizationServiceTrait>,
+        function_output_messages: &[crate::completions::ports::CompletionMessage],
     ) -> Result<Vec<crate::completions::ports::CompletionMessage>, errors::ResponseError> {
         use crate::completions::ports::CompletionMessage;
 
@@ -2399,39 +2404,37 @@ impl ResponseServiceImpl {
                     });
                 }
                 models::ResponseInput::Items(items) => {
+                    let mut fco_idx = 0;
                     for item in items {
-                        // Only process message input items
-                        let (role, item_content) = match item {
+                        match item {
                             models::ResponseInputItem::Message { role, content, .. } => {
-                                (role.clone(), content)
-                            }
-                            models::ResponseInputItem::McpApprovalResponse { .. } => {
-                                continue;
-                            }
-                            models::ResponseInputItem::McpListTools { .. } => {
-                                continue;
+                                let content = match content {
+                                    models::ResponseContent::Text(text) => text.clone(),
+                                    models::ResponseContent::Parts(parts) => {
+                                        Self::extract_content_parts(
+                                            parts,
+                                            workspace_id.0,
+                                            file_service,
+                                        )
+                                        .await?
+                                    }
+                                };
+                                messages.push(CompletionMessage {
+                                    role: role.clone(),
+                                    content,
+                                    tool_call_id: None,
+                                    tool_calls: None,
+                                });
                             }
                             models::ResponseInputItem::FunctionCallOutput { .. } => {
-                                // Function call outputs are processed separately
-                                continue;
+                                if fco_idx < function_output_messages.len() {
+                                    messages.push(function_output_messages[fco_idx].clone());
+                                    fco_idx += 1;
+                                }
                             }
-                        };
-
-                        let content = match item_content {
-                            models::ResponseContent::Text(text) => text.clone(),
-                            models::ResponseContent::Parts(parts) => {
-                                // Extract text from parts and fetch file content if needed
-                                Self::extract_content_parts(parts, workspace_id.0, file_service)
-                                    .await?
-                            }
-                        };
-
-                        messages.push(CompletionMessage {
-                            role,
-                            content,
-                            tool_call_id: None,
-                            tool_calls: None,
-                        });
+                            models::ResponseInputItem::McpApprovalResponse { .. }
+                            | models::ResponseInputItem::McpListTools { .. } => {}
+                        }
                     }
                 }
             }

@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use std::collections::HashSet;
 
 use crate::responses::errors::ResponseError;
-use crate::responses::models::{CreateResponseRequest, ResponseOutputItem, ResponseTool};
+use crate::responses::models::{CreateResponseRequest, ResponseOutputItem};
 use crate::responses::service_helpers::ToolCallInfo;
 
 use super::executor::{ToolEventContext, ToolExecutionContext, ToolExecutor, ToolOutput};
@@ -45,30 +45,13 @@ pub struct FunctionToolExecutor {
 impl FunctionToolExecutor {
     /// Create a new FunctionToolExecutor from a request
     ///
-    /// Extracts all client-executed tool names from the request's tools array:
-    /// - Custom function tools (ResponseTool::Function)
-    /// - CodeInterpreter tool (client must execute, no server implementation)
-    /// - Computer tool (client must execute, no server implementation)
+    /// Uses the canonical list of client-executed tool names from
+    /// [super::get_function_tool_names]. These are tools the client must execute
+    /// externally (Function, CodeInterpreter, Computer).
     pub fn new(request: &CreateResponseRequest) -> Self {
-        let mut function_names = HashSet::new();
-
-        if let Some(tools) = &request.tools {
-            for tool in tools {
-                match tool {
-                    ResponseTool::Function { name, .. } => {
-                        function_names.insert(name.clone());
-                    }
-                    ResponseTool::CodeInterpreter {} => {
-                        function_names.insert(super::CODE_INTERPRETER_TOOL_NAME.to_string());
-                    }
-                    ResponseTool::Computer {} => {
-                        function_names.insert(super::COMPUTER_TOOL_NAME.to_string());
-                    }
-                    // Other tools are server-executed
-                    _ => {}
-                }
-            }
-        }
+        let function_names = super::get_function_tool_names(request)
+            .into_iter()
+            .collect();
 
         Self { function_names }
     }

@@ -160,6 +160,7 @@ impl ToolExecutor for FunctionToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::responses::models::ResponseTool;
 
     fn create_test_request_with_functions(function_names: Vec<&str>) -> CreateResponseRequest {
         let tools: Vec<ResponseTool> = function_names

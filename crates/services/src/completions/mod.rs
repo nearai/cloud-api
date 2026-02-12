@@ -63,7 +63,7 @@ where
     model_id: Uuid,
     #[allow(dead_code)] // Kept for potential debugging/logging use
     model_name: String,
-    inference_type: String,
+    inference_type: crate::usage::ports::InferenceType,
     service_start_time: Instant,
     provider_start_time: Instant,
     first_token_received: bool,
@@ -147,7 +147,7 @@ where
         let workspace_id = self.workspace_id;
         let api_key_id = self.api_key_id;
         let model_id = self.model_id;
-        let inference_type = self.inference_type.clone();
+        let inference_type = self.inference_type;
 
         // Create span with context BEFORE any early returns so all error logs have context
         let _span = tracing::error_span!(
@@ -411,6 +411,18 @@ where
     }
 }
 
+/// RAII guard for concurrent request slots
+/// Automatically releases the slot when dropped, ensuring proper cleanup even if the request panics
+struct ConcurrentSlotGuard {
+    counter: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl Drop for ConcurrentSlotGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Release);
+    }
+}
+
 pub struct CompletionServiceImpl {
     pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub attestation_service: Arc<dyn AttestationServiceTrait>,
@@ -598,20 +610,51 @@ impl CompletionServiceImpl {
                         .collect()
                 });
 
+                // Parse content to detect multimodal JSON arrays (for vision models)
+                // Only parse as multimodal content if it's a proper OpenAI-format array
+                // with objects containing "type" fields (e.g., {"type": "text"}, {"type": "image_url"})
+                let content = if msg.content.trim().starts_with('[')
+                    && Self::is_valid_multimodal_content(&msg.content)
+                {
+                    serde_json::from_str::<serde_json::Value>(&msg.content)
+                        .unwrap_or_else(|_| serde_json::Value::String(msg.content.clone()))
+                } else {
+                    // Regular text content wrapped as string
+                    serde_json::Value::String(msg.content.clone())
+                };
+
                 ChatMessage {
                     role: match msg.role.as_str() {
-                        "system" => MessageRole::System,
+                        "system" | "developer" => MessageRole::System,
                         "assistant" => MessageRole::Assistant,
                         "tool" => MessageRole::Tool,
                         _ => MessageRole::User,
                     },
-                    content: Some(serde_json::Value::String(msg.content.clone())),
+                    content: Some(content),
                     name: None,
                     tool_call_id: msg.tool_call_id.clone(),
                     tool_calls,
                 }
             })
             .collect()
+    }
+
+    /// Check if content is a valid multimodal content array (OpenAI format)
+    /// Valid multimodal arrays have objects with "type" field (e.g., "text", "image_url")
+    fn is_valid_multimodal_content(content: &str) -> bool {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
+            if let Some(array) = value.as_array() {
+                // Must be a non-empty array
+                if array.is_empty() {
+                    return false;
+                }
+                // All elements must be objects with a "type" field
+                return array
+                    .iter()
+                    .all(|item| item.is_object() && item.get("type").is_some());
+            }
+        }
+        false
     }
 
     async fn try_acquire_concurrent_slot(
@@ -662,7 +705,7 @@ impl CompletionServiceImpl {
         api_key_id: Uuid,
         model_id: Uuid,
         model_name: String,
-        inference_type: &str,
+        inference_type: crate::usage::ports::InferenceType,
         service_start_time: Instant,
         provider_start_time: Instant,
         concurrent_counter: Option<Arc<AtomicU32>>,
@@ -690,7 +733,7 @@ impl CompletionServiceImpl {
             api_key_id,
             model_id,
             model_name,
-            inference_type: inference_type.to_string(),
+            inference_type,
             service_start_time,
             provider_start_time,
             first_token_received: false,
@@ -833,9 +876,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         };
 
         let inference_type = if is_streaming {
-            "chat_completion_stream"
+            crate::usage::ports::InferenceType::ChatCompletionStream
         } else {
-            "chat_completion"
+            crate::usage::ports::InferenceType::ChatCompletion
         };
 
         // Create the completion event stream with usage tracking
@@ -1049,7 +1092,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     model_id,
                     input_tokens,
                     output_tokens,
-                    inference_type: "chat_completion".to_string(),
+                    inference_type: crate::usage::ports::InferenceType::ChatCompletion,
                     ttft_ms: None,    // N/A for non-streaming
                     avg_itl_ms: None, // N/A for non-streaming
                     inference_id: Some(inference_id),
@@ -1074,6 +1117,137 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         });
 
         Ok(response_with_bytes)
+    }
+
+    async fn audio_transcription(
+        &self,
+        organization_id: uuid::Uuid,
+        model_id: uuid::Uuid,
+        model_name: &str,
+        params: inference_providers::AudioTranscriptionParams,
+        request_hash: String,
+    ) -> Result<inference_providers::AudioTranscriptionResponse, ports::CompletionError> {
+        // Acquire concurrent request slot to enforce organization limits
+        let counter = self
+            .try_acquire_concurrent_slot(organization_id, model_id, model_name)
+            .await?;
+
+        // Call inference provider pool with timeout protection
+        let timeout_duration = std::time::Duration::from_secs(120); // 2 minute timeout for audio
+        let result = tokio::time::timeout(
+            timeout_duration,
+            self.inference_provider_pool
+                .audio_transcription(params, request_hash),
+        )
+        .await;
+
+        // Release the concurrent request slot
+        counter.fetch_sub(1, Ordering::Release);
+
+        // Handle timeout and map provider errors
+        match result {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(e)) => {
+                let error_msg = match e {
+                    inference_providers::AudioTranscriptionError::TranscriptionError(msg) => msg,
+                    inference_providers::AudioTranscriptionError::HttpError {
+                        status_code,
+                        message,
+                    } => {
+                        format!("HTTP {}: {}", status_code, message)
+                    }
+                };
+                Err(ports::CompletionError::ProviderError(error_msg))
+            }
+            Err(_) => Err(ports::CompletionError::ProviderError(
+                "Audio transcription request timed out".to_string(),
+            )),
+        }
+    }
+
+    async fn try_rerank(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        params: inference_providers::RerankParams,
+    ) -> Result<inference_providers::RerankResponse, ports::CompletionError> {
+        // Acquire concurrent request slot to enforce organization limits
+        let counter = self
+            .try_acquire_concurrent_slot(organization_id, model_id, model_name)
+            .await?;
+
+        // Create RAII guard to ensure slot is released on drop (panic, error, or success)
+        let _guard = ConcurrentSlotGuard { counter };
+
+        // Call inference provider pool
+        // The guard will automatically release the slot when this function returns or panics
+        let result = self.inference_provider_pool.rerank(params).await;
+
+        // Map provider errors to service errors
+        result.map_err(|e| {
+            let error_msg = match e {
+                inference_providers::RerankError::GenerationError(msg) => msg,
+                inference_providers::RerankError::HttpError {
+                    status_code,
+                    message,
+                } => {
+                    format!("HTTP {}: {}", status_code, message)
+                }
+            };
+            ports::CompletionError::ProviderError(error_msg)
+        })
+    }
+
+    async fn try_score(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        request_hash: String,
+        params: inference_providers::ScoreParams,
+    ) -> Result<inference_providers::ScoreResponse, ports::CompletionError> {
+        // Acquire concurrent request slot to enforce organization limits
+        let counter = self
+            .try_acquire_concurrent_slot(organization_id, model_id, model_name)
+            .await?;
+
+        // Create RAII guard to ensure slot is released on drop (panic, error, or success)
+        let _guard = ConcurrentSlotGuard { counter };
+
+        // Call inference provider pool
+        // The guard will automatically release the slot when this function returns or panics
+        let result = self
+            .inference_provider_pool
+            .score(params, request_hash)
+            .await;
+
+        // Map provider errors to service errors
+        result.map_err(|e| {
+            let error_msg = match e {
+                inference_providers::ScoreError::GenerationError(msg) => msg,
+                inference_providers::ScoreError::HttpError {
+                    status_code,
+                    message,
+                } => {
+                    format!("HTTP {}: {}", status_code, message)
+                }
+            };
+            ports::CompletionError::ProviderError(error_msg)
+        })
+    }
+
+    async fn get_model(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
+        self.models_repository.get_model_by_name(model_name).await
+    }
+
+    fn get_inference_provider_pool(
+        &self,
+    ) -> std::sync::Arc<crate::inference_provider_pool::InferenceProviderPool> {
+        self.inference_provider_pool.clone()
     }
 }
 
@@ -1157,7 +1331,7 @@ mod tests {
             api_key_id,
             model_id,
             model_name: "test-model".to_string(),
-            inference_type: "chat_completion_stream".to_string(),
+            inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
             service_start_time: now,
             provider_start_time: now,
             first_token_received: false,
@@ -1313,7 +1487,7 @@ mod tests {
             api_key_id,
             model_id,
             model_name: "test-model".to_string(),
-            inference_type: "chat_completion_stream".to_string(),
+            inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
             service_start_time,
             provider_start_time,
             first_token_received: false,
@@ -1430,7 +1604,7 @@ mod tests {
             api_key_id,
             model_id,
             model_name: "test-model".to_string(),
-            inference_type: "chat_completion_stream".to_string(),
+            inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
             service_start_time: now,
             provider_start_time: now,
             first_token_received: false,
@@ -1594,7 +1768,7 @@ mod tests {
                 api_key_id: Uuid::new_v4(),
                 model_id: Uuid::new_v4(),
                 model_name: "test-model".to_string(),
-                inference_type: "chat_completion_stream".to_string(),
+                inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
                 service_start_time: Instant::now(),
                 provider_start_time: Instant::now(),
                 first_token_received: false,

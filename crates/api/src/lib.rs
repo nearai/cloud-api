@@ -16,7 +16,10 @@ use crate::{
             StateStore,
         },
         billing::{get_billing_costs, BillingRouteState},
-        completions::{chat_completions, image_edits, image_generations, models},
+        completions::{
+            audio_transcriptions, chat_completions, image_edits, image_generations, models, rerank,
+            score,
+        },
         conversations,
         health::health_check,
         models::{get_model_by_name, list_models, ModelsAppState},
@@ -46,6 +49,9 @@ use services::{
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use utoipa::OpenApi;
+
+// Audio transcription file size limit (25 MB for OpenAI Whisper API compatibility)
+const AUDIO_TRANSCRIPTION_MAX_BODY_SIZE: usize = 25 * 1024 * 1024; // 25 MB
 
 /// Service initialization components
 #[derive(Clone)]
@@ -537,7 +543,6 @@ pub async fn init_inference_providers(
             discovery_url,
             api_key,
             config.model_discovery.timeout,
-            config.model_discovery.inference_timeout,
             config.external_providers.clone(),
         ),
     );
@@ -573,7 +578,6 @@ pub async fn init_inference_providers_with_mocks(
             "http://localhost:8080/models".to_string(),
             None,
             5,
-            30 * 60,
             config::ExternalProvidersConfig::default(),
         ),
     );
@@ -592,6 +596,7 @@ pub async fn init_inference_providers_with_mocks(
         "deepseek-ai/DeepSeek-V3.1".to_string(),
         "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string(),
         "Qwen/Qwen-Image-2512".to_string(),
+        "Qwen/Qwen3-Reranker-0.6B".to_string(),
     ];
 
     let providers: Vec<(
@@ -658,6 +663,7 @@ pub fn build_app_with_config(
         user_service: domain_services.user_service.clone(),
         files_service: domain_services.files_service.clone(),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
+        metrics_service: domain_services.metrics_service.clone(),
         config: config.clone(),
     };
 
@@ -685,6 +691,13 @@ pub fn build_app_with_config(
     );
 
     let completion_routes = build_completion_routes(
+        app_state.clone(),
+        &auth_components.auth_state_middleware,
+        usage_state.clone(),
+        rate_limit_state.clone(),
+    );
+
+    let usage_recording_routes = build_usage_recording_routes(
         app_state.clone(),
         &auth_components.auth_state_middleware,
         usage_state.clone(),
@@ -781,6 +794,7 @@ pub fn build_app_with_config(
                 .merge(auth_vpc_routes)
                 .merge(files_routes)
                 .merge(billing_routes)
+                .merge(usage_recording_routes)
                 .merge(health_routes),
         )
         .merge(openapi_routes)
@@ -872,11 +886,15 @@ pub fn build_completion_routes(
 ) -> Router {
     use crate::routes::files::MAX_FILE_SIZE;
 
-    // Text-based inference routes (chat/completions, image generation)
+    // Text-based inference routes (chat/completions, image generation, audio transcription, rerank, score)
     // Use default body limit (~2 MB) since they only accept JSON
     let text_inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
         .route("/images/generations", post(image_generations))
+        .route("/audio/transcriptions", post(audio_transcriptions))
+        .route("/rerank", post(rerank))
+        .route("/score", post(score))
+        .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
         .with_state(app_state.clone())
         .layer(from_fn_with_state(
             usage_state.clone(),
@@ -1133,6 +1151,31 @@ pub fn build_billing_routes(
         ))
 }
 
+/// Build usage recording routes with auth, rate limiting, and usage check.
+/// No body_hash_middleware — attestation/signing is not applicable to usage records.
+pub fn build_usage_recording_routes(
+    app_state: AppState,
+    auth_state_middleware: &AuthState,
+    usage_state: middleware::UsageState,
+    rate_limit_state: middleware::RateLimitState,
+) -> Router {
+    Router::new()
+        .route("/usage", post(crate::routes::usage::record_usage))
+        .with_state(app_state)
+        .layer(from_fn_with_state(
+            usage_state,
+            middleware::usage_check_middleware,
+        ))
+        .layer(from_fn_with_state(
+            rate_limit_state,
+            middleware::api_key_rate_limit_middleware,
+        ))
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::auth_middleware_with_workspace_context,
+        ))
+}
+
 pub fn build_model_routes(models_service: Arc<dyn ModelsServiceTrait>) -> Router {
     let models_app_state = ModelsAppState { models_service };
 
@@ -1355,7 +1398,6 @@ mod tests {
                 api_key: Some("test-key".to_string()),
                 refresh_interval: 0,
                 timeout: 5,
-                inference_timeout: 30 * 60, // 30 minutes
             },
             logging: config::LoggingConfig {
                 level: "info".to_string(),
@@ -1459,7 +1501,6 @@ mod tests {
                 api_key: Some("test-key".to_string()),
                 refresh_interval: 0,
                 timeout: 5,
-                inference_timeout: 30 * 60, // 30 minutes
             },
             logging: config::LoggingConfig {
                 level: "info".to_string(),

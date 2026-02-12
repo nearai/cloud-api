@@ -786,6 +786,68 @@ pub enum ImageEditError {
     HttpError { status_code: u16, message: String },
 }
 
+// ========== Rerank Models ==========
+
+/// Parameters for document reranking
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankParams {
+    /// Model ID to use for reranking
+    pub model: String,
+    /// Query to rerank documents against
+    pub query: String,
+    /// Documents to rerank
+    pub documents: Vec<String>,
+    /// Extra parameters for future extensions
+    #[serde(flatten, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Response from document reranking
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankResponse {
+    /// Unique identifier for the rerank request
+    pub id: String,
+    /// Model used for reranking
+    pub model: String,
+    /// Reranked results
+    pub results: Vec<RerankResult>,
+    /// Usage information (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<RerankUsage>,
+}
+
+/// Individual reranked result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankResult {
+    /// Index of the document in the original input
+    pub index: i32,
+    /// Relevance score (typically 0.0 to 1.0)
+    pub relevance_score: f64,
+    /// The document (can be string or object depending on provider)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document: Option<serde_json::Value>,
+}
+
+/// Usage information for rerank request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankUsage {
+    /// Input tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<i32>,
+    /// Total number of tokens used
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<i32>,
+}
+
+/// Reranking errors
+#[derive(Debug, Error, Clone, Serialize, Deserialize)]
+pub enum RerankError {
+    #[error("Failed to rerank documents: {0}")]
+    GenerationError(String),
+    #[error("HTTP error {status_code}: {message}")]
+    HttpError { status_code: u16, message: String },
+}
+
 /// Attestation report errors
 #[derive(Debug, Error, Clone, Serialize, Deserialize)]
 pub enum AttestationError {
@@ -812,6 +874,163 @@ pub struct ChatSignature {
     pub signing_address: String,
     /// The signing algorithm used (e.g., "ecdsa")
     pub signing_algo: String,
+}
+
+// ========================================
+// Audio Transcription
+// ========================================
+
+/// Parameters for audio transcription request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioTranscriptionParams {
+    /// Model identifier (e.g., "openai/whisper-large-v3")
+    pub model: String,
+
+    /// Audio file bytes
+    #[serde(skip)]
+    pub file_bytes: Vec<u8>,
+
+    /// Original filename (for content-type detection)
+    #[serde(skip)]
+    pub filename: String,
+
+    /// Language code (e.g., "en", "es", optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+
+    /// Response format: "json", "text", "srt", "verbose_json", "vtt"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+
+    /// Sampling temperature (0-1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+
+    /// Timestamp granularities: "word", "segment"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp_granularities: Option<Vec<String>>,
+
+    /// Additional provider-specific parameters
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Word-level timing information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptionWord {
+    pub word: String,
+    pub start: f64,
+    pub end: f64,
+}
+
+/// Segment-level transcription with timing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptionSegment {
+    pub id: i32,
+    pub seek: i32,
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+    pub tokens: Vec<i32>,
+    pub temperature: f64,
+    /// Optional: may be null in some provider responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_logprob: Option<f64>,
+    /// Optional: may be null in some provider responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression_ratio: Option<f64>,
+    /// Optional: may be null in some provider responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_speech_prob: Option<f64>,
+}
+
+/// Audio transcription response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioTranscriptionResponse {
+    /// Transcribed text
+    pub text: String,
+
+    /// Total audio duration in seconds (may be a string in some provider responses)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub duration: Option<f64>,
+
+    /// Detected language code
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+
+    /// Transcription segments with timing
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segments: Option<Vec<TranscriptionSegment>>,
+
+    /// Word-level timing information
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub words: Option<Vec<TranscriptionWord>>,
+
+    /// Unique identifier for the transcription
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+/// Custom deserializer to handle duration as either string or number
+fn deserialize_duration<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    use serde_json::Value;
+
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Null => Ok(None),
+        Value::Number(n) => n
+            .as_f64()
+            .map(Some)
+            .ok_or_else(|| Error::custom("duration must be a valid f64")),
+        Value::String(s) => s
+            .parse::<f64>()
+            .ok()
+            .map(Some)
+            .ok_or_else(|| Error::custom("duration string must be a valid number")),
+        _ => Err(Error::custom("duration must be a number or string")),
+    }
+}
+
+/// Audio transcription errors
+#[derive(Debug, Error, Clone, Serialize, Deserialize)]
+pub enum AudioTranscriptionError {
+    #[error("Transcription error: {0}")]
+    TranscriptionError(String),
+
+    #[error("HTTP error {status_code}: {message}")]
+    HttpError { status_code: u16, message: String },
+}
+
+/// Utility function to detect audio MIME type from filename extension
+///
+/// Used by audio transcription providers to set proper Content-Type headers
+/// in multipart form uploads.
+///
+/// # Examples
+///
+/// ```
+/// # use inference_providers::detect_audio_content_type;
+/// assert_eq!(detect_audio_content_type("speech.mp3"), "audio/mpeg");
+/// assert_eq!(detect_audio_content_type("recording.wav"), "audio/wav");
+/// assert_eq!(detect_audio_content_type("unknown.xyz"), "application/octet-stream");
+/// ```
+pub fn detect_audio_content_type(filename: &str) -> String {
+    let ext = filename.rsplit('.').next().unwrap_or("");
+    match ext.to_lowercase().as_str() {
+        "mp3" => "audio/mpeg",
+        "mp4" | "m4a" => "audio/mp4",
+        "wav" => "audio/wav",
+        "webm" => "audio/webm",
+        "flac" => "audio/flac",
+        "ogg" => "audio/ogg",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
 
 #[cfg(test)]
@@ -920,4 +1139,53 @@ mod tests {
         assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
         assert!(choice.message.content.is_some());
     }
+}
+
+// Score models for text similarity endpoint
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoreParams {
+    pub model: String,
+    pub text_1: String,
+    pub text_2: String,
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoreResponse {
+    pub id: String,
+    pub object: String,
+    pub created: i64,
+    pub model: String,
+    pub data: Vec<ScoreResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ScoreUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoreResult {
+    pub index: i32,
+    pub score: f64,
+    pub object: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoreUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<serde_json::Value>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ScoreError {
+    #[error("Generation error: {0}")]
+    GenerationError(String),
+
+    #[error("HTTP {status_code}: {message}")]
+    HttpError { status_code: u16, message: String },
 }

@@ -170,6 +170,180 @@ async fn create_response_stream(
 // Response Tests
 // ============================================
 
+/// When inference fails at the start (e.g. model not found), the stream emits response.failed
+/// and the response has status=Failed with one failed output item (content empty).
+#[tokio::test]
+async fn test_response_stream_fails_with_failed_event_when_inference_fails_at_start() {
+    let (server, _pool, _mock, database, _guard) = setup_test_server_with_pool().await;
+    // Do NOT call setup_qwen_model so that the requested model is not in the DB
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let conversation = create_conversation(&server, api_key.clone()).await;
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "conversation": { "id": conversation.id },
+            "input": "hello",
+            "temperature": 0.7,
+            "max_output_tokens": 10,
+            "stream": true,
+            "model": "non-existent-model-for-failed-test"
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "POST /v1/responses should return 200"
+    );
+    let response_text = response.text();
+
+    let mut saw_created = false;
+    let mut saw_in_progress = false;
+    let mut saw_failed = false;
+    let mut saw_completed = false;
+    let mut failed_text: Option<String> = None;
+
+    for line_chunk in response_text.split("\n\n") {
+        if line_chunk.trim().is_empty() {
+            continue;
+        }
+        let mut event_type = "";
+        let mut event_data = "";
+        for line in line_chunk.lines() {
+            if let Some(name) = line.strip_prefix("event: ") {
+                event_type = name;
+            } else if let Some(data) = line.strip_prefix("data: ") {
+                event_data = data;
+            }
+        }
+        if event_type == "response.created" {
+            saw_created = true;
+        } else if event_type == "response.in_progress" {
+            saw_in_progress = true;
+        } else if event_type == "response.failed" {
+            saw_failed = true;
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(event_data) {
+                failed_text = json.get("text").and_then(|v| v.as_str()).map(String::from);
+            }
+        } else if event_type == "response.completed" {
+            saw_completed = true;
+        }
+    }
+
+    assert!(saw_created, "Stream should contain response.created");
+    assert!(
+        saw_in_progress,
+        "Stream should contain response.in_progress"
+    );
+    assert!(
+        saw_failed,
+        "Stream should contain response.failed when inference fails at start"
+    );
+    assert!(
+        !saw_completed,
+        "Stream should NOT contain response.completed when inference fails at start"
+    );
+    assert!(
+        failed_text.as_deref().is_some_and(|s| !s.is_empty()),
+        "response.failed event should have non-empty text (error message)"
+    );
+
+    // Verify DB: latest response for this conversation has status=Failed and one assistant item with status=failed, content containing error message
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    let pool = database.pool();
+    let client = pool.get().await.expect("db connection");
+    let conv_uuid = uuid::Uuid::parse_str(
+        conversation
+            .id
+            .strip_prefix("conv_")
+            .unwrap_or(&conversation.id),
+    )
+    .expect("conv id");
+    let resp_row = client
+        .query_one(
+            "SELECT id, status FROM responses WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT 1",
+            &[&conv_uuid],
+        )
+        .await
+        .expect("query responses");
+    let status: String = resp_row.get("status");
+    assert_eq!(status, "failed", "Response status in DB should be failed");
+
+    let item_rows = client
+        .query(
+            "SELECT item FROM response_items WHERE conversation_id = $1 ORDER BY created_at ASC",
+            &[&conv_uuid],
+        )
+        .await
+        .expect("query response_items");
+    let assistant_items: Vec<serde_json::Value> = item_rows
+        .into_iter()
+        .filter_map(|row| {
+            let item: serde_json::Value = row.get("item");
+            if item.get("role").and_then(|v| v.as_str()) == Some("assistant") {
+                Some(item)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        assistant_items.len(),
+        1,
+        "Should have exactly one assistant output item (the failed one)"
+    );
+    let item = &assistant_items[0];
+    assert_eq!(item.get("status").and_then(|v| v.as_str()), Some("failed"));
+    let content = item
+        .get("content")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Verify that the failed item contains the error message in its content
+    assert!(
+        !content.is_empty(),
+        "Failed item content should contain the error message"
+    );
+    assert_eq!(
+        content.len(),
+        1,
+        "Failed item should have exactly one content item"
+    );
+
+    let content_item = &content[0];
+    assert_eq!(
+        content_item.get("type").and_then(|v| v.as_str()),
+        Some("output_text"),
+        "Content item should be output_text"
+    );
+
+    let error_text_in_content = content_item
+        .get("text")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    assert!(
+        error_text_in_content
+            .as_deref()
+            .is_some_and(|s| !s.is_empty()),
+        "Failed item content should have non-empty error message text"
+    );
+
+    // Verify that the error message in content matches the error message from response.failed event
+    if let (Some(stream_error), Some(content_error)) =
+        (failed_text.as_ref(), error_text_in_content.as_ref())
+    {
+        assert_eq!(
+            stream_error, content_error,
+            "Error message in response.failed event should match error message in failed item content"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_responses_api() {
     let (server, _guard) = setup_test_server().await;

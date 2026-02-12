@@ -6,17 +6,17 @@ use uuid::Uuid;
 
 // Re-export essential MCP model types from rmcp crate
 pub use rmcp::model::{
-    CallToolRequestParam,
+    CallToolRequestParams,
     CallToolResult,
     ClientCapabilities,
     // Core types
     Content,
-    GetPromptRequestParam,
+    GetPromptRequestParams,
     GetPromptResult,
     Implementation,
     Prompt,
     ProtocolVersion,
-    ReadResourceRequestParam,
+    ReadResourceRequestParams,
     ReadResourceResult,
     Resource,
     ResourceTemplate,

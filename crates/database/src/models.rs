@@ -522,14 +522,18 @@ pub struct ModelAlias {
 // ============================================
 
 /// Organization limits history - stores historical spending limit data for organizations
-/// All amounts use fixed scale of 9 (nano-dollars) and USD currency
+/// All amounts use fixed scale of 9 (nano-dollars)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrganizationLimitsHistory {
     pub id: Uuid,
     pub organization_id: Uuid,
 
-    // Spend limit (fixed scale 9 = nano-dollars, USD only)
+    // Spend limit (fixed scale 9 = nano-dollars)
     pub spend_limit: i64,
+
+    pub credit_type: String,
+    pub source: Option<String>,
+    pub currency: String,
 
     // Temporal fields
     pub effective_from: DateTime<Utc>,
@@ -544,10 +548,13 @@ pub struct OrganizationLimitsHistory {
 }
 
 /// Request to update organization limits
-/// All amounts use fixed scale of 9 (nano-dollars) and USD currency
+/// All amounts use fixed scale of 9 (nano-dollars)
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateOrganizationLimitsDbRequest {
     pub spend_limit: i64,
+    pub credit_type: String,
+    pub source: Option<String>,
+    pub currency: String,
     pub changed_by: Option<String>,
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<Uuid>, // The authenticated user ID who made the change
@@ -593,6 +600,7 @@ pub struct OrganizationUsageLog {
     pub response_id: Option<ResponseId>,
     /// Number of images generated (for image generation requests)
     pub image_count: Option<i32>,
+    pub was_inserted: bool,
 }
 
 /// Organization balance summary - cached aggregate spending

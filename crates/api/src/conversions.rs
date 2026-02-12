@@ -21,7 +21,7 @@ impl From<crate::models::Message> for ChatMessage {
 
         Self {
             role: match msg.role.as_str() {
-                "system" => MessageRole::System,
+                "system" | "developer" => MessageRole::System,
                 "user" => MessageRole::User,
                 "assistant" => MessageRole::Assistant,
                 "tool" => MessageRole::Tool,
@@ -628,6 +628,20 @@ mod tests {
             back_to_http.content,
             Some(crate::models::MessageContent::Text("Hello".to_string()))
         );
+    }
+
+    #[test]
+    fn test_developer_role_maps_to_system() {
+        let http_msg = crate::models::Message {
+            role: "developer".to_string(),
+            content: Some(crate::models::MessageContent::Text(
+                "You are helpful.".to_string(),
+            )),
+            name: None,
+        };
+
+        let domain_msg: ChatMessage = http_msg.into();
+        assert!(matches!(domain_msg.role, MessageRole::System));
     }
 
     #[test]

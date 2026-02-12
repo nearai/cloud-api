@@ -21,7 +21,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             input_cost: request.input_cost,
             output_cost: request.output_cost,
             total_cost: request.total_cost,
-            inference_type: request.inference_type,
+            inference_type: request.inference_type.to_string(),
             ttft_ms: request.ttft_ms,
             avg_itl_ms: request.avg_itl_ms,
             inference_id: request.inference_id,
@@ -46,7 +46,10 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             input_cost: log.input_cost,
             output_cost: log.output_cost,
             total_cost: log.total_cost,
-            inference_type: log.inference_type,
+            inference_type: log
+                .inference_type
+                .parse()
+                .unwrap_or(services::usage::ports::InferenceType::ChatCompletion),
             created_at: log.created_at,
             ttft_ms: log.ttft_ms,
             avg_itl_ms: log.avg_itl_ms,
@@ -55,6 +58,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             stop_reason: log.stop_reason,
             response_id: log.response_id,
             image_count: log.image_count,
+            was_inserted: log.was_inserted,
         })
     }
 
@@ -101,7 +105,10 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 input_cost: log.input_cost,
                 output_cost: log.output_cost,
                 total_cost: log.total_cost,
-                inference_type: log.inference_type,
+                inference_type: log
+                    .inference_type
+                    .parse()
+                    .unwrap_or(services::usage::ports::InferenceType::ChatCompletion),
                 created_at: log.created_at,
                 ttft_ms: log.ttft_ms,
                 avg_itl_ms: log.avg_itl_ms,
@@ -110,6 +117,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 stop_reason: log.stop_reason,
                 response_id: log.response_id,
                 image_count: log.image_count,
+                was_inserted: true,
             })
             .collect();
 
@@ -143,7 +151,10 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 input_cost: log.input_cost,
                 output_cost: log.output_cost,
                 total_cost: log.total_cost,
-                inference_type: log.inference_type,
+                inference_type: log
+                    .inference_type
+                    .parse()
+                    .unwrap_or(services::usage::ports::InferenceType::ChatCompletion),
                 created_at: log.created_at,
                 ttft_ms: log.ttft_ms,
                 avg_itl_ms: log.avg_itl_ms,
@@ -152,6 +163,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 stop_reason: log.stop_reason,
                 response_id: log.response_id,
                 image_count: log.image_count,
+                was_inserted: true,
             })
             .collect();
 

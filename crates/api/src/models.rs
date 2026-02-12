@@ -389,6 +389,284 @@ pub struct ImageData {
     pub revised_prompt: Option<String>,
 }
 
+// ========================================
+// Audio Transcription
+// ========================================
+
+/// Audio transcription request schema for OpenAPI documentation
+/// This represents the multipart/form-data fields
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AudioTranscriptionRequestSchema {
+    /// Audio file (required) - binary audio data
+    pub file: String, // Placeholder for binary data in OpenAPI
+
+    /// Model identifier (required) - e.g. "openai/whisper-large-v3"
+    pub model: String,
+
+    /// Language code (optional) - e.g. "en", "es"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+
+    /// Response format (optional) - one of: "json", "text", "srt", "verbose_json", "vtt"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+}
+
+/// Audio transcription request (internal runtime struct)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioTranscriptionRequest {
+    /// Model identifier (required via form field)
+    #[serde(skip)]
+    pub model: String,
+
+    /// Audio file bytes (required via form field)
+    #[serde(skip)]
+    pub file_bytes: Vec<u8>,
+
+    /// Original filename
+    #[serde(skip)]
+    pub filename: String,
+
+    /// Language code (optional, e.g. "en", "es")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+
+    /// Response format: "json", "text", "srt", "verbose_json", "vtt"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+
+    /// Sampling temperature (0-1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+
+    /// Timestamp granularities: "word", "segment"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp_granularities: Option<Vec<String>>,
+}
+
+impl AudioTranscriptionRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        // Validate model is not empty
+        if self.model.trim().is_empty() {
+            return Err("Model is required and cannot be empty".to_string());
+        }
+
+        // Validate file is not empty
+        if self.file_bytes.is_empty() {
+            return Err("Audio file is required and cannot be empty".to_string());
+        }
+
+        // Validate file size (25 MB limit per OpenAI spec)
+        const MAX_FILE_SIZE: usize = 25 * 1024 * 1024; // 25 MB
+        if self.file_bytes.len() > MAX_FILE_SIZE {
+            return Err(format!(
+                "Audio file size exceeds maximum of 25 MB (got {} MB)",
+                self.file_bytes.len() / (1024 * 1024)
+            ));
+        }
+
+        // Validate filename by extracting just the base filename component
+        // This prevents path traversal attacks (including encoded variants)
+        use std::path::Path;
+
+        if self.filename.is_empty() {
+            return Err("Filename cannot be empty".to_string());
+        }
+
+        // Extract safe filename by stripping any path components
+        // This handles both Unix and Windows paths, and prevents traversal attacks
+        let safe_filename = Path::new(&self.filename)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                "Invalid filename: must be a valid UTF-8 filename without path components"
+                    .to_string()
+            })?;
+
+        // Check if filename was stripped of path components (indicates traversal attempt)
+        if safe_filename != self.filename {
+            return Err(
+                "Filename cannot contain path components or traversal sequences".to_string(),
+            );
+        }
+
+        // Validate filename length (max 255 characters per common filesystem limit)
+        if safe_filename.len() > 255 {
+            return Err("Filename exceeds maximum length of 255 characters".to_string());
+        }
+
+        // Validate filename has extension
+        if !safe_filename.contains('.') {
+            return Err("Filename must have an extension (e.g., .mp3, .wav)".to_string());
+        }
+
+        // Reject null bytes which could truncate paths in C-based systems
+        if safe_filename.contains('\0') {
+            return Err("Filename cannot contain null bytes".to_string());
+        }
+
+        // Validate temperature if provided
+        if let Some(temp) = self.temperature {
+            if !(0.0..=1.0).contains(&temp) {
+                return Err("Temperature must be between 0 and 1".to_string());
+            }
+        }
+
+        // Validate response_format if provided
+        if let Some(format) = &self.response_format {
+            let valid_formats = ["json", "text", "srt", "verbose_json", "vtt"];
+            if !valid_formats.contains(&format.as_str()) {
+                return Err(format!(
+                    "Invalid response_format. Must be one of: {}",
+                    valid_formats.join(", ")
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// ========== Rerank Models ==========
+
+/// Request for document reranking
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RerankRequest {
+    /// Model ID to use for reranking
+    pub model: String,
+    /// Query to rerank documents against
+    pub query: String,
+    /// Documents to rerank
+    pub documents: Vec<String>,
+}
+
+impl RerankRequest {
+    /// Validate the rerank request
+    pub fn validate(&self) -> Result<(), String> {
+        // Model is required and must not be empty
+        if self.model.trim().is_empty() {
+            return Err("model is required".to_string());
+        }
+
+        // Query is required and must not be empty
+        if self.query.trim().is_empty() {
+            return Err("query is required".to_string());
+        }
+
+        // Documents must have at least 1 item
+        if self.documents.is_empty() {
+            return Err("documents must contain at least 1 item".to_string());
+        }
+
+        // Documents must not exceed 1000 items
+        if self.documents.len() > 1000 {
+            return Err("documents must contain at most 1000 items".to_string());
+        }
+
+        // Each document must not be empty or whitespace-only
+        for (idx, doc) in self.documents.iter().enumerate() {
+            if doc.trim().is_empty() {
+                return Err(format!(
+                    "document at index {} is empty or contains only whitespace",
+                    idx
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Audio transcription response (with OpenAPI schema)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AudioTranscriptionResponse {
+    /// Transcribed text
+    pub text: String,
+
+    /// Total audio duration in seconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<f64>,
+
+    /// Detected language code
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+
+    /// Transcription segments with timing
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segments: Option<Vec<TranscriptionSegment>>,
+
+    /// Word-level timing information
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub words: Option<Vec<TranscriptionWord>>,
+}
+
+/// Transcription segment with optional metadata fields
+/// Matches the inference_providers version to ensure consistency with actual provider responses
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TranscriptionSegment {
+    pub id: i32,
+    pub seek: i32,
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+    pub tokens: Vec<i32>,
+    pub temperature: f64,
+    /// Optional: may be null in some provider responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_logprob: Option<f64>,
+    /// Optional: may be null in some provider responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression_ratio: Option<f64>,
+    /// Optional: may be null in some provider responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_speech_prob: Option<f64>,
+}
+
+/// Word-level timing information
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TranscriptionWord {
+    pub word: String,
+    pub start: f64,
+    pub end: f64,
+}
+
+/// Response from document reranking
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RerankResponse {
+    /// Unique identifier for the rerank request
+    pub id: String,
+    /// Model used for reranking
+    pub model: String,
+    /// Reranked results
+    pub results: Vec<RerankResult>,
+    /// Usage information (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<RerankUsage>,
+}
+
+/// Individual reranked result
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RerankResult {
+    /// Index of the document in the original input
+    pub index: i32,
+    /// Relevance score (typically 0.0 to 1.0)
+    pub relevance_score: f64,
+    /// The document (can be string or object depending on provider)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document: Option<serde_json::Value>,
+}
+
+/// Usage information for rerank request
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RerankUsage {
+    /// Input tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<i32>,
+    /// Total number of tokens used
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<i32>,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelsResponse {
     pub object: String,
@@ -502,7 +780,9 @@ impl ChatCompletionRequest {
             if message.role.is_empty() {
                 return Err("message role is required".to_string());
             }
-            if !["system", "user", "assistant", "tool"].contains(&message.role.as_str()) {
+            if !["system", "developer", "user", "assistant", "tool"]
+                .contains(&message.role.as_str())
+            {
                 return Err(format!("invalid message role: {}", message.role));
             }
             // Validate message content can be serialized (catches malformed multimodal content)
@@ -684,6 +964,8 @@ pub enum ResponseInput {
 pub struct ResponseInputItem {
     pub role: String,
     pub content: ResponseContent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Content can be text or array of content parts
@@ -2384,9 +2666,44 @@ pub struct ModelHistoryResponse {
 // Organization Limits API Models (Admin)
 // ============================================
 
+/// Credit type for organization limits
+/// - grant: Free credits provided by the platform
+/// - payment: Credits purchased by the organization
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CreditType {
+    #[serde(alias = "GRANT")]
+    Grant,
+    #[serde(alias = "PAYMENT")]
+    Payment,
+}
+
+impl std::fmt::Display for CreditType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CreditType::Grant => write!(f, "grant"),
+            CreditType::Payment => write!(f, "payment"),
+        }
+    }
+}
+
+impl CreditType {
+    /// Convert to string representation
+    pub fn as_str(&self) -> &str {
+        match self {
+            CreditType::Grant => "grant",
+            CreditType::Payment => "payment",
+        }
+    }
+}
+
 /// Request to update organization limits (Admin only)
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateOrganizationLimitsRequest {
+    #[serde(rename = "type")]
+    pub credit_type: CreditType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(rename = "spendLimit")]
     pub spend_limit: SpendLimitRequest,
     #[serde(rename = "changedBy", skip_serializing_if = "Option::is_none")]
@@ -2430,6 +2747,10 @@ pub struct SpendLimit {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateOrganizationLimitsResponse {
     pub organization_id: String,
+    #[serde(rename = "type")]
+    pub credit_type: CreditType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(rename = "spendLimit")]
     pub spend_limit: SpendLimit,
     pub updated_at: String,
@@ -2441,6 +2762,10 @@ pub struct OrgLimitsHistoryEntry {
     pub id: String,
     #[serde(rename = "organizationId")]
     pub organization_id: String,
+    #[serde(rename = "type")]
+    pub credit_type: CreditType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(rename = "spendLimit")]
     pub spend_limit: SpendLimit,
     #[serde(rename = "effectiveFrom")]
@@ -2904,4 +3229,103 @@ mod tests {
     fn test_is_basic_valid_email_rejects_multiple_ats() {
         assert!(!is_basic_valid_email("user@domain@example.com"));
     }
+}
+
+/// Maximum character length for score request texts (100k chars ≈ 25k tokens)
+/// Reranker models typically have token limits (512-8192 tokens)
+/// This limit provides a safety margin while allowing reasonable text lengths
+const MAX_SCORE_TEXT_LENGTH: usize = 100_000;
+
+/// Request for text similarity scoring
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ScoreRequest {
+    /// Model ID to use for scoring
+    pub model: String,
+    /// First text to compare
+    pub text_1: String,
+    /// Second text to compare
+    pub text_2: String,
+}
+
+impl ScoreRequest {
+    /// Validate the score request
+    pub fn validate(&self) -> Result<(), String> {
+        // Model is required and must not be empty
+        if self.model.trim().is_empty() {
+            return Err("model is required".to_string());
+        }
+
+        // Text 1 is required and must not be empty or whitespace-only
+        if self.text_1.trim().is_empty() {
+            return Err("text_1 is required and must not be empty".to_string());
+        }
+
+        // Text 2 is required and must not be empty or whitespace-only
+        if self.text_2.trim().is_empty() {
+            return Err("text_2 is required and must not be empty".to_string());
+        }
+
+        // Validate text lengths to prevent resource exhaustion
+        if self.text_1.len() > MAX_SCORE_TEXT_LENGTH {
+            return Err(format!(
+                "text_1 exceeds maximum length of {} characters",
+                MAX_SCORE_TEXT_LENGTH
+            ));
+        }
+
+        if self.text_2.len() > MAX_SCORE_TEXT_LENGTH {
+            return Err(format!(
+                "text_2 exceeds maximum length of {} characters",
+                MAX_SCORE_TEXT_LENGTH
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Individual score result
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ScoreResult {
+    /// Index of the result (always 0 for single score)
+    pub index: i32,
+    /// The similarity score between 0.0 and 1.0
+    pub score: f64,
+    /// Type of result
+    pub object: String,
+}
+
+/// Response from text similarity scoring
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ScoreResponse {
+    /// Unique identifier for the score request
+    pub id: String,
+    /// Object type
+    pub object: String,
+    /// Unix timestamp of when the score was created
+    pub created: i64,
+    /// Model used for scoring
+    pub model: String,
+    /// Score results
+    pub data: Vec<ScoreResult>,
+    /// Token usage information
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ScoreUsage>,
+}
+
+/// Token usage for score response
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ScoreUsage {
+    /// Number of tokens in the prompt
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<i32>,
+    /// Total number of tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<i32>,
+    /// Number of completion tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<i32>,
+    /// Prompt tokens details
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<serde_json::Value>,
 }

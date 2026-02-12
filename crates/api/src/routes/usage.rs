@@ -1,5 +1,5 @@
 use crate::{
-    middleware::AuthenticatedUser,
+    middleware::{auth::AuthenticatedApiKey, AuthenticatedUser},
     models::ErrorResponse,
     routes::{api::AppState, common::format_amount},
 };
@@ -7,7 +7,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::Json as ResponseJson,
-    Extension,
+    Extension, Json,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -352,7 +352,7 @@ pub async fn get_organization_usage_history(
             total_tokens: entry.total_tokens,
             total_cost: entry.total_cost,
             total_cost_display: format_amount(entry.total_cost),
-            inference_type: entry.inference_type,
+            inference_type: entry.inference_type.to_string(),
             created_at: entry.created_at.to_rfc3339(),
             stop_reason: entry.stop_reason.map(|r| r.to_string()),
             response_id: entry.response_id.map(|id| id.to_string()),
@@ -482,7 +482,7 @@ pub async fn get_api_key_usage_history(
             total_tokens: entry.total_tokens,
             total_cost: entry.total_cost,
             total_cost_display: format_amount(entry.total_cost),
-            inference_type: entry.inference_type,
+            inference_type: entry.inference_type.to_string(),
             created_at: entry.created_at.to_rfc3339(),
             stop_reason: entry.stop_reason.map(|r| r.to_string()),
             response_id: entry.response_id.map(|id| id.to_string()),
@@ -498,4 +498,173 @@ pub async fn get_api_key_usage_history(
         limit: query.limit,
         offset: query.offset,
     }))
+}
+
+// ============================================
+// POST /v1/usage — Record usage
+// ============================================
+
+/// POST /v1/usage response body — tagged union matching the request type.
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RecordUsageResponse {
+    /// Response for token-based chat completion usage
+    ChatCompletion {
+        /// Unique ID of the recorded usage entry
+        id: String,
+        /// Model name
+        model: String,
+        /// Input tokens recorded
+        input_tokens: i32,
+        /// Output tokens recorded
+        output_tokens: i32,
+        /// Total tokens (input + output)
+        total_tokens: i32,
+        /// Input cost in nano-dollars (scale 9)
+        input_cost: i64,
+        /// Output cost in nano-dollars (scale 9)
+        output_cost: i64,
+        /// Total cost in nano-dollars (scale 9)
+        total_cost: i64,
+        /// Human-readable total cost (e.g., "$0.00123")
+        total_cost_display: String,
+        /// Timestamp of the recorded entry (RFC3339)
+        created_at: String,
+    },
+    /// Response for image generation usage
+    ImageGeneration {
+        /// Unique ID of the recorded usage entry
+        id: String,
+        /// Model name
+        model: String,
+        /// Number of images generated
+        image_count: i32,
+        /// Total cost in nano-dollars (scale 9)
+        total_cost: i64,
+        /// Human-readable total cost (e.g., "$5.00")
+        total_cost_display: String,
+        /// Timestamp of the recorded entry (RFC3339)
+        created_at: String,
+    },
+}
+
+/// Record usage
+///
+/// Record a usage event. The server calculates costs based on the model's pricing.
+/// Uses a tagged union on the `type` field to distinguish usage kinds.
+///
+/// A required `id` field serves as an **idempotency key**. It is stored as
+/// `provider_request_id` and hashed to a deterministic UUID v5 for `inference_id`.
+/// If a record with the same `id` already exists within the same organization,
+/// the existing record is returned without double-charging.
+///
+/// ## Chat completion example
+/// ```json
+/// { "type": "chat_completion", "model": "Qwen/Qwen3-30B-A3B-Instruct-2507", "input_tokens": 100, "output_tokens": 50, "id": "req-abc-123" }
+/// ```
+///
+/// ## Image generation example
+/// ```json
+/// { "type": "image_generation", "model": "black-forest-labs/FLUX.1", "image_count": 2, "id": "req-img-456" }
+/// ```
+#[utoipa::path(
+    post,
+    path = "/v1/usage",
+    tag = "Usage",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Usage recorded successfully", body = RecordUsageResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 402, description = "Insufficient credits", body = ErrorResponse),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn record_usage(
+    State(app_state): State<AppState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Json(request): Json<services::usage::RecordUsageApiRequest>,
+) -> Result<ResponseJson<RecordUsageResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let api_key_id = Uuid::parse_str(&api_key.api_key.id.0).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse::new(
+                "Invalid API key ID".to_string(),
+                "internal_server_error".to_string(),
+            )),
+        )
+    })?;
+
+    let entry = app_state
+        .usage_service
+        .record_usage_from_api(
+            api_key.organization.id.0,
+            api_key.workspace.id.0,
+            api_key_id,
+            request,
+        )
+        .await
+        .map_err(|e| match &e {
+            services::usage::UsageError::ModelNotFound(_) => (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(e.to_string(), "not_found".to_string())),
+            ),
+            services::usage::UsageError::ValidationError(_) => (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    e.to_string(),
+                    "validation_error".to_string(),
+                )),
+            ),
+            _ => {
+                tracing::error!("Failed to record usage");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to record usage".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
+        })?;
+
+    // Use the *returned entry's* inference_type to determine response format,
+    // not the incoming request type. When idempotency returns an existing record
+    // the request type may differ from the stored record's actual type.
+    let response = match entry.inference_type {
+        services::usage::InferenceType::ImageGeneration
+        | services::usage::InferenceType::ImageEdit => RecordUsageResponse::ImageGeneration {
+            id: entry.id.to_string(),
+            model: entry.model,
+            image_count: entry.image_count.unwrap_or_else(|| {
+                tracing::error!(
+                    entry_id = %entry.id,
+                    "image_count unexpectedly missing for image generation usage record"
+                );
+                0
+            }),
+            total_cost: entry.total_cost,
+            total_cost_display: format_amount(entry.total_cost),
+            created_at: entry.created_at.to_rfc3339(),
+        },
+        _ => RecordUsageResponse::ChatCompletion {
+            id: entry.id.to_string(),
+            model: entry.model,
+            input_tokens: entry.input_tokens,
+            output_tokens: entry.output_tokens,
+            total_tokens: entry.total_tokens,
+            input_cost: entry.input_cost,
+            output_cost: entry.output_cost,
+            total_cost: entry.total_cost,
+            total_cost_display: format_amount(entry.total_cost),
+            created_at: entry.created_at.to_rfc3339(),
+        },
+    };
+
+    Ok(ResponseJson(response))
 }

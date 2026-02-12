@@ -24,6 +24,12 @@ pub const PREFIX_SK: &str = "sk-";
 /// Prefix for MCP approval request IDs
 pub const PREFIX_MCPR: &str = "mcpr_";
 
+/// Prefix for vector store IDs
+pub const PREFIX_VS: &str = "vs_";
+
+/// Prefix for vector store file batch IDs
+pub const PREFIX_VSFB: &str = "vsfb_";
+
 /// All known ID prefixes (useful for path normalization in metrics)
 pub const ALL_PREFIXES: &[&str] = &[
     PREFIX_CHATCMPL,
@@ -33,4 +39,6 @@ pub const ALL_PREFIXES: &[&str] = &[
     PREFIX_CONV,
     PREFIX_SK,
     PREFIX_MCPR,
+    PREFIX_VS,
+    PREFIX_VSFB,
 ];

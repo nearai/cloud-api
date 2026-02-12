@@ -7,6 +7,7 @@ use tracing::{debug, error, info, warn};
 
 const TEMPLATE_DB_NAME: &str = "platform_api_test_template";
 static TEMPLATE_INITIALIZED: OnceCell<()> = OnceCell::const_new();
+static ADMIN_DB_NAME: OnceCell<String> = OnceCell::const_new();
 
 /// Validate that a database identifier only contains safe characters (alphanumeric + underscore).
 /// PostgreSQL identifiers with only these characters don't need quoting and are safe from injection.
@@ -41,23 +42,29 @@ pub fn get_template_db_name() -> String {
     name
 }
 
-/// Get admin database name - try 'postgres' first, fallback to 'template1' if not available
+/// Get admin database name, cached after first successful probe.
+/// Tries 'postgres' first, falls back to 'template1'.
 async fn get_admin_db_name(
     host: &str,
     port: u16,
     username: &str,
     password: &str,
 ) -> Result<String, String> {
-    if can_connect_to_db(host, port, username, password, "postgres").await {
-        return Ok("postgres".to_string());
-    }
+    ADMIN_DB_NAME
+        .get_or_try_init(|| async {
+            if can_connect_to_db(host, port, username, password, "postgres").await {
+                return Ok("postgres".to_string());
+            }
 
-    if can_connect_to_db(host, port, username, password, "template1").await {
-        warn!("'postgres' database not found, using 'template1' as admin database");
-        return Ok("template1".to_string());
-    }
+            if can_connect_to_db(host, port, username, password, "template1").await {
+                warn!("'postgres' database not found, using 'template1' as admin database");
+                return Ok("template1".to_string());
+            }
 
-    Err("Neither 'postgres' nor 'template1' database found".to_string())
+            Err("Neither 'postgres' nor 'template1' database found".to_string())
+        })
+        .await
+        .cloned()
 }
 
 async fn can_connect_to_db(
@@ -209,7 +216,6 @@ async fn create_template_database_internal(config: &config::DatabaseConfig) -> R
     );
 
     drop(database);
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     let _ = client
         .execute(
@@ -253,6 +259,8 @@ async fn check_template_database_ready(config: &config::DatabaseConfig, db_name:
 }
 
 /// Create a unique test database from the template.
+/// UUID-based test_id means the database name can't pre-exist, so we skip
+/// redundant DROP/terminate operations and go straight to CREATE.
 pub async fn create_test_database_from_template(
     config: &config::DatabaseConfig,
     test_id: &str,
@@ -270,30 +278,6 @@ pub async fn create_test_database_from_template(
 
     let client = connect_to_admin_db(config).await?;
 
-    let _ = client
-        .execute(
-            &format!(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-                 WHERE datname = '{test_db_name}' AND pid <> pg_backend_pid()"
-            ),
-            &[],
-        )
-        .await;
-
-    let _ = client
-        .execute(&format!("DROP DATABASE IF EXISTS {test_db_name}"), &[])
-        .await;
-
-    let _ = client
-        .execute(
-            &format!(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-                 WHERE datname = '{template_db_name}' AND pid <> pg_backend_pid()"
-            ),
-            &[],
-        )
-        .await;
-
     client
         .execute(
             &format!("CREATE DATABASE {test_db_name} TEMPLATE {template_db_name}"),
@@ -308,6 +292,7 @@ pub async fn create_test_database_from_template(
 }
 
 /// Drop a test database after test completion.
+/// Uses WITH (FORCE) (PG 13+) to terminate connections automatically.
 pub async fn drop_test_database(
     config: &config::DatabaseConfig,
     db_name: &str,
@@ -325,18 +310,11 @@ pub async fn drop_test_database(
 
     let client = connect_to_admin_db(config).await?;
 
-    let _ = client
+    client
         .execute(
-            &format!(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-                 WHERE datname = '{db_name}' AND pid <> pg_backend_pid()"
-            ),
+            &format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"),
             &[],
         )
-        .await;
-
-    client
-        .execute(&format!("DROP DATABASE IF EXISTS {db_name}"), &[])
         .await
         .map_err(|e| format!("Failed to drop test database: {e}"))?;
 
@@ -376,18 +354,11 @@ pub async fn drop_all_test_databases(config: &config::DatabaseConfig) -> Result<
             continue;
         }
 
-        let _ = client
+        match client
             .execute(
-                &format!(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-                     WHERE datname = '{db_name}' AND pid <> pg_backend_pid()"
-                ),
+                &format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"),
                 &[],
             )
-            .await;
-
-        match client
-            .execute(&format!("DROP DATABASE IF EXISTS {db_name}"), &[])
             .await
         {
             Ok(_) => {

@@ -139,7 +139,6 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
 
     let auth_service: Arc<dyn AuthServiceTrait> = if config.auth.mock {
         // TODO: fix this, it should not use the database pool
-        println!("config: {config:?}");
         Arc::new(MockAuthService {
             apikey_repository: Arc::new(ApiKeyRepository::new(database.pool().clone())),
         })

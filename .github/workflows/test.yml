@@ -29,11 +29,24 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+          --shm-size=256mb
         ports:
           - 5432:5432
 
     steps:
     - uses: actions/checkout@v6
+
+    - name: Increase PostgreSQL max connections
+      run: |
+        # Default max_connections=100 is too low for parallel e2e tests.
+        # 16 parallel tests * ~4 connections each = 64, but spikes can exceed 100.
+        docker exec ${{ job.services.postgres.id }} \
+          psql -U postgres -c "ALTER SYSTEM SET max_connections = 300;"
+        docker restart ${{ job.services.postgres.id }}
+        for i in $(seq 1 30); do
+          docker exec ${{ job.services.postgres.id }} pg_isready -U postgres && break
+          sleep 1
+        done
     
     - name: Install Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
